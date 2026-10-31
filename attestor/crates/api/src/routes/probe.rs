@@ -9,17 +9,23 @@
 //! synchronously checks the sandbox.
 //!
 //! Behavior:
-//!   - deployment not Running                   → no-op
+//!   - deployment neither Running nor Stopped   → no-op
 //!   - sandbox 404 (deleted)                    → flip Failed, emit ContainerFailed
-//!   - sandbox state started/starting            → no-op (sandbox up or
+//!   - sandbox state started/starting/restoring/creating, or a desired state
+//!     of `started` (a start under way) → no-op (sandbox up or
 //!     booting; agent liveness isn't decided from get_sandbox alone — a
 //!     live-sandbox/dead-agent is caught by the heartbeat sweep)
 //!   - sandbox state error                        → flip Failed, emit ContainerFailed
 //!   - any other state (stopped/stopping/archived/archiving/…) → flip Stopped,
-//!     emit ContainerStopped (sandbox preserved → resumable). Safe default:
+//!     emit ContainerStopped (sandbox preserved → resumable); no-op when the
+//!     agent is already Stopped. Safe default:
 //!     an unrecognized state never wrongly Fails/reaps a still-live sandbox.
 //!   - sandbox API errored                      → no state mutation (could be a
 //!     flapping RPC; the sweep will catch persistent failures)
+//!
+//! A flip is written only while the deployment still names the probed
+//! sandbox in the container state the probe read, so a resume or reset that
+//! lands while the provider is being asked is never overwritten.
 //!
 //! Stopped vs Failed: a sandbox that still exists but isn't running can be
 //! resumed in place (sandbox.start), so it maps to StageStatus::Stopped and
@@ -38,7 +44,9 @@
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use attestor_shared::{DeploymentPhase, SealId, StageStatus, WsEvent};
+use attestor_shared::{
+    DeploymentPhase, DeploymentRepo, EventBus, SandboxClient, SealId, StageStatus, WsEvent,
+};
 use axum::extract::State;
 use axum::Json;
 use chrono::Utc;
@@ -65,8 +73,22 @@ pub async fn handle(
     State(state): State<AppState>,
     Json(req): Json<ProbeRequest>,
 ) -> ApiResult<Json<ProbeResponse>> {
-    let d = state
-        .deployments
+    probe(
+        state.deployments.as_ref(),
+        state.sandbox.as_ref(),
+        state.events.as_ref(),
+        req,
+    )
+    .await
+}
+
+async fn probe(
+    deployments: &dyn DeploymentRepo,
+    sandbox: &dyn SandboxClient,
+    events: &dyn EventBus,
+    req: ProbeRequest,
+) -> ApiResult<Json<ProbeResponse>> {
+    let d = deployments
         .get(req.seal_id)
         .await?
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
@@ -95,7 +117,7 @@ pub async fn handle(
         }));
     };
 
-    let info = match state.sandbox.get_sandbox(sandbox_id).await {
+    let info = match sandbox.get_sandbox(sandbox_id).await {
         Ok(v) => v,
         Err(e) => {
             // Transport / auth / parse failure. Don't mutate state — a
@@ -125,17 +147,22 @@ pub async fn handle(
         // 404: the container is gone — only a Recreate brings it back.
         None => Outcome::Failed("container missing (sandbox deleted)".to_string()),
         Some(ref i) => match i.state.as_str() {
+            // The sandbox runtime explicitly reports a broken container → a
+            // genuine failure.
+            "error" => Outcome::Failed("sandbox error".to_string()),
             // "started" = the sandbox (container) is up — but that does NOT
             // mean the agent inside is serving (openclaw can be dead while
             // the sandbox runs). We can't tell from get_sandbox alone, so
             // treat it as alive here; a dead-agent-but-live-sandbox is caught
             // by the heartbeat sweep (and could be confirmed with a /healthz
-            // probe). "starting" is a transient boot state — never declare a
-            // still-booting container failed.
-            "started" | "starting" => Outcome::Alive,
-            // The sandbox runtime explicitly reports a broken container → a
-            // genuine failure.
-            "error" => Outcome::Failed("sandbox error".to_string()),
+            // probe). "starting" and the restore/create states are transient
+            // boot states — never declare a still-booting container failed.
+            // A start of an archived sandbox keeps reporting "archived" until
+            // it restores; only its desired state shows the start is under way.
+            "started" | "starting" | "restoring" | "creating" | "pulling_snapshot" => {
+                Outcome::Alive
+            }
+            _ if i.desired_state.as_deref() == Some("started") => Outcome::Alive,
             // Anything else — stopped / stopping / archived / archiving / any
             // future transitional state — means "not running but the sandbox
             // is preserved", so it's resumable in place. Default to Stopped,
@@ -149,15 +176,18 @@ pub async fn handle(
         },
     };
 
+    let unchanged = Json(ProbeResponse {
+        seal_id: req.seal_id,
+        phase: d.phase,
+        flipped_to: None,
+    });
     let now = Utc::now();
     let (stage, event, phase, reason) = match outcome {
-        Outcome::Alive => {
-            // Still alive — no-op, return current state.
-            return Ok(Json(ProbeResponse {
-                seal_id: req.seal_id,
-                phase: d.phase,
-                flipped_to: None,
-            }));
+        // Still alive, or already recorded as stopped — no-op, return
+        // current state.
+        Outcome::Alive => return Ok(unchanged),
+        Outcome::Stopped(_) if matches!(d.container_stage, StageStatus::Stopped { .. }) => {
+            return Ok(unchanged);
         }
         Outcome::Stopped(reason) => (
             StageStatus::Stopped {
@@ -185,17 +215,32 @@ pub async fn handle(
         ),
     };
 
-    // Atomic flip + emit. Either piece failing leaves the deployment
-    // in a partially-updated state — we log and return what we know;
-    // the next sweep (or another /probe) will reconcile.
-    if let Err(e) = state
-        .deployments
-        .set_container_stage(req.seal_id, stage)
+    // The flip lands only while the row is still what was inspected (the
+    // same sandbox, the same container state): a resume or reset that moved
+    // it on while the provider was being asked keeps it. A failed write is
+    // logged and the current state returned; the next sweep (or another
+    // /probe) will reconcile.
+    match deployments
+        .set_container_stage_if(
+            req.seal_id,
+            sandbox_id,
+            d.container_stage.state_tag(),
+            None,
+            stage,
+        )
         .await
     {
-        tracing::warn!(?req.seal_id, error = %e, "probe: set_container_stage failed (non-fatal)");
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(?req.seal_id, %sandbox_id, "probe: deployment changed during the probe — leaving alone");
+            return Ok(unchanged);
+        }
+        Err(e) => {
+            tracing::warn!(?req.seal_id, error = %e, "probe: stage write failed (non-fatal)");
+            return Ok(unchanged);
+        }
     }
-    if let Err(e) = state.events.publish(event).await {
+    if let Err(e) = events.publish(event).await {
         tracing::warn!(?req.seal_id, error = %e, "probe: publish event failed (non-fatal)");
     }
     tracing::info!(?req.seal_id, %sandbox_id, %reason, ?phase, "probe: flipped container stage");
@@ -205,4 +250,175 @@ pub async fn handle(
         phase,
         flipped_to: Some(reason),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::B256;
+    use attestor_shared::mocks::{ConfigurableSandbox, InMemoryDeploymentRepo, InMemoryEventBus};
+    use attestor_shared::{SandboxCreateResponse, SandboxEnvelope, SandboxInfo};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    const SEAL: [u8; 32] = [0xab; 32];
+
+    fn running_on(sandbox: &str) -> attestor_shared::Deployment {
+        let now = Utc::now();
+        let confirmed = serde_json::json!({"state": "confirmed", "at": now});
+        serde_json::from_value(serde_json::json!({
+            "seal_id": B256::from(SEAL),
+            "agent_seal_addr": "0x2222222222222222222222222222222222222222",
+            "owner": "0x1111111111111111111111111111111111111111",
+            "agent_id": null,
+            "agent_uri": "",
+            "agent_card": {},
+            "phase": "running",
+            "storage_stage": confirmed,
+            "mint_stage": confirmed,
+            "container_stage": confirmed,
+            "sandbox_id": sandbox,
+            "created_at": now,
+            "updated_at": now,
+        }))
+        .expect("deployment fixture")
+    }
+
+    /// A provider whose lookup races a lifecycle job: by the time it
+    /// answers, the agent has been moved on to a new boot.
+    struct RacingSandbox {
+        repo: Arc<InMemoryDeploymentRepo>,
+        answer: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxClient for RacingSandbox {
+        async fn create(
+            &self,
+            _: SealId,
+            _: &SandboxEnvelope,
+            _: Option<&str>,
+        ) -> anyhow::Result<SandboxCreateResponse> {
+            unreachable!("probe never creates")
+        }
+        async fn start(&self, _: SealId, _: &SandboxEnvelope) -> anyhow::Result<()> {
+            unreachable!("probe never starts")
+        }
+        async fn stop(&self, _: SealId, _: &SandboxEnvelope) -> anyhow::Result<()> {
+            unreachable!("probe never stops")
+        }
+        async fn admin_delete(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!("probe never deletes")
+        }
+        async fn get_sandbox(&self, sandbox_id: &str) -> anyhow::Result<Option<SandboxInfo>> {
+            self.repo
+                .set_container_stage(
+                    B256::from(SEAL),
+                    StageStatus::Submitted {
+                        tx_hash: None,
+                        at: Utc::now(),
+                    },
+                )
+                .await?;
+            Ok(self.answer.map(|state| SandboxInfo {
+                id: sandbox_id.into(),
+                state: state.into(),
+                desired_state: None,
+            }))
+        }
+    }
+
+    fn request() -> ProbeRequest {
+        ProbeRequest {
+            seal_id: B256::from(SEAL),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deleted_sandbox_marks_the_agent_failed() {
+        let repo = Arc::new(InMemoryDeploymentRepo::new());
+        repo.seed(running_on("sb-1"));
+        let sandbox = ConfigurableSandbox::new();
+        *sandbox.sandbox_state.lock().unwrap() = None;
+        let events = InMemoryEventBus::new();
+        let out = probe(repo.as_ref(), &sandbox, &events, request())
+            .await
+            .unwrap();
+        assert_eq!(
+            out.flipped_to.as_deref(),
+            Some("container missing (sandbox deleted)")
+        );
+        let d = repo.get(B256::from(SEAL)).await.unwrap().unwrap();
+        assert!(matches!(d.container_stage, StageStatus::Failed { .. }));
+        assert_eq!(events.events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lifecycle_job_that_lands_during_the_lookup_keeps_the_row() {
+        for answer in [None, Some("stopped"), Some("error")] {
+            let repo = Arc::new(InMemoryDeploymentRepo::new());
+            repo.seed(running_on("sb-1"));
+            let sandbox = RacingSandbox {
+                repo: repo.clone(),
+                answer,
+            };
+            let events = InMemoryEventBus::new();
+            let out = probe(repo.as_ref(), &sandbox, &events, request())
+                .await
+                .unwrap();
+            assert_eq!(out.flipped_to, None, "{answer:?}");
+            let d = repo.get(B256::from(SEAL)).await.unwrap().unwrap();
+            assert!(
+                matches!(d.container_stage, StageStatus::Submitted { .. }),
+                "{answer:?}: {:?}",
+                d.container_stage
+            );
+            assert!(events.events.lock().unwrap().is_empty(), "{answer:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_under_way_counts_as_alive() {
+        let repo = Arc::new(InMemoryDeploymentRepo::new());
+        repo.seed(running_on("sb-1"));
+        let sandbox = ConfigurableSandbox::new();
+        *sandbox.sandbox_state.lock().unwrap() = Some("archived".into());
+        *sandbox.sandbox_desired_state.lock().unwrap() = Some("started".into());
+        let events = InMemoryEventBus::new();
+        let out = probe(repo.as_ref(), &sandbox, &events, request())
+            .await
+            .unwrap();
+        assert_eq!(out.flipped_to, None);
+        let d = repo.get(B256::from(SEAL)).await.unwrap().unwrap();
+        assert!(matches!(d.container_stage, StageStatus::Confirmed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_agent_whose_sandbox_is_stopped_is_left_alone() {
+        let repo = Arc::new(InMemoryDeploymentRepo::new());
+        repo.seed(running_on("sb-1"));
+        repo.set_container_stage(
+            B256::from(SEAL),
+            StageStatus::Stopped {
+                at: Utc::now(),
+                reason: "user".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let calls = repo.set_container_stage_calls.load(Ordering::SeqCst);
+        let sandbox = ConfigurableSandbox::new();
+        *sandbox.sandbox_state.lock().unwrap() = Some("stopped".into());
+        let events = InMemoryEventBus::new();
+        let out = probe(repo.as_ref(), &sandbox, &events, request())
+            .await
+            .unwrap();
+        assert_eq!(out.flipped_to, None);
+        assert_eq!(
+            repo.set_container_stage_calls.load(Ordering::SeqCst),
+            calls,
+            "no write, so a resume authorized meanwhile is never revoked"
+        );
+        assert!(events.events.lock().unwrap().is_empty());
+    }
 }
