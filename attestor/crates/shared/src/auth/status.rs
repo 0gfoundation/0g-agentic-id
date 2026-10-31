@@ -55,6 +55,10 @@ pub struct BootAuthorization {
     pub started_at: i64,
     pub owner: Option<Address>,
     pub sandbox_id: Option<String>,
+    /// The container key the provider certified in its response to this
+    /// attestor's create under the current ticket. None until that sandbox
+    /// is persisted, or when the response carried no certificate.
+    pub container_pubkey: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]

@@ -562,6 +562,12 @@ pub struct SandboxCreateResponse {
     pub state: Option<String>,
     #[serde(default, rename = "createdAt")]
     pub created_at: Option<String>,
+    /// The container key from the certificate the provider wrote into the
+    /// new sandbox's env (`env.SANDBOX_SEAL_ATTESTATION`, which the provider
+    /// returns with the sandbox), for this seal. Filled by the client after
+    /// parsing; None when the response carried no such certificate.
+    #[serde(skip)]
+    pub container_pubkey: Option<Vec<u8>>,
 }
 
 // Shape returned by `SandboxClient::get_sandbox`. Mirrors the relevant

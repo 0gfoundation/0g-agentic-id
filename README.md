@@ -251,7 +251,8 @@ are registered on chain — can ever obtain the AgentSeal private key.
   container's key and image hash, which the container hands to Attestor at
   its first `/provision`. Attestor checks that the certificate's signer and
   registration scope are the sandbox app instance registered in
-  TappRegistry, and that the image hash appears in the AgenticID contract's
+  TappRegistry, that the key is the one the provider reported when the
+  attestor created that sandbox, and that the image hash appears in the AgenticID contract's
   **`validFrameworkHashes` allowlist**. This allowlist
   covers the hashes of the **AgenticID runtime framework** — the container
   code that loads functional data, manages AgentSeal signing, and validates

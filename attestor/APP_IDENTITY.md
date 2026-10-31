@@ -126,7 +126,11 @@ Sandbox creation always overrides `ATTESTOR_URL` (the HTTPS locator without a tr
 environment; it writes no TLS trust into the environment. It refuses a create
 whose owner-signed environment has a key that is not a variable name
 (`[A-Za-z_][A-Za-z0-9_]*`): the runtime joins entries as `KEY=VALUE`, so a key
-holding `=` could add a second entry for a variable the attestor sets. Before every create the
+holding `=` could add a second entry for a variable the attestor sets. These overrides
+cover the containers the attestor creates; a sealed sandbox created at the provider
+directly can carry any environment, which is why `/provision` (below) accepts a first
+boot only from the container the attestor's own create made. The provider removes
+`SEAL_BOOT_TICKET`, like `SANDBOX_SEAL_KEY`, from every sandbox it returns. Before every create the
 attestor rechecks that AgenticID still trusts its own app instance. On a sealed create,
 which is every create the attestor makes, the sandbox provider strips
 `ATTESTOR_TLS_DESCRIPTOR`, `ATTESTOR_ALLOW_UNPINNED_DEV`, `TEE_SIGNER_ADDRESS` and every
@@ -173,9 +177,16 @@ the attestor requires that the recovered signer and the certificate's chain, reg
 appId and registeredAt equal the provider instance authenticated by sandbox discovery;
 an issue time no earlier than 300 seconds before the boot ticket was issued and no later
 than now + 300 seconds; the image in `validFrameworkHashes`; and the boot claim signed by
-the certified key. In the same transaction as the boot binding it records the container
-key, the image hash and the provider instance (chain, registry, appId, registeredAt,
-signer).
+the certified key. The certified key must also be the one the provider reported for the
+sandbox this attestor created under the current ticket: the provider returns a sealed
+sandbox with its certificate (the private key stripped), and the worker stores that key
+with the new sandbox ID. A sealed sandbox created at the provider directly is certified
+as well and can even carry the ticket, but it has another key and is refused with
+`401 certificate is not for the sandbox this attestor created; reset required` (or
+`401 the sandbox provider reported no container key for this sandbox at create; reset
+required` when the create response carried no certificate). In the same transaction as
+the boot binding it records the container key, the image hash and the provider instance
+(chain, registry, appId, registeredAt, signer).
 
 Later boots of the same container send no certificate. The recorded key must sign the
 boot claim, the recorded provider instance must still be the discovered one (otherwise
@@ -195,11 +206,12 @@ served, and `/status` confirms settings from that record alone. Neither the toke
 the record carries an attestor MAC. There is no v2 compatibility: release the provider,
 attestor and sealed images together and recreate every agent (the rollout steps are in
 [`README.md`](README.md#rolling-out-agentdna-14)). A `start` (resume) of a sandbox
-whose boot ticket predates v3 is refused with 409, since that runtime cannot provision.
+created before v3 (no boot ticket, or one without an issue time) is refused with 409,
+since that runtime cannot provision.
 
 A 401 or 403 for the authorized boot (ticket, generation, a newer attempt, persisted
 sandbox and live owner all checked) is logged as `provision rejected`. While that
 generation is still the enabled one, it is recorded as `last_provision_error` and the
-container stage becomes `failed` with it as the reason, so the owner sees the cause at
-once instead of a provision timeout five minutes later. Other rejections write
-nothing.
+container stage becomes `failed` with it as the reason, published as
+`container_failed`, so the owner sees the cause at once instead of a provision timeout
+five minutes later. Other rejections write nothing.

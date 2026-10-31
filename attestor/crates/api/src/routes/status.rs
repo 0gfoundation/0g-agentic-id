@@ -311,6 +311,7 @@ mod tests {
                 started_at: 1,
                 owner: Some(Address::ZERO),
                 sandbox_id: Some("sb-1".into()),
+                container_pubkey: None,
             },
         );
         repo.status_bindings
@@ -657,7 +658,7 @@ mod tests {
             .unwrap()
             .unwrap();
         s.repo
-            .set_sandbox_id(s.seal_id, "sb-1".into())
+            .set_sandbox_id(s.seal_id, "sb-1".into(), None)
             .await
             .unwrap();
         let claim = attestor_shared::auth::status::BootClaim {

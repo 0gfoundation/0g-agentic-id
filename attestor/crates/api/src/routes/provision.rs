@@ -16,7 +16,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::auth::status::{self, ServedSettings};
 use attestor_shared::{
-    image_attestation, ContainerRecord, ProvisionRequest, ProvisionResponse, SealId,
+    image_attestation, ContainerRecord, ProvisionRequest, ProvisionResponse, SealId, WsEvent,
 };
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
@@ -91,12 +91,30 @@ pub async fn handle(
         e.status,
         axum::http::StatusCode::UNAUTHORIZED | axum::http::StatusCode::FORBIDDEN
     ) {
-        if let Err(error) = state
+        match state
             .deployments
             .record_provision_error(seal_id, e.message.clone(), true, Some(generation))
             .await
         {
-            tracing::warn!(?seal_id, %error, "recording the provision rejection failed");
+            // The agent just went offline; watchers (the console's detail
+            // page) learn it from this event, as from the provision timeout.
+            Ok(true) => {
+                if let Err(error) = state
+                    .events
+                    .publish(WsEvent::ContainerFailed {
+                        seal_id,
+                        reason: e.message.clone(),
+                    })
+                    .await
+                {
+                    tracing::warn!(?seal_id, %error, "publishing the provision rejection failed");
+                }
+            }
+            // A reset or stop owns the row now; nothing changed.
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(?seal_id, %error, "recording the provision rejection failed");
+            }
         }
     }
     result.map(Json)
@@ -203,6 +221,23 @@ async fn provision(
     let later = matches!(boot, Boot::Later(_));
     let record = match boot {
         Boot::First(certificate) => {
+            // Only the container this attestor's create made may take the
+            // agent key: the provider certified its key in the create
+            // response. A sealed sandbox created at the provider directly is
+            // certified too, and can carry the ticket, but has another key.
+            match auth.container_pubkey.as_deref() {
+                Some(key) if key == certificate.pubkey.as_ref() => {}
+                Some(_) => {
+                    return Err(ApiError::unauthorized(
+                        "certificate is not for the sandbox this attestor created; reset required",
+                    ));
+                }
+                None => {
+                    return Err(ApiError::unauthorized(
+                        "the sandbox provider reported no container key for this sandbox at create; reset required",
+                    ));
+                }
+            }
             image_attestation::validate_scope(&certificate, &identity, Utc::now().timestamp())
                 .map_err(|e| ApiError::unauthorized(e.to_string()))?;
             let signer = certificate
@@ -690,7 +725,9 @@ pub(crate) mod tests {
         repo.prepare_status_boot(seal_id, Some(binding_hash(&ticket())), Address::ZERO)
             .await
             .unwrap();
-        repo.set_sandbox_id(seal_id, "sb-1".into()).await.unwrap();
+        repo.set_sandbox_id(seal_id, "sb-1".into(), Some(pubkey(CONTAINER_PRIV)))
+            .await
+            .unwrap();
         let mut state = AppState {
             providers: Arc::new(
                 attestor_shared::provider_registry::MemoryProviderRegistry::default(),
@@ -956,7 +993,9 @@ pub(crate) mod tests {
             request(&repo, seal, CONTAINER_PRIV, Some(foreign)).await,
             StatusCode::UNAUTHORIZED,
         ));
-        for issued_at in [ticket_issued_at - 301, Utc::now().timestamp() + 301] {
+        // The future edge is checked against the clock when the request is
+        // handled, which may be a second or more after the cases are built.
+        for issued_at in [ticket_issued_at - 301, Utc::now().timestamp() + 360] {
             cases.push((
                 "window",
                 request(
@@ -1023,7 +1062,9 @@ pub(crate) mod tests {
         repo.prepare_status_boot(seal, Some(binding_hash(&ticket())), Address::ZERO)
             .await
             .unwrap();
-        repo.set_sandbox_id(seal, "sb-2".into()).await.unwrap();
+        repo.set_sandbox_id(seal, "sb-2".into(), Some(pubkey(OTHER_CONTAINER_PRIV)))
+            .await
+            .unwrap();
         assert!(certificate_required(&state, seal).await);
         let error = call(&state, later(&repo, seal).await).await.unwrap_err();
         assert_eq!(error.message, "certificate_required");
@@ -1054,6 +1095,56 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_first_provision_must_come_from_the_sandbox_this_attestor_created() {
+        // A provider-certified container for this seal that holds the ticket
+        // but is not the one this attestor's create made (a sealed sandbox
+        // created at the provider directly): refused, nothing recorded.
+        let (state, repo, seal) = setup(None).await;
+        let error = call(
+            &state,
+            request(
+                &repo,
+                seal,
+                OTHER_CONTAINER_PRIV,
+                Some(certificate(seal, OTHER_CONTAINER_PRIV)),
+            )
+            .await,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(error.message.contains("not for the sandbox this attestor created"));
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(d.container_record.is_none());
+        assert!(!repo.status_bindings.lock().unwrap().contains_key(&seal));
+
+        // A create whose response carried no certificate has nothing to
+        // bind the first provision to.
+        let (state, repo, seal) = setup(None).await;
+        repo.set_sandbox_id(seal, "sb-1".into(), None).await.unwrap();
+        let error = call(&state, first(&repo, seal).await).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(error.message.contains("no container key"));
+        assert!(repo.get(seal).await.unwrap().unwrap().container_record.is_none());
+
+        // A resume keeps the bound key: the same container provisions again.
+        let (state, repo, seal) = setup(None).await;
+        call(&state, first(&repo, seal).await).await.unwrap();
+        repo.prepare_status_boot(seal, None, Address::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .container_pubkey,
+            Some(pubkey(CONTAINER_PRIV))
+        );
+        call(&state, later(&repo, seal).await).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn owner_create_fences_old_tickets_replays_and_claim_tampering() {
         let (state, repo, seal) = setup(Some(serde_json::json!({"model":"m"}))).await;
         let old = first(&repo, seal).await;
@@ -1068,9 +1159,13 @@ pub(crate) mod tests {
         repo.prepare_status_boot(seal, Some(binding_hash(&new_ticket)), Address::ZERO)
             .await
             .unwrap();
-        repo.set_sandbox_id(seal, "new-sandbox".into())
-            .await
-            .unwrap();
+        repo.set_sandbox_id(
+            seal,
+            "new-sandbox".into(),
+            Some(pubkey(OTHER_CONTAINER_PRIV)),
+        )
+        .await
+        .unwrap();
         let mut new = request(
             &repo,
             seal,
@@ -1188,6 +1283,8 @@ pub(crate) mod tests {
         let sandbox = Arc::new(ConfigurableSandbox::new());
         *sandbox.authenticated_identity.lock().unwrap() = Some(identity());
         state.sandbox = sandbox.clone();
+        let events = Arc::new(InMemoryEventBus::new());
+        state.events = events.clone();
         repo.set_provision_deadline(seal, Some(Utc::now() + chrono::Duration::minutes(5)))
             .await
             .unwrap();
@@ -1206,6 +1303,15 @@ pub(crate) mod tests {
         assert_eq!(after.last_provision_error.as_deref(), Some(error.message.as_str()));
         assert!(after.provision_deadline.is_none());
         assert!(after.container_record.is_none());
+        // Watchers learn the agent went offline.
+        assert!(
+            matches!(
+                events.events.lock().unwrap().as_slice(),
+                [WsEvent::ContainerFailed { seal_id, reason }] if *seal_id == seal && *reason == error.message
+            ),
+            "{:?}",
+            events.events.lock().unwrap()
+        );
         assert_eq!(
             sandbox
                 .admin_delete_calls
@@ -1231,7 +1337,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_rejection_that_is_not_the_authorized_boot_records_nothing() {
-        let (state, repo, seal) = setup(None).await;
+        let (mut state, repo, seal) = setup(None).await;
+        let events = Arc::new(InMemoryEventBus::new());
+        state.events = events.clone();
         let before = repo.get(seal).await.unwrap().unwrap();
         // A stale attempt: not newer than the one already accepted.
         let req = first(&repo, seal).await;
@@ -1252,10 +1360,12 @@ pub(crate) mod tests {
         // A rejection recorded under a generation that is no longer the
         // enabled one (a reset or stop won the race) leaves the row alone.
         let generation = repo.boot_authorization(seal).await.unwrap().unwrap().generation;
-        repo.record_provision_error(seal, "late".into(), true, Some(generation - 1))
+        assert!(!repo
+            .record_provision_error(seal, "late".into(), true, Some(generation - 1))
             .await
-            .unwrap();
+            .unwrap());
         assert!(repo.get(seal).await.unwrap().unwrap().last_provision_error.is_none());
+        assert!(events.events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

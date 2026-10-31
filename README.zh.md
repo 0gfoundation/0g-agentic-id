@@ -209,7 +209,8 @@ agentSeal 私钥。
   合法 owner 才能用 agent 的功能数据实例化它。
 - **运行时代码 attestation**：Sandbox 为容器公钥和镜像哈希签发证书，由容器在
   首次 `/provision` 时交给 Attestor。Attestor 核对证书签名者及其注册 scope 是
-  TappRegistry 中登记的 sandbox app 实例，且镜像哈希出现在 AgenticID 合约的
+  TappRegistry 中登记的 sandbox app 实例，公钥是 attestor 创建该 sandbox 时
+  provider 报告的公钥，且镜像哈希出现在 AgenticID 合约的
   **`validFrameworkHashes` 白名单**里。这个白名单覆盖
   的是 **AgenticID 运行时框架**的哈希——也就是负责加载功能数据、管理 AgentSeal
   签名、校验 owner 指令的那一层容器代码。它与 LangChain / CrewAI 这类 AI 编排

@@ -279,8 +279,16 @@ pub trait DeploymentRepo: Send + Sync {
     /// Update the recorded framework (reset/first-start harness switch).
     async fn set_framework(&self, seal_id: SealId, framework: String) -> anyhow::Result<()>;
 
-    /// Persist 0g-sandbox's resource id after container track submits.
-    async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()>;
+    /// Persist 0g-sandbox's resource id after container track submits, with
+    /// the container key the provider certified for it. Both are bound to
+    /// the enabled boot authorization: its first provision must come from
+    /// this sandbox's container.
+    async fn set_sandbox_id(
+        &self,
+        seal_id: SealId,
+        sandbox_id: String,
+        container_pubkey: Option<Vec<u8>>,
+    ) -> anyhow::Result<()>;
 
     /// Revoke the prior owner's binding and container record, preserving an
     /// authorized boot that belongs to the live chain owner. Return the
@@ -370,13 +378,14 @@ pub trait DeploymentRepo: Send + Sync {
     /// authorized under. The row is left alone unless that generation is
     /// still the enabled one, so a late rejection cannot overwrite a reset
     /// or stop that happened meanwhile. `None` records unconditionally.
+    /// Returns whether the row was written.
     async fn record_provision_error(
         &self,
         seal_id: SealId,
         reason: String,
         mark_failed: bool,
         generation: Option<i64>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<bool>;
 
     /// Atomically flip every deployment whose `provision_deadline` has
     /// passed AND whose `container_stage` is still `Submitted` to

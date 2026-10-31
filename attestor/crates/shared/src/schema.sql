@@ -61,6 +61,13 @@ UPDATE deployments SET container_pubkey = NULL
 -- container never got far enough to call /provision at all.
 -- NULL means "no deadline tracked" (legacy rows or no sandbox yet).
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provision_deadline TIMESTAMPTZ;
+-- A deadline is only live while the container stage is Submitted. Releases
+-- before 1.4 failed a timed-out or refused boot without clearing it; such a
+-- leftover would fail the next boot of that agent while its sandbox is still
+-- being created.
+UPDATE deployments SET provision_deadline = NULL
+ WHERE provision_deadline IS NOT NULL
+   AND container_stage->>'state' IS DISTINCT FROM 'submitted';
 
 -- Last /provision validation error visible to operators / dashboard.
 -- Written on every /provision rejection (bad pubkey shape, signer
@@ -242,6 +249,12 @@ ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_sandbo
 -- a certificate issued no earlier than 300 seconds before it. NULL on tickets
 -- issued before this column existed: such a container must be recreated.
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS ticket_issued_at BIGINT;
+-- The container key the provider certified for the sandbox this attestor
+-- created under the current ticket, read from the provider's create response.
+-- The first provision must present a certificate for this key: a sealed
+-- sandbox created at the provider directly, even one carrying the ticket,
+-- has another key. Cleared with every new ticket.
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_container_pubkey BYTEA;
 -- The settings document the current boot was served. A running/warning
 -- report confirms the version only when its applied digest equals this one.
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS served_settings_version BIGINT;

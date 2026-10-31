@@ -292,12 +292,14 @@ pub struct HttpSandbox {
     /// the sandbox create body as `env.ATTESTOR_URL`.
     attestor_public_url: String,
     /// Additional `(KEY, VALUE)` pairs injected into the container's env on
-    /// top of `ATTESTOR_URL`. Same trust boundary — these are
-    /// attestor-controlled, NOT deployer-controlled, so the container can
-    /// trust them as the canonical chain / storage / contract config (a
-    /// malicious deployer can't make the container talk to a fake chain;
-    /// `apply_attestor_env` also refuses payload keys that could smuggle a
-    /// duplicate entry).
+    /// top of `ATTESTOR_URL`: the canonical chain / storage / contract config,
+    /// overriding the owner-signed payload (`apply_attestor_env` also refuses
+    /// payload keys that could smuggle a duplicate entry). This holds for the
+    /// containers this attestor creates. A sealed sandbox created at the
+    /// provider directly can carry any env, so `/provision` hands the agent
+    /// key only to the container this attestor's own create made: the first
+    /// provision must present the key the provider certified in that create's
+    /// response (`SandboxCreateResponse::container_pubkey`).
     extra_env: Vec<(String, String)>,
     /// Public-port allowlist injected into the create body as `publicPorts`
     /// (0g-sandbox#57). Empty = field omitted = all-ports-public (today's
@@ -407,6 +409,20 @@ impl HttpSandbox {
         }
         Ok(())
     }
+}
+
+/// The container key the provider certified for `seal_id` in a create
+/// response: the provider returns the new sandbox with its env, which holds
+/// the certificate it wrote (`SANDBOX_SEAL_ATTESTATION`, the private key is
+/// stripped). The certificate's signature is checked at the first
+/// `/provision`; here only its key is taken, so that provision can require
+/// the container this create made.
+fn created_container_pubkey(body: &str, seal_id: SealId) -> Option<Vec<u8>> {
+    let response: serde_json::Value = serde_json::from_str(body).ok()?;
+    let raw = response.get("env")?.get("SANDBOX_SEAL_ATTESTATION")?.as_str()?;
+    let certificate: crate::image_attestation::Certificate = serde_json::from_str(raw).ok()?;
+    let parsed = certificate.parse().ok()?;
+    (parsed.seal_id == seal_id).then(|| parsed.pubkey.to_vec())
 }
 
 fn apply_boot_ticket(env: &mut serde_json::Map<String, serde_json::Value>, ticket: Option<&str>) {
@@ -540,9 +556,16 @@ impl SandboxClient for HttpSandbox {
         // Sandbox returns a rich object; we only need `id` (+ light metadata)
         // for later /start /stop envelopes. Unknown fields are ignored so
         // sandbox can evolve without breaking us.
-        let parsed: SandboxCreateResponse = serde_json::from_str(&body)
+        let mut parsed: SandboxCreateResponse = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("sandbox create: parse response: {e}"))?;
-        tracing::info!(?seal_id, sandbox_id = %parsed.id, state = ?parsed.state, "sandbox: created");
+        parsed.container_pubkey = created_container_pubkey(&body, seal_id);
+        tracing::info!(
+            ?seal_id,
+            sandbox_id = %parsed.id,
+            state = ?parsed.state,
+            certified_key = parsed.container_pubkey.is_some(),
+            "sandbox: created"
+        );
         Ok(parsed)
     }
 
@@ -813,6 +836,54 @@ impl HttpSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_response_yields_the_certified_container_key_for_this_seal() {
+        let provider = alloy::signers::local::PrivateKeySigner::from_bytes(
+            &alloy::primitives::B256::repeat_byte(0x55),
+        )
+        .unwrap();
+        let identity = crate::identity::SandboxServiceIdentity {
+            provider: provider.address(),
+            chain_id: 16602,
+            registry_address: Address::repeat_byte(0x11),
+            app_id: "sandbox-test".into(),
+            registered_at: 100,
+            expires_at: i64::MAX,
+        };
+        let seal = SealId::repeat_byte(0xaa);
+        let key = [0x02; 33];
+        let certificate = crate::mocks::signed_certificate(
+            &provider,
+            &identity,
+            seal,
+            &key,
+            alloy::primitives::B256::repeat_byte(0x11),
+            1_700_000_000,
+        );
+        let body = |env: serde_json::Value| {
+            serde_json::json!({"id": "sb-1", "state": "started", "env": env}).to_string()
+        };
+        let attested = body(serde_json::json!({
+            "SANDBOX_SEAL_ATTESTATION": serde_json::to_string(&certificate).unwrap(),
+            "ATTESTOR_URL": "https://attestor.example",
+        }));
+        assert_eq!(
+            created_container_pubkey(&attested, seal).as_deref(),
+            Some(&key[..])
+        );
+        // Another seal's certificate, none, or a malformed one: no key.
+        assert_eq!(created_container_pubkey(&attested, SealId::repeat_byte(0xbb)), None);
+        assert_eq!(created_container_pubkey(&body(serde_json::json!({})), seal), None);
+        assert_eq!(
+            created_container_pubkey(
+                &body(serde_json::json!({"SANDBOX_SEAL_ATTESTATION": "{}"})),
+                seal
+            ),
+            None
+        );
+        assert_eq!(created_container_pubkey(r#"{"id":"sb-1"}"#, seal), None);
+    }
 
     struct LeaseDns {
         expires_at: chrono::DateTime<chrono::Utc>,
