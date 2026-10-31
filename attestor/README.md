@@ -189,10 +189,12 @@ load-bearing ones, grouped:
 | `ATTESTOR_SANDBOX_ENDPOINT` | Dev-only locator; production uses the authorized on-chain HTTPS URL |
 | `ATTESTOR_SANDBOX_SNAPSHOT` | Sealed runtime snapshot used when instantiating new agent containers. Bump this on image upgrade |
 | `ATTESTOR_SANDBOX_PUBLIC_PORTS` | Comma-separated public-port allowlist (0g-sandbox#57). When set, sandbox creates carry `publicPorts` so only these ports are publicly reachable; all others fall back to Daytona auth. Must include the agent serve port (8080). Empty = all-ports-public — the only safe setting until the provider runs the 0g-daytona fork images |
-| `ATTESTOR_SUPPORTED_FRAMEWORKS` | Comma-separated framework names deploys may select — checked pre-mint, served by `GET /config` for the UI picker. Must match the adapters the sealed image in `ATTESTOR_SANDBOX_SNAPSHOT` bundles. Unset/empty = `openclaw` |
+| `ATTESTOR_SUPPORTED_FRAMEWORKS` | Comma-separated framework names deploys may select — checked pre-mint, served by `GET /config` for the UI picker. Must match the adapters the sealed image in `ATTESTOR_SANDBOX_SNAPSHOT` bundles. Unset/empty = `openclaw`. Legacy fallback for `ATTESTOR_FRAMEWORKS` (`name[:image]` per entry, see `.env.example`); in either, `dsh` is refused at startup |
 | `ATTESTOR_SECRET_ENV_ENABLED` | Opt-in (`true`/`1`/`on`/`yes`). `GET /config` then advertises `secret_env_scheme`, and the SDK seals the inference key of start/reset/retry to the agentSeal key instead of signing it in clear. Enable only once every image in `ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS` reads `SEAL_SECRET_ENV`. Default off |
 | `ATTESTOR_PUBLIC_URL` | Attestor's public-facing URL. Injected into the sandbox container as `ATTESTOR_URL` so the container can POST `/provision` and `/status` back |
 | `MOCK_SANDBOX` | Dev mock switch. When `true`, skips actually spinning up containers and only logs |
+
+Upgrading from a release that named the harness framework `dsh`: rename the entry to `0g-harness` in `ATTESTOR_FRAMEWORKS` and point it at the 0g-harness image in the same roll. Startup renames every `dsh` deployment row to `0g-harness` and refuses a configuration that still names `dsh`, so the two cannot disagree.
 
 Attestor and configured sealed images are released together. `/config.inference_capabilities` is derived from that release and the existing framework/snapshot configuration; there is no extra capability ENV. Administrative provider writes require the live owner of `ATTESTOR_APP_ID` in `ATTESTOR_TAPP_REGISTRY_ADDR`. See [rollout](../sdk/typescript/PROVIDERS.md).
 

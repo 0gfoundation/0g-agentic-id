@@ -348,7 +348,7 @@ impl Config {
             // fallback so a not-yet-migrated deployment keeps working.
             frameworks: parse_frameworks(
                 env_opt("ATTESTOR_FRAMEWORKS").or_else(|| env_opt("ATTESTOR_SUPPORTED_FRAMEWORKS")),
-            ),
+            )?,
             chain_priority_fee_gwei: env_opt("ATTESTOR_PRIORITY_FEE_GWEI")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),
@@ -506,7 +506,33 @@ fn parse_opt_addr(key: &str, raw: Option<&str>) -> anyhow::Result<Option<Address
 /// Parse the `ATTESTOR_FRAMEWORKS` value: a comma list of `name[:image]`
 /// entries. `image` omitted → `None` (caller falls back to sandbox_snapshot).
 /// Empty / `None` → `[openclaw]` (an empty list would reject every deploy).
-fn parse_frameworks(raw: Option<String>) -> Vec<Framework> {
+/// Framework names sealed ships an adapter for.
+const KNOWN_FRAMEWORKS: [&str; 4] = ["openclaw", "hermes", "prime-agent", "0g-harness"];
+
+/// Parse `ATTESTOR_FRAMEWORKS`. `dsh` is refused: startup renames every `dsh`
+/// row to `0g-harness` (schema.sql), so a configuration still advertising
+/// `dsh` would no longer match those agents and would point new ones at the
+/// old image. A name sealed has no adapter for is logged.
+fn parse_frameworks(raw: Option<String>) -> anyhow::Result<Vec<Framework>> {
+    let frameworks = parse_framework_entries(raw);
+    if frameworks.iter().any(|f| f.name == "dsh") {
+        anyhow::bail!(
+            "ATTESTOR_FRAMEWORKS names `dsh`, which is now `0g-harness`: rename the entry and point it at the 0g-harness image"
+        );
+    }
+    for framework in &frameworks {
+        if !KNOWN_FRAMEWORKS.contains(&framework.name.as_str()) {
+            tracing::error!(
+                framework = %framework.name,
+                known = ?KNOWN_FRAMEWORKS,
+                "ATTESTOR_FRAMEWORKS names a framework sealed has no adapter for"
+            );
+        }
+    }
+    Ok(frameworks)
+}
+
+fn parse_framework_entries(raw: Option<String>) -> Vec<Framework> {
     let parsed: Vec<Framework> = raw
         .map(|s| {
             s.split(',')
@@ -541,7 +567,7 @@ mod tests {
     fn capabilities_follow_the_release_and_configured_framework_images() {
         let frameworks = parse_frameworks(Some(
             "openclaw,hermes:hermes-new,prime-agent:prime-new,0g-harness:harness-new".into(),
-        ));
+        )).unwrap();
         let caps = runtime_capabilities(true, "openclaw-new", &frameworks);
         assert_eq!(caps.len(), 4);
         for capability in &caps {
@@ -561,7 +587,7 @@ mod tests {
     fn capabilities_do_not_advertise_unknown_images_or_protocols() {
         let frameworks = parse_frameworks(Some(
             "future:unknown-image,openclaw:shared,hermes:shared".into(),
-        ));
+        )).unwrap();
         let caps = runtime_capabilities(true, "default", &frameworks);
         assert!(!caps.iter().any(|cap| cap.image == "unknown-image"));
         assert_eq!(
@@ -620,7 +646,7 @@ mod tests {
     fn parse_frameworks_name_and_image() {
         let fws = parse_frameworks(Some(
             "openclaw, hermes:0g-sealed-hermes ,prime:0g-sealed-prime".to_string(),
-        ));
+        )).unwrap();
         assert_eq!(fws.len(), 3);
         assert_eq!(fws[0].name, "openclaw");
         assert_eq!(fws[0].image, None); // no image → default snapshot
@@ -630,9 +656,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_frameworks_refuses_the_old_harness_name() {
+        let err = parse_frameworks(Some("openclaw,dsh:0g-sealed-dsh".into())).unwrap_err();
+        assert!(err.to_string().contains("0g-harness"), "{err}");
+        let fws = parse_frameworks(Some("openclaw,0g-harness:0g-sealed-harness".into())).unwrap();
+        assert_eq!(fws[1].name, "0g-harness");
+    }
+
+    #[test]
     fn parse_frameworks_empty_or_none_defaults_openclaw() {
         for raw in [None, Some(String::new()), Some("  ,  ".to_string())] {
-            let fws = parse_frameworks(raw);
+            let fws = parse_frameworks(raw).unwrap();
             assert_eq!(fws.len(), 1);
             assert_eq!(fws[0].name, "openclaw");
             assert_eq!(fws[0].image, None);
@@ -642,7 +676,7 @@ mod tests {
     #[test]
     fn parse_frameworks_legacy_names_only_still_works() {
         // legacy ATTESTOR_SUPPORTED_FRAMEWORKS value shape (no images)
-        let fws = parse_frameworks(Some("openclaw,hermes".to_string()));
+        let fws = parse_frameworks(Some("openclaw,hermes".to_string())).unwrap();
         assert_eq!(
             fws.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
             vec!["openclaw", "hermes"]
