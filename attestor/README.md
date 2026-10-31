@@ -111,15 +111,27 @@ go on until each check passes.
    `running`. The sealed log shows `attestor tls: statement accepted` and
    `OK   status reported`. A refused provision is in the api log
    (`provision rejected`) and is the reason on the agent's container stage.
-6. **Announce.** Owners reset their agents. A resume (`/start` with `start`)
-   of a sandbox created before 1.4 is refused with 409, because that runtime
-   cannot provision. Owners acknowledge the provider again (SDK `ack()`) if
-   the preflight asks. Ask owners to spread their resets: the worker runs one
-   job at a time, and a reset not started within about 150 s of being signed
-   is dropped and leaves the agent as it was. The console shows
-   `request expired before it ran — sign it again`; the CLI keeps waiting for
-   the new container until its limit, then says the agent did not come online
-   and to run the reset again.
+6. **Publish the SDK.** The 1.4 CLI is `@0gfoundation/0g-agentdna` 0.2.2.
+   The versions already on npm (0.2.0, 0.2.1) predate it: their `reset` can
+   report `running` from the 1.3 container before the worker has replaced
+   it, and their deploy wizard does not limit 0g-harness agents to models
+   with tool use. Publish 0.2.2 and its compatibility package in the
+   [release order](../sdk/typescript/MIGRATION.md#release-order), with 0.2.2
+   as the `latest` dist-tag (what `0g-agentdna update` installs). Then set
+   `ATTESTOR_CLI_LATEST=0.2.2` and an `ATTESTOR_CLI_NOTES` line asking CLI
+   owners to update before they reset, and restart the api. Check:
+   `npm view @0gfoundation/0g-agentdna dist-tags.latest` prints `0.2.2`, and
+   `GET /config` shows `"cli_latest":"0.2.2"`.
+7. **Announce.** CLI owners update (`0g-agentdna update`), then owners reset
+   their agents. A resume (`/start` with `start`) of a sandbox created before
+   1.4 is refused with 409, because that runtime cannot provision. Owners
+   acknowledge the provider again (SDK `ack()`) if the preflight asks. Ask
+   owners to spread their resets: the worker runs one job at a time, and a
+   reset not started within about 150 s of being signed is dropped and leaves
+   the agent as it was. The console shows
+   `request expired before it ran — sign it again`; the 0.2.2 CLI keeps
+   waiting for the new container until its limit, then says the agent did not
+   come online and to run the reset again.
 
 **Rolling back.** The 1.4 attestor is one-way: its schema drops columns a
 1.3 attestor reads (`inference_provider_registry.acceptance_mac`,

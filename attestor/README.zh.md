@@ -89,12 +89,21 @@ worker 日志即可。
 5. **每个框架 reset 一个。**每个框架各 reset 一个 agent，等到 `running`。sealed 日志
    出现 `attestor tls: statement accepted` 和 `OK   status reported`。被拒的 provision
    会出现在 api 日志里（`provision rejected`），也是该 agent 容器 stage 上的原因。
-6. **公告。**owner reset 自己的 agent。1.4 之前创建的 sandbox 不能 resume
-   （`/start` 带 `start`），会得到 409，因为那个运行时无法 provision。preflight 要求时，
-   owner 需重新确认 provider（SDK `ack()`）。请 owner 错开 reset：worker 一次只跑一个
-   job，签名后约 150 s 内没开始执行的 reset 会被丢弃，agent 保持原样。控制台显示
-   `request expired before it ran — sign it again`；CLI 会一直等新容器直到超时，然后提示
-   agent 没有上线、请重新 reset。
+6. **发布 SDK。**1.4 的 CLI 是 `@0gfoundation/0g-agentdna` 0.2.2。npm 上已有的版本
+   （0.2.0、0.2.1）早于它：它们的 `reset` 可能在 worker 替换容器之前就从 1.3 容器读到
+   `running` 并报告完成，部署向导也不会把 0g-harness agent 限定为支持工具调用的模型。
+   按[发布顺序](../sdk/typescript/MIGRATION.zh.md#发布顺序)发布 0.2.2 及其兼容包，并让
+   `latest` dist-tag 指向 0.2.2（`0g-agentdna update` 安装的就是它）。然后设置
+   `ATTESTOR_CLI_LATEST=0.2.2`，以及一行提醒 CLI 用户在 reset 前先更新的
+   `ATTESTOR_CLI_NOTES`，并重启 api。检查：
+   `npm view @0gfoundation/0g-agentdna dist-tags.latest` 输出 `0.2.2`，
+   `GET /config` 显示 `"cli_latest":"0.2.2"`。
+7. **公告。**使用 CLI 的 owner 先更新（`0g-agentdna update`），然后 owner reset 自己的
+   agent。1.4 之前创建的 sandbox 不能 resume（`/start` 带 `start`），会得到 409，因为
+   那个运行时无法 provision。preflight 要求时，owner 需重新确认 provider（SDK `ack()`）。
+   请 owner 错开 reset：worker 一次只跑一个 job，签名后约 150 s 内没开始执行的 reset
+   会被丢弃，agent 保持原样。控制台显示 `request expired before it ran — sign it again`；
+   0.2.2 的 CLI 会一直等新容器直到超时，然后提示 agent 没有上线、请重新 reset。
 
 **回滚。**1.4 attestor 是单向的：它的 schema 删除了 1.3 attestor 要读的列
 （`inference_provider_registry.acceptance_mac`、`deployments.container_pubkey_mac`），
