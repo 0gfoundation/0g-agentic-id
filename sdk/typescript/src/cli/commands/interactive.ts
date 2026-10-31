@@ -28,7 +28,7 @@ import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
-import { applyAssignments, assertModelPresent, assertOthersFitFramework, parseAssignments, renderSettings } from '../settings';
+import { applyAssignments, assertModelPresent, assertOthersFitFramework, isHarnessFramework, parseAssignments, renderSettings } from '../settings';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
@@ -2100,6 +2100,15 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
   return true;
 }
 
+/**
+ * Whether the deploy wizard offers `framework` only models with tool use: the
+ * tool-driven frameworks, the harness under either of its names (`dsh` on a
+ * network still on AgentDNA 1.3, see `isHarnessFramework`).
+ */
+export function frameworkNeedsToolModels(framework: string): boolean {
+  return framework === 'openclaw' || framework === 'prime-agent' || isHarnessFramework(framework);
+}
+
 async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string) => Promise<string>, ctx: CommandContext, irq: Interrupt): Promise<Session | null> {
   const cfg = (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(10_000) })
     .then((r) => r.json())
@@ -2123,10 +2132,9 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   const provider = await pickInferenceProvider(ask, loadConfig().inferenceProvider ?? '0g-compute');
   const definition = knownProviders.find((entry) => entry.id === provider)!;
   await ag.agent.assertProviderSupported(provider, { framework });
-  const NEEDS_TOOLS = new Set(['openclaw', '0g-harness', 'prime-agent']);
   const caps = await ag.agent.listModelCaps({ provider });
   const models = caps.filter((model) => model.chat)
-    .filter((model) => !NEEDS_TOOLS.has(framework) || model.tools)
+    .filter((model) => !frameworkNeedsToolModels(framework) || model.tools)
     .filter((model) => framework !== 'hermes' || definition.native || model.formats.includes('openai') || (!model.formats.length && !model.id.startsWith('claude')))
     .map((model) => model.id);
   let model: string;
