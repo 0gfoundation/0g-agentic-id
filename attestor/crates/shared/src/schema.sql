@@ -217,6 +217,11 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_confirmed_version BIGI
 -- a configuration change while an agent is unhealthy, which is exactly when
 -- an owner most needs to.
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_attempts INT NOT NULL DEFAULT 0;
+-- The boot (sealed's per-PID-1 boot_id) that made the last counted attempt.
+-- A retry of /provision by that same boot is not counted again, so it is
+-- served the same document; only a container that comes back as a new boot
+-- moves the count past the first attempt.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_attempt_boot BYTEA;
 
 
 -- Global provider revisions, scoped to the deployment environment. Exact signed

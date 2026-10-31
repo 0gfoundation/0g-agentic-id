@@ -32,6 +32,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/ethereum/go-ethereum/common"
+
+	"seal-verify/internal/logger"
 )
 
 // DevEnv turns pinning off for local development when set to "true". The
@@ -213,6 +215,9 @@ func (r *resolver) refresh(ctx context.Context) error {
 	}
 	if r.transport != nil {
 		r.transport.CloseIdleConnections()
+	}
+	if l.issuedAt != r.issuedAt {
+		logger.Logf("attestor tls: statement accepted issued_at=%d expires_at=%d pins=%d", l.issuedAt, l.expiresAt, len(l.pins))
 	}
 	r.transport, r.issuedAt, r.expiresAt = pinnedTransport(l.pins, l.expiresAt), l.issuedAt, l.expiresAt
 	return nil

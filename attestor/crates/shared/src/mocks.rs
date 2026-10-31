@@ -1091,6 +1091,9 @@ pub struct InMemoryDeploymentRepo {
     /// Settings served to the boot whose token hash is in `status_bindings`.
     pub served_settings: Mutex<HashMap<SealId, crate::auth::status::ServedSettings>>,
     pub boot_authorizations: Mutex<HashMap<SealId, crate::auth::status::BootAuthorization>>,
+    /// Mirror of `settings_attempt_boot`: the boot that made the last
+    /// counted settings attempt.
+    pub settings_attempt_boots: Mutex<HashMap<SealId, Option<B256>>>,
     pub by_seal: Mutex<HashMap<SealId, Deployment>>,
     pub by_agent: Mutex<HashMap<AgentId, SealId>>,
     /// Mirror of `last_heartbeat` (DB column not surfaced on the
@@ -1127,6 +1130,7 @@ impl InMemoryDeploymentRepo {
     pub fn new() -> Self {
         Self {
             status_bindings: Mutex::new(HashMap::new()),
+            settings_attempt_boots: Mutex::new(HashMap::new()),
             served_settings: Mutex::new(HashMap::new()),
             boot_authorizations: Mutex::new(HashMap::new()),
             by_seal: Mutex::new(HashMap::new()),
@@ -1440,14 +1444,27 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         seal_id: SealId,
         reason: String,
         mark_failed: bool,
+        generation: Option<i64>,
     ) -> anyhow::Result<()> {
         self.record_provision_error_calls
             .fetch_add(1, Ordering::SeqCst);
+        if let Some(generation) = generation {
+            let current = self
+                .boot_authorizations
+                .lock()
+                .unwrap()
+                .get(&seal_id)
+                .is_some_and(|a| a.enabled && a.generation == generation);
+            if !current {
+                return Ok(());
+            }
+        }
         let now = chrono::Utc::now();
         self.mut_with(seal_id, |d| {
             d.last_provision_error = Some(reason.clone());
             d.last_provision_error_at = Some(now);
             if mark_failed {
+                d.provision_deadline = None;
                 d.container_stage = StageStatus::Failed {
                     at: now,
                     reason: reason.clone(),
@@ -1481,6 +1498,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 at: now,
                 reason: reason.clone(),
             };
+            d.provision_deadline = None;
             d.phase =
                 crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
             d.updated_at = now;
@@ -1736,6 +1754,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         seal: SealId,
         version: i64,
         generation: Option<i64>,
+        boot: Option<B256>,
     ) -> anyhow::Result<Option<i32>> {
         let mut rows = self.by_seal.lock().unwrap();
         let Some(d) = rows.get_mut(&seal) else {
@@ -1752,7 +1771,12 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             && d.settings_version == version
             && d.settings_version > d.settings_confirmed_version
         {
-            d.settings_attempts += 1;
+            let mut last = self.settings_attempt_boots.lock().unwrap();
+            let same_boot = boot.is_some() && last.get(&seal).copied().flatten() == boot;
+            if !(d.settings_attempts > 0 && same_boot) {
+                d.settings_attempts += 1;
+            }
+            last.insert(seal, boot);
             Ok(Some(d.settings_attempts))
         } else {
             Ok(None)

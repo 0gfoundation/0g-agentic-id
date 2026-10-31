@@ -21,6 +21,10 @@ pub const MAX_LEASE_SECS: u64 = 300;
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 /// sealed accepts a statement only while `expires_at > now + 5`.
 const ACCEPT_MARGIN_SECS: u64 = 5;
+/// The relay stops serving a statement this long before it expires, so one
+/// it hands out still has more than `ACCEPT_MARGIN_SECS` left when sealed
+/// checks it, after transit and a few seconds of clock skew.
+const SERVE_MARGIN_SECS: u64 = 15;
 const CLOCK_SKEW_SECS: u64 = 30;
 const REFRESH_AHEAD_SECS: u64 = 60;
 /// After a failed refresh, wait this long before asking the provider again.
@@ -190,6 +194,7 @@ struct Cached {
     body: Bytes,
     issued_at: u64,
     expires_at: u64,
+    pins: usize,
 }
 
 #[derive(Default)]
@@ -211,7 +216,7 @@ impl RelayState {
     fn servable(&self, provider: Address, now: u64) -> Option<Bytes> {
         self.cached
             .as_ref()
-            .filter(|c| c.provider == provider && now + ACCEPT_MARGIN_SECS < c.expires_at)
+            .filter(|c| c.provider == provider && now + SERVE_MARGIN_SECS < c.expires_at)
             .map(|c| c.body.clone())
     }
 }
@@ -274,7 +279,7 @@ impl AttestorTlsRelay {
             Err(error) => {
                 tracing::warn!(%error, "attestor tls: sandbox discovery unavailable");
                 let mut state = self.state.lock().unwrap();
-                state.retry_at = now + RETRY_AFTER_SECS;
+                state.retry_at = unix_now() + RETRY_AFTER_SECS;
                 return state
                     .servable(provider, unix_now())
                     .ok_or(RelayError::Unavailable);
@@ -283,18 +288,31 @@ impl AttestorTlsRelay {
         if provider != current {
             return Err(RelayError::UnknownProvider);
         }
+        // Discovery may have taken a while: judge the statement, and time the
+        // next attempt, by the clock after it.
+        let now = unix_now();
         let previous = self.state.lock().unwrap().cached.clone();
         match self.load(provider, previous.as_ref(), now).await {
             Ok(fresh) => {
-                let body = fresh.body.clone();
                 // A provider that has not re-signed yet returns the same
                 // statement; do not ask it again on every request.
                 let unchanged = previous
                     .is_some_and(|p| p.provider == provider && p.issued_at == fresh.issued_at);
+                if !unchanged {
+                    tracing::info!(
+                        %provider,
+                        issued_at = fresh.issued_at,
+                        expires_at = fresh.expires_at,
+                        pins = fresh.pins,
+                        "attestor tls: provider statement refreshed"
+                    );
+                }
                 let mut state = self.state.lock().unwrap();
                 state.cached = Some(fresh);
                 state.retry_at = if unchanged { now + RETRY_AFTER_SECS } else { 0 };
-                Ok(body)
+                state
+                    .servable(provider, unix_now())
+                    .ok_or(RelayError::Unavailable)
             }
             Err(error) => {
                 tracing::warn!(%provider, %error, "attestor tls: provider statement rejected or unavailable");
@@ -332,7 +350,25 @@ impl AttestorTlsRelay {
             body: body.into(),
             issued_at: statement.issued_at,
             expires_at: statement.expires_at,
+            pins: statement.tls_spki_sha256.len(),
         })
+    }
+
+    /// Fetch the discovered provider's statement once and log the outcome,
+    /// so a relay that cannot serve containers shows in the api log at
+    /// startup rather than first as a container that fails to provision.
+    pub async fn self_check(&self) {
+        let provider = match self.source.provider().await {
+            Ok(provider) => provider,
+            Err(error) => {
+                tracing::error!(%error, "attestor tls self-check: sandbox discovery failed; containers cannot reach this attestor until it recovers");
+                return;
+            }
+        };
+        match self.statement(provider).await {
+            Ok(_) => tracing::info!(%provider, "attestor tls self-check: provider statement verified"),
+            Err(error) => tracing::error!(%provider, ?error, "attestor tls self-check: no valid provider statement; containers cannot reach this attestor (check the provider's GET /api/attestor-tls)"),
+        }
     }
 }
 
@@ -585,6 +621,8 @@ mod tests {
             live(&[B256::repeat_byte(2)], now, now + 200),
             // About to expire.
             live(&pinned, now - 290, now + 5),
+            // Valid for sealed now, but not after transit and skew.
+            live(&pinned, now - 290, now + 12),
             // Another chain.
             signed_attestor_tls(
                 &provider_key(),

@@ -123,7 +123,10 @@ making tapp's app startup depend on API business readiness.
 
 Sandbox creation always overrides `ATTESTOR_URL` (the HTTPS locator without a trailing
 `/`), `SEAL_BOOT_TICKET` and the chain/indexer settings after the owner-signed
-environment; it writes no TLS trust into the environment. Before every create the
+environment; it writes no TLS trust into the environment. It refuses a create
+whose owner-signed environment has a key that is not a variable name
+(`[A-Za-z_][A-Za-z0-9_]*`): the runtime joins entries as `KEY=VALUE`, so a key
+holding `=` could add a second entry for a variable the attestor sets. Before every create the
 attestor rechecks that AgenticID still trusts its own app instance. On a sealed create,
 which is every create the attestor makes, the sandbox provider strips
 `ATTESTOR_TLS_DESCRIPTOR`, `ATTESTOR_ALLOW_UNPINNED_DEV`, `TEE_SIGNER_ADDRESS` and every
@@ -139,7 +142,9 @@ it checks the provider signature, the lease, and that its own app TLS key (the S
 from local tapp `GetAppCsr`) is among the pins; it refreshes 60 seconds before expiry and
 answers 503 when it has no valid statement. A cached statement is served without asking
 sandbox discovery, which is consulted only to refresh; if discovery fails then, the
-cached statement is served for as long as sealed would still accept it. sealed fetches the statement without CA
+cached statement is served until 15 seconds before it expires (sealed accepts one
+while more than 5 seconds remain). Each new statement is logged, and the api fetches
+one at startup and logs the result. sealed fetches the statement without CA
 validation and accepts it only if the signer of its own certificate signed it for the
 certificate's chain and registry, the lease is at most 300 seconds, and the SPKI of the
 connection it arrived over is pinned. It then pins `/provision`, `/status`, settings and
@@ -188,4 +193,13 @@ Every accepted provision returns a fresh opaque status token encrypted to the co
 key. The attestor stores only its SHA-256, beside the settings version and digest it
 served, and `/status` confirms settings from that record alone. Neither the token nor
 the record carries an attestor MAC. There is no v2 compatibility: release the provider,
-attestor and sealed images together and recreate every agent.
+attestor and sealed images together and recreate every agent (the rollout steps are in
+[`README.md`](README.md#rolling-out-agentdna-14)). A `start` (resume) of a sandbox
+whose boot ticket predates v3 is refused with 409, since that runtime cannot provision.
+
+A 401 or 403 for the authorized boot (ticket, generation, a newer attempt, persisted
+sandbox and live owner all checked) is logged as `provision rejected`. While that
+generation is still the enabled one, it is recorded as `last_provision_error` and the
+container stage becomes `failed` with it as the reason, so the owner sees the cause at
+once instead of a provision timeout five minutes later. Other rejections write
+nothing.

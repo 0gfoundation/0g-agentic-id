@@ -70,6 +70,47 @@ pub async fn handle(
         certificate = req.certificate.is_some(),
         "provision request"
     );
+    let seal_id = req.seal_id;
+    let mut authorized = None;
+    let result = provision(&state, req, &mut authorized).await;
+    let Err(e) = &result else {
+        return result.map(Json);
+    };
+    let Some(generation) = authorized else {
+        // Not the authorized boot (stale, replayed or malformed): nothing
+        // about the agent is known from it.
+        tracing::info!(?seal_id, status = %e.status, error = %e.message, "provision rejected");
+        return result.map(Json);
+    };
+    tracing::warn!(?seal_id, generation, status = %e.status, error = %e.message, "provision rejected");
+    // The authorized boot's own container was refused for a reason a retry
+    // cannot change (certificate, key, image, provider instance). Record it
+    // on the row, and take the agent offline now rather than at the
+    // provision timeout, while that generation is still the current one.
+    if matches!(
+        e.status,
+        axum::http::StatusCode::UNAUTHORIZED | axum::http::StatusCode::FORBIDDEN
+    ) {
+        if let Err(error) = state
+            .deployments
+            .record_provision_error(seal_id, e.message.clone(), true, Some(generation))
+            .await
+        {
+            tracing::warn!(?seal_id, %error, "recording the provision rejection failed");
+        }
+    }
+    result.map(Json)
+}
+
+/// Runs a `/provision` request. `authorized` is set to the boot generation
+/// once the request is known to come from the authorized boot (ticket,
+/// generation, a strictly newer attempt, the persisted sandbox and the live
+/// owner all check out).
+async fn provision(
+    state: &AppState,
+    req: ProvisionRequest,
+    authorized: &mut Option<i64>,
+) -> ApiResult<ProvisionResponse> {
 
     // Formats first: nothing below runs on a malformed request.
     let claim = status::claimed_boot(&req)
@@ -127,6 +168,7 @@ pub async fn handle(
             ));
         }
     }
+    *authorized = Some(auth.generation);
 
     let boot = match (certificate, d.container_record.clone()) {
         (Some(certificate), None) => Boot::First(certificate),
@@ -182,7 +224,7 @@ pub async fn handle(
                     "certificate issued outside its boot ticket window",
                 ));
             }
-            if !allowed_image(&state, certificate.image_hash).await? {
+            if !allowed_image(state, certificate.image_hash).await? {
                 // Permanent: the image is baked into the container.
                 return Err(ApiError::unauthorized(
                     "image_hash not in validFrameworkHashes",
@@ -209,7 +251,7 @@ pub async fn handle(
                 "provider instance no longer trusted; reset required",
             ));
         }
-        if !allowed_image(&state, record.image_hash).await? {
+        if !allowed_image(state, record.image_hash).await? {
             return Err(ApiError::unauthorized(
                 "recorded image_hash not in validFrameworkHashes; reset required",
             ));
@@ -232,7 +274,7 @@ pub async fn handle(
     // container with no document still comes up (the sealed side treats an
     // absent blob as "never configured").
     let mut served = None;
-    let encrypted_settings = match settings_for_boot(&state, &d, claim.generation).await {
+    let encrypted_settings = match settings_for_boot(state, &d, claim.generation, claim.boot_id).await {
         Some((doc, version)) => match serde_json::to_vec(doc)
             .map_err(|e| anyhow::anyhow!("serialize settings: {e}"))
             .and_then(|bytes| {
@@ -284,15 +326,18 @@ pub async fn handle(
         )
         .await?
     {
+        // Another boot or a lifecycle change won the race; this request no
+        // longer speaks for the agent.
+        *authorized = None;
         return Err(ApiError::forbidden(
             "boot authorization changed during provisioning",
         ));
     }
-    Ok(Json(ProvisionResponse {
+    Ok(ProvisionResponse {
         encrypted_agent_seal_priv: encrypted.into(),
         encrypted_settings,
         encrypted_status_binding: encrypted_status_binding.into(),
-    }))
+    })
 }
 
 /// `validFrameworkHashes` membership. A chain error (wrong contract, RPC
@@ -318,6 +363,9 @@ async fn allowed_image(state: &AppState, image_hash: alloy::primitives::B256) ->
 /// distinguishes the two: `/provision` bumps `settings_attempts` while the
 /// current version is unconfirmed, and a container that keeps coming back
 /// without ever reporting `running` is, by that fact, not booting on it.
+/// Attempts are counted per boot: sealed retries a failed or lost
+/// `/provision` under the same boot ID, and such a retry is the same
+/// attempt, so it is served the same document.
 /// Keying the fallback on repeated attempts rather than on an error report
 /// is deliberate — an error report arrives on every failing heartbeat, so
 /// reverting there made it impossible to land a configuration change while
@@ -329,6 +377,7 @@ async fn settings_for_boot<'a>(
     state: &AppState,
     d: &'a attestor_shared::Deployment,
     generation: i64,
+    boot_id: alloy::primitives::B256,
 ) -> Option<(&'a serde_json::Value, i64)> {
     let current = if let Some(doc) = d.settings.as_ref() {
         (doc, d.settings_version)
@@ -341,12 +390,13 @@ async fn settings_for_boot<'a>(
         return Some(current);
     }
 
-    // Count this boot against the unconfirmed document. A failure to record
-    // it must not fail the boot: treat the attempt as the first, i.e. serve
-    // what the owner asked for.
+    // Count this boot against the unconfirmed document (a retry by the same
+    // boot is not counted again). A failure to record it must not fail the
+    // boot: treat the attempt as the first, i.e. serve what the owner asked
+    // for.
     let attempts = match state
         .deployments
-        .note_settings_attempt(d.seal_id, d.settings_version, Some(generation))
+        .note_settings_attempt(d.seal_id, d.settings_version, Some(generation), Some(boot_id))
         .await
     {
         Ok(Some(n)) => n,
@@ -509,6 +559,28 @@ pub(crate) mod tests {
         certificate_at(seal, private, Utc::now().timestamp())
     }
 
+    /// A fresh boot ID per request: each one models a new container boot.
+    fn next_boot_id() -> B256 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        keccak256(
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .to_be_bytes(),
+        )
+    }
+
+    /// The same boot asking again, as sealed does after a 5xx or a lost
+    /// response: same boot ID, a later `boot_started_at`.
+    async fn retried(
+        repo: &InMemoryDeploymentRepo,
+        mut req: ProvisionRequest,
+        private: [u8; 32],
+    ) -> ProvisionRequest {
+        let auth = repo.boot_authorization(req.seal_id).await.unwrap().unwrap();
+        req.boot_started_at = req.boot_started_at.max(auth.started_at) + 1;
+        sign_claim(&mut req, private);
+        req
+    }
+
     /// A boot claim for the current authorization, signed by `private`, with
     /// a strictly newer `boot_started_at` than any accepted attempt.
     async fn request(
@@ -523,7 +595,7 @@ pub(crate) mod tests {
             certificate,
             boot_ticket: ticket(),
             boot_generation: auth.generation,
-            boot_id: B256::repeat_byte(0x77),
+            boot_id: next_boot_id(),
             boot_started_at: auth
                 .started_at
                 .max(Utc::now().timestamp_nanos_opt().unwrap())
@@ -1111,31 +1183,79 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_provision_never_changes_or_deletes_a_container() {
+    async fn a_rejected_authorized_boot_is_recorded_and_nothing_is_deleted() {
         let (mut state, repo, seal) = setup(Some(serde_json::json!({"model":"current"}))).await;
         let sandbox = Arc::new(ConfigurableSandbox::new());
         *sandbox.authenticated_identity.lock().unwrap() = Some(identity());
         state.sandbox = sandbox.clone();
-        let before = repo.get(seal).await.unwrap().unwrap();
+        repo.set_provision_deadline(seal, Some(Utc::now() + chrono::Duration::minutes(5)))
+            .await
+            .unwrap();
         let mut req = first(&repo, seal).await;
         req.container_signature = Default::default();
-        assert_eq!(
-            call(&state, req).await.unwrap_err().status,
-            StatusCode::UNAUTHORIZED
-        );
+        let error = call(&state, req).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        // The authorized boot's own container was refused: the reason is on
+        // the row and the agent is offline now, not at the provision timeout.
         let after = repo.get(seal).await.unwrap().unwrap();
-        assert_eq!(
-            serde_json::to_value(after.container_stage).unwrap(),
-            serde_json::to_value(before.container_stage).unwrap()
+        assert!(
+            matches!(after.container_stage, StageStatus::Failed { ref reason, .. } if *reason == error.message),
+            "{:?}",
+            after.container_stage
         );
+        assert_eq!(after.last_provision_error.as_deref(), Some(error.message.as_str()));
+        assert!(after.provision_deadline.is_none());
         assert!(after.container_record.is_none());
-        assert!(after.last_provision_error.is_none());
         assert_eq!(
             sandbox
                 .admin_delete_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_v3_rejection_reaches_the_row() {
+        let (mut state, repo, seal) = setup(None).await;
+        let chain = Arc::new(MockChain::new());
+        chain.set_valid_framework(false);
+        state.chain = chain;
+        call(&state, first(&repo, seal).await).await.unwrap_err();
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(d
+            .last_provision_error
+            .as_deref()
+            .is_some_and(|e| e.contains("image_hash not in validFrameworkHashes")));
+        assert!(matches!(d.container_stage, StageStatus::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_rejection_that_is_not_the_authorized_boot_records_nothing() {
+        let (state, repo, seal) = setup(None).await;
+        let before = repo.get(seal).await.unwrap().unwrap();
+        // A stale attempt: not newer than the one already accepted.
+        let req = first(&repo, seal).await;
+        call(&state, req.clone()).await.unwrap();
+        let error = call(&state, req).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        // A wrong ticket.
+        let mut req = later(&repo, seal).await;
+        req.boot_ticket = "00".repeat(32);
+        sign_claim(&mut req, CONTAINER_PRIV);
+        call(&state, req).await.unwrap_err();
+        let after = repo.get(seal).await.unwrap().unwrap();
+        assert!(after.last_provision_error.is_none());
+        assert_eq!(
+            serde_json::to_value(&after.container_stage).unwrap(),
+            serde_json::to_value(&before.container_stage).unwrap()
+        );
+        // A rejection recorded under a generation that is no longer the
+        // enabled one (a reset or stop won the race) leaves the row alone.
+        let generation = repo.boot_authorization(seal).await.unwrap().unwrap().generation;
+        repo.record_provision_error(seal, "late".into(), true, Some(generation - 1))
+            .await
+            .unwrap();
+        assert!(repo.get(seal).await.unwrap().unwrap().last_provision_error.is_none());
     }
 
     #[tokio::test]
@@ -1243,7 +1363,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .map(|a| a.generation);
-        repo.note_settings_attempt(seal, 1, generation)
+        repo.note_settings_attempt(seal, 1, generation, None)
             .await
             .unwrap();
         repo.promote_settings_last_good(seal).await.unwrap();
@@ -1275,7 +1395,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .map(|a| a.generation);
-        repo.note_settings_attempt(seal, 1, generation)
+        repo.note_settings_attempt(seal, 1, generation, None)
             .await
             .unwrap();
         repo.promote_settings_last_good(seal).await.unwrap();
@@ -1304,6 +1424,43 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_retry_by_the_same_boot_is_the_same_settings_attempt() {
+        // sealed retries /provision under one boot ID after a 5xx or a lost
+        // response. That is still the first attempt: it must get the new
+        // document again, not the fallback, or one dropped response would
+        // revert the owner's change on every later boot.
+        let good = serde_json::json!({"model": "works"});
+        let new = serde_json::json!({"model": "new"});
+        let (state, repo, seal) = setup(Some(good.clone())).await;
+        let generation = repo
+            .boot_authorization(seal)
+            .await
+            .unwrap()
+            .map(|a| a.generation);
+        repo.note_settings_attempt(seal, 1, generation, None)
+            .await
+            .unwrap();
+        repo.promote_settings_last_good(seal).await.unwrap();
+        repo.set_settings(seal, new.clone(), 1).await.unwrap();
+
+        let req = first(&repo, seal).await;
+        let resp = call(&state, req.clone()).await.unwrap();
+        assert_eq!(opened(&state, &resp), new);
+        // The response was lost; the same boot asks again.
+        let resp = call(&state, retried(&repo, req, CONTAINER_PRIV).await)
+            .await
+            .unwrap();
+        assert_eq!(opened(&state, &resp), new, "a same-boot retry gets the same document");
+        assert_eq!(repo.served_settings.lock().unwrap()[&seal].version, 2);
+        assert_eq!(repo.get(seal).await.unwrap().unwrap().settings_attempts, 1);
+
+        // A new boot is a second attempt and falls back.
+        let resp = call(&state, later(&repo, seal).await).await.unwrap();
+        assert_eq!(opened(&state, &resp), good);
+        assert_eq!(repo.get(seal).await.unwrap().unwrap().settings_attempts, 2);
+    }
+
+    #[tokio::test]
     async fn owner_recreate_retries_current_settings_without_rewriting_the_document() {
         let previous = serde_json::json!({"provider":"0g-compute","model":"old"});
         let current = serde_json::json!({"provider":"partner","model":"new"});
@@ -1313,7 +1470,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .map(|a| a.generation);
-        repo.note_settings_attempt(seal, 1, generation)
+        repo.note_settings_attempt(seal, 1, generation, None)
             .await
             .unwrap();
         repo.promote_settings_last_good(seal).await.unwrap();
@@ -1376,7 +1533,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .map(|a| a.generation);
-        repo.note_settings_attempt(seal, 1, generation)
+        repo.note_settings_attempt(seal, 1, generation, None)
             .await
             .unwrap();
         repo.promote_settings_last_good(seal).await.unwrap();

@@ -344,21 +344,28 @@ pub trait DeploymentRepo: Send + Sync {
     ) -> anyhow::Result<()>;
 
     /// Record a `/provision` validation failure for visibility. When
-    /// `mark_failed` is true, ALSO flip `container_stage` to Failed
-    /// (use for permanent errors like wrong image_hash, signer
-    /// mismatch, malformed pubkey — anything that won't fix on
-    /// container retry). Atomic with the stage update.
+    /// `mark_failed` is true, ALSO flip `container_stage` to Failed and
+    /// clear the provision deadline (use for permanent errors like wrong
+    /// image_hash, signer mismatch, malformed pubkey — anything that won't
+    /// fix on container retry). Atomic with the stage update.
+    ///
+    /// `generation`: the boot generation the rejected request was
+    /// authorized under. The row is left alone unless that generation is
+    /// still the enabled one, so a late rejection cannot overwrite a reset
+    /// or stop that happened meanwhile. `None` records unconditionally.
     async fn record_provision_error(
         &self,
         seal_id: SealId,
         reason: String,
         mark_failed: bool,
+        generation: Option<i64>,
     ) -> anyhow::Result<()>;
 
     /// Atomically flip every deployment whose `provision_deadline` has
     /// passed AND whose `container_stage` is still `Submitted` to
-    /// `Failed { reason }`. Returns the affected `seal_id`s so the
-    /// caller can publish `WsEvent::ContainerFailed`.
+    /// `Failed { reason }`, clearing the spent deadline. Returns the
+    /// affected `seal_id`s so the caller can publish
+    /// `WsEvent::ContainerFailed`.
     ///
     /// Used by the worker sweep loop to convert "container never
     /// reached /provision" silent stuck-state into an observable
@@ -521,11 +528,17 @@ pub trait DeploymentRepo: Send + Sync {
     /// `None` when the document is already confirmed and nothing was
     /// counted. `/provision` uses the count to decide whether this boot gets
     /// the new document (first attempt) or the last one that worked.
+    ///
+    /// `boot` is the claiming container's boot ID. A request from the boot
+    /// that made the last counted attempt (a retried `/provision`) is not
+    /// counted again: it gets the current count back, so it is served the
+    /// same document. `None` always counts.
     async fn note_settings_attempt(
         &self,
         seal_id: SealId,
         version: i64,
         generation: Option<i64>,
+        boot: Option<B256>,
     ) -> anyhow::Result<Option<i32>>;
 
     /// Settle the stages an abandoned job (`ReapCause::Abandoned`) left in

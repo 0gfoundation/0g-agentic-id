@@ -101,6 +101,8 @@ evidence 或 Scan 读取公开 app signer，完成上述 AgenticID 绑定及 san
 
 创建 sandbox 时，在 owner 签名的环境变量之后始终覆盖 `ATTESTOR_URL`（HTTPS locator，
 去掉末尾 `/`）、`SEAL_BOOT_TICKET` 以及链/indexer 配置；不再把 TLS 信任写进环境变量。
+owner 签名的环境变量中如有键不是合法变量名（`[A-Za-z_][A-Za-z0-9_]*`），attestor 拒绝
+create：运行时按 `KEY=VALUE` 拼接条目，含 `=` 的键可能给 attestor 设置的变量多加一条。
 每次 create 前 attestor 都会重新确认 AgenticID 仍信任它自己的 app 实例。在 sealed create
 （attestor 发起的每次 create 都是）中，sandbox provider 在写入自己的 `SANDBOX_SEAL_KEY`
 与 v3 证书之前，会从调用方环境变量中删除 `ATTESTOR_TLS_DESCRIPTOR`、
@@ -113,7 +115,8 @@ provider 用与证书相同的 key，把本 attestor app 的 TLS SPKI pin（来�
 `GET /attestor-tls?provider=0x…` 原样（逐字节）转发。转发前检查 provider 签名、租期，
 以及它自己的 app TLS 公钥（本地 tapp `GetAppCsr` 返回的 SPKI hash）在 pin 中；到期前
 60 秒刷新，没有有效声明时返回 503。缓存中的声明直接返回，不询问 sandbox discovery；只有
-刷新时才询问 discovery，此时若 discovery 失败，只要缓存的声明 sealed 仍会接受，就继续返回它。sealed 不做 CA 校验地获取声明，只有当签名者是它自己
+刷新时才询问 discovery，此时若 discovery 失败，缓存的声明继续返回，直到到期前 15 秒
+（sealed 在剩余超过 5 秒时接受）。每份新声明都会打日志，api 启动时取一次并记录结果。sealed 不做 CA 校验地获取声明，只有当签名者是它自己
 证书的签名者、chain 与 registry 与证书一致、租期不超过 300 秒，且声明所经连接的 SPKI
 在 pin 中时才接受；之后对 `/provision`、`/status`、settings 和 provider registry 的请求
 都钉在这些公钥上。不会给 workload 挂载 tapp socket 或开放通用 secret API。
@@ -151,4 +154,10 @@ signer 改变则需要 owner 执行 reset。
 每次被接受的 provision 都返回一个加密给容器公钥的全新不透明状态令牌。attestor 只保存
 它的 SHA-256，旁边记录实际下发的配置版本和摘要，`/status` 只依据这条记录确认配置。
 令牌和记录都不含 attestor MAC。不兼容 v2：provider、attestor 与 sealed 镜像需同时发布，
-并重建所有 agent。
+并重建所有 agent（升级步骤见 [`README.zh.md`](README.zh.md#升级到-agentdna-14)）。启动票据早于
+v3 的 sandbox 不能 `start`（resume），返回 409，因为那个运行时无法 provision。
+
+对已授权启动（票据、代次、更新的尝试、已落库的 sandbox 与链上实时 owner 均已校验）的
+401 或 403 会以 `provision rejected` 打日志。在该代次仍是启用代次时，记为
+`last_provision_error`，并把容器 stage 置为 `failed`、以此为原因，owner 立即看到原因，
+而不是五分钟后的 provision timeout。其他拒绝不写任何东西。

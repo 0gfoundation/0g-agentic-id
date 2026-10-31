@@ -798,8 +798,12 @@ func startAgent(
 	if err := settingsDoc.Validate(); err != nil {
 		// Loud, not silent: an agent with no usable pin will fail to start on
 		// two of the four adapters, and "why is it offline" must not require
-		// reading adapter internals.
+		// reading adapter internals. Where it does start (e.g. a clone whose
+		// new owner has written no settings yet), it cannot answer, so it
+		// reports a warning rather than a healthy "running" until a settings
+		// push applies.
 		logger.Logf("WARN owner settings invalid: %v", err)
+		currentStatus.SettingsIssue(fmt.Sprintf("owner settings unusable (%v); write the agent's settings (provider and model)", err))
 	}
 
 	// Build the uploader. The watcher tick handler reuses this single
@@ -920,6 +924,13 @@ func startAgent(
 			currentStatus.SupervisorRecovered()
 		}
 		logger.Logf("settings: applied (provider=%s model=%s thinking=%s)", doc.Provider, doc.Model, doc.Thinking)
+		// A document that applied clears a boot-time settings warning; say
+		// so now rather than at the next heartbeat.
+		if doc.Validate() == nil && currentStatus.SettingsIssue("") != "running" {
+			if level, msg := currentStatus.Get(); level == "running" {
+				go report.Status(cfg.AttestorURL, agentSealPriv, sealID, level, msg, cfg.StatusBinding)
+			}
+		}
 		return nil
 	})
 	sealedProxy.SetRuntimeSettings(live.runtime)

@@ -590,8 +590,15 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         seal_id: SealId,
         reason: String,
         mark_failed: bool,
+        generation: Option<i64>,
     ) -> anyhow::Result<()> {
         let now = Utc::now();
+        // Only while the rejected boot's generation is still the enabled
+        // one: a reset or stop since then owns the row.
+        const CURRENT_GENERATION: &str = "($GEN::BIGINT IS NULL OR EXISTS (
+                 SELECT 1 FROM container_status_bindings b
+                  WHERE b.seal_id = deployments.seal_id
+                    AND b.enabled AND b.generation = $GEN))";
         if mark_failed {
             // Atomic update: visibility fields + container_stage flip +
             // recompute phase. Keeping it in one statement guarantees
@@ -601,32 +608,37 @@ impl DeploymentRepo for PostgresDeploymentRepo {
                 at: now,
                 reason: reason.clone(),
             })?;
-            sqlx::query(
+            sqlx::query(&format!(
                 "UPDATE deployments
                  SET last_provision_error    = $1,
                      last_provision_error_at = $2,
                      container_stage         = $3,
                      phase                   = 'offline',
+                     provision_deadline      = NULL,
                      updated_at              = $2
-                 WHERE seal_id = $4",
-            )
+                 WHERE seal_id = $4 AND {}",
+                CURRENT_GENERATION.replace("$GEN", "$5")
+            ))
             .bind(&reason)
             .bind(now)
             .bind(stage)
             .bind(seal_id.as_slice())
+            .bind(generation)
             .execute(&self.pool)
             .await?;
         } else {
-            sqlx::query(
+            sqlx::query(&format!(
                 "UPDATE deployments
                  SET last_provision_error    = $1,
                      last_provision_error_at = $2,
                      updated_at              = $2
-                 WHERE seal_id = $3",
-            )
+                 WHERE seal_id = $3 AND {}",
+                CURRENT_GENERATION.replace("$GEN", "$4")
+            ))
             .bind(&reason)
             .bind(now)
             .bind(seal_id.as_slice())
+            .bind(generation)
             .execute(&self.pool)
             .await?;
         }
@@ -642,16 +654,19 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         // `RETURNING seal_id` lets the caller publish per-seal events
         // without a second roundtrip. The `container_stage->>'state'`
         // probe matches the partial index in schema.sql so this scan
-        // stays cheap.
+        // stays cheap. The deadline is spent: clearing it keeps a later
+        // move back to Submitted (a recreate, before its own deadline is
+        // written) from matching this sweep again.
         let stage = serde_json::to_value(StageStatus::Failed {
             at: now,
             reason: reason.clone(),
         })?;
         let rows = sqlx::query(
             "UPDATE deployments
-             SET container_stage = $1,
-                 phase           = 'offline',
-                 updated_at      = $2
+             SET container_stage    = $1,
+                 phase              = 'offline',
+                 provision_deadline = NULL,
+                 updated_at         = $2
              WHERE provision_deadline IS NOT NULL
                AND provision_deadline < $2
                AND container_stage->>'state' = 'submitted'
@@ -1062,6 +1077,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         seal: SealId,
         version: i64,
         generation: Option<i64>,
+        boot: Option<B256>,
     ) -> anyhow::Result<Option<i32>> {
         let mut tx = deployment_tx(&self.pool).await?;
         sqlx::query("SELECT seal_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
@@ -1084,7 +1100,27 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         if !allowed {
             return Ok(None);
         }
-        let attempts:Option<i32>=sqlx::query_scalar("UPDATE deployments SET settings_attempts=settings_attempts+1,updated_at=now() WHERE seal_id=$1 AND settings_version=$2 AND settings_version>settings_confirmed_version RETURNING settings_attempts").bind(seal.as_slice()).bind(version).fetch_optional(&mut *tx).await?;
+        // Every write that resets the count to 0 also ends the dedupe: a
+        // count of 0 is always bumped, whichever boot asks.
+        let attempts: Option<i32> = sqlx::query_scalar(
+            "UPDATE deployments
+             SET settings_attempts = CASE
+                     WHEN settings_attempts > 0 AND settings_attempt_boot = $3
+                     THEN settings_attempts
+                     ELSE settings_attempts + 1
+                 END,
+                 settings_attempt_boot = $3,
+                 updated_at = now()
+             WHERE seal_id = $1
+               AND settings_version = $2
+               AND settings_version > settings_confirmed_version
+             RETURNING settings_attempts",
+        )
+        .bind(seal.as_slice())
+        .bind(version)
+        .bind(boot.map(|b| b.to_vec()))
+        .fetch_optional(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(attempts)
     }
@@ -1384,7 +1420,8 @@ mod settings_retry_tests {
                 repo.boot_authorization(seal)
                     .await
                     .unwrap()
-                    .map(|a| a.generation)
+                    .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap(),
@@ -1749,7 +1786,7 @@ mod settings_retry_tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            repo.note_settings_attempt(seal, 1, Some(first))
+            repo.note_settings_attempt(seal, 1, Some(first), None)
                 .await
                 .unwrap(),
             Some(1)
@@ -1758,7 +1795,7 @@ mod settings_retry_tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.note_settings_attempt(seal, 1, Some(first))
+            repo.note_settings_attempt(seal, 1, Some(first), None)
                 .await
                 .unwrap(),
             None,
@@ -1772,14 +1809,14 @@ mod settings_retry_tests {
             .unwrap();
         repo.retry_settings(seal, 2).await.unwrap();
         assert_eq!(
-            repo.note_settings_attempt(seal, 2, Some(first))
+            repo.note_settings_attempt(seal, 2, Some(first), None)
                 .await
                 .unwrap(),
             None,
             "old generation burned reset's fresh attempt"
         );
         assert_eq!(
-            repo.note_settings_attempt(seal, 2, None).await.unwrap(),
+            repo.note_settings_attempt(seal, 2, None, None).await.unwrap(),
             None,
             "legacy request burned a managed boot's attempt"
         );
@@ -1815,11 +1852,93 @@ mod settings_retry_tests {
         assert!(auth.enabled);
         assert_eq!(auth.sandbox_id.as_deref(), Some("buyer-new"));
         assert_eq!(
-            repo.note_settings_attempt(seal, 2, Some(current))
+            repo.note_settings_attempt(seal, 2, Some(current), None)
                 .await
                 .unwrap(),
             Some(1)
         );
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_attempts_per_boot_spent_deadlines_and_guarded_rejections() {
+        let pool = connect(&test_database_url()).await.unwrap();
+        let repo = PostgresDeploymentRepo::new(pool.clone());
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner,sandbox_id) VALUES($1,$2,$2,'sb')").bind(seal.as_slice()).bind(Address::ZERO.as_slice()).execute(&pool).await.unwrap();
+        repo.set_settings(seal, serde_json::json!({"model":"v1"}), 0)
+            .await
+            .unwrap();
+        let generation = repo
+            .prepare_status_boot(seal, Some([1; 32]), Address::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        let (a, b) = (B256::repeat_byte(0x0a), B256::repeat_byte(0x0b));
+        // A retry by the same boot is the same attempt; a new boot is the next.
+        for (boot, want) in [(a, 1), (a, 1), (b, 2), (b, 2)] {
+            assert_eq!(
+                repo.note_settings_attempt(seal, 1, Some(generation), Some(boot))
+                    .await
+                    .unwrap(),
+                Some(want)
+            );
+        }
+        // A count reset to 0 ends the dedupe.
+        assert!(repo.retry_settings(seal, 1).await.unwrap());
+        assert_eq!(
+            repo.note_settings_attempt(seal, 1, Some(generation), Some(b))
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        // A rejection under a generation that is no longer enabled writes
+        // nothing; under the current one it records and fails the stage.
+        let submitted = || StageStatus::Submitted {
+            tx_hash: None,
+            at: Utc::now(),
+        };
+        repo.set_container_stage(seal, submitted()).await.unwrap();
+        repo.set_provision_deadline(seal, Some(Utc::now() + chrono::Duration::minutes(5)))
+            .await
+            .unwrap();
+        repo.record_provision_error(seal, "late".into(), true, Some(generation - 1))
+            .await
+            .unwrap();
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(d.last_provision_error.is_none());
+        assert!(matches!(d.container_stage, StageStatus::Submitted { .. }));
+        repo.record_provision_error(seal, "refused".into(), true, Some(generation))
+            .await
+            .unwrap();
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.last_provision_error.as_deref(), Some("refused"));
+        assert!(matches!(d.container_stage, StageStatus::Failed { .. }));
+        assert!(d.provision_deadline.is_none());
+
+        // The timeout sweep clears the deadline it spends, so a later move
+        // back to Submitted is not flipped again.
+        repo.set_container_stage(seal, submitted()).await.unwrap();
+        repo.set_provision_deadline(seal, Some(Utc::now() - chrono::Duration::minutes(1)))
+            .await
+            .unwrap();
+        let flipped = repo
+            .flip_provision_timeouts(Utc::now(), "provision timeout".into())
+            .await
+            .unwrap();
+        assert!(flipped.contains(&seal));
+        assert!(repo.get(seal).await.unwrap().unwrap().provision_deadline.is_none());
+        repo.set_container_stage(seal, submitted()).await.unwrap();
+        assert!(!repo
+            .flip_provision_timeouts(Utc::now(), "provision timeout".into())
+            .await
+            .unwrap()
+            .contains(&seal));
         sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
             .bind(seal.as_slice())
             .execute(&pool)

@@ -56,6 +56,11 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 - `thinking` 必须属于 `Levels`,大小写不敏感;
 - `others` 必须是合法 JSON,仅此而已。
 
+文档未通过 `Validate` 的开机,在 adapter 允许时照样启动,但 sealed 此时上报 `warning`
+(`owner settings unusable (…); write the agent's settings (provider and model)`)而不是
+`running`,直到一次 settings 推送生效 —— 例如新 owner 还没写 settings 的克隆
+(`main.go`、`status.go` (`SettingsIssue`))。
+
 **模型建议检查不会拒绝目录外的模型。**CLI 在签名前查询所选 provider 自己的目录；
 没有配置目录的 native provider 允许手动输入模型 ID。注册表成员及凭据绑定由
 `ResolveForRegistry` 分别强制校验。
@@ -490,7 +495,9 @@ sealed 只有在使用下发的配置完成框架启动后，才在报告里附�
 会给 `settings_attempts` 加一,过了第一次就改投 `settings_last_good`:推送后的第一次开机
 总是拿到 owner 当前的文档(读取时就偏好 last-known-good 的话,新文档永远没机会被确认),
 而一个反复回来却从不上报 `running` 的容器,拿到的是最后一份能跑的
-(`routes/provision.rs` (`settings_for_boot`))。记录尝试失败时按"第一次尝试"处理并投当前文档 ——
+(`routes/provision.rs` (`settings_for_boot`))。尝试按开机计数:sealed 在同一个 boot ID 下
+重试失败或丢了响应的 `/provision`,这样的重试算同一次尝试,拿到同一份文档
+(`deployments.settings_attempt_boot`)。记录尝试失败时按"第一次尝试"处理并投当前文档 ——
 **这套簿记不能有能力让开机失败**。
 
 "错误报告即回滚"试过,而且是错的;`routes/status.rs` 现在在 `Error` 分支上对文档不做
