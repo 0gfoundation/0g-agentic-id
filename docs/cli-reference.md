@@ -1,6 +1,6 @@
 # 0g-agentdna CLI Reference
 
-> Matches `@0gfoundation/0g-agentdna` ≥ 0.2.1 · the CLI ships inside the SDK package — no separate install
+> Matches `@0gfoundation/0g-agentdna` ≥ 0.2.2 · the CLI ships inside the SDK package — no separate install
 > Every command, flag, and exit code below was verified against `sdk/typescript/src/cli/` source
 
 ## 1. Installation & Mental Model
