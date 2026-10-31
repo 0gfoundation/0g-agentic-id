@@ -93,7 +93,11 @@ worker 日志即可。
    （0.2.0、0.2.1）早于它：它们的 `reset` 可能在 worker 替换容器之前就从 1.3 容器读到
    `running` 并报告完成，部署向导也不会把 0g-harness agent 限定为支持工具调用的模型。
    按[发布顺序](../sdk/typescript/MIGRATION.zh.md#发布顺序)发布 0.2.2 及其兼容包，并让
-   `latest` dist-tag 指向 0.2.2（`0g-agentdna update` 安装的就是它）。然后设置
+   `latest` dist-tag 指向 0.2.2（`0g-agentdna update` 安装的就是它）。dist-tag 由所有网络
+   共用，所以 `latest` 也会到达仍在 1.3 的网络上的 owner（mainnet 在其自身的 1.4 升级之前
+   即是如此），这些网络的 attestor 把 harness 称为 `dsh`；0.2.2 会把 `dsh` 当作
+   `0g-harness`。在所有网络都运行 1.4 之前，只把仍能对接 1.3 attestor 的版本发布为
+   `latest`，不能对接的版本用其他 dist-tag 发布。然后设置
    `ATTESTOR_CLI_LATEST=0.2.2`，以及一行提醒 CLI 用户在 reset 前先更新的
    `ATTESTOR_CLI_NOTES`，并重启 api。检查：
    `npm view @0gfoundation/0g-agentdna dist-tags.latest` 输出 `0.2.2`，

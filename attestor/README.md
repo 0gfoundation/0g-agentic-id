@@ -117,7 +117,12 @@ go on until each check passes.
    it, and their deploy wizard does not limit 0g-harness agents to models
    with tool use. Publish 0.2.2 and its compatibility package in the
    [release order](../sdk/typescript/MIGRATION.md#release-order), with 0.2.2
-   as the `latest` dist-tag (what `0g-agentdna update` installs). Then set
+   as the `latest` dist-tag (what `0g-agentdna update` installs). Dist-tags
+   are shared by every network, so `latest` also reaches owners on networks
+   still on 1.3 (mainnet until its own 1.4 rollout), whose attestors name the
+   harness `dsh`; 0.2.2 reads `dsh` as `0g-harness`. Until every network runs
+   1.4, publish as `latest` only a version that still works against a 1.3
+   attestor, and use another dist-tag for one that does not. Then set
    `ATTESTOR_CLI_LATEST=0.2.2` and an `ATTESTOR_CLI_NOTES` line asking CLI
    owners to update before they reset, and restart the api. Check:
    `npm view @0gfoundation/0g-agentdna dist-tags.latest` prints `0.2.2`, and
