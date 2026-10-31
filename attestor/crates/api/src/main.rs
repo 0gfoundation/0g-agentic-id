@@ -96,16 +96,23 @@ async fn main() -> anyhow::Result<()> {
         // sealed pins this attestor through the provider-signed statement
         // relayed at GET /attestor-tls.
         Arc::new(match (&discovery, &attestor_identity) {
-            (Some(sandbox), Some(attestor)) => client.with_attestor_tls_relay(Arc::new(
-                attestor_shared::attestor_tls::AttestorTlsRelay::new(
+            (Some(sandbox), Some(attestor)) => {
+                let relay = Arc::new(attestor_shared::attestor_tls::AttestorTlsRelay::new(
                     Arc::new(attestor_shared::identity::DiscoveredTlsSource {
                         sandbox: sandbox.clone(),
                         attestor: attestor.clone(),
                     }),
                     cfg.chain_id,
                     cfg.tapp_registry_addr,
-                ),
-            )),
+                ));
+                // One fetch in the background: a relay that cannot serve
+                // shows in this log now, not first as a failed provision.
+                tokio::spawn({
+                    let relay = relay.clone();
+                    async move { relay.self_check().await }
+                });
+                client.with_attestor_tls_relay(relay)
+            }
             _ => client,
         })
     };

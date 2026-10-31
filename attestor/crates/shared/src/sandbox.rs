@@ -239,12 +239,27 @@ where
     }
 }
 
+/// `^[A-Za-z_][A-Za-z0-9_]*$`: a name the container runtime cannot read as
+/// anything but one variable.
+fn is_env_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Overlay the attestor-controlled env (`ATTESTOR_URL` + `extra_env`) onto a
 /// create body's `env`, creating the object if the payload has none. Always
 /// OVERRIDES a same-named key from the deployer-signed payload — including
 /// with an empty value, which is how an unset attestor setting (e.g. a blank
 /// `VERIFIED_FEEDBACK_ADDR`) still blocks a payload-supplied one. Pulled out
 /// of `create()` so the override is unit-testable without an HTTP round-trip.
+///
+/// A payload key that is not a plain variable name is refused: the runtime
+/// joins each entry as `KEY=VALUE`, so a key such as `CHAIN_RPC_URL=https://x/`
+/// would become a second `CHAIN_RPC_URL` entry beside the attestor's, and
+/// either one may win.
 fn apply_attestor_env(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     attestor_public_url: &str,
@@ -256,6 +271,11 @@ fn apply_attestor_env(
     let env_obj = env_val.as_object_mut().ok_or_else(|| {
         anyhow::anyhow!("sandbox create: canonical.payload.env must be a JSON object")
     })?;
+    if !env_obj.keys().all(|key| is_env_name(key)) {
+        anyhow::bail!(
+            "sandbox create: canonical.payload.env has a key that is not a variable name ([A-Za-z_][A-Za-z0-9_]*)"
+        );
+    }
     env_obj.insert(
         "ATTESTOR_URL".into(),
         serde_json::Value::String(attestor_public_url.trim_end_matches('/').to_string()),
@@ -275,7 +295,9 @@ pub struct HttpSandbox {
     /// top of `ATTESTOR_URL`. Same trust boundary — these are
     /// attestor-controlled, NOT deployer-controlled, so the container can
     /// trust them as the canonical chain / storage / contract config (a
-    /// malicious deployer can't make the container talk to a fake chain).
+    /// malicious deployer can't make the container talk to a fake chain;
+    /// `apply_attestor_env` also refuses payload keys that could smuggle a
+    /// duplicate entry).
     extra_env: Vec<(String, String)>,
     /// Public-port allowlist injected into the create body as `publicPorts`
     /// (0g-sandbox#57). Empty = field omitted = all-ports-public (today's
@@ -1142,6 +1164,29 @@ mod tests {
             obj["env"]["VERIFIED_FEEDBACK_ADDR"],
             "0x00000000000000000000000000000000000000b7"
         );
+    }
+
+    #[test]
+    fn attestor_env_refuses_keys_that_are_not_variable_names() {
+        // A '='-bearing key would reach the runtime as a duplicate of an
+        // attestor-owned variable.
+        for key in [
+            "CHAIN_RPC_URL=https://rpc.example/?x",
+            "AGENTIC_ID_ADDR=0x0",
+            "",
+            "1ABC",
+            "A-B",
+            "A B",
+            "A\nB",
+            "Ä",
+        ] {
+            let mut obj = serde_json::json!({ "env": { key: "" } });
+            let err = apply_attestor_env(obj.as_object_mut().unwrap(), "http://attestor", &[])
+                .unwrap_err();
+            assert!(err.to_string().contains("not a variable name"), "{key:?}: {err}");
+        }
+        let mut obj = serde_json::json!({ "env": { "_A1": "x", "SEAL_SECRET_ENV": "y", "a": "z" } });
+        apply_attestor_env(obj.as_object_mut().unwrap(), "http://attestor", &[]).unwrap();
     }
 
     #[test]
