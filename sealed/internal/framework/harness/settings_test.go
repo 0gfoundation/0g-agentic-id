@@ -1,4 +1,4 @@
-package dsh
+package harness
 
 import (
 	"context"
@@ -47,7 +47,7 @@ func reasoningModel(id string) map[string]any {
 }
 
 // render resolves a document and runs it through the adapter, returning the
-// bridge environment as a map.
+// harness environment as a map.
 func render(t *testing.T, a *Adapter, d settings.Doc) map[string]string {
 	t.Helper()
 	if err := a.RenderSettings(context.Background(), settings.Resolve(context.Background(), d, "sk-test")); err != nil {
@@ -160,7 +160,7 @@ func TestRenderSettings_OverlayAppliedButPlatformWins(t *testing.T) {
 		}`),
 	})
 
-	if env["SEAL_DSH_TOOL_JOBS"] != "1" || env["SEAL_DSH_MAX_PARALLEL_TOOL_CALLS"] != "4" {
+	if env["SEAL_HARNESS_TOOL_JOBS"] != "1" || env["SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS"] != "4" {
 		t.Errorf("owner knobs were not applied: %v", env)
 	}
 	if env["SEAL_MODEL_ID"] != "glm-5.3" {
@@ -174,17 +174,39 @@ func TestRenderSettings_OverlayAppliedButPlatformWins(t *testing.T) {
 	}
 }
 
-// An empty overlay must reproduce exactly the composition the bridge shipped
-// with — the knobs are an owner option, not a behaviour change.
+// An empty overlay must reproduce exactly the shipped composition — every
+// knob is an owner option, off until the owner turns it on.
 func TestRenderSettings_DefaultKnobsAreTheShippedComposition(t *testing.T) {
 	catalogServer(t, reasoningModel("glm-5.3"))
 	env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3"})
 	for k, want := range map[string]string{
-		"SEAL_DSH_TOOL_JOBS":               "0",
-		"SEAL_DSH_MAX_PARALLEL_TOOL_CALLS": "1",
+		"SEAL_HARNESS_TOOL_JOBS":               "0",
+		"SEAL_HARNESS_SUBAGENTS":               "0",
+		"SEAL_HARNESS_SCHEDULE":                "0",
+		"SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS": "1",
 	} {
 		if env[k] != want {
-			t.Errorf("%s = %q, want %q (today's hardcoded literal)", k, env[k], want)
+			t.Errorf("%s = %q, want %q (the shipped default)", k, env[k], want)
+		}
+	}
+}
+
+// The subagents and schedule knobs reach the harness under their own names,
+// each independent of the others.
+func TestRenderSettings_SubagentsAndScheduleKnobs(t *testing.T) {
+	catalogServer(t, reasoningModel("glm-5.3"))
+	for _, c := range []struct {
+		overlay             string
+		subagents, schedule string
+	}{
+		{`{"subagents":true}`, "1", "0"},
+		{`{"schedule":true}`, "0", "1"},
+		{`{"subagents":true,"schedule":true}`, "1", "1"},
+		{`{"subagents":false,"schedule":false}`, "0", "0"},
+	} {
+		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.overlay)})
+		if env["SEAL_HARNESS_SUBAGENTS"] != c.subagents || env["SEAL_HARNESS_SCHEDULE"] != c.schedule {
+			t.Errorf("%s → SUBAGENTS=%q SCHEDULE=%q, want %q %q", c.overlay, env["SEAL_HARNESS_SUBAGENTS"], env["SEAL_HARNESS_SCHEDULE"], c.subagents, c.schedule)
 		}
 	}
 }
@@ -204,22 +226,27 @@ func TestRenderSettings_BadOverlayValuesNeverFailTheRender(t *testing.T) {
 		{
 			"wrongly-typed knob falls back and leaves its neighbours alone",
 			`{"toolJobs":"yes","maxParallelToolCalls":4}`,
-			map[string]string{"SEAL_DSH_TOOL_JOBS": "0", "SEAL_DSH_MAX_PARALLEL_TOOL_CALLS": "4"},
+			map[string]string{"SEAL_HARNESS_TOOL_JOBS": "0", "SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS": "4"},
 		},
 		{
 			"out-of-range value clamps, same as before",
 			`{"toolJobs":true,"maxParallelToolCalls":0}`,
-			map[string]string{"SEAL_DSH_TOOL_JOBS": "1", "SEAL_DSH_MAX_PARALLEL_TOOL_CALLS": "1"},
+			map[string]string{"SEAL_HARNESS_TOOL_JOBS": "1", "SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS": "1"},
+		},
+		{
+			"wrongly-typed subagents falls back; schedule beside it applies",
+			`{"subagents":"yes","schedule":true}`,
+			map[string]string{"SEAL_HARNESS_SUBAGENTS": "0", "SEAL_HARNESS_SCHEDULE": "1"},
 		},
 		{
 			"wrongly-typed number",
 			`{"maxParallelToolCalls":"lots"}`,
-			map[string]string{"SEAL_DSH_MAX_PARALLEL_TOOL_CALLS": "1"},
+			map[string]string{"SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS": "1"},
 		},
 		{
 			"section is not an object at all",
 			`["toolJobs"]`,
-			map[string]string{"SEAL_DSH_TOOL_JOBS": "0", "SEAL_DSH_MAX_PARALLEL_TOOL_CALLS": "1"},
+			map[string]string{"SEAL_HARNESS_TOOL_JOBS": "0", "SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS": "1"},
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -257,12 +284,12 @@ func TestRenderSettings_WorkspaceContextKnobIsRefused(t *testing.T) {
 	})
 	for k, v := range env {
 		if strings.Contains(k, "WORKSPACE") {
-			t.Errorf("the refused knob still reaches the bridge: %s=%s", k, v)
+			t.Errorf("the refused knob still reaches the harness: %s=%s", k, v)
 		}
 	}
 	// Refusing one knob must not cost the owner the legitimate ones.
-	if env["SEAL_DSH_TOOL_JOBS"] != "1" {
-		t.Errorf("toolJobs = %q, want 1 — a refused knob must not take its neighbours down", env["SEAL_DSH_TOOL_JOBS"])
+	if env["SEAL_HARNESS_TOOL_JOBS"] != "1" {
+		t.Errorf("toolJobs = %q, want 1 — a refused knob must not take its neighbours down", env["SEAL_HARNESS_TOOL_JOBS"])
 	}
 }
 
@@ -382,7 +409,7 @@ func TestStart_WithoutAPinFails(t *testing.T) {
 // settings document, not from RuntimeContext. RuntimeContext carries an
 // APIKey field, is losing it, and is frozen at the first Start; taking the key
 // from there is what dialled a platform-routed endpoint keyless and 401'd
-// live, and dsh was the last adapter still doing it.
+// live, and this adapter was the last one still doing it.
 func TestBridgeEnv_CredentialComesFromTheSettingsDocument(t *testing.T) {
 	catalogServer(t, reasoningModel("glm-5.3"))
 	a := New()
@@ -397,7 +424,7 @@ func TestBridgeEnv_CredentialComesFromTheSettingsDocument(t *testing.T) {
 		apiKey:      a.rendered.resolved.APIKey,
 		settingsEnv: a.rendered.env,
 		rt:          framework.RuntimeContext{APIKey: "sk-from-runtimecontext"},
-	}.environ("/node_modules"), "\n")
+	}.environ(), "\n")
 
 	if !strings.Contains(env, "SEAL_MODEL_API_KEY=sk-from-settings") {
 		t.Errorf("the bridge was not handed the resolved settings credential:\n%s", env)
@@ -447,7 +474,7 @@ func TestHandleLegacy_SettingsYAML_RecoversThePin(t *testing.T) {
 
 	doc, ok := a.SeededSettings()
 	if !ok {
-		t.Fatal("SeededSettings() found nothing; a legacy agent would boot with no pin and dsh.Start refuses that")
+		t.Fatal("SeededSettings() found nothing; a legacy agent would boot with no pin and harness.Start refuses that")
 	}
 	if doc.Provider != "0g-compute" || doc.Model != "glm-5.3" {
 		t.Errorf("recovered %+v, want provider=0g-compute model=glm-5.3", doc)

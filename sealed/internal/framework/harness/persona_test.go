@@ -1,10 +1,12 @@
-package dsh
+package harness
 
 import (
 	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"seal-verify/internal/framework"
 )
 
 // HandleLegacy["persona"] is the mandatory protocol seed translation
@@ -85,7 +87,7 @@ func TestRestoreFramework_ForeignBindingRejected(t *testing.T) {
 func TestRestoreFramework_EmptyVersionResolvesToWhitelistMax(t *testing.T) {
 	a := New()
 	dshHome = t.TempDir()
-	if err := a.Restore(context.Background(), "framework", []byte(`{"name":"dsh","schema_version":1}`)); err != nil {
+	if err := a.Restore(context.Background(), "framework", []byte(`{"name":"0g-harness","schema_version":1}`)); err != nil {
 		t.Fatalf("Restore[framework]: %v", err)
 	}
 	if a.binding.PackageVersion != whitelistMax() {
@@ -93,10 +95,44 @@ func TestRestoreFramework_EmptyVersionResolvesToWhitelistMax(t *testing.T) {
 	}
 }
 
+// An agent minted under the old name boots on this adapter, and its binding
+// comes out under the new name: the framework role is drift-watched, so what
+// EvolutionFor returns here is what the agent's first commit writes on chain.
+// Its pinned DSH version is not a harness version and resolves to
+// whitelistMax the same way.
+func TestRestoreFramework_OldNameBootsAndIsRewritten(t *testing.T) {
+	a := New()
+	dshHome = t.TempDir()
+
+	fw, err := framework.Get("dsh")
+	if err != nil {
+		t.Fatalf("framework.Get(\"dsh\"): %v — an agent minted under the old name would not boot", err)
+	}
+	if fw != framework.Framework(a) || fw.Name() != "0g-harness" {
+		t.Fatalf("the old name selects %v (%q), want this adapter", fw, fw.Name())
+	}
+
+	old := []byte(`{"name":"dsh","package_version":"0.1.1-rc.2","schema_version":1}`)
+	if err := a.Restore(context.Background(), "framework", old); err != nil {
+		t.Fatalf("Restore[framework] of an old-name binding: %v", err)
+	}
+	got, err := a.EvolutionFor(context.Background(), "framework")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"name":"0g-harness","package_version":"` + whitelistMax() + `","schema_version":1}`
+	if string(got) != want {
+		t.Errorf("binding after an old-name restore = %s, want %s", got, want)
+	}
+	if string(got) == string(old) {
+		t.Error("the binding did not change, so no commit would rewrite the chain")
+	}
+}
+
 // ── the persona seed as a pin source ─────────────────────────────────────────
 //
 // attestor mints exactly two iData roles, so a never-drifted agent carries its
-// pin only in the seed — and dsh's Start hard-fails without one, so an
+// pin only in the seed — and the harness's Start hard-fails without one, so an
 // unrecovered pin is an offline container, not a degraded one.
 
 // The gap population: persona on chain, no settings.yaml entry.
@@ -111,7 +147,7 @@ func TestHandleLegacy_Persona_RecoversTheNeverDriftedAgentsPin(t *testing.T) {
 
 	doc, ok := a.SeededSettings()
 	if !ok {
-		t.Fatal("SeededSettings() found nothing — this agent boots with no pin, dsh.Start refuses that, and the container goes offline where the pre-migration code booted it")
+		t.Fatal("SeededSettings() found nothing — this agent boots with no pin, harness.Start refuses that, and the container goes offline where the pre-migration code booted it")
 	}
 	if doc.Provider != "0g-compute" || doc.Model != "glm-5.3" {
 		t.Errorf("recovered %+v, want the owner's literal 0g-compute/glm-5.3", doc)

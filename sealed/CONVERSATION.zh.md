@@ -23,10 +23,13 @@ settings 推送、每次 `/think` 都是 Stop+Start(`manager.Reload`),崩溃走�
 1. **对话活过进程重启,且归 HARNESS 所有**——不归 proxy(代理再实现一遍会话管理
    = 第二份有损真相源),不归客户端(它是窗口,不是仓库)。框架启动时,存在已
    持久化的对话就接上它。
-2. **一个 agent 恰好一条对话。**固定身份(dsh 已硬编码 `SessionId('owner-chat')`)。
-   多 session 永不启用——安全决定,非简化:跨 session 隔离要押注未审计的上游代码,
+2. **一个 agent 恰好一条对话。**固定身份(0g-harness 硬编码 `SessionId('owner-chat')`)。
+   第二条对话永不启用——安全决定,非简化:跨 session 隔离要押注未审计的上游代码,
    而长期记忆跨 session 共享本就破了隔离。与单驾驶座(CONFIG_SURFACE §8.1)对齐:
-   一个 agent、一条时间线、一个驾驶员。
+   一个 agent、一条时间线、一个驾驶员。0g-harness 的子 agent(owner 开关)跑在各自的
+   session 里,不算第二条对话:它们是同一个 owner 的一次性工作者,只在内存里,
+   不落盘,客户端也找不到它们,工具只有读。它们查到的东西以通知的形式回到这唯一
+   一条对话,再由 agent 自己的轮次转告 owner。
 3. **存容器可写层的不追踪路径**——构造上不上链:在所有链上角色之外,watcher 任何
    一拍都提交不到、任何转让都带不走。由构造保证而非运行时校验:每个存储路径都是 adapter 里的编译期常量、保持在其角色树之外(`RoleSpec` 刻意不携带文件系统路径,平台层的通用校验根本不可表达)——各 adapter 的 `paths.go` 记录归类。
 4. **容器重建清空——这是设计。**`reset` 即"重新开始";该留的早已蒸馏进链上记忆
@@ -55,7 +58,7 @@ adapter 在自己的包里用自己的方言作答。
 #155 引入),下面前两个能力接口就是给它用的。synth 服务所有没声明
 `kind:"responses"` 路由的框架——目前是 hermes 和 openclaw——把 `/v1/responses`
 翻译成框架的 chat 接口,并提供长任务机制(`starting_after` 续传、取消、事件记录)。
-和 prime/dsh 的桥不同,它不串行任务。两家网关其实都自带 `/v1/responses`
+和 prime 的桥、0g-harness 不同,它不串行任务。两家网关其实都自带 `/v1/responses`
 (hermes `api_server.py`;openclaw `handleOpenResponsesHttpRequest`,认
 `x-openclaw-session-key`),但都没有实现 `starting_after` 续传。后续(独立 PR):
 先在真容器里验证两扇原生门(重启后能否延续、流格式与 CLI/SDK 是否兼容、断线和
@@ -78,7 +81,7 @@ adapter 在自己的包里用自己的方言作答。
   推送文法,占座门控),CLI 加 `/clear`;历史在客户端侧的 adapter 答 501,CLI
   只清本地回显。
 - **`framework.SessionCompactor`** —— 按需运行 harness **自己的**压缩:较早的
-  历史变成摘要,最新的部分原样保留(保留多少由 harness 决定:dsh 只留最新的一项,
+  历史变成摘要,最新的部分原样保留(保留多少由 harness 决定:0g-harness 只留最新的一项,
   openclaw 约 20K token),进程不重启。proxy 暴露一条 owner 签名的
   `POST /_seal/compact`(tag `0GSealCompact`,clear 同一文法,占座门控),CLI 加
   `/compact`。有三道 clear 不需要的闸:同一时间只跑一个压缩(第二个答 409);
@@ -90,13 +93,13 @@ adapter 在自己的包里用自己的方言作答。
   请求解耦:连接断开不会中止它,结果写进日志。这一点有实际意义:长的摘要会比客户端
   等得更久——Node 的 fetch 等 300 秒没有回应就放弃——所以 CLI 把"没等到回应"报成
   "仍在压缩,看 /startuplog",而不是失败。
-  dsh 让桥执行(`POST /v1/compact` → 组合里的 `compactNow`,排在正在跑的那一轮
-  之后,同一时间只挂一个;摘要由桥当前运行的模型来写,输出上限 16384,低于一轮的
+  0g-harness 适配器让 harness 执行(`POST /v1/compact` → 组合里的 `compactNow`,排在正在跑的
+  轮次之后、等 agent 空闲,同一时间只挂一个;摘要由 harness 当前运行的模型来写,输出上限 16384,低于一轮的
   32768——目录没给预算时用引擎自己的 8192,见 `CONFIG_SURFACE.zh.md` §3.2);
   openclaw 对正在运行的网关执行它自己的
   `openclaw sessions compact <key>`,网关地址和 token 走环境变量(它的边界情况见
   下方 openclaw 的坑)。两者在引擎认为没有可折叠的内容时都答"无可压缩"(200,不算
-  失败)。上次 `/compact` 之后还没聊过时,dsh 桥也直接答"无可压缩",不调用模型:
+  失败)。上次 `/compact` 之后还没聊过时,0g-harness 也直接答"无可压缩",不调用模型:
   离线实测,紧接着再按一次、或重启后马上按,都会再做一次摘要调用,把摘要再压一遍。
   hermes 和 prime 暂时答 501。
 
@@ -110,19 +113,19 @@ adapter 在自己的包里用自己的方言作答。
 |---|---|---|---|
 | **prime** | `bridge.mjs` + `sessionstore.mjs`(原生 `/v1/responses`) | `createAgentSession({ …, sessionManager: SessionManager.open(SEAL_CONVERSATION_FILE) })` —— SDK 自己逐条追加(消息、工具调用、压缩、思考),重启 `open()` 重建上下文。文件 `/root/.prime-conversation/session/owner-chat.jsonl`,在 `primeHome` 外,交给 agent 用户(`privsep.OwnTree`);放在交接目录下一层,是因为 SDK 把每个会话的 artifacts 放在会话目录**旁边**,于是它们落在同一棵树里的 `/root/.prime-conversation/session-artifacts/`(早先的 sealed 把文件直接放在 `/root/.prime-conversation`,artifacts 会落到 root 的家目录 `/root/session-artifacts/<id>`;在升级后的容器里,启动时会把那个目录移到 `/root/.prime-conversation/session-artifacts`——`privsep.DeclareRelocation`,由 `ReclaimHome` 执行——Start 再把文件及其轮转产物移进 `session/`,于是恢复的对话既找得到 transcript,也找得到它的会话 artifacts,包括 RLM 会话状态和本地 harness 状态)。自轮转切在最近压缩条目(保留 header、压缩条目重挂根、丢弃更早行);损坏文件隔离(`.corrupt-<ts>`)后开新。真 SDK 验证:轮转 9209B→729B 且上下文可重建;断尾行可容忍。 | 删文件+残留+会话 artifacts,重启 |
 | **hermes** | 它自己的网关,经 `ConversationSession` 绑定 | 网关在 HTTP 上本就有状态:`X-Hermes-Session-Id`(Bearer `API_SERVER_KEY`,早已设置)让历史从 `~/.hermes/state.db` 读、body 最后一条为当前轮。adapter 铸造并持久化唯一 id(存在 sealed 仅 root 可访问的状态目录 `/var/lib/sealed/hermes-conversation-id`,不在 agent 可写的家目录里)并**跟随**回吐的 id——压缩会结束父会话、在子 id 上续。不安全回吐(路径形、控制字符)永不落盘。不变量 7 注:transcript 存储是 hermes 自己的 `state.db`——它的存储、它的压缩;自轮转不适用于 harness 自有的文件。 | 铸新 id(旧行留在 hermes 的 db,无引用),重启 |
-| **dsh** | `bridge.mjs` + `sessionstore.mjs`(原生 `/v1/responses`) | 无现成后端(`SessionPersistence` 接缝无具体子类;没它 `resume()` 拒绝)。桥即后端:`owner-chat` 会话每个已提交 `session/event` 经 `packChunkRuns` 追加;boot 时 `decodeStorageRecord` 解码后作 `ctx.agents.create({ seed, meta:{seedLength} })` 的种子;`interruptedTurnClosers` 闭合中途崩溃(closer 也落盘,文件自平衡);seq 守卫跳过重发的种子事件。轮转必然更粗:seed 必须从 seq 0 连续,砍不了头——到上限就归档、响亮地重开新对话。文件 `/root/.dsh/owner-chat.session.jsonl`(本就归为不追踪)。真 SDK 验证:追加→装载→`Session.fromRestore`(create 的校验器)通过;崩溃修复平衡。 | 删日志+残留,重启 |
+| **0g-harness** | `src/store/sessionstore.mjs`(原生 `/v1/responses`) | 无现成后端(`SessionPersistence` 接缝无具体子类;没它 `resume()` 拒绝)。harness 即后端:`owner-chat` 会话每个已提交 `session/event` 经 `packChunkRuns` 追加,在 agent 创建之前就挂好,所以创建瞬间开启的轮次(过期的提醒)也会写进去;boot 时 `decodeStorageRecord` 解码后作 `ctx.agents.create({ seed })` 的种子,按"续上"恢复,不带 `seedLength`——这个字段是分叉边界,DSH 只从它之后的事件里恢复待处理的收件箱任务和定时提醒;轮次记录(收件箱、任务)以 `<日志>.records.jsonl` 放在日志旁边;`interruptedTurnClosers` 闭合中途崩溃(closer 也落盘,文件自平衡);seq 守卫跳过重发的种子事件。轮转必然更粗:seed 必须从 seq 0 连续,砍不了头——到上限就归档、响亮地重开新对话。文件 `/root/.dsh/owner-chat.session.jsonl`(本就归为不追踪)。真 SDK 验证:追加→装载→`Session.fromRestore`(create 的校验器)通过;崩溃修复平衡;定时提醒和待处理通知跨重启保留。 | 删日志及所有 `<日志>.*` 文件(归档、轮次记录),重启 |
 | **openclaw** | `ConversationSession` + `ConversationHistory`,在 adapter 包内 | openclaw 把每轮网关对话都落盘(`~/.openclaw/agents/main/sessions/<id>.jsonl`,`sessions.json` 存 key→session 映射),它的网关会把钉住的会话**重放**进每一轮——而且始终是同一个会话,因为 render 把 `session.reset` 设成了永不过期的策略(openclaw 默认每天开一个新会话;见下方的坑)。adapter 钉一个会话 key(`x-openclaw-session-key`,存在 sealed 仅 root 可访问的状态目录 `/var/lib/sealed/openclaw-conversation-key`)让有状态门的所有轮次落进同一个会话,并让门只发当前轮(`ConversationHistory` 返回空——见下方的坑)。私有格式耦合(`sessions.json` 结构、文件命名)关在 openclaw 包内——和这个 adapter 已有的耦合同类(它本就解析 openclaw.json)。不变量 7(2026-10-19 复核,见下方的坑):openclaw 的压缩是**追加**一条 `compaction` 记录、保留所有消息行——会轮转文件的 `truncateAfterCompaction` 需显式开启、默认关——所以这里 harness 并没有给文件封顶;待解决。 | 轮换 key + 删掉被替换会话的文件——transcript 和 trajectory 记录(openclaw 的 `sessions.json` 是它自己的存储——绝不从外部改写),重启 |
 
 源码级的坑,记录在案:
 
 - prime 的 `createAgentSession` JSDoc 写着 `continueSession: true`——**死文档**,
   没代码读它。持久化只由 `sessionManager` 承载。
-- dsh 落盘格式 `SESSION_FORMAT_VERSION = 0`,无兼容承诺——可接受:同镜像写读,
-  格式变更必随镜像变更,而那要求重建、重建清文件。只有写它的桥可以读它。
-- dsh 事件文法:`user/message` 的 data **就是**消息本体(不包 `{message:}`),
+- DSH 落盘格式 `SESSION_FORMAT_VERSION = 0`,无兼容承诺——可接受:同镜像写读,
+  格式变更必随镜像变更,而那要求重建、重建清文件。只有写它的 harness 可以读它。
+- DSH 事件文法:`user/message` 的 data **就是**消息本体(不包 `{message:}`),
   surface 事件**必须**带 `surfaceOp` 标记,消息必须有 id——`Session.fromRestore`
   三样都校验,这正是存储冒烟要驱动真校验器、不用仿制品的原因。
-- dsh 的 Session **构造器**在 seed 未以 `session/end-seed` 结尾时,会在
+- DSH 的 Session **构造器**在 seed 未以 `session/end-seed` 结尾时,会在
   `seq = seed.length` 处自行追加该标记——且从不发布到 `session/event`,firehose
   持久器收不到,**第二次重启**就撞连续性校验砖死(评审 #169 blocker,跨代实证)。
   `loadSeed` 预先把标记同时写入文件和返回的 seed,构造器便不再追加。
@@ -202,6 +205,8 @@ adapter 在自己的包里用自己的方言作答。
 
 ## 6. 落地 —— 已完成并通过 T2 真机验证(2026-09-29,dev)
 
+本节的记录用的是 0g-harness 当时的名字 dsh。
+
 演练覆盖四框架(agent 436/449/450/452,镜像 cd547ec),每一问都由**全新
 client(零历史)**发出——连续性只可能来自容器:
 
@@ -228,11 +233,12 @@ client(零历史)**发出——连续性只可能来自容器:
 - hermes 压缩轮换未在演练中触发(需要长对话);跟随逻辑有单测,回吐语义读自
   网关源码。
 
-可重复的回归护栏(评审跟进 2):每个桥的 store 旁有一个
-`sessionstore_regression.mjs`——dsh 重放完整四代场景(finding-1 不变量)、崩溃
-修复与残根;prime 覆盖往返、压缩点轮转与残根隔离。真 SDK 取自
-`$DSH_SDK_ROOT` / `$PRIME_SDK_ROOT`(镜像内 node_modules 或 docker cp 抽出的树),
-缺席则干净 SKIP——仓库对环境门控测试的既有惯例。
+可重复的回归护栏(评审跟进 2):每个 store 都有一个 `sessionstore_regression.mjs`
+——0g-harness 的在它自己的仓库里(`test/regression/`,由它的 `npm test` 在 harness 锁定的
+SDK 树上运行),重放完整四代场景(finding-1 不变量)、崩溃修复与残根;prime 的在它
+桥的 store 旁边,覆盖往返、压缩点轮转与残根隔离。真 SDK 取自 `$DSH_SDK_ROOT` /
+`$PRIME_SDK_ROOT`(构建好的镜像里的 node_modules 或 docker cp 抽出的树);prime 的
+在缺席时干净 SKIP——仓库对环境门控测试的既有惯例。
 
 原清单(全部完成):
 

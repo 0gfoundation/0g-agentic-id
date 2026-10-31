@@ -1,28 +1,32 @@
-// Package dsh is the framework adapter for DeepSeek Harness (DSH,
-// @deepseek-ai/dsh) — a Cordis-plugin-composed harness whose every capability
-// (model, tools, skills, sessions, storage, system prompt) is an independently
-// swappable plugin.
+// Package harness is the framework adapter for 0g-harness
+// (github.com/0gfoundation/0g-harness): the platform's agent harness, composed
+// from DeepSeek Harness (DSH, @deepseek-ai/dsh) plugin packages, where every
+// capability (model, tools, skills, sessions, storage, system prompt) is an
+// independently swappable plugin.
 //
 // STATUS: complete adapter. The state half — Roles(), Defaults(),
 // Restore/EvolutionFor, FrameworkFacts — is conformance-tested. The process
-// half (spawn.go) composes the DSH plugin tree inside a sealed-owned Node
-// bridge (bridge/bridge.mjs), embedded via go:embed and materialized at
-// Start, and New() self-registers so an on-chain "dsh" binding selects it.
-// The composition is authored IN the bridge (not a loader/profile/cordis.yml
-// and not any $DSH_HOME patch layer), so the plugin SET rides the image hash
-// and an agent editing its home cannot alter what mounts next boot. Two spine
-// options are the owner's (README.md), delivered as env at spawn. Like prime-agent, the
-// process half wants a live-boot pass to confirm on first deploy (model
-// streams end-to-end, bash/skills work de-privileged); the state half needed
-// no such loop (FRAMEWORK_ADAPTER.md §13 point 5).
+// half (spawn.go) runs 0g-harness, which the image installs at build time, and
+// New() self-registers so an on-chain "0g-harness" binding selects it. The
+// harness composes the DSH plugin tree in its own code (not a
+// loader/profile/cordis.yml and not any $DSH_HOME patch layer), so the plugin
+// SET rides the image hash and an agent editing its home cannot alter what
+// mounts next boot. Four composition options are the owner's (README.md),
+// delivered as env at spawn. Like prime-agent, the process half wants a
+// live-boot pass to confirm on first deploy (model streams end-to-end,
+// bash/skills work de-privileged); the state half needed no such loop
+// (FRAMEWORK_ADAPTER.md §13 point 5).
+//
+// The old name: an agent minted before 0g-harness carries a "dsh" binding.
+// It still selects this adapter, and its binding is rewritten to "0g-harness"
+// at its first commit (legacyFrameworkName).
 //
 // Role set:
 //
-//	framework       Leaf — 3-field binding JSON (package_version = the DSH
-//	                npm/release version — the two series match for DSH,
-//	                unlike prime-agent; see whitelist.go)
+//	framework       Leaf — 3-field binding JSON (package_version = the
+//	                0g-harness version; see whitelist.go)
 //	APPEND_SYSTEM.md Leaf — owner persona, verbatim bytes (persona.go).
-//	                Injected by the bridge into ctx.systemPrompt at boot,
+//	                Injected by the harness into ctx.systemPrompt at boot,
 //	                NOT through any DSH-native config file — DSH's own
 //	                `persona` config key lives in the plugin composition
 //	                (cordis.yml), which is per-boot platform structure, not
@@ -31,34 +35,37 @@
 //	                $DSH_HOME/skills/ (skills.go)
 //
 // There is no config role: the inference pin is not chain state but the
-// owner's settings document, rendered into the bridge's environment at every
+// owner's settings document, rendered into the harness's environment at every
 // Start (RenderSettings in settings.go). So a routing fix reaches an
 // already-minted agent on its next boot instead of only at mint time, and
 // $DSH_HOME/settings.yaml — which DSH itself never read, see settings.go —
 // is gone entirely.
 //
-// What makes this adapter unusual among the shipped set: DSH is the only
-// framework here whose composition is not fixed by the adapter but assembled
-// per-boot from ~50 independently versioned plugin packages. There is no
-// single "the framework's config file" the way openclaw and hermes each have
-// one — the composition itself (which plugins, which order, which config) is
-// platform structure this adapter authors and materializes at Start, exactly
-// like the sealed-owned HTTP bridge it also ships.
+// What makes this adapter unusual among the shipped set: 0g-harness is the
+// only framework here whose composition is not fixed by the adapter but
+// assembled per-boot from ~50 independently versioned DSH plugin packages.
+// There is no single "the framework's config file" the way openclaw and hermes
+// each have one — the composition itself (which plugins, which order, which
+// config) is platform structure, authored in the harness package the image
+// carries.
 //
 // File map:
 //
-//	dsh.go          Adapter struct + framework.Framework interface methods
+//	harness.go      Adapter struct + framework.Framework interface methods
 //	paths.go        on-disk paths this adapter manages (+ what it does not)
-//	whitelist.go    validated DSH version set
+//	whitelist.go    validated 0g-harness version set
 //	persona.go      APPEND_SYSTEM.md + HandleLegacy persona ingestion
-//	settings.go     RenderSettings: the owner's settings → bridge env (no config
+//	settings.go     RenderSettings: the owner's settings → harness env (no config
 //	                file), plus recovery of the retired settings.yaml role
 //	skills.go       the skills/ manifest role
 //	platformtext.go FrameworkFacts (this framework's blanks in the agent doc)
-//	spawn.go        Start/Stop/probes + the bridge lifecycle
-//	bridge/         the go:embed'd Node bridge (bridge.mjs) + platform plugins
-//	                (seal-tools.mjs, seal-guard.mjs)
-package dsh
+//	spawn.go        Start/Stop/probes + the harness lifecycle and the routes
+//	                it advertises
+//
+// The harness itself, with its platform plugins (seal-tools, seal-guard,
+// subagent-guard), lives in github.com/0gfoundation/0g-harness; the image
+// installs a pinned version of it (images/harness/Dockerfile).
+package harness
 
 import (
 	"context"
@@ -76,25 +83,32 @@ import (
 
 // frameworkName is the adapter id and the `name` field of the framework
 // binding. Selection at boot matches on this exact string.
-const frameworkName = "dsh"
+const frameworkName = "0g-harness"
 
-// Adapter is the DSH implementation of framework.Framework.
+// legacyFrameworkName is the name this framework had before 0g-harness, which
+// agents minted then carry in their binding. It selects this adapter too, and
+// restoreFramework composes a binding that names frameworkName, so the drift
+// watcher commits the new name at the agent's first commit. Remove once no
+// agent on any chain carries it.
+const legacyFrameworkName = "dsh"
+
+// Adapter is the 0g-harness implementation of framework.Framework.
 type Adapter struct {
 	mu sync.RWMutex
 
 	// binding is the composed framework-role state (name + pinned version).
 	binding frameworkBinding
 
-	// cmd is the running bridge process (nil before first Start / after Stop).
+	// cmd is the running harness process (nil before first Start / after Stop).
 	cmd *exec.Cmd
 
-	// bridgeToken gates the bridge's /v1/* surface; AuthResponse hands it to a
+	// bridgeToken gates the harness's /v1/* surface; AuthResponse hands it to a
 	// verified owner. Minted once per container (memory-only), so a reset
 	// rotates it.
 	bridgeToken string
 
 	// rendered is what RenderSettings last produced from the owner's settings
-	// document: the resolved pin Start boots on, plus the bridge environment
+	// document: the resolved pin Start boots on, plus the harness environment
 	// derived from it. nil means RenderSettings has not run — a programming
 	// error Start refuses to paper over, because there is no file left to
 	// recover a pin from (settings.go).
@@ -125,8 +139,7 @@ type frameworkBinding struct {
 }
 
 // New builds the adapter and self-registers it (side-effect, like every other
-// bundled adapter's New()). The process half (spawn.go) is real now, so an
-// on-chain "dsh" binding can select it.
+// bundled adapter's New()), under its name and its old one.
 func New() *Adapter {
 	a := &Adapter{
 		binding: frameworkBinding{
@@ -136,6 +149,7 @@ func New() *Adapter {
 		},
 	}
 	framework.Register(frameworkName, a)
+	framework.Register(legacyFrameworkName, a)
 	// The tree spawnBridge hands to the agent user (privsep.DeclareTree:
 	// Harden leaves it in root's home although the agent owns it).
 	privsep.DeclareTree(dshHome)
@@ -195,31 +209,38 @@ func (a *Adapter) Restore(ctx context.Context, role string, plaintext []byte) er
 		return a.restoreManifestDir(plaintext)
 	}
 	// Unknown roles are not an error: bootstrap routes them to HandleLegacy.
-	logger.Logf("dsh.Restore: ignoring unknown role %q", role)
+	logger.Logf("harness.Restore: ignoring unknown role %q", role)
 	return nil
 }
 
 // restoreFramework composes the binding. A binding naming a DIFFERENT
 // framework fails loud: selection and adapter disagree about what this agent
-// is, and booting anyway would forge identity (FRAMEWORK_ADAPTER.md §3). An
-// empty/absent package_version resolves to whitelistMax, because version
-// knowledge lives with the code that validates versions, not with attestor.
+// is, and booting anyway would forge identity (FRAMEWORK_ADAPTER.md §3). The
+// old name is this framework (legacyFrameworkName): the composed binding names
+// frameworkName, and the drift watcher commits it. An empty/absent
+// package_version resolves to whitelistMax, because version knowledge lives
+// with the code that validates versions, not with attestor.
 func (a *Adapter) restoreFramework(plaintext []byte) error {
 	next := frameworkBinding{Name: frameworkName, PackageVersion: whitelistMax(), SchemaVersion: 1}
 	if len(plaintext) > 0 {
 		var got frameworkBinding
 		if err := json.Unmarshal(plaintext, &got); err != nil {
-			return fmt.Errorf("dsh.Restore[framework]: parse: %w", err)
+			return fmt.Errorf("harness.Restore[framework]: parse: %w", err)
 		}
-		if got.Name != "" && got.Name != frameworkName {
-			return fmt.Errorf("dsh.Restore[framework]: binding names %q, this adapter is %q — refusing to forge identity", got.Name, frameworkName)
+		switch got.Name {
+		case "", frameworkName:
+		case legacyFrameworkName:
+			logger.Logf("harness.Restore[framework]: binding names %q, the old name of %q; the next commit rewrites it",
+				got.Name, frameworkName)
+		default:
+			return fmt.Errorf("harness.Restore[framework]: binding names %q, this adapter is %q — refusing to forge identity", got.Name, frameworkName)
 		}
 		if got.SchemaVersion != 0 {
 			next.SchemaVersion = got.SchemaVersion
 		}
 		next.PackageVersion = coerceWhitelisted(got.PackageVersion)
 		if got.PackageVersion != "" && got.PackageVersion != next.PackageVersion {
-			logger.Logf("dsh.Restore[framework]: pinned version %q is not whitelisted; coerced to %q",
+			logger.Logf("harness.Restore[framework]: pinned version %q is not whitelisted; coerced to %q",
 				got.PackageVersion, next.PackageVersion)
 		}
 	}
@@ -234,14 +255,14 @@ func (a *Adapter) restoreManifestDir(plaintext []byte) error {
 	if len(plaintext) > 0 {
 		m, err := manifest.Unmarshal(plaintext)
 		if err != nil {
-			return fmt.Errorf("dsh.Restore[skills/]: %w", err)
+			return fmt.Errorf("harness.Restore[skills/]: %w", err)
 		}
 		count = len(m.Entries)
 	}
 	if err := ensureRoleDir(skillsDir()); err != nil {
-		return fmt.Errorf("dsh.Restore[skills/]: %w", err)
+		return fmt.Errorf("harness.Restore[skills/]: %w", err)
 	}
-	logger.Logf("dsh.Restore[skills/]: parsed manifest (%d entries)", count)
+	logger.Logf("harness.Restore[skills/]: parsed manifest (%d entries)", count)
 	return nil
 }
 
@@ -251,7 +272,7 @@ func (a *Adapter) EvolutionFor(ctx context.Context, role string) ([]byte, error)
 	case "framework":
 		out, err := json.Marshal(&a.binding)
 		if err != nil {
-			return nil, fmt.Errorf("dsh evoFramework: marshal: %w", err)
+			return nil, fmt.Errorf("harness evoFramework: marshal: %w", err)
 		}
 		return out, nil
 	case "APPEND_SYSTEM.md":
@@ -283,10 +304,10 @@ func (a *Adapter) RestoreEntry(ctx context.Context, role, path string, plaintext
 // optional capability is a feature quietly off (FRAMEWORK_ADAPTER.md §2.2).
 //
 // VersionReconciler is deliberately absent, for the same reason as
-// prime-agent: DSH is provisioned at image build time so its bytes ride the
-// image hash in on-chain validFrameworkHashes; a drifted `framework` role is
-// committed as-is rather than downloading a different version into an
-// attested container (see spawn.go verifyInstalled).
+// prime-agent: 0g-harness is installed at image build time
+// (images/harness/Dockerfile), so its bytes ride the image hash in on-chain
+// validFrameworkHashes; a drifted `framework` role is committed as-is rather
+// than installing a different version into an attested container.
 var (
 	_ framework.Framework = (*Adapter)(nil)
 	// Transitional: recovers the pin from the retired "settings.yaml" role

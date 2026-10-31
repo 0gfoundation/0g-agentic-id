@@ -1,4 +1,4 @@
-package dsh
+package harness
 
 import (
 	"errors"
@@ -39,7 +39,7 @@ func (a *Adapter) evoSkills() ([]byte, error) {
 		return m.Marshal()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("dsh evoSkills: read %s: %w", skillsDir(), err)
+		return nil, fmt.Errorf("harness evoSkills: read %s: %w", skillsDir(), err)
 	}
 
 	type item struct {
@@ -77,7 +77,7 @@ func (a *Adapter) evoSkills() ([]byte, error) {
 			entry, ok, err = manifest.FileEntryOf(full, it.name, nil)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("dsh evoSkills: %w", err)
+			return nil, fmt.Errorf("harness evoSkills: %w", err)
 		}
 		if ok {
 			m.Entries = append(m.Entries, entry)
@@ -90,13 +90,13 @@ func (a *Adapter) loadEntrySkills(path string) ([]byte, error) {
 	if strings.HasSuffix(path, "/") {
 		slug, err := skillDirSlug(path)
 		if err != nil {
-			return nil, fmt.Errorf("dsh.LoadEntry[skills/]: %w", err)
+			return nil, fmt.Errorf("harness.LoadEntry[skills/]: %w", err)
 		}
 		return manifest.PackDir(filepath.Join(skillsDir(), slug))
 	}
 	slug, err := skillFileSlug(path)
 	if err != nil {
-		return nil, fmt.Errorf("dsh.LoadEntry[skills/]: %w", err)
+		return nil, fmt.Errorf("harness.LoadEntry[skills/]: %w", err)
 	}
 	return privsep.ReadFile(filepath.Join(skillsDir(), slug), privsep.LimitTracked)
 }
@@ -105,28 +105,28 @@ func (a *Adapter) restoreEntrySkills(path string, plaintext []byte) error {
 	if strings.HasSuffix(path, "/") {
 		slug, err := skillDirSlug(path)
 		if err != nil {
-			return fmt.Errorf("dsh.RestoreEntry[skills/]: %w", err)
+			return fmt.Errorf("harness.RestoreEntry[skills/]: %w", err)
 		}
 		if err := ensureRoleDir(skillsDir()); err != nil {
-			return fmt.Errorf("dsh.RestoreEntry[skills/]: %w", err)
+			return fmt.Errorf("harness.RestoreEntry[skills/]: %w", err)
 		}
 		dst := filepath.Join(skillsDir(), slug)
 		// Clean any prior content so deletions inside the tarball are honoured
 		// (UnpackDir overwrites files but does not remove stale ones).
 		if err := privsep.RemoveAll(dst); err != nil {
-			return fmt.Errorf("dsh.RestoreEntry[skills/]: clean %s: %w", dst, err)
+			return fmt.Errorf("harness.RestoreEntry[skills/]: clean %s: %w", dst, err)
 		}
 		return manifest.UnpackDir(plaintext, dst)
 	}
 	slug, err := skillFileSlug(path)
 	if err != nil {
-		return fmt.Errorf("dsh.RestoreEntry[skills/]: %w", err)
+		return fmt.Errorf("harness.RestoreEntry[skills/]: %w", err)
 	}
 	if err := ensureRoleDir(skillsDir()); err != nil {
-		return fmt.Errorf("dsh.RestoreEntry[skills/]: %w", err)
+		return fmt.Errorf("harness.RestoreEntry[skills/]: %w", err)
 	}
 	if err := privsep.WriteFile(filepath.Join(skillsDir(), slug), plaintext, 0o644); err != nil {
-		return fmt.Errorf("dsh.RestoreEntry[skills/]: write %s: %w", slug, err)
+		return fmt.Errorf("harness.RestoreEntry[skills/]: write %s: %w", slug, err)
 	}
 	return nil
 }

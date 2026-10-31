@@ -113,7 +113,7 @@ func catalogServer(t *testing.T, entry map[string]any) {
 // The whole point of the ModelFacts/Endpoint split: a native provider still
 // gets the reasoning bound, it just supplies its own endpoint. Before the
 // split both hung off one `provider == "0g-compute"` check, so choosing a
-// native provider silently dropped the bound (hermes, dsh).
+// native provider silently dropped the bound (hermes, 0g-harness).
 func TestNativeProviderStillGetsBoundedReasoning(t *testing.T) {
 	catalogServer(t, map[string]any{
 		"id":                    "glm-5.3",

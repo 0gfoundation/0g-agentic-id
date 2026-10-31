@@ -70,7 +70,7 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 | host 读不到容器内存 | TDX 硬件内存加密 + attestation |
 | 磁盘持久化是加密的 | `agent_seal_priv` 从不以明文写盘；只 provision 到内存 |
 | openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`（agent 自己的家目录 `/home/agent`）、`OPENCLAW_STATE_DIR` 和 `OPENCLAW_HOME`（框架目录树的绝对路径及其上级目录，非机密）、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
-| 存储上传不让它离开进程 | `dataplane.Upload` 在 sealed 进程内通过 0g-storage-client Go SDK 上传（`internal/dataplane/upload.go`），SDK 的交易签名器直接由 sealed 已持有的密钥构造，所以密钥从不交给任何子进程 —— 不进参数列表（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），不进环境变量，不经文件描述符，也不落文件。blob 从内存直接交给 SDK（不写临时文件）。本次上传一旦结束（比如在 90s 截止时被放弃），SDK 就不能再用这把密钥签名或发送交易：签名器拒绝签名，fullnode 客户端也拒绝发送，provider 的每次重试都一样；只有截止那一刻已经在线路上的发送仍可能到达节点，这和 CLI 在截止时被杀掉的情形相同。代价是体积和故障隔离。SDK 往这个进程里多链接了约 360 个非标准库包（大部分是 go-ethereum 的 node 栈；细节见 `QUIRKS.md`），并经由它们带进了标准库的 `net/http/pprof` 和 `expvar`（见下一行）；`TestLinkedPackages_Reviewed` 同时钉住这些非标准库包和它们直接导入的标准库包。上传现在也和 sealed 共用一个进程：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（PID 1），连同容器和 agent 一起，而以前只会结束一次 CLI 运行（`runBounded` 只 recover 调用 SDK 的那个 goroutine；见 `QUIRKS.md`）。钉住的 SDK 版本还会在 2 MiB 以上 blob 的提交每次被回滚、或回执查询失败后，留下一个永久阻塞的 goroutine，以前 CLI 运行结束退出时会把它一并带走；`Upload` 给它们能累积的数量设了上限（见 `QUIRKS.md`）。下载仍经 `privsep.RootCommand`（只在仅 root 可写的 `PATH` 目录中解析）运行 0g-storage-client CLI，下载不涉及密钥；构建它的那些镜像（`Dockerfile`、`images/{hermes,prime,dsh,sealed}`）把它装到 `/usr/local/bin`，基础镜像 `images/openclaw` 不带。由 `internal/dataplane` 的测试钉住：`Upload` 不起任何子进程（一道源码检查：上传路径上不出现任何启动进程的 API，`internal/privsep` 的命令构造函数也算在内；再加 root 侧的结构测试不给 `Upload` 列任何可运行的二进制）、源码里出现启动进程 API 的依赖是一份审查过的固定清单、SDK 接线与 CLI 一致、签名和发送随上传结束而停止 |
+| 存储上传不让它离开进程 | `dataplane.Upload` 在 sealed 进程内通过 0g-storage-client Go SDK 上传（`internal/dataplane/upload.go`），SDK 的交易签名器直接由 sealed 已持有的密钥构造，所以密钥从不交给任何子进程 —— 不进参数列表（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），不进环境变量，不经文件描述符，也不落文件。blob 从内存直接交给 SDK（不写临时文件）。本次上传一旦结束（比如在 90s 截止时被放弃），SDK 就不能再用这把密钥签名或发送交易：签名器拒绝签名，fullnode 客户端也拒绝发送，provider 的每次重试都一样；只有截止那一刻已经在线路上的发送仍可能到达节点，这和 CLI 在截止时被杀掉的情形相同。代价是体积和故障隔离。SDK 往这个进程里多链接了约 360 个非标准库包（大部分是 go-ethereum 的 node 栈；细节见 `QUIRKS.md`），并经由它们带进了标准库的 `net/http/pprof` 和 `expvar`（见下一行）；`TestLinkedPackages_Reviewed` 同时钉住这些非标准库包和它们直接导入的标准库包。上传现在也和 sealed 共用一个进程：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（PID 1），连同容器和 agent 一起，而以前只会结束一次 CLI 运行（`runBounded` 只 recover 调用 SDK 的那个 goroutine；见 `QUIRKS.md`）。钉住的 SDK 版本还会在 2 MiB 以上 blob 的提交每次被回滚、或回执查询失败后，留下一个永久阻塞的 goroutine，以前 CLI 运行结束退出时会把它一并带走；`Upload` 给它们能累积的数量设了上限（见 `QUIRKS.md`）。下载仍经 `privsep.RootCommand`（只在仅 root 可写的 `PATH` 目录中解析）运行 0g-storage-client CLI，下载不涉及密钥；构建它的那些镜像（`Dockerfile`、`images/{hermes,prime,harness,sealed}`）把它装到 `/usr/local/bin`，基础镜像 `images/openclaw` 不带。由 `internal/dataplane` 的测试钉住：`Upload` 不起任何子进程（一道源码检查：上传路径上不出现任何启动进程的 API，`internal/privsep` 的命令构造函数也算在内；再加 root 侧的结构测试不给 `Upload` 列任何可运行的二进制）、源码里出现启动进程 API 的依赖是一份审查过的固定清单、SDK 接线与 CLI 一致、签名和发送随上传结束而停止 |
 | 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节。profile 和进程变量也不对外提供：被链接进来的库（`net/http/pprof`、`expvar`）在 init 时注册到 `http.DefaultServeMux` 上的 `/debug/pprof/*` 和 `/debug/vars` 路由，sealed 启动时通过替换这个 mux 一并丢掉（`defaultmux.go`） |
 | provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到由已认证的稳定 sandbox app signer 签发、并绑定 chain、registry、appId 和注册 epoch 的 v2 envelope 携带的那个 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:227-243`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
 
@@ -646,7 +646,7 @@ framework 自动签名以外，agent 自己也会通过 unix socket
 - 作为 agentSeal 签 EIP-712 结构化数据（Permit、Seaport 等）
 - 作为 agentSeal 发链上交易
 
-在 DSH 组合里，`seal-guard.mjs` 通过拒绝同时点名 socket 拼法和
+在 0g-harness 的组合里，`seal-guard.mjs` 通过拒绝同时点名 socket 拼法和
 `/sign/` 路径的 tool 调用，把模型引向原生工具
 （`seal_sign`、`seal_sign_typed_data`、`seal_sign_transaction` ——
 每个端点一个工具，每次调用都是一条结构化的 session log 记录）。
@@ -668,7 +668,7 @@ EIP-712 digest、或 socket 从字段组装的交易上。sealed 自己在进程
 keccak256 digest，serve-proof 是 `0x00`。`chain.Update` 不在其外：它是
 普通交易，跟 `/sign/transaction` 产出的形状相同，签名域分不开这两者——
 所以这条渠道靠的是钢印（见上面的承重墙表）。
-把 socket 桥接成 agent 工具的 adapter（例如 dsh 的 `seal_sign`）
+把 socket 桥接成 agent 工具的 adapter（例如 0g-harness 的 `seal_sign`）
 不得补上这两条缺失的路径。
 
 unix socket 以 0600 绑定、属主是框架子进程所运行的低权 `agent` 用户
@@ -700,7 +700,7 @@ agent 进程是 sealed 此后以 root 身份所做一切的不可信输入，所
   `/home` 都不能是链接）：它是 agent 运行的一切进程的 `HOME`，也是
   `AgentCommand` 的默认工作目录，所以工具缓存与配置（`~/.npm`、`~/.cache`、
   `~/.config`、`~/.local`、`~/.gitconfig` 等）以及 agent 自己的文件都在那里。
-  （prime 和 dsh 的 bridge 有意从各自的框架目录树启动，所以它们运行的工具
+  （prime 的 bridge 和 0g-harness 有意从各自的框架目录树启动，所以它们运行的工具
   的相对路径落在那棵树里。）两个家目录都就位之前 `Required` 一律拒绝
   provision。在 `/root` 里 agent 只拥有它的框架目录树（`OwnTree`；prime 另有
   `/root/.prime-conversation` 和每会话 harness 目录 `/root/.prime-session`），

@@ -32,6 +32,11 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS sandbox_id TEXT;
 -- this column existed. Read by clients so nobody has to REMEMBER which
 -- harness an agent runs (reset defaults, chat model selector, sealed image).
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS framework TEXT;
+-- 0g-harness's old name is dsh. Its rows carry the new name, the one
+-- ATTESTOR_FRAMEWORKS lists; the agent's container rewrites the on-chain
+-- binding at the agent's first commit (sealed/internal/framework/harness).
+-- Matches nothing once every row is renamed.
+UPDATE deployments SET framework = '0g-harness' WHERE framework = 'dsh';
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provisioned_at TIMESTAMPTZ;
 
 -- Container-pubkey binding for /provision freshness bypass on restart.

@@ -1,4 +1,4 @@
-package dsh
+package harness
 
 import (
 	"testing"
@@ -12,7 +12,7 @@ import (
 // round-trip, fixture round-trip + determinism + LoadEntry hash agreement,
 // Restore commutativity, unknown-role contract, FrameworkFacts non-empty.
 //
-// Exercises the whole state/identity half without DSH installed at all — the
+// Exercises the whole state/identity half without the harness installed at all — the
 // invariants the watcher would turn into infinite re-upload loops in
 // production are pure functions of disk state (FRAMEWORK_ADAPTER.md §13
 // point 5). The "framework" role has no fixture here, same as every other
