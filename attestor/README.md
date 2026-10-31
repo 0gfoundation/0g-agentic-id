@@ -62,11 +62,21 @@ learns from its next heartbeat that its job was reaped and drops the job;
 overwrites the reaped row.
 
 Upgrading from a release that encrypted job payloads: drain the queue first.
-Stop the api so no new jobs arrive, wait until
-`SELECT count(*) FROM jobs WHERE status IN ('pending','running')` returns 0,
-then upgrade. A job written by the earlier release cannot be decoded: a
-pending one is failed at claim and a running one is reaped, both without
-settling its deployment, which then stays `deploying` and needs a redeploy.
+Stop the api and indexer services so no new jobs arrive (the indexer resumes
+from its checkpoint, so no event is lost) and leave the worker running. That
+earlier worker logs `claimed job` when it starts a job and logs only failures
+(`job failed`), so the queue is drained once no `claimed job` line has
+appeared for longer than a job can run: allow 15 minutes, and more when the
+last job claimed is a deploy with several iData entries (each upload has a
+750 s budget). Where the database is reachable,
+`SELECT count(*) FROM jobs WHERE status IN ('pending','running')` returning 0
+confirms it. Then upgrade. A job written by the earlier release cannot be
+decoded: a pending one is failed at claim (`undecodable job payload`) and a
+running one is reaped (`job reaped` with no `seal_id`), both without settling
+its deployment, which then stays `deploying` and needs a redeploy. From this
+release on, the worker logs `job done` or `job failed` after every
+`claimed job` line (or the reaper logs the job as reaped), so a later drain
+can be read from the worker log alone.
 
 ## Workspace
 

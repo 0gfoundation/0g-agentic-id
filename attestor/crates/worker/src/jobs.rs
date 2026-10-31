@@ -126,7 +126,7 @@ fn classify_resume_failure(e: &anyhow::Error, view: &ProviderView) -> ResumeFail
     const UNAVAILABLE: &str = "sandbox temporarily unavailable — resume again in a moment";
     if matches!(view, ProviderView::Missing | ProviderView::Broken) {
         return ResumeFailure {
-            hint: "the sandbox no longer exists or is broken — reset the agent to create a new one",
+            hint: "the sandbox no longer exists or is broken — bring the agent online or reset it to create a new one",
             transient: false,
         };
     }
@@ -255,6 +255,29 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     return Ok(());
                 }
                 let failure = classify_resume_failure(&e, &view);
+                if matches!(view, ProviderView::Missing | ProviderView::Broken) {
+                    // No start can bring this sandbox back. Record the agent
+                    // offline, as the heartbeat sweep does for a missing
+                    // sandbox, so the owner is offered a new container
+                    // instead of another resume. Nothing is deleted here.
+                    ctx.deployments
+                        .set_container_stage(
+                            seal_id,
+                            StageStatus::Failed {
+                                at: Utc::now(),
+                                reason: failure.hint.to_string(),
+                            },
+                        )
+                        .await?;
+                    tracing::warn!(?seal_id, error = %e, ?view, "sandbox.start failed and the sandbox is gone or broken; c=Failed");
+                    ctx.events
+                        .publish(WsEvent::ContainerFailed {
+                            seal_id,
+                            reason: failure.hint.to_string(),
+                        })
+                        .await?;
+                    anyhow::bail!("resume not started: {e}");
+                }
                 ctx.deployments
                     .set_container_stage(
                         seal_id,
@@ -3962,29 +3985,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_start_fatal_error_keeps_sandbox_and_stays_stopped() {
-        let t = make_test_ctx();
-        let seal = dummy_seal();
-        seed_stopped_deployment(&t, seal, 9, "sb-gone").await;
-        t.sandbox.start_fails.store(true, Ordering::SeqCst);
-        *t.sandbox.fail_status.lock().unwrap() = Some(403);
-        *t.sandbox.fail_msg.lock().unwrap() = Some("forbidden".into());
-        set_provider_state(&t, None, None);
+    async fn sandbox_start_on_missing_sandbox_goes_offline_without_deleting() {
+        for (state, desired) in [(None, None), (Some("error"), None)] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_stopped_deployment(&t, seal, 9, "sb-gone").await;
+            t.sandbox.start_fails.store(true, Ordering::SeqCst);
+            *t.sandbox.fail_status.lock().unwrap() = Some(403);
+            *t.sandbox.fail_msg.lock().unwrap() = Some("forbidden".into());
+            set_provider_state(&t, state, desired);
 
-        let res = run_start(&t, seal).await;
+            let res = run_start(&t, seal).await;
 
-        assert!(res.is_err(), "a non-transient start error fails the job");
-        let d = t.deployments.get(seal).await.unwrap().unwrap();
-        assert!(
-            matches!(d.container_stage, StageStatus::Stopped { ref reason, .. } if reason == "resume_not_started"),
-            "got {:?}",
-            d.container_stage
-        );
-        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
-        let reasons = warning_reasons(&t);
-        assert_eq!(reasons.len(), 1);
-        assert!(reasons[0].contains("no longer exists"), "{}", reasons[0]);
-        assert!(!emitted_container_failed(&t));
+            assert!(res.is_err(), "{state:?}: a start that cannot work fails the job");
+            let d = t.deployments.get(seal).await.unwrap().unwrap();
+            assert!(
+                matches!(d.container_stage, StageStatus::Failed { ref reason, .. } if reason.contains("no longer exists")),
+                "{state:?}: got {:?}",
+                d.container_stage
+            );
+            assert_eq!(d.phase, DeploymentPhase::Offline, "{state:?}");
+            assert!(d.provision_deadline.is_none(), "{state:?}");
+            assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+            assert!(warning_reasons(&t).is_empty(), "{state:?}");
+            assert!(emitted_container_failed(&t), "{state:?}");
+        }
     }
 
     #[tokio::test]
@@ -4604,7 +4629,7 @@ mod tests {
                 &SandboxError::new("start", 502, "bad gateway").into(),
                 &view,
             );
-            assert!(got.hint.contains("reset the agent"), "{view:?}: {}", got.hint);
+            assert!(got.hint.contains("bring the agent online"), "{view:?}: {}", got.hint);
             assert!(!got.transient, "{view:?}");
         }
     }
