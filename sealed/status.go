@@ -42,7 +42,11 @@ type runtimeStatus struct {
 	// the runtime itself is "running", it shows as a "warning" with this
 	// message, so a later drift success or heartbeat cannot report the
 	// agent healthy. A real warning or error still takes precedence.
-	pinned            string
+	pinned string
+	// settingsIssue is why the settings this boot runs on give the agent
+	// no usable model (e.g. a clone whose new owner has not written any).
+	// It shows like pinned, after it, until a settings push applies.
+	settingsIssue     string
 	supervisorFailure string
 }
 
@@ -55,6 +59,9 @@ func (s *runtimeStatus) effective() (string, string) {
 	}
 	if s.level == "running" && s.pinned != "" {
 		return "warning", s.pinned
+	}
+	if s.level == "running" && s.settingsIssue != "" {
+		return "warning", s.settingsIssue
 	}
 	return s.level, s.message
 }
@@ -85,6 +92,17 @@ func (s *runtimeStatus) Pin(message string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pinned = message
+}
+
+// SettingsIssue sets (or, with "", clears) the settings warning described
+// on runtimeStatus and returns the previous effective level. The message
+// must carry no secret values.
+func (s *runtimeStatus) SettingsIssue(message string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, _ := s.effective()
+	s.settingsIssue = message
+	return prev
 }
 
 // severityOf classifies a runtime error into one of the 3 severity
