@@ -218,6 +218,22 @@ test('setSettings: a first write (no document yet) signs base version 0', async 
   }
 });
 
+test('setSettings: a thinking level the container refuses is refused before signing', async () => {
+  const cap = await mockAttestor();
+  try {
+    await assert.rejects(
+      clientAt(cap.port).setSettings({ sealId: SEAL, settings: { model: 'm', thinking: 'medium' }, baseVersion: 0 }),
+      /thinking must be one of low\|high\|max, got "medium"/,
+    );
+    assert.equal(cap.last(), null, 'nothing was sent');
+    // Go compares case-insensitively; so does the SDK.
+    await clientAt(cap.port).setSettings({ sealId: SEAL, settings: { model: 'm', thinking: 'HIGH' }, baseVersion: 0 });
+  } finally {
+    cap.server.closeAllConnections?.();
+    cap.server.close();
+  }
+});
+
 test('setSettings: a 409 re-reads and reports the conflict — it never retries', async () => {
   const live = { provider: '0g-compute', model: 'somebody-elses-choice' };
   const cap = await mockAttestor({ stored: live, version: 9, status: 409 });

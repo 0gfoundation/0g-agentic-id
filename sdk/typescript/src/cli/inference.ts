@@ -3,6 +3,7 @@ import type { Hash } from 'viem';
 import { inferenceKeyFromEnv, loadApiKey } from './config';
 import { CliError } from './errors';
 import { requiresMintFirst } from '../Providers';
+import { DEFAULT_PERSONA_INFERENCE } from '../AttestorClient';
 
 /** Deploy using the current registry's routing requirements. Called after
  * the wizard's prompts/preflight so an edited compute route is rechecked. */
@@ -47,7 +48,31 @@ export function requireConfiguredInferenceKey(provider: string, env: NodeJS.Proc
 /** A failed owner settings read must not select a different provider or key. */
 export async function agentInferenceProvider(ag: AgenticID, sealId: Hash): Promise<string> {
   const { settings } = await ag.agent.getSettings(sealId);
-  const provider = settings?.provider ?? '0g-compute';
+  return checkedProvider(settings?.provider ?? '0g-compute');
+}
+
+/**
+ * The provider a reset uses. An agent with no settings document at all — a
+ * clone whose new owner has written none, since the source's model pin left
+ * the chain at its first commit — would come up on its new container without
+ * a model, so it first gets the pin a fresh deploy starts from.
+ */
+export async function resetInferenceProvider(
+  ag: AgenticID,
+  sealId: Hash,
+  note: (line: string) => void,
+): Promise<string> {
+  const { settings, version } = await ag.agent.getSettings(sealId);
+  if (settings === null && version === 0) {
+    const doc = { ...DEFAULT_PERSONA_INFERENCE };
+    await ag.agent.setSettings(sealId, doc, { baseVersion: 0 });
+    note(`no settings yet: set provider=${doc.provider} model=${doc.model} (change them with settings)\n`);
+    return doc.provider;
+  }
+  return checkedProvider(settings?.provider ?? '0g-compute');
+}
+
+function checkedProvider(provider: string): string {
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(provider)) throw new CliError('BAD_FLAG', 'invalid inference provider ID');
   return provider;
 }

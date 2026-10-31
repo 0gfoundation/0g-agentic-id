@@ -16,7 +16,7 @@ import { SDK_VERSION } from './constants';
 import { agenticIDAbi, cloneGateAbi, tappRegistryAbi } from './abi';
 import {
   canonicalSettings, modelAdvisory, settingsAuthMessage, SettingsConflictError, sha256Hex,
-  type SettingsDoc,
+  THINKING_LEVELS, type SettingsDoc,
 } from './Settings';
 import {
   SECRET_ENV_SCHEME,
@@ -81,6 +81,9 @@ export interface IDataInput {
   extra?: Record<string, unknown>;
 }
 
+/** The persona inference pin a fresh deploy starts from (the 0G router's own model). */
+export const DEFAULT_PERSONA_INFERENCE = { provider: '0g-compute', model: '0gm-1.0-35b-a3b' } as const;
+
 /** Inputs for {@link defaultIData}. */
 export interface DefaultIDataParams {
   /** Framework name for the binding; default "openclaw". */
@@ -115,7 +118,7 @@ export function defaultIData(p: DefaultIDataParams): IDataInput[] {
       role: 'persona',
       plaintext: {
         system_prompt: `You are ${p.name}. ${p.description}\n`,
-        inference: p.inference ?? { provider: '0g-compute', model: '0gm-1.0-35b-a3b' },
+        inference: p.inference ?? { ...DEFAULT_PERSONA_INFERENCE },
       },
       extra: {},
     },
@@ -402,8 +405,8 @@ export class AttestorClient {
     let fw = framework;
     // An existing agent already knows what it is: its deployment row records
     // the framework. Without this read, a bare reset/start/retry of a
-    // hermes/prime/dsh agent fell back to the DEFAULT (openclaw) image and
-    // booted a container without its framework installed (observed live,
+    // hermes/prime/0g-harness agent fell back to the DEFAULT (openclaw) image
+    // and booted a container without its framework installed (observed live,
     // agent 452) — the CLI wizard papered over it by asking; the SDK is the
     // right place for the lookup. An UNREADABLE row refuses rather than
     // falling through: silently choosing the default image re-creates the
@@ -432,7 +435,17 @@ export class AttestorClient {
     const cfg: any = await this.attestorConfig();
     if (fw && Array.isArray(cfg?.frameworks)) {
       const entry = cfg.frameworks.find((f: any) => f?.name === fw);
-      if (entry?.image) return entry.image;
+      // A framework this attestor does not offer has no image here. The
+      // default snapshot belongs to another framework, and booting the agent
+      // on it fails only once the container is up, so refuse instead.
+      if (!entry) {
+        const offered = cfg.frameworks.map((f: any) => f?.name).filter(Boolean).join(', ');
+        throw new Error(
+          `framework "${fw}" is not offered by this attestor (GET /config frameworks: ${offered || 'none'}); ` +
+            'pass `framework` (or `sealedImage`) explicitly, or ask the operator to configure it',
+        );
+      }
+      if (entry.image) return entry.image;
     }
     return (cfg && cfg.sandbox_snapshot) || '';
   }
@@ -990,6 +1003,14 @@ export class AttestorClient {
     onWarn?: (warning: string) => void;
   }): Promise<{ version: number }> {
     const { walletClient, account } = requireWallet(this.ctx);
+    // The container refuses any other level (Go settings.Levels, compared
+    // case-insensitively); storing one would only fail the live push and
+    // then reach the next boot.
+    const thinking = params.settings.thinking as string | undefined;
+    if (thinking !== undefined && thinking.trim() !== ''
+      && !(THINKING_LEVELS as readonly string[]).includes(thinking.trim().toLowerCase())) {
+      throw new Error(`setSettings: thinking must be one of ${THINKING_LEVELS.join('|')}, got "${thinking}"`);
+    }
     if (params.settings.provider) await this.assertProviderSupported(params.settings.provider, { sealId: params.sealId });
     if (params.onWarn) {
       for (const w of await modelAdvisory(params.settings, await this.providerDefinition(params.settings.provider ?? '0g-compute'))) params.onWarn(w);

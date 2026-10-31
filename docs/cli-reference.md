@@ -107,7 +107,7 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 | `hello <id>` | hit any agent's public `/hello`; with a wallet configured, banks a rating ticket |
 | `call <id> [path] [json-body]` | call an agent's registered public service; bare `call` lists its services; responses bank tickets |
 | `rate <id> [score] [/endpoint]` | spend a ticket to rate on-chain — **no interaction, no rating** |
-| `start` / `stop` / `reset` / `retry <id>` | container lifecycle (owner-signed; on-chain identity unchanged) |
+| `start` / `stop` / `reset` / `retry <id>` | container lifecycle (owner-signed; on-chain identity unchanged). `reset` of an agent with no settings document (e.g. a fresh clone) first stores the default pin `provider=0g-compute model=0gm-1.0-35b-a3b` |
 | `clone` / `transfer` / `grant` / `revoke` / `authorizer` | clone, transfer, clone-authorization management |
 | `settings <id> [k=v …]` | same semantics as the subcommand |
 | `balance` / `deposit [og]` / `withdraw [og]` | prepaid account: balance + burn rate / fund / refund withdrawal (time-locked; bare argument claims everything) |
@@ -119,7 +119,9 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 
 Type to talk. **Esc / Ctrl-C interrupts the turn in flight** (server-side cancel on every bundled framework) and also cancels a `/start` or `/reset` wait.
 
-Slash commands (verified against `interactive.ts`): `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [k=v …]` `/think [low|high|max]` `/clear` (wipes the conversation; chain-tracked memory untouched — unlike `/reset`) `/tasks` `/result [id]` `/cancel [id]` (stop tasks — bare form brakes everything this session knows to be in flight, newest first; with an id, just that one. The brake for turns that outlived their stream: Esc only cancels a turn the current connection started. /result <id> adopts an id into the session) `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit` (alias `/exit`).
+Slash commands (verified against `interactive.ts`): `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [k=v …]` `/think [low|high|max]` `/clear` (wipes the conversation; chain-tracked memory untouched — unlike `/reset`) `/tasks` (on 0g-harness: every turn, background command and subagent, with who did it and who asked; elsewhere: this session's long tasks) `/result [id]` (on 0g-harness also a subagent's answer) `/cancel [id|all]` (stop tasks — bare form brakes everything this session knows to be in flight, newest first; with an id, just that one. The brake for turns that outlived their stream: Esc only cancels a turn the current connection started. /result <id> adopts an id into the session. On 0g-harness an id can be any task `/tasks` lists, and `all` stops everything running on the agent) `/inbox [all]` (0g-harness: what the agent said on its own — a background job finished, a reminder came due; bare: unread, `all`: the read ones too) `/schedules` (0g-harness: the reminders the agent set for itself) `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit` (alias `/exit`).
+
+On a 0g-harness agent, what the agent says on its own prints above the prompt as it arrives (during a command or a chat turn it waits for the next prompt), and what came while you were away prints when you enter the session. `/settings others=…` refuses the 0g-harness switches (`toolJobs`, `subagents`, `schedule`, `maxParallelToolCalls`) for an agent whose recorded framework is another one.
 
 The framework used by `/reset` and the chat model selector is **picked by you** from the attestor's list — never guessed.
 

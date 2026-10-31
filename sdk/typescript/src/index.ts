@@ -29,7 +29,10 @@ if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
 export { AgenticID as AgentDNA, AgenticID, AgentApi, AdminApi, ReputationApi } from './AgenticID';
 export type { DeployAccepted, WaitLevel } from './AgenticID';
 export { makeAgentClient } from './AgentClient';
-export type { AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask } from './AgentClient';
+export type {
+  AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask,
+  AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
+} from './AgentClient';
 export { mcpServices } from './AgentClient';
 export { defaultIData } from './AttestorClient';
 export type { DefaultIDataParams } from './AttestorClient';

@@ -595,6 +595,22 @@ test('an unreadable deployment row refuses instead of defaulting the image', asy
   });
 });
 
+test('a row whose framework /config does not offer refuses instead of defaulting the image', async () => {
+  const config = {
+    sandbox_snapshot: '0g-sealed',
+    secret_env_scheme: SECRET_ENV_SCHEME,
+    frameworks: [{ name: 'openclaw' }, { name: 'dsh', image: '0g-sealed-dsh' }],
+  };
+  await withAttestor({ config, rowFramework: '0g-harness' }, async (a) => {
+    const { c, signed } = client(a.port);
+    await assert.rejects(
+      c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY }),
+      /framework "0g-harness" is not offered by this attestor/,
+    );
+    assert.equal(signed.length, 0, 'nothing was signed');
+  });
+});
+
 test('a row with no framework still gets the default image', async () => {
   const config = { sandbox_snapshot: '0g-sealed', secret_env_scheme: SECRET_ENV_SCHEME };
   await withAttestor({ config, rowFramework: null }, async (a) => {

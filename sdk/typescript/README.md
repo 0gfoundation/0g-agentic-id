@@ -314,6 +314,17 @@ await agent.task!(taskId);                        // poll {status, output_text}
 for await (const d of agent.followTask!(taskId)) process.stdout.write(d);  // re-attach: replay + live
 await agent.cancelTask!(taskId);                  // stop the turn
 
+// The agent's own work (0g-harness): turns it opens by itself (a background job
+// finished, a reminder came due) and what runs in the background. Each method
+// is present only when /hello declares its kind (inbox / events / tasks /
+// schedules) and this handle holds the owner key:
+const box = await agent.inbox!();                 // unread messages + the cursor
+if (box.data.length) await agent.ackInbox!(box.data[box.data.length - 1].seq);  // read, for every client
+for await (const e of agent.events!({ after: box.cursor, signal })) { /* inbox.message, turn.*, task.updated, … */ }
+await agent.tasks!();                             // turns, commands, subagents: who did each, who asked
+await agent.stopTask!('subagent-1');              // one task; stopAllTasks() for everything running
+await agent.schedules!();                         // reminders the agent set for itself
+
 // opinionated shortcuts over client():
 const auth = await ag.agent.authenticate(agentId);   // mints the owner token up front (needs a wallet)
 const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (never attaches a token)
