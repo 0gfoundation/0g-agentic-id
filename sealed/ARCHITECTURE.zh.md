@@ -642,9 +642,11 @@ README 的 sweep 部分）。
 
 —— 一句话：**handleDrift 决定 "现在是什么状态"，runHeartbeat 负责 "定期告诉别人"**。两个不互相覆盖，因为它们读写的是同一个 `currentStatus`，谁动了对方下次也能看到。
 
-attestor 那侧 15min 没收到任何 `/status` 就把 deployment flip 成
-`Failed { reason: "heartbeat timeout (15min)" }` 并广播 `ContainerFailed`
-事件 —— 这是 sealed 真挂了（进程死、网络全断）才会发生。
+attestor 那侧，worker sweep 会把 15 min 没有 `/status` 的 deployment 与它的
+sandbox 对账（见 attestor README）：sandbox 处于 started 但 `/healthz` 也不可达，
+就标为 `Failed` 并删除 sandbox，同时广播 `ContainerFailed` 事件。只有 provider
+提供 attestor TLS 声明时上报才能到达，所以 provider 不提供声明期间、以及它恢复提供
+后的 15 min 内，sweep 不会根据过期心跳采取行动。
 
 ### `handleDrift` 的三态 severity
 

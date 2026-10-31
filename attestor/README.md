@@ -61,6 +61,21 @@ learns from its next heartbeat that its job was reaped and drops the job;
 `done`/`failed` only ever replace `running`, so its late result never
 overwrites the reaped row.
 
+The sweep also reconciles each running deployment whose container has sent
+no `/status` for 15 min against its sandbox. The provider's answer decides
+when it gives one: a deleted sandbox marks the agent failed, an `error`
+sandbox marks it failed and deletes the sandbox, and any other state that is
+not running marks it stopped, so the owner can resume it. A started sandbox,
+or one the provider cannot report, is decided by the agent's `/healthz`:
+unreachable marks the agent failed and deletes the sandbox. That verdict
+rests on the stale heartbeat, and a container can report only while the
+provider serves a valid attestor TLS statement, which sealed pins this
+attestor with. So the worker asks the provider for that statement on every
+sweep and acts on a stale heartbeat only once the provider has served it at
+every check for the last 15 min; that wait also follows every worker start.
+A provider outage therefore leaves running agents running rather than
+marking them offline. The provider's own answers do not wait.
+
 Upgrading from a release that encrypted job payloads: drain the queue first.
 Stop the api and indexer services so no new jobs arrive (the indexer resumes
 from its checkpoint, so no event is lost) and leave the worker running. That
@@ -140,6 +155,14 @@ go on until each check passes.
    `request expired before it ran — sign it again`; the 0.2.2 CLI keeps
    waiting for the new container until its limit, then says the agent did not
    come online and to run the reset again.
+
+   Until its owner resets it, a container created before 1.4 keeps running,
+   but the 1.4 attestor refuses its status reports (their token format
+   predates 1.4), so its heartbeat stays stale and only the `/healthz` probe
+   keeps it `running`: a failed probe marks it offline and deletes its
+   container, as for any agent whose heartbeat is stale (see the sweep
+   above). Its state on chain and in storage is kept, and a reset brings it
+   back, so ask owners to reset soon.
 
 **Rolling back.** The 1.4 attestor is one-way: its schema drops columns a
 1.3 attestor reads (`inference_provider_registry.acceptance_mac`,

@@ -331,20 +331,20 @@ impl AttestorTlsRelay {
         previous: Option<&Cached>,
         now: u64,
     ) -> anyhow::Result<Cached> {
-        let body = self.source.fetch(provider).await?;
-        let statement = Statement::parse(&body)?;
-        statement.verify(provider, self.chain_id, self.registry_address, now)?;
+        let (body, statement) = fetch_checked(
+            self.source.as_ref(),
+            provider,
+            self.chain_id,
+            self.registry_address,
+            now,
+        )
+        .await?;
         if let Some(previous) = previous.filter(|p| p.provider == provider) {
             anyhow::ensure!(
                 statement.issued_at >= previous.issued_at,
                 "provider served an older statement than the cached one"
             );
         }
-        let own = self.source.own_tls_spki().await?;
-        anyhow::ensure!(
-            statement.pins(&own),
-            "provider statement does not pin this attestor's TLS key"
-        );
         Ok(Cached {
             provider,
             body: body.into(),
@@ -370,6 +370,48 @@ impl AttestorTlsRelay {
             Err(error) => tracing::error!(%provider, ?error, "attestor tls self-check: no valid provider statement; containers cannot reach this attestor (check the provider's GET /api/attestor-tls)"),
         }
     }
+}
+
+/// Fetch `provider`'s statement from `source` and apply every rule sealed
+/// applies that the attestor can check itself: scope, signer and lease, and
+/// that it pins this attestor's current TLS key.
+async fn fetch_checked(
+    source: &dyn StatementSource,
+    provider: Address,
+    chain_id: u64,
+    registry_address: Address,
+    now: u64,
+) -> anyhow::Result<(Vec<u8>, Statement)> {
+    let body = source.fetch(provider).await?;
+    let statement = Statement::parse(&body)?;
+    statement.verify(provider, chain_id, registry_address, now)?;
+    let own = source.own_tls_spki().await?;
+    anyhow::ensure!(
+        statement.pins(&own),
+        "provider statement does not pin this attestor's TLS key"
+    );
+    Ok((body, statement))
+}
+
+/// Whether the discovered provider serves, right now, a statement the relay
+/// would hand to sealed. Unlike [`AttestorTlsRelay::statement`] it keeps no
+/// cache, so it reports an outage as soon as it starts. Without such a
+/// statement no container can report its status, which the worker's
+/// heartbeat sweep needs to know before it reads a stale heartbeat as a dead
+/// agent.
+pub async fn check_source(
+    source: &dyn StatementSource,
+    chain_id: u64,
+    registry_address: Address,
+) -> anyhow::Result<()> {
+    let provider = source.provider().await?;
+    let (_, statement) =
+        fetch_checked(source, provider, chain_id, registry_address, unix_now()).await?;
+    anyhow::ensure!(
+        unix_now() + SERVE_MARGIN_SECS < statement.expires_at,
+        "provider statement is about to expire"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -698,6 +740,30 @@ mod tests {
             Err(RelayError::Unavailable)
         );
         assert_eq!(source.fetches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn check_source_asks_the_provider_every_time_and_applies_the_relay_rules() {
+        let now = unix_now();
+        let (source, _) = make_relay(live(&[B256::repeat_byte(1)], now, now + 288));
+        let check = |chain_id| check_source(source.as_ref(), chain_id, Address::repeat_byte(9));
+        assert!(check(16602).await.is_ok());
+        assert!(check(16602).await.is_ok());
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 2, "never cached");
+        assert!(check(1).await.is_err());
+
+        // Unreachable provider, discovery down, an unpinned attestor key, and
+        // a statement the relay would no longer serve.
+        source.set_body(Err("provider 502".into()));
+        assert!(check(16602).await.is_err());
+        source.set_body(Ok(live(&[B256::repeat_byte(1)], now, now + 288)));
+        source.provider_fails.store(true, Ordering::SeqCst);
+        assert!(check(16602).await.is_err());
+        source.provider_fails.store(false, Ordering::SeqCst);
+        source.set_body(Ok(live(&[B256::repeat_byte(2)], now, now + 288)));
+        assert!(check(16602).await.is_err());
+        source.set_body(Ok(live(&[B256::repeat_byte(1)], now - 290, now + 12)));
+        assert!(check(16602).await.is_err());
     }
 
     #[tokio::test]

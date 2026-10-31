@@ -50,6 +50,17 @@ storage/mint stage），让 `/retry` 能恢复；给没有 provision deadline �
 worker 会从下一次 heartbeat 得知自己的 job 已被 reap，随即放弃该 job；
 `done`/`failed` 只会替换 `running`，所以它迟到的结果不会覆盖被 reap 的行。
 
+sweep 还会把容器已经 15 min 没有发 `/status` 的 running deployment 与它的 sandbox
+对账。provider 给出答复时以它为准：sandbox 已删除则把 agent 标为 failed；sandbox 处于
+`error` 则标为 failed 并删除 sandbox；其他非运行状态标为 stopped，owner 可以 resume。
+sandbox 处于 started，或 provider 查不到它的状态时，由 agent 的 `/healthz` 决定：
+不可达就把 agent 标为 failed 并删除 sandbox。这个判断依赖心跳过期，而容器只有在
+provider 提供有效的 attestor TLS 声明（sealed 用它 pin 这个 attestor）时才能上报。
+因此 worker 每轮 sweep 都向 provider 取这份声明，只有在过去 15 min 的每次检查中
+provider 都提供了它，才把过期心跳当作故障；每次 worker 启动后也要先等这 15 min。
+provider 故障期间，running 的 agent 因此保持 running，不会被标为 offline。provider
+自己的答复不受这个等待影响。
+
 从加密 job payload 的旧版本升级时，先排空队列：停掉 api 和 indexer 服务，
 不再进新 job（indexer 从 checkpoint 继续，不会漏事件），worker 保持运行。
 旧版 worker 开始一个 job 时打 `claimed job`，只在失败时再打一行
@@ -110,6 +121,12 @@ worker 日志即可。
    请 owner 错开 reset：worker 一次只跑一个 job，签名后约 150 s 内没开始执行的 reset
    会被丢弃，agent 保持原样。控制台显示 `request expired before it ran — sign it again`；
    0.2.2 的 CLI 会一直等新容器直到超时，然后提示 agent 没有上线、请重新 reset。
+
+   owner reset 之前，1.4 之前创建的容器会继续运行，但 1.4 attestor 拒绝它的状态上报
+   （其 token 格式早于 1.4），所以它的心跳一直是过期的，只靠 `/healthz` 探测维持
+   `running`：和任何心跳过期的 agent 一样（见上文 sweep），探测失败就会把它标为
+   offline 并删除容器。它在链上和存储中的状态都保留，reset 即可恢复，所以请 owner
+   尽快 reset。
 
 **回滚。**1.4 attestor 是单向的：它的 schema 删除了 1.3 attestor 要读的列
 （`inference_provider_registry.acceptance_mac`、`deployments.container_pubkey_mac`），
