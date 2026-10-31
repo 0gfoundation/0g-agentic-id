@@ -72,9 +72,11 @@ worker 日志即可。
 1. **镜像。**为每个框架构建 sealed 镜像，注册为 provider snapshot，并用
    `addValidFrameworkHash` 加入其镜像哈希。检查：每个镜像的
    `isValidFrameworkHash(<hash>)` 都返回 `true`。
-2. **配置。**把 `ATTESTOR_SANDBOX_SNAPSHOT` 和 `ATTESTOR_FRAMEWORKS` 指向新的
-   snapshot，使用本版本发布的框架名。检查：升级后 `GET /config` 列出每个框架及其新
-   snapshot。
+2. **配置。**在第 4 步升级 attestor 之前，把 `ATTESTOR_SANDBOX_SNAPSHOT` 和
+   `ATTESTOR_FRAMEWORKS` 指向新的 snapshot，使用本版本发布的框架名。harness 框架现在叫
+   `0g-harness`：仍写着 `dsh` 的条目（testnet 上是 `dsh:0g-sealed-dsh`）会让 api、
+   worker 和 indexer 启动失败，需替换为 `0g-harness:<新的 0g-harness snapshot>`。检查：
+   升级后 `GET /config` 列出每个框架及其新 snapshot。
 3. **暂停并排空。**公告一个窗口，期间 owner 不部署也不 reset：provider 与 attestor
    版本不一致时 create 会失败，无论哪一方先升级。按上文排空 job 队列。
 4. **在该窗口内升级 provider 和 attestor。**检查：`GET <provider>/api/attestor-tls`
@@ -98,8 +100,8 @@ worker 日志即可。
 
 **回滚。**1.4 attestor 是单向的：它的 schema 删除了 1.3 attestor 要读的列
 （`inference_provider_registry.acceptance_mac`、`deployments.container_pubkey_mac`），
-在同一数据库上启动的 1.3 attestor 读不了 provider registry；它也无法验证 1.4 创建的容器
-的 v3 证书，也解码不了 1.4 的 job。某一步检查失败时，按该步的处理方法向前修复，不要重新
+在同一数据库上启动的 1.3 attestor 读不了 provider registry，且 `dsh` 行已改名为
+`0g-harness`；它也无法验证 1.4 创建的容器的 v3 证书，也解码不了 1.4 的 job。某一步检查失败时，按该步的处理方法向前修复，不要重新
 部署 1.3 镜像。
 
 ## Workspace

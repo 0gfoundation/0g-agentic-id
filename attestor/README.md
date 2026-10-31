@@ -88,10 +88,13 @@ go on until each check passes.
 1. **Images.** Build each framework's sealed image, register it as a provider
    snapshot and add its image hash with `addValidFrameworkHash`. Check:
    `isValidFrameworkHash(<hash>)` returns `true` for every image.
-2. **Configuration.** Point `ATTESTOR_SANDBOX_SNAPSHOT` and
-   `ATTESTOR_FRAMEWORKS` at the new snapshots, under the framework names the
-   release ships. Check: after the roll, `GET /config` lists every framework
-   with its new snapshot.
+2. **Configuration.** Before the attestor is rolled in step 4, point
+   `ATTESTOR_SANDBOX_SNAPSHOT` and `ATTESTOR_FRAMEWORKS` at the new snapshots,
+   under the framework names the release ships. The harness framework is now
+   `0g-harness`: an entry still named `dsh` (testnet has
+   `dsh:0g-sealed-dsh`) stops the api, worker and indexer at startup, so
+   replace it with `0g-harness:<the new 0g-harness snapshot>`. Check: after
+   the roll, `GET /config` lists every framework with its new snapshot.
 3. **Pause and drain.** Announce a window in which owners neither deploy nor
    reset: creates fail while the provider and the attestor run different
    versions, in either order. Drain the job queue as described above.
@@ -124,8 +127,9 @@ go on until each check passes.
 **Rolling back.** The 1.4 attestor is one-way: its schema drops columns a
 1.3 attestor reads (`inference_provider_registry.acceptance_mac`,
 `deployments.container_pubkey_mac`), so a 1.3 attestor started on the same
-database fails to read the provider registry; it also cannot verify the v3
-certificates of the containers 1.4 created, and cannot decode 1.4 jobs. If a
+database fails to read the provider registry, and finds `dsh` rows renamed
+to `0g-harness`; it also cannot verify the v3 certificates of the containers
+1.4 created, and cannot decode 1.4 jobs. If a
 check fails, fix forward with that step's remedy rather than redeploying the
 1.3 image.
 
