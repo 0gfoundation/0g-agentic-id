@@ -12,10 +12,10 @@
 //!     gets re-uploaded to OSS (same key, same on-chain `tokenURI`).
 //!
 //! Frontend decides which to sign from the deployment's phase and stages;
-//! we just dispatch, except that a `start` of a sandbox created before
-//! AgentDNA 1.4 (no boot ticket, or one without an issue time) is refused
-//! with 409: that runtime cannot provision, so only a `create` brings the
-//! agent back.
+//! we just dispatch, except that a `start` of a sandbox that does not hold
+//! the agent's current boot ticket (one created before AgentDNA 1.4, or one
+//! a reset whose create failed left on the row) is refused with 409: that
+//! container cannot provision, so only a `create` brings the agent back.
 
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
@@ -81,22 +81,23 @@ pub async fn handle(
         }
     }
 
-    // Only a sandbox created under certificate v3 (AgentDNA 1.4) can be
-    // resumed: its boot ticket carries an issue time. One created under 1.3
-    // holds a ticket without it, and one created before 1.3 has no boot
-    // authorization at all; either runs a runtime that cannot provision
-    // against this attestor, so resuming it would bill a container that goes
-    // offline at the provision timeout. Only a new container (reset) brings
-    // it back.
+    // Only the sandbox created under the agent's current boot ticket can be
+    // resumed (`BootAuthorization::holds_current_ticket`). One created before
+    // 1.3 has no boot authorization, one created under 1.3 holds a ticket
+    // without an issue time, and one a reset left on the row when its create
+    // failed holds the ticket that reset superseded; none of them can
+    // provision against this attestor, so resuming it would bill a container
+    // that goes offline at the provision timeout. Only a new container
+    // (reset) brings the agent back.
     if action == "start"
         && !state
             .deployments
             .boot_authorization(req.seal_id)
             .await?
-            .is_some_and(|a| a.ticket_issued_at.is_some())
+            .is_some_and(|a| a.holds_current_ticket(d.sandbox_id.as_deref()))
     {
         return Err(ApiError::conflict(
-            "this agent's sandbox was created before AgentDNA 1.4 and cannot be resumed; reset the agent to create a new one",
+            attestor_shared::auth::status::NOT_RESUMABLE,
         ));
     }
 
@@ -381,6 +382,31 @@ mod tests {
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert!(err.message.contains("reset the agent"), "{}", err.message);
         assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resuming_a_sandbox_that_does_not_hold_the_current_ticket_is_refused_with_409() {
+        // A reset whose create failed: the new ticket names no sandbox, and
+        // the row still names the previous one. Or the ticket names another
+        // sandbox than the row. Neither container can provision.
+        for authorized in [None, Some("sb-other")] {
+            let s = make_setup();
+            seed_boot_authorization(&s, Some(Utc::now().timestamp()));
+            s.deployments
+                .boot_authorizations
+                .lock()
+                .unwrap()
+                .get_mut(&s.seal_id)
+                .unwrap()
+                .sandbox_id = authorized.map(str::to_owned);
+            let req = signed_req(s.seal_id, &OWNER_PRIV, "start");
+            let err = handle(axum::extract::State(s.state.clone()), Json(req))
+                .await
+                .expect_err("the row's sandbox holds a superseded ticket");
+            assert_eq!(err.status, StatusCode::CONFLICT, "{authorized:?}");
+            assert!(err.message.contains("reset the agent"), "{}", err.message);
+            assert!(s.jobs.submitted.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

@@ -205,9 +205,12 @@ key. The attestor stores only its SHA-256, beside the settings version and diges
 served, and `/status` confirms settings from that record alone. Neither the token nor
 the record carries an attestor MAC. There is no v2 compatibility: release the provider,
 attestor and sealed images together and recreate every agent (the rollout steps are in
-[`README.md`](README.md#rolling-out-agentdna-14)). A `start` (resume) of a sandbox
-created before v3 (no boot ticket, or one without an issue time) is refused with 409,
-since that runtime cannot provision.
+[`README.md`](README.md#rolling-out-agentdna-14)). A `start` (resume) is accepted only
+for the sandbox the current boot ticket was issued for, which the attestor records
+when that create's sandbox is persisted and clears with every new ticket. Any other
+sandbox is refused with 409, since it cannot provision: one created before v3 (no boot
+ticket, or one without an issue time), or the previous sandbox a reset leaves on the
+row when its create fails (it holds the ticket that reset superseded).
 
 A 401 or 403 for the authorized boot (ticket, generation, a newer attempt, persisted
 sandbox and live owner all checked) is logged as `provision rejected`. While that

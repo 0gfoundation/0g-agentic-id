@@ -163,9 +163,11 @@ signer 改变则需要 owner 执行 reset。
 每次被接受的 provision 都返回一个加密给容器公钥的全新不透明状态令牌。attestor 只保存
 它的 SHA-256，旁边记录实际下发的配置版本和摘要，`/status` 只依据这条记录确认配置。
 令牌和记录都不含 attestor MAC。不兼容 v2：provider、attestor 与 sealed 镜像需同时发布，
-并重建所有 agent（升级步骤见 [`README.zh.md`](README.zh.md#升级到-agentdna-14)）。v3 之前创建的
-sandbox（没有启动票据，或票据没有签发时间）不能 `start`（resume），返回 409，因为那个
-运行时无法 provision。
+并重建所有 agent（升级步骤见 [`README.zh.md`](README.zh.md#升级到-agentdna-14)）。只有当前启动票据
+为其签发的 sandbox 才能 `start`（resume）；attestor 在该次 create 的 sandbox 落库时记录它，
+每次签发新票据时清除。其他 sandbox 一律返回 409，因为它们无法 provision：v3 之前创建的
+sandbox（没有启动票据，或票据没有签发时间），以及 reset 的 create 失败后仍留在记录上的
+旧 sandbox（它持有的是被该次 reset 取代的票据）。
 
 对已授权启动（票据、代次、更新的尝试、已落库的 sandbox 与链上实时 owner 均已校验）的
 401 或 403 会以 `provision rejected` 打日志。在该代次仍是启用代次时，记为

@@ -61,6 +61,26 @@ pub struct BootAuthorization {
     pub container_pubkey: Option<Vec<u8>>,
 }
 
+/// Why a resume (`/start` with `start`) is refused: the deployment's sandbox
+/// does not hold the agent's current boot ticket.
+pub const NOT_RESUMABLE: &str = "this agent's sandbox cannot be resumed: it was created before AgentDNA 1.4, or a later reset replaced its boot ticket; reset the agent to create a new one";
+
+impl BootAuthorization {
+    /// Whether `sandbox_id`, the deployment's current sandbox, was created
+    /// under this ticket and so can be resumed. `sandbox_id` on the
+    /// authorization is set only when a 1.4 create's sandbox is persisted,
+    /// and every new ticket clears it, so it names exactly the sandbox that
+    /// holds this ticket. Any other sandbox cannot provision: one created
+    /// under 1.3 holds a ticket without an issue time and speaks the previous
+    /// `/provision` protocol, and one left on the row by a reset whose create
+    /// failed holds the ticket that reset superseded.
+    pub fn holds_current_ticket(&self, sandbox_id: Option<&str>) -> bool {
+        self.ticket_issued_at.is_some()
+            && self.sandbox_id.is_some()
+            && self.sandbox_id.as_deref() == sandbox_id
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BootClaim {
     pub generation: i64,
