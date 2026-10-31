@@ -5115,6 +5115,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -5140,6 +5141,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -5157,6 +5159,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -5187,6 +5190,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -5590,6 +5594,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(d.container_stage, StageStatus::Failed { .. }));
+        assert!(
+            d.provision_deadline.is_none(),
+            "the spent deadline is cleared, so a later Submitted cannot match it"
+        );
+        // Moving back to Submitted (a recreate before its new deadline is
+        // written) must not be flipped by the next tick.
+        t.deployments
+            .set_container_stage(
+                B256::repeat_byte(0x01),
+                StageStatus::Submitted {
+                    tx_hash: None,
+                    at: now,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(t
+            .deployments
+            .flip_provision_timeouts(now + chrono::Duration::minutes(1), "test timeout".into())
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| *s != B256::repeat_byte(0x01)));
         // Sanity: the others are untouched.
         let d2 = t
             .deployments
@@ -5622,7 +5649,7 @@ mod tests {
         );
 
         t.deployments
-            .record_provision_error(seal, "image_hash not in whitelist".into(), true)
+            .record_provision_error(seal, "image_hash not in whitelist".into(), true, None)
             .await
             .unwrap();
 
@@ -5650,7 +5677,7 @@ mod tests {
         );
 
         t.deployments
-            .record_provision_error(seal, "stale attestation".into(), false)
+            .record_provision_error(seal, "stale attestation".into(), false, None)
             .await
             .unwrap();
 
