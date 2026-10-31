@@ -5,7 +5,7 @@ use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
     auth::status::NOT_RESUMABLE,
     oss::OssClient,
-    sandbox::SandboxError,
+    sandbox::{envelope_names_sandbox, SandboxError, NOT_CURRENT_SANDBOX},
     AgentId, ChainClient, CloneFromParams, CloneRetryParams, Config, CryptoModule, DeploymentRepo,
     EventBus, IDataArtifact, IDataInput, IntelligentData, JobCloneAuth, JobId, JobPayload,
     JobQueue, MintParams, ReapCause, ReapedJob, SandboxClient, SandboxEnvelope, SealId,
@@ -53,6 +53,33 @@ async fn recheck_job_owner(
         }
     }
     Ok(())
+}
+
+/// Refuse an owner's start or stop whose envelope names a sandbox other than
+/// `sandbox_id`, the deployment's, before the job writes anything: the
+/// provider would act on the named sandbox while the stage, the boot ticket
+/// and the status binding follow the deployment's.
+async fn refuse_other_sandbox(
+    ctx: &Ctx,
+    seal_id: SealId,
+    envelope: &SandboxEnvelope,
+    sandbox_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if envelope_names_sandbox(envelope, sandbox_id) {
+        return Ok(());
+    }
+    tracing::warn!(
+        ?seal_id,
+        ?sandbox_id,
+        "lifecycle: the envelope names another sandbox than the deployment's; not relaying it"
+    );
+    ctx.events
+        .publish(WsEvent::ContainerWarning {
+            seal_id,
+            reason: NOT_CURRENT_SANDBOX.to_string(),
+        })
+        .await?;
+    anyhow::bail!(NOT_CURRENT_SANDBOX)
 }
 
 /// A create response without a certificate for this seal leaves nothing to
@@ -237,6 +264,11 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 _ => {}
             }
             recheck_job_owner(ctx, seal_id, &sandbox_envelope).await?;
+            // The provider starts the sandbox the envelope names, and all of
+            // the bookkeeping below is for the deployment's sandbox. /start
+            // refuses an envelope for another one; the row can change after
+            // that check, so it is repeated before anything is written.
+            refuse_other_sandbox(ctx, seal_id, &sandbox_envelope, sandbox_id.as_deref()).await?;
             // Only the sandbox created under the agent's current boot ticket
             // can provision against this attestor; /start refuses the others,
             // and this keeps a job that slipped past it (or a reset that
@@ -374,6 +406,16 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             // error. Fall through to the success path so the UI doesn't flip
             // Failed and force a recreate.
             recheck_job_owner(ctx, seal_id, &sandbox_envelope).await?;
+            // The provider stops the sandbox the envelope names; the stage
+            // written below is the deployment's. Same check as /stop, repeated
+            // because the row can change while the job waits.
+            refuse_other_sandbox(
+                ctx,
+                seal_id,
+                &sandbox_envelope,
+                deployment.as_ref().and_then(|d| d.sandbox_id.as_deref()),
+            )
+            .await?;
             if let Err(e) = ctx.sandbox.stop(seal_id, &sandbox_envelope).await {
                 let msg = e.to_string();
                 let already_stopped = msg.contains("not started")
@@ -2500,12 +2542,18 @@ mod tests {
     }
 
     fn dummy_envelope(action: &str) -> SandboxEnvelope {
+        dummy_envelope_for(action, "")
+    }
+
+    /// [`dummy_envelope`] naming `resource_id`, the sandbox a start or stop
+    /// acts on.
+    fn dummy_envelope_for(action: &str, resource_id: &str) -> SandboxEnvelope {
         let canonical = serde_json::json!({
             "action": action,
             "expires_at": 9_999_999_999_i64,
             "nonce": "00000000000000000000000000000000",
             "payload": {"snapshot": "stub"},
-            "resource_id": "",
+            "resource_id": resource_id,
         });
         let bytes = serde_json::to_vec(&canonical).unwrap();
         SandboxEnvelope {
@@ -3843,7 +3891,7 @@ mod tests {
             &t.ctx,
             JobPayload::SandboxStart {
                 seal_id: seal,
-                sandbox_envelope: dummy_envelope("start"),
+                sandbox_envelope: dummy_envelope_for("start", "sb-broke"),
             },
         )
         .await
@@ -3917,7 +3965,7 @@ mod tests {
             &t.ctx,
             JobPayload::SandboxStart {
                 seal_id: seal,
-                sandbox_envelope: dummy_envelope("start"),
+                sandbox_envelope: dummy_envelope_for("start", "sb-backing-up"),
             },
         )
         .await
@@ -4019,26 +4067,92 @@ mod tests {
         generation
     }
 
+    /// The deployment's sandbox, which an owner's start or stop names.
+    async fn row_sandbox(t: &TestCtx, seal: SealId) -> String {
+        t.deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .and_then(|d| d.sandbox_id)
+            .unwrap_or_default()
+    }
+
     async fn run_start(t: &TestCtx, seal: SealId) -> anyhow::Result<()> {
+        let sandbox = row_sandbox(t, seal).await;
         run(
             &t.ctx,
             JobPayload::SandboxStart {
                 seal_id: seal,
-                sandbox_envelope: dummy_envelope("start"),
+                sandbox_envelope: dummy_envelope_for("start", &sandbox),
             },
         )
         .await
     }
 
     async fn run_stop(t: &TestCtx, seal: SealId) -> anyhow::Result<()> {
+        let sandbox = row_sandbox(t, seal).await;
         run(
             &t.ctx,
             JobPayload::SandboxStop {
                 seal_id: seal,
-                sandbox_envelope: dummy_envelope("stop"),
+                sandbox_envelope: dummy_envelope_for("stop", &sandbox),
             },
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn a_start_or_stop_for_another_sandbox_is_not_relayed_or_recorded() {
+        // The row moved to a new sandbox after /start or /stop accepted an
+        // envelope for the old one (or a caller kept a stale id). Nothing is
+        // relayed and nothing about the deployment changes.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_stopped_deployment(&t, seal, 21, "sb-new").await;
+        let generation = boot_generation(&t, seal).await;
+        let err = run(
+            &t.ctx,
+            JobPayload::SandboxStart {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope_for("start", "sb-old"),
+            },
+        )
+        .await
+        .expect_err("the envelope names another sandbox");
+        assert!(
+            err.to_string().contains("not this agent's current sandbox"),
+            "{err}"
+        );
+        assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(boot_generation(&t, seal).await, generation);
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(matches!(d.container_stage, StageStatus::Stopped { .. }));
+        assert!(d.provision_deadline.is_none());
+        assert!(warning_reasons(&t)
+            .iter()
+            .any(|r| r.contains("not this agent's current sandbox")));
+
+        t.deployments
+            .set_container_stage(seal, StageStatus::Confirmed { at: Utc::now() })
+            .await
+            .unwrap();
+        let err = run(
+            &t.ctx,
+            JobPayload::SandboxStop {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope_for("stop", "sb-old"),
+            },
+        )
+        .await
+        .expect_err("the envelope names another sandbox");
+        assert!(
+            err.to_string().contains("not this agent's current sandbox"),
+            "{err}"
+        );
+        assert_eq!(t.sandbox.stop_calls.load(Ordering::SeqCst), 0);
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(matches!(d.container_stage, StageStatus::Confirmed { .. }));
+        assert!(!emitted_container_failed(&t));
     }
 
     fn emitted_container_failed(t: &TestCtx) -> bool {
@@ -4433,7 +4547,7 @@ mod tests {
             &t.ctx,
             JobPayload::SandboxStart {
                 seal_id: seal,
-                sandbox_envelope: dummy_envelope("start"),
+                sandbox_envelope: dummy_envelope_for("start", "sb-stopped"),
             },
         )
         .await
@@ -4853,7 +4967,7 @@ mod tests {
             &t.ctx,
             JobPayload::SandboxStop {
                 seal_id: seal,
-                sandbox_envelope: dummy_envelope("stop"),
+                sandbox_envelope: dummy_envelope_for("stop", "sb-x"),
             },
         )
         .await
@@ -4889,7 +5003,7 @@ mod tests {
             &t.ctx,
             JobPayload::SandboxStop {
                 seal_id: seal,
-                sandbox_envelope: dummy_envelope("stop"),
+                sandbox_envelope: dummy_envelope_for("stop", "sb-running"),
             },
         )
         .await
@@ -5951,6 +6065,8 @@ mod tests {
         );
         let mut env = dummy_envelope("create");
         env.wallet_address = Address::repeat_byte(0x99);
+        let mut named = dummy_envelope_for("stop", "sandbox");
+        named.wallet_address = env.wallet_address;
         assert!(run(
             &t.ctx,
             JobPayload::SandboxRecreate {
@@ -5971,7 +6087,7 @@ mod tests {
             &t.ctx,
             JobPayload::SandboxStop {
                 seal_id: seal,
-                sandbox_envelope: env.clone()
+                sandbox_envelope: named.clone()
             }
         )
         .await
@@ -5991,7 +6107,7 @@ mod tests {
             &t.ctx,
             JobPayload::SandboxStart {
                 seal_id: seal,
-                sandbox_envelope: env
+                sandbox_envelope: named
             }
         )
         .await

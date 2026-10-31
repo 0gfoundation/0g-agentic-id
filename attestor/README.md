@@ -120,7 +120,12 @@ go on until each check passes.
    it, and their deploy wizard does not limit 0g-harness agents to models
    with tool use. Publish 0.2.2 and its compatibility package in the
    [release order](../sdk/typescript/MIGRATION.md#release-order), with 0.2.2
-   as the `latest` dist-tag (what `0g-agentdna update` installs). Then set
+   as the `latest` dist-tag (what `0g-agentdna update` installs). Dist-tags
+   are shared by every network, so `latest` also reaches owners on networks
+   still on 1.3 (mainnet until its own 1.4 rollout), whose attestors name the
+   harness `dsh`; 0.2.2 reads `dsh` as `0g-harness`. Until every network runs
+   1.4, publish as `latest` only a version that still works against a 1.3
+   attestor, and use another dist-tag for one that does not. Then set
    `ATTESTOR_CLI_LATEST=0.2.2` and an `ATTESTOR_CLI_NOTES` line asking CLI
    owners to update before they reset, and restart the api. Check:
    `npm view @0gfoundation/0g-agentdna dist-tags.latest` prints `0.2.2`, and
@@ -226,7 +231,7 @@ stay up.
 |---|---|---|
 | `POST /deploy` | User deploys an agent | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | Source owner mints a brand-new agent for another owner, reusing the source's on-chain iData (dataKey re-sealed to a fresh agentSeal); lands Offline for the new owner to bring online | owner EIP-191, verified against the **live on-chain `ownerOf(source)`** (not a self-declared owner) |
-| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent. A `start` (resume) is `409` unless the agent's current boot ticket was issued for the deployment's sandbox: a sandbox created before AgentDNA 1.4 (no boot ticket, or one without an issue time), or the previous sandbox a reset leaves on the row when its create fails, cannot provision, so the agent needs a reset | owner envelope, signature verified against the on-chain owner (`/retry` without an envelope is limited to idempotent attestor-side re-runs, gated by an owner-field match) |
+| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent. A `start` (resume) is `409` unless the agent's current boot ticket was issued for the deployment's sandbox: a sandbox created before AgentDNA 1.4 (no boot ticket, or one without an issue time), or the previous sandbox a reset leaves on the row when its create fails, cannot provision, so the agent needs a reset. A `start` or `stop` whose envelope `resource_id` is not the deployment's current sandbox is `409` too (the API and the worker both check), so a sandbox id kept from before a reset is never started or stopped in the agent's name | owner envelope, signature verified against the on-chain owner (`/retry` without an envelope is limited to idempotent attestor-side re-runs, gated by an owner-field match) |
 | `GET /settings?seal_id=0x…` | Owner reads the agent's configuration document and its current `version` (the base for the next write). The document is the owner's, so it is in no public tier — this is the only way to read it. The response also carries `confirmed_version` / `attempts` / `fallback_active`, so a client can tell the owner their last push did not boot, the agent is running the previous document, and pushing again is the retry | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` in `X-Auth-Message`, verified against the **live on-chain owner** |
 | `POST /settings` | Owner writes the agent's ONE configuration document. attestor stores it as an OPAQUE blob — it never parses, validates or logs the contents, so widening the settings vocabulary never touches attestor. Not on chain: configuration is re-suppliable, memory is not. Compare-and-swap: a stale base version is 409 with `current_version`, so a captured request cannot reinstate a superseded document and two clients cannot silently overwrite each other | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<sha256 of the document>` in `X-Auth-Message`, verified against the **live on-chain owner** |
 | `POST /probe` | Synchronous liveness probe; flips unreachable containers to `Failed` and preserved-but-not-running sandboxes to `Stopped` (resumable) | none |

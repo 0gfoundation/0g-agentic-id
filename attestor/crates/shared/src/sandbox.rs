@@ -105,6 +105,28 @@ pub struct CanonicalSignedMessage {
     pub resource_id: String,
 }
 
+/// Why an owner's start or stop is refused: the envelope names a sandbox
+/// other than the deployment's current one.
+pub const NOT_CURRENT_SANDBOX: &str =
+    "the signed sandbox is not this agent's current sandbox; refresh and sign again";
+
+/// Whether an owner-signed lifecycle envelope names `sandbox_id`, the
+/// deployment's current sandbox. The provider acts on the envelope's
+/// `resource_id`, while the attestor checks and records the deployment's
+/// sandbox, so a start or stop is relayed only when the two are the same.
+/// An envelope that does not decode names no sandbox, and a deployment
+/// without a sandbox has none to name.
+pub fn envelope_names_sandbox(envelope: &SandboxEnvelope, sandbox_id: Option<&str>) -> bool {
+    let Some(sandbox_id) = sandbox_id.filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(envelope.signed_message_b64.as_bytes())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CanonicalSignedMessage>(&bytes).ok())
+        .is_some_and(|canonical| canonical.resource_id == sandbox_id)
+}
+
 /// Compute the EIP-191 `personal_sign` digest for arbitrary bytes.
 ///
 /// digest = keccak256("\x19Ethereum Signed Message:\n{len}" || msg)
@@ -1452,6 +1474,19 @@ mod tests {
         // == recovered address.
         assert_eq!(envelope.wallet_address, signer.address);
     }
+    #[test]
+    fn envelope_names_only_the_sandbox_its_resource_id_carries() {
+        let env = crate::mocks::signed_envelope_for(&[0x11; 32], "start", "sb-new");
+        assert!(envelope_names_sandbox(&env, Some("sb-new")));
+        assert!(!envelope_names_sandbox(&env, Some("sb-old")));
+        assert!(!envelope_names_sandbox(&env, None));
+        let unnamed = crate::mocks::signed_envelope(&[0x11; 32], "start");
+        assert!(!envelope_names_sandbox(&unnamed, Some("")));
+        let mut garbled = env.clone();
+        garbled.signed_message_b64 = "!!!".into();
+        assert!(!envelope_names_sandbox(&garbled, Some("sb-new")));
+    }
+
     #[test]
     fn boot_ticket_is_reserved_for_attestor_create_not_owner_env() {
         let mut env =

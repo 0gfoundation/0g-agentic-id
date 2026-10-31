@@ -24,6 +24,15 @@ use std::sync::Mutex;
 /// signer's derived address — pass it as the deployment owner and/or the
 /// `MockChain::set_owner_of` value to exercise the lifecycle owner gate.
 pub fn signed_envelope(priv_bytes: &[u8; 32], action: &str) -> SandboxEnvelope {
+    signed_envelope_for(priv_bytes, action, "")
+}
+
+/// [`signed_envelope`] naming `resource_id`, the sandbox a start or stop acts on.
+pub fn signed_envelope_for(
+    priv_bytes: &[u8; 32],
+    action: &str,
+    resource_id: &str,
+) -> SandboxEnvelope {
     let sk = SigningKey::from_bytes(priv_bytes.into()).expect("valid signing key");
     let encoded = sk.verifying_key().to_encoded_point(false);
     let addr = Address::from_slice(&keccak256(&encoded.as_bytes()[1..])[12..]);
@@ -34,7 +43,7 @@ pub fn signed_envelope(priv_bytes: &[u8; 32], action: &str) -> SandboxEnvelope {
         nonce: "00000000000000000000000000000000".into(),
         payload: serde_json::Value::Object(Default::default()),
         provider: None,
-        resource_id: String::new(),
+        resource_id: resource_id.into(),
     };
     let msg_bytes = serde_json::to_vec(&canonical).expect("serialize canonical");
     let digest = crate::sandbox::eip191_digest(&msg_bytes);

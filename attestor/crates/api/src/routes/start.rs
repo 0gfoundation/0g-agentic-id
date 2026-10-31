@@ -15,12 +15,15 @@
 //! we just dispatch, except that a `start` of a sandbox that does not hold
 //! the agent's current boot ticket (one created before AgentDNA 1.4, or one
 //! a reset whose create failed left on the row) is refused with 409: that
-//! container cannot provision, so only a `create` brings the agent back.
+//! container cannot provision, so only a `create` brings the agent back. A
+//! `start` signed for a sandbox other than the deployment's is also 409.
 
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use attestor_shared::sandbox::CanonicalSignedMessage;
+use attestor_shared::sandbox::{
+    envelope_names_sandbox, CanonicalSignedMessage, NOT_CURRENT_SANDBOX,
+};
 use attestor_shared::{JobPayload, LifecycleRequest};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -99,6 +102,15 @@ pub async fn handle(
         return Err(ApiError::conflict(
             attestor_shared::auth::status::NOT_RESUMABLE,
         ));
+    }
+    // The provider starts the sandbox the owner signed for (`resource_id`),
+    // while the check above and the worker's bookkeeping follow the
+    // deployment's sandbox. A start signed for another one, such as a sandbox
+    // a reset replaced, would start a container the attestor does not track,
+    // so it is refused and the owner signs again for the current sandbox.
+    if action == "start" && !envelope_names_sandbox(&req.sandbox_envelope, d.sandbox_id.as_deref())
+    {
+        return Err(ApiError::conflict(NOT_CURRENT_SANDBOX));
     }
 
     let payload = if action == "start" {
@@ -195,12 +207,23 @@ mod tests {
     const ATTACKER_PRIV: [u8; 32] = [0x99; 32];
 
     /// A lifecycle request whose envelope is validly signed by `priv_bytes`.
+    /// A `start` names the deployment's sandbox; a `create` names none.
     fn signed_req(
         seal_id: SealId,
         priv_bytes: &[u8; 32],
         action: &str,
     ) -> attestor_shared::LifecycleRequest {
-        let env = attestor_shared::mocks::signed_envelope(priv_bytes, action);
+        let resource_id = if action == "create" { "" } else { "sb-old" };
+        signed_req_for(seal_id, priv_bytes, action, resource_id)
+    }
+
+    fn signed_req_for(
+        seal_id: SealId,
+        priv_bytes: &[u8; 32],
+        action: &str,
+        resource_id: &str,
+    ) -> attestor_shared::LifecycleRequest {
+        let env = attestor_shared::mocks::signed_envelope_for(priv_bytes, action, resource_id);
         attestor_shared::LifecycleRequest {
             seal_id,
             owner: env.wallet_address,
@@ -405,6 +428,28 @@ mod tests {
                 .expect_err("the row's sandbox holds a superseded ticket");
             assert_eq!(err.status, StatusCode::CONFLICT, "{authorized:?}");
             assert!(err.message.contains("reset the agent"), "{}", err.message);
+            assert!(s.jobs.submitted.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_signed_for_another_sandbox_is_refused_with_409() {
+        // The row's sandbox holds the current ticket, but the owner signed
+        // for another one (a sandbox id kept from before a reset). The
+        // provider would start that one while the worker tracked this one.
+        for signed_for in ["sb-stale", ""] {
+            let s = make_setup();
+            seed_boot_authorization(&s, Some(Utc::now().timestamp()));
+            let req = signed_req_for(s.seal_id, &OWNER_PRIV, "start", signed_for);
+            let err = handle(axum::extract::State(s.state.clone()), Json(req))
+                .await
+                .expect_err("the envelope names another sandbox");
+            assert_eq!(err.status, StatusCode::CONFLICT, "{signed_for:?}");
+            assert!(
+                err.message.contains("not this agent's current sandbox"),
+                "{}",
+                err.message
+            );
             assert!(s.jobs.submitted.lock().unwrap().is_empty());
         }
     }

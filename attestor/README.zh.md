@@ -95,7 +95,11 @@ worker 日志即可。
    （0.2.0、0.2.1）早于它：它们的 `reset` 可能在 worker 替换容器之前就从 1.3 容器读到
    `running` 并报告完成，部署向导也不会把 0g-harness agent 限定为支持工具调用的模型。
    按[发布顺序](../sdk/typescript/MIGRATION.zh.md#发布顺序)发布 0.2.2 及其兼容包，并让
-   `latest` dist-tag 指向 0.2.2（`0g-agentdna update` 安装的就是它）。然后设置
+   `latest` dist-tag 指向 0.2.2（`0g-agentdna update` 安装的就是它）。dist-tag 由所有网络
+   共用，所以 `latest` 也会到达仍在 1.3 的网络上的 owner（mainnet 在其自身的 1.4 升级之前
+   即是如此），这些网络的 attestor 把 harness 称为 `dsh`；0.2.2 会把 `dsh` 当作
+   `0g-harness`。在所有网络都运行 1.4 之前，只把仍能对接 1.3 attestor 的版本发布为
+   `latest`，不能对接的版本用其他 dist-tag 发布。然后设置
    `ATTESTOR_CLI_LATEST=0.2.2`，以及一行提醒 CLI 用户在 reset 前先更新的
    `ATTESTOR_CLI_NOTES`，并重启 api。检查：
    `npm view @0gfoundation/0g-agentdna dist-tags.latest` 输出 `0.2.2`，
@@ -191,7 +195,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|---|
 | `POST /deploy` | 用户部署 agent | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | 源 owner 为另一 owner 铸一个全新 agent，复用源的链上 iData（dataKey 重封给新 agentSeal）；落 Offline，由新 owner 自行上线 | owner EIP-191，校验签名者 == **链上实时 `ownerOf(source)`**（非自声明 owner） |
-| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。只有当前启动票据为其签发的 sandbox 才能 `start`（resume），否则返回 `409`：AgentDNA 1.4 之前创建的 sandbox（没有启动票据，或票据没有签发时间），以及 reset 的 create 失败后仍留在记录上的旧 sandbox，都无法 provision，需 reset | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
+| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。只有当前启动票据为其签发的 sandbox 才能 `start`（resume），否则返回 `409`：AgentDNA 1.4 之前创建的 sandbox（没有启动票据，或票据没有签发时间），以及 reset 的 create 失败后仍留在记录上的旧 sandbox，都无法 provision，需 reset。envelope 的 `resource_id` 不是该部署当前 sandbox 的 `start` 或 `stop` 同样返回 `409`（API 与 worker 都会检查），因此 reset 之前留存的 sandbox id 不会以该 agent 的名义被启动或停止 | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
 | `GET /settings?seal_id=0x…` | owner 读自己的配置文档，连带当前 `version`（下一次写要签的 base）。文档是 owner 的，不进任何公开层——只有这一条路能读。响应还带 `confirmed_version` / `attempts` / `fallback_active`：客户端据此告诉 owner「上次推送没起来、agent 正跑着上一份文档、再推一次就是重试」| owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /settings` | owner 写 agent 的那一份配置文档。attestor 只当**不透明 blob** 存：不解析、不校验、不打日志，所以扩配置词表永远不用改 attestor。不上链——配置可随时重给，记忆不行。写是 compare-and-swap：base version 过期就 409 带 `current_version`，于是抓包重放回不去旧文档，两个客户端也不会互相无声覆盖 | owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<文档 sha256>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /probe` | 同步探活：失联容器 flip 到 `Failed`；sandbox 仍保留但没在跑的 flip 到 `Stopped`（可 Resume）| 无 |
