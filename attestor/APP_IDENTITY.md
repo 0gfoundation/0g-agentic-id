@@ -44,9 +44,14 @@ waiting for another refresh, local tapp resolution, and authorization checks.
 Their chain RPC clients use 5-second connection and 30-second request timeouts.
 A timeout releases the cache lock without publishing a replacement or extending
 the previous identity lease.
-An outbound operation keeps that same snapshot for every retry. Its absolute lease
-deadline also bounds connection setup and response-body reads; expiry cancels the
-operation. A response-body failure never resends a possibly processed create.
+An outbound operation keeps that same snapshot for every retry. For an idempotent
+operation (lookup, admin delete) its absolute lease deadline also bounds connection
+setup and response-body reads; expiry cancels the operation. A non-idempotent one
+(create, owner-signed start and stop) starts no attempt once the lease has expired,
+but an attempt already sent runs to its own request timeout (120 s for create,
+30 s otherwise): the provider completes a create it received even when the attestor
+goes away, so cancelling it would leave a sandbox no record names. A response-body
+failure never resends a possibly processed create.
 
 A current node with only its node identity, or valid TLS metadata without
 `app_signer`, can remain a standby. It contributes neither service TLS pins nor the service lease;

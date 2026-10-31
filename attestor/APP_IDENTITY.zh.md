@@ -38,8 +38,11 @@ KMS appIdHash 和注册 epoch。连接要求 HTTPS、校验应用 SPKI、拒绝 
 解析和授权检查；链 RPC 连接超时为 5 秒，单请求超时为 30 秒。超时会释放缓存锁，
 不发布替换结果，也不延长此前 identity 的 lease。
 
-每次出站操作的所有重试都使用同一 snapshot，其绝对 lease deadline 同时限制连接建立
-和响应 body 读取；到期即取消操作。响应 body 失败不会重发可能已被处理的 create。
+每次出站操作的所有重试都使用同一 snapshot。对幂等操作（查询、admin delete），其绝对
+lease deadline 同时限制连接建立和响应 body 读取；到期即取消操作。对非幂等操作（create、
+owner 签名的 start 与 stop），lease 到期后不再发起新的尝试，但已发出的尝试会运行到它自己的
+请求超时（create 120 秒，其余 30 秒）：provider 收到 create 后即使 attestor 断开也会完成，
+中途取消会留下一个没有任何记录指向的 sandbox。响应 body 失败不会重发可能已被处理的 create。
 
 仅有 node identity，或已有合法 TLS metadata、尚未获取 `app_signer` 的 current 节点可保留为 standby，
 但不贡献服务 TLS pins，也不决定服务 lease；至少一个 current 节点必须具备完整服务身份。

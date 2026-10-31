@@ -6,7 +6,7 @@
 //! We still perform a defense-in-depth check at `/deploy` time so obviously
 //! bad requests are rejected before hitting the worker.
 
-use crate::retry::{retry_send, RetryPolicy};
+use crate::retry::{retry_send_starting_by, RetryPolicy};
 use crate::traits::SandboxClient;
 use crate::types::{SandboxCreateResponse, SandboxEnvelope, SandboxInfo, SealId};
 use alloy::primitives::{keccak256, Address};
@@ -199,6 +199,16 @@ fn apply_public_ports(obj: &mut serde_json::Map<String, serde_json::Value>, port
 
 /// One operation keeps the provider, URL, pins and signed envelope from one
 /// snapshot. Response bodies are consumed here too, before returning a result.
+///
+/// The snapshot's lease bounds an idempotent operation as a whole: expiry
+/// cancels it, and a caller can repeat it. A non-idempotent one
+/// (`RetryPolicy::Strict`: create, owner-signed start/stop) is bounded only
+/// in when an attempt may start. An attempt already sent runs to its own
+/// request timeout (create 120 s, otherwise the client's 30 s): the provider
+/// completes a create or start it received even when the caller goes away,
+/// so cutting the request off at the lease would leave that effect behind
+/// with no record of it (for a create, a sandbox nothing tracks that bills
+/// its owner).
 async fn send_text_in_snapshot<F>(
     connection: &crate::identity::SandboxConnection,
     op: &'static str,
@@ -208,8 +218,20 @@ async fn send_text_in_snapshot<F>(
 where
     F: FnMut() -> reqwest::RequestBuilder,
 {
+    // Explicit mock/manual connections have no discovery lease.
+    let deadline = if connection.expires_at == i64::MAX {
+        None
+    } else {
+        let expires_at = chrono::DateTime::from_timestamp(connection.expires_at, 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid sandbox snapshot expiry"))?;
+        let remaining = (expires_at - chrono::Utc::now())
+            .to_std()
+            .map_err(|_| anyhow::anyhow!("sandbox snapshot expired before {op}"))?;
+        Some(tokio::time::Instant::now() + remaining)
+    };
+    let start_by = deadline.filter(|_| policy == RetryPolicy::Strict);
     let send = async {
-        let response = retry_send(op, policy, || {
+        let response = retry_send_starting_by(op, policy, start_by, || {
             let request = request();
             async move { request.send().await }
         })
@@ -218,16 +240,9 @@ where
         let body = response.text().await?;
         Ok((status, body))
     };
-    if connection.expires_at == i64::MAX {
-        // Explicit mock/manual connections have no discovery lease.
+    let Some(deadline) = deadline.filter(|_| policy == RetryPolicy::Idempotent) else {
         return send.await;
-    }
-    let expires_at = chrono::DateTime::from_timestamp(connection.expires_at, 0)
-        .ok_or_else(|| anyhow::anyhow!("invalid sandbox snapshot expiry"))?;
-    let remaining = (expires_at - chrono::Utc::now())
-        .to_std()
-        .map_err(|_| anyhow::anyhow!("sandbox snapshot expired before {op}"))?;
-    let deadline = tokio::time::Instant::now() + remaining;
+    };
     tokio::select! {
         // Check expiry before polling send again: an elapsed retry backoff
         // must not start another request from an expired snapshot.
@@ -975,6 +990,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sent_create_completes_after_the_snapshot_lease_expires() {
+        // The provider finishes a create it received even if the attestor
+        // goes away; cutting the request off at the lease would leave a
+        // sandbox no record names.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expires_at = chrono::Utc::now().timestamp() + 1;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let past_lease = chrono::DateTime::from_timestamp(expires_at, 0).unwrap()
+                + chrono::Duration::milliseconds(500);
+            tokio::time::sleep((past_lease - chrono::Utc::now()).to_std().unwrap()).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"id\":\"sb-1\"}")
+                .await
+                .unwrap();
+        });
+        let connection = crate::identity::SandboxConnection {
+            provider: Address::repeat_byte(1),
+            base_url: format!("http://{address}"),
+            registered_at: 1,
+            expires_at,
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap(),
+        };
+        let (status, body) =
+            send_text_in_snapshot(&connection, "create", RetryPolicy::Strict, || {
+                connection.http.post(&connection.base_url)
+            })
+            .await
+            .expect("a create already sent runs to its own timeout");
+        assert!(chrono::Utc::now().timestamp() >= expires_at);
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body, r#"{"id":"sb-1"}"#);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn snapshot_deadline_includes_response_body_without_retrying_a_processed_create() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1012,8 +1071,10 @@ mod tests {
         received_headers
             .await
             .expect("the provider must have returned success headers");
+        // The lease (2 s) does not cut the create off; the request's own
+        // timeout (4 s) ends the body read.
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("snapshot expired"), "{error:#}");
+        assert!(!error.to_string().contains("snapshot expired"), "{error:#}");
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             1,
