@@ -1,5 +1,5 @@
 /**
- * Tool-activity narration: the dsh bridge streams ": activity <kind>" SSE
+ * Tool-activity narration: 0g-harness streams ": activity <kind>" SSE
  * comments alongside the OpenAI deltas; chatStream must (a) keep yielding
  * the exact text, (b) surface activity labels through opts.onActivity, and
  * (c) stay silent-compatible — no callback, no behavior change.

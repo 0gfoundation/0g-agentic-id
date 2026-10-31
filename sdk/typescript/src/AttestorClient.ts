@@ -402,8 +402,8 @@ export class AttestorClient {
     let fw = framework;
     // An existing agent already knows what it is: its deployment row records
     // the framework. Without this read, a bare reset/start/retry of a
-    // hermes/prime/dsh agent fell back to the DEFAULT (openclaw) image and
-    // booted a container without its framework installed (observed live,
+    // hermes/prime/0g-harness agent fell back to the DEFAULT (openclaw) image
+    // and booted a container without its framework installed (observed live,
     // agent 452) — the CLI wizard papered over it by asking; the SDK is the
     // right place for the lookup. An UNREADABLE row refuses rather than
     // falling through: silently choosing the default image re-creates the

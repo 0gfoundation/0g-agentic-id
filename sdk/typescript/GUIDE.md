@@ -739,7 +739,7 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   // `ag.agent.clearConversation(base, agentId)` (CLI `/clear`) wipes it
   // without a reset; chain-tracked memory is untouched.
   // `ag.agent.compactConversation(base, agentId)` (CLI `/compact`) keeps it
-  // but has the framework summarize the older part now (dsh, openclaw from
+  // but has the framework summarize the older part now (0g-harness, openclaw from
   // 2026.7.1; other frameworks answer 501). One or more model calls — it can
   // take minutes, longer than Node's fetch waits for an answer (300s); the
   // compaction finishes anyway, and the runtime log has the outcome. HTTP 409
@@ -819,6 +819,36 @@ reads only the **last user message** of the `messages` array you send. So
 does not rewind or branch the conversation the way it does against openclaw or
 hermes (which are real OpenAI-compatible servers). Turns are also serialized
 per agent, since one SDK session is one conversation.
+
+**0g-harness** is stateful in the same way, and its agents also work on their own.
+With the owner's `toolJobs`, `subagents` or `schedule` switches on (the
+settings document's `others`), a 0g-harness agent runs commands and read-only
+subagents in the background and sets itself reminders. When one finishes or
+comes due while the agent is idle, the agent opens a turn that no message
+asked for, and its words go to the agent's inbox. The handle exposes that
+surface. Each method is present only when `/hello` declares its kind
+(`inbox`, `events`, `tasks`, `schedules`; the other frameworks declare none)
+and the handle holds the owner key:
+
+```ts
+const box = await agent.inbox!();      // { data, unread, read_through, cursor }: unread messages, oldest first
+await agent.ackInbox!(lastSeq);        // the read position is the agent's: every client sees the same unread count
+
+// The live feed: resumes from the last event after a cut or a stall, and
+// runs until the signal aborts.
+for await (const e of agent.events!({ after: box.cursor, signal })) {
+  if (e.type === 'inbox.message') { /* e.data: an AgentInboxMessage */ }
+  if (e.type === 'reset') { /* the agent could not serve the position: re-read the inbox */ }
+}
+
+const tasks = await agent.tasks!({ status: 'active' });
+// every turn (yours and the agent's), command (bash-N) and subagent (subagent-N):
+// actor = who does the work (agent | subagent), trigger = who asked
+await agent.taskInfo!('subagent-1');   // includes a finished subagent's answer
+await agent.stopTask!('bash-2');       // a turn is cancelled, a command or subagent is killed
+await agent.stopAllTasks!();           // everything running
+await agent.schedules!();              // { enabled, data }: the reminders the agent set for itself
+```
 
 ## Agents as owners (nested agents)
 
@@ -951,7 +981,7 @@ For the old CLI update path and automatic local-config migration, see
 
 Two levels. The **manager** (`0g-agentdna>`): `list` (public listing with sealIds and the same FRAMEWORK/AGENTSEAL/OWNER columns as `0g-agentdna list`, `⇄ #<agentId>` on agent-owned agents, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `settings <id> [key=value …]` (show or change the agent's configuration document), `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login [provider]` (guided setup: attestor URL → owner key → provider → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
 
-The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/compact` (keep the conversation but have the framework summarize its older part now — dsh, and openclaw 2026.7.1 or later; one or more model calls, can take minutes) `/tasks` `/result [id]` `/cancel [id]` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
+The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/compact` (keep the conversation but have the framework summarize its older part now — 0g-harness, and openclaw 2026.7.1 or later; one or more model calls, can take minutes) `/tasks` `/result [id]` `/cancel [id|all]` `/inbox [all]` `/schedules` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed. On a 0g-harness agent, what the agent says on its own (a background job finished, a reminder came due) prints above the prompt as it arrives, and what came while you were away prints when you enter; `/tasks` lists every turn, background command and subagent with who did it, `/cancel <id>` stops any of them and `/cancel all` everything running. On the other frameworks `/inbox` and `/schedules` say the agent has none.
 
 Configuration persists under `~/.config/0g-agentdna/` — `config.json` (attestor URL), `credentials` (owner key + provider-scoped inference keys, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. `rate` checks a ticket on what the registry checks — expiry and the signature — and discards one that fails on its own merits (bad signature — e.g. one banked from a pre-1.2.0 sealed image — or expiry), but keeps one that fails only because no VerifiedFeedbackRegistry, or a different one, is configured on this side. A ticket whose data hashes the agent has since replaced (it commits state drift every 30 s) still redeems — the registry records the version that served you without comparing it to current chain state — so `rate` only notes it and goes ahead. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 
