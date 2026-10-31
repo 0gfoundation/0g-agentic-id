@@ -107,7 +107,7 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 | `hello <id>` | hit any agent's public `/hello`; with a wallet configured, banks a rating ticket |
 | `call <id> [path] [json-body]` | call an agent's registered public service; bare `call` lists its services; responses bank tickets |
 | `rate <id> [score] [/endpoint]` | spend a ticket to rate on-chain — **no interaction, no rating** |
-| `start` / `stop` / `reset` / `retry <id>` | container lifecycle (owner-signed; on-chain identity unchanged) |
+| `start` / `stop` / `reset` / `retry <id>` | container lifecycle (owner-signed; on-chain identity unchanged). `reset` of an agent with no settings document (e.g. a fresh clone) first stores the default pin `provider=0g-compute model=0gm-1.0-35b-a3b` |
 | `clone` / `transfer` / `grant` / `revoke` / `authorizer` | clone, transfer, clone-authorization management |
 | `settings <id> [k=v …]` | same semantics as the subcommand |
 | `balance` / `deposit [og]` / `withdraw [og]` | prepaid account: balance + burn rate / fund / refund withdrawal (time-locked; bare argument claims everything) |

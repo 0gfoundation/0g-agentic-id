@@ -249,7 +249,7 @@ await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3
 });                                   // → { version: 12 }
 ```
 
-**Whole-document write.** `setSettings` replaces the document — read it first and spread it to change one field.
+**Whole-document write.** `setSettings` replaces the document — read it first and spread it to change one field. A `thinking` outside `low|high|max` (case-insensitive, as the container compares it) is refused before signing.
 
 **Who may read or write it.** Owner-signed, both directions, against the **live on-chain owner** read at request time — so a seller cannot keep configuring (or reading) an agent they already sold. The SDK signs `AgenticID.Settings.v1:<sealId>:<ts>:<base_version>:<sha256 of the document>` (EIP-191) for a write, and the same message minus the digest for a read (`GET /settings`, no body, base version 0). A rejected call is a clearly-worded HTTP 401. The document is on **no** listing tier and on no public deployment row: `getSettings` is the only way to read it.
 
@@ -492,8 +492,9 @@ deploy** (nor at `reset`/`retry`): at deploy the SDK resolves the right image
 for your `framework` from `GET /config`'s `frameworks[]` (each entry
 `{ name, image? }`; no image → the default snapshot). For an EXISTING agent,
 `reset`/`start`/`retry` need neither — the SDK reads the framework off the
-agent's own deployment row and resolves the same way (an unreadable row
-refuses rather than guessing the default). Pass `framework` only to override
+agent's own deployment row and resolves the same way (an unreadable row, or
+a framework `/config.frameworks[]` does not list, refuses rather than
+guessing the default). Pass `framework` only to override
 the row, and `sandbox.sealedImage` (or `sealedImage` on reset/retry) only to
 pin a specific image. Which frameworks are live is whatever
 `/config.frameworks[]` advertises.
