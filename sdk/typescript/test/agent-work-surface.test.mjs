@@ -26,13 +26,14 @@ import { PassThrough, Writable } from 'node:stream';
 
 import { makeAgentClient } from '../dist/AgentClient.js';
 import {
+  frameworkNeedsToolModels,
   makeInboxFeed,
   printAbovePrompt,
   renderInboxMessage,
   renderSchedules,
   renderTaskTable,
 } from '../dist/cli/commands/interactive.js';
-import { assertOthersFitFramework, parseAssignments } from '../dist/cli/settings.js';
+import { assertOthersFitFramework, isHarnessFramework, parseAssignments } from '../dist/cli/settings.js';
 
 const HARNESS_ROUTES = [
   { prefix: '/v1/', kind: 'chat', auth: 'bearer', signed: false },
@@ -559,10 +560,23 @@ test('0g-harness switches in others= are refused for an agent known to run anoth
   assert.throws(() => assertOthersFitFramework(a('{"toolJobs": true, "schedule": true}'), 'hermes'), (e) =>
     /"toolJobs", "schedule" are 0g-harness switches; this agent runs hermes, which does not read them$/.test(e.message));
 
-  // fine: 0g-harness itself, an unknown framework, another framework's own keys, a clear
+  // fine: 0g-harness itself (also under dsh, its name on a network still on 1.3,
+  // whose adapter reads toolJobs and maxParallelToolCalls), an unknown
+  // framework, another framework's own keys, a clear
   assertOthersFitFramework(a('{"subagents": true}'), '0g-harness');
+  assertOthersFitFramework(a('{"toolJobs": true, "maxParallelToolCalls": 4}'), 'dsh');
   assertOthersFitFramework(a('{"subagents": true}'), undefined);
   assertOthersFitFramework(a('{"subagents": true}'), null);
   assertOthersFitFramework(a('{"agents": {"defaults": {}}}'), 'openclaw');
   assertOthersFitFramework(parseAssignments(['others=', 'model=x']), 'openclaw');
+});
+
+test('dsh, the harness name on a network still on AgentDNA 1.3, is the harness', () => {
+  assert.equal(isHarnessFramework('0g-harness'), true);
+  assert.equal(isHarnessFramework('dsh'), true);
+  assert.equal(isHarnessFramework('openclaw'), false);
+  assert.equal(isHarnessFramework(null), false);
+  // the deploy wizard offers a harness agent only models with tool use, under either name
+  for (const fw of ['openclaw', '0g-harness', 'dsh', 'prime-agent']) assert.equal(frameworkNeedsToolModels(fw), true, fw);
+  assert.equal(frameworkNeedsToolModels('hermes'), false);
 });
