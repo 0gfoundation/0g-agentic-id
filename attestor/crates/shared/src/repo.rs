@@ -676,6 +676,78 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         Ok(out)
     }
 
+    async fn resolve_abandoned_stages(
+        &self,
+        seal_id: SealId,
+        starts_identity: bool,
+        reason: String,
+        now: DateTime<Utc>,
+        container_deadline: DateTime<Utc>,
+    ) -> anyhow::Result<AbandonedStages> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        let Some(row) = sqlx::query(
+            "SELECT storage_stage, mint_stage, container_stage, provision_deadline
+             FROM deployments WHERE seal_id = $1 FOR UPDATE",
+        )
+        .bind(seal_id.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(AbandonedStages::default());
+        };
+        let mut storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
+        let mut mint: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
+        let container: StageStatus = serde_json::from_value(row.try_get("container_stage")?)?;
+        let mut deadline: Option<DateTime<Utc>> = row.try_get("provision_deadline")?;
+
+        let failed = StageStatus::Failed { at: now, reason };
+        let mut out = AbandonedStages::default();
+        if matches!(storage, StageStatus::Submitted { .. })
+            || (starts_identity && matches!(storage, StageStatus::NotStarted))
+        {
+            storage = failed.clone();
+            out.storage_failed = true;
+        }
+        if starts_identity && matches!(mint, StageStatus::NotStarted) {
+            mint = failed;
+            out.mint_failed = true;
+        }
+        if matches!(container, StageStatus::Submitted { .. }) && deadline.is_none() {
+            // Same guard as `set_provision_deadline`: a container that has
+            // already provisioned is never given a deadline.
+            let provisioned: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM container_status_bindings
+                 WHERE seal_id=$1 AND enabled=TRUE AND binding_hash IS NOT NULL)",
+            )
+            .bind(seal_id.as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !provisioned {
+                deadline = Some(container_deadline);
+                out.container_deadline_set = true;
+            }
+        }
+        if out == AbandonedStages::default() {
+            return Ok(out);
+        }
+        let phase = derive_phase(&storage, &mint, &container);
+        sqlx::query(
+            "UPDATE deployments
+             SET storage_stage = $2, mint_stage = $3, provision_deadline = $4,
+                 phase = $5, updated_at = now()
+             WHERE seal_id = $1",
+        )
+        .bind(seal_id.as_slice())
+        .bind(serde_json::to_value(&storage)?)
+        .bind(serde_json::to_value(&mint)?)
+        .bind(deadline)
+        .bind(phase.serde_tag())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
     async fn mark_heartbeat(&self, seal_id: SealId, now: DateTime<Utc>) -> anyhow::Result<()> {
         // Touch updated_at too — heartbeats are themselves a form of
         // mutation, and keeping the two timestamps coherent simplifies
@@ -1161,6 +1233,89 @@ mod settings_retry_tests {
             if url.contains('?') { '&' } else { '?' },
             hex::encode(rand::random::<[u8; 8]>())
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_abandoned_job_stages_never_touch_a_submitted_mint() {
+        let pool = connect(&test_database_url()).await.unwrap();
+        let repo = PostgresDeploymentRepo::new(pool.clone());
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::minutes(5);
+        let submitted =
+            |tx_hash| serde_json::to_value(StageStatus::Submitted { tx_hash, at: now }).unwrap();
+
+        // Died mid-deploy: upload in flight, mint broadcast, create in flight.
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner,storage_stage,mint_stage,container_stage) VALUES($1,$2,$2,$3,$4,$5)")
+            .bind(seal.as_slice()).bind(Address::ZERO.as_slice())
+            .bind(submitted(None)).bind(submitted(Some(B256::repeat_byte(1)))).bind(submitted(None))
+            .execute(&pool).await.unwrap();
+        assert_eq!(
+            repo.resolve_abandoned_stages(seal, true, "abandoned".into(), now, deadline)
+                .await
+                .unwrap(),
+            AbandonedStages {
+                storage_failed: true,
+                mint_failed: false,
+                container_deadline_set: true
+            }
+        );
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(d.storage_stage.is_failed());
+        assert!(matches!(
+            d.mint_stage,
+            StageStatus::Submitted {
+                tx_hash: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(d.container_stage, StageStatus::Submitted { .. }));
+        assert_eq!(
+            d.provision_deadline.map(|t| t.timestamp()),
+            Some(deadline.timestamp())
+        );
+        assert_eq!(d.phase, DeploymentPhase::Failed);
+        assert_eq!(
+            repo.resolve_abandoned_stages(seal, true, "again".into(), now, deadline)
+                .await
+                .unwrap(),
+            AbandonedStages::default()
+        );
+
+        // Never started: only a job that starts the identity tracks fails them.
+        let fresh = B256::from(rand::random::<[u8; 32]>());
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner) VALUES($1,$2,$2)")
+            .bind(fresh.as_slice())
+            .bind(Address::ZERO.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.resolve_abandoned_stages(fresh, false, "abandoned".into(), now, deadline)
+                .await
+                .unwrap(),
+            AbandonedStages::default()
+        );
+        assert_eq!(
+            repo.resolve_abandoned_stages(fresh, true, "abandoned".into(), now, deadline)
+                .await
+                .unwrap(),
+            AbandonedStages {
+                storage_failed: true,
+                mint_failed: true,
+                container_deadline_set: false
+            }
+        );
+        let d = repo.get(fresh).await.unwrap().unwrap();
+        assert!(d.storage_stage.is_failed() && d.mint_stage.is_failed());
+        assert!(matches!(d.container_stage, StageStatus::NotStarted));
+
+        sqlx::query("DELETE FROM deployments WHERE seal_id = ANY($1)")
+            .bind(vec![seal.to_vec(), fresh.to_vec()])
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

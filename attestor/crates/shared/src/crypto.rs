@@ -10,7 +10,7 @@
 //! `material = chainId‖contract‖sealId` and gets back 32 bytes used directly
 //! as the secp256k1 private key. The attestor holds no fleet-wide master —
 //! only an app-scoped key (`app_key`, empty material) cached at construction
-//! for the sync helpers (job-encryption key, binding MAC).
+//! for `hmac_binding` (provision binding MAC, status boot receipt).
 
 use crate::kms::KmsClient;
 use crate::traits::CryptoModule;
@@ -40,9 +40,8 @@ pub fn seal_material(chain_id: u64, contract: Address, seal_id: SealId) -> Vec<u
 }
 
 pub struct RealCrypto {
-    /// App-scoped key (KMS empty-material), cached once at construction so the
-    /// sync helpers (`hmac_binding`, and the job key derived in main) don't
-    /// take a KMS round-trip. NOT an agentSeal source.
+    /// App-scoped key (KMS empty-material), cached once at construction so
+    /// `hmac_binding` doesn't take a KMS round-trip. NOT an agentSeal source.
     app_key: [u8; 32],
     /// KMS handle for per-seal agentSeal derivation.
     kms: Arc<dyn KmsClient>,
@@ -255,6 +254,9 @@ mod tests {
         assert_ne!(ct, pt);
         let out = crypto.aes_gcm_decrypt(&ct, &key).unwrap();
         assert_eq!(out, pt);
+        assert!(crypto
+            .aes_gcm_decrypt(&ct, &crypto.random_key_32())
+            .is_err());
     }
 
     #[tokio::test]

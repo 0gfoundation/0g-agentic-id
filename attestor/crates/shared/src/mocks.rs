@@ -960,6 +960,8 @@ pub struct InMemoryDeploymentRepo {
     pub set_agent_id_calls: AtomicU64,
     pub set_sandbox_id_calls: AtomicU64,
     pub fail_set_sandbox_id: AtomicBool,
+    /// `resolve_abandoned_stages` errors while set.
+    pub fail_resolve_abandoned_stages: AtomicBool,
     pub set_i_data_artifacts_calls: AtomicU64,
     pub update_i_data_artifacts_calls: AtomicU64,
     pub set_agent_uri_and_card_calls: AtomicU64,
@@ -992,6 +994,7 @@ impl InMemoryDeploymentRepo {
             set_agent_id_calls: AtomicU64::new(0),
             set_sandbox_id_calls: AtomicU64::new(0),
             fail_set_sandbox_id: AtomicBool::new(false),
+            fail_resolve_abandoned_stages: AtomicBool::new(false),
             set_i_data_artifacts_calls: AtomicU64::new(0),
             update_i_data_artifacts_calls: AtomicU64::new(0),
             set_agent_uri_and_card_calls: AtomicU64::new(0),
@@ -1372,6 +1375,49 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         Ok(affected)
     }
 
+    async fn resolve_abandoned_stages(
+        &self,
+        seal_id: SealId,
+        starts_identity: bool,
+        reason: String,
+        now: chrono::DateTime<chrono::Utc>,
+        container_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<AbandonedStages> {
+        if self.fail_resolve_abandoned_stages.load(Ordering::SeqCst) {
+            anyhow::bail!("mock: resolve_abandoned_stages failed");
+        }
+        let provisioned = self.status_bindings.lock().unwrap().contains_key(&seal_id);
+        let mut g = self.by_seal.lock().unwrap();
+        let Some(d) = g.get_mut(&seal_id) else {
+            return Ok(Default::default());
+        };
+        let failed = StageStatus::Failed { at: now, reason };
+        let mut out = AbandonedStages::default();
+        if matches!(d.storage_stage, StageStatus::Submitted { .. })
+            || (starts_identity && matches!(d.storage_stage, StageStatus::NotStarted))
+        {
+            d.storage_stage = failed.clone();
+            out.storage_failed = true;
+        }
+        if starts_identity && matches!(d.mint_stage, StageStatus::NotStarted) {
+            d.mint_stage = failed;
+            out.mint_failed = true;
+        }
+        if matches!(d.container_stage, StageStatus::Submitted { .. })
+            && d.provision_deadline.is_none()
+            && !provisioned
+        {
+            d.provision_deadline = Some(container_deadline);
+            out.container_deadline_set = true;
+        }
+        if out != Default::default() {
+            d.phase =
+                crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+            d.updated_at = now;
+        }
+        Ok(out)
+    }
+
     async fn set_settings(
         &self,
         seal_id: SealId,
@@ -1663,17 +1709,27 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
 // ── In-memory JobQueue ───────────────────────────────────────────────────
 //
 // Captures every `submit()` call so handlers can be asserted on the exact
-// `JobPayload` variant they enqueued. Other queue methods are stubs —
-// nothing in the test surface claims/completes jobs through this mock.
+// `JobPayload` variant they enqueued. Claim/complete/fail are stubs; the
+// reaper side is scriptable: `reap` returns every `reapable` job not yet in
+// `reap_settled`, and `heartbeat` reports a running job until
+// `heartbeat_lost` is set.
 
 pub struct InMemoryJobQueue {
     pub submitted: Mutex<Vec<JobPayload>>,
+    pub reapable: Mutex<Vec<ReapedJob>>,
+    pub reap_settled: Mutex<Vec<JobId>>,
+    pub heartbeats: AtomicU64,
+    pub heartbeat_lost: AtomicBool,
 }
 
 impl InMemoryJobQueue {
     pub fn new() -> Self {
         Self {
             submitted: Mutex::new(Vec::new()),
+            reapable: Mutex::new(Vec::new()),
+            reap_settled: Mutex::new(Vec::new()),
+            heartbeats: AtomicU64::new(0),
+            heartbeat_lost: AtomicBool::new(false),
         }
     }
 }
@@ -1705,6 +1761,28 @@ impl JobQueue for InMemoryJobQueue {
 
     async fn sweep_expired(&self, _older_than_secs: i64) -> anyhow::Result<u64> {
         Ok(0)
+    }
+
+    async fn heartbeat(&self, _job_id: JobId) -> anyhow::Result<bool> {
+        self.heartbeats.fetch_add(1, Ordering::SeqCst);
+        Ok(!self.heartbeat_lost.load(Ordering::SeqCst))
+    }
+
+    async fn reap(&self, _abandoned_after_secs: i64) -> anyhow::Result<Vec<ReapedJob>> {
+        let settled = self.reap_settled.lock().unwrap().clone();
+        Ok(self
+            .reapable
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|job| !settled.contains(&job.id))
+            .cloned()
+            .collect())
+    }
+
+    async fn mark_reap_settled(&self, job_id: JobId) -> anyhow::Result<()> {
+        self.reap_settled.lock().unwrap().push(job_id);
+        Ok(())
     }
 }
 

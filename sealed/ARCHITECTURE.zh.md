@@ -43,8 +43,8 @@ POSIX ACL 的 `root:root 0711`（`privsep.SecureHome`），或者 agent 自己�
 因为 `/status` 要用的正是这次启动拒绝去取的那把密钥签名；改由 attestor 的
 provision 超时扫描兜底：sandbox 创建或重建后 `PROVISION_TIMEOUT`（5 分钟）内
 `/provision` 没来，扫描就会接手
-（`attestor/crates/worker/src/jobs.rs:21`、
-`attestor/crates/worker/src/main.rs:166-189`）。扫描把 `container_stage` 置为
+（`attestor/crates/worker/src/jobs.rs:22`、
+`attestor/crates/worker/src/main.rs:228-254`）。扫描把 `container_stage` 置为
 `Failed`（原因 `provision timeout`），于是这条部署显示为 `offline`，而不是
 `failed`：`failed` 指部署本身没走完（存储或 mint 失败），而存储和 mint 都已落地
 的部署出了容器故障，显示的是 `offline`

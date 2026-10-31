@@ -543,6 +543,26 @@ pub trait DeploymentRepo: Send + Sync {
         generation: Option<i64>,
     ) -> anyhow::Result<Option<i32>>;
 
+    /// Settle the stages an abandoned job (`ReapCause::Abandoned`) left in
+    /// flight, in one transaction:
+    ///   - storage `Submitted` → `Failed`, so `/retry` re-uploads;
+    ///   - with `starts_identity` (`JobPayload::starts_identity`), storage
+    ///     and mint `NotStarted` → `Failed`: nothing else starts them;
+    ///   - container `Submitted` without a provision deadline gets
+    ///     `container_deadline`, under the same condition as
+    ///     `set_provision_deadline`, leaving the outcome to the
+    ///     provision-timeout sweep (the container may still provision).
+    /// Mint `Submitted` is left alone: its transaction may have landed, and
+    /// `/retry` reconciles it by receipt. Every other stage is untouched.
+    async fn resolve_abandoned_stages(
+        &self,
+        seal_id: SealId,
+        starts_identity: bool,
+        reason: String,
+        now: chrono::DateTime<chrono::Utc>,
+        container_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<AbandonedStages>;
+
     /// Read-only: running deployments whose last heartbeat is older than
     /// `now - threshold_secs`. Returns `(seal_id, sandbox_id)` so the caller
     /// (the worker's reconcile sweep) can check each sandbox's real state and
@@ -568,12 +588,34 @@ pub trait IdempotencyStore: Send + Sync {
 pub trait JobQueue: Send + Sync {
     async fn submit(&self, payload: JobPayload) -> anyhow::Result<JobId>;
     async fn claim_next(&self, worker_id: &str) -> anyhow::Result<Option<(JobId, JobPayload)>>;
+    /// Mark a running job done. A job that is no longer running (the reaper
+    /// failed it) keeps its status.
     async fn complete(&self, job_id: JobId) -> anyhow::Result<()>;
+    /// Mark a running job failed. A job that is no longer running keeps its
+    /// status and error.
     async fn fail(&self, job_id: JobId, error: &str) -> anyhow::Result<()>;
 
     /// Permanently delete done/failed jobs whose `completed_at` is older
     /// than `older_than_secs`. Returns the number of rows deleted.
     async fn sweep_expired(&self, older_than_secs: i64) -> anyhow::Result<u64>;
+
+    /// Refresh the liveness stamp of a running job. The worker calls it on
+    /// a fixed interval for as long as the job executes. `false`: the job is
+    /// no longer running (the reaper failed it), so the worker stops it.
+    async fn heartbeat(&self, job_id: JobId) -> anyhow::Result<bool>;
+
+    /// Mark failed, without requeueing, every running job whose liveness
+    /// stamp is older than `abandoned_after_secs` (`ReapCause::Abandoned`)
+    /// and every pending job whose owner envelope has expired or is about to
+    /// (`ReapCause::Expired`; the claim skips those), clearing payloads.
+    /// Returns those jobs plus every job reaped earlier whose settlement was
+    /// not recorded with `mark_reap_settled`, so a settlement that failed, or
+    /// was cut short by a worker exit, is retried on the next sweep.
+    async fn reap(&self, abandoned_after_secs: i64) -> anyhow::Result<Vec<ReapedJob>>;
+
+    /// Record that a reaped job's follow-up ran. Until then `reap` returns
+    /// the job again and the retention sweep keeps its row.
+    async fn mark_reap_settled(&self, job_id: JobId) -> anyhow::Result<()>;
 }
 
 // ── Event bus (Postgres LISTEN/NOTIFY backed) ──────────────────────────

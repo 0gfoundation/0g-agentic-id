@@ -113,6 +113,20 @@ impl std::fmt::Debug for SandboxEnvelope {
     }
 }
 
+impl SandboxEnvelope {
+    /// `expires_at` of the signed canonical message (unix seconds).
+    pub fn expires_at(&self) -> anyhow::Result<i64> {
+        use base64::Engine as _;
+        #[derive(Deserialize)]
+        struct Signed {
+            expires_at: i64,
+        }
+        let bytes =
+            base64::engine::general_purpose::STANDARD.decode(self.signed_message_b64.as_bytes())?;
+        Ok(serde_json::from_slice::<Signed>(&bytes)?.expires_at)
+    }
+}
+
 // ── /deploy ─────────────────────────────────────────────────────────────
 //
 // User-facing input shape. Public display fields (`name`/`description`/
@@ -633,7 +647,7 @@ mod tests {
 
     #[test]
     fn job_payload_clone_serde_roundtrip() {
-        // PostgresJobQueue seals+serializes JobPayload; a missing/renamed
+        // PostgresJobQueue serializes JobPayload; a missing/renamed
         // field would only surface at runtime. Lock the Clone shape here.
         let p = JobPayload::Clone {
             new_seal_id: B256::repeat_byte(1),
@@ -681,6 +695,97 @@ mod tests {
             }
             other => panic!("expected Clone, got {other:?}"),
         }
+    }
+
+    fn signed_envelope(expires_at: i64) -> SandboxEnvelope {
+        use base64::Engine as _;
+        let signed = format!(
+            r#"{{"action":"start","expires_at":{expires_at},"nonce":"00","payload":{{}},"resource_id":"sb"}}"#
+        );
+        SandboxEnvelope {
+            wallet_address: Address::ZERO,
+            signed_message_b64: base64::engine::general_purpose::STANDARD.encode(signed),
+            wallet_signature: alloy::primitives::Bytes::new(),
+        }
+    }
+
+    #[test]
+    fn only_relay_jobs_expire() {
+        let seal = B256::repeat_byte(7);
+        let env = signed_envelope(1_800_000_000);
+        let jobs = [
+            (
+                JobPayload::Deploy {
+                    seal_id: seal,
+                    owner: Address::ZERO,
+                    i_data: vec![],
+                    name: "n".into(),
+                    description: "d".into(),
+                    image: None,
+                    sandbox_envelope: Some(env.clone()),
+                },
+                None,
+            ),
+            (
+                JobPayload::SandboxStart {
+                    seal_id: seal,
+                    sandbox_envelope: env.clone(),
+                },
+                Some(1_800_000_000),
+            ),
+            (
+                JobPayload::SandboxStop {
+                    seal_id: seal,
+                    sandbox_envelope: env.clone(),
+                },
+                Some(1_800_000_000),
+            ),
+            (
+                JobPayload::SandboxRecreate {
+                    seal_id: seal,
+                    sandbox_envelope: env.clone(),
+                },
+                Some(1_800_000_000),
+            ),
+            (
+                JobPayload::ResumeDeploy {
+                    seal_id: seal,
+                    artifacts: vec![],
+                    sandbox_envelope: Some(env.clone()),
+                },
+                None,
+            ),
+            (
+                JobPayload::SandboxTeardown {
+                    seal_id: seal,
+                    expected_sandbox_id: None,
+                },
+                None,
+            ),
+            (
+                JobPayload::Clone {
+                    new_seal_id: seal,
+                    source_seal_id: B256::repeat_byte(8),
+                    target_owner: Address::ZERO,
+                    name: "n".into(),
+                    description: "d".into(),
+                    image: None,
+                    authorization: JobCloneAuth::Owner,
+                },
+                None,
+            ),
+        ];
+        for (job, expiry) in jobs {
+            assert_eq!(job.expires_at().unwrap(), expiry, "{}", job.kind());
+        }
+        let mut unreadable = signed_envelope(0);
+        unreadable.signed_message_b64 = "not base64".into();
+        assert!(JobPayload::SandboxStop {
+            seal_id: seal,
+            sandbox_envelope: unreadable,
+        }
+        .expires_at()
+        .is_err());
     }
 
     #[test]
@@ -1287,11 +1392,11 @@ pub struct ReceiptSummary {
 
 // ── Jobs ────────────────────────────────────────────────────────────────
 //
-// JobPayload travels plaintext in-memory; `PostgresJobQueue` wraps it in
-// AES-GCM(job_key) before writing the `jobs.payload` Postgres column, so
-// at-rest confidentiality covers the whole payload (i_data plaintexts,
-// sandbox envelope user-supplied env vars, etc.) without callers doing
-// per-field crypto.
+// `PostgresJobQueue` stores JobPayload as plain JSON in `jobs.payload`. The
+// attestor's Postgres lives on the tapp FDE volume (`x-tapp: data:
+// encrypted` in docker-compose.yml). A payload carries iData plaintexts and
+// owner envelopes (with their user-supplied env), so a row holds it only
+// while the job is pending: claiming the job, or failing it unrun, clears it.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1356,8 +1461,8 @@ pub enum JobPayload {
         /// Pre-mint resume context, carried by the job itself. Populated by
         /// `/retry` from the deployment's `i_data` only when the agent isn't
         /// minted yet; empty once minted (post-mint the authoritative iData is
-        /// read from chain). Sealed at rest in the job envelope, same as
-        /// `Deploy`'s inputs.
+        /// read from chain). Held in the job row only until a worker claims
+        /// it, same as `Deploy`'s inputs.
         #[serde(default)]
         artifacts: Vec<IDataArtifact>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1423,6 +1528,64 @@ impl JobPayload {
             JobPayload::Clone { new_seal_id, .. } => *new_seal_id,
         }
     }
+
+    /// Whether the job drives a new deployment's storage and mint tracks
+    /// from `NotStarted`. Nothing else starts them, so if such a job dies the
+    /// reaper fails the tracks it never started.
+    pub fn starts_identity(kind: &str) -> bool {
+        matches!(kind, "deploy" | "clone")
+    }
+
+    /// When the job stops being runnable (unix seconds): the owner envelope's
+    /// `expires_at` for the jobs whose only effect is relaying that envelope
+    /// to the sandbox provider, which refuses an expired one. `None` for jobs
+    /// whose work outlives the envelope: a deploy or retry still mints and
+    /// finalizes the agent, and only its container step fails on a stale
+    /// envelope, on its own terms.
+    pub fn expires_at(&self) -> anyhow::Result<Option<i64>> {
+        match self {
+            Self::SandboxStart {
+                sandbox_envelope, ..
+            }
+            | Self::SandboxStop {
+                sandbox_envelope, ..
+            }
+            | Self::SandboxRecreate {
+                sandbox_envelope, ..
+            } => Ok(Some(sandbox_envelope.expires_at()?)),
+            Self::Deploy { .. }
+            | Self::ResumeDeploy { .. }
+            | Self::SandboxTeardown { .. }
+            | Self::Clone { .. } => Ok(None),
+        }
+    }
+}
+
+/// Why `JobQueue::reap` failed a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapCause {
+    /// Running, but its worker stopped heartbeating.
+    Abandoned,
+    /// Pending when its owner envelope expired; never ran.
+    Expired,
+}
+
+/// A job `JobQueue::reap` marked failed. `kind`/`seal_id` are `None` only on
+/// rows written before those columns existed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReapedJob {
+    pub id: JobId,
+    pub kind: Option<String>,
+    pub seal_id: Option<SealId>,
+    pub cause: ReapCause,
+}
+
+/// What `DeploymentRepo::resolve_abandoned_stages` changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AbandonedStages {
+    pub storage_failed: bool,
+    pub mint_failed: bool,
+    pub container_deadline_set: bool,
 }
 
 /// Mint-path selector carried on `JobPayload::Clone` (issue #133).

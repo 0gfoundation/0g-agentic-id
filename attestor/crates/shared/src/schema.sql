@@ -105,7 +105,7 @@ ALTER TABLE idempotency DROP CONSTRAINT IF EXISTS idempotency_seal_id_fkey;
 
 CREATE TABLE IF NOT EXISTS jobs (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    payload      JSONB NOT NULL,
+    payload      JSONB,
     status       TEXT  NOT NULL DEFAULT 'pending',   -- pending | running | done | failed
     picked_by    TEXT,
     error        TEXT,
@@ -115,6 +115,25 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs (status, created_at);
+
+-- `payload` is plain JSON; the database lives on the tapp FDE volume. Only a
+-- pending row holds one: claiming the job, or failing it before it runs,
+-- clears it. `kind` and `seal_id` keep a running job identifiable for the
+-- reaper; `expires_at` is the owner envelope expiry of a job that only relays
+-- that envelope (NULL: the job does not expire); `heartbeat_at` is the
+-- worker's liveness stamp while the job runs. `reap_cause` marks a job the
+-- reaper failed ('abandoned' | 'expired'); `reap_settled_at` records that its
+-- follow-up ran. The reaper retries rows with a cause and no settlement, and
+-- the retention sweep keeps them. Payloads written as encrypted envelopes by
+-- earlier releases fail as undecodable when claimed (drain the queue before
+-- upgrading; see the attestor README).
+ALTER TABLE jobs ALTER COLUMN payload DROP NOT NULL;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS kind            TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS seal_id         BYTEA;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS expires_at      TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS heartbeat_at    TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reap_cause      TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reap_settled_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS indexer_checkpoints (
     name       TEXT PRIMARY KEY,
@@ -211,12 +230,13 @@ CREATE TABLE IF NOT EXISTS inference_provider_registry (
     document TEXT NOT NULL,
     signature TEXT NOT NULL,
     publisher BYTEA NOT NULL CHECK (octet_length(publisher) = 20),
-    acceptance_mac BYTEA NOT NULL CHECK (octet_length(acceptance_mac) = 32),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (chain_id, contract, version)
 );
 
 -- Support development databases that already have the earlier registry table.
--- Old rows without an authenticated acceptance record are never trusted.
+-- Old rows without a publisher are never served.
 ALTER TABLE inference_provider_registry ADD COLUMN IF NOT EXISTS publisher BYTEA;
-ALTER TABLE inference_provider_registry ADD COLUMN IF NOT EXISTS acceptance_mac BYTEA;
+-- No acceptance MAC: the table lives on the tapp FDE volume, and every read
+-- re-checks the row's environment and version.
+ALTER TABLE inference_provider_registry DROP COLUMN IF EXISTS acceptance_mac;

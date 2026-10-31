@@ -9,7 +9,7 @@ use attestor_shared::{
     crypto::RealCrypto,
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
-    kms::{derive_subkey, KmsClient, MockKmsClient, TappKmsClient, JOB_ENCRYPTION_KEY_INFO},
+    kms::{KmsClient, MockKmsClient, TappKmsClient},
     mocks::MockSandbox,
     repo::{self, PostgresDeploymentRepo, PostgresIdempotencyStore},
     sandbox::{AdminSigner, HttpSandbox},
@@ -45,7 +45,6 @@ async fn main() -> anyhow::Result<()> {
     let kms = build_kms_client(&cfg).await?;
     attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
     let app_key = kms.app_key().await?;
-    let job_key = derive_subkey(&app_key, JOB_ENCRYPTION_KEY_INFO);
 
     let crypto = Arc::new(RealCrypto::new(
         app_key,
@@ -73,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
     let idempotency = PostgresIdempotencyStore::new(pool.clone());
-    let jobs = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
+    let jobs = PostgresJobQueue::new(pool.clone());
     let events = PostgresEventBus::connect(pool.clone()).await?;
 
     // Authenticated discovery is shared with the worker; lifecycle mutations

@@ -74,7 +74,7 @@ which turns a skipped key branch into a failure.
 
 ```bash
 cd attestor
-docker compose up -d postgres
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres   # published on 127.0.0.1:5432
 cp .env.example .env                           # MOCK_TEE/KMS/SANDBOX/STORAGE=true by default
 # Two groups of vars ship BLANK in .env.example and must be filled or the
 # binaries refuse to boot:
@@ -337,6 +337,16 @@ late transfer events, and captured teardown targets. The API test crate includes
 the actual worker handlers to test stop → delayed status → start end to end.
 The Postgres tests run concurrently and explicitly test schema bootstrap waiting
 behind runtime locks; do not serialize them to hide lock-order regressions.
+The job-queue test checks that a payload is stored as plain JSON and held only
+while pending, that an undecodable payload fails its job, that an expired
+`/start` / `/stop` / `/reset` job is never claimed, that the reaper fails
+abandoned and expired jobs without requeueing them, that a reaped job's late
+heartbeat reports it gone and its late `done`/`failed` keeps the reaped row,
+and that a reaped job is returned by every sweep, and kept past retention,
+until its settlement is recorded; the repository test checks
+which stages an abandoned job's settlement fails, leaves, or hands to the
+provision-timeout sweep. Point it at a disposable database: a leftover pending
+job there would be claimed first.
 
 ```bash
 AGENTDNA_TEST_DATABASE_URL=postgres://postgres:<test-password>@127.0.0.1:<test-port>/registry \

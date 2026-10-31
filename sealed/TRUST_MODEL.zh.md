@@ -198,8 +198,10 @@ ack，等于把派生 key 下发给一段没人审过的代码。
 Attestor 实际从 KMS 拿到的是：
 
 - **一把 app-scoped key**（派生 material 为空），启动时取一次，
-  只用于 job 队列落盘加密和 provision 绑定的 MAC（Layer 3）。
-  它**不是**任何 agent key 的种子。
+  只用于 provision 绑定的 MAC（Layer 3）和 status boot receipt 的
+  HMAC。它**不是**任何 agent key 的种子。job 队列不用它加密：Attestor
+  的 Postgres 落在 tapp FDE 卷上，job 行只在 job 处于 pending 时持有
+  payload。
 - **一把把独立的 `agent_seal_priv`**，per seal 按需派生（Layer 2）。
   派生在 KMS 集群内部完成且单向：拿到一把派生 key 推不出任何兄弟
   key，Attestor 内存里也从不存在全局密钥。

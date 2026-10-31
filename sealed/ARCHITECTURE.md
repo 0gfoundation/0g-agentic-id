@@ -52,8 +52,8 @@ fix). Nothing reaches attestor, because `/status` is signed with the very key
 this boot declined to fetch; instead attestor's provision-timeout sweep
 catches it once `/provision` has not arrived within `PROVISION_TIMEOUT`
 (5 min) of sandbox create or recreate
-(`attestor/crates/worker/src/jobs.rs:21`,
-`attestor/crates/worker/src/main.rs:166-189`). The sweep flips
+(`attestor/crates/worker/src/jobs.rs:22`,
+`attestor/crates/worker/src/main.rs:228-254`). The sweep flips
 `container_stage` to `Failed` (reason `provision timeout`), so the deployment
 shows as `offline`, not `failed`: `failed` means the deploy itself never
 completed (a storage or mint failure), while a container failure on a

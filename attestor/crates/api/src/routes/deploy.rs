@@ -147,9 +147,8 @@ pub async fn handle(
     };
     state.deployments.insert(&deployment).await?;
 
-    // `PostgresJobQueue` seals the whole payload with AES-GCM(job_key)
-    // before hitting Postgres, so iData plaintexts (plus sandbox envelope
-    // contents) never land on disk in the clear. No per-field crypto here.
+    // The payload (iData plaintexts, envelope contents) sits in the job row
+    // only until a worker claims it; the database is on the tapp FDE volume.
     state
         .jobs
         .submit(JobPayload::Deploy {

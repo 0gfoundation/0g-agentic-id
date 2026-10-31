@@ -3,8 +3,8 @@
 //! Two derivations, deliberately split so no single resident key can
 //! reconstruct the agent fleet:
 //!   - `app_key()` — the app-scoped 32-byte secret (empty material),
-//!     fetched once at startup. Used for the job-queue encryption key and
-//!     the provision binding MAC — attestor-local data, NOT agent identity.
+//!     fetched once at startup. Used for the provision binding MAC and the
+//!     status boot-receipt HMAC — attestor-local data, NOT agent identity.
 //!     Its leak exposes neither the master nor any agentSeal.
 //!   - `derive(material)` — a per-`material` key, called for every agentSeal
 //!     (material = chainId‖contract‖sealId; see `crypto::seal_material`).
@@ -86,19 +86,6 @@ impl KmsClient for MockKmsClient {
         Ok(out)
     }
 }
-
-/// HKDF-SHA256 subkey derivation from the app-scoped KMS key.
-/// `info` scopes the derivation (e.g. `b"attestor.job_encryption_key.v1"`).
-pub fn derive_subkey(master_key: &[u8; 32], info: &[u8]) -> [u8; 32] {
-    use hkdf::Hkdf;
-    use sha2::Sha256;
-    let hkdf = Hkdf::<Sha256>::new(None, master_key);
-    let mut out = [0u8; 32];
-    hkdf.expand(info, &mut out).expect("hkdf expand 32 bytes");
-    out
-}
-
-pub const JOB_ENCRYPTION_KEY_INFO: &[u8] = b"attestor.job_encryption_key.v1";
 
 /// Startup guard against the silent-fallback hazard: derive two distinct
 /// materials and require distinct keys. If they match, the KMS path is
@@ -318,68 +305,5 @@ mod tests {
         assert_ne!(a1, b, "different material → different key");
         // Per-seal derivation must not collapse to the app key.
         assert_ne!(a1, kms.app_key().await.unwrap());
-    }
-
-    #[test]
-    fn derive_subkey_is_deterministic_and_info_scoped() {
-        let master = [42u8; 32];
-        let k1 = derive_subkey(&master, b"info-a");
-        let k2 = derive_subkey(&master, b"info-a");
-        assert_eq!(k1, k2);
-        let k3 = derive_subkey(&master, b"info-b");
-        assert_ne!(k1, k3, "different info must give different subkey");
-    }
-
-    /// End-to-end simulation of api → worker iData round trip.
-    /// Both sides resolve the same master from (mock) KMS, derive the
-    /// same job_key, encrypt on api side, decrypt on worker side.
-    #[test]
-    fn job_encryption_roundtrip_simulates_api_worker_handoff() {
-        use crate::crypto::RealCrypto;
-        use crate::traits::CryptoModule;
-        use std::sync::Arc;
-
-        let master = MockKmsClient::DEV_MASTER_KEY;
-        let job_key = derive_subkey(&master, JOB_ENCRYPTION_KEY_INFO);
-
-        let api = RealCrypto::new_for_test(master);
-        let worker = RealCrypto::new_for_test(master);
-
-        let plaintext_value = serde_json::json!({
-            "framework": {"name": "openclaw", "version": "0.1.0"},
-            "persona":   {"system_prompt": "top-secret"},
-            "inference": {"provider": "0g-compute", "model": "glm"}
-        });
-        let plaintext_bytes = serde_json::to_vec(&plaintext_value).unwrap();
-
-        // api side
-        let ciphertext = api.aes_gcm_encrypt(&plaintext_bytes, &job_key).unwrap();
-        assert!(
-            !ciphertext.windows(b"top-secret".len()).any(|w| w == b"top-secret"),
-            "ciphertext must not contain plaintext substring"
-        );
-
-        // worker side (separate RealCrypto instance, same master → same subkey)
-        let recovered_bytes = worker.aes_gcm_decrypt(&ciphertext, &job_key).unwrap();
-        let recovered_value: serde_json::Value = serde_json::from_slice(&recovered_bytes).unwrap();
-        assert_eq!(recovered_value, plaintext_value);
-    }
-
-    #[test]
-    fn decryption_fails_with_wrong_key() {
-        use crate::crypto::RealCrypto;
-        use crate::traits::CryptoModule;
-        use std::sync::Arc;
-
-        let master = MockKmsClient::DEV_MASTER_KEY;
-        let job_key = derive_subkey(&master, JOB_ENCRYPTION_KEY_INFO);
-        let wrong_key = derive_subkey(&master, b"different.info");
-
-        let crypto = RealCrypto::new_for_test(master);
-        let ciphertext = crypto.aes_gcm_encrypt(b"secret", &job_key).unwrap();
-        assert!(
-            crypto.aes_gcm_decrypt(&ciphertext, &wrong_key).is_err(),
-            "decrypt must fail with wrong key (AES-GCM authenticated)"
-        );
     }
 }

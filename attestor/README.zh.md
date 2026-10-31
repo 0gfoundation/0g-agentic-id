@@ -15,21 +15,56 @@ Attestor 代表 owner 发起 mint tx、给经过 RA 的 Agent TEE 派
 - **api** — owner 入口（deploy / 生命周期）、容器 `/provision` +
   `/status` 接收、`/probe` 同步探活、WebSocket 实时事件推送
 - **worker** — 异步任务消费者；跑 storage 加密上传 / mint tx /
-  sandbox 生命周期；带 60s sweep loop（job retention + provision
-  deadline + heartbeat staleness）
+  sandbox 生命周期；带 60s sweep loop（job retention + job reaper +
+  provision deadline + heartbeat staleness）
 - **indexer** — 链上事件监听 + AgentCard 重建；Postgres 落库后通过
   EventBus 推 WS 给前端
 
 目前三个 binary 跑在一个节点上，但设计并不绑定单机：队列用
 `FOR UPDATE SKIP LOCKED` 领活（`shared/src/jobs.rs`），任意多个
-worker 可以共享；job payload 和 provision 绑定 MAC 用的是 KMS
-**app-scoped** key，同一个 Tapp app 的任何节点都解得开；agentSeal
+worker 可以共享；provision 绑定 MAC 用的是 KMS **app-scoped** key，
+同一个 Tapp app 的任何节点都能校验；agentSeal
 由 KMS per-seal 按需派生，任何节点都能 provision 任何 agent，节点
 本地没有密钥状态。多节点**尚未实际跑过**——生产使用共享 KMS 稳定 app signer、
 绑定实例的 AgenticID 授权与 gas；Postgres 从
 per-host compose 里抽出来共享、以及 **indexer 保持单实例**（链上
 checkpoint 是单写者，两个 indexer 会重复消费事件）。归属
 node-federation 工作流。
+
+job payload（owner 签名的 iData 明文、带 env 的 sandbox envelope）以明文
+JSON 存储。一行只在 job 处于 pending 时持有 payload：claim 时清空，所有
+在执行前就把 job 判失败的路径（payload 无法解码、owner envelope 已过期）
+也会清空。落盘保护来自 tapp FDE 卷：`docker-compose.yml` 声明了
+`x-tapp: data: encrypted`，Postgres 的 named volume 因此落在 app 由 KMS
+加密的卷上。放在这个卷之外的 Postgres（例如多节点共享的那种）会以未加密
+形式保存 pending payload。
+
+worker 从不重新排队 job。job 运行期间每 30 s 刷新该行的 heartbeat；sweep
+里的 reaper 会把 heartbeat 超过 5 min 的 running job（其 worker 已经不在）
+以及 owner envelope 在 30 s 内过期的 pending `/start`、`/stop`、`/reset`
+job（claim 也会跳过这些）标记为失败。对被放弃的 job，它把 `Submitted` 的
+storage stage 置为失败（若是 deploy 或 clone，还包括它没来得及启动的
+storage/mint stage），让 `/retry` 能恢复；给没有 provision deadline 的
+`Submitted` 容器补上标准的 5 min deadline；`Submitted` 的 mint 一律不动，
+它的交易由 `/retry` 按 receipt 对账。被 reap 的行会记录原因，直到这些后续
+处理跑完为止：后续处理出错、或者执行 sweep 的 worker 先退出了，下一轮 sweep
+都会重试，期间 retention sweep 也会保留这一行。只是卡住（而非退出）的
+worker 会从下一次 heartbeat 得知自己的 job 已被 reap，随即放弃该 job；
+`done`/`failed` 只会替换 `running`，所以它迟到的结果不会覆盖被 reap 的行。
+
+从加密 job payload 的旧版本升级时，先排空队列：停掉 api 和 indexer 服务，
+不再进新 job（indexer 从 checkpoint 继续，不会漏事件），worker 保持运行。
+旧版 worker 开始一个 job 时打 `claimed job`，只在失败时再打一行
+（`job failed`），所以当超过一个 job 可能运行的时长都没有新的 `claimed job`
+行时，队列就排空了：留 15 分钟；如果最后 claim 的是带多个 iData 条目的
+deploy，要留得更久（每个条目的上传预算是 750 s）。能连到数据库时，
+`SELECT count(*) FROM jobs WHERE status IN ('pending','running')` 返回 0
+即可确认。然后再升级。旧版本写入的 job 无法解码：pending 的会在 claim 时
+判失败（`undecodable job payload`），running 的会被 reap（`job reaped`，
+没有 `seal_id`），两者都不会结算它的 deployment，该 deployment 会一直停在
+`deploying`，只能重新部署。从本版本起，worker 在每行 `claimed job` 之后都会
+打 `job done` 或 `job failed`（或由 reaper 记为已 reap），以后排空队列只看
+worker 日志即可。
 
 ## Workspace
 
@@ -39,11 +74,12 @@ attestor/
 ├── crates/
 │   ├── shared/               types / traits / chain / sandbox / crypto / repo / mocks
 │   ├── api/                  HTTP + WS server + 静态 web/ 资源
-│   ├── worker/               异步任务 + 三类 sweep
+│   ├── worker/               异步任务 + 60s sweep loop
 │   └── indexer/              链上事件监听
 ├── scripts/                  e2e / verify-agent / regression 测试脚本
 ├── version-meld/             vendored crate 修复，经 [patch.crates-io]（Cargo.toml）接入，Dockerfile 会拷进构建
-├── docker-compose.yml        api / worker / indexer / postgres 全栈
+├── docker-compose.yml        api / worker / indexer / postgres 全栈（`x-tapp: data: encrypted`；Postgres 不对外发布）
+├── docker-compose.dev.yml    本地 overlay：把 Postgres 发布到 127.0.0.1:5432，供裸跑的 binary 使用
 ├── Dockerfile                三 binary 共用镜像（cargo build --release 多入口）
 └── .env.example              所有运行时配置
 ```
@@ -58,6 +94,8 @@ docker compose up -d                                # 起 postgres + 3 个 attes
 docker compose logs -f attestor-api                 # 看 api 日志
 ```
 
+Postgres 只在 compose 网络内可达，不会发布到宿主机。
+
 本地构建注意：compose 里设了 `pull_policy: always`，且 `image:` 默认值
 （`ATTESTOR_IMAGE`）指向一个 VPC 内网 Aliyun registry tag——出了那个
 VPC 默认 registry 根本不可达；而在可达的环境里，`up -d` 会重新拉取
@@ -68,7 +106,7 @@ registry 镜像、覆盖你刚 `docker compose build` 出来的本地产物。�
 非容器（裸跑，开发调试用）：
 
 ```bash
-docker compose up -d postgres                       # 只起 Postgres
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres   # 只起 Postgres，监听 127.0.0.1:5432
 cp .env.example .env && vim .env                    # 填真实 chain / app_id / addr
 cargo run -p attestor-api    # 一个终端
 cargo run -p attestor-worker # 另一个终端

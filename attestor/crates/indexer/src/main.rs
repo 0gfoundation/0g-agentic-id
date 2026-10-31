@@ -9,7 +9,7 @@ use attestor_shared::{
     crypto::RealCrypto,
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
-    kms::{derive_subkey, KmsClient, MockKmsClient, TappKmsClient, JOB_ENCRYPTION_KEY_INFO},
+    kms::{KmsClient, MockKmsClient, TappKmsClient},
     repo::{self, PostgresDeploymentRepo},
     Config,
 };
@@ -44,10 +44,8 @@ async fn main() -> anyhow::Result<()> {
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
     let events = PostgresEventBus::connect(pool.clone()).await?;
-    // Enqueue SandboxTeardown on transfer (Layer 2). Same job_key derivation
-    // as the worker so the encrypted payloads round-trip.
-    let job_key = derive_subkey(&app_key, JOB_ENCRYPTION_KEY_INFO);
-    let jobs = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
+    // Enqueues SandboxTeardown on transfer (Layer 2).
+    let jobs = PostgresJobQueue::new(pool.clone());
 
     let watcher = watcher::Watcher::new(&cfg, pool, crypto, deployments, events, jobs).await?;
     watcher.run().await
