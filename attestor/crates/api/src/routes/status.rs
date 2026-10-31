@@ -788,6 +788,15 @@ mod tests {
             .prepare_status_boot(s.seal_id, Some([9; 32]), Address::ZERO)
             .await
             .unwrap();
+        // The create under that ticket persisted the row's sandbox.
+        let created = s.repo.get(s.seal_id).await.unwrap().unwrap().sandbox_id;
+        s.repo
+            .boot_authorizations
+            .lock()
+            .unwrap()
+            .get_mut(&s.seal_id)
+            .unwrap()
+            .sandbox_id = created;
         s.repo
             .status_bindings
             .lock()

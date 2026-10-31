@@ -38,8 +38,11 @@ KMS appIdHash 和注册 epoch。连接要求 HTTPS、校验应用 SPKI、拒绝 
 解析和授权检查；链 RPC 连接超时为 5 秒，单请求超时为 30 秒。超时会释放缓存锁，
 不发布替换结果，也不延长此前 identity 的 lease。
 
-每次出站操作的所有重试都使用同一 snapshot，其绝对 lease deadline 同时限制连接建立
-和响应 body 读取；到期即取消操作。响应 body 失败不会重发可能已被处理的 create。
+每次出站操作的所有重试都使用同一 snapshot。对幂等操作（查询、admin delete），其绝对
+lease deadline 同时限制连接建立和响应 body 读取；到期即取消操作。对非幂等操作（create、
+owner 签名的 start 与 stop），lease 到期后不再发起新的尝试，但已发出的尝试会运行到它自己的
+请求超时（create 120 秒，其余 30 秒）：provider 收到 create 后即使 attestor 断开也会完成，
+中途取消会留下一个没有任何记录指向的 sandbox。响应 body 失败不会重发可能已被处理的 create。
 
 仅有 node identity，或已有合法 TLS metadata、尚未获取 `app_signer` 的 current 节点可保留为 standby，
 但不贡献服务 TLS pins，也不决定服务 lease；至少一个 current 节点必须具备完整服务身份。
@@ -163,9 +166,11 @@ signer 改变则需要 owner 执行 reset。
 每次被接受的 provision 都返回一个加密给容器公钥的全新不透明状态令牌。attestor 只保存
 它的 SHA-256，旁边记录实际下发的配置版本和摘要，`/status` 只依据这条记录确认配置。
 令牌和记录都不含 attestor MAC。不兼容 v2：provider、attestor 与 sealed 镜像需同时发布，
-并重建所有 agent（升级步骤见 [`README.zh.md`](README.zh.md#升级到-agentdna-14)）。v3 之前创建的
-sandbox（没有启动票据，或票据没有签发时间）不能 `start`（resume），返回 409，因为那个
-运行时无法 provision。
+并重建所有 agent（升级步骤见 [`README.zh.md`](README.zh.md#升级到-agentdna-14)）。只有当前启动票据
+为其签发的 sandbox 才能 `start`（resume）；attestor 在该次 create 的 sandbox 落库时记录它，
+每次签发新票据时清除。其他 sandbox 一律返回 409，因为它们无法 provision：v3 之前创建的
+sandbox（没有启动票据，或票据没有签发时间），以及 reset 的 create 失败后仍留在记录上的
+旧 sandbox（它持有的是被该次 reset 取代的票据）。
 
 对已授权启动（票据、代次、更新的尝试、已落库的 sandbox 与链上实时 owner 均已校验）的
 401 或 403 会以 `provision rejected` 打日志。在该代次仍是启用代次时，记为

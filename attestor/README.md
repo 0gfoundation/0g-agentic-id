@@ -114,15 +114,27 @@ go on until each check passes.
    `running`. The sealed log shows `attestor tls: statement accepted` and
    `OK   status reported`. A refused provision is in the api log
    (`provision rejected`) and is the reason on the agent's container stage.
-6. **Announce.** Owners reset their agents. A resume (`/start` with `start`)
-   of a sandbox created before 1.4 is refused with 409, because that runtime
-   cannot provision. Owners acknowledge the provider again (SDK `ack()`) if
-   the preflight asks. Ask owners to spread their resets: the worker runs one
-   job at a time, and a reset not started within about 150 s of being signed
-   is dropped and leaves the agent as it was. The console shows
-   `request expired before it ran — sign it again`; the CLI keeps waiting for
-   the new container until its limit, then says the agent did not come online
-   and to run the reset again.
+6. **Publish the SDK.** The 1.4 CLI is `@0gfoundation/0g-agentdna` 0.2.2.
+   The versions already on npm (0.2.0, 0.2.1) predate it: their `reset` can
+   report `running` from the 1.3 container before the worker has replaced
+   it, and their deploy wizard does not limit 0g-harness agents to models
+   with tool use. Publish 0.2.2 and its compatibility package in the
+   [release order](../sdk/typescript/MIGRATION.md#release-order), with 0.2.2
+   as the `latest` dist-tag (what `0g-agentdna update` installs). Then set
+   `ATTESTOR_CLI_LATEST=0.2.2` and an `ATTESTOR_CLI_NOTES` line asking CLI
+   owners to update before they reset, and restart the api. Check:
+   `npm view @0gfoundation/0g-agentdna dist-tags.latest` prints `0.2.2`, and
+   `GET /config` shows `"cli_latest":"0.2.2"`.
+7. **Announce.** CLI owners update (`0g-agentdna update`), then owners reset
+   their agents. A resume (`/start` with `start`) of a sandbox created before
+   1.4 is refused with 409, because that runtime cannot provision. Owners
+   acknowledge the provider again (SDK `ack()`) if the preflight asks. Ask
+   owners to spread their resets: the worker runs one job at a time, and a
+   reset not started within about 150 s of being signed is dropped and leaves
+   the agent as it was. The console shows
+   `request expired before it ran — sign it again`; the 0.2.2 CLI keeps
+   waiting for the new container until its limit, then says the agent did not
+   come online and to run the reset again.
 
 **Rolling back.** The 1.4 attestor is one-way: its schema drops columns a
 1.3 attestor reads (`inference_provider_registry.acceptance_mac`,
@@ -214,7 +226,7 @@ stay up.
 |---|---|---|
 | `POST /deploy` | User deploys an agent | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | Source owner mints a brand-new agent for another owner, reusing the source's on-chain iData (dataKey re-sealed to a fresh agentSeal); lands Offline for the new owner to bring online | owner EIP-191, verified against the **live on-chain `ownerOf(source)`** (not a self-declared owner) |
-| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent. A `start` (resume) of a sandbox created before AgentDNA 1.4 (no boot ticket, or one without an issue time) is `409`: that runtime cannot provision, so the agent needs a reset | owner envelope, signature verified against the on-chain owner (`/retry` without an envelope is limited to idempotent attestor-side re-runs, gated by an owner-field match) |
+| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent. A `start` (resume) is `409` unless the agent's current boot ticket was issued for the deployment's sandbox: a sandbox created before AgentDNA 1.4 (no boot ticket, or one without an issue time), or the previous sandbox a reset leaves on the row when its create fails, cannot provision, so the agent needs a reset | owner envelope, signature verified against the on-chain owner (`/retry` without an envelope is limited to idempotent attestor-side re-runs, gated by an owner-field match) |
 | `GET /settings?seal_id=0x…` | Owner reads the agent's configuration document and its current `version` (the base for the next write). The document is the owner's, so it is in no public tier — this is the only way to read it. The response also carries `confirmed_version` / `attempts` / `fallback_active`, so a client can tell the owner their last push did not boot, the agent is running the previous document, and pushing again is the retry | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` in `X-Auth-Message`, verified against the **live on-chain owner** |
 | `POST /settings` | Owner writes the agent's ONE configuration document. attestor stores it as an OPAQUE blob — it never parses, validates or logs the contents, so widening the settings vocabulary never touches attestor. Not on chain: configuration is re-suppliable, memory is not. Compare-and-swap: a stale base version is 409 with `current_version`, so a captured request cannot reinstate a superseded document and two clients cannot silently overwrite each other | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<sha256 of the document>` in `X-Auth-Message`, verified against the **live on-chain owner** |
 | `POST /probe` | Synchronous liveness probe; flips unreachable containers to `Failed` and preserved-but-not-running sandboxes to `Stopped` (resumable) | none |

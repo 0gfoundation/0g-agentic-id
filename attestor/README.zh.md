@@ -91,12 +91,21 @@ worker 日志即可。
 5. **每个框架 reset 一个。**每个框架各 reset 一个 agent，等到 `running`。sealed 日志
    出现 `attestor tls: statement accepted` 和 `OK   status reported`。被拒的 provision
    会出现在 api 日志里（`provision rejected`），也是该 agent 容器 stage 上的原因。
-6. **公告。**owner reset 自己的 agent。1.4 之前创建的 sandbox 不能 resume
-   （`/start` 带 `start`），会得到 409，因为那个运行时无法 provision。preflight 要求时，
-   owner 需重新确认 provider（SDK `ack()`）。请 owner 错开 reset：worker 一次只跑一个
-   job，签名后约 150 s 内没开始执行的 reset 会被丢弃，agent 保持原样。控制台显示
-   `request expired before it ran — sign it again`；CLI 会一直等新容器直到超时，然后提示
-   agent 没有上线、请重新 reset。
+6. **发布 SDK。**1.4 的 CLI 是 `@0gfoundation/0g-agentdna` 0.2.2。npm 上已有的版本
+   （0.2.0、0.2.1）早于它：它们的 `reset` 可能在 worker 替换容器之前就从 1.3 容器读到
+   `running` 并报告完成，部署向导也不会把 0g-harness agent 限定为支持工具调用的模型。
+   按[发布顺序](../sdk/typescript/MIGRATION.zh.md#发布顺序)发布 0.2.2 及其兼容包，并让
+   `latest` dist-tag 指向 0.2.2（`0g-agentdna update` 安装的就是它）。然后设置
+   `ATTESTOR_CLI_LATEST=0.2.2`，以及一行提醒 CLI 用户在 reset 前先更新的
+   `ATTESTOR_CLI_NOTES`，并重启 api。检查：
+   `npm view @0gfoundation/0g-agentdna dist-tags.latest` 输出 `0.2.2`，
+   `GET /config` 显示 `"cli_latest":"0.2.2"`。
+7. **公告。**使用 CLI 的 owner 先更新（`0g-agentdna update`），然后 owner reset 自己的
+   agent。1.4 之前创建的 sandbox 不能 resume（`/start` 带 `start`），会得到 409，因为
+   那个运行时无法 provision。preflight 要求时，owner 需重新确认 provider（SDK `ack()`）。
+   请 owner 错开 reset：worker 一次只跑一个 job，签名后约 150 s 内没开始执行的 reset
+   会被丢弃，agent 保持原样。控制台显示 `request expired before it ran — sign it again`；
+   0.2.2 的 CLI 会一直等新容器直到超时，然后提示 agent 没有上线、请重新 reset。
 
 **回滚。**1.4 attestor 是单向的：它的 schema 删除了 1.3 attestor 要读的列
 （`inference_provider_registry.acceptance_mac`、`deployments.container_pubkey_mac`），
@@ -182,7 +191,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|---|
 | `POST /deploy` | 用户部署 agent | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | 源 owner 为另一 owner 铸一个全新 agent，复用源的链上 iData（dataKey 重封给新 agentSeal）；落 Offline，由新 owner 自行上线 | owner EIP-191，校验签名者 == **链上实时 `ownerOf(source)`**（非自声明 owner） |
-| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。AgentDNA 1.4 之前创建的 sandbox（没有启动票据，或票据没有签发时间）不能 `start`（resume），返回 `409`：那个运行时无法 provision，需 reset | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
+| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。只有当前启动票据为其签发的 sandbox 才能 `start`（resume），否则返回 `409`：AgentDNA 1.4 之前创建的 sandbox（没有启动票据，或票据没有签发时间），以及 reset 的 create 失败后仍留在记录上的旧 sandbox，都无法 provision，需 reset | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
 | `GET /settings?seal_id=0x…` | owner 读自己的配置文档，连带当前 `version`（下一次写要签的 base）。文档是 owner 的，不进任何公开层——只有这一条路能读。响应还带 `confirmed_version` / `attempts` / `fallback_active`：客户端据此告诉 owner「上次推送没起来、agent 正跑着上一份文档、再推一次就是重试」| owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /settings` | owner 写 agent 的那一份配置文档。attestor 只当**不透明 blob** 存：不解析、不校验、不打日志，所以扩配置词表永远不用改 attestor。不上链——配置可随时重给，记忆不行。写是 compare-and-swap：base version 过期就 409 带 `current_version`，于是抓包重放回不去旧文档，两个客户端也不会互相无声覆盖 | owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<文档 sha256>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /probe` | 同步探活：失联容器 flip 到 `Failed`；sandbox 仍保留但没在跑的 flip 到 `Stopped`（可 Resume）| 无 |

@@ -44,9 +44,14 @@ waiting for another refresh, local tapp resolution, and authorization checks.
 Their chain RPC clients use 5-second connection and 30-second request timeouts.
 A timeout releases the cache lock without publishing a replacement or extending
 the previous identity lease.
-An outbound operation keeps that same snapshot for every retry. Its absolute lease
-deadline also bounds connection setup and response-body reads; expiry cancels the
-operation. A response-body failure never resends a possibly processed create.
+An outbound operation keeps that same snapshot for every retry. For an idempotent
+operation (lookup, admin delete) its absolute lease deadline also bounds connection
+setup and response-body reads; expiry cancels the operation. A non-idempotent one
+(create, owner-signed start and stop) starts no attempt once the lease has expired,
+but an attempt already sent runs to its own request timeout (120 s for create,
+30 s otherwise): the provider completes a create it received even when the attestor
+goes away, so cancelling it would leave a sandbox no record names. A response-body
+failure never resends a possibly processed create.
 
 A current node with only its node identity, or valid TLS metadata without
 `app_signer`, can remain a standby. It contributes neither service TLS pins nor the service lease;
@@ -205,9 +210,12 @@ key. The attestor stores only its SHA-256, beside the settings version and diges
 served, and `/status` confirms settings from that record alone. Neither the token nor
 the record carries an attestor MAC. There is no v2 compatibility: release the provider,
 attestor and sealed images together and recreate every agent (the rollout steps are in
-[`README.md`](README.md#rolling-out-agentdna-14)). A `start` (resume) of a sandbox
-created before v3 (no boot ticket, or one without an issue time) is refused with 409,
-since that runtime cannot provision.
+[`README.md`](README.md#rolling-out-agentdna-14)). A `start` (resume) is accepted only
+for the sandbox the current boot ticket was issued for, which the attestor records
+when that create's sandbox is persisted and clears with every new ticket. Any other
+sandbox is refused with 409, since it cannot provision: one created before v3 (no boot
+ticket, or one without an issue time), or the previous sandbox a reset leaves on the
+row when its create fails (it holds the ticket that reset superseded).
 
 A 401 or 403 for the authorized boot (ticket, generation, a newer attempt, persisted
 sandbox and live owner all checked) is logged as `provision rejected`. While that

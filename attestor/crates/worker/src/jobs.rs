@@ -3,6 +3,7 @@
 use alloy::primitives::{Address, Bytes, B256};
 use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
+    auth::status::NOT_RESUMABLE,
     oss::OssClient,
     sandbox::SandboxError,
     AgentId, ChainClient, CloneFromParams, CloneRetryParams, Config, CryptoModule, DeploymentRepo,
@@ -65,9 +66,6 @@ fn warn_uncertified_create(seal_id: SealId, resp: &attestor_shared::SandboxCreat
         );
     }
 }
-
-/// Why a resume of a sandbox created before AgentDNA 1.4 is not started.
-const PRE_V3_RESUME: &str = "this agent's sandbox was created before AgentDNA 1.4 and cannot be resumed; reset the agent to create a new one";
 
 /// The provider's own report of a deployment's sandbox.
 #[derive(Debug, PartialEq, Eq)]
@@ -239,15 +237,16 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 _ => {}
             }
             recheck_job_owner(ctx, seal_id, &sandbox_envelope).await?;
-            // Only a sandbox created under AgentDNA 1.4 (a boot ticket with an
-            // issue time) can provision against this attestor; /start refuses
-            // the others, and this keeps a job that slipped past it from
-            // starting a container that can only go offline.
+            // Only the sandbox created under the agent's current boot ticket
+            // can provision against this attestor; /start refuses the others,
+            // and this keeps a job that slipped past it (or a reset that
+            // failed after it was queued) from starting a container that can
+            // only go offline.
             let resumable = ctx
                 .deployments
                 .boot_authorization(seal_id)
                 .await?
-                .is_some_and(|a| a.ticket_issued_at.is_some());
+                .is_some_and(|a| a.holds_current_ticket(sandbox_id.as_deref()));
             let generation = if resumable {
                 ctx.deployments
                     .prepare_status_boot(seal_id, None, sandbox_envelope.wallet_address)
@@ -256,14 +255,17 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 None
             };
             if generation.is_none() {
-                tracing::warn!(?seal_id, "sandbox start: sandbox predates AgentDNA 1.4; not starting it");
+                tracing::warn!(
+                    ?seal_id,
+                    "sandbox start: the sandbox does not hold the current boot ticket; not starting it"
+                );
                 ctx.events
                     .publish(WsEvent::ContainerWarning {
                         seal_id,
-                        reason: PRE_V3_RESUME.to_string(),
+                        reason: NOT_RESUMABLE.to_string(),
                     })
                     .await?;
-                anyhow::bail!(PRE_V3_RESUME);
+                anyhow::bail!(NOT_RESUMABLE);
             }
             // Publish the pending stage before start can invoke provisioning;
             // a fast Running callback must never be demoted after start returns.
@@ -3997,12 +3999,24 @@ mod tests {
             .generation
     }
 
+    /// The boot authorization a successful 1.4 create leaves: a ticket with
+    /// an issue time that names the row's sandbox.
     async fn seed_boot_authorization(t: &TestCtx, seal: SealId) -> i64 {
-        t.deployments
+        let generation = t
+            .deployments
             .prepare_status_boot(seal, Some([1u8; 32]), dummy_envelope("start").wallet_address)
             .await
             .unwrap()
-            .expect("generation")
+            .expect("generation");
+        let sandbox_id = t.deployments.get(seal).await.unwrap().unwrap().sandbox_id;
+        t.deployments
+            .boot_authorizations
+            .lock()
+            .unwrap()
+            .get_mut(&seal)
+            .unwrap()
+            .sandbox_id = sandbox_id;
+        generation
     }
 
     async fn run_start(t: &TestCtx, seal: SealId) -> anyhow::Result<()> {
@@ -4485,6 +4499,72 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("before AgentDNA 1.4")));
         }
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_after_a_failed_reset_does_not_resume_the_previous_sandbox() {
+        // A reset issues a new ticket before its create. When the create
+        // fails, the row still names the previous sandbox, which holds the
+        // superseded ticket and can never provision: a resume must not start
+        // it.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_confirmed_deployment(&t, seal, 105, "sb-previous").await;
+        t.sandbox.create_fails.store(true, Ordering::SeqCst);
+        handle_sandbox_recreate(&t.ctx, seal, dummy_envelope("create"))
+            .await
+            .expect_err("the create fails");
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.sandbox_id.as_deref(), Some("sb-previous"));
+        let auth = t
+            .deployments
+            .boot_authorization(seal)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            auth.ticket_issued_at.is_some(),
+            "the reset issued a new ticket"
+        );
+        assert!(auth.sandbox_id.is_none(), "no sandbox holds it");
+
+        let err = run_start(&t, seal).await.expect_err("must not start");
+        assert!(err.to_string().contains("reset the agent"), "{err}");
+        assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 0);
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Failed { .. }),
+            "got {:?}",
+            d.container_stage
+        );
+        assert!(d.provision_deadline.is_none());
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_resumes_the_sandbox_a_reset_created() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_confirmed_deployment(&t, seal, 106, "sb-previous").await;
+        *t.sandbox.create_id.lock().unwrap() = "sb-new".into();
+        handle_sandbox_recreate(&t.ctx, seal, dummy_envelope("create"))
+            .await
+            .expect("the create succeeds");
+        t.deployments
+            .set_container_stage(
+                seal,
+                StageStatus::Stopped {
+                    at: Utc::now(),
+                    reason: "user".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        run_start(&t, seal).await.expect("the new sandbox resumes");
+        assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 1);
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.sandbox_id.as_deref(), Some("sb-new"));
+        assert!(matches!(d.container_stage, StageStatus::Submitted { .. }));
     }
 
     async fn seed_confirmed_deployment(t: &TestCtx, seal: SealId, agent: u64, sandbox_id: &str) {

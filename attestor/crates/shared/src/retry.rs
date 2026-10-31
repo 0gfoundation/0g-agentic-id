@@ -66,6 +66,23 @@ fn is_retryable_err(e: &reqwest::Error, policy: RetryPolicy) -> bool {
 pub async fn retry_send<F, Fut>(
     op: &'static str,
     policy: RetryPolicy,
+    f: F,
+) -> anyhow::Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = reqwest::Result<reqwest::Response>>,
+{
+    retry_send_starting_by(op, policy, None, f).await
+}
+
+/// [`retry_send`], except that no attempt starts at or after `start_by`.
+/// An attempt already started is never cut off here: it runs to its own
+/// request timeout. Once `start_by` has passed, the next attempt (after a
+/// retryable error) is refused instead of started.
+pub async fn retry_send_starting_by<F, Fut>(
+    op: &'static str,
+    policy: RetryPolicy,
+    start_by: Option<tokio::time::Instant>,
     mut f: F,
 ) -> anyhow::Result<reqwest::Response>
 where
@@ -74,6 +91,13 @@ where
 {
     let mut last_err: Option<reqwest::Error> = None;
     for attempt in 1..=MAX_ATTEMPTS {
+        if start_by.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            let cause = last_err
+                .as_ref()
+                .map(|e| format!("; previous attempt: {e}"))
+                .unwrap_or_default();
+            anyhow::bail!("{op}: start deadline passed before attempt {attempt}{cause}");
+        }
         match f().await {
             Ok(resp) if !resp.status().is_server_error() => return Ok(resp),
             Ok(resp) => {
@@ -187,5 +211,40 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(counter.load(Ordering::SeqCst), MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn no_attempt_starts_after_the_start_deadline() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+        let err = retry_send_starting_by(
+            "test-op",
+            RetryPolicy::Strict,
+            Some(tokio::time::Instant::now() + Duration::from_millis(100)),
+            move || connect_error(c.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the retry after the 200 ms backoff starts past the deadline"
+        );
+        assert!(err.to_string().contains("start deadline passed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_started_attempt_runs_past_the_start_deadline() {
+        let start_by = tokio::time::Instant::now() + Duration::from_millis(50);
+        let response =
+            retry_send_starting_by("test-op", RetryPolicy::Strict, Some(start_by), || async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                connect_error(Arc::new(AtomicU32::new(0))).await
+            })
+            .await;
+        let err = response.unwrap_err();
+        assert!(tokio::time::Instant::now() >= start_by + Duration::from_millis(150));
+        assert!(err.to_string().contains("start deadline passed"), "{err}");
+        assert!(err.to_string().contains("previous attempt"), "{err}");
     }
 }
