@@ -1,34 +1,30 @@
-package dsh
+package harness
 
-// supportedDSHVersions is the closed set of DSH (@deepseek-ai/dsh) versions
-// sealed has been validated against. Bump together with the image: the
-// framework is installed at image build time (see images/dsh/Dockerfile), so
-// a version listed here that the image does not carry cannot be honoured.
-//
-// Unlike prime-agent, DSH's release series and its npm package version are
-// the SAME series, so this list speaks npm versions directly — no
-// tarball/release-channel split. Keep it in lockstep with DSH_VERSION in
-// sealed/images/dsh/Dockerfile: the image bakes exactly this version, and
-// spawn.go verifyInstalled hard-fails a mismatch.
+// supportedVersions is the closed set of 0g-harness versions (the version in
+// its package.json) sealed has been validated against. Bump together with the
+// image: the harness is installed at image build time, and the build
+// (images/harness/Dockerfile) fails unless the installed version is the LAST
+// entry here. The DSH packages the harness runs on are locked by its own
+// npm-shrinkwrap.json, so a harness version names one exact dependency tree.
 //
 // Stored as a slice (not a map) so the order encodes "preferred order": the
 // LAST entry is whitelistMax, the version a `framework` role drift
 // reconciles against.
-var supportedDSHVersions = []string{
-	"0.1.1-rc.2", // pre-1.0: expect this list to move often (see package doc)
+var supportedVersions = []string{
+	"0.1.0", // pre-1.0: expect this list to move often (see package doc)
 }
 
 // whitelistMax returns the version sealed targets: always the last element.
 func whitelistMax() string {
-	if len(supportedDSHVersions) == 0 {
+	if len(supportedVersions) == 0 {
 		return ""
 	}
-	return supportedDSHVersions[len(supportedDSHVersions)-1]
+	return supportedVersions[len(supportedVersions)-1]
 }
 
 // isWhitelisted reports whether v is one of the validated versions.
 func isWhitelisted(v string) bool {
-	for _, s := range supportedDSHVersions {
+	for _, s := range supportedVersions {
 		if s == v {
 			return true
 		}
@@ -41,7 +37,8 @@ func isWhitelisted(v string) bool {
 // and any unvalidated pin both resolve to whitelistMax — same conservative
 // choice as prime-agent's coercion, for the same reason: the image carries
 // exactly one installed version, so there is nothing to gain from a "nearest
-// lower" search.
+// lower" search. A binding from before 0g-harness pins a DSH version, which
+// resolves the same way.
 func coerceWhitelisted(v string) string {
 	if v == "" || !isWhitelisted(v) {
 		return whitelistMax()

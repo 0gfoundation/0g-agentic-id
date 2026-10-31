@@ -452,7 +452,7 @@ fn runtime_capabilities(
     for framework in frameworks {
         let formats: &[&str] = match framework.name.as_str() {
             "hermes" => &["openai"],
-            "openclaw" | "prime-agent" | "dsh" => &["openai", "anthropic"],
+            "openclaw" | "prime-agent" | "0g-harness" => &["openai", "anthropic"],
             _ => continue,
         };
         let image = framework.image.as_deref().unwrap_or(default_image);
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn capabilities_follow_the_release_and_configured_framework_images() {
         let frameworks = parse_frameworks(Some(
-            "openclaw,hermes:hermes-new,prime-agent:prime-new,dsh:dsh-new".into(),
+            "openclaw,hermes:hermes-new,prime-agent:prime-new,0g-harness:harness-new".into(),
         ));
         let caps = runtime_capabilities(true, "openclaw-new", &frameworks);
         assert_eq!(caps.len(), 4);

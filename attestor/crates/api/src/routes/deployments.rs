@@ -253,7 +253,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::json!({}),
             i_data: Vec::new(),
-            framework: Some("dsh".into()),
+            framework: Some("0g-harness".into()),
             clone_params: None,
             phase: DeploymentPhase::Deploying,
             storage_stage: StageStatus::NotStarted,
@@ -281,7 +281,7 @@ mod tests {
         // withheld — the ONLY genuinely private case (review #154 F4/F9).
         let minted = serde_json::to_value(PublicDeployment::from(row(true))).unwrap();
         assert!(minted.get("owner").is_some(), "minted rows expose owner");
-        assert_eq!(minted["framework"], "dsh");
+        assert_eq!(minted["framework"], "0g-harness");
         let unminted = serde_json::to_value(PublicDeployment::from(row(false))).unwrap();
         assert!(unminted.get("owner").is_none(), "unminted rows withhold owner");
     }

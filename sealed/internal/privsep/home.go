@@ -16,7 +16,7 @@ package privsep
 //
 // The agent has a home of its own, agentHomeDir (/home/agent, agent:agent
 // 0700), which is HOME for everything it runs and the default working
-// directory of AgentCommand. (The prime and dsh bridges deliberately start
+// directory of AgentCommand. (The prime bridge and 0g-harness deliberately start
 // in their framework tree instead, as their spawn.go explains, so relative
 // paths of the tools they run resolve inside that tree.) Tools keep their
 // per-user caches and configuration there (~/.npm, ~/.cache, ~/.config,

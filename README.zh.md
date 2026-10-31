@@ -380,6 +380,8 @@ Monorepo 四个子项目：
 | [`sealed/`](sealed/ARCHITECTURE.zh.md) | agent 运行时容器（TEE 内还原 iData、演化上链、签名）| Go |
 | [`sdk/typescript/`](sdk/typescript/README.md) | 客户端 SDK（`@0gfoundation/0g-agentdna`，CLI `0g-agentdna`）：deploy / clone / transfer、serve-proof 抓取 + 验证、feedback、信任根 ack、sandbox 充值 | TypeScript (viem) |
 
+仓库是公开的。每次克隆后，先运行一次 `git config core.hooksPath .githooks`，启用隐私检查。之后每次提交，pre-commit 钩子都会检查新增的内容：如果加入了私钥、token、个人路径或邮箱、公网 IP，提交会被拒绝。规则见 `scripts/privacy-check.mjs`，详细说明见 `AGENTS.md`。
+
 ### 进一步阅读
 
 **[`sdk/typescript/README.md`](sdk/typescript/README.md) — 客户端 SDK**

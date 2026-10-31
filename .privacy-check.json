@@ -1,0 +1,39 @@
+{
+  "ignorePaths": [
+    "attestor/version-meld/"
+  ],
+  "allow": [
+    {
+      "sha256": "da755f2f38e33e8871369d2166194343aca291752c4e529399ae0f4a8cb1aafd",
+      "note": "attestor/.env.example MOCK_APP_SECRET: the mock-KMS value for local runs with MOCK_KMS=true"
+    },
+    {
+      "sha256": "58badd9b455145b487ad24c7f259cc437cc4ffd0784716845249321fb5961cfc",
+      "note": "attestation test vector test_app_private_key (attestor + sealed testdata); its address appears only in testdata"
+    },
+    {
+      "sha256": "749f1a97ff6cd00ea46ccb3a47bb123283fe56c8fa324bea295d928f558161df",
+      "note": "attestation test vector test_container_private_key (attestor + sealed testdata); its address appears nowhere else"
+    },
+    {
+      "sha256": "2d23b34a69ee132da2f1ade478741b06190067c4e249a71e7a2fe79ef959309e",
+      "note": "sealed inference testdata status-v2.json: test vector; its address appears only in testdata"
+    },
+    {
+      "sha256": "95e82a7ebb036b3c3b3c14120ed7ce5f356ac69348bf38a71e8e117c1ef8c7e0",
+      "note": "secret-env tests (sdk + sealed): the well-known test seal key; its address appears only in tests"
+    },
+    {
+      "sha256": "bb483b357c95e5b2383819dc57b51aa70b9dd545b546ac9f90e2772bcedd246a",
+      "note": "sdk/typescript/test/secret-env.test.mjs: a fake sk- key made of words"
+    },
+    {
+      "sha256": "51942f3b450804350f224c4e2e0587d3a17b7480d7d7f2ceaf0062400602a9ae",
+      "note": "sealed hermes spawn_test.go: a fake sk- key made of words"
+    },
+    {
+      "sha256": "83a0a37234e1bc339e4320477b2f1c7e5388a86ec938c7f229026b231d2ee553",
+      "note": "sealed proxy settings_test.go: a fake sk- key made of words"
+    }
+  ]
+}

@@ -14,7 +14,7 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 | attestor | sandbox 起来后向 attestor 发起 RA，换 `agent_seal_priv`。详见 [`attestor/`](../attestor/README.zh.md) |
 | AgenticID 合约 | 读 `intelligentDatasOf` / `sealedKeysOf`、签 `update` tx 把演化推上链 |
 | 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 下载，通过同一 client 的 Go SDK 在进程内上传（`internal/dataplane/upload.go`），签名密钥从不离开 sealed |
-| agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、dsh（`main.go:118-121`）；链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
+| agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、0g-harness（`main.go:118-121`）；链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
 
 本文档讲**当前代码里实际跑的形态**和**为什么这么分**。
 
@@ -184,7 +184,7 @@ sealed/
 │   │   ├── openclaw/             openclaw 适配器（node；参考实现）
 │   │   ├── hermes/               hermes 适配器（python/uv）
 │   │   ├── prime/                prime-agent 适配器（node + python；自带 go:embed 的 HTTP bridge）
-│   │   ├── dsh/                  dsh 适配器（node；自带 go:embed 的 HTTP bridge）
+│   │   ├── harness/              0g-harness 适配器（node；运行镜像里装好的 0g-harness）
 │   │   └── conformance/          可执行不变量套件,每个 adapter 在测试里跑
 │   ├── settings/                 owner 的配置 document：Doc（owner 选的那部分，唯一被持久化的）
 │   │                             + Resolved（Doc 加上平台每次开机算出来的部分，哪儿都不存）
@@ -205,13 +205,13 @@ sealed/
 ├── images/sealed/                通用 node 镜像（npm 安装只是热缓存）；不构建任何实际发布的镜像——openclaw 的是上面的 Dockerfile
 ├── images/hermes/                sealed sandbox 镜像，python/uv 版（hermes）
 ├── images/prime/                 sealed sandbox 镜像，node+python 版（prime-agent）
-└── images/dsh/                   sealed sandbox 镜像，dsh 版
+└── images/harness/               sealed sandbox 镜像，0g-harness 版
 ```
 
 ### 各包职责一句话
 
 - **chain**：所有 AgenticID 链 view / tx 在这里收口，外面拿不到 `*ethclient.Client`，只能拿语义 API（`WaitForMint` / `IntelligentDatasOf` / `Update` 等）。唯一在别处发出的交易是 0G 存储的 flow 提交，由 `dataplane.Upload` 通过存储 SDK 发出
-- **dataplane**：iData 加解密 + 0g-storage 传输；不调用 AgenticID。`UnsealDataKey(sealed, priv) → dataKey`、`Decrypt(ct, key)`、`Encrypt(pt, key)`；`Download` 经 `privsep.RootCommand` 跑 `0g-storage-client download`（只在仅 root 可写的 `PATH` 目录中解析；由 `Dockerfile` 和 `images/{hermes,prime,dsh,sealed}` 按 `go.mod` 里钉住的 SDK 版本安装到 `/usr/local/bin`），输出写进仅 root 可访问的临时目录；`Upload` 通过同一 client 的 Go SDK 在进程内上传，并自己提交 0G 存储的 flow 交易（SDK 连 `CHAIN_RPC_URL`），用 sealed 持有的 agent_seal 密钥签名 —— 不起子进程、不写临时文件 —— 每个 blob 上限 90s。上传与 sealed 共用进程，因此没有隔离：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（见 `QUIRKS.md`）
+- **dataplane**：iData 加解密 + 0g-storage 传输；不调用 AgenticID。`UnsealDataKey(sealed, priv) → dataKey`、`Decrypt(ct, key)`、`Encrypt(pt, key)`；`Download` 经 `privsep.RootCommand` 跑 `0g-storage-client download`（只在仅 root 可写的 `PATH` 目录中解析；由 `Dockerfile` 和 `images/{hermes,prime,harness,sealed}` 按 `go.mod` 里钉住的 SDK 版本安装到 `/usr/local/bin`），输出写进仅 root 可访问的临时目录；`Upload` 通过同一 client 的 Go SDK 在进程内上传，并自己提交 0G 存储的 flow 交易（SDK 连 `CHAIN_RPC_URL`），用 sealed 持有的 agent_seal 密钥签名 —— 不起子进程、不写临时文件 —— 每个 blob 上限 90s。上传与 sealed 共用进程，因此没有隔离：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（见 `QUIRKS.md`）
 - **framework**：定义 `Framework` 接口（adapter 协议）+ `RuntimeContext` + `RoleSpec{Name, Shape}` + 共享类型如 `StartParams`、`StartResult`。**不依赖具体框架**
 - **settings**：`Doc`（provider / model / thinking / 一段不透明的 per-framework overlay）是 owner 的 document，也是唯一被持久化的那一半；`Resolved` 再加上平台在 Start 时算出来的部分 —— endpoint、输出预算、模型吃不吃 reasoning bound —— 哪儿都不存，因为存下来的副本会过期、然后跟算出来的值打架（`settings.go:10-15`）
 - **framework/openclaw**：参考 adapter 实现。又内部拆成 `restore.go`/`restore_paths.go`、`evolution.go`/`evolution_paths.go`、`spawn.go`、`ingest.go`（persona legacy）、`inference.go`（`RenderSettings`：owner 的 document → openclaw.json）、`disk.go`（openclaw.json read/write）、`whitelist.go`（npm 版本白名单）、`identitymd.go`/`soulmd.go`/`toolsmd.go`（IDENTITY/SOUL/TOOLS 三份 sealed-managed 平台段 + 共享 marker 工具）
@@ -286,7 +286,7 @@ type Framework interface {
 **`RenderSettings` 是唯一一个跟 iData 无关的方法。** 接口上其他方法搬的都是链上锚
 定的状态；`RenderSettings` 拿的是 `settings.Resolved` —— owner 的 document 加上
 平台为这次开机算出来的部分 —— 把它放到那个框架自己读配置的地方：openclaw 和
-hermes 是配置文件，prime 和 dsh 是 bridge 进程的环境变量。（prime 还会额外渲染一份
+hermes 是配置文件，prime 是 bridge 进程的环境变量，0g-harness 是 harness 进程的环境变量。（prime 还会额外渲染一份
 `models.json` —— 那是产物，不是 role：它用的 SDK 没有 0G router 的内置 provider，
 而且没有任何环境变量能把内置 provider 重定向到别的端点，`prime/modelsjson.go:47-55`。）
 这是整条配置通道里唯一没法共用的一段，因为只有 adapter 知道自己的方言。平台依赖
@@ -481,7 +481,7 @@ adapter 同时把自家那份摘掉了，理由见 §5（"什么是 iData，什�
 | openclaw（`openclaw.go:164`） | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `openclaw.json` |
 | hermes（`hermes.go:143`） | `framework`、`SOUL.md`、`memories/`、`skills/` | `config.yaml` |
 | prime-agent（`prime.go:162`） | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `models.json` |
-| dsh（`dsh.go:153`） | `framework`、`APPEND_SYSTEM.md`、`skills/` | `settings.yaml` |
+| 0g-harness（`harness.go:167`） | `framework`、`APPEND_SYSTEM.md`、`skills/` | `settings.yaml` |
 
 四个都收敛成同一个形状 —— *binding + persona + memory + skills* —— 这个形状以前被
 各框架的配置文件挡住了。
@@ -492,8 +492,8 @@ adapter 同时把自家那份摘掉了，理由见 §5（"什么是 iData，什�
 是 adapter 把恢复出来的东西交还给平台的方式，平台再用 `report.SeedSettings` 在
 watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是吃劲的：uploader 按
 `Roles()` 重建条目表并整表提交，所以第一次 drift commit 就会把这条未声明的 role 删
-掉 —— 到那时 pin 还没被读出来存下，它就没了，而 prime 和 dsh 没有 pin 都会 hard-fail
-`Start`。今天覆盖并不完整：只有 dsh 实现了 seeder（`dsh/settings.go:366`），另外三个
+掉 —— 到那时 pin 还没被读出来存下，它就没了，而 prime 和 0g-harness 没有 pin 都会 hard-fail
+`Start`。今天覆盖并不完整：只有 0g-harness 实现了 seeder（`harness/settings.go:382`），另外三个
 把自己退役的 role 当未知 legacy role 记一条日志就忽略。见
 [CONFIG_SURFACE.zh.md](CONFIG_SURFACE.zh.md) §10。
 
@@ -519,7 +519,8 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 | `/_seal/compact` | **owner 钱包** | 立刻对这份对话运行框架自己的压缩，不重启（tag `0GSealCompact`，占座门控）：同一时间只跑一个、一条签名消息只接受一次、与 synth 门上的一轮永不重叠——每种拒绝都答 409；adapter 无法触发框架的压缩时答 501——没实现 `SessionCompactor`，或已安装的版本缺少它要调用的东西（openclaw 2026.7.1 之前没有 `sessions compact` 这条 CLI 命令）（`internal/proxy/compact.go`、`CONVERSATION.zh.md`） |
 | `/v1/*` | 用户、owner | framework chat API，反代到 gateway(bearer 鉴权;响应一律不带 proof 签名——这是 owner↔agent 的操控通道);未声明的路径一律 404——没有 catch-all 转发 |
 | `/api/*` | 外部调用方 | agent 注册的服务(精确路径,经 sign socket 的 `/services` 注册),反代到 agent 的 loopback backend;响应先缓冲再带 proof 签名(`X-Agent-Proof`),backend 发 SSE 也一样 |
-| `/v1/responses*` | owner | 长任务面(OpenAI Responses 子集):turn 归属服务端 id、断线不死、`starting_after` 续播、`POST /{id}/cancel` 停止。框架声明了 `kind:"responses"` 路由时由其 bridge 原生提供(prime、dsh),否则由 sealed proxy 在框架自身 chat API 之前**合成**(openclaw、hermes)——见 `internal/proxy/responses.go` |
+| `/v1/responses*` | owner | 长任务面(OpenAI Responses 子集):turn 归属服务端 id、断线不死、`starting_after` 续播、`POST /{id}/cancel` 停止。框架声明了 `kind:"responses"` 路由时由其 bridge 原生提供(prime、0g-harness),否则由 sealed proxy 在框架自身 chat API 之前**合成**(openclaw、hermes)——见 `internal/proxy/responses.go` |
+| `/v1/inbox`、`/v1/events`、`/v1/tasks`、`/v1/schedules` | owner | 仅 0g-harness(声明为 kind `inbox` / `events` / `tasks` / `schedules`):agent 自己开的 turn 说的话(后台任务结束、提醒到点)、可续接的实时事件流(turn、任务、inbox、提醒的变化)、每个 turn / 后台命令 / subagent 及其执行者,以及 agent 设的提醒。其他框架都不声明,SDK 只在声明了的 agent 上提供这些方法(`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
 | `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
 | `/log/agent` + `/log/agent.html` | 运维 | agent 子进程的 stdout/stderr（实时）;路径经 adapter 的 `SubprocessLogPath()` 解析。`/log/openclaw`（`.html`）作为 legacy 别名保留 |
 | `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名；永不签裸 hash，也永不签 EIP-191 version `0x00` —— serve-proof 所在的域，见下）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）+ `/settings`（agent 自己提配置变更 —— 见下）|

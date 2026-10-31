@@ -1,6 +1,6 @@
-package dsh
+package harness
 
-// Filesystem paths the dsh adapter manages.
+// Filesystem paths the 0g-harness adapter manages.
 //
 // DSH keeps all user data under one root: $DSH_HOME, default ~/.dsh
 // (dsh-home-paths' resolveDshHome()). This adapter tracks two children of
@@ -15,9 +15,9 @@ package dsh
 //
 //   - $DSH_HOME/settings.yaml — DSH's own hot-reloaded settings file. This
 //     adapter no longer writes, reads or tracks it: the inference pin comes
-//     from the owner's settings document and reaches the bridge as env
-//     (settings.go). Nothing regressed by dropping it — the bridge never
-//     mounted `dsh-settings-file`, so DSH itself never read the file either.
+//     from the owner's settings document and reaches the harness as env
+//     (settings.go). `dsh-settings-file` is not mounted, so DSH itself never
+//     reads the file either.
 //     An agent minted while the role existed still has one last use for it:
 //     HandleLegacy reads the pin out of the chain entry once at boot, and the
 //     platform persists it as that agent's settings document (settings.go).
@@ -28,14 +28,14 @@ package dsh
 //     read by nothing and survives nothing.
 //
 //   - Any session-persistence backend's output. This adapter's composition
-//     mounts no UPSTREAM session-persistence plugin; the bridge itself is the
-//     backend now (sessionstore.mjs, CONVERSATION.md) and its output is
+//     mounts no UPSTREAM session-persistence plugin; the harness itself is the
+//     backend (its sessionstore, CONVERSATION.md) and its output is
 //     conversationPath() below — untracked for the same reason:
 //     `followup()` continuity does not depend on a durable session log —
 //     and DSH's own session log is append-only, growing on every turn, which
 //     would phantom-drift on every 30s tick if it were ever tracked.
 //   - $DSH_HOME/.credentials.yaml — the credentials store. The inference key
-//     reaches the bridge via env only; nothing writes this file.
+//     reaches the harness via env only; nothing writes this file.
 //   - $DSH_HOME/skills/.system — the local skill provider's own reserved
 //     child (docs/subsystems/skills.md), never agent content.
 //   - The sealed platform/doctrine text: injected in code via
@@ -51,7 +51,7 @@ package dsh
 //     this codebase does not have yet (see the package doc). v1 tracks only
 //     the framework's DATA surface — the persona and the installed skills.
 //     The inference pin is NOT part of it: it is the owner's settings
-//     document, rendered into the bridge's environment at every Start
+//     document, rendered into the harness's environment at every Start
 //     (settings.go), and no role carries it.
 //
 // `dshHome` is a var (not const) so unit tests can redirect into
@@ -87,7 +87,7 @@ func ensureRoleDir(dir string) error {
 
 func skillsDir() string { return dshHome + "/skills" }
 
-// appendSystemPath holds the owner persona, injected by the bridge into
+// appendSystemPath holds the owner persona, injected by the harness into
 // ctx.systemPrompt at boot (see spawn.go) — DSH has no native
 // append-system-prompt-from-file convention the way prime-agent does, so
 // nothing but this adapter ever reads this file. It lives under dshHome
@@ -96,12 +96,12 @@ func skillsDir() string { return dshHome + "/skills" }
 func appendSystemPath() string { return dshHome + "/APPEND_SYSTEM.md" }
 
 // agentDocPath is where Start writes the assembled agent doc (platform
-// mechanics + this adapter's FrameworkFacts) for the bridge to inject via
+// mechanics + this adapter's FrameworkFacts) for the harness to inject via
 // ctx.systemPrompt.section(). Deliberately OUTSIDE dshHome: per-boot platform
 // text must never be reachable by a tracked role.
 func agentDocPath() string { return "/run/seal-agentdoc.md" }
 
-// conversationPath is where the bridge persists this agent's ONE conversation
+// conversationPath is where the harness persists this agent's ONE conversation
 // (CONVERSATION.md): the event log the session is re-seeded from on a process
 // restart. An untracked child of dshHome — this file is exactly the "session-
 // persistence backend's output" the header above classifies as deliberately

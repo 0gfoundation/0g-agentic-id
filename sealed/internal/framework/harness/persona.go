@@ -1,4 +1,4 @@
-package dsh
+package harness
 
 import (
 	"context"
@@ -19,11 +19,11 @@ import (
 // DSH has no native "append this file to my system prompt" convention the
 // way prime-agent's DefaultResourceLoader does — its own `persona` concept is
 // a config VALUE inside the plugin composition (dsh-system-prompt's `persona`
-// field), which is per-boot platform structure this adapter authors, not
+// field), which is per-boot platform structure the harness authors, not
 // agent-owned state. So this role's bytes reach the model through the
-// bridge's own code: a ctx.systemPrompt.section() call at boot (spawn.go),
-// the same authoritative channel the sealed platform doc uses — never a file
-// DSH itself reads. Consequence: like prime-agent's APPEND_SYSTEM.md, this
+// harness's own code: the persona slot it fills at boot from the file
+// SEAL_PERSONA_PATH names (spawn.go), the system prompt the sealed platform
+// doc also rides — never a file DSH itself reads. Consequence: like prime-agent's APPEND_SYSTEM.md, this
 // role needs no marker stripping, because nothing platform-authored ever
 // shares its bytes.
 
@@ -38,7 +38,7 @@ func (a *Adapter) evoAppendSystem() ([]byte, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("dsh evoAppendSystem: read %s: %w", appendSystemPath(), err)
+		return nil, fmt.Errorf("harness evoAppendSystem: read %s: %w", appendSystemPath(), err)
 	}
 	if len(content) == 0 {
 		return nil, nil
@@ -52,21 +52,21 @@ func (a *Adapter) evoAppendSystem() ([]byte, error) {
 // synthesizes a stock template that would land on chain as first-boot drift.
 func (a *Adapter) restoreAppendSystem(plaintext []byte) error {
 	if err := ensureDir(dshHome); err != nil {
-		return fmt.Errorf("dsh.Restore[APPEND_SYSTEM.md]: %w", err)
+		return fmt.Errorf("harness.Restore[APPEND_SYSTEM.md]: %w", err)
 	}
 	if len(plaintext) == 0 {
 		if _, err := privsep.Lstat(appendSystemPath()); err == nil {
 			return nil
 		}
 		if err := privsep.WriteFile(appendSystemPath(), nil, 0o644); err != nil {
-			return fmt.Errorf("dsh.Restore[APPEND_SYSTEM.md]: touch: %w", err)
+			return fmt.Errorf("harness.Restore[APPEND_SYSTEM.md]: touch: %w", err)
 		}
 		return nil
 	}
 	if err := privsep.WriteFile(appendSystemPath(), plaintext, 0o644); err != nil {
-		return fmt.Errorf("dsh.Restore[APPEND_SYSTEM.md]: write: %w", err)
+		return fmt.Errorf("harness.Restore[APPEND_SYSTEM.md]: write: %w", err)
 	}
-	logger.Logf("dsh.Restore[APPEND_SYSTEM.md]: %d bytes", len(plaintext))
+	logger.Logf("harness.Restore[APPEND_SYSTEM.md]: %d bytes", len(plaintext))
 	return nil
 }
 
@@ -96,7 +96,7 @@ func (a *Adapter) HandleLegacy(ctx context.Context, role string, plaintext []byt
 	case legacySettingsRole:
 		return a.handleLegacySettings(plaintext)
 	}
-	logger.Logf("dsh.HandleLegacy: ignoring unknown role %q (%d bytes)", role, len(plaintext))
+	logger.Logf("harness.HandleLegacy: ignoring unknown role %q (%d bytes)", role, len(plaintext))
 	return nil
 }
 
@@ -104,14 +104,14 @@ func (a *Adapter) HandleLegacy(ctx context.Context, role string, plaintext []byt
 // handle (FRAMEWORK_ADAPTER.md §5.4).
 func (a *Adapter) handleLegacyPersona(plaintext []byte) error {
 	if len(strings.TrimSpace(string(plaintext))) == 0 {
-		logger.Logf("dsh.HandleLegacy[persona]: empty seed, nothing to ingest")
+		logger.Logf("harness.HandleLegacy[persona]: empty seed, nothing to ingest")
 		return nil
 	}
 
 	var seed personaSeed
 	if err := json.Unmarshal(plaintext, &seed); err != nil {
 		// A malformed seed must not stop the boot: log and keep defaults.
-		logger.Logf("dsh.HandleLegacy[persona]: WARN parse failed (%v); keeping defaults", err)
+		logger.Logf("harness.HandleLegacy[persona]: WARN parse failed (%v); keeping defaults", err)
 		return nil
 	}
 
@@ -128,11 +128,11 @@ func (a *Adapter) handleLegacyPersona(plaintext []byte) error {
 			// container OFFLINE — strictly worse than running on the stock
 			// system prompt, and worse than what the pre-migration code did
 			// with the same disk.
-			logger.Logf("dsh.HandleLegacy[persona]: WARN write APPEND_SYSTEM.md: %v", err)
+			logger.Logf("harness.HandleLegacy[persona]: WARN write APPEND_SYSTEM.md: %v", err)
 		}
 	}
 
-	logger.Logf("dsh.HandleLegacy[persona]: system_prompt=%d bytes", len(seed.SystemPrompt))
+	logger.Logf("harness.HandleLegacy[persona]: system_prompt=%d bytes", len(seed.SystemPrompt))
 	return nil
 }
 
@@ -141,8 +141,8 @@ func (a *Adapter) handleLegacyPersona(plaintext []byte) error {
 // settings migration left: attestor mints exactly two iData roles, `framework`
 // and `persona`, so an agent minted before the channel that never committed
 // drift carries its pin HERE and nowhere else — the retired settings.yaml role
-// settings.go recovers from only exists on chain after a drift commit. For dsh
-// an unrecovered pin is an outage, not a degradation: Start hard-fails without
+// settings.go recovers from only exists on chain after a drift commit. For
+// 0g-harness an unrecovered pin is an outage, not a degradation: Start hard-fails without
 // one (spawn.go), and the pre-migration code booted these agents fine.
 //
 // The pin is deliberately NOT written into a settings.yaml on disk. It used to
@@ -163,16 +163,16 @@ func (a *Adapter) seedFromPersona(provider, model string) {
 	model = strings.TrimSpace(model)
 	if provider == "" || model == "" {
 		if provider != "" || model != "" {
-			logger.Logf("dsh.HandleLegacy[persona]: seed pins provider=%q model=%q; half a pin is not a recovery", provider, model)
+			logger.Logf("harness.HandleLegacy[persona]: seed pins provider=%q model=%q; half a pin is not a recovery", provider, model)
 		}
 		return
 	}
 	doc := settings.Doc{Provider: provider, Model: model}
 	if !a.stashSeededPin(sourcePersona, doc) {
-		logger.Logf("dsh.HandleLegacy[persona]: the mint seed pins %s/%s, but the retired %s role already recovered this agent's later pin; keeping that one",
+		logger.Logf("harness.HandleLegacy[persona]: the mint seed pins %s/%s, but the retired %s role already recovered this agent's later pin; keeping that one",
 			provider, model, legacySettingsRole)
 		return
 	}
-	logger.Logf("dsh.HandleLegacy[persona]: recovered pin provider=%s model=%s from the mint seed; the platform will persist it as the owner's settings document",
+	logger.Logf("harness.HandleLegacy[persona]: recovered pin provider=%s model=%s from the mint seed; the platform will persist it as the owner's settings document",
 		provider, model)
 }

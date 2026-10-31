@@ -51,7 +51,7 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 **校验刻意做得很薄**(`Doc.Validate`,`settings.go:102`):
 
 - `model` 为空是唯一的致命错误,因为有两家在缺 pin 时 `Start` 硬失败
-  (`framework/prime/spawn.go:81`、`framework/dsh/spawn.go:78`),另两家只告警然后无模型
+  (`framework/prime/spawn.go:81`、`framework/harness/spawn.go:65`),另两家只告警然后无模型
   运行(`framework/openclaw/spawn.go:65`、`framework/hermes/spawn.go:300`);
 - `thinking` 必须属于 `Levels`,大小写不敏感;
 - `others` 必须是合法 JSON,仅此而已。
@@ -84,8 +84,8 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 
 **这个拆分不是美化。**facts 与 endpoint 过去共用一个结构体、挂在同一个
 `provider == "0g-compute"` 判断后面,于是选了 native provider 就连**推理上界**一起被悄悄
-跳过了。hermes 与 dsh 都出过这个 bug(`zgcompute.go:62-65`、
-`framework/dsh/settings.go:147-154`)。拆开它正是 native provider 今天仍然拿得到上界的
+跳过了。hermes 与 0g-harness 的适配器都出过这个 bug(`zgcompute.go:62-65`、
+`framework/harness/settings.go:164-171`)。拆开它正是 native provider 今天仍然拿得到上界的
 原因,并且有专门的回归测试(`internal/settings/settings_test.go`,
 `TestNativeProviderStillGetsBoundedReasoning`)。
 
@@ -96,7 +96,7 @@ owner settings；见 [provider 扩展及上线](../sdk/typescript/PROVIDERS.zh.m
 
 ### 3.1 `Effort()` 有三种结果,任何两种都不能合并
 
-`Resolved.Effort() (level string, decided bool)`(`settings.go:160`):
+`Resolved.Effort() (level string, decided bool)`(`settings.go:201`):
 
 ```
 ("high", true)   施加这个档位
@@ -127,7 +127,7 @@ owner settings；见 [provider 扩展及上线](../sdk/typescript/PROVIDERS.zh.m
 
 ### 3.2 `PersistableMaxTokens()`,以及"解析结果一律不存"的由来
 
-`Resolved.PersistableMaxTokens()`(`settings.go:184`)返回目录给出的输出预算,或者 `0`
+`Resolved.PersistableMaxTokens()`(`settings.go:225`)返回目录给出的输出预算,或者 `0`
 表示"什么都别写",闸门是 `ModelFacts.CatalogSourced`。名字启发式的兜底值是
 `inference.HeuristicOpenAIMaxTokens = 8192`(`zgcompute.go:160`);在目录故障期间被写进
 磁盘,它此后看起来就永远像是手工设定的,把一个推理模型"思考+回复"的共享预算饿成永远
@@ -137,27 +137,27 @@ owner settings；见 [provider 扩展及上线](../sdk/typescript/PROVIDERS.zh.m
 那次事故就是 `Resolved` 每次启动重算、且哪儿都不存的原因:**存下来的副本会过时,然后
 与算出来的值互相打架**(`settings.go:11-15`)。
 
-适配器真正交给框架的是 `Resolved.RequestMaxTokens()`(`settings.go:216`):即
-`PersistableMaxTokens()` 封顶到 `RequestOutputCeiling = 32768`(`settings.go:196`),
+适配器真正交给框架的是 `Resolved.RequestMaxTokens()`(`settings.go:258`):即
+`PersistableMaxTokens()` 封顶到 `RequestOutputCeiling = 32768`(`settings.go:237`),
 同样以 `0` 表示"什么都别写"。目录里的 `max_completion_tokens` 是一种能力——单次回复
 最多能有多长——而不是每次请求该填的值,而每个框架都会在每次请求里带上它配置的预算。
 如果服务端按"prompt + 预算"对照上下文窗口做检查,这个能力值会占掉窗口的大半:路由
 目录里 deepseek-v3 的输出上限是 147456、窗口 163840,只给对话留 16,384 个 token;
 封顶后是 131,072(目录,2026-10-19)。32768 也是目录预算接进来之前 pi-ai 默认发的值,
-是实测最大单次输出(约 13.6K token,glm-5.3,effort=max)的两倍多。线上的字段:dsh 发
+是实测最大单次输出(约 13.6K token,glm-5.3,effort=max)的两倍多。线上的字段:0g-harness 发
 `max_completion_tokens`,openclaw 和 hermes 发 `max_tokens`;prime-agent 的 SDK
-不管 models.json 写多少,都会压到 32000。还有一个调用压得更低:dsh 的压缩摘要
-(`/compact`)封顶 16384(`bridge.mjs` 的 `COMPACT_SUMMARY_MAX_TOKENS`;目录没给
+不管 models.json 写多少,都会压到 32000。还有一个调用压得更低:0g-harness 的压缩摘要
+(`/compact`)封顶 16384(0g-harness `src/composition.mjs` 的 `COMPACT_SUMMARY_MAX_TOKENS`;目录没给
 预算时用引擎自己的 8192):它在历史最长
 的时候带着约一轮的输入,所以凡是服务端按"prompt + 预算"对照某个上限做检查的地方,更小
 的预算都给它留出比一轮更多的空间;16384 是实测最大摘要的 3 倍(effort=max 下 33.9K
 token 的 prompt 产出 5,239 个输出 token)。
 
 2026-10 长对话里 glm-5.3 遇到的 HTTP 400(code `400001`)不是靠这个封顶修好的。那些
-请求的"prompt + 预算"都在约 196,608 及以上,**并且** dsh 的系统提示是用 `developer`
+请求的"prompt + 预算"都在约 196,608 及以上,**并且** 系统提示是用 `developer`
 角色的消息发的;把这段提示改成 `system` 后重放同一个请求,65 次全部通过(2026-10-16),
-zg compute 也确认(2026-10-19)腾讯和 0G 自部署的后端不支持这个角色。真正的修复是 dsh
-改发 `system`(`bridge.mjs`,`compat.supportsDeveloperRole: false`——openclaw 和
+zg compute 也确认(2026-10-19)腾讯和 0G 自部署的后端不支持这个角色。真正的修复是 0g-harness
+发 `system`(0g-harness `src/composition.mjs`,`compat.supportsDeveloperRole: false`——openclaw 和
 prime 早已这样钉住)。
 
 ## 4. 文档存在哪,怎么到达容器
@@ -317,13 +317,13 @@ RenderSettings(ctx context.Context, s settings.Resolved) error
 | openclaw(`openclaw/inference.go:69`) | `~/.openclaw/openclaw.json` | 顶层深合并;`gateway` 被丢弃 —— 它携带首次 Start 写入的每次启动凭据,顺序保护不了它;`~/.openclaw` 之外的 `~/x` agent workspace 或 `agentDir` 渲染为 `/home/agent/x` —— openclaw 在那里从 `OPENCLAW_HOME=/root` 展开 `~`(`homeRelativeOverlayPaths`;见 QUIRKS.md)。在 openclaw 2026.7.1 及以上(有 `/compact` 的版本)写三个 `agents.defaults.compaction` 键:`keepRecentTokens` 设为 openclaw 自己的默认值(20000)——手动压缩只有在它被设置时才保留最近的尾部——`timeoutSeconds` 设为 600,因为 openclaw 默认的 180 秒会把慢的 `/compact` 摘要截断,两者都是除非 openclaw.json 里那里已经是一个正整数(owner 的 overlay,或磁盘上的修改);对走路由的 pin,`model` 设为这个 pin,让换模型后马上做的压缩用新模型写摘要,除非 overlay 指定了模型。`session.reset` 设为 `{mode: "idle"}`(永不过期),除非 openclaw.json 里已经有一个(overlay 的,或磁盘上的修改)——openclaw 默认每天开一个新会话(`CONVERSATION.zh.md`) |
 | hermes(`hermes/spawn.go:177`) | `~/.hermes/config.yaml` | 深合并,再把平台键写在上面:`model.{default,provider,base_url,api_key}`、`agent.reasoning_effort`,以及目录给出预算时的 `model.max_tokens`;文档不再提供时,三个接线键会被**清除**,否则 hermes 会继续拿上一次启动的 key 去拨上一次启动的 endpoint;`model.max_tokens` 在同一模型遇目录故障时保留,模型变了就删除(除非 overlay 自己设了它),否则换到输出上限更低的模型后每个请求都会失败 |
 | prime-agent(`prime/modelsjson.go:144`) | `~/.prime/agent/models.json` **以及**桥的环境 | 泛型 JSON 合并,平台键在**两条路径上都**覆盖其上;框架内置 provider 且没有 overlay 时干脆不写文件,并删掉遗留的旧文件 |
-| dsh(`dsh/settings.go:161`) | 只有桥进程的环境 | 一份有类型的旋钮白名单(`toolJobs`、`maxParallelToolCalls`);这个框架根本没有配置文件可渲染 |
+| 0g-harness(`harness/settings.go:178`) | 只有 harness 进程的环境 | 一份有类型的旋钮白名单(`toolJobs`、`subagents`、`schedule`、`maxParallelToolCalls`);这个框架根本没有配置文件可渲染 |
 
-dsh 是有意思的一个:DSH 自己的 `settings.yaml` 由 `@deepseek-ai/dsh-settings-file` 提供,
-而桥**刻意不挂载**它 —— 它的热加载会让 agent 的一次编辑当场往活进程里注入任意
+0g-harness 是有意思的一个:DSH 自己的 `settings.yaml` 由 `@deepseek-ai/dsh-settings-file` 提供,
+而 harness **刻意不挂载**它 —— 它的热加载会让 agent 的一次编辑当场往活进程里注入任意
 `baseURL`/`apiKeyEnv`。这个文件后来是作为本 adapter 自己的 pin 持久化存储活下来的;
 有了 settings 文档做 pin 的归宿,它就没有用途了 —— 没有东西写它、没有东西读它,而那个
-插件依然没被挂载(`dsh/settings.go:15-34`)。
+插件依然没被挂载(`harness/settings.go:15-34`)。
 
 有三处细节值得带着走,每一处都是一道疤:
 
@@ -337,15 +337,15 @@ dsh 是有意思的一个:DSH 自己的 `settings.yaml` 由 `@deepseek-ai/dsh-se
   openclaw 还额外把 overlay 的值**深拷贝**进来:别名共享曾让平台自己的键透过与"已应用
   overlay 记录"共享的 map 被写入,于是下次开机那轮"撤回已删除的 overlay 键"把平台自己
   的推理上界撤掉了(`openclaw/inference.go:357-364`)。
-- **overlay 绝不能有能力把开机搞挂。**dsh 的 `parseKnobs` 对 overlay 出错的每一种方式都
+- **overlay 绝不能有能力把开机搞挂。**0g-harness 的 `parseKnobs` 对 overlay 出错的每一种方式都
   尽力而为 —— 类型不对、越界、根本不是对象 —— 因为 `RenderSettings` 是从 `PreStart` 在
   **每一次** spawn 前跑的,所以这里报错不是"一次被拒的推送",而是**一个起不来的 agent**,
   而且会一直起不来,因为导致它的那份文档正是 attestor 存着的那份
-  (`dsh/settings.go:76-85`)。
+  (`harness/settings.go:96-105`)。
 
-dsh 的旋钮集合是白名单而不是透传,原因很具体:`workspaceContext` 会被识别并**拒绝**,
+0g-harness 的旋钮集合是白名单而不是透传,原因很具体:`workspaceContext` 会被识别并**拒绝**,
 因为它把一个 agent 可写、且不属于任何角色的文件(`~/.dsh/AGENTS.md`)喂进系统提示。
-那是**平台边界的动作,不是编排偏好**,owner 的旋钮不该能做这件事(`dsh/settings.go:46-57`)。
+那是**平台边界的动作,不是编排偏好**,owner 的旋钮不该能做这件事(`harness/settings.go:46-57`)。
 
 ## 7. 凭据
 
@@ -367,7 +367,7 @@ v2 明文绑定 provider ID；v3 还绑定 endpoint/协议的路由 hash，以�
 | openclaw | 引用式:配置里放 `{source: env, id: <VAR>}`,盘上只有变量**名**;`spawn.go` 把值导给子进程 |
 | hermes | **明文写在盘上**的 `model.api_key` —— hermes 的 `custom` provider 声明了 `env_vars=()`,只从 `config.yaml` 读密钥;用 env 注入曾导致 router 线上 401,hermes 是裸着拨过去的(`hermes/spawn.go:165-172`) |
 | prime-agent | 引用式:`models.json` 里放 `apiKey: "SEAL_MODEL_API_KEY"`(`prime/modelsjson.go:72`),值在桥的 env 里 |
-| dsh | 只在桥的 env 里 —— 并且**刻意不放进**那个确定性、会被记录、每次启动重建的 `settingsEnv` 切片,这样渲染出来的环境可以被比较和记录而不必碰密钥(`dsh/settings.go:181-187`) |
+| 0g-harness | 只在 harness 的 env 里 —— 并且**刻意不放进**那个确定性、会被记录、每次启动重建的 `settingsEnv` 切片,这样渲染出来的环境可以被比较和记录而不必碰密钥(`harness/settings.go:198-204`) |
 
 `config.yaml` 还是上链角色的时候,hermes 把密钥写盘需要在捕获路径上加一道
 `stripSecrets`。两份 `stripSecrets` 都随角色一起没了:**现在没有任何东西会捕获这些文件,
@@ -535,7 +535,7 @@ attestor 因此把它当作严格弱于 owner 写入的东西,并加了三道闸
 
 **覆盖:四家 adapter 两个遗留来源都能恢复。**每家都实现了
 `LegacySettingsSeeder`,既从各自退役的配置角色恢复 pin(openclaw `openclaw.json`、
-hermes `config.yaml`、prime `models.json`、dsh `settings.yaml`),也从 mint 时的
+hermes `config.yaml`、prime `models.json`、0g-harness `settings.yaml`),也从 mint 时的
 `persona` 种子恢复——后者之所以必要,是因为 attestor 只 mint `framework` + `persona`
 两个角色,一个从未漂移过的 agent 的 pin 只存在于种子里。这两个来源在真实链上不可能
 共存(第一次写入配置角色的那笔漂移提交会整体重建数组、同时丢掉 `persona`),但每家
@@ -550,7 +550,7 @@ attestor 已存的文档。
 这是通道所取代的那个世界 —— 保留它,因为它是证据,也因为同样这四列是看清这次改动到底
 买到了什么最快的方式。**本节没有任何一句描述当前行为。**
 
-| | openclaw | hermes | prime-agent | dsh |
+| | openclaw | hermes | prime-agent | 0g-harness |
 |---|---|---|---|---|
 | 配置文件 | `~/.openclaw/openclaw.json` | `~/.hermes/config.yaml` | `~/.prime/agent/models.json` | `~/.dsh/settings.yaml` |
 | 上链的部分 | 仅顶层 `agents`、`auth`、`models` | 仅顶层 `approvals`、`model`、`terminal` | 整个文件 | 整个文件 |
@@ -560,7 +560,7 @@ attestor 已存的文档。
 | 模型上链 | 是 | 是 | 是 | 是 |
 | 思考档位键 | `agents.defaults.thinkingDefault` | `agent.reasoning_effort` | *(无 —— 仅环境变量)* | *(无 —— 仅环境变量)* |
 | **思考档位上链** | **是**(在 `agents` 内) | **否**(`agent` 不在白名单) | **否** | **否** |
-| 运行中可改档位 | 否 —— Start 时读取 | 否 —— Start 时读取 | **是,可逐条请求指定** | 否 —— 桥启动时固定 |
+| 运行中可改档位 | 否 —— Start 时读取 | 否 —— Start 时读取 | **是,可逐条请求指定** | 否 —— harness 启动时固定 |
 | owner 改档位的通道 | create 时沙盒 env 里的 `SEAL_OWNER_THINKING` —— 改它必须重建容器 | ← 同左 | ← 同左 | ← 同左 |
 | API key | 环境变量引用 | **明文写在盘上**;捕获时剥离 | 环境变量*名* | 环境变量名 + `stripSecrets` |
 | 声明的角色 | `framework`、**`openclaw.json`**、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `framework`、**`config.yaml`**、`SOUL.md`、`memories/`、`skills/` | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、**`models.json`**、`skills/` | `framework`、`APPEND_SYSTEM.md`、**`settings.yaml`**、`skills/` |
@@ -580,7 +580,7 @@ attestor 已存的文档。
    编辑会被忠实持久化,下次启动又把坏状态恢复回来。**已从结构上解决**:agent 的通道不
    持久化,而文件每次 spawn 都重渲染。
 5. **版本 pin 的可改性取决于安装方式。**openclaw 与 hermes 在容器内安装(改 pin = 重启
-   harness);prime 与 dsh 烤进镜像(改 pin = 换镜像 = 重建容器)。**未变** —— 它与这条
+   harness);prime 与 0g-harness 烤进镜像(改 pin = 换镜像 = 重建容器)。**未变** —— 它与这条
    通道无关。
 
 ### 11.1 iData 里少了什么,以及跟着被删掉的东西
@@ -590,7 +590,7 @@ attestor 已存的文档。
 | openclaw | `framework`、`openclaw.json`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/`(`openclaw/openclaw.go:164`) |
 | hermes | `framework`、`config.yaml`、`SOUL.md`、`memories/`、`skills/` | `framework`、`SOUL.md`、`memories/`、`skills/`(`hermes/hermes.go:143`) |
 | prime-agent | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`models.json`、`skills/` | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/`(`prime/prime.go:162`) |
-| dsh | `framework`、`APPEND_SYSTEM.md`、`settings.yaml`、`skills/` | `framework`、`APPEND_SYSTEM.md`、`skills/`(`dsh/dsh.go:153`) |
+| 0g-harness | `framework`、`APPEND_SYSTEM.md`、`settings.yaml`、`skills/` | `framework`、`APPEND_SYSTEM.md`、`skills/`(`harness/harness.go:167`) |
 
 **没有任何配置角色。**四家统一收敛成「读法 + 人格 + 记忆 + 技能」—— 这个共性以前被各家
 形状各异的配置文件盖住了。
@@ -646,7 +646,7 @@ hermes 的 `approvals` 与 `terminal` 也一并离开,而且不是顺带。它�
   现在有了:#167 把推理密钥加密到 agentSeal 公钥(`SEAL_SECRET_ENV`),钱包弹窗、中转
   各方、attestor 的任务存储看到的都是密文 —— 而且信封里的 `env` 本来就是一张命名表,
   第二个凭据天然有地方骑。仍然敞着的是**落地**一半:§7 把解开后的 key 放在框架进程
-  env(openclaw/prime/dsh)或 hermes 的 `config.yaml` 盘上,而对一个 agent 有 shell、
+  env(openclaw/prime/0g-harness)或 hermes 的 `config.yaml` 盘上,而对一个 agent 有 shell、
   有文件访问的框架来说,"只在进程 env 里"不构成保密边界。那剩下一半的修法形状是
   "能用而不可见" —— #163 connections 设计给 OAuth token 的待遇 —— 推理密钥还没有拿到
   这个待遇。agent 圣经里也该

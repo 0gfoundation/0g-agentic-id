@@ -1,4 +1,4 @@
-package dsh
+package harness
 
 import (
 	"bytes"
@@ -12,31 +12,31 @@ import (
 	"seal-verify/internal/settings"
 )
 
-// The owner's configuration channel, dsh half (CONFIG_SURFACE.md §9).
+// The owner's configuration channel, 0g-harness half (CONFIG_SURFACE.md §9).
 //
 // THIS FRAMEWORK HAS NO CONFIG FILE TO RENDER INTO, deliberately. DSH's own
 // settings file ($DSH_HOME/settings.yaml) is served by
-// `@deepseek-ai/dsh-settings-file`, and the bridge does NOT mount that plugin:
+// `@deepseek-ai/dsh-settings-file`, and the harness does NOT mount that plugin:
 // it hot-reloads, so an agent edit of the file would inject an arbitrary
 // baseURL/apiKeyEnv route into a live process. The file survived anyway as
 // this adapter's own durable store for the inference pin — a chain-tracked
 // `settings.yaml` role that Start read back at boot. With the owner's settings
 // document as the pin's home that store has no remaining purpose, so it is
-// gone: nothing writes the file, nothing reads it, and the bridge still does
-// not mount the plugin that would. The security property is unchanged;
+// gone: nothing writes the file, nothing reads it, and the harness does not
+// mount the plugin that would. The security property is unchanged;
 // nothing is left for it to protect. The one remaining trace is the CHAIN
 // entry an agent minted while the role existed still carries, which
 // HandleLegacy reads the pin out of exactly once (see the bottom of this
 // file) before the watcher drops it.
 //
-// "Where this framework reads its settings" is therefore the bridge process's
+// "Where this framework reads its settings" is therefore the harness process's
 // ENVIRONMENT. RenderSettings computes those variables once, deterministically,
 // and Start hands them to the process it spawns (spawn.go).
 
-// dshKnobs are the composition knobs the owner may set through the settings
-// document's opaque `framework` section. They are the literals the bridge
-// used to hardcode; an overlay that says nothing must reproduce exactly the
-// composition that shipped.
+// harnessKnobs are the composition knobs the owner may set through the settings
+// document's opaque `others` section. An overlay that says nothing must
+// reproduce exactly the composition that ships: every capability below is off
+// until the owner turns it on.
 //
 // This set is an allowlist on purpose. The composition also carries the
 // platform's OWN decisions — the sandbox policy mode, the spine invariant
@@ -55,17 +55,37 @@ import (
 // dropped. Making ~/.dsh/AGENTS.md a tracked role is the change that would
 // let this become an owner option again; it is listed as deferred in
 // README.md and needs the role, not a flag.
-type dshKnobs struct {
+type harnessKnobs struct {
 	// ToolJobs mounts the spine's background-job tools.
 	ToolJobs bool
+	// Subagents mounts the subagent tool: read-only helper agents the main
+	// agent runs in the background. They run as jobs, so the harness turns
+	// the job tools on with this knob.
+	Subagents bool
+	// Schedule mounts dsh-schedule: reminders the agent sets for itself.
+	Schedule bool
 	// MaxParallelToolCalls bounds how many tool calls one turn may run at
 	// once. 1 = strictly serial.
 	MaxParallelToolCalls int
 }
 
-// defaultKnobs is today's composition, i.e. what an empty overlay must yield.
-func defaultKnobs() dshKnobs {
-	return dshKnobs{ToolJobs: false, MaxParallelToolCalls: 1}
+// defaultKnobs is the shipped composition, i.e. what an empty overlay must
+// yield.
+func defaultKnobs() harnessKnobs {
+	return harnessKnobs{ToolJobs: false, Subagents: false, Schedule: false, MaxParallelToolCalls: 1}
+}
+
+// parseBoolKnob reads one boolean knob. A value that is not a boolean costs
+// that knob, not the agent: it falls back to the default and says so.
+func parseBoolKnob(fields map[string]json.RawMessage, name string, dst *bool, def bool) {
+	v, ok := fields[name]
+	if !ok {
+		return
+	}
+	if err := json.Unmarshal(v, dst); err != nil {
+		logger.Logf("harness.RenderSettings: %s=%s is not a boolean (%v); using %v", name, v, err, def)
+		*dst = def
+	}
 }
 
 // parseKnobs reads the owner's opaque per-framework section, key by key. An
@@ -83,36 +103,33 @@ func defaultKnobs() dshKnobs {
 // is owner-authored free text; a typo in it must cost the knob it is in, not
 // the agent. Each rejected value falls back to the shipped default and says so
 // in the log, and the knobs around it still apply.
-func parseKnobs(raw json.RawMessage) dshKnobs {
+func parseKnobs(raw json.RawMessage) harnessKnobs {
 	k := defaultKnobs()
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return k
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
-		logger.Logf("dsh.RenderSettings: framework overlay is not a JSON object (%v); composing with the shipped defaults", err)
+		logger.Logf("harness.RenderSettings: others overlay is not a JSON object (%v); composing with the shipped defaults", err)
 		return k
 	}
 
-	if v, ok := fields["toolJobs"]; ok {
-		if err := json.Unmarshal(v, &k.ToolJobs); err != nil {
-			logger.Logf("dsh.RenderSettings: toolJobs=%s is not a boolean (%v); using %v",
-				v, err, defaultKnobs().ToolJobs)
-			k.ToolJobs = defaultKnobs().ToolJobs
-		}
-	}
+	d := defaultKnobs()
+	parseBoolKnob(fields, "toolJobs", &k.ToolJobs, d.ToolJobs)
+	parseBoolKnob(fields, "subagents", &k.Subagents, d.Subagents)
+	parseBoolKnob(fields, "schedule", &k.Schedule, d.Schedule)
 
 	if v, ok := fields["maxParallelToolCalls"]; ok {
 		n := defaultKnobs().MaxParallelToolCalls
 		switch err := json.Unmarshal(v, &n); {
 		case err != nil:
-			logger.Logf("dsh.RenderSettings: maxParallelToolCalls=%s is not a whole number (%v); using %d",
+			logger.Logf("harness.RenderSettings: maxParallelToolCalls=%s is not a whole number (%v); using %d",
 				v, err, defaultKnobs().MaxParallelToolCalls)
 			n = defaultKnobs().MaxParallelToolCalls
 		case n < 1:
 			// A zero or negative bound would compose an agent that can run no
 			// tool at all.
-			logger.Logf("dsh.RenderSettings: maxParallelToolCalls=%d is out of range; using %d",
+			logger.Logf("harness.RenderSettings: maxParallelToolCalls=%d is out of range; using %d",
 				n, defaultKnobs().MaxParallelToolCalls)
 			n = defaultKnobs().MaxParallelToolCalls
 		}
@@ -123,14 +140,14 @@ func parseKnobs(raw json.RawMessage) dshKnobs {
 		// Refused, loudly and in one place. See the type doc: the file it
 		// would pull into the system prompt is agent-writable and tracked by
 		// nothing, so this is not a knob an owner gets to turn.
-		logger.Logf("dsh.RenderSettings: REFUSING framework.workspaceContext — it feeds ~/.dsh/AGENTS.md into the system prompt, and that file is agent-writable and belongs to no chain-tracked role, so this platform does not offer it as a setting (composing with it off)")
+		logger.Logf("harness.RenderSettings: REFUSING others.workspaceContext — it feeds ~/.dsh/AGENTS.md into the system prompt, and that file is agent-writable and belongs to no chain-tracked role, so this platform does not offer it as a setting (composing with it off)")
 	}
 
 	return k
 }
 
 // renderedSettings is what RenderSettings produced: the resolved document
-// (Start reads the pin from it) and the bridge environment derived from it.
+// (Start reads the pin from it) and the harness environment derived from it.
 type renderedSettings struct {
 	resolved settings.Resolved
 	env      []string // KEY=VALUE, sorted; see settingsEnv
@@ -167,12 +184,12 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 	a.mu.Unlock()
 
 	level, decided := s.Effort()
-	logger.Logf("dsh: rendered settings provider=%s model=%s effort=%q(decided=%t) routed=%v maxTokens=%d knobs=%+v",
+	logger.Logf("harness: rendered settings provider=%s model=%s effort=%q(decided=%t) routed=%v maxTokens=%d knobs=%+v",
 		s.Provider, s.Model, level, decided, s.Endpoint != nil, s.RequestMaxTokens(), knobs)
 	return nil
 }
 
-// settingsEnv renders the settings-derived half of the bridge environment.
+// settingsEnv renders the settings-derived half of the harness environment.
 //
 // Deterministic by construction: values are collected in a map and emitted
 // sorted, so the same Resolved yields byte-identical output however the
@@ -185,7 +202,7 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 // the idempotence contract is about. Keeping the key out of it is what lets
 // the rendered env be compared, logged and reasoned about without handling a
 // secret.
-func settingsEnv(s settings.Resolved, k dshKnobs) []string {
+func settingsEnv(s settings.Resolved, k harnessKnobs) []string {
 	env := map[string]string{}
 
 	// Owner's knobs FIRST, platform-owned keys written over them. Today that
@@ -194,8 +211,10 @@ func settingsEnv(s settings.Resolved, k dshKnobs) []string {
 	// name a platform variable in the first place — but the ordering is what
 	// keeps that true when a knob is added later, without anyone having to
 	// maintain an exclusion list.
-	env["SEAL_DSH_TOOL_JOBS"] = boolEnv(k.ToolJobs)
-	env["SEAL_DSH_MAX_PARALLEL_TOOL_CALLS"] = strconv.Itoa(k.MaxParallelToolCalls)
+	env["SEAL_HARNESS_TOOL_JOBS"] = boolEnv(k.ToolJobs)
+	env["SEAL_HARNESS_SUBAGENTS"] = boolEnv(k.Subagents)
+	env["SEAL_HARNESS_SCHEDULE"] = boolEnv(k.Schedule)
+	env["SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS"] = strconv.Itoa(k.MaxParallelToolCalls)
 
 	env["SEAL_MODEL_PROVIDER"] = s.Provider
 	env["SEAL_MODEL_ID"] = s.Model
@@ -212,12 +231,12 @@ func settingsEnv(s settings.Resolved, k dshKnobs) []string {
 	// three of Effort()'s outcomes are handled, and two of them are NOT the
 	// same decision even though they render the same way here:
 	//
-	//   level != ""      name it; the bridge declares the model
+	//   level != ""      name it; the harness declares the model
 	//                    reasoning-capable and defaults the profile to it.
 	//   decided, ""      the catalog says this model REJECTS
 	//                    reasoning_effort. Naming a level would put the
 	//                    parameter on the wire and earn a hard 400 on every
-	//                    turn, so the variable is absent and the bridge
+	//                    turn, so the variable is absent and the harness
 	//                    declares nothing.
 	//   undecided, ""    the catalog was unreachable or silent. The platform
 	//                    knows nothing, so it CLAIMS nothing: no variable, and
@@ -227,7 +246,7 @@ func settingsEnv(s settings.Resolved, k dshKnobs) []string {
 	//                    no previous value here to leave standing — but there
 	//                    is a third DECISION, and it is "do not state what we
 	//                    cannot know". Inventing "low" out of an outage is the
-	//                    400 above; the bridge's silence instead leaves the
+	//                    400 above; the harness's silence instead leaves the
 	//                    judgement with pi-ai's own model metadata, which for a
 	//                    framework built-in still knows the answer.
 	//
@@ -240,16 +259,16 @@ func settingsEnv(s settings.Resolved, k dshKnobs) []string {
 	case level != "":
 		env["SEAL_MODEL_EFFORT"] = level
 	case decided:
-		logger.Logf("dsh: %q takes no reasoning bound (catalog); the bridge will declare none", s.Model)
+		logger.Logf("harness: %q takes no reasoning bound (catalog); the harness will declare none", s.Model)
 	default:
-		logger.Logf("warn: dsh: the router catalog is silent on %q, so the platform states no reasoning bound for this boot; if this model always thinks it can reason unbounded until the catalog answers — set `thinking` in the settings document to pin a level regardless", s.Model)
+		logger.Logf("warn: harness: the router catalog is silent on %q, so the platform states no reasoning bound for this boot; if this model always thinks it can reason unbounded until the catalog answers — set `thinking` in the settings document to pin a level regardless", s.Model)
 	}
 
-	// Only a catalog-sourced budget reaches the bridge (review P1): the name
+	// Only a catalog-sourced budget reaches the harness (review P1): the name
 	// heuristic's guess (8192) starves a reasoning model's shared
 	// thinking+reply budget, and RequestMaxTokens is 0 for it. With no
-	// variable the bridge omits maxTokens and pi-ai's own default applies.
-	// The bridge declares this as the model's maxTokens, which pi-ai sends as
+	// variable the harness omits maxTokens and pi-ai's own default applies.
+	// The harness declares this as the model's maxTokens, which pi-ai sends as
 	// max_completion_tokens on EVERY request — so it is the capped request
 	// budget, never the catalog's raw capability (see RequestMaxTokens).
 	if mt := s.RequestMaxTokens(); mt > 0 {
@@ -264,7 +283,7 @@ func settingsEnv(s settings.Resolved, k dshKnobs) []string {
 	return out
 }
 
-// wireAPI maps a resolved wire format onto the pi-ai `api` id the bridge
+// wireAPI maps a resolved wire format onto the pi-ai `api` id the harness
 // passes to the llm-pi-ai route.
 func wireAPI(f inference.WireFormat) string {
 	if f == inference.WireAnthropic {
@@ -296,7 +315,7 @@ const legacySettingsRole = "settings.yaml"
 
 // legacyLLMPluginID is the composition-entry key the retired role nested the
 // route under — DSH's own settings-file shape, which this adapter wrote even
-// though the bridge never mounted the plugin that reads it.
+// though the plugin that reads it was never mounted.
 const legacyLLMPluginID = "llm-pi-ai"
 
 // handleLegacySettings recovers the inference pin from the retired role's
@@ -306,7 +325,7 @@ const legacyLLMPluginID = "llm-pi-ai"
 func (a *Adapter) handleLegacySettings(plaintext []byte) error {
 	provider, model := legacyPin(plaintext)
 	if model == "" {
-		logger.Logf("dsh.HandleLegacy[%s]: no usable pin in the legacy entry (%d bytes); nothing to recover",
+		logger.Logf("harness.HandleLegacy[%s]: no usable pin in the legacy entry (%d bytes); nothing to recover",
 			legacySettingsRole, len(plaintext))
 		return nil
 	}
@@ -317,7 +336,7 @@ func (a *Adapter) handleLegacySettings(plaintext []byte) error {
 	// else — so it wins over the mint seed whichever order Phase C visits.
 	a.stashSeededPin(sourceConfig, doc)
 
-	logger.Logf("dsh.HandleLegacy[%s]: recovered pin provider=%s model=%s from the retired role; the platform will persist it as the owner's settings document",
+	logger.Logf("harness.HandleLegacy[%s]: recovered pin provider=%s model=%s from the retired role; the platform will persist it as the owner's settings document",
 		legacySettingsRole, provider, model)
 	return nil
 }
@@ -390,7 +409,7 @@ func legacyPin(plaintext []byte) (provider, model string) {
 		} `json:"providers"`
 	}
 	if err := json.Unmarshal(plaintext, &cfg); err != nil {
-		logger.Logf("dsh.HandleLegacy[%s]: WARN parse failed (%v); nothing recovered", legacySettingsRole, err)
+		logger.Logf("harness.HandleLegacy[%s]: WARN parse failed (%v); nothing recovered", legacySettingsRole, err)
 		return "", ""
 	}
 	providers := cfg[legacyLLMPluginID].Providers

@@ -14,10 +14,10 @@ framework behind an HTTP bridge), was built as a seam probe and then
 **retired** — a per-request CLI can't host the owner-built public services
 this platform is for (see §12 for the full field report; the adapter code
 was removed, but the port's lessons are the reason much of this contract
-exists). A fifth, `dsh` (DeepSeek Harness), is a Cordis-plugin-composed
-harness driven through a sealed-owned bridge; its composition and
-capability tiers are documented in `internal/framework/dsh/README.md`,
-the port report in §14.
+exists). A fifth, `0g-harness` (old name `dsh`), is the platform's own
+harness, composed from DeepSeek Harness (DSH) plugins and run by sealed as
+the framework process; its composition and capability tiers are documented
+in `internal/framework/harness/README.md`, the port report in §14.
 
 The authoritative source is the code:
 [`internal/framework/framework.go`](internal/framework/framework.go)
@@ -102,7 +102,7 @@ components hold only the interface (or a narrow subset of it) and need
   carry does not require a new image, just (optionally) one more warm-cache
   line; a new ecosystem does. That is the design intent; what ships today
   differs: openclaw runs on `sealed/Dockerfile` (FROM the
-  `images/openclaw/` base), dsh, also node, has its own `images/dsh/`, and
+  `images/openclaw/` base), 0g-harness, also node, has its own `images/harness/`, and
   `images/sealed/` builds no image that ships.
 
 - **The owner's configuration is core-owned end to end but the last
@@ -210,7 +210,7 @@ Conventions and rules:
   | openclaw (`openclaw.go:164`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `~/.openclaw/openclaw.json`, re-rendered every spawn |
   | hermes (`hermes.go:143`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `~/.hermes/config.yaml`, re-rendered every spawn |
   | prime-agent (`prime.go:162`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `~/.prime/agent/models.json`, re-rendered every spawn |
-  | dsh (`dsh.go:153`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | none — the bridge's process environment |
+  | 0g-harness (`harness.go:167`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | none — the harness's process environment |
 
   `openclaw.json`, `config.yaml`, `models.json` and `settings.yaml` were all
   roles until the owner's settings document became the pin's durable home.
@@ -408,7 +408,7 @@ what the owner signs is what gets minted); the deploy client (SDK
 adapter is the
 translator for the **`system_prompt` half**: map it onto your own
 path-driven artifact (openclaw → `SOUL.md`, hermes → `SOUL.md`, prime and
-dsh → `APPEND_SYSTEM.md`). An adapter that ignores `persona` silently drops
+0g-harness → `APPEND_SYSTEM.md`). An adapter that ignores `persona` silently drops
 the owner's mint-time prompt — the claudecode port shipped with exactly this
 bug before the rule was written down.
 
@@ -417,8 +417,8 @@ document owns the pin (§5.5), and `RenderSettings` rebuilds the framework's
 configuration from it before every spawn, so anything an ingestion writes is
 overwritten moments later. Keeping a copy would only create a second source of
 truth, and the stale one wins on exactly the boots where the document is
-empty. prime and dsh therefore log the seed's pin and do not apply it
-(`prime/persona.go:114-135`, `dsh/persona.go:123-135`); openclaw and hermes
+empty. prime and 0g-harness therefore log the seed's pin and do not apply it
+(`prime/persona.go:114-135`, `harness/persona.go:123-135`); openclaw and hermes
 still write it, which now matters only for an agent whose document carries no
 model (`hermes/ingest.go:51-55`). If your framework can't honour part of a
 seed, log it and keep your default rather than writing config your framework
@@ -434,7 +434,7 @@ durable form.
 
 `RenderSettings(ctx, s settings.Resolved) error` puts the owner's
 configuration where THIS framework reads it — a config file for openclaw and
-hermes, the bridge process's environment for prime-agent and dsh (prime also
+hermes, the bridge process's environment for prime-agent, the harness process's environment for 0g-harness (prime also
 writes a `models.json` provider registration, because that is the only way to
 register a provider its SDK has no built-in for). It is the one piece of the
 configuration channel that cannot be shared, because only your adapter knows
@@ -462,8 +462,8 @@ See [provider extension and image rollout](../sdk/typescript/PROVIDERS.md).
 The Facts/Endpoint split is load-bearing, and it is why a native provider now
 still gets a reasoning bound. The two used to share one struct behind a single
 `provider == "0g-compute"` check, so picking a native provider silently
-skipped the bound along with the endpoint wiring — hermes and dsh both did
-this (`inference/zgcompute.go:57-65`). Facts apply to every provider; only
+skipped the bound along with the endpoint wiring — the hermes and 0g-harness
+adapters both did this (`inference/zgcompute.go:57-65`). Facts apply to every provider; only
 `Endpoint` is gated on routing.
 
 Three accessors carry the gating you must not re-invent:
@@ -508,11 +508,11 @@ None of the four bundled adapters renders into a tracked path today —
 `openclaw.json` sits beside `workspace/` rather than inside it, `config.yaml`
 is on hermes's explicit never-tracked list (`hermes/paths.go`), `models.json`
 sits under `primeHome` but under none of the tracked paths (`prime/paths.go`),
-and dsh renders to environment variables. So for today's adapters the rule is
+and 0g-harness renders to environment variables. So for today's adapters the rule is
 a standing guarantee for the first adapter that does render into a role, plus
 a plain operational one: the render runs on every spawn, and a file whose
 bytes differ boot to boot is a file nobody can reason about. Every bundled
-adapter tests it anyway (`TestRenderSettings_Idempotent` in openclaw and dsh,
+adapter tests it anyway (`TestRenderSettings_Idempotent` in openclaw and 0g-harness,
 `TestRenderIdempotent` in hermes, `TestRenderSettingsIsIdempotent` in prime),
 including under a catalog outage (`TestRenderSettings_OutageRenderIsIdempotent`),
 because carrying facts forward must itself be a fixed point.
@@ -526,11 +526,11 @@ per-boot token.
 Ordering, not an exclusion list, is what stops an overlay disabling a platform
 protection — pinning a stale base URL, or turning off the reasoning bound the
 `Effort()` tri-state exists to protect. An exclusion list has to be maintained
-key by key, and the key it silently stops covering is the one added next. dsh
-states this plainly at its own merge site: today the ordering is
+key by key, and the key it silently stops covering is the one added next. The
+0g-harness adapter states this plainly at its own merge site: today the ordering is
 belt-and-braces there, since `parseKnobs` reads only keys it knows and emits
 each under a fixed name, but the ordering is what keeps that true when a knob
-is added later, with nobody maintaining a list (`dsh/settings.go:settingsEnv`).
+is added later, with nobody maintaining a list (`harness/settings.go:settingsEnv`).
 
 The corollary the gating above forces: **a value the platform does not
 actually know is not written, and does not erase what is already on disk
@@ -623,9 +623,9 @@ Because two of those three run before the process exists or while it is being
 replaced, **do not fail on anything the owner or the agent wrote.** An error
 on the PreStart path is not a rejected push, it is an agent that will not
 boot — and it keeps not booting, because the document that caused it is the
-one attestor stores. dsh takes every malformed overlay value back to the
+one attestor stores. 0g-harness takes every malformed overlay value back to the
 shipped default and logs it, one policy for out-of-range, wrong-typed, and
-not-an-object alike (`dsh/settings.go:parseKnobs`); openclaw sets an
+not-an-object alike (`harness/settings.go:parseKnobs`); openclaw sets an
 unparseable `openclaw.json` aside and rebuilds it rather than propagating the
 parse error, which used to be terminal *and* self-perpetuating — Start refuses
 to run without a successful render and nothing repaired the file, so the agent
@@ -659,8 +659,8 @@ change one the owner authored (`report/report.go:134-138`). The call is
 best-effort — a failure is logged, the agent runs on the recovered pin either
 way, and the next boot retries.
 
-Exactly one adapter implements the interface today: dsh, for its retired
-`settings.yaml` role (`dsh/settings.go:286-338`). openclaw, hermes and prime
+Exactly one adapter implements the interface today: 0g-harness, for its
+retired `settings.yaml` role (`harness/settings.go:305-357`). openclaw, hermes and prime
 do not, so a pre-channel agent on those three comes up on whatever document
 attestor already holds; prime's `HandleLegacy` says so in as many words and
 calls lifting those pins "the platform's job", not yet landed
@@ -793,7 +793,7 @@ tree populates or reads them any more: `APIKey`, `Provider`, `Model`,
 `ZGComputeRouted` and `OwnerThinking` are declared in the struct but dead.
 Take the credential and the pin from `settings.Resolved` instead — reading
 `RuntimeContext.APIKey` is the defect that dialled a platform-routed endpoint
-keyless and 401'd live (`openclaw/spawn.go:335-342`, `dsh/spawn.go:225-228`).
+keyless and 401'd live (`openclaw/spawn.go:335-342`, `harness/spawn.go:155-158`).
 
 What to *do* with the rest is adapter policy, but the openclaw adapter is
 the reference: it injects marker-wrapped sections into the agent's
@@ -836,7 +836,7 @@ You get these for free; design your framework's surface assuming them:
   in the agent's doctrine* (see [AGENT_DOCTRINE.md](AGENT_DOCTRINE.md));
   your adapter should install an equivalent of openclaw's SOUL rules so
   externally-prompted sign requests get refused. If your adapter
-  bridges the socket into an agent tool (as dsh's `seal_sign` does), it
+  bridges the socket into an agent tool (as 0g-harness's `seal_sign` does), it
   must forward only to these endpoints and must **never** add a
   raw-hash or `0x00` signing path. Either one would let the agent forge
   serve-proofs.
@@ -895,7 +895,7 @@ func TestConformance(t *testing.T) {
 }
 ```
 
-Every bundled adapter runs it (`openclaw/`, `hermes/`, `prime/`, `dsh/`
+Every bundled adapter runs it (`openclaw/`, `hermes/`, `prime/`, `harness/`
 `conformance_test.go`; the retired claudecode port ran it too); its first
 run against openclaw immediately caught two real bugs (§12), so treat a
 red conformance test as a production incident you got for free. It is
@@ -1025,7 +1025,7 @@ The one obligation that replaced all four is step 4.
      The agent has its own home, `/home/agent`, which is `HOME` for
      everything it runs and the default working directory of
      `AgentCommand` (a spawn may set another directory the agent owns as
-     `Dir`, as the prime and dsh bridges do with their framework tree);
+     `Dir`, as the prime bridge and 0g-harness do with their framework tree);
      `/root` stays `root:root 0711`. Call `privsep.OwnTree` on your
      framework trees only (it refuses `/`, root's home, any ancestor of a
      PATH directory or sealed's executable, and anything inside sealed's
@@ -1164,10 +1164,12 @@ The one obligation that replaced all four is step 4.
     TRACKED roles is a key-filtered file — `ConfigFile` + `ConfigKeys`, which
     render the "considers only these top-level keys" paragraph. Prime's
     `harness_state.json` is the last user of that pair; openclaw, hermes and
-    dsh leave it empty and instead list their rendered config file under
-    `Untracked`, telling the agent in as many words that the platform
-    rewrites those keys every boot and that nothing in the file survives a
-    container reset (`openclaw/platformtext.go:35`).
+    0g-harness leave it empty. openclaw and hermes instead list their
+    rendered config file under `Untracked`, telling the agent in as many
+    words that the platform rewrites those keys every boot and that nothing
+    in the file survives a container reset (`openclaw/platformtext.go:35`);
+    0g-harness renders no file, and its `Untracked` note says the model and
+    route are not a file in its home at all.
     `platform.AssembleAgentDoc(pc, facts)` splices the platform
     halves with your rendered facts — single-file frameworks (hermes) inject
     the whole result into one context file; openclaw distributes the platform
@@ -1301,7 +1303,7 @@ parts of it:
     claudecode bridge is `go:embed`ded, and the attestor allowlist
     carries a single hash. Net effect: attestor is fully
     framework-agnostic — its only remaining framework knowledge is a
-    list of opaque names. (Since then hermes, prime and dsh have shipped
+    list of opaque names. (Since then hermes, prime and 0g-harness have shipped
     images of their own, and openclaw ships from `sealed/Dockerfile`;
     `images/sealed/` builds no image that ships.)
 18. Finding 12 resolved by the ecosystem: 0g-compute shipped an
@@ -1507,38 +1509,41 @@ keeping the attested measurement honest.
 
 ## 14. Port report: DeepSeek Harness (DSH) (2026-08) — the fourth port
 
-This section records the port's design decisions; the composition and
-capability tiers are documented in
-[`internal/framework/dsh/README.md`](internal/framework/dsh/README.md).
+This section records the port's design decisions. The framework it produced
+is 0g-harness (old name `dsh`); its composition and capability tiers are
+documented in
+[`internal/framework/harness/README.md`](internal/framework/harness/README.md).
 
 DSH (`@deepseek-ai/dsh`) is a Cordis-plugin-composed harness: every
 capability — model, tools, skills, sessions, storage, the system prompt
 itself — is an independently versioned, independently swappable plugin
 package (~50 of them). Unlike openclaw, hermes and prime-agent, there is no
 single "the framework's config file"; the composition itself (which plugins,
-in what order, with what config) is platform structure this adapter authors:
-it lives in the sealed-owned bridge (`bridge/bridge.mjs`, go:embed'd,
-materialized at Start), the same way this repo already ships the prime-agent
-bridge. The state half — `Roles`, `Defaults`, `Restore`/`EvolutionFor`,
+in what order, with what config) is platform structure: it lives in
+[0g-harness](https://github.com/0gfoundation/0g-harness) (`src/composition.mjs`),
+which the 0g-harness image installs at build time. The state half — `Roles`, `Defaults`, `Restore`/`EvolutionFor`,
 `HandleLegacy["persona"]`, `FrameworkFacts` — is green under
 `conformance.Run` plus adapter-specific tests for persona ingestion and, since
 the settings channel landed, for the render itself
-(`dsh/settings_test.go`: idempotence, overlay parsing, and recovery of the
+(`harness/settings_test.go`: idempotence, overlay parsing, and recovery of the
 retired role's pin).
 
 **Role set, and the reasoning distinct from the other three adapters:**
 
 1. **`framework`** — the protocol-reserved binding leaf, same shape as every
-   adapter. DSH's release series and its npm version are the *same* series
-   (unlike prime-agent's tarball/npm split), so the whitelist speaks npm
-   versions directly.
+   adapter. The whitelist speaks 0g-harness versions (its `package.json`); the
+   harness's `npm-shrinkwrap.json` locks the DSH packages under it, so one
+   harness version names one exact dependency tree. A binding minted under
+   the old name `dsh`, pinning a DSH version, is read as this framework's and
+   rewritten at the agent's first commit (`harness/harness.go`
+   `legacyFrameworkName`).
 2. **`APPEND_SYSTEM.md`** — owner persona, verbatim bytes. DSH has no
    file-based "append to my system prompt" convention the way prime-agent's
    `DefaultResourceLoader` does; its own `persona` concept is a *config value*
    inside the plugin composition, which is per-boot platform structure this
    adapter authors, not agent state. So this role's bytes reach the model
-   through the bridge's own code — a `ctx.systemPrompt.section()` call after
-   boot settles — never through a file DSH itself reads. That
+   through the harness's own code — the persona slot it fills at boot from
+   the file `SEAL_PERSONA_PATH` names — never through a file DSH itself reads. That
    also means, like prime-agent, no marker stripping is needed: nothing
    platform-authored ever shares this role's bytes.
 3. **No config role at all** — and this adapter is where that became the
@@ -1549,14 +1554,14 @@ retired role's pin).
    The owner's settings document is a better one (§5.5), so the role is gone
    and with it the file — nothing writes `$DSH_HOME/settings.yaml`, nothing
    reads it, and `stripSecrets` and the JSON/YAML wire split it needed are
-   deleted. The bridge still deliberately does not mount
+   deleted. The harness deliberately does not mount
    `@deepseek-ai/dsh-settings-file`, whose hot-reload would layer that file
    over the composition and let an agent edit inject an arbitrary inference
    route; the security property is unchanged, there is simply nothing left
-   for it to protect. "Where this framework reads its settings" is now the
-   bridge process's ENVIRONMENT: `RenderSettings` computes those variables
+   for it to protect. "Where this framework reads its settings" is the
+   harness process's ENVIRONMENT: `RenderSettings` computes those variables
    deterministically and `Start` hands them to the process it spawns
-   (`dsh/settings.go:15-34`). The one remaining trace is the CHAIN entry an
+   (`harness/settings.go:15-34`). The one remaining trace is the CHAIN entry an
    agent minted while the role existed still carries, which `HandleLegacy`
    reads the pin out of exactly once — this adapter is the only implementor
    of `framework.LegacySettingsSeeder` (§5.5).
@@ -1599,29 +1604,35 @@ replacing with equivalent machinery: the intended shape is an always-allow
 approval policy (doctrine constrains the agent, not a permission dialog) and
 simply not loading a structured ask-user tool, so a question surfaces as
 plain assistant text the way it already does on openclaw and prime-agent —
-free, because the underlying `Agent` object is long-lived in the bridge
+free, because the underlying `Agent` object is long-lived in the harness
 process and a plain follow-up message already continues the same turn
 context, no separate answer channel required.
 
-**The process half.** The bridge (`bridge/bridge.mjs` + the platform
-plugins `seal-tools.mjs` / `seal-guard.mjs`, all go:embed'd) composes the
-plugin tree in-process — no loader, no profile, no `$DSH_HOME` patch layer,
-so the composition rides the sealed image hash and an agent editing its home
-cannot change what mounts next boot. It keeps one long-lived `Agent`,
-serializes turns, and exposes one OpenAI-shaped `/v1/chat/completions`
-(streaming off `session/event`'s `text-delta` chunks). Doctrine constrains
-the agent rather than a permission dialog: no approval UI, `danger-full-access`
-sandbox mode — privsep's kernel uid split is the isolation wall, not DSH's
-own sandbox stack. The `@deepseek-ai/dsh-*` family is npm-installed at image
-build time, pinned exact per `whitelist.go` (the family's `latest` dist-tags
-are mutually inconsistent, so exact pins only), and `verifyInstalled` makes a
-whitelist/image mismatch a loud boot failure — same measurement reasoning as
-prime-agent's install (§13). What each capability plugin is and why the rest
-are deliberately unmounted is the composition doc:
-[`internal/framework/dsh/README.md`](internal/framework/dsh/README.md).
+**The process half.** 0g-harness (with its platform plugins `seal-tools`,
+`seal-guard` and `subagent-guard`) composes the plugin tree in-process — no
+loader, no profile, no `$DSH_HOME` patch layer — and the 0g-harness image installs
+one exact build of it at build time, its dependency tree locked, so the
+composition rides the image hash and an agent editing its home cannot change
+what mounts next boot. It keeps one long-lived `Agent`, runs owner turns one
+at a time, and routes each turn's output to whoever opened the turn: the
+owner request, or the inbox for a turn the agent opened itself (a background
+job finishing, a reminder coming due). It serves `/v1/chat/completions`
+(streaming off `session/event`'s `text-delta` chunks), `/v1/responses`, and
+the inbox / events / tasks / schedules routes `FrameworkRoutes` advertises by
+kind on `/hello`. Doctrine constrains the agent rather than a permission
+dialog: no approval UI, `danger-full-access` sandbox mode — privsep's kernel
+uid split is the isolation wall, not DSH's own sandbox stack. The harness pins
+the `@deepseek-ai/dsh-*` family exact (the family's `latest` dist-tags are
+mutually inconsistent, so exact pins only), and the image build fails unless
+the installed 0g-harness version is the one `whitelist.go` records in the
+`framework` role — the same measurement reasoning as prime-agent's install
+(§13), checked where the image is made. What each capability plugin is and
+why the rest are deliberately unmounted is the composition doc:
+[`internal/framework/harness/README.md`](internal/framework/harness/README.md).
 
-One rule this port added to the checklist: **run an embedded bridge against
-the built image before shipping it** — `go build` embeds the JS without
-validating it, so module-shape mistakes (default-importing a named-only
-plugin module, mounting both a `Local*` provider and the base class it
-already registers) surface only at boot, as a container that never listens.
+One rule this port added to the checklist: **run the framework process on
+its real packages before shipping it** — module-shape mistakes
+(default-importing a named-only plugin module, mounting both a `Local*`
+provider and the base class it already registers) surface only at boot, as a
+container that never listens. 0g-harness's end-to-end tests run its real
+process on its locked dependency tree.
