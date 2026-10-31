@@ -540,10 +540,16 @@ pub struct SandboxCreateResponse {
 // 404 = gone (Failed); everything else = preserved-but-not-running (Stopped,
 // resumable). Defaulting unknowns to Stopped avoids wrongly Failing/reaping a
 // live sandbox when a new transitional state (e.g. "archiving") appears.
+//
+// `desired_state` is the provider's target state ("started", "stopped",
+// "archived", …). An accepted start of an archived sandbox keeps reporting
+// `state` "archived", then "restoring", while `desired_state` is "started".
 #[derive(Debug, Clone, Deserialize)]
 pub struct SandboxInfo {
     pub id: String,
     pub state: String,
+    #[serde(default, rename = "desiredState")]
+    pub desired_state: Option<String>,
 }
 
 #[cfg(test)]

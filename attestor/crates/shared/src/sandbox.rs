@@ -26,10 +26,12 @@ use serde::{Deserialize, Serialize};
 pub struct SandboxError {
     /// Operation that failed: "create" | "start" | "stop" | "admin_delete" | …
     pub op: String,
-    /// HTTP status from the provider, when the call reached it. `None` for a
-    /// pre-flight/transport failure (which is treated as non-transient).
+    /// HTTP status from the provider, when the call reached it. `None` when
+    /// the call was refused before it was sent (e.g. an owner envelope that
+    /// does not match the provider). Transport failures are plain errors,
+    /// not `SandboxError`.
     pub status: Option<u16>,
-    /// Raw response body (or transport error text).
+    /// Raw response body, or the reason the call was not sent.
     pub message: String,
 }
 
@@ -42,10 +44,10 @@ impl SandboxError {
         }
     }
 
-    /// True when the condition is transient/recoverable and the caller must
-    /// NOT destroy the sandbox — it's healthy now or will be once the
-    /// condition clears (a state-transition lock, the ~90s post-stop backup,
-    /// a rate limit, an upstream RPC hiccup, or a top-up-able balance gap).
+    /// True when the condition clears on its own or with a top-up, so the
+    /// call can simply be made again later (a state-transition lock, the ~90s
+    /// post-stop backup, a rate limit, an upstream RPC hiccup, or a
+    /// top-up-able balance gap).
     /// Classification is by HTTP status; see the 0g-sandbox provider error
     /// map. The two body checks below are only because the provider can't
     /// disambiguate by status alone (it has no structured error codes and
@@ -734,22 +736,32 @@ impl HttpSandbox {
         envelope: &SandboxEnvelope,
         verb: &str,
     ) -> anyhow::Result<()> {
+        let refused = |message: String| -> anyhow::Error {
+            SandboxError {
+                op: verb.to_string(),
+                status: None,
+                message,
+            }
+            .into()
+        };
         let msg_bytes = base64::engine::general_purpose::STANDARD
             .decode(envelope.signed_message_b64.as_bytes())
-            .map_err(|e| anyhow::anyhow!("sandbox {verb}: base64 decode: {e}"))?;
+            .map_err(|e| refused(format!("base64 decode: {e}")))?;
         let canonical: CanonicalSignedMessage = serde_json::from_slice(&msg_bytes)
-            .map_err(|e| anyhow::anyhow!("sandbox {verb}: parse canonical JSON: {e}"))?;
+            .map_err(|e| refused(format!("parse canonical JSON: {e}")))?;
         let connection = self.connection().await?;
-        self.check_provider(&canonical, &connection)?;
+        self.check_provider(&canonical, &connection)
+            .map_err(|e| refused(e.to_string()))?;
         if canonical.resource_id.is_empty() {
-            anyhow::bail!("sandbox {verb}: envelope.resource_id (sandbox_id) must be non-empty");
+            return Err(refused(
+                "envelope.resource_id (sandbox_id) must be non-empty".into(),
+            ));
         }
         if canonical.action != verb {
-            anyhow::bail!(
-                "sandbox {verb}: envelope.action mismatch — got {:?}, want {:?}",
-                canonical.action,
-                verb
-            );
+            return Err(refused(format!(
+                "envelope.action mismatch — got {:?}, want {:?}",
+                canonical.action, verb
+            )));
         }
 
         let url = format!(
@@ -761,15 +773,15 @@ impl HttpSandbox {
         let sig_hex = format!("0x{}", hex::encode(envelope.wallet_signature.as_ref()));
         let addr_hex = format!("{:#x}", envelope.wallet_address);
 
-        // Idempotent retry: lifecycle start/stop on a known sandbox_id is
-        // safe to replay — sandbox treats repeated transitions to the
-        // same state as no-ops.
+        // Strict retry: the provider consumes the envelope nonce in its auth
+        // middleware before handling the request, so a resend of a request
+        // that reached it can only be refused. Retry only when it never left.
         let op: &'static str = match verb {
             "start" => "sandbox start",
             "stop" => "sandbox stop",
             _ => "sandbox lifecycle",
         };
-        let res = send_text_in_snapshot(&connection, op, RetryPolicy::Idempotent, || {
+        let res = send_text_in_snapshot(&connection, op, RetryPolicy::Strict, || {
             connection
                 .http
                 .post(&url)
@@ -931,6 +943,63 @@ mod tests {
             1,
             "a possibly processed create must never be resent after a body failure"
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_call_does_not_resend_after_a_server_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server = {
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = vec![0u8; 4096];
+                    let _ = socket.read(&mut request).await.unwrap();
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    socket
+                        .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy")
+                        .await
+                        .unwrap();
+                }
+            })
+        };
+        let mut sandbox = HttpSandbox::new(
+            format!("http://{address}"),
+            "http://attestor.test",
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        );
+        sandbox.http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let canonical = CanonicalSignedMessage {
+            action: "start".into(),
+            expires_at: 9_999_999_999,
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            payload: serde_json::json!({}),
+            provider: None,
+            resource_id: "sb-1".into(),
+        };
+        let envelope = SandboxEnvelope {
+            wallet_address: Address::repeat_byte(7),
+            signed_message_b64: base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&canonical).unwrap()),
+            wallet_signature: Bytes::from(vec![0u8; 65]),
+        };
+
+        let error = sandbox
+            .start(alloy::primitives::B256::ZERO, &envelope)
+            .await
+            .unwrap_err();
+        server.abort();
+
+        let refusal = error.downcast_ref::<SandboxError>().expect("SandboxError");
+        assert_eq!(refusal.status, Some(503));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -456,9 +456,9 @@ worker 在 owner 授权的 create 前生成独立票据，通过保留的内部�
 代次、启动 ID 与时间。POST 要求票据、容器私钥证明及实际 sandbox 身份均匹配，
 并复核链上 owner。重复或更早的启动请求不能换新凭据。票据在框架启动前从环境中清除。
 
-stop 和 worker 的致命启动失败会在同一事务中撤销凭据；resume 先开新代次，再调用
-sandbox.start。reset 在恢复配置首次尝试计数之前先隔离旧代次，因此旧请求不能消耗
-新启动的重试机会。新 sandbox ID 尚未落库时返回 409，sealed 在 180 秒内重试。
+stop 和启动失败会在同一事务中撤销凭据，包括 sandbox provider 报告未启动的 resume；
+resume 失败从不删除 sandbox。resume 先开新代次，再调用 sandbox.start。reset 在
+恢复配置首次尝试计数之前先隔离旧代次，因此旧请求不能消耗新启动的重试机会。新 sandbox ID 尚未落库时返回 409，sealed 在 180 秒内重试。
 创建或 ID 落库失败会撤销票据，清理新容器。转让清理绑定捕获的旧 sandbox ID，
 不会删除或撤销新 owner 已授权的容器。排队的 owner 操作会在执行前复核链上 owner。
 

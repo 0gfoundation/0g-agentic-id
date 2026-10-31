@@ -3763,9 +3763,15 @@ async function renderDetail(sealId) {
     // `container_stage` — it's a transient UI signal that sealed
     // re-emits on every heartbeat while the condition holds. So we
     // stash it in State and clear on any subsequent container_*
-    // event that implies the agent is back to a normal state.
+    // event that implies the agent is back to a normal state. Other
+    // warnings (the worker's resume/stop hints) are shown as a toast.
     if (evt.event === 'container_warning') {
-      State.containerWarning = { sealId, reason: evt.reason || 'unknown' };
+      const reason = evt.reason || 'unknown';
+      if (isAgentGasWarning(reason)) {
+        State.containerWarning = { sealId, reason };
+      } else {
+        toast(reason);
+      }
     } else if (evt.event === 'container_running'
             || evt.event === 'container_starting'
             || evt.event === 'container_stopped'
@@ -4358,15 +4364,18 @@ function renderSealStatus(balance, sealAddr, agentName) {
 //      The agent literally cannot evolve until the owner funds the
 //      agent_seal address. This IS about the avatar's wallet → pin it.
 //
-//   2. attestor worker: owner's sandbox prepaid balance is insufficient
-//      — sandbox.start / sandbox.create returned 402. That's the owner's
-//      account, not the agent's seal, and it lands the agent in Offline
-//      where the failure banner already says so + offers top-up. Not the
-//      avatar's concern → applyContainerWarning bails on it.
+//   2. everything else, e.g. the attestor worker's lifecycle hints: a
+//      resume that did not start (sandbox balance, provider not
+//      acknowledged, expired signature, provider busy), or a Stop to try
+//      again. A failed resume leaves the agent Stopped and a failed
+//      create leaves it Offline. Neither is about the agent's wallet, so
+//      the WS handler shows these as a toast instead.
 //
-// The reason string distinguishes them: sandbox-balance warnings contain
-// "sandbox balance"; sealed drift warnings carry the raw RPC error
-// (e.g. "insufficient funds for gas * price + value").
+// sealed's gas warnings carry the raw RPC error (e.g. "insufficient funds
+// for gas * price + value", or a data-less "execution reverted").
+function isAgentGasWarning(reason) {
+  return /insufficient funds|insufficient balance|execution reverted/i.test(reason || '');
+}
 const CONTAINER_WARNING_LINES_SEAL = [
   'Out of gas — can’t evolve 🧬',
   'Need gas to self-update 💸',
@@ -4390,16 +4399,10 @@ function applyContainerWarning(sealAddr, agentName) {
     return;
   }
 
-  // Sandbox prepaid balance is the OWNER's account — not the agent_seal
-  // wallet the avatar represents — so a sandbox-balance 402 must NOT pin
-  // the avatar plea. That case lands the agent in Offline, where the
-  // failure banner already surfaces "insufficient sandbox balance" with a
-  // top-up action; doubling it onto the avatar reads as the *agent* being
-  // broke, which it isn't. Leave the bubble to renderSealStatus (balance
-  // plea) and bail. Only agentSeal-gas warnings — the agent literally
-  // can't pay to publish a drift tx — belong on the avatar.
-  const isSandboxBalance = /sandbox balance/i.test(w.reason || '');
-  if (isSandboxBalance) {
+  // Only agentSeal-gas warnings — the agent literally can't pay to
+  // publish a drift tx — belong on the avatar. Anything else (e.g. the
+  // owner's sandbox balance) would read as the *agent* being broke.
+  if (!isAgentGasWarning(w.reason)) {
     plea.classList.remove('seal-plea--alert');
     return;
   }
@@ -4495,7 +4498,7 @@ window.actionStop = (sealId, sandboxId) => lifecycleAction('stop', sealId, sandb
 //
 // Why not `isProvisioned`? It's a sticky DB column (set on first
 // successful /provision, never cleared). A deployment that ran fine,
-// then got stopped, then failed start, then ended up in c=Failed
+// then got stopped, then went down and ended up in c=Failed
 // still has provisioned_at populated — picking action by that field
 // would sign `start` against a dead sandbox and loop forever in 400/403.
 // Recovery click handler. Two paths based on `useStart`:
@@ -4524,10 +4527,11 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
     // Same pre-flight gates as deploy: bringing a sandbox up (create) or
     // resuming one (start) needs the owner's trust roots acked AND prepaid
     // sandbox balance ≥ threshold. Surface the ack + top-up modals up
-    // front rather than letting the worker 402 and bounce the agent back
-    // into Offline. Both calls are no-ops when already satisfied; a falsey
-    // return means the user dismissed the modal, so abort (finally still
-    // releases the in-flight guard).
+    // front rather than letting the worker get a 402 (a resume then stays
+    // Stopped with a hint; a create lands the agent in Offline). Both
+    // calls are no-ops when already satisfied; a falsey return means the
+    // user dismissed the modal, so abort (finally still releases the
+    // in-flight guard).
     if (!await ensureTrustRootsAcked()) return;
     if (!await ensureSandboxBalance()) return;
 

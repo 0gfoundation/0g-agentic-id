@@ -327,6 +327,27 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
 
+                    // A resume job may have restarted this row while the
+                    // sandbox was being inspected; its stage then no longer
+                    // matches what this decision was based on.
+                    if !matches!(act, Act::Skip) {
+                        match deployments.get(seal_id).await {
+                            Ok(Some(d))
+                                if matches!(
+                                    d.container_stage,
+                                    attestor_shared::StageStatus::Confirmed { .. }
+                                ) => {}
+                            Ok(_) => {
+                                tracing::info!(?seal_id, sandbox_id = %sb, "sweep: container stage changed during reconcile — leaving alone");
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(?seal_id, error = %e, "sweep: re-read failed — leaving alone");
+                                continue;
+                            }
+                        }
+                    }
+
                     match act {
                         Act::Skip => {
                             tracing::debug!(?seal_id, sandbox_id = %sb, "sweep: heartbeat stale but /healthz ok — leaving alone");

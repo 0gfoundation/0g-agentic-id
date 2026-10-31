@@ -5,15 +5,16 @@
 //!
 //!   * [`RetryPolicy::Idempotent`] — full retry on any «request didn't
 //!     reach server OR server hiccuped» class of error. Safe to use for
-//!     reads + same-key overwrites + lifecycle calls whose double-fire
-//!     is benign. Retries on `is_timeout / is_connect / is_request` and
-//!     on HTTP 5xx responses.
+//!     reads + same-key overwrites + calls whose double-fire is benign.
+//!     Retries on `is_timeout / is_connect / is_request` and on HTTP
+//!     5xx responses.
 //!
 //!   * [`RetryPolicy::Strict`] — only retry when we're *sure* the
 //!     request never landed (TCP `connect` failed). Used for
-//!     non-idempotent ops like `sandbox.create` where a sandbox-side
-//!     nonce dedup means a retry-after-server-processed produces an
-//!     orphan container.
+//!     non-idempotent ops like `sandbox.create`, where a
+//!     retry-after-server-processed produces an orphan container, and
+//!     for owner-signed `start`/`stop`, whose nonce the provider
+//!     consumes on first receipt so a resend can only be refused.
 //!
 //! Three attempts total (1 initial + 2 retries) with 200ms / 800ms
 //! backoff. The 5xx return-as-is on the last attempt lets the caller
