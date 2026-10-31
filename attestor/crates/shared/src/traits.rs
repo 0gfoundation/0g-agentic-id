@@ -242,6 +242,23 @@ pub trait DeploymentRepo: Send + Sync {
     async fn set_mint_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()>;
     async fn set_container_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()>;
 
+    /// A reconciler's verdict (the heartbeat sweep, `/probe`): apply `stage`
+    /// only while the row is still what the reconciler inspected, i.e. the
+    /// same `sandbox_id`, a container stage whose state tag is
+    /// `expected_state`, and, with `stale_before`, a last heartbeat older
+    /// than that. A lifecycle job that moved the row on in the meantime (a
+    /// reset onto a new sandbox, a resume) keeps it. Stopped and Failed
+    /// revoke the boot binding as `set_container_stage` does. Returns whether
+    /// the stage was applied.
+    async fn set_container_stage_if(
+        &self,
+        seal_id: SealId,
+        sandbox_id: &str,
+        expected_state: &str,
+        stale_before: Option<chrono::DateTime<chrono::Utc>>,
+        stage: StageStatus,
+    ) -> anyhow::Result<bool>;
+
     /// Reset the container track after the sandbox is torn down on ownership
     /// transfer: container_stage → NotStarted, sandbox_id → NULL,
     /// provisioned_at → NULL. With storage + mint still Confirmed this yields
