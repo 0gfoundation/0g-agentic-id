@@ -767,15 +767,20 @@ agent 进程是 sealed 此后以 root 身份所做一切的不可信输入，所
   agent 目录树里；两者都只来自镜像（它的信任库和工具链归 root 所有的配置）。
   sealed 自己的进程以 root 身份、在同一个环境里运行，同样的规则也适用于它：
   启动时、在它的第一个 TLS 连接（链 RPC、attestor、存储 indexer、推理
-  router）之前，只有当 `SSL_CERT_FILE` 和 `SSL_CERT_DIR` 指向仅 root 可写的
-  文件时才保留它们，否则将其移除（`ScrubTrustEnv`），所以它信任的 CA 来自
-  镜像；在它的第一行日志之前（正是这行日志让 Go 读取 `TZ` 指向的时区文件，
+  router）之前，无论 `SSL_CERT_FILE` 和 `SSL_CERT_DIR` 指向什么，都将其移除
+  （`ScrubTrustEnv`），所以它信任的 CA 来自镜像。只在它们指向仅 root 可写的
+  文件时保留是不够的：`/proc/self/environ` 是 root 所有、权限 0400 的文件，
+  内容却是调用方设置的其他变量，其中某个变量里的 PEM 就会被信任。没有任何镜像
+  设置这两个变量。provider 也会从每个 sealed create 中删掉这两个变量，attestor
+  也只转发 owner 的 `API_KEY` 和 `SEAL_SECRET_ENV`
+  （[应用身份](../attestor/APP_IDENTITY.zh.md)）；sealed 自己的移除不依赖这两者。
+  在它的第一行日志之前（正是这行日志让 Go 读取 `TZ` 指向的时区文件，
   而那是阻塞、跟随链接的读取），只有当 `TZ` 指向（或 `TZ` 未设置时
   `/etc/localtime` 是）Go 能加载的、仅 root 可写的时区文件时才保留它，否则
   设为 `TZ=UTC`（`ScrubTimeEnv`；能加载的时区也让 Go 不会退而去读
-  `$GOROOT/lib/time/zoneinfo.zip`）。这些变量和代理端点，就是 sealed 自己的
-  进程会读取的、由部署设定的变量；`ZONEINFO` 只有 `time.LoadLocation` 才读，
-  而 sealed 不调用它。代理端点同样作用于 sealed 自己的客户端：代理能看到连接了哪些主机，
+  `$GOROOT/lib/time/zoneinfo.zip`）。于是 `TZ` 和代理端点就是 sealed 自己的
+  进程会读取的、来自部署环境的路径和网络变量；`ZONEINFO` 只有
+  `time.LoadLocation` 才读，而 sealed 不调用它。代理端点同样作用于 sealed 自己的客户端：代理能看到连接了哪些主机，
   但读不了也改不了 TLS 连接（配置成明文 `http` 的端点没有这层保护，有没有
   代理都一样）。provision 的回复无论如何都加密给容器的密钥。
   root 命令在 `/` 运行，或在经 `RootDir` 检查为仅 root 可访问的目录里运行，

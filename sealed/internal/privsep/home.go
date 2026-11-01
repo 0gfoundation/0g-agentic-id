@@ -643,7 +643,7 @@ func reclaimState() (bool, error) {
 
 // Harden is sealed's boot-time hardening, run once from main before
 // anything else (after the adapters have registered, and so declared their
-// trees): sealed's own CA locations are checked (ScrubTrustEnv), the
+// trees): sealed's own CA locations are removed (ScrubTrustEnv), the
 // process becomes non-dumpable (HardenSelf), and when the split is active
 // root's home is made root-only (SecureHome), the agent's own home is
 // prepared (PrepareAgentHome), what an earlier sealed let the agent leave
@@ -656,10 +656,11 @@ func Harden() {
 	harden(scrubOwnEnv, Active, HardenSelf, SecureHome, PrepareAgentHome, ReclaimHome, UntrustedPATH)
 }
 
-// scrubOwnEnv checks the path-valued variables of sealed's own environment
-// that its own process reads: the time zone (ScrubTimeEnv), then the CA
-// locations (ScrubTrustEnv). Neither logs, so both are done before the
-// first log line, which is what first uses the time zone.
+// scrubOwnEnv settles the path-valued variables of sealed's own
+// environment that its own process reads: the time zone is checked
+// (ScrubTimeEnv), then the CA locations are removed (ScrubTrustEnv).
+// Neither logs, so both are done before the first log line, which is what
+// first uses the time zone.
 func scrubOwnEnv() []string {
 	return append(ScrubTimeEnv(), ScrubTrustEnv()...)
 }

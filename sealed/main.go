@@ -131,8 +131,8 @@ func main() {
 	// their own trees, which stay). Enforced rather than trusted to the base
 	// image: privsep.Required (the provision gate below) refuses until that
 	// has succeeded, so a boot that skips this call is never provisioned.
-	// It also checks sealed's own time zone and CA locations
-	// (privsep.ScrubTimeEnv, privsep.ScrubTrustEnv) before the first TLS
+	// It also checks sealed's own time zone (privsep.ScrubTimeEnv) and
+	// removes its CA locations (privsep.ScrubTrustEnv) before the first TLS
 	// connection and before its first log line, which is what first reads
 	// the time zone: nothing may log before this call.
 	privsep.Harden()
