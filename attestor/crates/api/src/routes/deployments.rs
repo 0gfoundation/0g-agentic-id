@@ -14,7 +14,8 @@
 //!   signature (`X-Auth-Message` = `0GDeployments:<owner>:<ts>`,
 //!   `X-Auth-Signature`); the recovered signer must equal `<owner>` and the
 //!   timestamp must be fresh. Returns the operational fields an owner needs for
-//!   their own agents (stages, sandbox_id, provision error, …).
+//!   their own agents (stages, sandbox_id, provision error, the container's
+//!   last status report, …).
 //!
 //! Neither shape ever serializes the container record (key, image and
 //! provider instance recorded at provision), nor `i_data` /
@@ -25,7 +26,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use alloy::primitives::Address;
 use attestor_shared::sandbox::eip191_digest;
-use attestor_shared::{AgentId, Deployment, DeploymentPhase, SealId, StageStatus};
+use attestor_shared::{AgentId, ContainerStatus, Deployment, DeploymentPhase, SealId, StageStatus};
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
@@ -120,6 +121,11 @@ struct OwnerDeployment {
     provisioned_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_provision_error: Option<String>,
+    /// The current container's last `/status` report (`level`, `reason`,
+    /// `at`): `phase` shows a `warning` as running, so this is where a
+    /// running agent that cannot do its work shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container_status: Option<ContainerStatus>,
     // Deliberately no `settings`: the owner's configuration document is
     // served by `GET /settings` alone, which proves the caller is the LIVE
     // on-chain owner. This tier authenticates against the `owner` query
@@ -145,6 +151,7 @@ impl From<Deployment> for OwnerDeployment {
             container_stage: d.container_stage,
             provisioned_at: d.provisioned_at,
             last_provision_error: d.last_provision_error,
+            container_status: d.container_status,
         }
     }
 }
@@ -265,6 +272,7 @@ mod tests {
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings: None,
             settings_last_good: None,
             settings_version: 0,
@@ -323,5 +331,28 @@ mod tests {
         assert!(owner_tier.get("settings").is_none());
         let public_tier = serde_json::to_value(PublicDeployment::from(d)).unwrap();
         assert!(public_tier.get("settings").is_none());
+    }
+
+    #[test]
+    fn the_owner_tier_carries_the_last_container_status() {
+        // A warning shows as phase running; the owner reads why here. The
+        // public listing keeps omitting container detail.
+        let mut d = row(true);
+        d.container_status = Some(ContainerStatus {
+            level: attestor_shared::ContainerReportStatus::Warning,
+            reason: Some("owner settings unusable".into()),
+            at: Utc::now(),
+        });
+        let owner_tier = serde_json::to_value(OwnerDeployment::from(d.clone())).unwrap();
+        assert_eq!(owner_tier["container_status"]["level"], "warning");
+        assert_eq!(
+            owner_tier["container_status"]["reason"],
+            "owner settings unusable"
+        );
+        assert!(owner_tier["container_status"]["at"].is_string());
+        let public_tier = serde_json::to_value(PublicDeployment::from(d)).unwrap();
+        assert!(public_tier.get("container_status").is_none());
+        let none = serde_json::to_value(OwnerDeployment::from(row(true))).unwrap();
+        assert!(none.get("container_status").is_none());
     }
 }

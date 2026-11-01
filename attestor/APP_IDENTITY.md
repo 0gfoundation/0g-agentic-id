@@ -131,7 +131,10 @@ Sandbox creation always overrides `ATTESTOR_URL` (the HTTPS locator without a tr
 environment; it writes no TLS trust into the environment. The owner-signed
 environment may carry only `API_KEY` and `SEAL_SECRET_ENV` (the inference key, in
 clear or sealed to the agent), which is all the SDK and the console send; a create
-with any other key is refused before anything is sent. That covers a key holding
+with any other key is refused before anything is sent. `/deploy`, `/reset`, a
+first-provision `/start` and `/retry` answer such an envelope with a `400` naming the
+key before they queue any work (a clone carries no envelope: its container comes from
+a later `/start` or `/reset`). That covers a key holding
 `=` (the runtime joins entries as `KEY=VALUE`, so it could add a second entry for a
 variable the attestor sets), the attestor's own variables, and the variables
 sealed's own process reads, such as `SSL_CERT_FILE`, `HTTPS_PROXY`, `GODEBUG` or

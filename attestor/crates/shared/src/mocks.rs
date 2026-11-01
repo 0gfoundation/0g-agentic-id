@@ -33,6 +33,21 @@ pub fn signed_envelope_for(
     action: &str,
     resource_id: &str,
 ) -> SandboxEnvelope {
+    signed_envelope_with_payload(
+        priv_bytes,
+        action,
+        resource_id,
+        serde_json::Value::Object(Default::default()),
+    )
+}
+
+/// [`signed_envelope_for`] carrying `payload` (e.g. a create's `env`).
+pub fn signed_envelope_with_payload(
+    priv_bytes: &[u8; 32],
+    action: &str,
+    resource_id: &str,
+    payload: serde_json::Value,
+) -> SandboxEnvelope {
     let sk = SigningKey::from_bytes(priv_bytes.into()).expect("valid signing key");
     let encoded = sk.verifying_key().to_encoded_point(false);
     let addr = Address::from_slice(&keccak256(&encoded.as_bytes()[1..])[12..]);
@@ -41,7 +56,7 @@ pub fn signed_envelope_for(
         action: action.into(),
         expires_at: 9_999_999_999,
         nonce: "00000000000000000000000000000000".into(),
-        payload: serde_json::Value::Object(Default::default()),
+        payload,
         provider: None,
         resource_id: resource_id.into(),
     };
@@ -1347,6 +1362,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         d.provisioned_at = None;
         d.provision_deadline = None;
         d.container_record = None;
+        d.container_status = None;
         d.phase = derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
         Ok(true)
     }
@@ -1407,6 +1423,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         }
         self.revoke_status_boot(seal);
         d.container_record = None;
+        d.container_status = None;
         Ok(sandbox)
     }
 
@@ -1662,6 +1679,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             .ok_or_else(|| anyhow::anyhow!("unknown seal"))?;
         let mut auths = self.boot_authorizations.lock().unwrap();
         let generation = auths.get(&seal).map_or(1, |a| a.generation + 1);
+        // The boot being authorized reports afresh.
+        d.container_status = None;
         let (sandbox_id, ticket_issued_at, container_pubkey) = match ticket {
             Some(_) => {
                 d.container_record = None;
@@ -1737,6 +1756,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         d.provision_deadline = None;
         d.last_provision_error = None;
         d.last_provision_error_at = None;
+        d.container_status = None;
         self.status_bindings
             .lock()
             .unwrap()
@@ -1755,6 +1775,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         token_hash: [u8; 32],
         stage: StageStatus,
         applied_digest: Option<B256>,
+        status: &ContainerStatus,
     ) -> anyhow::Result<bool> {
         let mut rows = self.by_seal.lock().unwrap();
         let Some(d) = rows.get_mut(&seal_id) else {
@@ -1774,6 +1795,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         }
         d.container_stage = stage;
         d.phase = derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+        d.container_status = Some(status.clone());
         let served = self.served_settings.lock().unwrap().get(&seal_id).copied();
         if applied_digest.is_some_and(|applied| served.is_some_and(|s| s.digest == applied))
             && served.map(|s| s.version) == Some(d.settings_version)

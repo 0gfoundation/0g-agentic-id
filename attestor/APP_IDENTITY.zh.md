@@ -105,7 +105,9 @@ evidence 或 Scan 读取公开 app signer，完成上述 AgenticID 绑定及 san
 创建 sandbox 时，在 owner 签名的环境变量之后始终覆盖 `ATTESTOR_URL`（HTTPS locator，
 去掉末尾 `/`）、`SEAL_BOOT_TICKET` 以及链/indexer 配置；不再把 TLS 信任写进环境变量。
 owner 签名的环境变量只能包含 `API_KEY` 和 `SEAL_SECRET_ENV`（推理 key，明文或加密给
-agent），SDK 和 console 也只发送这两个；含有其他键的 create 在发出之前就被拒绝。这涵盖
+agent），SDK 和 console 也只发送这两个；含有其他键的 create 在发出之前就被拒绝。`/deploy`、
+`/reset`、首次 provision 的 `/start` 和 `/retry` 收到这样的 envelope 时返回 `400` 并指出该键，
+不会排入任何任务（clone 不带 envelope：它的容器来自之后的 `/start` 或 `/reset`）。这涵盖
 含 `=` 的键（运行时按 `KEY=VALUE` 拼接条目，这样的键可能给 attestor 设置的变量多加一条）、
 attestor 自己的变量，以及 sealed 自身进程会读取的变量，如 `SSL_CERT_FILE`、`HTTPS_PROXY`、
 `GODEBUG` 或 `DAYTONA_SANDBOX_ID`（owner 的条目会取代 runner 的）。

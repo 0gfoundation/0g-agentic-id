@@ -85,7 +85,9 @@ fn agent_id_from_text(s: &str) -> anyhow::Result<AgentId> {
 }
 
 /// The seven container-record columns, cleared together.
-const CLEAR_CONTAINER_RECORD: &str = "container_pubkey=NULL,container_image_hash=NULL,provider_chain_id=NULL,provider_registry_address=NULL,provider_app_id=NULL,provider_registered_at=NULL,provider_signer=NULL";
+/// Clears the current container's record and, with it, the last status it
+/// reported.
+const CLEAR_CONTAINER_RECORD: &str = "container_pubkey=NULL,container_image_hash=NULL,provider_chain_id=NULL,provider_registry_address=NULL,provider_app_id=NULL,provider_registered_at=NULL,provider_signer=NULL,container_status=NULL";
 
 fn record_column<'r, T: sqlx::Decode<'r, Postgres> + sqlx::Type<Postgres>>(
     row: &'r sqlx::postgres::PgRow,
@@ -135,6 +137,7 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
     let provision_deadline: Option<DateTime<Utc>> = row.try_get("provision_deadline")?;
     let last_provision_error: Option<String> = row.try_get("last_provision_error")?;
     let last_provision_error_at: Option<DateTime<Utc>> = row.try_get("last_provision_error_at")?;
+    let container_status: Option<serde_json::Value> = row.try_get("container_status")?;
     let clone_params_json: Option<serde_json::Value> = row.try_get("clone_params")?;
     let settings: Option<serde_json::Value> = row.try_get("settings")?;
     let settings_last_good: Option<serde_json::Value> = row.try_get("settings_last_good")?;
@@ -155,6 +158,7 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
 
     let i_data: Vec<IDataArtifact> = serde_json::from_value(i_data_json)?;
     let clone_params = clone_params_json.map(serde_json::from_value).transpose()?;
+    let container_status = container_status.map(serde_json::from_value).transpose()?;
     let storage_stage: StageStatus = serde_json::from_value(storage_stage)?;
     let mint_stage: StageStatus = serde_json::from_value(mint_stage)?;
     let container_stage: StageStatus = serde_json::from_value(container_stage)?;
@@ -180,6 +184,7 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
         provision_deadline,
         last_provision_error,
         last_provision_error_at,
+        container_status,
         settings,
         settings_last_good,
         settings_version,
@@ -939,6 +944,12 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             Some(sqlx::query_scalar("INSERT INTO container_status_bindings(seal_id,binding_hash,generation,ticket_hash,ticket_issued_at,enabled,authorized_owner) VALUES($1,NULL,1,$2,EXTRACT(EPOCH FROM now())::BIGINT,TRUE,$3) ON CONFLICT(seal_id) DO UPDATE SET generation=container_status_bindings.generation+1,ticket_hash=EXCLUDED.ticket_hash,ticket_issued_at=EXCLUDED.ticket_issued_at,enabled=TRUE,binding_hash=NULL,boot_started_at=0,boot_id=NULL,authorized_owner=EXCLUDED.authorized_owner,authorized_sandbox_id=NULL,authorized_container_pubkey=NULL RETURNING generation")
                 .bind(seal_id.as_slice()).bind(ticket.as_slice()).bind(owner.as_slice()).fetch_one(&mut *tx).await?)
         } else {
+            // The resumed boot reports afresh; the last report described the
+            // boot before it.
+            sqlx::query("UPDATE deployments SET container_status=NULL WHERE seal_id=$1")
+                .bind(seal_id.as_slice())
+                .execute(&mut *tx)
+                .await?;
             sqlx::query_scalar("UPDATE container_status_bindings SET generation=generation+1,enabled=TRUE,binding_hash=NULL,boot_started_at=0,boot_id=NULL,authorized_owner=$2 WHERE seal_id=$1 AND ticket_hash IS NOT NULL RETURNING generation")
                 .bind(seal_id.as_slice()).bind(owner.as_slice()).fetch_optional(&mut *tx).await?
         };
@@ -1002,10 +1013,10 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             return Ok(false);
         }
         // First boot writes the record; a later boot must match it exactly.
-        // An accepted boot also clears the last rejection: it no longer
-        // describes the agent.
+        // An accepted boot also clears the last rejection and the last
+        // status report: neither describes this boot.
         let provider = &record.provider;
-        let n = sqlx::query("UPDATE deployments SET container_pubkey=$2,container_image_hash=$3,provider_chain_id=$4,provider_registry_address=$5,provider_app_id=$6,provider_registered_at=$7,provider_signer=$8,provisioned_at=COALESCE(provisioned_at,now()),provision_deadline=NULL,last_provision_error=NULL,last_provision_error_at=NULL WHERE seal_id=$1 AND (container_pubkey IS NULL OR (container_pubkey=$2 AND container_image_hash=$3 AND provider_chain_id=$4 AND provider_registry_address=$5 AND provider_app_id=$6 AND provider_registered_at=$7 AND provider_signer=$8))")
+        let n = sqlx::query("UPDATE deployments SET container_pubkey=$2,container_image_hash=$3,provider_chain_id=$4,provider_registry_address=$5,provider_app_id=$6,provider_registered_at=$7,provider_signer=$8,provisioned_at=COALESCE(provisioned_at,now()),provision_deadline=NULL,last_provision_error=NULL,last_provision_error_at=NULL,container_status=NULL WHERE seal_id=$1 AND (container_pubkey IS NULL OR (container_pubkey=$2 AND container_image_hash=$3 AND provider_chain_id=$4 AND provider_registry_address=$5 AND provider_app_id=$6 AND provider_registered_at=$7 AND provider_signer=$8))")
             .bind(seal_id.as_slice())
             .bind(record.pubkey.as_ref())
             .bind(record.image_hash.as_slice())
@@ -1030,6 +1041,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         token_hash: [u8; 32],
         stage: StageStatus,
         applied_digest: Option<B256>,
+        status: &ContainerStatus,
     ) -> anyhow::Result<bool> {
         let mut tx = deployment_tx(&self.pool).await?;
         // Lock the deployment before reading the token hash in a fresh
@@ -1072,8 +1084,8 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             && d.settings_confirmed_version < d.settings_version
             && d.settings.is_some();
         let phase = derive_phase(&d.storage_stage, &d.mint_stage, &stage);
-        sqlx::query("UPDATE deployments SET container_stage=$2,phase=$3,last_heartbeat=now(),updated_at=now(), settings_last_good=CASE WHEN $4 THEN settings ELSE settings_last_good END,settings_confirmed_version=CASE WHEN $4 THEN settings_version ELSE settings_confirmed_version END,settings_attempts=CASE WHEN $4 THEN 0 ELSE settings_attempts END WHERE seal_id=$1")
-            .bind(seal_id.as_slice()).bind(serde_json::to_value(stage)?).bind(phase.serde_tag()).bind(confirm).execute(&mut *tx).await?;
+        sqlx::query("UPDATE deployments SET container_stage=$2,phase=$3,last_heartbeat=now(),updated_at=now(), settings_last_good=CASE WHEN $4 THEN settings ELSE settings_last_good END,settings_confirmed_version=CASE WHEN $4 THEN settings_version ELSE settings_confirmed_version END,settings_attempts=CASE WHEN $4 THEN 0 ELSE settings_attempts END,container_status=$5 WHERE seal_id=$1")
+            .bind(seal_id.as_slice()).bind(serde_json::to_value(stage)?).bind(phase.serde_tag()).bind(confirm).bind(serde_json::to_value(status)?).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1375,6 +1387,14 @@ mod settings_retry_tests {
             digest: B256::repeat_byte(digest),
         })
     }
+
+    fn running_report() -> ContainerStatus {
+        ContainerStatus {
+            level: ContainerReportStatus::Running,
+            reason: None,
+            at: Utc::now(),
+        }
+    }
     fn test_database_url() -> String {
         let url = std::env::var("AGENTDNA_TEST_DATABASE_URL").expect("isolated DB URL");
         format!(
@@ -1619,7 +1639,7 @@ mod settings_retry_tests {
         let stage = StageStatus::Confirmed { at: Utc::now() };
         // No boot has been bound yet: nothing may report.
         assert!(!repo
-            .apply_status_report(seal, [1; 32], stage.clone(), None)
+            .apply_status_report(seal, [1; 32], stage.clone(), None, &running_report())
             .await
             .unwrap());
         let generation = repo
@@ -1688,12 +1708,24 @@ mod settings_retry_tests {
             Some(record(2))
         );
         assert!(!repo
-            .apply_status_report(seal, [1; 32], stage.clone(), Some(B256::repeat_byte(0xa1)))
+            .apply_status_report(
+                seal,
+                [1; 32],
+                stage.clone(),
+                Some(B256::repeat_byte(0xa1)),
+                &running_report()
+            )
             .await
             .unwrap());
         // The boot was served the last-known-good (version 1): no promotion.
         assert!(repo
-            .apply_status_report(seal, [2; 32], stage.clone(), Some(B256::repeat_byte(0xa1)))
+            .apply_status_report(
+                seal,
+                [2; 32],
+                stage.clone(),
+                Some(B256::repeat_byte(0xa1)),
+                &running_report()
+            )
             .await
             .unwrap());
         assert_eq!(
@@ -1713,7 +1745,13 @@ mod settings_retry_tests {
         let task_stage = stage.clone();
         let task = tokio::spawn(async move {
             task_repo
-                .apply_status_report(seal, [2; 32], task_stage, Some(B256::repeat_byte(0xa1)))
+                .apply_status_report(
+                    seal,
+                    [2; 32],
+                    task_stage,
+                    Some(B256::repeat_byte(0xa1)),
+                    &running_report(),
+                )
                 .await
                 .unwrap()
         });
@@ -1745,7 +1783,13 @@ mod settings_retry_tests {
         );
         // A digest other than the served one confirms nothing.
         assert!(repo
-            .apply_status_report(seal, [3; 32], stage.clone(), Some(B256::repeat_byte(0xa1)))
+            .apply_status_report(
+                seal,
+                [3; 32],
+                stage.clone(),
+                Some(B256::repeat_byte(0xa1)),
+                &running_report()
+            )
             .await
             .unwrap());
         assert_eq!(
@@ -1757,7 +1801,13 @@ mod settings_retry_tests {
             1
         );
         assert!(repo
-            .apply_status_report(seal, [3; 32], stage.clone(), Some(B256::repeat_byte(0xa2)))
+            .apply_status_report(
+                seal,
+                [3; 32],
+                stage.clone(),
+                Some(B256::repeat_byte(0xa2)),
+                &running_report()
+            )
             .await
             .unwrap());
         let d = repo.get(seal).await.unwrap().unwrap();
@@ -1770,7 +1820,13 @@ mod settings_retry_tests {
             .await
             .unwrap();
         assert!(!repo
-            .apply_status_report(seal, [3; 32], stage, Some(B256::repeat_byte(0xa2)))
+            .apply_status_report(
+                seal,
+                [3; 32],
+                stage,
+                Some(B256::repeat_byte(0xa2)),
+                &running_report()
+            )
             .await
             .unwrap());
         // A new ticket is a new container: the record goes, the issue time is set.
@@ -1856,7 +1912,7 @@ mod settings_retry_tests {
         .await
         .unwrap();
         assert!(!repo
-            .apply_status_report(seal, [1; 32], running.clone(), None)
+            .apply_status_report(seal, [1; 32], running.clone(), None, &running_report())
             .await
             .unwrap());
         assert!(
@@ -1954,7 +2010,7 @@ mod settings_retry_tests {
             .container_record
             .is_none());
         assert!(!repo
-            .apply_status_report(seal, [4; 32], running, None)
+            .apply_status_report(seal, [4; 32], running, None, &running_report())
             .await
             .unwrap());
         assert!(!repo

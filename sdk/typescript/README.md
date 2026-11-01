@@ -125,10 +125,12 @@ await ag.agent.start(sealId, sandboxId);      // resume a STOPPED container
 await ag.agent.start(sealId, { apiKey });     // FIRST provision of a mint-only agent
 await ag.agent.reset(sealId, { framework, apiKey });   // recreate an EXISTING container
 await ag.agent.retry(sealId, { apiKey });     // resume a 'failed' deploy (do NOT redeploy — that orphans the mint)
-await ag.agent.listDeployments();             // public listing; sandboxId/lastProvisionError null (owner+agentSeal present on minted rows)
+await ag.agent.listDeployments();             // public listing; sandboxId/lastProvisionError/containerStatus null (owner+agentSeal present on minted rows)
 await ag.agent.listMyDeployments();           // owner-signed; full detail
-// row → { agentId, sealId, phase, sandboxId, url, owner, agentSeal, name, createdAt, lastProvisionError }
+// row → { agentId, sealId, phase, sandboxId, url, owner, agentSeal, name, createdAt, lastProvisionError, containerStatus }
 // phase: 'deploying' | 'running' | 'stopped' | 'offline' | 'failed'
+// containerStatus: { level, reason, at } | null — the container's last report. phase
+// shows a 'warning' as 'running' (e.g. reason "owner settings unusable…": no model).
 
 // settings — the owner's configuration document (which model the agent thinks
 // with, and how hard). Stored by the attestor as an OPAQUE blob and applied by

@@ -59,7 +59,8 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 文档未通过 `Validate` 的开机,在 adapter 允许时照样启动,但 sealed 此时上报 `warning`
 (`owner settings unusable (…); write the agent's settings (provider and model)`)而不是
 `running`,直到一次 settings 推送生效 —— 例如新 owner 还没写 settings 的克隆
-(`main.go`、`status.go` (`SettingsIssue`))。
+(`main.go`、`status.go` (`SettingsIssue`))。attestor 把这次上报记在 deployment 行的
+`container_status` 上(该行的 `phase` 仍是 `running`)。
 
 **模型建议检查不会拒绝目录外的模型。**CLI 在签名前查询所选 provider 自己的目录；
 没有配置目录的 native provider 允许手动输入模型 ID。注册表成员及凭据绑定由

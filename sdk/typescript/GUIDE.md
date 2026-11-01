@@ -227,7 +227,8 @@ await ag.agent.reset(sealId, { apiKey });   // recreate an EXISTING container: r
                                             // apiKey required in practice (attestor doesn't
                                             // cache the model key); sealedImage optional.
 await ag.agent.listDeployments();
-// → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }, …]
+// → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError,
+//      containerStatus }, …]
 //   phase: 'deploying' | 'running' | 'stopped' (owner-stopped, start() to resume)
 //        | 'offline' (no running container — never provisioned (mint-only) / failure / timeout /
 //          transfer-teardown; on-chain identity persists, use start({apiKey}) or reset) | 'failed'
@@ -640,8 +641,8 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolu
 `authenticate`/`connect`) resolve it on chain (`tokenURI` → the AgentCard's
 serve `url`). Reach for `listDeployments()` when you want the URL or `phase`
 explicitly. It's the **public** listing (needs `attestorUrl`, no wallet), so it
-returns only non-sensitive fields; `sandboxId` and `lastProvisionError` come
-back **null** (`owner` and `agentSeal` are present on minted rows — both
+returns only non-sensitive fields; `sandboxId`, `lastProvisionError` and
+`containerStatus` come back **null** (`owner` and `agentSeal` are present on minted rows — both
 chain-public — which is what makes nesting visible: a child's `owner` matches
 its parent's `agentSeal`). To see the withheld fields for your OWN agents (and
 the `sandboxId` you
@@ -650,7 +651,8 @@ pass to `stop`/`start`), use `listMyDeployments()`, which signs with your wallet
 ```ts
 const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
 // me → { agentId, sealId, phase, url, name, createdAt } populated;
-//      owner, sandboxId, lastProvisionError come back NULL on this public listing.
+//      owner, sandboxId, lastProvisionError, containerStatus come back NULL on this
+//      public listing.
 // For those (and to debug a stuck deploy), list your own with the wallet:
 const mine = await ag.agent.listMyDeployments();   // owner-signed; full detail
 const agentUrl = me?.url;               // null until the container is provisioned
@@ -659,6 +661,12 @@ const agentUrl = me?.url;               // null until the container is provision
 // validFrameworkHashes") or mint/storage-pipeline failures (e.g. "mint
 // submit: … replacement transaction underpriced" — folded in from the
 // failed stage's reason).
+// A 'running' agent that does not answer: read mine's containerStatus
+// ({ level, reason, at }, the container's last report). phase shows a
+// 'warning' as 'running'; e.g. level 'warning' with reason "owner settings
+// unusable (settings: model is required)…" means the agent has no model:
+// write its settings (setSettings), then pushSettingsToContainer applies them
+// to the running container (a later boot applies them anyway).
 
 // A 'failed' row is recoverable — retry() FIRST, don't redeploy (that
 // orphans the already-minted identity). It re-runs the failed idempotent
