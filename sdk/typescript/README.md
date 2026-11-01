@@ -124,6 +124,9 @@ await ag.agent.stop(sealId, sandboxId);
 await ag.agent.start(sealId, sandboxId);      // resume a STOPPED container
 await ag.agent.start(sealId, { apiKey });     // FIRST provision of a mint-only agent
 await ag.agent.reset(sealId, { framework, apiKey });   // recreate an EXISTING container
+// start/reset of an agent with no settings document that is a clone or has
+// provisioned before first store the default model (0g-compute) as its settings
+// (one more owner signature), so it does not boot without a model.
 await ag.agent.retry(sealId, { apiKey });     // resume a 'failed' deploy (do NOT redeploy — that orphans the mint)
 await ag.agent.listDeployments();             // public listing; sandboxId/lastProvisionError null (owner+agentSeal present on minted rows)
 await ag.agent.listMyDeployments();           // owner-signed; full detail

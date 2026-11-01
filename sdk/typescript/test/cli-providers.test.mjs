@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { loadCredentials, saveApiKey, loadApiKey, inferenceKeyFromEnv, configPaths } from '../dist/cli/config.js';
 import { configuredInferenceKey, agentInferenceProvider, resetInferencePlan, applyResetInference, requireConfiguredInferenceKey, deployWithInference } from '../dist/cli/inference.js';
 import { listInferenceProviders } from '../dist/Providers.js';
+import { SettingsConflictError } from '../dist/index.js';
 import { completeLine } from '../dist/cli/commands/interactive.js';
 
 const KEY = `0x${'42'.repeat(32)}`;
@@ -120,6 +121,11 @@ test('reset stores the default model pin only when the minted pin can be gone', 
   assert.equal(writes.length,0);
   assert.equal(notes.length,0);
   await assert.rejects(resetInferencePlan({ agent:{ getSettings:async()=>{ throw new Error('unreadable'); } } },seal,fresh),/unreadable/);
+  // A document written between the plan and the write is kept, not replaced.
+  const raced = await resetInferencePlan(agent(none),seal,{ provisioned:true, clone:false });
+  const conflict = { agent:{ setSettings:async()=>{ throw new SettingsConflictError({ sealId:seal, baseVersion:0, currentVersion:2, current:null }); } } };
+  await applyResetInference(conflict,seal,raced,(l)=>notes.push(l));
+  assert.match(notes.pop(),/written meanwhile: kept/);
 });
 
 test('inline provider model completion cannot reuse compute suggestions', () => {

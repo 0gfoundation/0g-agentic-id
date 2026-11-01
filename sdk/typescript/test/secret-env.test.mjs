@@ -564,7 +564,7 @@ test('a bare reset resolves the sealed image from the deployment row', async () 
   });
 });
 
-test('an explicit framework wins over the row, and no row read happens', async () => {
+test('an explicit framework wins over the row', async () => {
   const config = {
     sandbox_snapshot: '0g-sealed',
     secret_env_scheme: SECRET_ENV_SCHEME,
@@ -574,7 +574,8 @@ test('an explicit framework wins over the row, and no row read happens', async (
     const { c, signed } = client(a.port);
     await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY, framework: 'hermes' });
     assert.equal(JSON.parse(signed[0]).payload.snapshot, '0g-sealed-hermes');
-    assert.ok(!a.hits.some((h) => h.startsWith('/deployment/')), 'no row read when the caller chose');
+    // The row is still read, for the settings rule (default-settings tests),
+    // but its framework does not pick the image.
   });
 });
 

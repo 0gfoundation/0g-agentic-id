@@ -84,6 +84,55 @@ export interface IDataInput {
 /** The persona inference pin a fresh deploy starts from (the 0G router's own model). */
 export const DEFAULT_PERSONA_INFERENCE = { provider: '0g-compute', model: '0gm-1.0-35b-a3b' } as const;
 
+/** What an agent's public deployment row says about its history, for
+ *  {@link needsDefaultSettings}. */
+export interface DeploymentFacts {
+  /** A container of this agent has provisioned before (`provisioned_at`). */
+  provisioned: boolean;
+  /** The agent is a clone (`clone_params`). */
+  clone: boolean;
+}
+
+/** Read {@link DeploymentFacts} from a raw `GET /deployment/:sealId` row. */
+export function deploymentFactsOf(row: Record<string, unknown>): DeploymentFacts {
+  return { provisioned: !!row.provisioned_at, clone: row.clone_params != null };
+}
+
+/**
+ * Whether a start or reset must first store {@link DEFAULT_PERSONA_INFERENCE}
+ * as the agent's settings document. `settingsVersion` is the document's
+ * version (0: the agent has none).
+ *
+ * An agent with no settings document boots on the model pinned in its minted
+ * persona while that pin is on chain, and its container then stores the pin
+ * as the agent's settings. The pin leaves the chain at the agent's first
+ * commit, so an agent that has provisioned before, or a clone (whose source
+ * may have committed), would come up with no model: only those get the
+ * default. An agent that has a document keeps it.
+ */
+export function needsDefaultSettings(facts: DeploymentFacts, settingsVersion: number): boolean {
+  return settingsVersion === 0 && (facts.provisioned || facts.clone);
+}
+
+/**
+ * Store {@link DEFAULT_PERSONA_INFERENCE} as the agent's FIRST settings
+ * document (owner-signed, `baseVersion: 0`). Returns false when the agent
+ * already has one (the write is refused with a version conflict): that
+ * document is kept, never overwritten.
+ */
+export async function storeDefaultSettings(
+  api: { setSettings(sealId: `0x${string}`, settings: SettingsDoc, opts: { baseVersion: number }): Promise<unknown> },
+  sealId: `0x${string}`,
+): Promise<boolean> {
+  try {
+    await api.setSettings(sealId, { ...DEFAULT_PERSONA_INFERENCE }, { baseVersion: 0 });
+    return true;
+  } catch (e) {
+    if (e instanceof SettingsConflictError) return false;
+    throw e;
+  }
+}
+
 /** Inputs for {@link defaultIData}. */
 export interface DefaultIDataParams {
   /** Framework name for the binding; default "openclaw". */
@@ -402,6 +451,41 @@ export class AttestorClient {
   }
 
   /**
+   * The agent's public deployment row (`GET /deployment/:sealId`). An
+   * unreadable row refuses, naming `purpose`: the call that needs it posts to
+   * the same attestor anyway, and guessing past it is how an agent boots on
+   * the wrong image or without a model.
+   */
+  private async deploymentRow(sealId: `0x${string}`, purpose: string): Promise<Record<string, unknown>> {
+    try {
+      const r = await fetch(`${this.baseUrl()}/deployment/${sealId}`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const row = (await r.json()) as unknown;
+      if (!row || typeof row !== 'object') throw new Error('not a JSON object');
+      return row as Record<string, unknown>;
+    } catch (e) {
+      throw new Error(
+        `cannot read /deployment/${sealId} to ${purpose} (${errMsg(e)}); ` +
+          "retry, or pass `framework` (or `sealedImage`) explicitly",
+      );
+    }
+  }
+
+  /**
+   * The settings document a start or reset of this agent stores before it
+   * signs, per {@link needsDefaultSettings}, or null. Reads the row's
+   * `settings_version`; a row without it (an attestor that predates the
+   * settings channel) gets nothing stored.
+   */
+  private defaultSettingsFor(row: Record<string, unknown>): { provider: string; model: string } | null {
+    const version = row.settings_version;
+    if (typeof version !== 'number') return null;
+    return needsDefaultSettings(deploymentFactsOf(row), version) ? { ...DEFAULT_PERSONA_INFERENCE } : null;
+  }
+
+  /**
    * Resolve the sealed image name: an explicit value wins; otherwise the
    * image `GET /config` declares for `framework` (frameworks whose runtime
    * isn't in the default snapshot — hermes etc. — carry their own image);
@@ -410,7 +494,12 @@ export class AttestorClient {
    * create envelope makes the provider fail ("sealed containers require an
    * image or snapshot"), so /config is the source of truth.
    */
-  private async resolveSealedImage(explicit?: string, framework?: string, sealId?: `0x${string}`): Promise<string> {
+  private async resolveSealedImage(
+    explicit?: string,
+    framework?: string,
+    sealId?: `0x${string}`,
+    row?: { framework?: unknown },
+  ): Promise<string> {
     if (explicit) return explicit;
     let fw = framework;
     // An existing agent already knows what it is: its deployment row records
@@ -425,20 +514,8 @@ export class AttestorClient {
     // never-provisioned agent) still gets the default — that is data, not a
     // failed read.
     if (!fw && sealId) {
-      let row: { framework?: string | null };
-      try {
-        const r = await fetch(`${this.baseUrl()}/deployment/${sealId}`, {
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        row = (await r.json()) as { framework?: string | null };
-      } catch (e) {
-        throw new Error(
-          `cannot read /deployment/${sealId} to pick the sealed image (${errMsg(e)}); ` +
-            "retry, or pass `framework` (or `sealedImage`) explicitly",
-        );
-      }
-      fw = row.framework ?? undefined;
+      const known = row ?? (await this.deploymentRow(sealId, 'pick the sealed image'));
+      fw = typeof known.framework === 'string' ? known.framework : undefined;
     }
     // Rides the instance's memoized /config (review #154 N3a) — this was the
     // one remaining uncached fetch on the deploy/reset/first-start path.
@@ -845,6 +922,16 @@ export class AttestorClient {
    * the way to force a fresh boot (e.g. after a new sealed image, or
    * stuck-state recovery). All are owner-signed; the attestor + sandbox
    * both re-verify.
+   *
+   * `start` and `reset` first read the agent's public deployment row. When
+   * the agent has no settings document and is a clone or has provisioned
+   * before ({@link needsDefaultSettings}), the boot would come up with no
+   * model, so {@link DEFAULT_PERSONA_INFERENCE} is stored as its first
+   * document (one more owner signature) before the envelope is signed. That
+   * write comes after every check that can refuse the call, so a refused
+   * call writes nothing; a document that already exists is never replaced.
+   * Such an agent cannot be started on another `provider` until its settings
+   * name one: the call refuses before anything is written or signed.
    */
   async lifecycle(
     op: 'stop' | 'start' | 'reset',
@@ -878,40 +965,66 @@ export class AttestorClient {
   ): Promise<void> {
     const { account } = requireWallet(this.ctx);
     const ttl = params.envelopeTtlSec ?? 180;
-    let envelope;
     // `reset`, OR a first-time `start` of a never-provisioned (mint-only)
     // agent: both spin a FRESH container via the `create` envelope. A `start`
     // WITH a sandboxId resumes an existing (stopped) container instead.
-    if (op === 'reset' || (op === 'start' && !params.sandboxId)) {
-      if (params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined) {
-        throw new SecretEnvRefusedError('invalid_input', `reset/start for ${params.provider} requires its API key`);
-      }
-      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
-      envelope = await this.signEnvelope(
-        'create',
-        '',
-        {
-          snapshot,
-          sealed: true,
-          ...(params.apiKey || params.sealedSecretEnv !== undefined
-            ? {
-                env: await this.sandboxEnv({
-                  sealId: params.sealId,
-                  provider: params.provider,
-                  image: snapshot,
-                  apiKey: params.apiKey,
-                  sealedSecretEnv: params.sealedSecretEnv,
-                  mode: params.secretEnv,
-                }),
-              }
-            : {}),
-        },
-        ttl,
-      );
-    } else {
-      if (!params.sandboxId) throw new Error(`${op}: sandboxId is required`);
-      envelope = await this.signEnvelope(op, params.sandboxId, {}, ttl);
+    const create = op === 'reset' || (op === 'start' && !params.sandboxId);
+    if (!create && !params.sandboxId) throw new Error(`${op}: sandboxId is required`);
+    if (create && params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined) {
+      throw new SecretEnvRefusedError('invalid_input', `reset/start for ${params.provider} requires its API key`);
     }
+    // Every boot a start or reset brings about is served the agent's settings
+    // document, so an agent that would boot with no model gets the default
+    // one stored first (see needsDefaultSettings). The row is read, and every
+    // check below that can refuse runs, before anything is written or signed.
+    let seed: { provider: string; model: string } | null = null;
+    let row: Record<string, unknown> | undefined;
+    if (op !== 'stop') {
+      row = await this.deploymentRow(
+        params.sealId,
+        create && !params.sealedImage && !params.framework
+          ? "pick the sealed image and check the agent's settings"
+          : "check the agent's settings",
+      );
+      seed = this.defaultSettingsFor(row);
+      if (seed && params.provider && params.provider !== seed.provider) {
+        throw new Error(
+          `${op}: agent ${params.sealId} has no settings document and could boot with no model; ` +
+            `write its settings (provider ${params.provider} and a model) with setSettings first`,
+        );
+      }
+    }
+    let action: string = op;
+    let resourceId = params.sandboxId ?? '';
+    let payload: Record<string, unknown> = {};
+    if (create) {
+      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId, row);
+      action = 'create';
+      resourceId = '';
+      payload = {
+        snapshot,
+        sealed: true,
+        ...(params.apiKey || params.sealedSecretEnv !== undefined
+          ? {
+              env: await this.sandboxEnv({
+                sealId: params.sealId,
+                provider: params.provider,
+                image: snapshot,
+                apiKey: params.apiKey,
+                sealedSecretEnv: params.sealedSecretEnv,
+                mode: params.secretEnv,
+              }),
+            }
+          : {}),
+      };
+    }
+    if (seed) {
+      await storeDefaultSettings(
+        { setSettings: (sealId, settings, opts) => this.setSettings({ sealId, settings, baseVersion: opts.baseVersion }) },
+        params.sealId,
+      );
+    }
+    const envelope = await this.signEnvelope(action, resourceId, payload, ttl);
     // A no-sandboxId `start` still POSTs /start; the attestor dispatches on the
     // envelope action (create → fresh provision, start → resume).
     const path = op === 'reset' ? '/reset' : `/${op}`;

@@ -226,6 +226,13 @@ await ag.agent.reset(sealId, { apiKey });   // recreate an EXISTING container: r
                                             // from chain, reselect the framework adapter.
                                             // apiKey required in practice (attestor doesn't
                                             // cache the model key); sealedImage optional.
+// A booting agent with no settings document uses the model pinned in its minted
+// persona, which leaves the chain at its first commit. So start and reset of an
+// agent that has no document and is a clone or has provisioned before first
+// store DEFAULT_PERSONA_INFERENCE (0g-compute) as its settings: one more owner
+// signature, after every check that can refuse the call; an existing document is
+// never replaced. To start such an agent on another provider, write its settings
+// (setSettings) first. The CLI's reset applies the same rule (needsDefaultSettings).
 await ag.agent.listDeployments();
 // → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }, …]
 //   phase: 'deploying' | 'running' | 'stopped' (owner-stopped, start() to resume)
