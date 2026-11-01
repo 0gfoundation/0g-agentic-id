@@ -59,7 +59,7 @@ func TestLeaseBoundsInFlightRoundTripWithoutRetry(t *testing.T) {
 		calls++
 		got, ok := req.Context().Deadline()
 		if !ok || !got.Equal(deadline) {
-			t.Fatal("outbound request did not retain the identity's absolute deadline")
+			t.Fatal("outbound request did not retain the statement's absolute deadline")
 		}
 		<-req.Context().Done()
 		return nil, req.Context().Err()
@@ -224,7 +224,7 @@ func TestResolverLeaseBoundsRealPinnedHTTPSBody(t *testing.T) {
 		t.Fatal("HTTPS fixture did not finish after its delayed body")
 	}
 	if !errors.Is(readErr, context.DeadlineExceeded) {
-		t.Fatalf("resolver accepted a successful body after identity expiry: body=%q err=%v", body, readErr)
+		t.Fatalf("resolver accepted a successful body after statement expiry: body=%q err=%v", body, readErr)
 	}
 	if dials.Load() != 1 {
 		t.Fatalf("processed request was retried: dials=%d", dials.Load())

@@ -1,0 +1,8 @@
+# Local development overlay: publishes Postgres on the loopback interface for
+# host-run binaries (`.env.example` points ATTESTOR_DB_URL at localhost:5432).
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres
+# Never part of a tapp deployment.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"

@@ -1,0 +1,67 @@
+{
+  "description": "EIP-712 known-answer vector for the v3 attestor TLS statement (GET /api/attestor-tls). TEST-ONLY deterministic keys derived from public labels; never use them outside tests.",
+  "test_only_provider_key": {
+    "private_key": "0x481ccc0ad1885a8d939ee1e88358c5b084cd0cce557906171f74953a654e9683",
+    "derivation": "keccak256(\"agentdna1.4 test key\")",
+    "address": "0xED08394C2Fdade872df01deDB470887E40314833"
+  },
+  "typed_data": {
+    "types": {
+      "EIP712Domain": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "version",
+          "type": "string"
+        },
+        {
+          "name": "chainId",
+          "type": "uint256"
+        },
+        {
+          "name": "verifyingContract",
+          "type": "address"
+        }
+      ],
+      "AttestorTLS": [
+        {
+          "name": "tlsSpkiSha256",
+          "type": "bytes32[]"
+        },
+        {
+          "name": "issuedAt",
+          "type": "uint64"
+        },
+        {
+          "name": "expiresAt",
+          "type": "uint64"
+        }
+      ]
+    },
+    "primaryType": "AttestorTLS",
+    "domain": {
+      "name": "0G Sandbox AttestorTLS",
+      "version": "3",
+      "chainId": 16602,
+      "verifyingContract": "0x79d11d8d71784dfed781124e219ad3c62b3a17f6"
+    },
+    "message": {
+      "tlsSpkiSha256": [
+        "0x2b4d268ffcbd65772e5c1887ec65a8d8f65020a0da2fa1736427e045d853b933",
+        "0x2bffeb0c253cc061fd6cfd16dc930b1a5ea89fc400cadac3de76977d4299501c"
+      ],
+      "issuedAt": 1793318460,
+      "expiresAt": 1793318748
+    }
+  },
+  "type_hash": "0x675e355e71bd5697ad3ead6661f4eca56cbc4bf0232cb7c04cbb18febd5aeb24",
+  "tls_spki_sha256_array_hash": "0x699d6c424087822aaa8c48ef9c5561c81d13d76293ca53fdc55236db2a99b932",
+  "domain_separator": "0x052cf9c704a73f14f4f2295712874c880b48bfcb5ed2d69d9ae9a449b1f8657f",
+  "struct_hash": "0xdf1a5177033e6436854ad95b9484fdcca90a3b23171b901f5d5934af62b31b09",
+  "digest": "0xdce5e1abb99e26e8aa982f4a3a3666f3e2ab6505df56942f4ce8c64792769766",
+  "signature": "0x0d07bbf3b9ae59bdf76bd9c05a04b6f84ad88abcdaf0f201a4546179ad0d69e37251709174c30aec0408c66c537b2e536488724e80010a80bbe0ba815d6a0e851c",
+  "recovered_address": "0xED08394C2Fdade872df01deDB470887E40314833",
+  "response_body": "{\"version\":3,\"chain_id\":16602,\"registry_address\":\"0x79d11d8d71784dfed781124e219ad3c62b3a17f6\",\"tls_spki_sha256\":[\"2b4d268ffcbd65772e5c1887ec65a8d8f65020a0da2fa1736427e045d853b933\",\"2bffeb0c253cc061fd6cfd16dc930b1a5ea89fc400cadac3de76977d4299501c\"],\"issued_at\":1793318460,\"expires_at\":1793318748,\"signature\":\"0x0d07bbf3b9ae59bdf76bd9c05a04b6f84ad88abcdaf0f201a4546179ad0d69e37251709174c30aec0408c66c537b2e536488724e80010a80bbe0ba815d6a0e851c\"}"
+}

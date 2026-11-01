@@ -10,7 +10,7 @@ require (
 	// TestCLISource_Unchanged fails until the new versions of those files
 	// are recorded. This is also the version of the `0g-storage-client` CLI
 	// (downloads) in every image that builds it (Dockerfile,
-	// images/{hermes,prime,dsh}): their storage-builder stages read it from
+	// images/{hermes,prime,harness}): their storage-builder stages read it from
 	// this file (`go list -m`) and `go install` the CLI at it.
 	github.com/0gfoundation/0g-storage-client v1.4.4-testnet.0.20260825201704-bb5675461a96
 	github.com/ecies/go/v2 v2.0.11

@@ -130,14 +130,16 @@ the registry, read failures including 404 stop credential sealing/signing;
 they never substitute the built-in seed. Version 0 is the
 built-in seed from `sealed/internal/inference/providers.json`; SDK builds also
 bundle that seed for old attestors/offline discovery. Published data is not
-compiled into the SDK or image. The API stores a KMS-derived acceptance MAC over
-the environment, Tapp, version, publisher, and exact signed envelope. Database
-edits cannot forge that receipt. Accepted revisions remain readable after a
+compiled into the SDK or image. The API stores each accepted revision with its
+publisher and exact signed envelope in Postgres, which lives on the attestor's
+tapp FDE volume; every read re-checks that the stored document belongs to this
+environment and to its version. Accepted revisions remain readable after a
 Tapp ownership transfer or wallet-policy change; every new write checks the
 current owner again, so an old owner cannot continue publishing.
 
 The trusted attestor's `/config` publishes `provider_registry_version` and
-`provider_registry_digest`, computed only from a verified acceptance record.
+`provider_registry_digest`, computed only from an accepted revision that passed
+those checks.
 SDK and sealed check that fingerprint, the exact document contents, and scope
 before using the registry. This uses the same trusted-attestor discovery
 boundary as contract addresses and snapshots; it is not an independent trust

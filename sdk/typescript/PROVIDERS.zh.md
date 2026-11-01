@@ -111,12 +111,13 @@ EOA 使用 EIP-191 签名，合约钱包 owner 通过
 `document` 和 `signature`。`/config` 已声明注册表能力时，包括 404 在内的读取失败
 都会在封装凭据、签名前终止，不回退到内置名单。版本 0 是 `sealed/internal/inference/providers.json`
 提供的内置初始名单，SDK 构建时也打包它以兼容旧 attestor、支持离线查询。
-已发布配置不编进 SDK 或镜像。API 使用 KMS 派生的密钥，对环境、Tapp、版本、
-发布者及完整签名原文生成接受凭据 MAC，数据库修改无法伪造该凭据。
+已发布配置不编进 SDK 或镜像。API 把每个已接受版本连同发布者和完整签名原文存进
+Postgres，该数据库落在 attestor 的 tapp FDE 卷上；每次读取都会重新核对存储的文档
+属于当前环境、且与其版本号相符。
 Tapp owner 转让或合约钱包策略变化后，已接受配置仍可读取；新写入始终重新查询
 当前 owner，旧 owner 不能继续发布。
 
-受信任 attestor 的 `/config` 仅从已验证的接受凭据生成并提供
+受信任 attestor 的 `/config` 仅从通过上述核对的已接受版本生成并提供
 `provider_registry_version`、`provider_registry_digest`。SDK 与 sealed 使用它核对
 配置指纹、原始文档及范围，再使用注册表。这里沿用合约地址、snapshot 发现的
 attestor 信任边界，不额外构成独立信任根。SDK 实例会拒绝低于已见版本、或同版本

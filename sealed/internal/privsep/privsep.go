@@ -35,7 +35,8 @@
 //     RootCommand, which resolves binaries only in root-only PATH
 //     directories and fixes the environment (only proxy endpoints come from
 //     the container's), including a root-only TMPDIR, and sealed's own TLS
-//     trusts only CA locations that name root-only files (ScrubTrustEnv);
+//     trusts only the image's store (ScrubTrustEnv removes the CA
+//     locations from its environment);
 //     framework CLIs that read agent-writable state run as the agent
 //     (AgentCommand). A root-run install is given an environment that keeps
 //     it out of the agent's trees, so it touches nothing the agent can

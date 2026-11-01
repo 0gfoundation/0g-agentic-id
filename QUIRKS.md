@@ -189,7 +189,7 @@ deliberate:
   (`sealed/defaultmux.go`), so those routes are never served from the process that
   holds the key.
 - That pin is also the CLI's: the `storage-builder` stage of every image that builds
-  it (`sealed/Dockerfile`, `images/{hermes,prime,dsh,sealed}`; the base image
+  it (`sealed/Dockerfile`, `images/{hermes,prime,harness,sealed}`; the base image
   `images/openclaw` has none) reads the version from
   `sealed/go.mod` (`go list -m`) and `go install`s the CLI at it, so downloads and
   uploads always move together (and a rebuilt image no longer picks up whatever
@@ -288,7 +288,7 @@ not support the role, and is changing the broker to map `developer` →
 
 Workaround, per adapter that speaks the OpenAI dialect to the router: tell the
 framework the model has no `developer` role, so its system prompt goes out as
-`system` — dsh `compat.supportsDeveloperRole: false` (`dsh/bridge/bridge.mjs`),
+`system` — 0g-harness `compat.supportsDeveloperRole: false` (its `src/composition.mjs`),
 openclaw `supportsDeveloperRole: false` in the rendered model `compat`
 (`openclaw/inference.go`), prime the same flag in `models.json`
 (`prime/modelsjson.go`). The flags stay correct after the broker change.
@@ -324,7 +324,7 @@ themselves when extracting there; nvm does the same under `/root/.nvm`. An
 image built that way boots, then fails at first Start with `"npm" not found
 in a root-only PATH directory` (and `Sweep` quietly stops working).
 
-The workarounds are deliberate: the prime and dsh images extract node with
+The workarounds are deliberate: the prime and 0g-harness images extract node with
 `tar --no-same-owner`; the openclaw images `chown -h 0:0` the nvm and
 `/usr/local` trees after install. Every image then runs a check near its
 end that walks each command sealed needs, and its PATH directory, up to `/`
@@ -456,6 +456,21 @@ agent doc says so (hermes `FrameworkFacts`). Do not "fix" this with
 the denylist, so that would also make the credential files under
 `~/.hermes` deliverable.
 
+### The preview gateway's nginx buffers streams unless the response says not to
+
+Agents are reached through the sandbox's preview gateway, an nginx
+(`Server: nginx/1.27.5` on `https://8080-<id>.<proxy>`) whose preview server
+block keeps nginx's default `proxy_buffering on`. A buffered stream arrives
+only when a buffer fills or the stream ends. Measured on dev (2026-10-30): a
+49-delta reply arrived in one burst when the turn ended, and `/v1/events`,
+which never ends, delivered nothing, not even its headers, for a minute. So
+every SSE response sealed relays or synthesizes carries
+`X-Accel-Buffering: no`, which nginx honors per response
+(`internal/proxy/proxy.go` `streamRelay`, `internal/proxy/responses.go`), and
+0g-harness sets it on its own streams (`src/http.mjs` `openSSE`). Do not drop
+the header because a stream looks fine end to end: a finite stream hides the
+buffering, and only a live view (the CLI's notices, live typing) shows it.
+
 ---
 
 ## Fault localization (serve-proof / sealed runtime)
@@ -487,7 +502,9 @@ A fixed privileged port such as `127.0.0.1:1` can be silently filtered on a
 host, yielding a timeout instead of a connect-class error. Host HTTP proxies
 can also change that classification. The retry tests inject a resolver that deterministically returns a DNS error
 and bypass proxies, so another process cannot race to bind a released test port. Keep the production Strict policy
-connect-only: retrying timeouts could duplicate non-idempotent sandbox creates.
+connect-only: retrying timeouts could duplicate non-idempotent sandbox creates, and owner-signed `start`/`stop`
+use it too because the provider consumes the envelope nonce before handling the request, so a resend can only be
+refused.
 
 
 ### Deployment transactions take write intent before row locks

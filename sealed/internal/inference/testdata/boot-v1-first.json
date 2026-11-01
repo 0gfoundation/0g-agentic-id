@@ -1,0 +1,30 @@
+{
+  "description": "First /provision of a deployment: the attestor has no container key recorded (certificate_required), so the request carries the provider's v3 certificate (internal/provision/testdata/image-attestation-v3.json) verbatim, and container_signature recovers the address of its pubkey. TEST-ONLY key; never use it outside tests.",
+  "test_only_container_key": {
+    "private_key": "0x3039aed7d54f4e29d521883f3f81787eaea2fe2300cdef9d37c57655e289afd8",
+    "derivation": "keccak256(\"agentdna1.4 test container key\")",
+    "address": "0x6Cc01F350e9Cbe7A15Cb5919344a8289a7b9c82f",
+    "pubkey": "0x038038c5cc4de940c65aef5e05053b3703b9aac292f8e58e99c93a05a205f472fa"
+  },
+  "request": {
+    "seal_id": "0x2b4e3b394775ad7d108d05017138fbaacd4650b773122bd4822fd0f42ba0d092",
+    "certificate": {
+      "version": 3,
+      "chain_id": 16602,
+      "registry_address": "0x79d11d8d71784dfed781124e219ad3c62b3a17f6",
+      "app_id": "0g-sandbox-provider",
+      "registered_at": 1792108800,
+      "seal_id": "2b4e3b394775ad7d108d05017138fbaacd4650b773122bd4822fd0f42ba0d092",
+      "pubkey": "0x038038c5cc4de940c65aef5e05053b3703b9aac292f8e58e99c93a05a205f472fa",
+      "image_hash": "sha256:86d7d5cb9673bc3cf760ef58b53b5627112e76bb261ba4959258012637df9ec8",
+      "ts": 1793318445,
+      "signature": "0x68000267c6b79c45ce3e3cc8ed6775a83f6ea21c53ba5d981f1b5c006ffd356574885e4eb7f73e5ca6d1492ffac9be3e76c5dd05f7601adeff9270a0d26812761c"
+    },
+    "boot_ticket": "2222222222222222222222222222222222222222222222222222222222222222",
+    "boot_generation": 1,
+    "boot_id": "0x8888888888888888888888888888888888888888888888888888888888888888",
+    "boot_started_at": 1793318450123456789,
+    "container_signature": "0x33fda5e93606f2cf7618eb33a13c890d38d0e8395725763cc33aa1c084c37d8a70c3c3b2e7e27f9acc307caf37df615def39ee49582d06fdb6fb21ce5eff19601c"
+  },
+  "canonical": "ProvisionBoot.v1:0x2b4e3b394775ad7d108d05017138fbaacd4650b773122bd4822fd0f42ba0d092:1:4f2e8d65483c641648cdb374ae9d8abd368d269e4ddffe092a8237b8162cddd6:8888888888888888888888888888888888888888888888888888888888888888:1793318450123456789"
+}

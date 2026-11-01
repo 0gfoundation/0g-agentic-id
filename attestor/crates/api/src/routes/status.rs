@@ -4,14 +4,18 @@
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::{
-    auth::status::verify_status_signature, ContainerReportStatus, StageStatus, StatusReport,
-    WsEvent,
+    auth::status::verify_status_signature, ContainerReportStatus, ContainerStatus, StageStatus,
+    StatusReport, WsEvent,
 };
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use serde_json::json;
+
+/// The longest `container_status.reason` kept on the row (sealed's own
+/// status messages are far shorter).
+const STATUS_REASON_MAX_CHARS: usize = 1024;
 
 pub async fn handle(
     State(state): State<AppState>,
@@ -67,27 +71,17 @@ pub async fn handle(
         }
     }
 
-    use attestor_shared::auth::status::{binding_hash, open_binding};
-    let hash = report.status_binding.as_deref().map(binding_hash);
-    let mut confirmed_version = None;
-    if let Some(token) = &report.status_binding {
-        let receipt = open_binding(state.crypto.as_ref(), token)
-            .map_err(|e| ApiError::forbidden(format!("invalid boot receipt: {e}")))?;
-        if receipt.seal_id != report.seal_id
-            || receipt.chain_id != state.cfg.chain_id
-            || receipt.contract != state.cfg.agentic_id_addr
-        {
-            return Err(ApiError::forbidden("boot receipt environment mismatch"));
-        }
-        if matches!(
-            report.status,
-            ContainerReportStatus::Running | ContainerReportStatus::Warning
-        ) && report.settings_digest.is_some()
-            && report.settings_digest == receipt.settings_digest
-        {
-            confirmed_version = receipt.settings_version;
-        }
+    use attestor_shared::auth::status::{binding_hash, is_status_token};
+    if !is_status_token(&report.status_binding) {
+        return Err(ApiError::bad_request("invalid status token"));
     }
+    // The opaque token only identifies the current boot; which settings that
+    // boot was served is read from its binding row, never from the report.
+    let token_hash = binding_hash(&report.status_binding);
+    let applied_digest = match report.status {
+        ContainerReportStatus::Running | ContainerReportStatus::Warning => report.settings_digest,
+        _ => None,
+    };
     let now = Utc::now();
     let reason = report.error_detail.clone().unwrap_or_else(|| {
         if matches!(report.status, ContainerReportStatus::Stopping) {
@@ -113,16 +107,34 @@ pub async fn handle(
             reason: reason.clone(),
         },
     };
-    // Receipt freshness, stage/liveness and exact-version promotion are checked
+    // The row keeps what the container said, not only the stage: a warning
+    // runs (the stage is confirmed, the phase running), so its reason is
+    // visible nowhere else once the WebSocket event has passed.
+    let container_status = ContainerStatus {
+        level: report.status,
+        // Bounded: it is stored on the row and served with it.
+        reason: report
+            .error_detail
+            .as_deref()
+            .map(|r| r.chars().take(STATUS_REASON_MAX_CHARS).collect()),
+        at: now,
+    };
+    // Token currency, stage/liveness and exact-version promotion are checked
     // in one repository transaction. Old instances cannot win a validation/write race.
     if !state
         .deployments
-        .apply_status_report(report.seal_id, hash, stage, confirmed_version)
+        .apply_status_report(
+            report.seal_id,
+            token_hash,
+            stage,
+            applied_digest,
+            &container_status,
+        )
         .await?
     {
         return Ok((
             StatusCode::OK,
-            Json(json!({"ok":true,"ignored":"stale boot receipt"})),
+            Json(json!({"ok":true,"ignored":"stale status token"})),
         ));
     }
     let event = match report.status {
@@ -156,7 +168,10 @@ mod tests {
     use alloy::primitives::{keccak256, Address, Bytes, B256};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::signers::SignerSync;
-    use attestor_shared::auth::status::canonical_message;
+    use attestor_shared::auth::status::{
+        binding_hash, canonical_message, new_status_token, settings_digest, BootAuthorization,
+        ServedSettings,
+    };
     use attestor_shared::crypto::RealCrypto;
     use attestor_shared::mocks::{
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
@@ -237,8 +252,9 @@ mod tests {
     ///
     /// `confirmed` is `settings_confirmed_version` (0 = no boot has ever
     /// confirmed it) and `attempts` is how many boots `/provision` has
-    /// handed the unconfirmed version to. The fixture issues a receipt for the
-    /// document provision would serve; promotion uses that receipt, not counters.
+    /// handed the unconfirmed version to. The fixture binds a status token
+    /// with the document provision would serve; promotion uses that record,
+    /// not counters.
     fn make_setup(
         settings: Option<serde_json::Value>,
         last_good: Option<serde_json::Value>,
@@ -260,15 +276,7 @@ mod tests {
         } else {
             1
         };
-        let receipt = attestor_shared::auth::status::new_receipt(
-            1,
-            Address::ZERO,
-            seal_id,
-            Bytes::new(),
-            Some(served_version),
-            served,
-        )
-        .unwrap();
+        let digest = served.map(|doc| settings_digest(&serde_json::to_vec(doc).unwrap()));
         repo.seed(Deployment {
             seal_id,
             agent_seal_addr: agent_seal.address(),
@@ -289,11 +297,11 @@ mod tests {
             container_stage,
             sandbox_id: Some("sb-1".into()),
             provisioned_at: Some(now),
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings,
             settings_last_good: last_good,
             settings_version: 1,
@@ -315,15 +323,36 @@ mod tests {
             jobs: Arc::new(InMemoryJobQueue::new()),
             events: Arc::new(InMemoryEventBus::new()),
         };
-        let token =
-            attestor_shared::auth::status::issue_binding(state.crypto.as_ref(), &receipt).unwrap();
+        let token = new_status_token();
+        repo.boot_authorizations.lock().unwrap().insert(
+            seal_id,
+            BootAuthorization {
+                generation: 1,
+                ticket_hash: [9; 32],
+                ticket_issued_at: Some(now.timestamp()),
+                enabled: true,
+                started_at: 1,
+                owner: Some(Address::ZERO),
+                sandbox_id: Some("sb-1".into()),
+                container_pubkey: None,
+            },
+        );
         repo.status_bindings
             .lock()
             .unwrap()
-            .insert(seal_id, attestor_shared::auth::status::binding_hash(&token));
+            .insert(seal_id, binding_hash(&token));
+        if let Some(digest) = digest {
+            repo.served_settings.lock().unwrap().insert(
+                seal_id,
+                ServedSettings {
+                    version: served_version,
+                    digest,
+                },
+            );
+        }
         Setup {
             token,
-            digest: receipt.settings_digest,
+            digest,
             state,
             repo,
             agent_seal,
@@ -340,7 +369,7 @@ mod tests {
             seal_id: s.seal_id,
             status,
             error_detail,
-            status_binding: Some(s.token.clone()),
+            status_binding: s.token.clone(),
             settings_digest: s.digest,
             agent_seal_signature: Bytes::new(),
         };
@@ -420,6 +449,57 @@ mod tests {
             "a warning container is up — stage must be Confirmed, got {:?}",
             d.container_stage
         );
+    }
+
+    #[tokio::test]
+    async fn the_row_keeps_the_last_reported_level_and_reason() {
+        // A warning runs (phase running), so the row is the one place a
+        // client can still read it after the WebSocket event.
+        let s = make_setup(None, None, 0, 0, StageStatus::Confirmed { at: Utc::now() });
+        let reason = "owner settings unusable (settings: model is required); write the agent's settings (provider and model)";
+        let report = signed_report(&s, ContainerReportStatus::Warning, Some(reason.into()));
+        handle(State(s.state.clone()), Json(report)).await.unwrap();
+        let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
+        assert_eq!(d.phase, attestor_shared::DeploymentPhase::Running);
+        let status = d.container_status.clone().expect("recorded");
+        assert_eq!(status.level, ContainerReportStatus::Warning);
+        assert_eq!(status.reason.as_deref(), Some(reason));
+        // Served on the row as {level, reason, at}.
+        let row = serde_json::to_value(&d).unwrap();
+        assert_eq!(row["container_status"]["level"], "warning");
+        assert_eq!(row["container_status"]["reason"], reason);
+        assert!(row["container_status"]["at"].is_string());
+
+        // A later running report replaces it, reason and all.
+        let report = signed_report(&s, ContainerReportStatus::Running, None);
+        handle(State(s.state.clone()), Json(report)).await.unwrap();
+        let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
+        let status = d.container_status.expect("recorded");
+        assert_eq!(status.level, ContainerReportStatus::Running);
+        assert_eq!(status.reason, None);
+
+        // A stale token records nothing.
+        let mut stale = signed_report(&s, ContainerReportStatus::Warning, Some("old".into()));
+        stale.status_binding = attestor_shared::auth::status::new_status_token();
+        resign(&s, &mut stale);
+        handle(State(s.state.clone()), Json(stale)).await.unwrap();
+        let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
+        assert_eq!(
+            d.container_status.unwrap().level,
+            ContainerReportStatus::Running
+        );
+
+        // The next authorized boot starts with no report.
+        s.repo
+            .prepare_status_boot(s.seal_id, None, Address::ZERO)
+            .await
+            .unwrap();
+        let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
+        assert!(d.container_status.is_none());
+        assert!(serde_json::to_value(&d)
+            .unwrap()
+            .get("container_status")
+            .is_none());
     }
 
     #[tokio::test]
@@ -639,20 +719,12 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
-        let receipt = attestor_shared::auth::status::new_receipt(
-            1,
-            Address::ZERO,
-            s.seal_id,
-            Bytes::from(vec![2; 33]),
-            Some(2),
-            Some(&json!({"model":"new"})),
-        )
-        .unwrap();
-        let token = attestor_shared::auth::status::issue_binding(s.state.crypto.as_ref(), &receipt)
-            .unwrap();
+        let token = new_status_token();
+        let new_digest = settings_digest(&serde_json::to_vec(&json!({"model":"new"})).unwrap());
         let generation = s
             .repo
             .prepare_status_boot(s.seal_id, Some([9; 32]), Address::ZERO)
@@ -660,7 +732,7 @@ mod tests {
             .unwrap()
             .unwrap();
         s.repo
-            .set_sandbox_id(s.seal_id, "sb-1".into())
+            .set_sandbox_id(s.seal_id, "sb-1".into(), None)
             .await
             .unwrap();
         let claim = attestor_shared::auth::status::BootClaim {
@@ -669,16 +741,31 @@ mod tests {
             boot_id: B256::repeat_byte(1),
             started_at: 1,
         };
-        s.repo
+        let record = attestor_shared::ContainerRecord {
+            pubkey: Bytes::from(vec![2; 33]),
+            image_hash: B256::repeat_byte(0x11),
+            provider: attestor_shared::ProviderInstance {
+                chain_id: 16602,
+                registry_address: Address::repeat_byte(0x22),
+                app_id: "sandbox".into(),
+                registered_at: 100,
+                signer: Address::repeat_byte(0x33),
+            },
+        };
+        assert!(s
+            .repo
             .bind_status_boot(
                 s.seal_id,
-                vec![2; 33],
-                vec![0; 32],
-                attestor_shared::auth::status::binding_hash(&token),
+                &record,
+                binding_hash(&token),
+                Some(ServedSettings {
+                    version: 2,
+                    digest: new_digest,
+                }),
                 &claim,
             )
             .await
-            .unwrap();
+            .unwrap());
         for status in [
             ContainerReportStatus::Running,
             ContainerReportStatus::Warning,
@@ -688,7 +775,7 @@ mod tests {
         ] {
             let report = signed_report(&s, status, None);
             let (_, body) = handle(State(s.state.clone()), Json(report)).await.unwrap();
-            assert_eq!(body.0["ignored"], "stale boot receipt");
+            assert_eq!(body.0["ignored"], "stale status token");
         }
         let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
         assert!(matches!(d.container_stage, StageStatus::Submitted { .. }));
@@ -696,8 +783,8 @@ mod tests {
         assert!(d.settings_last_good.is_none());
         assert!(!s.repo.heartbeats.lock().unwrap().contains_key(&s.seal_id));
         let mut report = signed_report(&s, ContainerReportStatus::Running, None);
-        report.status_binding = Some(token);
-        report.settings_digest = receipt.settings_digest;
+        report.status_binding = token;
+        report.settings_digest = Some(new_digest);
         resign(&s, &mut report);
         handle(State(s.state.clone()), Json(report)).await.unwrap();
         let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
@@ -706,7 +793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_heartbeat_never_promotes_and_is_ignored_after_modern_provision() {
+    async fn an_unknown_or_malformed_token_changes_nothing() {
         let s = make_setup(
             Some(json!({"model":"new"})),
             None,
@@ -717,24 +804,29 @@ mod tests {
                 at: Utc::now(),
             },
         );
-        let mut legacy = signed_report(&s, ContainerReportStatus::Running, None);
-        legacy.status_binding = None;
-        legacy.settings_digest = None;
-        resign(&s, &mut legacy);
-        let (_, body) = handle(State(s.state.clone()), Json(legacy.clone()))
-            .await
-            .unwrap();
-        assert_eq!(body.0["ignored"], "stale boot receipt");
-        s.repo.status_bindings.lock().unwrap().remove(&s.seal_id);
-        handle(State(s.state.clone()), Json(legacy)).await.unwrap();
+        let mut unknown = signed_report(&s, ContainerReportStatus::Running, None);
+        unknown.status_binding = new_status_token();
+        resign(&s, &mut unknown);
+        let (_, body) = handle(State(s.state.clone()), Json(unknown)).await.unwrap();
+        assert_eq!(body.0["ignored"], "stale status token");
+        let mut malformed = signed_report(&s, ContainerReportStatus::Running, None);
+        malformed.status_binding = "not-a-token".into();
+        resign(&s, &mut malformed);
+        assert_eq!(
+            handle(State(s.state.clone()), Json(malformed))
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
         let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
-        assert!(matches!(d.container_stage, StageStatus::Confirmed { .. }));
+        assert!(matches!(d.container_stage, StageStatus::Submitted { .. }));
         assert_eq!(d.settings_confirmed_version, 0);
-        assert!(d.settings_last_good.is_none());
+        assert!(!s.repo.heartbeats.lock().unwrap().contains_key(&s.seal_id));
     }
 
     #[tokio::test]
-    async fn receipt_without_matching_applied_digest_cannot_confirm_settings() {
+    async fn a_report_without_the_served_digest_cannot_confirm_settings() {
         for digest in [None, Some(B256::repeat_byte(0xff))] {
             let s = make_setup(
                 Some(json!({"model":"new"})),
@@ -759,6 +851,7 @@ mod tests {
     async fn delayed_heartbeat_cannot_undo_stop_or_make_start_skip_resume() {
         use attestor_shared::mocks::{ConfigurableSandbox, ConfigurableStorage};
         use attestor_shared::{JobPayload, SandboxEnvelope};
+        use base64::Engine as _;
         let s = make_setup(
             Some(json!({"model":"m"})),
             None,
@@ -770,10 +863,20 @@ mod tests {
             .prepare_status_boot(s.seal_id, Some([9; 32]), Address::ZERO)
             .await
             .unwrap();
-        s.repo.status_bindings.lock().unwrap().insert(
-            s.seal_id,
-            attestor_shared::auth::status::binding_hash(&s.token),
-        );
+        // The create under that ticket persisted the row's sandbox.
+        let created = s.repo.get(s.seal_id).await.unwrap().unwrap().sandbox_id;
+        s.repo
+            .boot_authorizations
+            .lock()
+            .unwrap()
+            .get_mut(&s.seal_id)
+            .unwrap()
+            .sandbox_id = created.clone();
+        s.repo
+            .status_bindings
+            .lock()
+            .unwrap()
+            .insert(s.seal_id, binding_hash(&s.token));
         let delayed = signed_report(&s, ContainerReportStatus::Running, None);
         let sandbox = Arc::new(ConfigurableSandbox::new());
         let ctx = crate::test_worker_jobs::Ctx {
@@ -786,9 +889,18 @@ mod tests {
             events: s.state.events.clone(),
             oss: attestor_shared::oss::OssClient::for_test(),
         };
+        // The owner's stop and start name the row's sandbox.
+        let canonical = json!({
+            "action": "stop",
+            "expires_at": 9_999_999_999_i64,
+            "nonce": "00000000000000000000000000000000",
+            "payload": {},
+            "resource_id": created.expect("row sandbox"),
+        });
         let envelope = SandboxEnvelope {
             wallet_address: Address::ZERO,
-            signed_message_b64: String::new(),
+            signed_message_b64: base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&canonical).unwrap()),
             wallet_signature: Bytes::new(),
         };
         crate::test_worker_jobs::run(
@@ -863,10 +975,11 @@ mod tests {
             .prepare_status_boot(s.seal_id, Some([9; 32]), Address::ZERO)
             .await
             .unwrap();
-        s.repo.status_bindings.lock().unwrap().insert(
-            s.seal_id,
-            attestor_shared::auth::status::binding_hash(&s.token),
-        );
+        s.repo
+            .status_bindings
+            .lock()
+            .unwrap()
+            .insert(s.seal_id, binding_hash(&s.token));
         let report = signed_report(&s, ContainerReportStatus::Running, None);
         assert_eq!(
             handle(State(s.state.clone()), Json(report))

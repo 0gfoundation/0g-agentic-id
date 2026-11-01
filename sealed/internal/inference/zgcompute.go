@@ -62,7 +62,7 @@ func SetCatalogURLForTest(u string) (restore func()) {
 // Keeping them separate from Endpoint is load-bearing. They used to share
 // one struct behind a single `provider == "0g-compute"` check, so choosing a
 // native provider silently skipped the bound as well as the endpoint wiring
-// (hermes and dsh both did this).
+// (the hermes and 0g-harness adapters both did this).
 type ModelFacts struct {
 	ContextWindow int
 	MaxTokens     int

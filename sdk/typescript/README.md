@@ -124,11 +124,16 @@ await ag.agent.stop(sealId, sandboxId);
 await ag.agent.start(sealId, sandboxId);      // resume a STOPPED container
 await ag.agent.start(sealId, { apiKey });     // FIRST provision of a mint-only agent
 await ag.agent.reset(sealId, { framework, apiKey });   // recreate an EXISTING container
+// start/reset of an agent with no settings document that is a clone or has
+// provisioned before first store the default model (0g-compute) as its settings
+// (one more owner signature), so it does not boot without a model.
 await ag.agent.retry(sealId, { apiKey });     // resume a 'failed' deploy (do NOT redeploy — that orphans the mint)
-await ag.agent.listDeployments();             // public listing; sandboxId/lastProvisionError null (owner+agentSeal present on minted rows)
+await ag.agent.listDeployments();             // public listing; sandboxId/lastProvisionError/containerStatus null (owner+agentSeal present on minted rows)
 await ag.agent.listMyDeployments();           // owner-signed; full detail
-// row → { agentId, sealId, phase, sandboxId, url, owner, agentSeal, name, createdAt, lastProvisionError }
+// row → { agentId, sealId, phase, sandboxId, url, owner, agentSeal, name, createdAt, lastProvisionError, containerStatus }
 // phase: 'deploying' | 'running' | 'stopped' | 'offline' | 'failed'
+// containerStatus: { level, reason, at } | null — the container's last report. phase
+// shows a 'warning' as 'running' (e.g. reason "owner settings unusable…": no model).
 
 // settings — the owner's configuration document (which model the agent thinks
 // with, and how hard). Stored by the attestor as an OPAQUE blob and applied by
@@ -313,6 +318,17 @@ for await (const d of agent.chatStream!(msgs, { onTask: (id) => (taskId = id) })
 await agent.task!(taskId);                        // poll {status, output_text}
 for await (const d of agent.followTask!(taskId)) process.stdout.write(d);  // re-attach: replay + live
 await agent.cancelTask!(taskId);                  // stop the turn
+
+// The agent's own work (0g-harness): turns it opens by itself (a background job
+// finished, a reminder came due) and what runs in the background. Each method
+// is present only when /hello declares its kind (inbox / events / tasks /
+// schedules) and this handle holds the owner key:
+const box = await agent.inbox!();                 // unread messages + the cursor
+if (box.data.length) await agent.ackInbox!(box.data[box.data.length - 1].seq);  // read, for every client
+for await (const e of agent.events!({ after: box.cursor, signal })) { /* inbox.message, turn.*, task.updated, … */ }
+await agent.tasks!();                             // turns, commands, subagents: who did each, who asked
+await agent.stopTask!('subagent-1');              // one task; stopAllTasks() for everything running
+await agent.schedules!();                         // reminders the agent set for itself
 
 // opinionated shortcuts over client():
 const auth = await ag.agent.authenticate(agentId);   // mints the owner token up front (needs a wallet)

@@ -864,6 +864,11 @@ func streamRelay(w http.ResponseWriter, resp *http.Response) {
 	// No Content-Length: length is unknown until the stream ends. Go falls
 	// back to chunked transfer-encoding, which is what SSE needs.
 	w.Header().Del("Content-Length")
+	// The sandbox preview gateway is an nginx, which buffers a proxied
+	// response by default: a stream then arrives only when a buffer fills or
+	// the stream ends, and a feed that never ends never arrives at all. This
+	// header turns the buffering off for this response (QUIRKS.md).
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(resp.StatusCode)
 
 	// NewResponseController unwraps middleware ResponseWriters to find the
