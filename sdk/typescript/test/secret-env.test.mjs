@@ -620,6 +620,42 @@ test('a row with no framework still gets the default image', async () => {
   });
 });
 
+// A deploy with the caller's own iData signs the image of the framework that
+// iData binds, not the default (openclaw) snapshot.
+const HERMES_IDATA = [
+  { role: 'framework', plaintext: { name: 'hermes', schema_version: 1 }, extra: {} },
+  { role: 'persona', plaintext: { system_prompt: 'x', inference: { provider: '0g-compute', model: 'm' } }, extra: {} },
+];
+const HERMES_CONFIG = {
+  sandbox_snapshot: '0g-sealed',
+  secret_env_scheme: SECRET_ENV_SCHEME,
+  frameworks: [{ name: 'openclaw' }, { name: 'hermes', image: '0g-sealed-hermes' }],
+};
+
+test("a deploy with its own iData signs the image of the iData's framework", async () => {
+  await withAttestor({ config: HERMES_CONFIG }, async (a) => {
+    const { c, signed } = client(a.port);
+    await c.deploy({ name: 'n', description: 'd', iData: HERMES_IDATA, sandbox: { apiKey: KEY } });
+    assert.equal(signed.length, 2, 'deploy canonical + create envelope');
+    assert.equal(JSON.parse(signed[1]).payload.snapshot, '0g-sealed-hermes');
+    // The same name passed as `framework` agrees and changes nothing.
+    await c.deploy({ name: 'n', description: 'd', iData: HERMES_IDATA, framework: 'hermes', sandbox: { apiKey: KEY } });
+    assert.equal(JSON.parse(signed[3]).payload.snapshot, '0g-sealed-hermes');
+  });
+});
+
+test("a deploy whose framework disagrees with its iData's binding is refused before signing", async () => {
+  await withAttestor({ config: HERMES_CONFIG }, async (a) => {
+    const { c, signed } = client(a.port);
+    await assert.rejects(
+      c.deploy({ name: 'n', description: 'd', iData: HERMES_IDATA, framework: 'openclaw', sandbox: { apiKey: KEY } }),
+      /framework "openclaw" disagrees with the iData's framework binding "hermes"/,
+    );
+    assert.equal(signed.length, 0, 'nothing was signed');
+    assert.equal(a.posts.length, 0);
+  });
+});
+
 // ── 5. integrator flow: the server seals, the browser signs ciphertext ──────
 
 test('sealApiKey needs no wallet and returns a ciphertext bound to the owner', async () => {

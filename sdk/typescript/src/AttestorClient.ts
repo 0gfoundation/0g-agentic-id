@@ -125,6 +125,14 @@ export function defaultIData(p: DefaultIDataParams): IDataInput[] {
   ];
 }
 
+/** The name in an iData's `role="framework"` binding, as the attestor reads
+ *  it (`plaintext.name`, trimmed); undefined when there is none. */
+function iDataFramework(iData: IDataInput[]): string | undefined {
+  const binding = iData.find((entry) => entry.role === 'framework')?.plaintext as { name?: unknown } | undefined;
+  const name = typeof binding?.name === 'string' ? binding.name.trim() : '';
+  return name || undefined;
+}
+
 export interface DeployParams {
   /**
    * Idempotency key. Optional — the SDK generates a random one per call. Pass
@@ -153,7 +161,9 @@ export interface DeployParams {
    * need to know a framework's image. CLIENT-SIDE for the binding: it feeds
    * `defaultIData()` when `iData` is omitted — the on-chain binding inside
    * i_data is the single source of truth (validated against `GET /config`'s
-   * `frameworks[]` before mint). Ignored when you pass your own `iData`.
+   * `frameworks[]` before mint). With your own `iData`, the image follows
+   * that iData's `role="framework"` binding; you may omit this, and a value
+   * that names another framework is refused before anything is signed.
    */
   framework?: string;
   /** Inference pin for the SDK-built default persona (defaults to
@@ -1168,6 +1178,18 @@ export class AttestorClient {
           inference: params.inference,
         });
     const iData = source.map((d) => ({ role: d.role, plaintext: d.plaintext, extra: d.extra ?? {} }));
+    // The create envelope's image follows the framework the agent is minted
+    // with: a caller's own iData binds it, and the default snapshot belongs
+    // to openclaw, so signing it for a hermes binding would boot the agent
+    // on an image without its runtime.
+    const bound = params.iData?.length ? iDataFramework(params.iData) : undefined;
+    if (bound && params.framework && params.framework !== bound) {
+      throw new Error(
+        `framework "${params.framework}" disagrees with the iData's framework binding "${bound}"; ` +
+          'omit `framework` or bind the same name',
+      );
+    }
+    const framework = bound ?? params.framework;
 
     // Owner canonical — must match CanonicalDeploy (order is irrelevant; the
     // attestor deserializes then re-checks each field).
@@ -1184,7 +1206,7 @@ export class AttestorClient {
     // Provision only when a sandbox is given; omit it → mint-only deploy
     // (attestor mints, no container — the agent lands Offline).
     const sandbox_envelope = params.sandbox
-      ? await this.sandboxEnvelope(params.sandbox, params.envelopeTtlSec ?? 180, params.framework)
+      ? await this.sandboxEnvelope(params.sandbox, params.envelopeTtlSec ?? 180, framework)
       : undefined;
 
     return this.post('/deploy', {
