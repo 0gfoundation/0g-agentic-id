@@ -1184,14 +1184,16 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         &self,
         now: DateTime<Utc>,
         threshold_secs: i64,
-    ) -> anyhow::Result<Vec<(SealId, Option<String>)>> {
+    ) -> anyhow::Result<Vec<crate::traits::StaleRunner>> {
         // Read-only counterpart to flip_stale_heartbeats: same predicate
         // (running + heartbeat older than the window), but we hand the
         // candidates back so the worker can reconcile each against its
-        // sandbox before deciding Stopped vs Failed vs reap.
+        // sandbox before deciding Stopped vs Failed vs reap. A container
+        // record exists only once the current container completed a 1.4
+        // provision (the schema clears records from earlier releases).
         let cutoff = now - chrono::Duration::seconds(threshold_secs);
         let rows = sqlx::query(
-            "SELECT seal_id, sandbox_id
+            "SELECT seal_id, sandbox_id, container_pubkey IS NOT NULL AS can_report
              FROM deployments
              WHERE last_heartbeat IS NOT NULL
                AND last_heartbeat < $1
@@ -1203,8 +1205,11 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let bytes: &[u8] = row.try_get("seal_id")?;
-            let sandbox_id: Option<String> = row.try_get("sandbox_id")?;
-            out.push((B256::from_slice(bytes), sandbox_id));
+            out.push(crate::traits::StaleRunner {
+                seal_id: B256::from_slice(bytes),
+                sandbox_id: row.try_get("sandbox_id")?,
+                can_report: row.try_get("can_report")?,
+            });
         }
         Ok(out)
     }
@@ -1455,6 +1460,33 @@ mod settings_retry_tests {
 
         sqlx::query("DELETE FROM deployments WHERE seal_id = ANY($1)")
             .bind(vec![seal.to_vec(), fresh.to_vec()])
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_stale_candidates_say_whether_the_container_can_report() {
+        let pool = connect(&test_database_url()).await.unwrap();
+        let repo = PostgresDeploymentRepo::new(pool.clone());
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        let now = Utc::now();
+        let stale = now - chrono::Duration::hours(1);
+        let confirmed = serde_json::to_value(StageStatus::Confirmed { at: stale }).unwrap();
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner,storage_stage,mint_stage,container_stage,phase,sandbox_id,last_heartbeat) VALUES($1,$2,$2,$3,$3,$3,'running','sb-1',$4)")
+            .bind(seal.as_slice()).bind(Address::ZERO.as_slice()).bind(&confirmed).bind(stale).execute(&pool).await.unwrap();
+        let find = |all: Vec<crate::traits::StaleRunner>| all.into_iter().find(|c| c.seal_id == seal);
+        // A container from before 1.4: no container record.
+        let candidate = find(repo.stale_running_candidates(now, 900).await.unwrap()).unwrap();
+        assert_eq!(candidate.sandbox_id.as_deref(), Some("sb-1"));
+        assert!(!candidate.can_report);
+        // Its first 1.4 provision recorded the container.
+        sqlx::query("UPDATE deployments SET container_pubkey=$2,container_image_hash=$3,provider_chain_id=1,provider_registry_address=$4,provider_app_id='sandbox',provider_registered_at=1,provider_signer=$4 WHERE seal_id=$1")
+            .bind(seal.as_slice()).bind([2u8; 33].as_slice()).bind([0x11u8; 32].as_slice()).bind(Address::ZERO.as_slice()).execute(&pool).await.unwrap();
+        assert!(find(repo.stale_running_candidates(now, 900).await.unwrap()).unwrap().can_report);
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
             .execute(&pool)
             .await
             .unwrap();

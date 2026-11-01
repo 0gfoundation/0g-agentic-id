@@ -54,7 +54,9 @@ sweep 还会把容器已经 15 min 没有发 `/status` 的 running deployment �
 对账。provider 给出答复时以它为准：sandbox 已删除则把 agent 标为 failed；sandbox 处于
 `error` 则标为 failed 并删除 sandbox；其他非运行状态标为 stopped，owner 可以 resume。
 sandbox 处于 started，或 provider 查不到它的状态时，由 agent 的 `/healthz` 决定：
-不可达就把 agent 标为 failed 并删除 sandbox。这个判断依赖心跳过期，而容器只有在
+不可达就把 agent 标为 failed 并删除 sandbox。这个判断依赖心跳过期，所以只适用于本可以
+上报的容器。首次 provision 不是在 1.4 下完成的容器无法上报：attestor 拒绝它的上报。
+对这样的容器只看 provider 的答复；不会探测它，也不会因为不可达而删除它。1.4 容器只有在
 provider 提供有效的 attestor TLS 声明（sealed 用它 pin 这个 attestor）时才能上报。
 因此 worker 每轮 sweep 都向 provider 取这份声明，只有在过去 15 min 的每次检查中
 provider 都提供了它，才把过期心跳当作故障；每次 worker 启动后也要先等这 15 min。
@@ -87,7 +89,9 @@ worker 日志即可。
    snapshot，使用本版本发布的框架名。检查：升级后 `GET /config` 列出每个框架及其新
    snapshot。
 3. **暂停并排空。**公告一个窗口，期间 owner 不部署也不 reset：provider 与 attestor
-   版本不一致时 create 会失败，无论哪一方先升级。按上文排空 job 队列。
+   版本不一致时 create 会失败，无论哪一方先升级。同一公告中说明：第 4 步 provider 升级时
+   所有 agent 都会下线，并一直保持下线，直到 owner 在第 7 步之后 reset。按上文排空 job
+   队列。
 4. **在该窗口内升级 provider 和 attestor。**检查：`GET <provider>/api/attestor-tls`
    返回 200，`GET <ATTESTOR_URL>/attestor-tls?provider=<provider signer>` 返回 200，
    且 api 日志出现 `attestor tls self-check: provider statement verified`。自检只在
@@ -114,17 +118,19 @@ worker 日志即可。
    `npm view @0gfoundation/0g-agentdna dist-tags.latest` 输出 `0.2.2`，
    `GET /config` 显示 `"cli_latest":"0.2.2"`。
 7. **公告。**使用 CLI 的 owner 先更新（`0g-agentdna update`），然后 owner reset 自己的
-   agent。1.4 之前创建的 sandbox 不能 resume（`/start` 带 `start`），会得到 409，因为
+   agent。容器创建于 1.4 之前的 agent 自第 4 步起都已下线，显示为 `stopped`，只有 reset
+   才能恢复：1.4 之前创建的 sandbox 不能 resume（`/start` 带 `start`），会得到 409，因为
    那个运行时无法 provision。preflight 要求时，owner 需重新确认 provider（SDK `ack()`）。
    请 owner 错开 reset：worker 一次只跑一个 job，签名后约 150 s 内没开始执行的 reset
    会被丢弃，agent 保持原样。控制台显示 `request expired before it ran — sign it again`；
    0.2.2 的 CLI 会一直等新容器直到超时，然后提示 agent 没有上线、请重新 reset。
 
-   owner reset 之前，1.4 之前创建的容器会继续运行，但 1.4 attestor 拒绝它的状态上报
-   （其 token 格式早于 1.4），所以它的心跳一直是过期的，只靠 `/healthz` 探测维持
-   `running`：和任何心跳过期的 agent 一样（见上文 sweep），探测失败就会把它标为
-   offline 并删除容器。它在链上和存储中的状态都保留，reset 即可恢复，所以请 owner
-   尽快 reset。
+   第 4 步 provider 升级时会 archive 所有运行中的 sandbox，所以容器创建于 1.4 之前的
+   agent 从那时起都已停止。心跳过期 15 min 后，sweep 发现它的 sandbox 已 archive，把它
+   标为 `stopped`。它已提交到链上和存储中的状态都保留，reset 即可恢复。仍在运行的 1.4
+   之前创建的容器（provider 没有 archive 它）同样无法上报：1.4 attestor 拒绝它的状态上报
+   （其 token 格式早于 1.4）。sweep 对它只按 provider 的答复处理（已删除、`error`、
+   stopped 或 archived），否则保持 `running`；不会因为不可达而探测或删除它。
 
 **回滚。**1.4 attestor 是单向的：它的 schema 删除了 1.3 attestor 要读的列
 （`inference_provider_registry.acceptance_mac`、`deployments.container_pubkey_mac`），

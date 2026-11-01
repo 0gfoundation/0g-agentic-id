@@ -1860,7 +1860,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         &self,
         now: chrono::DateTime<chrono::Utc>,
         threshold_secs: i64,
-    ) -> anyhow::Result<Vec<(SealId, Option<String>)>> {
+    ) -> anyhow::Result<Vec<crate::traits::StaleRunner>> {
         let cutoff = now - chrono::Duration::seconds(threshold_secs);
         let stale: Vec<SealId> = {
             let hb = self.heartbeats.lock().unwrap();
@@ -1874,7 +1874,11 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         for seal_id in stale {
             if let Some(d) = g.get(&seal_id) {
                 if d.phase == crate::types::DeploymentPhase::Running {
-                    out.push((seal_id, d.sandbox_id.clone()));
+                    out.push(crate::traits::StaleRunner {
+                        seal_id,
+                        sandbox_id: d.sandbox_id.clone(),
+                        can_report: d.container_record.is_some(),
+                    });
                 }
             }
         }

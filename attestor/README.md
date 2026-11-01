@@ -68,13 +68,17 @@ sandbox marks it failed and deletes the sandbox, and any other state that is
 not running marks it stopped, so the owner can resume it. A started sandbox,
 or one the provider cannot report, is decided by the agent's `/healthz`:
 unreachable marks the agent failed and deletes the sandbox. That verdict
-rests on the stale heartbeat, and a container can report only while the
-provider serves a valid attestor TLS statement, which sealed pins this
-attestor with. So the worker asks the provider for that statement on every
-sweep and acts on a stale heartbeat only once the provider has served it at
-every check for the last 15 min; that wait also follows every worker start.
-A provider outage therefore leaves running agents running rather than
-marking them offline. The provider's own answers do not wait.
+rests on the stale heartbeat, so it applies only to a container that could
+have reported. A container whose first provision did not run under 1.4
+cannot: the attestor refuses its reports. For such a container only the
+provider's answers count; it is never probed, and never deleted for being
+unreachable. A 1.4 container can report only while the provider serves a
+valid attestor TLS statement, which sealed pins this attestor with. So the
+worker asks the provider for that statement on every sweep and acts on a
+stale heartbeat only once the provider has served it at every check for the
+last 15 min; that wait also follows every worker start. A provider outage
+therefore leaves running agents running rather than marking them offline.
+The provider's own answers do not wait.
 
 Upgrading from a release that encrypted job payloads: drain the queue first.
 Stop the api and indexer services so no new jobs arrive (the indexer resumes
@@ -109,7 +113,9 @@ go on until each check passes.
    with its new snapshot.
 3. **Pause and drain.** Announce a window in which owners neither deploy nor
    reset: creates fail while the provider and the attestor run different
-   versions, in either order. Drain the job queue as described above.
+   versions, in either order. Say in the same announcement that every agent
+   goes offline when the provider rolls in step 4 and stays offline until its
+   owner resets it after step 7. Drain the job queue as described above.
 4. **Roll the provider and the attestor** in that window. Check:
    `GET <provider>/api/attestor-tls` answers 200,
    `GET <ATTESTOR_URL>/attestor-tls?provider=<provider signer>` answers 200, and
@@ -143,8 +149,10 @@ go on until each check passes.
    `npm view @0gfoundation/0g-agentdna dist-tags.latest` prints `0.2.2`, and
    `GET /config` shows `"cli_latest":"0.2.2"`.
 7. **Announce.** CLI owners update (`0g-agentdna update`), then owners reset
-   their agents. A resume (`/start` with `start`) of a sandbox created before
-   1.4 is refused with 409, because that runtime cannot provision. Owners
+   their agents. Every agent whose container predates 1.4 has been offline
+   since step 4 and shows `stopped`, and a reset is the only way back: a
+   resume (`/start` with `start`) of a sandbox created before 1.4 is refused
+   with 409, because that runtime cannot provision. Owners
    acknowledge the provider again (SDK `ack()`) if the preflight asks. Ask
    owners to spread their resets: the worker runs one job at a time, and a
    reset not started within about 150 s of being signed is dropped and leaves
@@ -153,13 +161,16 @@ go on until each check passes.
    waiting for the new container until its limit, then says the agent did not
    come online and to run the reset again.
 
-   Until its owner resets it, a container created before 1.4 keeps running,
-   but the 1.4 attestor refuses its status reports (their token format
-   predates 1.4), so its heartbeat stays stale and only the `/healthz` probe
-   keeps it `running`: a failed probe marks it offline and deletes its
-   container, as for any agent whose heartbeat is stale (see the sweep
-   above). Its state on chain and in storage is kept, and a reset brings it
-   back, so ask owners to reset soon.
+   The provider's roll in step 4 archives every running sandbox, so every
+   agent whose container predates 1.4 is down from then on. Once its
+   heartbeat is 15 min old, the sweep finds its sandbox archived and marks it
+   `stopped`. Its committed state on chain and in storage is kept, and a
+   reset brings it back. A container created before 1.4 that is still running
+   (one the provider did not archive) cannot report either: the 1.4 attestor
+   refuses its status reports (their token format predates 1.4). The sweep
+   then acts only on the provider's answers for it (deleted, `error`, stopped
+   or archived) and leaves it `running` otherwise; it never probes or deletes
+   it for being unreachable.
 
 **Rolling back.** The 1.4 attestor is one-way: its schema drops columns a
 1.3 attestor reads (`inference_provider_registry.acceptance_mac`,
