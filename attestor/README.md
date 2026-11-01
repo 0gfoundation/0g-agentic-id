@@ -138,8 +138,14 @@ on dev would first meet the live provider with every agent already offline.
    means its attestor instance pin is stale: re-authorize the instance as the
    sandbox provider's `docs/APP_IDENTITY.md` describes before going on.
 5. **One reset per framework.** Reset one agent on each framework and wait for
-   `running`. Reset some from the console and some with the 0.2.2 CLI: each
-   builds its own create request. The sealed log shows `attestor tls: statement accepted` and
+   `running`. Use the 0.2.2 CLI, and also each other client owners reset
+   from: the embedded console where it is served (a headless attestor,
+   `ATTESTOR_CONSOLE_ENABLED=false`, serves none) and any web frontend. Each
+   client builds its own create request, which must name the provider
+   (`provider`, from `GET /config` `sandbox_provider_addr`) and the agent's
+   framework image (from `GET /config` `frameworks[]`). Without the provider
+   the worker refuses the create (`owner envelope targets another provider`);
+   on another framework's image the agent's framework does not start. The sealed log shows `attestor tls: statement accepted` and
    `OK   status reported`. A refused provision is in the api log
    (`provision rejected`) and is the reason on the agent's container stage.
 6. **Publish the SDK.** The 1.4 CLI is `@0gfoundation/0g-agentdna` 0.2.2.

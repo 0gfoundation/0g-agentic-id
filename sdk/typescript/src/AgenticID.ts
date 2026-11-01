@@ -875,8 +875,9 @@ export class AgentApi {
     try { url = card.url ? new URL(card.url as string).origin : null; } catch { /* malformed → null */ }
     // Failure reasons live on the per-track stage objects
     // (storage/mint/container_stage.reason); last_provision_error is a
-    // sticky DB column (only set, never cleared) so it is only consulted
-    // for phase=failed, as a backstop — same gating and priority as the
+    // sticky DB column (cleared only by the next accepted /provision or a
+    // new container's boot ticket) so it is only consulted for
+    // phase=failed, as a backstop — same gating and priority as the
     // attestor console's failureReason(). phase=offline surfaces only a
     // genuine container failure (a clean owner stop carries no reason);
     // recovered rows report null rather than a stale sticky error. (These

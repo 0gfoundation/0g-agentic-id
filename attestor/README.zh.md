@@ -108,8 +108,13 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
    自检）。provider 报 `attestor instance requires explicit re-authorization` 说明它保存的
    attestor 实例已过期：先按 sandbox provider 的 `docs/APP_IDENTITY.md` 重新授权该实例
    再继续。
-5. **每个框架 reset 一个。**每个框架各 reset 一个 agent，等到 `running`。其中一些用
-   console reset，一些用 0.2.2 CLI reset：两者各自构造 create 请求。sealed 日志
+5. **每个框架 reset 一个。**每个框架各 reset 一个 agent，等到 `running`。用 0.2.2 CLI，
+   并用 owner 会用来 reset 的其他每个客户端各做一次：提供内嵌 console 时用 console
+   （headless attestor，即 `ATTESTOR_CONSOLE_ENABLED=false`，不提供 console），以及任何
+   web 前端。每个客户端各自构造 create 请求，请求必须带上 provider（`provider`，取自
+   `GET /config` 的 `sandbox_provider_addr`）和该 agent 框架的镜像（取自 `GET /config`
+   的 `frameworks[]`）。缺少 provider 时 worker 会拒绝 create（`owner envelope targets another provider`）；
+   用了其他框架的镜像时，该 agent 的框架无法启动。sealed 日志
    出现 `attestor tls: statement accepted` 和 `OK   status reported`。被拒的 provision
    会出现在 api 日志里（`provision rejected`），也是该 agent 容器 stage 上的原因。
 6. **发布 SDK。**1.4 的 CLI 是 `@0gfoundation/0g-agentdna` 0.2.2。npm 上已有的版本
