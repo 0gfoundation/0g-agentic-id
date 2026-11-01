@@ -462,9 +462,10 @@ pub struct Deployment {
 
     /// Last `/provision` validation error (image_hash rejected, signer
     /// mismatch, stale attestation, etc.) — surfaces in the UI so
-    /// "still booting" is distinguishable from "broken". Cleared on
-    /// next successful `/provision`. None means no failures observed
-    /// yet (or pre-feature row).
+    /// "still booting" is distinguishable from "broken". Cleared by the
+    /// next accepted `/provision` and when a new container is issued a
+    /// boot ticket. None means no rejection since then (or pre-feature
+    /// row).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_provision_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

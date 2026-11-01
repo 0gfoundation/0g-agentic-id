@@ -928,9 +928,10 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             .fetch_one(&mut *tx)
             .await?;
         let generation: Option<i64> = if let Some(ticket) = ticket {
-            // A new container must present its own certificate.
+            // A new container must present its own certificate, and a
+            // rejection of the previous container no longer describes it.
             sqlx::query(&format!(
-                "UPDATE deployments SET {CLEAR_CONTAINER_RECORD},updated_at=now() WHERE seal_id=$1"
+                "UPDATE deployments SET {CLEAR_CONTAINER_RECORD},last_provision_error=NULL,last_provision_error_at=NULL,updated_at=now() WHERE seal_id=$1"
             ))
             .bind(seal_id.as_slice())
             .execute(&mut *tx)
@@ -1001,8 +1002,10 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             return Ok(false);
         }
         // First boot writes the record; a later boot must match it exactly.
+        // An accepted boot also clears the last rejection: it no longer
+        // describes the agent.
         let provider = &record.provider;
-        let n = sqlx::query("UPDATE deployments SET container_pubkey=$2,container_image_hash=$3,provider_chain_id=$4,provider_registry_address=$5,provider_app_id=$6,provider_registered_at=$7,provider_signer=$8,provisioned_at=COALESCE(provisioned_at,now()),provision_deadline=NULL WHERE seal_id=$1 AND (container_pubkey IS NULL OR (container_pubkey=$2 AND container_image_hash=$3 AND provider_chain_id=$4 AND provider_registry_address=$5 AND provider_app_id=$6 AND provider_registered_at=$7 AND provider_signer=$8))")
+        let n = sqlx::query("UPDATE deployments SET container_pubkey=$2,container_image_hash=$3,provider_chain_id=$4,provider_registry_address=$5,provider_app_id=$6,provider_registered_at=$7,provider_signer=$8,provisioned_at=COALESCE(provisioned_at,now()),provision_deadline=NULL,last_provision_error=NULL,last_provision_error_at=NULL WHERE seal_id=$1 AND (container_pubkey IS NULL OR (container_pubkey=$2 AND container_image_hash=$3 AND provider_chain_id=$4 AND provider_registry_address=$5 AND provider_app_id=$6 AND provider_registered_at=$7 AND provider_signer=$8))")
             .bind(seal_id.as_slice())
             .bind(record.pubkey.as_ref())
             .bind(record.image_hash.as_slice())
@@ -1958,6 +1961,60 @@ mod settings_retry_tests {
             .bind_status_boot(seal, &record(2), [5; 32], None, &current)
             .await
             .unwrap());
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_an_accepted_boot_or_a_new_container_clears_the_provision_error() {
+        use crate::auth::status::BootClaim;
+        let pool = connect(&test_database_url()).await.unwrap();
+        let repo = PostgresDeploymentRepo::new(pool.clone());
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner,sandbox_id) VALUES($1,$2,$2,'sandbox')").bind(seal.as_slice()).bind(Address::ZERO.as_slice()).execute(&pool).await.unwrap();
+        let generation = repo
+            .prepare_status_boot(seal, Some([1; 32]), Address::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.set_sandbox_id(seal, "sandbox".into(), None).await.unwrap();
+        let cleared = |d: Deployment| {
+            d.last_provision_error.is_none() && d.last_provision_error_at.is_none()
+        };
+
+        // A refused boot of this container records its reason; the next
+        // accepted boot clears it.
+        assert!(repo
+            .record_provision_error(seal, "image_hash not in validFrameworkHashes".into(), true, Some(generation))
+            .await
+            .unwrap());
+        assert!(!cleared(repo.get(seal).await.unwrap().unwrap()));
+        let claim = BootClaim {
+            generation,
+            ticket_hash: [1; 32],
+            boot_id: B256::repeat_byte(1),
+            started_at: 100,
+        };
+        assert!(repo
+            .bind_status_boot(seal, &record(2), [1; 32], None, &claim)
+            .await
+            .unwrap());
+        assert!(cleared(repo.get(seal).await.unwrap().unwrap()));
+
+        // A new container (a new ticket) clears a rejection of the old one.
+        assert!(repo
+            .record_provision_error(seal, "container key differs from record".into(), true, Some(generation))
+            .await
+            .unwrap());
+        assert!(!cleared(repo.get(seal).await.unwrap().unwrap()));
+        repo.prepare_status_boot(seal, Some([2; 32]), Address::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cleared(repo.get(seal).await.unwrap().unwrap()));
         sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
             .bind(seal.as_slice())
             .execute(&pool)

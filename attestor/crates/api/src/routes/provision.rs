@@ -1336,6 +1336,38 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn an_accepted_boot_or_a_new_container_clears_the_recorded_rejection() {
+        let (mut state, repo, seal) = setup(None).await;
+        let chain = Arc::new(MockChain::new());
+        chain.set_valid_framework(false);
+        state.chain = chain.clone();
+        let rejected = |d: Deployment| {
+            d.last_provision_error.is_some() && d.last_provision_error_at.is_some()
+        };
+        call(&state, first(&repo, seal).await).await.unwrap_err();
+        assert!(rejected(repo.get(seal).await.unwrap().unwrap()));
+        // The image is allowlisted and the same container boots again: the
+        // old rejection no longer describes the agent, so the console must
+        // not keep showing its hint.
+        chain.set_valid_framework(true);
+        call(&state, first(&repo, seal).await).await.unwrap();
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(d.last_provision_error.is_none() && d.last_provision_error_at.is_none());
+
+        // A rejection followed by a new container (a new ticket) is cleared
+        // by the ticket, before the new container boots.
+        repo.record_provision_error(seal, "container key differs from record".into(), true, None)
+            .await
+            .unwrap();
+        assert!(rejected(repo.get(seal).await.unwrap().unwrap()));
+        repo.prepare_status_boot(seal, Some(binding_hash(&ticket())), Address::ZERO)
+            .await
+            .unwrap();
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(d.last_provision_error.is_none() && d.last_provision_error_at.is_none());
+    }
+
+    #[tokio::test]
     async fn a_rejection_that_is_not_the_authorized_boot_records_nothing() {
         let (mut state, repo, seal) = setup(None).await;
         let events = Arc::new(InMemoryEventBus::new());

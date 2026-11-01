@@ -178,4 +178,5 @@ sandbox（没有启动票据，或票据没有签发时间），以及 reset 的
 401 或 403 会以 `provision rejected` 打日志。在该代次仍是启用代次时，记为
 `last_provision_error`，并把容器 stage 置为 `failed`、以此为原因，同时发布
 `container_failed`，owner 立即看到原因，而不是五分钟后的 provision timeout。其他拒绝
-不写任何东西。
+不写任何东西。下一次被接受的启动，或新容器的启动票据，会清除 `last_provision_error`，
+修好的 agent 不会一直显示旧的拒绝。

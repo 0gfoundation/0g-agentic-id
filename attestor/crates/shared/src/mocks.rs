@@ -1665,6 +1665,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         let (sandbox_id, ticket_issued_at, container_pubkey) = match ticket {
             Some(_) => {
                 d.container_record = None;
+                d.last_provision_error = None;
+                d.last_provision_error_at = None;
                 (None, Some(chrono::Utc::now().timestamp()), None)
             }
             None => (
@@ -1733,6 +1735,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         d.container_record = Some(record.clone());
         d.provisioned_at.get_or_insert(chrono::Utc::now());
         d.provision_deadline = None;
+        d.last_provision_error = None;
+        d.last_provision_error_at = None;
         self.status_bindings
             .lock()
             .unwrap()
