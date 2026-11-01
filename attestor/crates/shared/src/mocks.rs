@@ -142,6 +142,9 @@ pub struct StaticStatementSource {
     pub provider_calls: AtomicU64,
     body: Mutex<Result<Vec<u8>, String>>,
     pub own_tls_spki: Mutex<B256>,
+    /// What a re-read of the TLS key returns (the key changed), if set.
+    pub reread_tls_spki: Mutex<Option<B256>>,
+    pub rereads: AtomicU64,
     pub fetches: AtomicU64,
 }
 
@@ -153,6 +156,8 @@ impl StaticStatementSource {
             provider_calls: AtomicU64::new(0),
             body: Mutex::new(Ok(body)),
             own_tls_spki: Mutex::new(own_tls_spki),
+            reread_tls_spki: Mutex::new(None),
+            rereads: AtomicU64::new(0),
             fetches: AtomicU64::new(0),
         }
     }
@@ -184,6 +189,15 @@ impl crate::attestor_tls::StatementSource for StaticStatementSource {
 
     async fn own_tls_spki(&self) -> anyhow::Result<B256> {
         Ok(*self.own_tls_spki.lock().unwrap())
+    }
+
+    async fn reread_own_tls_spki(&self) -> anyhow::Result<B256> {
+        self.rereads.fetch_add(1, Ordering::SeqCst);
+        let mut own = self.own_tls_spki.lock().unwrap();
+        if let Some(changed) = *self.reread_tls_spki.lock().unwrap() {
+            *own = changed;
+        }
+        Ok(*own)
     }
 }
 
@@ -1846,7 +1860,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         &self,
         now: chrono::DateTime<chrono::Utc>,
         threshold_secs: i64,
-    ) -> anyhow::Result<Vec<(SealId, Option<String>)>> {
+    ) -> anyhow::Result<Vec<crate::traits::StaleRunner>> {
         let cutoff = now - chrono::Duration::seconds(threshold_secs);
         let stale: Vec<SealId> = {
             let hb = self.heartbeats.lock().unwrap();
@@ -1860,7 +1874,11 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         for seal_id in stale {
             if let Some(d) = g.get(&seal_id) {
                 if d.phase == crate::types::DeploymentPhase::Running {
-                    out.push((seal_id, d.sandbox_id.clone()));
+                    out.push(crate::traits::StaleRunner {
+                        seal_id,
+                        sandbox_id: d.sandbox_id.clone(),
+                        can_report: d.container_record.is_some(),
+                    });
                 }
             }
         }

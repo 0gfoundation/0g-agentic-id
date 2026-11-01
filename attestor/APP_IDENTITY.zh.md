@@ -119,8 +119,10 @@ provider 用与证书相同的 key，把本 attestor app 的 TLS SPKI pin（来�
 身份解析，每份声明最长 300 秒）签成 EIP-712 `AttestorTLS`，并在 `GET /api/attestor-tls`
 提供。attestor 通过 sandbox discovery snapshot 的固定 TLS 连接取得最新声明，在
 `GET /attestor-tls?provider=0x…` 原样（逐字节）转发。转发前检查 provider 签名、租期，
-以及它自己的 app TLS 公钥（本地 tapp `GetAppCsr` 返回的 SPKI hash）在 pin 中；到期前
-60 秒刷新，没有有效声明时返回 503。缓存中的声明直接返回，不询问 sandbox discovery；只有
+以及它自己的 app TLS 公钥（本地 tapp `GetAppCsr` 返回的 SPKI hash）在 pin 中。tapp 每次
+处理 `GetAppCsr` 都会加载该 key；`--tls-key-source kms` 时它从 KMS 派生该 key，并向节点
+evidence 追加一条运行时度量。因此 attestor 每个进程只读一次这个 hash，只有声明没有 pin 它时才重读，
+且最多每 5 分钟一次。转发到期前 60 秒刷新，没有有效声明时返回 503。缓存中的声明直接返回，不询问 sandbox discovery；只有
 刷新时才询问 discovery，此时若 discovery 失败，缓存的声明继续返回，直到到期前 15 秒
 （sealed 在剩余超过 5 秒时接受）。每份新声明都会打日志，api 启动时取一次并记录结果。sealed 不做 CA 校验地获取声明，只有当签名者是它自己
 证书的签名者、chain 与 registry 与证书一致、租期不超过 300 秒，且声明所经连接的 SPKI

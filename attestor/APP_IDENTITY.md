@@ -148,7 +148,10 @@ certificate, as EIP-712 `AttestorTLS`, and serves them at `GET /api/attestor-tls
 attestor relays the latest statement byte-identical at `GET /attestor-tls?provider=0x…`,
 fetching it over the pinned connection of its sandbox discovery snapshot. Before serving
 it checks the provider signature, the lease, and that its own app TLS key (the SPKI hash
-from local tapp `GetAppCsr`) is among the pins; it refreshes 60 seconds before expiry and
+from local tapp `GetAppCsr`) is among the pins. tapp loads that key for each `GetAppCsr`;
+under `--tls-key-source kms` it derives the key from KMS and adds a runtime measurement
+to the node's evidence. So the attestor reads the hash once per process and again, at
+most every 5 minutes, only when a statement does not pin it. The relay refreshes 60 seconds before expiry and
 answers 503 when it has no valid statement. A cached statement is served without asking
 sandbox discovery, which is consulted only to refresh; if discovery fails then, the
 cached statement is served until 15 seconds before it expires (sealed accepts one

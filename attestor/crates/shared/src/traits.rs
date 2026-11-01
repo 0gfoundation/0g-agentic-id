@@ -588,14 +588,29 @@ pub trait DeploymentRepo: Send + Sync {
     ) -> anyhow::Result<AbandonedStages>;
 
     /// Read-only: running deployments whose last heartbeat is older than
-    /// `now - threshold_secs`. Returns `(seal_id, sandbox_id)` so the caller
-    /// (the worker's reconcile sweep) can check each sandbox's real state and
-    /// decide Stopped vs Failed vs reap — instead of blindly flipping Failed.
+    /// `now - threshold_secs`, so the caller (the worker's reconcile sweep)
+    /// can check each sandbox's real state and decide Stopped vs Failed vs
+    /// reap — instead of blindly flipping Failed.
     async fn stale_running_candidates(
         &self,
         now: chrono::DateTime<chrono::Utc>,
         threshold_secs: i64,
-    ) -> anyhow::Result<Vec<(SealId, Option<String>)>>;
+    ) -> anyhow::Result<Vec<StaleRunner>>;
+}
+
+/// A running deployment whose last heartbeat is older than the staleness
+/// window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRunner {
+    pub seal_id: SealId,
+    pub sandbox_id: Option<String>,
+    /// Whether the current container completed a 1.4 provision (the row
+    /// holds its container record), so it holds a status token and a silent
+    /// heartbeat means it stopped reporting. False for a container created
+    /// before 1.4, whose reports the attestor refuses, and after an
+    /// ownership change revoked the container: such a heartbeat is stale
+    /// whether or not the agent is alive.
+    pub can_report: bool,
 }
 
 // ── Idempotency ─────────────────────────────────────────────────────────

@@ -34,7 +34,7 @@ pub use error::{AttestorError, Result};
 pub use events::WsEvent;
 pub use traits::{
     ChainClient, CryptoModule, DeploymentRepo, EventBus, EventSubscription, IdempotencyStore,
-    JobQueue, SandboxClient, StorageClient,
+    JobQueue, SandboxClient, StaleRunner, StorageClient,
 };
 pub use types::*;
 

@@ -10,21 +10,31 @@
 //!   - `started`/`starting`, or the lookup failed: the agent's `/healthz` is
 //!     probed; reachable means alive, unreachable means Failed and reaped.
 //!
-//! The last case rests on the stale heartbeat, and a heartbeat can only
-//! arrive while sealed can pin this attestor: it reports over a TLS
-//! connection pinned by the provider-signed statement the api relays at
-//! `GET /attestor-tls`, which is valid for at most 300 s. While the provider
-//! serves no such statement, no container can report, and the `/healthz`
-//! probe, which goes through the provider's preview proxy behind the same
-//! front end as its API, usually fails at the same time. [`ReportPath`]
-//! therefore records whether the provider served a valid statement at every
-//! check, and a stale heartbeat counts only once that has held for a whole
-//! staleness window. Until then such agents are left running. The provider's
-//! own answers (404, `error`, a stopped state) do not depend on it.
+//! The last case rests on the stale heartbeat, which means something only
+//! while the container could report:
+//!   - The container must hold a status token, which only a 1.4 provision
+//!     issues ([`StaleRunner::can_report`]). The attestor refuses the reports
+//!     of a container created before 1.4, so its heartbeat stays stale while
+//!     it serves; such a row is decided only by the provider's own answers
+//!     above, and is never probed or reaped for being unreachable. Its
+//!     owner's reset replaces the container.
+//!   - sealed reports over a TLS connection pinned by the provider-signed
+//!     statement the api relays at `GET /attestor-tls`, which is valid for
+//!     at most 300 s. While the provider serves no such statement, no
+//!     container can report. [`ReportPath`] therefore records whether the
+//!     provider served a valid statement at every check, and a stale
+//!     heartbeat counts only once that has held for a whole staleness
+//!     window. Until then such agents are left running.
+//!
+//! The `/healthz` probe goes through the provider's preview proxy, which can
+//! fail on its own while the statement is still served, so a probe failure
+//! alone never decides: it confirms a heartbeat that the container could
+//! have sent and did not. The provider's own answers (404, `error`, a
+//! stopped state) depend on neither.
 
 use alloy::primitives::Address;
 use attestor_shared::attestor_tls::{self, StatementSource};
-use attestor_shared::{DeploymentRepo, EventBus, SandboxClient, StageStatus, WsEvent};
+use attestor_shared::{DeploymentRepo, EventBus, SandboxClient, StageStatus, StaleRunner, WsEvent};
 use chrono::{DateTime, Duration, Utc};
 use std::future::Future;
 use std::sync::Arc;
@@ -128,6 +138,10 @@ enum Act {
     Skip,
     /// Reports could not have arrived: the stale heartbeat proves nothing.
     Hold,
+    /// The container cannot report at all (created before 1.4, or revoked
+    /// by an ownership change): only the provider's own answers count, and
+    /// it gave none that ends the agent.
+    Unreported,
     /// The sandbox is preserved: Stopped (resumable).
     Stop(String),
     /// Failed; the bool says whether to reap (admin_delete).
@@ -190,7 +204,12 @@ pub async fn reconcile_stale_runners<H, F>(
     };
 
     let mut held = 0usize;
-    for (seal_id, sandbox_id) in candidates {
+    for StaleRunner {
+        seal_id,
+        sandbox_id,
+        can_report,
+    } in candidates
+    {
         let Some(sb) = sandbox_id.filter(|s| !s.is_empty()) else {
             // No sandbox to reconcile against; leave for an operator.
             continue;
@@ -200,6 +219,9 @@ pub async fn reconcile_stale_runners<H, F>(
             // Gone already: flip Failed, nothing to reap.
             Ok(None) => Act::Fail("container missing (sandbox deleted)".to_string(), false),
             Ok(Some(ref i)) => match i.state.as_str() {
+                // Running, and the container cannot report: nothing says
+                // the agent is down.
+                "started" | "starting" if !can_report => Act::Unreported,
                 // Sandbox up but heartbeat stale: confirm with a /healthz
                 // probe before declaring the agent dead, so a
                 // healthy-but-isolated agent is not reaped.
@@ -226,7 +248,12 @@ pub async fn reconcile_stale_runners<H, F>(
             // broken sandbox it cannot report (0g-sandbox#50), so a dead
             // agent must not stay "running" forever; the /healthz probe
             // decides. Never on this alone during a provider outage, which
-            // fails the lookup and the probe together: see ReportPath.
+            // fails the lookup and the probe together: see ReportPath. Nor
+            // for a container that cannot report.
+            Err(e) if !can_report => {
+                tracing::debug!(?seal_id, sandbox_id = %sb, error = %e, "sweep: get_sandbox failed");
+                Act::Unreported
+            }
             Err(e) => {
                 tracing::debug!(?seal_id, sandbox_id = %sb, error = %e, "sweep: get_sandbox failed");
                 unless_reachable(
@@ -254,6 +281,10 @@ pub async fn reconcile_stale_runners<H, F>(
             Act::Hold => {
                 tracing::debug!(?seal_id, sandbox_id = %sb, "sweep: heartbeat stale while containers could not report — leaving alone");
                 held += 1;
+                continue;
+            }
+            Act::Unreported => {
+                tracing::debug!(?seal_id, sandbox_id = %sb, "sweep: heartbeat stale but the container cannot report (created before 1.4) — leaving alone");
                 continue;
             }
             Act::Stop(reason) => (
@@ -342,9 +373,11 @@ mod tests {
         ))
     }
 
-    fn running(repo: &InMemoryDeploymentRepo, last_heartbeat: DateTime<Utc>) {
+    /// A running row; `can_report` gives it the container record a 1.4
+    /// provision writes.
+    fn running(repo: &InMemoryDeploymentRepo, last_heartbeat: DateTime<Utc>, can_report: bool) {
         let confirmed = serde_json::json!({"state": "confirmed", "at": last_heartbeat});
-        let d = serde_json::from_value(serde_json::json!({
+        let mut d: attestor_shared::Deployment = serde_json::from_value(serde_json::json!({
             "seal_id": B256::from(SEAL),
             "agent_seal_addr": "0x2222222222222222222222222222222222222222",
             "owner": "0x1111111111111111111111111111111111111111",
@@ -360,6 +393,17 @@ mod tests {
             "updated_at": last_heartbeat,
         }))
         .expect("deployment fixture");
+        d.container_record = can_report.then(|| attestor_shared::ContainerRecord {
+            pubkey: alloy::primitives::Bytes::from_static(&[2u8; 33]),
+            image_hash: B256::repeat_byte(0x11),
+            provider: attestor_shared::ProviderInstance {
+                chain_id: CHAIN,
+                registry_address: Address::from(REGISTRY),
+                app_id: "sandbox".into(),
+                registered_at: 100,
+                signer: provider_key().address(),
+            },
+        });
         repo.seed(d);
         repo.heartbeats
             .lock()
@@ -380,8 +424,18 @@ mod tests {
         /// A running agent silent for 20 min, with the statement path
         /// pinned to a provider that serves a valid statement.
         fn new(now: DateTime<Utc>) -> Self {
+            Self::with_container(now, true)
+        }
+
+        /// The same, for a container created before 1.4, which cannot
+        /// report.
+        fn legacy(now: DateTime<Utc>) -> Self {
+            Self::with_container(now, false)
+        }
+
+        fn with_container(now: DateTime<Utc>, can_report: bool) -> Self {
             let repo = InMemoryDeploymentRepo::new();
-            running(&repo, now - Duration::minutes(20));
+            running(&repo, now - Duration::minutes(20), can_report);
             let source = statement_source();
             let reports = ReportPath::pinned(source.clone(), CHAIN, Address::from(REGISTRY));
             Self {
@@ -597,5 +651,63 @@ mod tests {
             "{:?}",
             w.stage()
         );
+    }
+
+    #[tokio::test]
+    async fn a_container_that_cannot_report_is_never_probed_or_reaped() {
+        // A 1.3 container still serving: the provider answers started (or
+        // cannot be asked), its statement path is up, and the preview proxy
+        // fails the probe.
+        for (state, lookup_fails) in [
+            (Some("started"), false),
+            (Some("starting"), false),
+            (Some("started"), true),
+        ] {
+            let now = Utc::now();
+            let mut w = World::legacy(now);
+            w.reports.check(now - Duration::minutes(20)).await;
+            *w.sandbox.sandbox_state.lock().unwrap() = state.map(str::to_string);
+            w.sandbox
+                .get_sandbox_fails
+                .store(lookup_fails, Ordering::SeqCst);
+            for minute in 0..30 {
+                w.sweep(now + Duration::minutes(minute), false, quiet).await;
+            }
+            assert!(w.untouched(), "{state:?} {lookup_fails}: {:?}", w.stage());
+            assert_eq!(w.healthz_calls.load(Ordering::SeqCst), 0, "{state:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_container_that_cannot_report_still_follows_the_providers_own_answers() {
+        let cases: [(Option<&str>, bool, bool); 3] = [
+            (None, true, false),
+            (Some("error"), true, true),
+            (Some("archived"), false, false),
+        ];
+        for (state, failed, reaped) in cases {
+            let now = Utc::now();
+            let mut w = World::legacy(now);
+            *w.sandbox.sandbox_state.lock().unwrap() = state.map(str::to_string);
+            w.sweep(now, false, quiet).await;
+            let stage = w.stage();
+            if failed {
+                assert!(
+                    matches!(stage, StageStatus::Failed { .. }),
+                    "{state:?}: {stage:?}"
+                );
+            } else {
+                assert!(
+                    matches!(stage, StageStatus::Stopped { .. }),
+                    "{state:?}: {stage:?}"
+                );
+            }
+            assert_eq!(
+                w.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+                reaped as u64,
+                "{state:?}"
+            );
+            assert_eq!(w.healthz_calls.load(Ordering::SeqCst), 0, "{state:?}");
+        }
     }
 }
