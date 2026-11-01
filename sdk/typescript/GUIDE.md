@@ -490,7 +490,9 @@ whose runtime isn't in the default image ship their own — openclaw runs on the
 default `sandbox_snapshot`, hermes on a Python/uv image. **You don't pass it at
 deploy** (nor at `reset`/`retry`): at deploy the SDK resolves the right image
 for your `framework` from `GET /config`'s `frameworks[]` (each entry
-`{ name, image? }`; no image → the default snapshot). For an EXISTING agent,
+`{ name, image? }`; no image → the default snapshot). With your own `iData`,
+the framework is the one its `role: 'framework'` binding names, and a
+`framework` that names another one is refused. For an EXISTING agent,
 `reset`/`start`/`retry` need neither — the SDK reads the framework off the
 agent's own deployment row and resolves the same way (an unreadable row, or
 a framework `/config.frameworks[]` does not list, refuses rather than
@@ -541,7 +543,8 @@ minting is the owner's freedom; whether the content actually boots is the
 **sealed runtime's contract**. Each framework runs on the sealed image
 `/config.frameworks[]` declares for it (openclaw = the default snapshot,
 hermes = its own Python/uv image); at **deploy** the SDK resolves that image
-from `framework`, so you don't pass one. **reset**/**start**/**retry** on an
+from `framework` (or from your own iData's framework binding), so you don't
+pass one. **reset**/**start**/**retry** on an
 existing agent resolve it from the agent's own deployment row, so a bare call
 is enough (`framework` overrides the row; `sealedImage` pins a specific
 image). Pick with `framework`;
