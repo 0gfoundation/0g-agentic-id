@@ -280,10 +280,80 @@ pub struct AttestorDiscovery {
     cfg: Config,
     signer: Address,
     cached: Mutex<Option<AttestorInstance>>,
+    tls_spki: Mutex<SpkiCache>,
 }
 
 /// Names the throwaway CSR whose only use is its SPKI hash.
 const TLS_KEY_PROBE_DOMAIN: &str = "attestor-tls-pin.invalid";
+/// Bound on one `GetAppCsr` call. tapp may wait minutes on its KMS, and the
+/// worker's sweep loop, which also runs the job reaper, waits on this call.
+const TLS_SPKI_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Minimum time between two reads of the app TLS key once one succeeded.
+const TLS_SPKI_REREAD_AFTER: Duration = Duration::from_secs(300);
+
+/// This node's app TLS SPKI hash, read from tapp once and re-read only when a
+/// statement does not pin it. Each `GetAppCsr` makes tapp load the TLS key;
+/// under `--tls-key-source kms` it derives the key from the KMS and extends a
+/// runtime measurement, which stays in the node's attestation evidence until
+/// it reboots. So the key is not read per statement check.
+struct SpkiCache {
+    value: Option<B256>,
+    read_at: Option<std::time::Instant>,
+    read_timeout: Duration,
+}
+
+impl Default for SpkiCache {
+    fn default() -> Self {
+        Self {
+            value: None,
+            read_at: None,
+            read_timeout: TLS_SPKI_READ_TIMEOUT,
+        }
+    }
+}
+
+impl SpkiCache {
+    /// The cached hash, reading it first when there is none yet, or when
+    /// `reread` is set (a statement did not pin the cached one) and the last
+    /// read is at least [`TLS_SPKI_REREAD_AFTER`] old. A failed re-read keeps
+    /// the cached hash.
+    async fn get<F, Fut>(
+        &mut self,
+        reread: bool,
+        now: std::time::Instant,
+        read: F,
+    ) -> anyhow::Result<B256>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<B256>>,
+    {
+        if let (Some(value), Some(read_at)) = (self.value, self.read_at) {
+            if !reread || now.saturating_duration_since(read_at) < TLS_SPKI_REREAD_AFTER {
+                return Ok(value);
+            }
+        }
+        let result = match tokio::time::timeout(self.read_timeout, read()).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("tapp app TLS key lookup timed out")),
+        };
+        match (result, self.value) {
+            (Ok(value), previous) => {
+                if previous.is_some_and(|p| p != value) {
+                    tracing::info!(spki = %value, "attestor tls: this node's app TLS key changed");
+                }
+                self.value = Some(value);
+                self.read_at = Some(now);
+                Ok(value)
+            }
+            (Err(error), Some(previous)) => {
+                tracing::warn!(%error, "attestor tls: re-reading this node's app TLS key failed; keeping the cached one");
+                self.read_at = Some(now);
+                Ok(previous)
+            }
+            (Err(error), None) => Err(error),
+        }
+    }
+}
 
 impl AttestorDiscovery {
     pub fn new(cfg: &Config, signer: Address) -> anyhow::Result<Arc<Self>> {
@@ -296,6 +366,7 @@ impl AttestorDiscovery {
             cfg: cfg.clone(),
             signer,
             cached: Mutex::new(None),
+            tls_spki: Mutex::new(SpkiCache::default()),
         }))
     }
 
@@ -321,10 +392,36 @@ impl AttestorDiscovery {
         Ok(instance)
     }
 
-    /// SHA-256 of this node's current app TLS SubjectPublicKeyInfo, the key
-    /// the attested HTTPS endpoint serves. Read from local tapp's public
-    /// `GetAppCsr`, so no private key material is fetched.
+    /// SHA-256 of this node's app TLS SubjectPublicKeyInfo, the key the
+    /// attested HTTPS endpoint serves, as last read from local tapp (see
+    /// [`SpkiCache`]). The first call reads it.
     pub async fn tls_spki_sha256(&self) -> anyhow::Result<B256> {
+        self.tls_spki
+            .lock()
+            .await
+            .get(false, std::time::Instant::now(), || {
+                self.read_tls_spki_sha256()
+            })
+            .await
+    }
+
+    /// The same, read again from tapp because a statement did not pin the
+    /// cached hash, at most once per [`TLS_SPKI_REREAD_AFTER`].
+    pub async fn reread_tls_spki_sha256(&self) -> anyhow::Result<B256> {
+        self.tls_spki
+            .lock()
+            .await
+            .get(true, std::time::Instant::now(), || {
+                self.read_tls_spki_sha256()
+            })
+            .await
+    }
+
+    /// One `GetAppCsr` call. tapp answers it from the app's TLS key, which it
+    /// loads for the call (under `--tls-key-source kms`, derived from the KMS
+    /// and measured into the node's runtime event log); only the public SPKI
+    /// hash comes back.
+    async fn read_tls_spki_sha256(&self) -> anyhow::Result<B256> {
         use tapp_grpc::proto::{tapp_service_client::TappServiceClient, GetAppCsrRequest};
         let app_id = tapp_grpc::require_app_id(&self.cfg)?;
         let mut client = TappServiceClient::new(tapp_grpc::connect(&self.cfg).await?);
@@ -396,6 +493,10 @@ impl crate::attestor_tls::StatementSource for DiscoveredTlsSource {
 
     async fn own_tls_spki(&self) -> anyhow::Result<B256> {
         self.attestor.tls_spki_sha256().await
+    }
+
+    async fn reread_own_tls_spki(&self) -> anyhow::Result<B256> {
+        self.attestor.reread_tls_spki_sha256().await
     }
 }
 
@@ -726,6 +827,85 @@ mod tests {
             .expect("identity RPC ignored the HTTP request deadline")
             .unwrap()
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn the_app_tls_key_is_read_once_and_reread_at_most_every_five_minutes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let reads = AtomicU64::new(0);
+        let key = std::sync::Mutex::new(B256::repeat_byte(1));
+        let fail = std::sync::atomic::AtomicBool::new(false);
+        let read = || async {
+            reads.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(!fail.load(Ordering::SeqCst), "tapp down");
+            Ok(*key.lock().unwrap())
+        };
+        let mut cache = SpkiCache::default();
+        let t0 = std::time::Instant::now();
+
+        // Nothing cached: a failed read is an error and caches nothing.
+        fail.store(true, Ordering::SeqCst);
+        assert!(cache.get(false, t0, read).await.is_err());
+        fail.store(false, Ordering::SeqCst);
+        assert_eq!(
+            cache.get(false, t0, read).await.unwrap(),
+            B256::repeat_byte(1)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        // Plain calls never read again, however late.
+        let late = t0 + Duration::from_secs(86_400);
+        assert_eq!(
+            cache.get(false, late, read).await.unwrap(),
+            B256::repeat_byte(1)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        // A re-read waits five minutes after the last read.
+        *key.lock().unwrap() = B256::repeat_byte(2);
+        let soon = t0 + TLS_SPKI_REREAD_AFTER - Duration::from_secs(1);
+        assert_eq!(
+            cache.get(true, soon, read).await.unwrap(),
+            B256::repeat_byte(1)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        let due = t0 + TLS_SPKI_REREAD_AFTER;
+        assert_eq!(
+            cache.get(true, due, read).await.unwrap(),
+            B256::repeat_byte(2)
+        );
+        assert_eq!(
+            cache.get(false, due, read).await.unwrap(),
+            B256::repeat_byte(2)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+
+        // A failed re-read keeps the cached key and counts as a read.
+        fail.store(true, Ordering::SeqCst);
+        let next = due + TLS_SPKI_REREAD_AFTER;
+        assert_eq!(
+            cache.get(true, next, read).await.unwrap(),
+            B256::repeat_byte(2)
+        );
+        assert_eq!(
+            cache.get(true, next, read).await.unwrap(),
+            B256::repeat_byte(2)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn an_app_tls_key_read_that_hangs_times_out() {
+        let mut cache = SpkiCache {
+            read_timeout: Duration::from_millis(10),
+            ..SpkiCache::default()
+        };
+        let hang = || std::future::pending::<anyhow::Result<B256>>();
+        let error = cache
+            .get(false, std::time::Instant::now(), hang)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
     }
 
     #[tokio::test]

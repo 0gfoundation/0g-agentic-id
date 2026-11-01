@@ -142,6 +142,9 @@ pub struct StaticStatementSource {
     pub provider_calls: AtomicU64,
     body: Mutex<Result<Vec<u8>, String>>,
     pub own_tls_spki: Mutex<B256>,
+    /// What a re-read of the TLS key returns (the key changed), if set.
+    pub reread_tls_spki: Mutex<Option<B256>>,
+    pub rereads: AtomicU64,
     pub fetches: AtomicU64,
 }
 
@@ -153,6 +156,8 @@ impl StaticStatementSource {
             provider_calls: AtomicU64::new(0),
             body: Mutex::new(Ok(body)),
             own_tls_spki: Mutex::new(own_tls_spki),
+            reread_tls_spki: Mutex::new(None),
+            rereads: AtomicU64::new(0),
             fetches: AtomicU64::new(0),
         }
     }
@@ -184,6 +189,15 @@ impl crate::attestor_tls::StatementSource for StaticStatementSource {
 
     async fn own_tls_spki(&self) -> anyhow::Result<B256> {
         Ok(*self.own_tls_spki.lock().unwrap())
+    }
+
+    async fn reread_own_tls_spki(&self) -> anyhow::Result<B256> {
+        self.rereads.fetch_add(1, Ordering::SeqCst);
+        let mut own = self.own_tls_spki.lock().unwrap();
+        if let Some(changed) = *self.reread_tls_spki.lock().unwrap() {
+            *own = changed;
+        }
+        Ok(*own)
     }
 }
 

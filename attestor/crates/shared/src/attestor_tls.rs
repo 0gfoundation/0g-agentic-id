@@ -184,8 +184,15 @@ pub trait StatementSource: Send + Sync {
     async fn provider(&self) -> anyhow::Result<Address>;
     /// The raw statement body served by `provider`, at most `MAX_BODY_BYTES`.
     async fn fetch(&self, provider: Address) -> anyhow::Result<Vec<u8>>;
-    /// SHA-256 of this attestor's current app TLS SubjectPublicKeyInfo.
+    /// SHA-256 of this attestor's app TLS SubjectPublicKeyInfo. May be a
+    /// cached value.
     async fn own_tls_spki(&self) -> anyhow::Result<B256>;
+    /// The same, read again because a statement did not pin the value
+    /// [`StatementSource::own_tls_spki`] returned: the key may have changed.
+    /// May return the cached value when it was read recently.
+    async fn reread_own_tls_spki(&self) -> anyhow::Result<B256> {
+        self.own_tls_spki().await
+    }
 }
 
 #[derive(Clone)]
@@ -385,7 +392,10 @@ async fn fetch_checked(
     let body = source.fetch(provider).await?;
     let statement = Statement::parse(&body)?;
     statement.verify(provider, chain_id, registry_address, now)?;
-    let own = source.own_tls_spki().await?;
+    let mut own = source.own_tls_spki().await?;
+    if !statement.pins(&own) {
+        own = source.reread_own_tls_spki().await?;
+    }
     anyhow::ensure!(
         statement.pins(&own),
         "provider statement does not pin this attestor's TLS key"
@@ -778,5 +788,28 @@ mod tests {
             relay.statement(provider).await.unwrap().as_ref(),
             &newer[..]
         );
+    }
+
+    #[tokio::test]
+    async fn the_own_tls_key_is_read_again_only_when_a_statement_does_not_pin_it() {
+        let now = unix_now();
+        let (source, _) = make_relay(live(&[B256::repeat_byte(1)], now, now + 288));
+        let check = || check_source(source.as_ref(), 16602, Address::repeat_byte(9));
+        for _ in 0..3 {
+            assert!(check().await.is_ok());
+        }
+        assert_eq!(source.rereads.load(Ordering::SeqCst), 0);
+
+        // The key changed and the provider already pins the new one.
+        *source.reread_tls_spki.lock().unwrap() = Some(B256::repeat_byte(2));
+        source.set_body(Ok(live(&[B256::repeat_byte(2)], now, now + 288)));
+        assert!(check().await.is_ok());
+        assert!(check().await.is_ok());
+        assert_eq!(source.rereads.load(Ordering::SeqCst), 1);
+
+        // A statement that pins neither still fails after the re-read.
+        source.set_body(Ok(live(&[B256::repeat_byte(3)], now, now + 288)));
+        assert!(check().await.is_err());
+        assert_eq!(source.rereads.load(Ordering::SeqCst), 2);
     }
 }
