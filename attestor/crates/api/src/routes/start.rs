@@ -22,7 +22,7 @@ use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::sandbox::{
-    envelope_names_sandbox, CanonicalSignedMessage, NOT_CURRENT_SANDBOX,
+    check_owner_env, envelope_names_sandbox, CanonicalSignedMessage, NOT_CURRENT_SANDBOX,
 };
 use attestor_shared::{JobPayload, LifecycleRequest};
 use axum::extract::State;
@@ -56,6 +56,12 @@ pub async fn handle(
         return Err(ApiError::bad_request(format!(
             "envelope action must be 'start' or 'create', got {action:?}"
         )));
+    }
+    // A first provision creates a container: only the inference key may
+    // ride the owner's env, refused here rather than at the sandbox create.
+    if action == "create" {
+        check_owner_env(&canonical.payload)
+            .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
     }
 
     // Real owner authorization: the envelope must be signed by the current
@@ -277,6 +283,7 @@ mod tests {
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings: None,
             settings_last_good: None,
             settings_version: 0,
@@ -392,6 +399,29 @@ mod tests {
             .await
             .expect("create replaces the old sandbox");
         assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn a_first_provision_env_key_other_than_the_inference_key_is_400() {
+        let s = make_setup();
+        let env = attestor_shared::mocks::signed_envelope_with_payload(
+            &OWNER_PRIV,
+            "create",
+            "",
+            serde_json::json!({ "env": { "API_KEY": "sk", "SSL_CERT_FILE": "/proc/self/environ" } }),
+        );
+        let req = attestor_shared::LifecycleRequest {
+            seal_id: s.seal_id,
+            owner: env.wallet_address,
+            sandbox_envelope: env,
+            framework: None,
+        };
+        let err = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect_err("refused before any job");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("SSL_CERT_FILE"), "{}", err.message);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

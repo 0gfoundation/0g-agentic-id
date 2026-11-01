@@ -82,6 +82,13 @@ UPDATE deployments SET provision_deadline = NULL
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS last_provision_error    TEXT;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS last_provision_error_at TIMESTAMPTZ;
 
+-- The last status the current container reported on /status
+-- ({"level","reason","at"}). The phase folds a `warning` into running, so
+-- this is where a running agent that cannot do its work shows. Cleared with
+-- the container record and whenever a boot is authorized or accepted. NULL
+-- until the current boot reports.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_status JSONB;
+
 -- Partial index for the deadline sweep: only Submitted rows with a
 -- deadline are candidates, vastly fewer than the table size in the
 -- common case. The cast to text on the JSONB stage probe is what

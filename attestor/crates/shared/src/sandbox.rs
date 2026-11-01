@@ -286,6 +286,31 @@ where
 /// a consumer.
 const OWNER_ENV_KEYS: [&str; 2] = ["API_KEY", "SEAL_SECRET_ENV"];
 
+/// Why an owner-signed create `env` is refused: it names a variable other
+/// than [`OWNER_ENV_KEYS`] (shown by its first 64 characters).
+fn owner_env_refusal(env: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    env.keys()
+        .find(|key| !OWNER_ENV_KEYS.contains(&key.as_str()))
+        .map(|key| {
+            let key: String = key.chars().take(64).collect();
+            format!("canonical.payload.env may carry only API_KEY and SEAL_SECRET_ENV, not {key:?}")
+        })
+}
+
+/// Check an owner-signed create payload's `env` against [`OWNER_ENV_KEYS`].
+/// The routes that accept a create envelope (`/deploy`, `/reset`, `/start`,
+/// `/retry`) call this before queueing any work, so the owner gets a 400
+/// naming the key instead of a job that fails at the sandbox create;
+/// [`apply_attestor_env`] applies the same rule there. A payload with no
+/// `env` passes.
+pub fn check_owner_env(payload: &serde_json::Value) -> Result<(), String> {
+    match payload.get("env") {
+        None => Ok(()),
+        Some(serde_json::Value::Object(env)) => owner_env_refusal(env).map_or(Ok(()), Err),
+        Some(_) => Err("canonical.payload.env must be a JSON object".into()),
+    }
+}
+
 /// Overlay the attestor-controlled env (`ATTESTOR_URL` + `extra_env`) onto a
 /// create body's `env`, creating the object if the payload has none. An
 /// attestor value is written even when empty, which is how an unset attestor
@@ -311,14 +336,8 @@ fn apply_attestor_env(
     let env_obj = env_val.as_object_mut().ok_or_else(|| {
         anyhow::anyhow!("sandbox create: canonical.payload.env must be a JSON object")
     })?;
-    if let Some(key) = env_obj
-        .keys()
-        .find(|key| !OWNER_ENV_KEYS.contains(&key.as_str()))
-    {
-        let key: String = key.chars().take(64).collect();
-        anyhow::bail!(
-            "sandbox create: canonical.payload.env may carry only API_KEY and SEAL_SECRET_ENV, not {key:?}"
-        );
+    if let Some(why) = owner_env_refusal(env_obj) {
+        anyhow::bail!("sandbox create: {why}");
     }
     env_obj.insert(
         "ATTESTOR_URL".into(),
@@ -1427,6 +1446,42 @@ mod tests {
         ] {
             let mut obj = serde_json::json!({ "env": env });
             apply_attestor_env(obj.as_object_mut().unwrap(), "http://attestor", &[]).unwrap();
+        }
+    }
+
+    #[test]
+    fn check_owner_env_applies_the_create_rule_to_a_signed_payload() {
+        // What the routes run on the envelope before queueing work: the same
+        // allowlist apply_attestor_env enforces at the create.
+        for payload in [
+            serde_json::json!({ "snapshot": "img" }),
+            serde_json::json!({ "env": {} }),
+            serde_json::json!({ "env": { "API_KEY": "sk" } }),
+            serde_json::json!({ "env": { "SEAL_SECRET_ENV": "c2VhbGVk" } }),
+        ] {
+            check_owner_env(&payload).unwrap();
+        }
+        for key in [
+            "HTTPS_PROXY",
+            "SSL_CERT_FILE",
+            "BASH_ENV",
+            "DAYTONA_SANDBOX_ID",
+            "ATTESTOR_URL",
+        ] {
+            let err = check_owner_env(&serde_json::json!({ "env": { "API_KEY": "sk", key: "v" } }))
+                .unwrap_err();
+            assert!(
+                err.contains("may carry only API_KEY and SEAL_SECRET_ENV") && err.contains(key),
+                "{key}: {err}"
+            );
+        }
+        for env in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!("API_KEY=x"),
+        ] {
+            let err = check_owner_env(&serde_json::json!({ "env": env })).unwrap_err();
+            assert!(err.contains("must be a JSON object"), "{err}");
         }
     }
 

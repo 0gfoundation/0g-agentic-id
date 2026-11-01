@@ -73,7 +73,9 @@ A boot whose document fails `Validate` still starts where the adapter allows
 it, but sealed then reports `warning` (`owner settings unusable (…); write the
 agent's settings (provider and model)`) instead of `running` until a settings
 push applies, e.g. on a clone whose new owner has written no settings yet
-(`main.go`, `status.go` (`SettingsIssue`)).
+(`main.go`, `status.go` (`SettingsIssue`)). The attestor keeps that report on
+the deployment row as `container_status` (the row's `phase` stays
+`running`).
 
 **An unlisted model is not rejected by the model advisory.** The CLI checks
 the selected provider's configured catalog before signing; native providers

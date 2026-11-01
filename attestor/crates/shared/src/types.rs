@@ -384,6 +384,21 @@ pub struct ContainerRecord {
     pub provider: ProviderInstance,
 }
 
+/// A container's last `POST /status` report, as kept on its deployment row
+/// (`Deployment::container_status`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerStatus {
+    /// `starting`, `running`, `warning`, `error` or `stopping`.
+    pub level: ContainerReportStatus,
+    /// The container's reason, for a `warning`, `error` or `stopping`
+    /// report that gave one. It carries no secret values (sealed's status
+    /// messages never do).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// When the attestor accepted the report.
+    pub at: DateTime<Utc>,
+}
+
 // ── Deployment aggregate (persisted) ────────────────────────────────────
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deployment {
@@ -470,6 +485,15 @@ pub struct Deployment {
     pub last_provision_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_provision_error_at: Option<DateTime<Utc>>,
+
+    /// The last status the container reported on `POST /status`, for the
+    /// boot it describes. `phase` folds `warning` into `running` (the agent
+    /// is up), so this is where a running agent that cannot do its work
+    /// (for example, its settings give it no model) shows. Cleared when a
+    /// boot is authorized or accepted, so it never describes an earlier
+    /// container. None until the current boot reports (or pre-feature row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_status: Option<ContainerStatus>,
 
     /// The owner's configuration document — OPAQUE. attestor stores it as
     /// received, serves it to the container over `/provision`, and never
@@ -899,6 +923,7 @@ mod tests {
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings: None,
             settings_last_good: None,
             settings_version: 0,
@@ -1213,12 +1238,12 @@ pub enum ContainerReportStatus {
     Starting,
     Running,
     /// Owner-recoverable condition (e.g. agent wallet has insufficient
-    /// funds for the drift-publish transaction). Agent itself is
-    /// operational; this is a UI prompt for the owner to act, not a
-    /// system failure. Surfaces as a `WsEvent::ContainerWarning` for
-    /// the frontend to render (e.g. avatar bubble); not persisted in
-    /// `StageStatus` for now, sealed re-emits it on every heartbeat
-    /// while the condition holds.
+    /// funds for the drift-publish transaction, or settings that give the
+    /// agent no model). Agent itself is operational; this is a prompt for
+    /// the owner to act, not a system failure. Surfaces as a
+    /// `WsEvent::ContainerWarning` and as the row's `container_status`;
+    /// the container stage records it as running, and sealed re-emits it
+    /// on every heartbeat while the condition holds.
     Warning,
     Error,
     Stopping,

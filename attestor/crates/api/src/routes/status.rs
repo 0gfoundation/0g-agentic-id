@@ -4,14 +4,18 @@
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::{
-    auth::status::verify_status_signature, ContainerReportStatus, StageStatus, StatusReport,
-    WsEvent,
+    auth::status::verify_status_signature, ContainerReportStatus, ContainerStatus, StageStatus,
+    StatusReport, WsEvent,
 };
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use serde_json::json;
+
+/// The longest `container_status.reason` kept on the row (sealed's own
+/// status messages are far shorter).
+const STATUS_REASON_MAX_CHARS: usize = 1024;
 
 pub async fn handle(
     State(state): State<AppState>,
@@ -103,11 +107,29 @@ pub async fn handle(
             reason: reason.clone(),
         },
     };
+    // The row keeps what the container said, not only the stage: a warning
+    // runs (the stage is confirmed, the phase running), so its reason is
+    // visible nowhere else once the WebSocket event has passed.
+    let container_status = ContainerStatus {
+        level: report.status,
+        // Bounded: it is stored on the row and served with it.
+        reason: report
+            .error_detail
+            .as_deref()
+            .map(|r| r.chars().take(STATUS_REASON_MAX_CHARS).collect()),
+        at: now,
+    };
     // Token currency, stage/liveness and exact-version promotion are checked
     // in one repository transaction. Old instances cannot win a validation/write race.
     if !state
         .deployments
-        .apply_status_report(report.seal_id, token_hash, stage, applied_digest)
+        .apply_status_report(
+            report.seal_id,
+            token_hash,
+            stage,
+            applied_digest,
+            &container_status,
+        )
         .await?
     {
         return Ok((
@@ -279,6 +301,7 @@ mod tests {
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings,
             settings_last_good: last_good,
             settings_version: 1,
@@ -426,6 +449,57 @@ mod tests {
             "a warning container is up — stage must be Confirmed, got {:?}",
             d.container_stage
         );
+    }
+
+    #[tokio::test]
+    async fn the_row_keeps_the_last_reported_level_and_reason() {
+        // A warning runs (phase running), so the row is the one place a
+        // client can still read it after the WebSocket event.
+        let s = make_setup(None, None, 0, 0, StageStatus::Confirmed { at: Utc::now() });
+        let reason = "owner settings unusable (settings: model is required); write the agent's settings (provider and model)";
+        let report = signed_report(&s, ContainerReportStatus::Warning, Some(reason.into()));
+        handle(State(s.state.clone()), Json(report)).await.unwrap();
+        let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
+        assert_eq!(d.phase, attestor_shared::DeploymentPhase::Running);
+        let status = d.container_status.clone().expect("recorded");
+        assert_eq!(status.level, ContainerReportStatus::Warning);
+        assert_eq!(status.reason.as_deref(), Some(reason));
+        // Served on the row as {level, reason, at}.
+        let row = serde_json::to_value(&d).unwrap();
+        assert_eq!(row["container_status"]["level"], "warning");
+        assert_eq!(row["container_status"]["reason"], reason);
+        assert!(row["container_status"]["at"].is_string());
+
+        // A later running report replaces it, reason and all.
+        let report = signed_report(&s, ContainerReportStatus::Running, None);
+        handle(State(s.state.clone()), Json(report)).await.unwrap();
+        let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
+        let status = d.container_status.expect("recorded");
+        assert_eq!(status.level, ContainerReportStatus::Running);
+        assert_eq!(status.reason, None);
+
+        // A stale token records nothing.
+        let mut stale = signed_report(&s, ContainerReportStatus::Warning, Some("old".into()));
+        stale.status_binding = attestor_shared::auth::status::new_status_token();
+        resign(&s, &mut stale);
+        handle(State(s.state.clone()), Json(stale)).await.unwrap();
+        let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
+        assert_eq!(
+            d.container_status.unwrap().level,
+            ContainerReportStatus::Running
+        );
+
+        // The next authorized boot starts with no report.
+        s.repo
+            .prepare_status_boot(s.seal_id, None, Address::ZERO)
+            .await
+            .unwrap();
+        let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
+        assert!(d.container_status.is_none());
+        assert!(serde_json::to_value(&d)
+            .unwrap()
+            .get("container_status")
+            .is_none());
     }
 
     #[tokio::test]

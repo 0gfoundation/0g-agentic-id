@@ -469,7 +469,8 @@ pub trait DeploymentRepo: Send + Sync {
     /// so the new container must present a certificate, and the last
     /// `/provision` rejection, which was about the old one. None resumes the
     /// existing ticket and keeps the record; it returns None when no ticket
-    /// was ever issued.
+    /// was ever issued. Both clear the last status report, which described
+    /// an earlier boot.
     async fn prepare_status_boot(
         &self,
         seal_id: SealId,
@@ -484,7 +485,7 @@ pub trait DeploymentRepo: Send + Sync {
     /// generation, ticket, strictly newer `started_at`, persisted sandbox),
     /// install the status token hash and the served settings, write
     /// `record` unless an identical one is already recorded, and clear the
-    /// last `/provision` rejection. A different
+    /// last `/provision` rejection and status report. A different
     /// recorded container, or any failed compare, returns false and writes
     /// nothing.
     async fn bind_status_boot(
@@ -499,12 +500,15 @@ pub trait DeploymentRepo: Send + Sync {
     /// token and a sandbox is still tracked. `applied_digest` (a running or
     /// warning report's applied settings) confirms the current settings
     /// version only when it equals the digest that boot was served.
+    /// `status` (the report's level and reason) is kept as the row's
+    /// `container_status` in the same write.
     async fn apply_status_report(
         &self,
         seal_id: SealId,
         token_hash: [u8; 32],
         stage: StageStatus,
         applied_digest: Option<B256>,
+        status: &ContainerStatus,
     ) -> anyhow::Result<bool>;
 
     /// Write a document ONLY onto a row that has never had one — the
