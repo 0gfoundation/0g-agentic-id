@@ -435,17 +435,28 @@ impl HttpSandbox {
         connection: &crate::identity::SandboxConnection,
     ) -> anyhow::Result<()> {
         if self.discovery.is_some() {
-            anyhow::ensure!(
-                canonical
-                    .provider
-                    .as_deref()
-                    .and_then(|s| s.parse::<Address>().ok())
-                    == Some(connection.provider),
-                "owner envelope targets another provider; refresh config and sign again"
-            );
+            check_envelope_provider(canonical, connection.provider)?;
         }
         Ok(())
     }
+}
+
+/// With sandbox discovery, an owner envelope must name the discovered
+/// provider (`canonical.provider`, GET /config `sandbox_provider_addr`);
+/// every client that signs one (SDK, console, scripts) adds it.
+fn check_envelope_provider(
+    canonical: &CanonicalSignedMessage,
+    provider: Address,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        canonical
+            .provider
+            .as_deref()
+            .and_then(|s| s.parse::<Address>().ok())
+            == Some(provider),
+        "owner envelope targets another provider; refresh config and sign again"
+    );
+    Ok(())
 }
 
 /// The container key the provider certified for `seal_id` in a create
@@ -873,6 +884,33 @@ impl HttpSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_envelopes_must_name_the_discovered_provider() {
+        let provider = Address::repeat_byte(0x11);
+        let parse = |json: &str| serde_json::from_str::<CanonicalSignedMessage>(json).unwrap();
+        // The byte layout the console's signSandboxEnvelope and the SDK's
+        // signEnvelope produce: `provider` between payload and resource_id,
+        // as /config prints it (lower case).
+        let bound = parse(
+            r#"{"action":"create","expires_at":1700000180,"nonce":"0011","payload":{"snapshot":"0g-sealed","sealed":true,"env":{}},"provider":"0x1111111111111111111111111111111111111111","resource_id":""}"#,
+        );
+        check_envelope_provider(&bound, provider).unwrap();
+        // The legacy layout, without the binding, is refused.
+        let unbound = parse(
+            r#"{"action":"create","expires_at":1700000180,"nonce":"0011","payload":{},"resource_id":""}"#,
+        );
+        let error = check_envelope_provider(&unbound, provider).unwrap_err();
+        assert!(
+            error.to_string().contains("targets another provider"),
+            "{error:#}"
+        );
+        // Another provider is refused too.
+        let other = parse(
+            r#"{"action":"start","expires_at":1700000180,"nonce":"0011","payload":{},"provider":"0x2222222222222222222222222222222222222222","resource_id":"sb-1"}"#,
+        );
+        assert!(check_envelope_provider(&other, provider).is_err());
+    }
 
     #[test]
     fn create_response_yields_the_certified_container_key_for_this_seal() {

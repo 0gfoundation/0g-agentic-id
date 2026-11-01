@@ -2332,12 +2332,22 @@ async function keyEnvFor(sealId, apiKey) {
   return { SEAL_SECRET_ENV: bytesToB64(ct) };
 }
 
+// The provider binding (0g-sandbox#93): GET /config's sandbox_provider_addr,
+// inserted between payload and resource_id in the same byte layout as the
+// SDK's signEnvelope. An attestor with sandbox discovery refuses an envelope
+// that does not name its current provider, so a missing /config refuses here,
+// before the wallet prompt, rather than in the worker after the request.
+// No address (an attestor without discovery) keeps the legacy layout.
 async function signSandboxEnvelope(action, resourceId, payload = {}) {
+  if (!State.config) throw new Error('GET /config did not load; reload the page and try again');
+  const addr = State.config.sandbox_provider_addr;
+  const provider = addr && addr !== '0x0000000000000000000000000000000000000000' ? addr : '';
   const canonical = JSON.stringify({
     action,
     expires_at: Math.floor(Date.now() / 1000) + 180,
     nonce: randomNonce(),
     payload,
+    ...(provider ? { provider } : {}),
     resource_id: resourceId,
   });
   const sig = await State.signer.signMessage(canonical);
