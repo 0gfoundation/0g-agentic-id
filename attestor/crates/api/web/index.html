@@ -3043,6 +3043,9 @@ window.submitDeploy = async function () {
     // missing package_version to its validated whitelistMax) and the
     // persona protocol seed every adapter translates into its own config.
     const framework = $('#framework').value || 'openclaw';
+    // The selected framework's sealed image (sealedSnapshotFor), resolved
+    // before any wallet prompt so a refusal costs no signature.
+    const snapshot = sealedSnapshotFor(framework);
     // system_prompt: the owner's custom prompt if they wrote one, else the
     // neutral default. Stays persona-level (framework-agnostic) — the
     // adapter translates persona into its own config at first boot, so the
@@ -3084,11 +3087,9 @@ window.submitDeploy = async function () {
     // exists, so the key cannot be sealed here and the wallet prompt shows
     // it (issue #166). Restore/Reset seal it (keyEnvFor).
     const env = apiKey ? { API_KEY: apiKey } : {};
-    // Snapshot identifier comes from attestor /config — operators bump
-    // ATTESTOR_SANDBOX_SNAPSHOT to point new deploys at a newer image
-    // without a frontend redeploy. Fall back to the legacy default if
-    // the field is missing (older attestor binary).
-    const snapshot = (State.config && State.config.sandbox_snapshot) || '0g-test-sealed';
+    // `snapshot` (above) comes from attestor /config — operators bump
+    // ATTESTOR_SANDBOX_SNAPSHOT / ATTESTOR_FRAMEWORKS to point new deploys
+    // at a newer image without a frontend redeploy.
     const { canonical: sandboxCanonical, envelope: sandboxEnvelope } =
       await signSandboxEnvelope('create', '', { snapshot, sealed: true, env });
 
@@ -3606,9 +3607,9 @@ function renderTaskProgress(dep) {
 // chip so the user knows what to do without clicking through.
 //
 // Critical: gate on `phase === 'failed'`. `last_provision_error` is a
-// sticky DB column (only set, never cleared) — without this gate it
-// would haunt every recovered deployment with a stale "Deployment
-// failed" banner long after the container has come back online.
+// sticky DB column (cleared only by the next accepted boot or a new
+// container) — without this gate it would haunt a recovered deployment
+// with a stale "Deployment failed" banner until then.
 function failureReason(dep) {
   if (!dep) return '';
   const stageReason = (s) =>
@@ -3663,6 +3664,17 @@ const PERMANENT_PROVISION_MARKERS = [
 function permanentFailureHint(dep) {
   const r = (dep && dep.last_provision_error) || '';
   if (!r) return '';
+  // Only for the rejection that took the current container down. It fails
+  // the container stage in the same write, so a stage that is not failed,
+  // or failed later (a provision timeout, a deleted sandbox), is about
+  // something else and must not inherit the old rejection's advice. The
+  // attestor also clears the column on the next accepted boot or new
+  // container; this guards rows that predate that.
+  const stage = dep.container_stage;
+  if (!stage || stage.state !== 'failed') return '';
+  const errorAt = Date.parse(dep.last_provision_error_at || '');
+  const stageAt = Date.parse(stage.at || '');
+  if (!(errorAt >= stageAt - 1000)) return '';
   for (const [marker, hint] of PERMANENT_PROVISION_MARKERS) {
     if (r.includes(marker)) return hint;
   }
@@ -4487,6 +4499,45 @@ function tracing(msg) { console.debug('[attestor]', msg); }
 
 window.actionStop = (sealId, sandboxId) => lifecycleAction('stop', sealId, sandboxId);
 
+// The sealed image a create must name for `framework`, by the same rule as
+// the SDK's resolveSealedImage: the image GET /config declares for that
+// framework, else the default snapshot. Frameworks whose runtime is not in
+// the default (openclaw) snapshot carry their own image, and the attestor
+// relays the signed snapshot as is, so signing the default for them boots a
+// container their framework cannot start in. A framework this attestor does
+// not offer is refused here rather than booted on another framework's image.
+// No framework (a legacy row) or no frameworks list (an older attestor) means
+// the default.
+function sealedSnapshotFor(framework) {
+  const cfg = State.config || {};
+  const fallback = cfg.sandbox_snapshot || '0g-test-sealed';
+  const list = Array.isArray(cfg.frameworks) ? cfg.frameworks : [];
+  if (!framework || !list.length) return fallback;
+  const entry = list.find((f) => f && f.name === framework);
+  if (!entry) {
+    const offered = list.map((f) => f && f.name).filter(Boolean).join(', ') || 'none';
+    throw new Error(`framework "${framework}" is not offered by this attestor `
+      + `(GET /config frameworks: ${offered}); ask the operator to configure it`);
+  }
+  return entry.image || fallback;
+}
+
+// The sealed image for an existing agent: read its deployment row's
+// framework. An unreadable row refuses rather than falling back to the
+// default image, which would boot a non-openclaw agent on the wrong one.
+async function sealedSnapshotForAgent(sealId) {
+  let row;
+  try {
+    const r = await fetch(`/deployment/${sealId}`, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    row = await r.json();
+  } catch (e) {
+    throw new Error(`cannot read /deployment/${sealId} to pick the sealed image `
+      + `(${e.message || e}); try again`);
+  }
+  return sealedSnapshotFor(row && row.framework);
+}
+
 // Bring back online — picks `start` vs `create` from the deployment's
 // CURRENT bucket, not from the historically-set provisioned_at flag.
 //
@@ -4557,6 +4608,8 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
       // so the user knows they're entering the rebuild path, not
       // the cheap resume path. (Reset and this share the same
       // backend dispatch — sandbox.create — so the UX gate matches.)
+      // Resolved before the prompt, so a refusal costs no key entry.
+      const snapshot = await sealedSnapshotForAgent(sealId);
       const result = await openRestorePrompt({
         title: 'Restore this agent?',
         body: 'A fresh sandbox will be spawned (image re-pulled). ' +
@@ -4567,9 +4620,10 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
       });
       if (!result) return;
       const env = await keyEnvFor(sealId, result.apiKey);
-      // Snapshot name comes from /config so a bump of ATTESTOR_SANDBOX_SNAPSHOT
-      // takes effect on Restore/Reset, not just fresh deploys.
-      const snapshot = (State.config && State.config.sandbox_snapshot) || '0g-test-sealed';
+      // The snapshot is the agent's framework image from /config
+      // (sealedSnapshotFor), so a bump of ATTESTOR_SANDBOX_SNAPSHOT or
+      // ATTESTOR_FRAMEWORKS takes effect on Restore/Reset, not just fresh
+      // deploys.
       payload = { snapshot, sealed: true, env };
     }
     const { envelope } = await signSandboxEnvelope(action, resourceId, payload);
@@ -4615,6 +4669,15 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
 // sandbox respawn.
 window.resetAgent = async function (sealId, sandboxId) {
   if (!State.signer) { toast('Connect wallet first', 'error'); return; }
+  // The agent's framework image, resolved before the prompt so a refusal
+  // costs no key entry.
+  let snapshot;
+  try {
+    snapshot = await sealedSnapshotForAgent(sealId);
+  } catch (e) {
+    toast('Reset failed: ' + (e.message || e), 'error');
+    return;
+  }
   const result = await openRestorePrompt({
     title: 'Reset this agent?',
     body: 'A fresh container will be spawned (image re-pulled). The ' +
@@ -4636,11 +4699,11 @@ window.resetAgent = async function (sealId, sandboxId) {
     // Same envelope shape as the bringOnline create branch — fresh
     // sandbox needs a fresh env, and attestor doesn't (and shouldn't)
     // cache the LLM key. apiKey came from the modal above, sealed to the
-    // agent when the attestor supports it (keyEnvFor, issue #166). Snapshot
-    // pulled from /config so an operator bump of ATTESTOR_SANDBOX_SNAPSHOT
+    // agent when the attestor supports it (keyEnvFor, issue #166). The
+    // snapshot (resolved above) is the agent's framework image from /config,
+    // so an operator bump of ATTESTOR_SANDBOX_SNAPSHOT or ATTESTOR_FRAMEWORKS
     // also drives Reset (not just fresh deploys).
     const env = await keyEnvFor(sealId, result.apiKey);
-    const snapshot = (State.config && State.config.sandbox_snapshot) || '0g-test-sealed';
     const payload = { snapshot, sealed: true, env };
     const { envelope } = await signSandboxEnvelope('create', '', payload);
 

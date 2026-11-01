@@ -225,4 +225,6 @@ sandbox and live owner all checked) is logged as `provision rejected`. While tha
 generation is still the enabled one, it is recorded as `last_provision_error` and the
 container stage becomes `failed` with it as the reason, published as
 `container_failed`, so the owner sees the cause at once instead of a provision timeout
-five minutes later. Other rejections write nothing.
+five minutes later. Other rejections write nothing. The next accepted boot, or the
+boot ticket of a new container, clears `last_provision_error`, so a fixed agent does
+not keep showing an old rejection.

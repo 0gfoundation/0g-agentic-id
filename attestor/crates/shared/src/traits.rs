@@ -466,7 +466,8 @@ pub trait DeploymentRepo: Send + Sync {
 
     /// Start an owner-authorized generation. Some(ticket) creates a new
     /// sandbox: it stamps `ticket_issued_at` and clears the container record,
-    /// so the new container must present a certificate. None resumes the
+    /// so the new container must present a certificate, and the last
+    /// `/provision` rejection, which was about the old one. None resumes the
     /// existing ticket and keeps the record; it returns None when no ticket
     /// was ever issued.
     async fn prepare_status_boot(
@@ -481,8 +482,9 @@ pub trait DeploymentRepo: Send + Sync {
     ) -> anyhow::Result<Option<crate::auth::status::BootAuthorization>>;
     /// In one transaction: compare-and-set the boot claim (enabled,
     /// generation, ticket, strictly newer `started_at`, persisted sandbox),
-    /// install the status token hash and the served settings, and write
-    /// `record` unless an identical one is already recorded. A different
+    /// install the status token hash and the served settings, write
+    /// `record` unless an identical one is already recorded, and clear the
+    /// last `/provision` rejection. A different
     /// recorded container, or any failed compare, returns false and writes
     /// nothing.
     async fn bind_status_boot(
