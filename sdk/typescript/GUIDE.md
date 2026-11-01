@@ -226,8 +226,16 @@ await ag.agent.reset(sealId, { apiKey });   // recreate an EXISTING container: r
                                             // from chain, reselect the framework adapter.
                                             // apiKey required in practice (attestor doesn't
                                             // cache the model key); sealedImage optional.
+// A booting agent with no settings document uses the model pinned in its minted
+// persona, which leaves the chain at its first commit. So start and reset of an
+// agent that has no document and is a clone or has provisioned before first
+// store DEFAULT_PERSONA_INFERENCE (0g-compute) as its settings: one more owner
+// signature, after every check that can refuse the call; an existing document is
+// never replaced. To start such an agent on another provider, write its settings
+// (setSettings) first. The CLI's reset applies the same rule (needsDefaultSettings).
 await ag.agent.listDeployments();
-// → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }, …]
+// → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError,
+//      containerStatus }, …]
 //   phase: 'deploying' | 'running' | 'stopped' (owner-stopped, start() to resume)
 //        | 'offline' (no running container — never provisioned (mint-only) / failure / timeout /
 //          transfer-teardown; on-chain identity persists, use start({apiKey}) or reset) | 'failed'
@@ -249,7 +257,7 @@ await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3
 });                                   // → { version: 12 }
 ```
 
-**Whole-document write.** `setSettings` replaces the document — read it first and spread it to change one field.
+**Whole-document write.** `setSettings` replaces the document — read it first and spread it to change one field. A `thinking` outside `low|high|max` (case-insensitive, as the container compares it) is refused before signing.
 
 **Who may read or write it.** Owner-signed, both directions, against the **live on-chain owner** read at request time — so a seller cannot keep configuring (or reading) an agent they already sold. The SDK signs `AgenticID.Settings.v1:<sealId>:<ts>:<base_version>:<sha256 of the document>` (EIP-191) for a write, and the same message minus the digest for a read (`GET /settings`, no body, base version 0). A rejected call is a clearly-worded HTTP 401. The document is on **no** listing tier and on no public deployment row: `getSettings` is the only way to read it.
 
@@ -490,10 +498,13 @@ whose runtime isn't in the default image ship their own — openclaw runs on the
 default `sandbox_snapshot`, hermes on a Python/uv image. **You don't pass it at
 deploy** (nor at `reset`/`retry`): at deploy the SDK resolves the right image
 for your `framework` from `GET /config`'s `frameworks[]` (each entry
-`{ name, image? }`; no image → the default snapshot). For an EXISTING agent,
+`{ name, image? }`; no image → the default snapshot). With your own `iData`,
+the framework is the one its `role: 'framework'` binding names, and a
+`framework` that names another one is refused. For an EXISTING agent,
 `reset`/`start`/`retry` need neither — the SDK reads the framework off the
-agent's own deployment row and resolves the same way (an unreadable row
-refuses rather than guessing the default). Pass `framework` only to override
+agent's own deployment row and resolves the same way (an unreadable row, or
+a framework `/config.frameworks[]` does not list, refuses rather than
+guessing the default). Pass `framework` only to override
 the row, and `sandbox.sealedImage` (or `sealedImage` on reset/retry) only to
 pin a specific image. Which frameworks are live is whatever
 `/config.frameworks[]` advertises.
@@ -540,7 +551,8 @@ minting is the owner's freedom; whether the content actually boots is the
 **sealed runtime's contract**. Each framework runs on the sealed image
 `/config.frameworks[]` declares for it (openclaw = the default snapshot,
 hermes = its own Python/uv image); at **deploy** the SDK resolves that image
-from `framework`, so you don't pass one. **reset**/**start**/**retry** on an
+from `framework` (or from your own iData's framework binding), so you don't
+pass one. **reset**/**start**/**retry** on an
 existing agent resolve it from the agent's own deployment row, so a bare call
 is enough (`framework` overrides the row; `sealedImage` pins a specific
 image). Pick with `framework`;
@@ -640,8 +652,8 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolu
 `authenticate`/`connect`) resolve it on chain (`tokenURI` → the AgentCard's
 serve `url`). Reach for `listDeployments()` when you want the URL or `phase`
 explicitly. It's the **public** listing (needs `attestorUrl`, no wallet), so it
-returns only non-sensitive fields; `sandboxId` and `lastProvisionError` come
-back **null** (`owner` and `agentSeal` are present on minted rows — both
+returns only non-sensitive fields; `sandboxId`, `lastProvisionError` and
+`containerStatus` come back **null** (`owner` and `agentSeal` are present on minted rows — both
 chain-public — which is what makes nesting visible: a child's `owner` matches
 its parent's `agentSeal`). To see the withheld fields for your OWN agents (and
 the `sandboxId` you
@@ -650,7 +662,8 @@ pass to `stop`/`start`), use `listMyDeployments()`, which signs with your wallet
 ```ts
 const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
 // me → { agentId, sealId, phase, url, name, createdAt } populated;
-//      owner, sandboxId, lastProvisionError come back NULL on this public listing.
+//      owner, sandboxId, lastProvisionError, containerStatus come back NULL on this
+//      public listing.
 // For those (and to debug a stuck deploy), list your own with the wallet:
 const mine = await ag.agent.listMyDeployments();   // owner-signed; full detail
 const agentUrl = me?.url;               // null until the container is provisioned
@@ -659,6 +672,12 @@ const agentUrl = me?.url;               // null until the container is provision
 // validFrameworkHashes") or mint/storage-pipeline failures (e.g. "mint
 // submit: … replacement transaction underpriced" — folded in from the
 // failed stage's reason).
+// A 'running' agent that does not answer: read mine's containerStatus
+// ({ level, reason, at }, the container's last report). phase shows a
+// 'warning' as 'running'; e.g. level 'warning' with reason "owner settings
+// unusable (settings: model is required)…" means the agent has no model:
+// write its settings (setSettings), then pushSettingsToContainer applies them
+// to the running container (a later boot applies them anyway).
 
 // A 'failed' row is recoverable — retry() FIRST, don't redeploy (that
 // orphans the already-minted identity). It re-runs the failed idempotent
@@ -739,7 +758,7 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   // `ag.agent.clearConversation(base, agentId)` (CLI `/clear`) wipes it
   // without a reset; chain-tracked memory is untouched.
   // `ag.agent.compactConversation(base, agentId)` (CLI `/compact`) keeps it
-  // but has the framework summarize the older part now (dsh, openclaw from
+  // but has the framework summarize the older part now (0g-harness, openclaw from
   // 2026.7.1; other frameworks answer 501). One or more model calls — it can
   // take minutes, longer than Node's fetch waits for an answer (300s); the
   // compaction finishes anyway, and the runtime log has the outcome. HTTP 409
@@ -819,6 +838,36 @@ reads only the **last user message** of the `messages` array you send. So
 does not rewind or branch the conversation the way it does against openclaw or
 hermes (which are real OpenAI-compatible servers). Turns are also serialized
 per agent, since one SDK session is one conversation.
+
+**0g-harness** is stateful in the same way, and its agents also work on their own.
+With the owner's `toolJobs`, `subagents` or `schedule` switches on (the
+settings document's `others`), a 0g-harness agent runs commands and read-only
+subagents in the background and sets itself reminders. When one finishes or
+comes due while the agent is idle, the agent opens a turn that no message
+asked for, and its words go to the agent's inbox. The handle exposes that
+surface. Each method is present only when `/hello` declares its kind
+(`inbox`, `events`, `tasks`, `schedules`; the other frameworks declare none)
+and the handle holds the owner key:
+
+```ts
+const box = await agent.inbox!();      // { data, unread, read_through, cursor }: unread messages, oldest first
+await agent.ackInbox!(lastSeq);        // the read position is the agent's: every client sees the same unread count
+
+// The live feed: resumes from the last event after a cut or a stall, and
+// runs until the signal aborts.
+for await (const e of agent.events!({ after: box.cursor, signal })) {
+  if (e.type === 'inbox.message') { /* e.data: an AgentInboxMessage */ }
+  if (e.type === 'reset') { /* the agent could not serve the position: re-read the inbox */ }
+}
+
+const tasks = await agent.tasks!({ status: 'active' });
+// every turn (yours and the agent's), command (bash-N) and subagent (subagent-N):
+// actor = who does the work (agent | subagent), trigger = who asked
+await agent.taskInfo!('subagent-1');   // includes a finished subagent's answer
+await agent.stopTask!('bash-2');       // a turn is cancelled, a command or subagent is killed
+await agent.stopAllTasks!();           // everything running
+await agent.schedules!();              // { enabled, data }: the reminders the agent set for itself
+```
 
 ## Agents as owners (nested agents)
 
@@ -951,7 +1000,7 @@ For the old CLI update path and automatic local-config migration, see
 
 Two levels. The **manager** (`0g-agentdna>`): `list` (public listing with sealIds and the same FRAMEWORK/AGENTSEAL/OWNER columns as `0g-agentdna list`, `⇄ #<agentId>` on agent-owned agents, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `settings <id> [key=value …]` (show or change the agent's configuration document), `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login [provider]` (guided setup: attestor URL → owner key → provider → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
 
-The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/compact` (keep the conversation but have the framework summarize its older part now — dsh, and openclaw 2026.7.1 or later; one or more model calls, can take minutes) `/tasks` `/result [id]` `/cancel [id]` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
+The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/compact` (keep the conversation but have the framework summarize its older part now — 0g-harness, and openclaw 2026.7.1 or later; one or more model calls, can take minutes) `/tasks` `/result [id]` `/cancel [id|all]` `/inbox [all]` `/schedules` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed. On a 0g-harness agent, what the agent says on its own (a background job finished, a reminder came due) prints above the prompt as it arrives, and what came while you were away prints when you enter; `/tasks` lists every turn, background command and subagent with who did it, `/cancel <id>` stops any of them and `/cancel all` everything running. On the other frameworks `/inbox` and `/schedules` say the agent has none.
 
 Configuration persists under `~/.config/0g-agentdna/` — `config.json` (attestor URL), `credentials` (owner key + provider-scoped inference keys, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. `rate` checks a ticket on what the registry checks — expiry and the signature — and discards one that fails on its own merits (bad signature — e.g. one banked from a pre-1.2.0 sealed image — or expiry), but keeps one that fails only because no VerifiedFeedbackRegistry, or a different one, is configured on this side. A ticket whose data hashes the agent has since replaced (it commits state drift every 30 s) still redeems — the registry records the version that served you without comparing it to current chain state — so `rate` only notes it and goes ahead. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 

@@ -1,3 +1,11 @@
+# data: encrypted — attestor state (the Postgres named volume: deployments,
+# the job queue with its pending payloads, the provider registry) is on the
+# app's FDE volume, keyed by the KMS; named volumes are redirected into it
+# (tapp-server 0.10.0 or later). Postgres is reachable only on the compose
+# network; host-run binaries use the docker-compose.dev.yml overlay.
+x-tapp:
+  data: encrypted
+
 x-attestor: &attestor
   build:
     # Context is repo root so the build can reach both `attestor/` and
@@ -24,8 +32,6 @@ services:
       POSTGRES_USER: attestor
       POSTGRES_PASSWORD: attestor
       POSTGRES_DB: attestor
-    ports:
-      - "5432:5432"
     volumes:
       - attestor-pgdata:/var/lib/postgresql/data
     healthcheck:

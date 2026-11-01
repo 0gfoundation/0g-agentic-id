@@ -98,6 +98,30 @@ function acceptedOf(res: DeployCloneResponse): DeployAccepted {
 
 /** Agent lifecycle (deploy / clone / transfer) + reads. Seal-bound today; the
  *  seal branch is reserved for non-seal agents. */
+/**
+ * What an agent's current container last reported to the attestor
+ * (`POST /status`), as carried on its deployment row. `level` is `starting`,
+ * `running`, `warning`, `error` or `stopping`; `reason` is the container's
+ * explanation for a `warning` / `error` / `stopping` report, null when it gave
+ * none; `at` is when the attestor accepted the report (ISO 8601).
+ */
+export interface ContainerStatus {
+  level: string;
+  reason: string | null;
+  at: string;
+}
+
+/** Read a row's `container_status`; null when absent or malformed. */
+function containerStatusOf(raw: unknown): ContainerStatus | null {
+  const s = raw as { level?: unknown; reason?: unknown; at?: unknown } | null | undefined;
+  if (!s || typeof s !== 'object' || typeof s.level !== 'string') return null;
+  return {
+    level: s.level,
+    reason: typeof s.reason === 'string' ? s.reason : null,
+    at: typeof s.at === 'string' ? s.at : '',
+  };
+}
+
 export class AgentApi {
   private readonly id: AgenticIDClient;
   private readonly attestor: AttestorClient;
@@ -620,8 +644,8 @@ export class AgentApi {
    * Compact the agent's ONE persisted conversation in place: the framework's
    * own compaction replaces the older history with a summary and keeps the
    * newest part verbatim (how much is the framework's: openclaw ~20K tokens,
-   * dsh only its newest item), so later requests carry less of it while the
-   * conversation goes on — the middle ground between doing nothing and
+   * 0g-harness only its newest item), so later requests carry less of it
+   * while the conversation goes on — the middle ground between doing nothing and
    * {@link clearConversation}. No restart. The summary takes one or more
    * model calls, so this can take minutes — longer than Node's fetch waits
    * for an answer (300s). A connection dropped or timed out meanwhile does not
@@ -802,14 +826,23 @@ export class AgentApi {
    * row is currently failed (any pipeline stage) or offline due to a
    * genuine container failure; recovered rows report null.
    *
+   * `containerStatus` is what the agent's current container last reported
+   * (`{ level, reason, at }`, owner listing only; null until that container
+   * reports, and from attestors that predate the field). `phase` shows a
+   * `warning` as `running`: the agent is up but needs the owner, for example
+   * because its settings give it no model (`reason` says so; write them with
+   * {@link AgentApi.setSettings}, then {@link AgentApi.pushSettingsToContainer}
+   * applies them to the running container). Check it when a running agent
+   * does not answer.
+   *
    * When `phase` is `"failed"`, try {@link AgentApi.retry} FIRST — it resumes
    * the failed stages on the same identity. Redeploying instead orphans the
    * already-minted agent; reset only helps once the container stage is
    * reached.
    *
    * This is the PUBLIC listing: the attestor returns only non-sensitive fields
-   * for an unauthenticated GET (issue #64), so `sandboxId` and
-   * `lastProvisionError` come back **null** here. No tier carries the owner's
+   * for an unauthenticated GET (issue #64), so `sandboxId`,
+   * `lastProvisionError` and `containerStatus` come back **null** here. No tier carries the owner's
    * settings document — read it with {@link AgentApi.getSettings}, which is
    * owner-signed. `agentId`/`sealId`/`phase`/`url`/`name` are still
    * present, and `owner` and `agentSeal` appear for MINTED rows (both
@@ -826,6 +859,7 @@ export class AgentApi {
     sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
     agentSeal: Address | null;
     createdAt: string | null; lastProvisionError: string | null;
+    containerStatus: ContainerStatus | null;
   }>> {
     // slim=1 drops the embedded avatar data-URIs (~95% of the payload); servers
     // predating the param ignore it.
@@ -836,7 +870,7 @@ export class AgentApi {
   /**
    * Owner-scoped, authenticated listing — your own agents WITH the fields the
    * public {@link AgentApi.listDeployments} withholds (`sandboxId`,
-   * `lastProvisionError`, stages). Signs `0GDeployments:<owner>:<ts>` with
+   * `lastProvisionError`, `containerStatus`, stages). Signs `0GDeployments:<owner>:<ts>` with
    * `ctx.account` and sends it as `X-Auth-Message`/`X-Auth-Signature`; the
    * attestor verifies the signer controls `<owner>` before returning its rows.
    * Requires a wallet. This is how you get a container's `sandboxId` for
@@ -860,13 +894,14 @@ export class AgentApi {
    *  {@link AgentApi.listMyDeployments}; whatever the tier omits simply
    *  comes through as null — public tier: owner/agentSeal only on minted
    *  rows (agentSeal only from attestors carrying the field),
-   *  sandboxId/lastProvisionError never; owner tier: everything present
+   *  sandboxId/lastProvisionError/containerStatus never; owner tier: everything present
    *  for your own rows, including unminted ones. */
   private normalizeDeploymentRow(r: Record<string, unknown>): {
     agentId: bigint | null; sealId: Hash; phase: string; framework: string | null;
     sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
     agentSeal: Address | null;
     createdAt: string | null; lastProvisionError: string | null;
+    containerStatus: ContainerStatus | null;
   } {
     const card = (r.agent_card as Record<string, unknown>) ?? {};
     // The card's url points at the /hello card endpoint; the base (origin)
@@ -875,8 +910,9 @@ export class AgentApi {
     try { url = card.url ? new URL(card.url as string).origin : null; } catch { /* malformed → null */ }
     // Failure reasons live on the per-track stage objects
     // (storage/mint/container_stage.reason); last_provision_error is a
-    // sticky DB column (only set, never cleared) so it is only consulted
-    // for phase=failed, as a backstop — same gating and priority as the
+    // sticky DB column (cleared only by the next accepted /provision or a
+    // new container's boot ticket) so it is only consulted for
+    // phase=failed, as a backstop — same gating and priority as the
     // attestor console's failureReason(). phase=offline surfaces only a
     // genuine container failure (a clean owner stop carries no reason);
     // recovered rows report null rather than a stale sticky error. (These
@@ -908,6 +944,7 @@ export class AgentApi {
       name: (card.name as string) ?? null,
       createdAt: (r.created_at as string) ?? null,
       lastProvisionError: failureReason,
+      containerStatus: containerStatusOf(r.container_status),
       // No `settings`: the owner's configuration document is owner-gated on
       // READ as well as write and is served only by {@link getSettings}. No
       // listing tier carries it, so advertising it here would have meant a
@@ -933,6 +970,13 @@ export class AgentApi {
    *    supplies the key, pass its {@link sealApiKey} output as
    *    `sealedSecretEnv` instead of `apiKey`, so the key never reaches the
    *    signer at all.
+   *
+   * Both shapes, like {@link reset}, first store the default model
+   * (`DEFAULT_PERSONA_INFERENCE`) as the agent's settings document when it
+   * has none and could boot without a model: a clone, or an agent that has
+   * provisioned before (`needsDefaultSettings`). That write is one more
+   * owner signature, made after every check that can refuse the call; an
+   * existing document is never replaced.
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
   start(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void>;
@@ -954,6 +998,16 @@ export class AgentApi {
    * signed envelope in clear (`secretEnv`, default `'auto'`; `'sealed'`
    * refuses the clear path). The attestor keeps no reusable copy, which
    * is WHY it must be passed again on every recreate.
+   *
+   * An agent with no settings document boots on the model pinned in its
+   * minted persona, which leaves the chain at its first commit. So when the
+   * agent has none and is a clone or has provisioned before
+   * (`needsDefaultSettings`), the default model (`DEFAULT_PERSONA_INFERENCE`,
+   * 0g-compute) is stored as its first document before the envelope is
+   * signed (one more owner signature, after every check that can refuse the
+   * call); an existing document is never replaced. Such an agent cannot be
+   * reset onto another `provider` until its settings name one: write them
+   * with {@link setSettings} first.
    */
   reset(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
     return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });

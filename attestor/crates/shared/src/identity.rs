@@ -2,7 +2,7 @@
 //! business authorization and URLs remain on their own contracts.
 use crate::{tapp_grpc, Config};
 use alloy::{
-    primitives::{keccak256, Address, U256},
+    primitives::{keccak256, Address, B256, U256},
     sol,
 };
 use std::{future::Future, sync::Arc, time::Duration};
@@ -95,12 +95,9 @@ where
 async fn ready_snapshots<A, S>(
     attestor: A,
     sandbox: S,
-) -> anyhow::Result<(
-    Option<AttestorTlsDescriptor>,
-    Option<Arc<SandboxConnection>>,
-)>
+) -> anyhow::Result<(Option<AttestorInstance>, Option<Arc<SandboxConnection>>)>
 where
-    A: Future<Output = anyhow::Result<Option<AttestorTlsDescriptor>>>,
+    A: Future<Output = anyhow::Result<Option<AttestorInstance>>>,
     S: Future<Output = anyhow::Result<Option<Arc<SandboxConnection>>>>,
 {
     let (attestor, sandbox) = tokio::join!(attestor, sandbox);
@@ -241,6 +238,19 @@ pub struct SandboxServiceIdentity {
     pub expires_at: i64,
 }
 
+impl SandboxServiceIdentity {
+    /// The provider instance a container record is compared against.
+    pub fn instance(&self) -> crate::ProviderInstance {
+        crate::ProviderInstance {
+            chain_id: self.chain_id,
+            registry_address: self.registry_address,
+            app_id: self.app_id.clone(),
+            registered_at: self.registered_at,
+            signer: self.provider,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SandboxConnection {
     pub provider: Address,
@@ -256,28 +266,93 @@ pub struct SandboxDiscovery {
     cached: Mutex<Option<Arc<SandboxConnection>>>,
 }
 
-/// Public bootstrap data, delivered only through an authenticated sandbox create.
-/// Runtimes independently refresh through the supplied pinned Scan trust anchor.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct AttestorTlsDescriptor {
-    pub version: u8,
-    pub chain_id: u64,
-    pub registry_address: String,
+/// This attestor's own app instance, as AgenticID currently authorizes it.
+/// Checked at startup and before every sandbox create.
+#[derive(Clone, Debug)]
+pub struct AttestorInstance {
     pub app_id: String,
     pub registered_at: u64,
-    pub app_signer: String,
-    pub url: String,
-    pub scan_url: String,
-    pub scan_public_key: String,
-    pub tls_spki_sha256: Vec<String>,
-    pub checked_at: i64,
+    pub signer: Address,
     pub expires_at: i64,
 }
 
 pub struct AttestorDiscovery {
     cfg: Config,
     signer: Address,
-    cached: Mutex<Option<AttestorTlsDescriptor>>,
+    cached: Mutex<Option<AttestorInstance>>,
+    tls_spki: Mutex<SpkiCache>,
+}
+
+/// Names the throwaway CSR whose only use is its SPKI hash.
+const TLS_KEY_PROBE_DOMAIN: &str = "attestor-tls-pin.invalid";
+/// Bound on one `GetAppCsr` call. tapp may wait minutes on its KMS, and the
+/// worker's sweep loop, which also runs the job reaper, waits on this call.
+const TLS_SPKI_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Minimum time between two reads of the app TLS key once one succeeded.
+const TLS_SPKI_REREAD_AFTER: Duration = Duration::from_secs(300);
+
+/// This node's app TLS SPKI hash, read from tapp once and re-read only when a
+/// statement does not pin it. Each `GetAppCsr` makes tapp load the TLS key;
+/// under `--tls-key-source kms` it derives the key from the KMS and extends a
+/// runtime measurement, which stays in the node's attestation evidence until
+/// it reboots. So the key is not read per statement check.
+struct SpkiCache {
+    value: Option<B256>,
+    read_at: Option<std::time::Instant>,
+    read_timeout: Duration,
+}
+
+impl Default for SpkiCache {
+    fn default() -> Self {
+        Self {
+            value: None,
+            read_at: None,
+            read_timeout: TLS_SPKI_READ_TIMEOUT,
+        }
+    }
+}
+
+impl SpkiCache {
+    /// The cached hash, reading it first when there is none yet, or when
+    /// `reread` is set (a statement did not pin the cached one) and the last
+    /// read is at least [`TLS_SPKI_REREAD_AFTER`] old. A failed re-read keeps
+    /// the cached hash.
+    async fn get<F, Fut>(
+        &mut self,
+        reread: bool,
+        now: std::time::Instant,
+        read: F,
+    ) -> anyhow::Result<B256>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<B256>>,
+    {
+        if let (Some(value), Some(read_at)) = (self.value, self.read_at) {
+            if !reread || now.saturating_duration_since(read_at) < TLS_SPKI_REREAD_AFTER {
+                return Ok(value);
+            }
+        }
+        let result = match tokio::time::timeout(self.read_timeout, read()).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("tapp app TLS key lookup timed out")),
+        };
+        match (result, self.value) {
+            (Ok(value), previous) => {
+                if previous.is_some_and(|p| p != value) {
+                    tracing::info!(spki = %value, "attestor tls: this node's app TLS key changed");
+                }
+                self.value = Some(value);
+                self.read_at = Some(now);
+                Ok(value)
+            }
+            (Err(error), Some(previous)) => {
+                tracing::warn!(%error, "attestor tls: re-reading this node's app TLS key failed; keeping the cached one");
+                self.read_at = Some(now);
+                Ok(previous)
+            }
+            (Err(error), None) => Err(error),
+        }
+    }
 }
 
 impl AttestorDiscovery {
@@ -291,29 +366,137 @@ impl AttestorDiscovery {
             cfg: cfg.clone(),
             signer,
             cached: Mutex::new(None),
+            tls_spki: Mutex::new(SpkiCache::default()),
         }))
     }
 
-    pub async fn snapshot(&self) -> anyhow::Result<AttestorTlsDescriptor> {
+    pub async fn snapshot(&self) -> anyhow::Result<AttestorInstance> {
         snapshot_with_deadline(SNAPSHOT_TIMEOUT, self.snapshot_inner()).await
     }
 
-    async fn snapshot_inner(&self) -> anyhow::Result<AttestorTlsDescriptor> {
+    async fn snapshot_inner(&self) -> anyhow::Result<AttestorInstance> {
         let mut cached = self.cached.lock().await;
-        if let Some(descriptor) = &*cached {
-            if descriptor.expires_at > chrono::Utc::now().timestamp() + 30 {
-                return Ok(descriptor.clone());
+        if let Some(instance) = &*cached {
+            if instance.expires_at > chrono::Utc::now().timestamp() + 30 {
+                return Ok(instance.clone());
             }
         }
-        let descriptor = attestor_descriptor(&self.cfg, self.signer).await?;
+        let instance = attestor_instance(&self.cfg, self.signer).await?;
         if let Some(previous) = &*cached {
             anyhow::ensure!(
-                descriptor.registered_at == previous.registered_at,
+                instance.registered_at == previous.registered_at,
                 "attestor registration changed; restart and recreate runtimes"
             );
         }
-        *cached = Some(descriptor.clone());
-        Ok(descriptor)
+        *cached = Some(instance.clone());
+        Ok(instance)
+    }
+
+    /// SHA-256 of this node's app TLS SubjectPublicKeyInfo, the key the
+    /// attested HTTPS endpoint serves, as last read from local tapp (see
+    /// [`SpkiCache`]). The first call reads it.
+    pub async fn tls_spki_sha256(&self) -> anyhow::Result<B256> {
+        self.tls_spki
+            .lock()
+            .await
+            .get(false, std::time::Instant::now(), || {
+                self.read_tls_spki_sha256()
+            })
+            .await
+    }
+
+    /// The same, read again from tapp because a statement did not pin the
+    /// cached hash, at most once per [`TLS_SPKI_REREAD_AFTER`].
+    pub async fn reread_tls_spki_sha256(&self) -> anyhow::Result<B256> {
+        self.tls_spki
+            .lock()
+            .await
+            .get(true, std::time::Instant::now(), || {
+                self.read_tls_spki_sha256()
+            })
+            .await
+    }
+
+    /// One `GetAppCsr` call. tapp answers it from the app's TLS key, which it
+    /// loads for the call (under `--tls-key-source kms`, derived from the KMS
+    /// and measured into the node's runtime event log); only the public SPKI
+    /// hash comes back.
+    async fn read_tls_spki_sha256(&self) -> anyhow::Result<B256> {
+        use tapp_grpc::proto::{tapp_service_client::TappServiceClient, GetAppCsrRequest};
+        let app_id = tapp_grpc::require_app_id(&self.cfg)?;
+        let mut client = TappServiceClient::new(tapp_grpc::connect(&self.cfg).await?);
+        let response = client
+            .get_app_csr(GetAppCsrRequest {
+                app_id,
+                domain: TLS_KEY_PROBE_DOMAIN.into(),
+            })
+            .await?
+            .into_inner();
+        anyhow::ensure!(
+            response.success,
+            "tapp app TLS key lookup failed: {}",
+            response.message
+        );
+        let hex = response
+            .public_key_sha256
+            .strip_prefix("0x")
+            .unwrap_or(&response.public_key_sha256)
+            .to_ascii_lowercase();
+        crate::image_attestation::lower_hex32(&hex)
+            .ok_or_else(|| anyhow::anyhow!("tapp returned an invalid app TLS SPKI hash"))
+    }
+}
+
+/// Production relay source: the discovered provider's `/api/attestor-tls`
+/// over its pinned client, and this node's own app TLS key.
+pub struct DiscoveredTlsSource {
+    pub sandbox: Arc<SandboxDiscovery>,
+    pub attestor: Arc<AttestorDiscovery>,
+}
+
+#[async_trait::async_trait]
+impl crate::attestor_tls::StatementSource for DiscoveredTlsSource {
+    async fn provider(&self) -> anyhow::Result<Address> {
+        Ok(self.sandbox.snapshot().await?.provider)
+    }
+
+    async fn fetch(&self, provider: Address) -> anyhow::Result<Vec<u8>> {
+        let snapshot = self.sandbox.snapshot().await?;
+        anyhow::ensure!(
+            snapshot.provider == provider,
+            "sandbox provider changed during the statement fetch"
+        );
+        let mut response = snapshot
+            .http
+            .get(format!(
+                "{}/api/attestor-tls",
+                snapshot.base_url.trim_end_matches('/')
+            ))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "provider attestor-tls request failed: {}",
+            response.status()
+        );
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            body.extend_from_slice(&chunk);
+            anyhow::ensure!(
+                body.len() <= crate::attestor_tls::MAX_BODY_BYTES,
+                "provider attestor-tls response too large"
+            );
+        }
+        Ok(body)
+    }
+
+    async fn own_tls_spki(&self) -> anyhow::Result<B256> {
+        self.attestor.tls_spki_sha256().await
+    }
+
+    async fn reread_own_tls_spki(&self) -> anyhow::Result<B256> {
+        self.attestor.reread_tls_spki_sha256().await
     }
 }
 
@@ -564,13 +747,10 @@ pub fn pinned_client(pins: Vec<String>) -> anyhow::Result<reqwest::Client> {
 }
 
 /// Production must migrate the business contract before using the stable key.
-async fn attestor_descriptor(
-    cfg: &Config,
-    signer: Address,
-) -> anyhow::Result<AttestorTlsDescriptor> {
+async fn attestor_instance(cfg: &Config, signer: Address) -> anyhow::Result<AttestorInstance> {
     let app_id = tapp_grpc::require_app_id(cfg)?;
     let identity = resolve(cfg, &app_id).await?;
-    let (resolved_signer, pins, expires_at) = validate_resolved(
+    let (resolved_signer, _pins, expires_at) = validate_resolved(
         cfg.chain_id,
         cfg.tapp_registry_addr,
         &app_id,
@@ -580,16 +760,6 @@ async fn attestor_descriptor(
     anyhow::ensure!(
         signer == resolved_signer,
         "attestor signer differs from its attested app_signer"
-    );
-    validate_https_locator(&cfg.attestor_public_url)?;
-    validate_https_locator(&identity.scan_url)?;
-    let scan_pin = identity
-        .scan_public_key
-        .strip_prefix("0x")
-        .unwrap_or(&identity.scan_public_key);
-    anyhow::ensure!(
-        scan_pin.len() == 64 && hex::decode(scan_pin).is_ok(),
-        "attestor identity has no pinned Scan trust anchor"
     );
     let provider = identity_provider(cfg.chain_rpc.parse()?, crate::nonce_submit::RPC_TIMEOUT)?;
     let auth = AttestorAuthorization::new(cfg.agentic_id_addr, &provider);
@@ -612,24 +782,10 @@ async fn attestor_descriptor(
         expires_at > chrono::Utc::now().timestamp() + 5,
         "attestor identity expired during authorization lookup"
     );
-    Ok(AttestorTlsDescriptor {
-        version: 1,
-        chain_id: cfg.chain_id,
-        registry_address: format!("{:#x}", cfg.tapp_registry_addr),
+    Ok(AttestorInstance {
         app_id,
         registered_at: identity.registered_at,
-        app_signer: format!("{:#x}", signer),
-        url: cfg.attestor_public_url.trim_end_matches('/').to_string(),
-        scan_url: identity.scan_url,
-        scan_public_key: scan_pin.to_ascii_lowercase(),
-        tls_spki_sha256: pins,
-        checked_at: identity
-            .nodes
-            .iter()
-            .filter(|node| !node.app_signer.is_empty())
-            .map(|node| node.checked_at)
-            .min()
-            .unwrap(),
+        signer,
         expires_at,
     })
 }
@@ -671,6 +827,85 @@ mod tests {
             .expect("identity RPC ignored the HTTP request deadline")
             .unwrap()
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn the_app_tls_key_is_read_once_and_reread_at_most_every_five_minutes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let reads = AtomicU64::new(0);
+        let key = std::sync::Mutex::new(B256::repeat_byte(1));
+        let fail = std::sync::atomic::AtomicBool::new(false);
+        let read = || async {
+            reads.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(!fail.load(Ordering::SeqCst), "tapp down");
+            Ok(*key.lock().unwrap())
+        };
+        let mut cache = SpkiCache::default();
+        let t0 = std::time::Instant::now();
+
+        // Nothing cached: a failed read is an error and caches nothing.
+        fail.store(true, Ordering::SeqCst);
+        assert!(cache.get(false, t0, read).await.is_err());
+        fail.store(false, Ordering::SeqCst);
+        assert_eq!(
+            cache.get(false, t0, read).await.unwrap(),
+            B256::repeat_byte(1)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        // Plain calls never read again, however late.
+        let late = t0 + Duration::from_secs(86_400);
+        assert_eq!(
+            cache.get(false, late, read).await.unwrap(),
+            B256::repeat_byte(1)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        // A re-read waits five minutes after the last read.
+        *key.lock().unwrap() = B256::repeat_byte(2);
+        let soon = t0 + TLS_SPKI_REREAD_AFTER - Duration::from_secs(1);
+        assert_eq!(
+            cache.get(true, soon, read).await.unwrap(),
+            B256::repeat_byte(1)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        let due = t0 + TLS_SPKI_REREAD_AFTER;
+        assert_eq!(
+            cache.get(true, due, read).await.unwrap(),
+            B256::repeat_byte(2)
+        );
+        assert_eq!(
+            cache.get(false, due, read).await.unwrap(),
+            B256::repeat_byte(2)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+
+        // A failed re-read keeps the cached key and counts as a read.
+        fail.store(true, Ordering::SeqCst);
+        let next = due + TLS_SPKI_REREAD_AFTER;
+        assert_eq!(
+            cache.get(true, next, read).await.unwrap(),
+            B256::repeat_byte(2)
+        );
+        assert_eq!(
+            cache.get(true, next, read).await.unwrap(),
+            B256::repeat_byte(2)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn an_app_tls_key_read_that_hangs_times_out() {
+        let mut cache = SpkiCache {
+            read_timeout: Duration::from_millis(10),
+            ..SpkiCache::default()
+        };
+        let hang = || std::future::pending::<anyhow::Result<B256>>();
+        let error = cache
+            .get(false, std::time::Instant::now(), hang)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
     }
 
     #[tokio::test]
@@ -811,18 +1046,10 @@ mod tests {
     #[tokio::test]
     async fn startup_snapshots_require_both_final_leases_to_exceed_the_margin() {
         let expires_at = chrono::Utc::now().timestamp() + 5;
-        let attestor = AttestorTlsDescriptor {
-            version: 1,
-            chain_id: 1,
-            registry_address: String::new(),
+        let attestor = AttestorInstance {
             app_id: "app".into(),
             registered_at: 1,
-            app_signer: String::new(),
-            url: String::new(),
-            scan_url: String::new(),
-            scan_public_key: String::new(),
-            tls_spki_sha256: vec![],
-            checked_at: expires_at - 60,
+            signer: Address::ZERO,
             expires_at,
         };
         let sandbox = Arc::new(SandboxConnection {

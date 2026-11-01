@@ -93,7 +93,7 @@ func TestDockerfiles_BuildOnlyTheDownloadCLI(t *testing.T) {
 		}
 	}
 	slices.Sort(checked)
-	want := []string{"../../Dockerfile", "../../images/dsh/Dockerfile", "../../images/hermes/Dockerfile", "../../images/prime/Dockerfile", "../../images/sealed/Dockerfile"}
+	want := []string{"../../Dockerfile", "../../images/harness/Dockerfile", "../../images/hermes/Dockerfile", "../../images/prime/Dockerfile", "../../images/sealed/Dockerfile"}
 	if !slices.Equal(checked, want) {
 		t.Fatalf("Dockerfiles with a storage-builder stage = %q, want %q (update the image lists in TRUST_MODEL.md/.zh.md, QUIRKS.md, ARCHITECTURE.md/.zh.md and downloadTo's comment)", checked, want)
 	}

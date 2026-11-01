@@ -2,9 +2,13 @@
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use alloy::primitives::Address;
 use attestor_shared::{
-    auth::deploy::verify_deploy_signature, derive_phase, sandbox::verify_envelope, DeployRequest,
-    DeployResponse, Deployment, DeploymentPhase, JobPayload, StageStatus, WsEvent,
+    auth::deploy::verify_deploy_signature,
+    derive_phase,
+    sandbox::{check_owner_env, verify_envelope},
+    CryptoModule, DeployRequest, DeployResponse, Deployment, DeploymentPhase, JobPayload,
+    SandboxEnvelope, StageStatus, WsEvent,
 };
 use axum::extract::State;
 use axum::Json;
@@ -56,31 +60,12 @@ pub async fn handle(
     //    Optional: absent = mint-only deploy (no container provisioned; the
     //    agent lands Offline and is brought online later via /start).
     if let Some(env) = &req.sandbox_envelope {
-        if env.wallet_address != req.owner {
-            return Err(ApiError::bad_request(
-                "sandbox envelope signer must match deploy owner",
-            ));
-        }
-        let canonical = verify_envelope(env, state.crypto.as_ref())
-            .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
-        if canonical.action != "create" {
-            return Err(ApiError::bad_request(format!(
-                "sandbox envelope action must be 'create', got {}",
-                canonical.action
-            )));
-        }
-        if !canonical.resource_id.is_empty() {
-            return Err(ApiError::bad_request(
-                "sandbox envelope resource_id must be empty for create",
-            ));
-        }
-        let now_secs = Utc::now().timestamp();
-        if canonical.expires_at <= now_secs {
-            return Err(ApiError::bad_request(format!(
-                "sandbox envelope already expired (expires_at={}, now={})",
-                canonical.expires_at, now_secs
-            )));
-        }
+        check_sandbox_envelope(
+            env,
+            req.owner,
+            state.crypto.as_ref(),
+            Utc::now().timestamp(),
+        )?;
     }
 
     // generate sealId + agentSeal
@@ -132,11 +117,11 @@ pub async fn handle(
         container_stage: StageStatus::NotStarted,
         sandbox_id: None,
         provisioned_at: None,
-        container_pubkey: None,
-        container_pubkey_mac: None,
+        container_record: None,
         provision_deadline: None,
         last_provision_error: None,
         last_provision_error_at: None,
+        container_status: None,
         settings: None,
         settings_last_good: None,
         settings_version: 0,
@@ -147,9 +132,8 @@ pub async fn handle(
     };
     state.deployments.insert(&deployment).await?;
 
-    // `PostgresJobQueue` seals the whole payload with AES-GCM(job_key)
-    // before hitting Postgres, so iData plaintexts (plus sandbox envelope
-    // contents) never land on disk in the clear. No per-field crypto here.
+    // The payload (iData plaintexts, envelope contents) sits in the job row
+    // only until a worker claims it; the database is on the tapp FDE volume.
     state
         .jobs
         .submit(JobPayload::Deploy {
@@ -184,10 +168,90 @@ pub async fn handle(
     }))
 }
 
+/// The edge checks on a deploy's sandbox envelope: signed by the deploy
+/// owner, a `create` for no existing resource, not expired, and an `env`
+/// that carries only the inference key (`check_owner_env`).
+fn check_sandbox_envelope(
+    env: &SandboxEnvelope,
+    owner: Address,
+    crypto: &dyn CryptoModule,
+    now_secs: i64,
+) -> ApiResult<()> {
+    if env.wallet_address != owner {
+        return Err(ApiError::bad_request(
+            "sandbox envelope signer must match deploy owner",
+        ));
+    }
+    let canonical = verify_envelope(env, crypto)
+        .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
+    if canonical.action != "create" {
+        return Err(ApiError::bad_request(format!(
+            "sandbox envelope action must be 'create', got {}",
+            canonical.action
+        )));
+    }
+    if !canonical.resource_id.is_empty() {
+        return Err(ApiError::bad_request(
+            "sandbox envelope resource_id must be empty for create",
+        ));
+    }
+    if canonical.expires_at <= now_secs {
+        return Err(ApiError::bad_request(format!(
+            "sandbox envelope already expired (expires_at={}, now={})",
+            canonical.expires_at, now_secs
+        )));
+    }
+    // Only the inference key may ride the owner's env: refused here, not
+    // when the job reaches the sandbox create.
+    check_owner_env(&canonical.payload)
+        .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
+    Ok(())
+}
+
 fn subscribe_url(state: &AppState, seal_id: attestor_shared::SealId) -> String {
     format!(
         "ws://{host}/ws/subscribe?seal_id=0x{hex}",
         host = state.cfg.bind,
         hex = hex::encode(seal_id.as_slice())
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attestor_shared::crypto::RealCrypto;
+    use attestor_shared::mocks::signed_envelope_with_payload;
+    use axum::http::StatusCode;
+
+    const OWNER_PRIV: [u8; 32] = [0x11; 32];
+
+    #[test]
+    fn a_deploy_envelope_carries_only_the_inference_key() {
+        let crypto = RealCrypto::new_for_test([0u8; 32]);
+        let ok = signed_envelope_with_payload(
+            &OWNER_PRIV,
+            "create",
+            "",
+            serde_json::json!({ "snapshot": "img", "env": { "API_KEY": "sk" } }),
+        );
+        check_sandbox_envelope(&ok, ok.wallet_address, &crypto, 0).expect("the key alone passes");
+        for key in ["HTTPS_PROXY", "SSL_CERT_FILE", "BASH_ENV", "ATTESTOR_URL"] {
+            let env = signed_envelope_with_payload(
+                &OWNER_PRIV,
+                "create",
+                "",
+                serde_json::json!({ "snapshot": "img", "env": { "API_KEY": "sk", key: "v" } }),
+            );
+            let err = check_sandbox_envelope(&env, env.wallet_address, &crypto, 0)
+                .expect_err("refused at the edge");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert!(
+                err.message
+                    .contains("may carry only API_KEY and SEAL_SECRET_ENV")
+                    && err.message.contains(key),
+                "{key}: {}",
+                err.message
+            );
+        }
+    }
 }

@@ -142,6 +142,12 @@ func TestStreamRelay_VerbatimUnsignedFlushed(t *testing.T) {
 	if !rec.Flushed {
 		t.Error("streamRelay must Flush so SSE frames are not buffered")
 	}
+	// Measured on dev (2026-10-30): without it, the preview gateway's nginx
+	// delivered a 49-delta reply in one burst at the end, and never delivered
+	// the never-ending /v1/events feed at all.
+	if got := res.Header.Get("X-Accel-Buffering"); got != "no" {
+		t.Errorf("X-Accel-Buffering = %q, want \"no\" (an nginx in front buffers the stream otherwise)", got)
+	}
 }
 
 // A body that yields data before EOF should already be visible to the client

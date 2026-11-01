@@ -8,12 +8,12 @@
       "note": "attestor/.env.example MOCK_APP_SECRET: the mock-KMS value for local runs with MOCK_KMS=true"
     },
     {
-      "sha256": "58badd9b455145b487ad24c7f259cc437cc4ffd0784716845249321fb5961cfc",
-      "note": "attestation test vector test_app_private_key (attestor + sealed testdata); its address appears only in testdata"
+      "sha256": "59b87c47592024798072f943e5b43d1b02f27b14c0e4c6aacd393ee134d3e427",
+      "note": "provision v3 test vectors test_only_provider_key (attestor + sealed testdata: image-attestation-v3.json, attestor-tls-v3.json): TEST-ONLY, keccak256(\"agentdna1.4 test key\") as the vectors record; its address appears only in testdata"
     },
     {
-      "sha256": "749f1a97ff6cd00ea46ccb3a47bb123283fe56c8fa324bea295d928f558161df",
-      "note": "attestation test vector test_container_private_key (attestor + sealed testdata); its address appears nowhere else"
+      "sha256": "dd16bd28dc08982045ae4497e4359f62812d1bd0f12b92dd2e536326eec21ffb",
+      "note": "provision v3 test vectors test_only_container_key (attestor + sealed testdata: image-attestation-v3.json, boot-v1.json, boot-v1-first.json): TEST-ONLY, keccak256(\"agentdna1.4 test container key\") as the vectors record; its address appears only in testdata"
     },
     {
       "sha256": "2d23b34a69ee132da2f1ade478741b06190067c4e249a71e7a2fe79ef959309e",

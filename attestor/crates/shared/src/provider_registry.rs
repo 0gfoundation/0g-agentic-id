@@ -1,6 +1,6 @@
 //! Global inference configuration authorized by the live attestor Tapp owner.
-//! Accepted revisions retain KMS-authenticated receipts and immutable history;
-//! compare-and-swap prevents replay and concurrent overwrites.
+//! Accepted revisions keep their exact signed bytes, publisher and immutable
+//! history; compare-and-swap prevents replay and concurrent overwrites.
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -70,7 +70,6 @@ pub struct StoredRegistry {
     pub version: i64,
     pub update: SignedUpdate,
     pub publisher: Address,
-    pub acceptance_mac: Vec<u8>,
 }
 
 pub fn signing_message(document: &str) -> String {
@@ -234,7 +233,6 @@ pub trait ProviderRegistryRepo: Send + Sync {
         base: i64,
         update: SignedUpdate,
         publisher: Address,
-        acceptance_mac: Vec<u8>,
     ) -> anyhow::Result<Option<i64>>;
 }
 
@@ -255,7 +253,7 @@ impl PostgresProviderRegistry {
 #[async_trait]
 impl ProviderRegistryRepo for PostgresProviderRegistry {
     async fn latest(&self) -> anyhow::Result<Option<StoredRegistry>> {
-        let row = sqlx::query("SELECT version, document, signature, publisher, acceptance_mac FROM inference_provider_registry WHERE chain_id=$1 AND contract=$2 ORDER BY version DESC LIMIT 1")
+        let row = sqlx::query("SELECT version, document, signature, publisher FROM inference_provider_registry WHERE chain_id=$1 AND contract=$2 ORDER BY version DESC LIMIT 1")
             .bind(self.chain_id).bind(self.contract.as_slice()).fetch_optional(&self.pool).await?;
         row.map(|row| {
             let publisher: Vec<u8> = row.try_get("publisher")?;
@@ -263,7 +261,6 @@ impl ProviderRegistryRepo for PostgresProviderRegistry {
             Ok(StoredRegistry {
                 version: row.try_get("version")?,
                 publisher: Address::from_slice(&publisher),
-                acceptance_mac: row.try_get("acceptance_mac")?,
                 update: SignedUpdate {
                     document: row.try_get("document")?,
                     signature: row.try_get("signature")?,
@@ -273,7 +270,7 @@ impl ProviderRegistryRepo for PostgresProviderRegistry {
         .transpose()
     }
     async fn get(&self, version: i64) -> anyhow::Result<Option<StoredRegistry>> {
-        let row = sqlx::query("SELECT version, document, signature, publisher, acceptance_mac FROM inference_provider_registry WHERE chain_id=$1 AND contract=$2 AND version=$3")
+        let row = sqlx::query("SELECT version, document, signature, publisher FROM inference_provider_registry WHERE chain_id=$1 AND contract=$2 AND version=$3")
             .bind(self.chain_id).bind(self.contract.as_slice()).bind(version).fetch_optional(&self.pool).await?;
         row.map(|row| {
             let publisher: Vec<u8> = row.try_get("publisher")?;
@@ -281,7 +278,6 @@ impl ProviderRegistryRepo for PostgresProviderRegistry {
             Ok(StoredRegistry {
                 version: row.try_get("version")?,
                 publisher: Address::from_slice(&publisher),
-                acceptance_mac: row.try_get("acceptance_mac")?,
                 update: SignedUpdate {
                     document: row.try_get("document")?,
                     signature: row.try_get("signature")?,
@@ -295,7 +291,6 @@ impl ProviderRegistryRepo for PostgresProviderRegistry {
         base: i64,
         update: SignedUpdate,
         publisher: Address,
-        acceptance_mac: Vec<u8>,
     ) -> anyhow::Result<Option<i64>> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(4703801312244819058)")
@@ -309,8 +304,8 @@ impl ProviderRegistryRepo for PostgresProviderRegistry {
         let next = base
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("registry version exhausted"))?;
-        sqlx::query("INSERT INTO inference_provider_registry(chain_id,contract,version,document,signature,publisher,acceptance_mac) VALUES($1,$2,$3,$4,$5,$6,$7)")
-            .bind(self.chain_id).bind(self.contract.as_slice()).bind(next).bind(update.document).bind(update.signature).bind(publisher.as_slice()).bind(acceptance_mac).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO inference_provider_registry(chain_id,contract,version,document,signature,publisher) VALUES($1,$2,$3,$4,$5,$6)")
+            .bind(self.chain_id).bind(self.contract.as_slice()).bind(next).bind(update.document).bind(update.signature).bind(publisher.as_slice()).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(Some(next))
     }
@@ -337,7 +332,6 @@ impl ProviderRegistryRepo for MemoryProviderRegistry {
         base: i64,
         update: SignedUpdate,
         publisher: Address,
-        acceptance_mac: Vec<u8>,
     ) -> anyhow::Result<Option<i64>> {
         let mut history = self.0.lock().unwrap();
         if history.last().map_or(0, |r| r.version) != base {
@@ -350,7 +344,6 @@ impl ProviderRegistryRepo for MemoryProviderRegistry {
             version,
             update,
             publisher,
-            acceptance_mac,
         });
         Ok(Some(version))
     }
@@ -384,12 +377,7 @@ mod tests {
         };
         assert_eq!(
             first
-                .replace(
-                    0,
-                    update("first accepted bytes"),
-                    Address::ZERO,
-                    vec![0; 32]
-                )
+                .replace(0, update("first accepted bytes"), Address::ZERO)
                 .await
                 .unwrap(),
             Some(1)
@@ -401,8 +389,8 @@ mod tests {
         assert_eq!(loaded.version, 1);
         assert_eq!(loaded.update.document, "first accepted bytes");
         let (a, b) = tokio::join!(
-            first.replace(1, update("publisher A"), Address::ZERO, vec![0; 32]),
-            second.replace(1, update("publisher B"), Address::ZERO, vec![0; 32])
+            first.replace(1, update("publisher A"), Address::ZERO),
+            second.replace(1, update("publisher B"), Address::ZERO)
         );
         assert_eq!(
             usize::from(a.unwrap().is_some()) + usize::from(b.unwrap().is_some()),
@@ -415,7 +403,7 @@ mod tests {
         );
         assert!(second.get(99).await.unwrap().is_none());
         assert!(first
-            .replace(0, update("replay"), Address::ZERO, vec![0; 32])
+            .replace(0, update("replay"), Address::ZERO)
             .await
             .unwrap()
             .is_none());

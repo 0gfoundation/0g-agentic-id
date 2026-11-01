@@ -178,8 +178,8 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 	// Never under a live turn: openclaw's sessions.compact ABORTS an active
 	// run in the session (interruptSessionRunIfActive), so compacting now
 	// would silently kill the owner's task. A turn on this door is one the
-	// proxy tracks; dsh (native door) queues its compaction behind the turn
-	// in the bridge instead, so nothing is tracked here for it.
+	// proxy tracks; 0g-harness (native door) queues its compaction behind the
+	// turn itself instead, so nothing is tracked here for it.
 	if s.synth != nil && s.synth.busy() {
 		s.compact.mu.Unlock()
 		http.Error(w, "a turn is in progress; wait for it to finish (or interrupt it), then compact", http.StatusConflict)

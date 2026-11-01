@@ -1,0 +1,83 @@
+{
+  "description": "EIP-712 known-answer vector for the v3 container certificate (SANDBOX_SEAL_ATTESTATION). TEST-ONLY deterministic keys derived from public labels; never use them outside tests.",
+  "test_only_provider_key": {
+    "private_key": "0x481ccc0ad1885a8d939ee1e88358c5b084cd0cce557906171f74953a654e9683",
+    "derivation": "keccak256(\"agentdna1.4 test key\")",
+    "address": "0xED08394C2Fdade872df01deDB470887E40314833"
+  },
+  "test_only_container_key": {
+    "private_key": "0x3039aed7d54f4e29d521883f3f81787eaea2fe2300cdef9d37c57655e289afd8",
+    "derivation": "keccak256(\"agentdna1.4 test container key\")",
+    "address": "0x6Cc01F350e9Cbe7A15Cb5919344a8289a7b9c82f"
+  },
+  "typed_data": {
+    "types": {
+      "EIP712Domain": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "version",
+          "type": "string"
+        },
+        {
+          "name": "chainId",
+          "type": "uint256"
+        },
+        {
+          "name": "verifyingContract",
+          "type": "address"
+        }
+      ],
+      "ImageAttestation": [
+        {
+          "name": "appId",
+          "type": "string"
+        },
+        {
+          "name": "registeredAt",
+          "type": "uint64"
+        },
+        {
+          "name": "sealId",
+          "type": "bytes32"
+        },
+        {
+          "name": "containerPubkey",
+          "type": "bytes"
+        },
+        {
+          "name": "imageHash",
+          "type": "bytes32"
+        },
+        {
+          "name": "issuedAt",
+          "type": "uint64"
+        }
+      ]
+    },
+    "primaryType": "ImageAttestation",
+    "domain": {
+      "name": "0G Sandbox ImageAttestation",
+      "version": "3",
+      "chainId": 16602,
+      "verifyingContract": "0x79d11d8d71784dfed781124e219ad3c62b3a17f6"
+    },
+    "message": {
+      "appId": "0g-sandbox-provider",
+      "registeredAt": 1792108800,
+      "sealId": "0x2b4e3b394775ad7d108d05017138fbaacd4650b773122bd4822fd0f42ba0d092",
+      "containerPubkey": "0x038038c5cc4de940c65aef5e05053b3703b9aac292f8e58e99c93a05a205f472fa",
+      "imageHash": "0x86d7d5cb9673bc3cf760ef58b53b5627112e76bb261ba4959258012637df9ec8",
+      "issuedAt": 1793318445
+    }
+  },
+  "type_hash": "0x7e4d1c1e9132cf83e5d8a1aa3f256611f8ebc32c5ca8bcf5794d7a200c8a0d7c",
+  "domain_separator": "0xa8b7d7299fb665859b4a7a9fc1b53d1a32abf07674385aadbec486ef6d2b6bf8",
+  "struct_hash": "0xf161bc4aa86b34d30b7f6430d7e0508d33e62fb6bdb6f631abf9b7498e264cfa",
+  "digest": "0x7c83aac153ab43e7b10560c2ef62b84e4f9c2a9dad8bc78ee0bd3a7267de1862",
+  "signature": "0x68000267c6b79c45ce3e3cc8ed6775a83f6ea21c53ba5d981f1b5c006ffd356574885e4eb7f73e5ca6d1492ffac9be3e76c5dd05f7601adeff9270a0d26812761c",
+  "recovered_address": "0xED08394C2Fdade872df01deDB470887E40314833",
+  "sandbox_seal_attestation": "{\"version\":3,\"chain_id\":16602,\"registry_address\":\"0x79d11d8d71784dfed781124e219ad3c62b3a17f6\",\"app_id\":\"0g-sandbox-provider\",\"registered_at\":1792108800,\"seal_id\":\"2b4e3b394775ad7d108d05017138fbaacd4650b773122bd4822fd0f42ba0d092\",\"pubkey\":\"0x038038c5cc4de940c65aef5e05053b3703b9aac292f8e58e99c93a05a205f472fa\",\"image_hash\":\"sha256:86d7d5cb9673bc3cf760ef58b53b5627112e76bb261ba4959258012637df9ec8\",\"ts\":1793318445,\"signature\":\"0x68000267c6b79c45ce3e3cc8ed6775a83f6ea21c53ba5d981f1b5c006ffd356574885e4eb7f73e5ca6d1492ffac9be3e76c5dd05f7601adeff9270a0d26812761c\"}"
+}

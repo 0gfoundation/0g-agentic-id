@@ -27,11 +27,15 @@ if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
 
 // ── Facade + namespaces ──
 export { AgenticID as AgentDNA, AgenticID, AgentApi, AdminApi, ReputationApi } from './AgenticID';
-export type { DeployAccepted, WaitLevel } from './AgenticID';
+export type { ContainerStatus, DeployAccepted, WaitLevel } from './AgenticID';
 export { makeAgentClient } from './AgentClient';
-export type { AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask } from './AgentClient';
+export type {
+  AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask,
+  AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
+} from './AgentClient';
 export { mcpServices } from './AgentClient';
-export { defaultIData } from './AttestorClient';
+export { defaultIData, DEFAULT_PERSONA_INFERENCE, deploymentFactsOf, needsDefaultSettings, storeDefaultSettings } from './AttestorClient';
+export type { DeploymentFacts } from './AttestorClient';
 export type { DefaultIDataParams } from './AttestorClient';
 export type { AgenticIDConfig as AgentDNAConfig, AgenticIDConfig } from './context';
 

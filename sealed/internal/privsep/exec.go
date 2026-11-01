@@ -58,7 +58,8 @@ var rootTmpDir = StateDir + "/tmp"
 // only from the image (its trust store, and the toolchains' root-owned
 // configuration). A proxy sees which hosts are contacted but cannot alter
 // what is fetched over TLS, which the image's trust store still verifies.
-// sealed's own connections follow the same rule (ScrubTrustEnv).
+// sealed's own connections follow the same rule: ScrubTrustEnv removes its
+// CA locations.
 var netEnv = []string{
 	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
 	"http_proxy", "https_proxy", "no_proxy",

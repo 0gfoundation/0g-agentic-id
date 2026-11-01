@@ -508,11 +508,11 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: Some("sb-1".into()),
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings: None,
             settings_last_good: None,
             settings_version: 0,
@@ -934,6 +934,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -951,6 +952,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -1078,6 +1080,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -1117,6 +1120,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -1145,6 +1149,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();

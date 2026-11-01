@@ -1,0 +1,109 @@
+package harness
+
+// Filesystem paths the 0g-harness adapter manages.
+//
+// DSH keeps all user data under one root: $DSH_HOME, default ~/.dsh
+// (dsh-home-paths' resolveDshHome()). This adapter tracks two children of
+// that root as agent identity:
+//
+//	skills/          agent-installed skills — the "user-dsh" rank-400 root in
+//	                 the skill-discovery table (docs/subsystems/skills.md),
+//	                 <name>/SKILL.md or <name>.md per skill (skills.go)
+//	APPEND_SYSTEM.md the owner persona (persona.go)
+//
+// Deliberately NOT managed (never on chain):
+//
+//   - $DSH_HOME/settings.yaml — DSH's own hot-reloaded settings file. This
+//     adapter no longer writes, reads or tracks it: the inference pin comes
+//     from the owner's settings document and reaches the harness as env
+//     (settings.go). `dsh-settings-file` is not mounted, so DSH itself never
+//     reads the file either.
+//     An agent minted while the role existed still has one last use for it:
+//     HandleLegacy reads the pin out of the chain entry once at boot, and the
+//     platform persists it as that agent's settings document (settings.go).
+//
+//   - $DSH_HOME/AGENTS.md — the spine's workspace-context file. Nothing
+//     mounts the extra that reads it (the knob that would is refused, see
+//     settings.go), and no role carries it: an agent may write it, but it is
+//     read by nothing and survives nothing.
+//
+//   - Any session-persistence backend's output. This adapter's composition
+//     mounts no UPSTREAM session-persistence plugin; the harness itself is the
+//     backend (its sessionstore, CONVERSATION.md) and its output is
+//     conversationPath() below — untracked for the same reason:
+//     `followup()` continuity does not depend on a durable session log —
+//     and DSH's own session log is append-only, growing on every turn, which
+//     would phantom-drift on every 30s tick if it were ever tracked.
+//   - $DSH_HOME/.credentials.yaml — the credentials store. The inference key
+//     reaches the harness via env only; nothing writes this file.
+//   - $DSH_HOME/skills/.system — the local skill provider's own reserved
+//     child (docs/subsystems/skills.md), never agent content.
+//   - The sealed platform/doctrine text: injected in code via
+//     ctx.systemPrompt.section() after boot settles (see spawn.go), never
+//     through a tracked file — the same pattern prime-agent uses and for the
+//     same reason (FRAMEWORK_ADAPTER.md §13 point 2: pick the authoritative
+//     channel, keep platform-authored bytes out of every tracked role).
+//   - The DSH checkout itself (packages/, apps/) — this port does not track
+//     agent self-modification of harness source. DSH is unusual among the
+//     shipped adapters in explicitly inviting that (a system-prompt section
+//     names its own checkout path so its self-referential toolset can read
+//     and edit it), but doing so safely needs a promote/rollback primitive
+//     this codebase does not have yet (see the package doc). v1 tracks only
+//     the framework's DATA surface — the persona and the installed skills.
+//     The inference pin is NOT part of it: it is the owner's settings
+//     document, rendered into the harness's environment at every Start
+//     (settings.go), and no role carries it.
+//
+// `dshHome` is a var (not const) so unit tests can redirect into
+// t.TempDir(). Production code never reassigns it.
+
+import (
+	"fmt"
+
+	"seal-verify/internal/privsep"
+)
+
+var dshHome = "/root/.dsh"
+
+// ensureDir creates a managed directory (and parents) if absent, without
+// following links (internal/privsep).
+func ensureDir(dir string) error {
+	if err := privsep.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	return nil
+}
+
+// ensureRoleDir makes dir, inside dshHome, a real directory: Restore is
+// authoritative over the shape of the role directories, so a link or file
+// the agent left where one belongs is replaced (privsep.EnsureDir), never
+// followed, and cannot keep the agent from booting.
+func ensureRoleDir(dir string) error {
+	if err := privsep.EnsureDir(dshHome, dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	return nil
+}
+
+func skillsDir() string { return dshHome + "/skills" }
+
+// appendSystemPath holds the owner persona, injected by the harness into
+// ctx.systemPrompt at boot (see spawn.go) — DSH has no native
+// append-system-prompt-from-file convention the way prime-agent does, so
+// nothing but this adapter ever reads this file. It lives under dshHome
+// anyway for FrameworkFacts' Home reporting and cross-adapter naming
+// consistency (informational only — tooling reads role names, not paths).
+func appendSystemPath() string { return dshHome + "/APPEND_SYSTEM.md" }
+
+// agentDocPath is where Start writes the assembled agent doc (platform
+// mechanics + this adapter's FrameworkFacts) for the harness to inject via
+// ctx.systemPrompt.section(). Deliberately OUTSIDE dshHome: per-boot platform
+// text must never be reachable by a tracked role.
+func agentDocPath() string { return "/run/seal-agentdoc.md" }
+
+// conversationPath is where the harness persists this agent's ONE conversation
+// (CONVERSATION.md): the event log the session is re-seeded from on a process
+// restart. An untracked child of dshHome — this file is exactly the "session-
+// persistence backend's output" the header above classifies as deliberately
+// not chain-tracked; it lives and dies with the container.
+func conversationPath() string { return dshHome + "/owner-chat.session.jsonl" }

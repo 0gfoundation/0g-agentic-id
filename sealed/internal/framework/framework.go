@@ -159,7 +159,7 @@ type Framework interface {
 
 	// RenderSettings places the owner's settings where THIS framework reads
 	// them — a config file for openclaw and hermes, process environment for
-	// the prime and dsh bridges. It is the one piece of the configuration
+	// the prime bridge and 0g-harness. It is the one piece of the configuration
 	// channel that cannot be shared, because only the adapter knows its own
 	// dialect.
 	//

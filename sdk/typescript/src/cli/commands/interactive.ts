@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
-import type { AgentClient, ChatMessage } from '../../AgentClient';
+import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentTaskInfo, AgentTaskStop, ChatMessage } from '../../AgentClient';
 import type { ServeProof, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
@@ -28,17 +28,17 @@ import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
-import { applyAssignments, assertModelPresent, parseAssignments, renderSettings } from '../settings';
+import { applyAssignments, assertModelPresent, assertOthersFitFramework, isHarnessFramework, parseAssignments, renderSettings } from '../settings';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
 import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
-import { configuredInferenceKey, requireConfiguredInferenceKey, agentInferenceProvider, requiresProviderReset, deployWithInference } from '../inference';
+import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePlan, applyResetInference, readDeploymentFacts, requiresProviderReset, deployWithInference } from '../inference';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -232,8 +232,9 @@ export async function routeTaskFailure(
 
 /**
  * The tasks bare `/cancel` stops: everything still in flight, NEWEST FIRST
- * (stopping only the newest would leave an older running turn alive; dsh/
- * prime serialize turns, so a queued one is waiting on the running one).
+ * (stopping only the newest would leave an older running turn alive;
+ * 0g-harness and prime serialize turns, so a queued one is waiting on the
+ * running one).
  * Statuses arrive live from the agent; "unknown" (evicted or agent
  * restarted, 404) counts as not in flight — cancelling an unknown record
  * would claim to stop something nobody can see. Exported for the tests:
@@ -245,6 +246,148 @@ export function inFlightIds(rows: Array<{ id: string; status: string }>): string
     if (rows[i].status === 'queued' || rows[i].status === 'in_progress') out.push(rows[i].id);
   }
   return out;
+}
+
+/** A span of seconds, short: 12s, 4m, 3h, 2d. */
+function span(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+/** Who asked for a task, as /tasks shows it. */
+const ASKED_BY: Record<string, string> = { user: 'you', job: 'job', schedule: 'reminder', plugin: 'plugin', agent: 'agent' };
+
+/**
+ * The /tasks table over the agent's own task list: BY is who does the work
+ * (the main agent or a subagent), FOR is who asked (you, a finished job, a
+ * reminder, the agent itself). Ids print whole: they are what /result and
+ * /cancel take. Exported for the tests.
+ */
+export function renderTaskTable(tasks: AgentTaskInfo[], nowMs: number): string[] {
+  const idw = Math.max(2, ...tasks.map((t) => cleanCell(t.id).length)) + 2;
+  const head = `  ${'ID'.padEnd(idw)}${'STATUS'.padEnd(13)}${'BY'.padEnd(10)}${'FOR'.padEnd(10)}${'AGE'.padEnd(6)}WHAT`;
+  return [
+    head,
+    ...tasks.map((t) =>
+      `  ${cleanCell(t.id).padEnd(idw)}${cellText(t.status, 13)}${cellText(t.actor, 10)}` +
+      `${cellText(ASKED_BY[t.trigger] ?? t.trigger, 10)}${span(nowMs / 1000 - t.created_at).padEnd(6)}` +
+      `${[...cleanCell(t.label)].slice(0, 70).join('')}`),
+  ];
+}
+
+/**
+ * One inbox message as the session prints it: why the agent spoke up, then
+ * what it said. Exported for the tests.
+ */
+export function renderInboxMessage(m: AgentInboxMessage): string {
+  const label = cleanCell(m.label);
+  const why = m.trigger === 'job' ? `job finished · ${label}`
+    : m.trigger === 'schedule' ? `reminder · ${label}`
+    : label || cleanCell(m.trigger);
+  const lines = [`◆ agent · ${why}`];
+  if (m.text?.trim()) lines.push(m.text.replace(/\s+$/, ''));
+  if (m.status === 'failed') lines.push(`(that turn failed: ${cleanCell(m.error ?? 'no reason given')})`);
+  else if (m.status === 'cancelled') lines.push('(that turn was cancelled)');
+  return `${lines.join('\n')}\n`;
+}
+
+/** The /schedules lines: id, how often, when next, the reminder's text.
+ *  Exported for the tests. */
+export function renderSchedules(list: AgentSchedule[], nowMs: number): string[] {
+  const idw = Math.max(2, ...list.map((r) => cleanCell(r.id).length)) + 2;
+  return list.map((r) => {
+    const how = r.kind === 'every' && r.everySeconds ? `every ${span(r.everySeconds)}` : 'once';
+    const due = r.state === 'overdue' ? 'due now' : `in ${span((Date.parse(r.scheduledAt) - nowMs) / 1000)}`;
+    return `  ${cleanCell(r.id).padEnd(idw)}${how.padEnd(12)}${due.padEnd(12)}${cleanCell(r.prompt)}`;
+  });
+}
+
+/** What stopping a task did, in words. */
+const STOP_OUTCOME: Record<AgentTaskStop['outcome'], string> = {
+  cancelled: 'stopped',
+  'already-finished': 'already finished',
+  'not-running': 'not running',
+};
+
+/**
+ * Follows one agent's inbox for a session: first the messages that came in
+ * while nobody was looking, then each new one as the agent's live feed
+ * announces it. `show` prints a rendered message, now or at the next prompt,
+ * and calls `shown` once it is on screen; the message is acked then, so
+ * another window does not show it again. A message is shown once per feed.
+ * `follow` is called with the session's current client before every prompt
+ * and restarts the feed when the client changed (/start, /reset); an agent
+ * without an inbox gets no feed. Exported for the tests.
+ */
+export function makeInboxFeed(show: (text: string, shown: () => void) => void): {
+  follow(client: AgentClient | undefined): void;
+  stop(): void;
+} {
+  let current: AgentClient | undefined;
+  let ac: AbortController | null = null;
+
+  async function run(client: AgentClient, signal: AbortSignal): Promise<void> {
+    const seen = new Set<number>();
+    let acked = 0;
+    const present = (msgs: AgentInboxMessage[], away: boolean): void => {
+      const fresh = msgs.filter((m) => !seen.has(m.seq));
+      if (!fresh.length || signal.aborted) return;
+      for (const m of fresh) seen.add(m.seq);
+      const through = Math.max(...fresh.map((m) => m.seq));
+      const text = (away ? `\nwhile you were away (${fresh.length}):\n` : '\n') + fresh.map(renderInboxMessage).join('\n');
+      show(text, () => {
+        if (through <= acked) return;
+        acked = through;
+        // Best-effort: a window that lost the seat cannot ack (409), and the
+        // owner's next window shows the message again.
+        client.ackInbox?.(through).catch(() => undefined);
+      });
+    };
+    const readUnread = async (away: boolean): Promise<number | undefined> => {
+      const page = await client.inbox!();
+      present(page.data, away);
+      return page.cursor;
+    };
+    let cursor: number | undefined;
+    try {
+      cursor = await readUnread(true);
+    } catch {
+      // The feed still runs; its first event, or a reset, catches up.
+    }
+    if (signal.aborted || !client.events) return;
+    try {
+      for await (const e of client.events({ after: cursor, signal })) {
+        // An inbox message's seq is its event's.
+        if (e.type === 'inbox.message') present([{ ...(e.data as unknown as AgentInboxMessage), seq: e.seq }], false);
+        // The agent could not serve our position: what we may have missed
+        // is in the inbox itself.
+        else if (e.type === 'reset') await readUnread(false).catch(() => undefined);
+      }
+    } catch {
+      // A 4xx: this agent no longer serves the feed. Nothing to say at the
+      // prompt about it; /inbox still reads the inbox.
+    }
+  }
+
+  const stop = (): void => {
+    ac?.abort();
+    ac = null;
+    current = undefined;
+  };
+  return {
+    follow(client) {
+      if (client === current) return;
+      stop();
+      if (!client?.inbox) return;
+      current = client;
+      ac = new AbortController();
+      void run(client, ac.signal);
+    },
+    stop,
+  };
 }
 
 let knownAgentIds: string[] = [];
@@ -285,6 +428,8 @@ const L1_ARGS: Record<string, string[] | (() => string[])> = {
 const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/think': ['low', 'high', 'max'],
   '/reset': ['pick'],
+  '/cancel': ['all'],
+  '/inbox': ['all'],
   '/settings': ['provider=', 'model=', 'thinking=', 'others='],
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
@@ -356,6 +501,34 @@ export function completeLine(
 // The live readline interface — askSecret scrubs submitted secrets out of
 // its history (display masking alone leaves the plaintext one ↑ away).
 let activeRl: readline.Interface | null = null;
+
+/**
+ * Print a block above the live prompt, keeping what the user has typed. The
+ * prompt and its input are erased from their first row down, the block is
+ * written, and readline redraws the prompt below it. Its redraw first moves
+ * up as many rows as the cursor sat below the prompt's first row (the
+ * prompt's own leading newline counts), so that many blank rows are left for
+ * it to land on. Without a terminal there is no prompt to keep: the block is
+ * just written. `rl`/`output` are the session's; exported for the tests,
+ * which pass a readline over a captured stream.
+ */
+export function printAbovePrompt(
+  text: string,
+  rl: readline.Interface | null = activeRl,
+  output: NodeJS.WritableStream = process.stdout,
+): void {
+  if (!rl || !rl.terminal) {
+    output.write(text.startsWith('\n') ? text : `\n${text}`);
+    return;
+  }
+  const { rows } = rl.getCursorPos();
+  readline.moveCursor(output, 0, -rows);
+  readline.cursorTo(output, 0);
+  readline.clearScreenDown(output);
+  output.write(text.endsWith('\n') ? text : `${text}\n`);
+  output.write('\n'.repeat(rows));
+  rl.prompt(true);
+}
 import type { CommandContext } from '../types';
 import { cellText, cleanCell, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
 
@@ -512,19 +685,63 @@ async function refreshSession(s: Session, quiet = false): Promise<void> {
   if (reason) out(`  last error: ${reason}\n`);
 }
 
+/** An agent's container state just before a lifecycle request was sent. */
+export interface LifecycleBaseline {
+  /** The container stage's `at`, in ms (server clock); undefined when it has none. */
+  at?: number;
+  state?: string;
+  sandboxId?: string;
+}
+
+/**
+ * Read the row a lifecycle request is about to change. The attestor answers
+ * `/reset` and `/start` with 202 before its worker touches the row, so the
+ * wait compares against this. undefined when the row cannot be read; the wait
+ * then takes the row as it finds it.
+ */
+export async function lifecycleBaseline(attestorUrl: string, sealId: `0x${string}`): Promise<LifecycleBaseline | undefined> {
+  try {
+    const d = (await (await fetch(`${attestorUrl}/deployment/${sealId}`, { signal: AbortSignal.timeout(10_000) })).json()) as {
+      sandbox_id?: string; container_stage?: { state?: string; at?: string };
+    };
+    const at = Date.parse(d.container_stage?.at ?? '');
+    return { at: Number.isFinite(at) ? at : undefined, state: d.container_stage?.state, sandboxId: d.sandbox_id };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Wait for a deployment to reach `running` by polling the attestor's public
  * /deployment/:sealId — and FAIL LOUD instead of hanging: a `failed`/`offline`
  * phase (or a failed container_stage) surfaces its recorded reason
  * immediately, and the timeout produces an error naming the last phase seen.
+ *
+ * With a `baseline` (the row read before a reset or start was sent), the row
+ * as it was then is not this request's outcome: until the worker moves the
+ * container on (a new start or create, a new sandbox, a stage written after
+ * the baseline), the wait shows `queued` and neither a still-running old
+ * container nor an earlier failure ends it.
  */
 class WaitCancelled extends Error { constructor() { super('wait cancelled'); } }
 
-async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: string, timeoutMs = 360000, signal?: AbortSignal): Promise<{ url: string }> {
+export async function pollRunning(
+  attestorUrl: string,
+  sealId: `0x${string}`,
+  agentId: string,
+  timeoutMs = 360000,
+  signal?: AbortSignal,
+  opts: { baseline?: LifecycleBaseline; intervalMs?: number } = {},
+): Promise<{ url: string }> {
+  const { baseline, intervalMs = 4000 } = opts;
   const deadline = Date.now() + timeoutMs;
   const t0 = Date.now();
   let lastPhase = 'contacting attestor';
   let lastShown = '';
+  // Whether the request has visibly started: a fresh `submitted` stage, a new
+  // sandbox, or a stage written after the baseline other than the old
+  // container's own running reports.
+  let progressed = !baseline;
   // Transient progress line between phase changes — a deploy sits minutes in
   // one phase with zero output otherwise. Repainted each second; phase-change
   // lines and the final result overwrite it. TTY only.
@@ -550,15 +767,22 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
       const d = (await (await fetch(`${attestorUrl}/deployment/${sealId}`)).json()) as {
         phase?: string; url?: string; sandbox_id?: string;
         agent_card?: { url?: string };
-        container_stage?: { state?: string; reason?: string };
+        container_stage?: { state?: string; reason?: string; at?: string };
       };
-      lastPhase = d.phase ?? lastPhase;
+      if (!progressed && baseline) {
+        const at = Date.parse(d.container_stage?.at ?? '');
+        const fresh = Number.isFinite(at) && (baseline.at === undefined || at > baseline.at);
+        const state = d.container_stage?.state;
+        progressed = (fresh && !(state === 'confirmed' && baseline.state === 'confirmed'))
+          || (d.sandbox_id !== undefined && d.sandbox_id !== baseline.sandboxId);
+      }
+      lastPhase = progressed ? (d.phase ?? lastPhase) : 'queued';
       if (lastPhase !== lastShown) { clearSpinner(); out(`  … ${lastPhase}\n`); lastShown = lastPhase; }
       const cardBase = d.agent_card?.url?.replace(/\/hello$/, '');
       const url = d.url ?? cardBase ?? (d.sandbox_id && cfg.sandbox_proxy_addr ? containerUrl(d.sandbox_id, cfg.sandbox_proxy_addr) : undefined);
-      if (d.phase === 'running' && url) return { url };
+      if (progressed && d.phase === 'running' && url) return { url };
       const reason = d.container_stage?.state === 'failed' ? d.container_stage?.reason : undefined;
-      if (d.phase === 'failed' || reason) {
+      if (progressed && (d.phase === 'failed' || reason)) {
         throw new CliError('UNKNOWN', `agent ${agentId} did not start: ${reason ?? `phase=${d.phase}`}`, {
           remedy: `run \`reset ${agentId}\` to recreate the container once the cause is fixed`,
         });
@@ -568,12 +792,17 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
       // transient fetch error — keep polling until the deadline
     }
     if (Date.now() > deadline) {
+      if (!progressed) {
+        throw new CliError('UNKNOWN', `agent ${agentId} did not come online: the attestor had not started this request after ${Math.round(timeoutMs / 1000)}s`, {
+          remedy: 'a request that waits too long in the attestor\'s queue expires and leaves the agent as it was — run the command again',
+        });
+      }
       throw new CliError('UNKNOWN', `timed out after ${Math.round(timeoutMs / 1000)}s waiting for agent ${agentId} (last phase: ${lastPhase})`, {
         remedy: 'check `status` — provisioning can lag; retry the command when the phase moves',
       });
     }
     if (signal?.aborted) throw new WaitCancelled();
-    await new Promise((r) => setTimeout(r, 4000));
+    await new Promise((r) => setTimeout(r, intervalMs));
     if (signal?.aborted) throw new WaitCancelled();
   }
   } finally {
@@ -584,11 +813,11 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
 
 /** pollRunning wired to the Esc/Ctrl-C interrupt: cancelling abandons the
  *  WAIT only — the lifecycle operation keeps going server-side. */
-async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sealId: `0x${string}`, agentId: string): Promise<{ url: string } | null> {
+async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sealId: `0x${string}`, agentId: string, baseline?: LifecycleBaseline): Promise<{ url: string } | null> {
   const ac = new AbortController();
   irq.streaming = ac;
   try {
-    return await pollRunning(attestorUrl, sealId, agentId, 360000, ac.signal);
+    return await pollRunning(attestorUrl, sealId, agentId, 360000, ac.signal, { baseline });
   } catch (e) {
     if (e instanceof WaitCancelled || ac.signal.aborted) {
       out('\n(wait cancelled — the operation continues server-side; check with `list` or re-enter with `use`)\n');
@@ -1102,8 +1331,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           if (row.phase !== 'stopped' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
           if (!(await ensureOwnerReady(ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
           out(`starting agent ${row.agentId}… (Esc cancels the wait)\n`);
+          const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
           await ag.agent.start(row.sealId, row.sandboxId);
-          const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId);
+          const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
           if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
           continue;
         }
@@ -1117,13 +1347,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         } else {
           framework = await pickFramework(attestorUrl, ask, row.framework ?? undefined);
         }
-        const provider = await agentInferenceProvider(ag, row.sealId);
+        const plan = await resetInferencePlan(ag, row.sealId, await readDeploymentFacts(attestorUrl, row.sealId));
+        const provider = plan.provider;
         await ag.agent.assertProviderSupported(provider, { sealId: row.sealId, framework });
         const apiKey = await inferenceKey(ctx, ask, provider);
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
+        await applyResetInference(ag, row.sealId, plan, out);
         out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
+        const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
         await ag.agent.reset(row.sealId, { provider, framework, apiKey });
-        const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId);
+        const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
         if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
         continue;
       }
@@ -1158,7 +1391,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
-        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined);
+        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework);
         continue;
       }
 
@@ -1480,8 +1713,9 @@ let cachedClient: { key: string; ag: AgenticID } | null = null;
  * Returns the document now in force (unchanged on a bare show), so a caller
  * like /think can report the level that actually landed.
  */
-async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string): Promise<SettingsDoc | null> {
+async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null): Promise<SettingsDoc | null> {
   const assignments = parseAssignments(args); // throws CliError on a bad key/level
+  assertOthersFitFramework(assignments, framework);
   const { settings: current, version } = await ag.agent.getSettings(sealId);
   if (!assignments.length) {
     for (const l of renderSettings(current)) out(`  ${l}\n`);
@@ -1866,6 +2100,15 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
   return true;
 }
 
+/**
+ * Whether the deploy wizard offers `framework` only models with tool use: the
+ * tool-driven frameworks, the harness under either of its names (`dsh` on a
+ * network still on AgentDNA 1.3, see `isHarnessFramework`).
+ */
+export function frameworkNeedsToolModels(framework: string): boolean {
+  return framework === 'openclaw' || framework === 'prime-agent' || isHarnessFramework(framework);
+}
+
 async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string) => Promise<string>, ctx: CommandContext, irq: Interrupt): Promise<Session | null> {
   const cfg = (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(10_000) })
     .then((r) => r.json())
@@ -1889,10 +2132,9 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   const provider = await pickInferenceProvider(ask, loadConfig().inferenceProvider ?? '0g-compute');
   const definition = knownProviders.find((entry) => entry.id === provider)!;
   await ag.agent.assertProviderSupported(provider, { framework });
-  const NEEDS_TOOLS = new Set(['openclaw', 'dsh', 'prime-agent']);
   const caps = await ag.agent.listModelCaps({ provider });
   const models = caps.filter((model) => model.chat)
-    .filter((model) => !NEEDS_TOOLS.has(framework) || model.tools)
+    .filter((model) => !frameworkNeedsToolModels(framework) || model.tools)
     .filter((model) => framework !== 'hermes' || definition.native || model.formats.includes('openai') || (!model.formats.length && !model.id.startsWith('claude')))
     .map((model) => model.id);
   let model: string;
@@ -2036,7 +2278,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /clear /compact /tasks /result /cancel /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /clear /compact /tasks /result /cancel /inbox /schedules /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -2067,24 +2309,40 @@ const L2_HELP_FULL = `session commands
                           is untouched; that is the difference from /reset
   /compact                compact the agent's conversation in place — older
                           history becomes a summary, the newest part stays
-                          as it is (openclaw ~20K tokens, dsh its newest
-                          item), and the conversation goes on (unlike
+                          as it is (openclaw ~20K tokens, 0g-harness its
+                          newest item), and the conversation goes on (unlike
                           /clear). One or more model calls; can take
-                          minutes. dsh, and openclaw 2026.7.1 or later
-  /tasks                  this session's long tasks with live status — on
-                          agents with the responses transport a chat turn
-                          survives dropped connections and keeps running
+                          minutes. 0g-harness, and openclaw 2026.7.1 or later
+  /tasks                  on 0g-harness: everything that runs or ran on the
+                          agent — your turns, the turns it opened itself,
+                          background commands and subagents — with who did
+                          each (BY) and who asked (FOR). Elsewhere: this
+                          session's long tasks with live status — on agents
+                          with the responses transport a chat turn survives
+                          dropped connections and keeps running
   /result [id]            re-attach to a task (default: latest): prints a
-                          finished one, follows a running one live
-  /cancel [id]            stop tasks — the brake for orphaned turns: Esc only
-                          cancels a turn THIS connection started (on dsh/prime
-                          it interrupts the bridge-wide current turn), so after
-                          a dropped stream /cancel is the way to stop what
-                          survived. Bare form stops everything this session
-                          knows to be in flight (newest first); with an id,
-                          just that one — /result <id> adopts an id into the
-                          session first. Session memory starts empty after a
-                          CLI restart or /back + use
+                          finished one, follows a running one live; on
+                          0g-harness also a subagent's answer or a command's
+                          status
+  /cancel [id|all]        stop tasks — the brake for orphaned turns: Esc only
+                          cancels a turn THIS connection started (on
+                          0g-harness and prime it interrupts the agent-wide
+                          current turn), so after a dropped stream /cancel
+                          is the way to stop what survived. Bare form stops
+                          everything this session knows to be in flight
+                          (newest first); with an id, just that one —
+                          /result <id> adopts an id into the session first.
+                          Session memory starts empty after a CLI restart or
+                          /back + use. On 0g-harness an id can be any task
+                          /tasks lists, and /cancel all stops everything
+                          running on the agent
+  /inbox [all]            what the agent said on its own (0g-harness): a
+                          background job finished, a reminder came due. It
+                          prints above the prompt as it arrives, and what
+                          came while you were away prints when you enter.
+                          Bare: unread messages; all: the read ones too
+  /schedules              the reminders the agent set for itself
+                          (0g-harness)
   /agentlog [n]           agent process log, last n lines (owner-only)
   /startuplog [n]         sealed runtime startup log, last n lines
   /back  (or /unuse)      return to the manager
@@ -2145,6 +2403,20 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     };
 
   irq.brake = makeBrake(() => s.client, out, displacedSeat, () => seatPromptPending);
+  // What the agent says on its own (a background job finished, a reminder
+  // came due) arrives at any time. At the session prompt it prints above the
+  // prompt; during a command, a chat turn or any other question it waits for
+  // the next session prompt, so it never lands inside a reply.
+  let atPrompt = false;
+  const held: Array<{ text: string; shown: () => void }> = [];
+  const inbox = makeInboxFeed((text, shown) => {
+    if (atPrompt) {
+      printAbovePrompt(text);
+      shown();
+    } else {
+      held.push({ text, shown });
+    }
+  });
   // A friendly message that hides WHICH failure happened costs a whole
   // debugging round trip: "no headers ever arrived" and "the stream was cut
   // mid-way" have different causes and used to print identically. Append the
@@ -2165,7 +2437,18 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // connecting the moment it reaches running). Once connected, skip: no
     // per-chat-line attestor round-trip; bare Enter stays the manual refresh.
     if (!s.client) { try { await refreshSession(s, true); } catch { /* prompt anyway */ } }
-    const line = (await ask(`\nagent ${s.agentId} › `)).trim();
+    inbox.follow(s.client);
+    for (const h of held.splice(0)) {
+      out(h.text);
+      h.shown();
+    }
+    atPrompt = true;
+    let line: string;
+    try {
+      line = (await ask(`\nagent ${s.agentId} › `)).trim();
+    } finally {
+      atPrompt = false;
+    }
     if (!line) {
       // Bare Enter = live status refresh (phase moves on its own during
       // deploying/provisioning; the entry card only showed the initial one).
@@ -2244,8 +2527,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (s.phase === 'running') { out('already running\n'); continue; }
         if (s.phase !== 'stopped' || !s.sandboxId) { out(`agent is ${s.phase} — a plain start cannot revive it; use /reset\n`); continue; }
         if (!(await ensureOwnerReady(s.ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
-        out('starting… (Esc cancels the wait)\n'); await s.ag.agent.start(s.sealId, s.sandboxId);
-        const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
+        out('starting… (Esc cancels the wait)\n');
+        const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
+        await s.ag.agent.start(s.sealId, s.sandboxId);
+        const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
         if (!r) continue;
         await connectSession(s, r.url);
         out(`running at ${s.url}\n`); continue;
@@ -2260,13 +2545,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         } else {
           s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
         }
-        const provider = await agentInferenceProvider(s.ag, s.sealId);
+        const plan = await resetInferencePlan(s.ag, s.sealId, await readDeploymentFacts(s.attestorUrl, s.sealId));
+        const provider = plan.provider;
         await s.ag.agent.assertProviderSupported(provider, { sealId: s.sealId, framework: s.framework });
         const apiKey = await inferenceKey(ctx, ask, provider);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
+        await applyResetInference(s.ag, s.sealId, plan, out);
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
+        const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
         await s.ag.agent.reset(s.sealId, { provider, framework: s.framework, apiKey });
-        const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
+        const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
         if (!r) continue;
         await connectSession(s, r.url);
         messages.length = 0; out(`back up at ${s.url}\n`); continue;
@@ -2352,7 +2640,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // with, and how hard. Bare shows it; key=value writes it (merged).
         // Owner-signed in both directions, so it needs the wallet client and
         // not the session's (possibly keyless) one.
-        await settingsOp(await withWallet(ctx), s.sealId, tokenize(line).slice(1), s.client && s.url ? s.url : undefined);
+        await settingsOp(await withWallet(ctx), s.sealId, tokenize(line).slice(1), s.client && s.url ? s.url : undefined, s.framework);
         continue;
       }
       if (line === '/think' || line.startsWith('/think ')) {
@@ -2383,6 +2671,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/tasks') {
+        // An agent with its own task list (0g-harness) answers for everything that
+        // runs on it: every turn, yours and the ones it opened itself, and
+        // every background command and subagent, with who did each.
+        if (s.client?.tasks) {
+          const list = await s.client.tasks({ limit: 30 });
+          if (!list.length) { out('nothing has run on this agent yet\n'); continue; }
+          for (const l of renderTaskTable(list, Date.now())) out(`${l}\n`);
+          out('/result <id> shows one · /cancel <id> stops one · /cancel all stops everything running\n');
+          continue;
+        }
         // Long-task surface (responses transport). The list is this session's
         // memory of submitted ids; status is fetched live from the agent.
         if (!s.client?.task) { out('(this agent has no task surface — chat turns are connection-bound here)\n'); continue; }
@@ -2407,8 +2705,21 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/result' || line.startsWith('/result ')) {
+        // A background command or a subagent is not a turn: its record is
+        // the task list's, and it has no stream to follow.
+        const named = line.split(/\s+/)[1];
+        if (named && s.client?.taskInfo) {
+          const t = await s.client.taskInfo(named).catch(() => null);
+          if (t && t.type !== 'turn') {
+            out(`${cleanCell(t.id)} — ${t.status} · by ${t.actor} · ${cleanCell(t.label)}\n`);
+            if (t.output_text) out(`${t.output_text}\n`);
+            else if (t.type === 'command') out('(a command\'s output goes to the agent, which reports on it when the command finishes — /inbox)\n');
+            if (t.error) out(`error: ${cleanCell(t.error)}\n`);
+            continue;
+          }
+        }
         if (!s.client?.task || !s.client.followTask) { out('(this agent has no task surface)\n'); continue; }
-        const id = line.split(/\s+/)[1] ?? s.tasks?.[s.tasks.length - 1]?.id;
+        const id = named ?? s.tasks?.[s.tasks.length - 1]?.id;
         if (!id) { out('no task to show — /result <id>, or start one by chatting\n'); continue; }
         // Adopt an explicitly-named id into this session's task memory: the
         // id may come from another window, a /tasks listing before a restart,
@@ -2457,6 +2768,27 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // survival is the feature). /cancel is the explicit brake: by id, or
         // everything in flight this session knows.
         let id = line.split(/\s+/)[1];
+        // An agent with its own task list (0g-harness) stops any of its tasks by id
+        // (a turn, a background command, a subagent), and all of them at once.
+        if (id && s.client.stopTask && s.client.stopAllTasks) {
+          for (;;) {
+            try {
+              const stopped = id === 'all' ? await s.client.stopAllTasks() : [await s.client.stopTask(id)];
+              if (!stopped.length) out('nothing running\n');
+              for (const x of stopped) out(`⏹ ${cleanCell(x.id)} — ${STOP_OUTCOME[x.outcome] ?? x.outcome}\n`);
+              break;
+            } catch (e) {
+              const d = await routeTaskFailure(out, displacedSeat, e, `(cancel failed: ${(e as Error).message})\n`, `retry /cancel ${id}`);
+              if (d === 'reclaimed') continue; // seat is back — retry
+              break;
+            }
+          }
+          continue;
+        }
+        if (id === 'all') {
+          out('(this agent has no task list: bare /cancel stops what this session started, /stop stops the whole container)\n');
+          continue;
+        }
         if (!id && s.client?.task) {
           if (!s.tasks?.length) { out('no task id given and none started from this session — /cancel <id>, or /tasks to list (after a CLI restart or /back+use, this session starts empty)\n'); continue; }
           // Fetch live statuses; a fetch FAILURE is not "not in flight" —
@@ -2484,8 +2816,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             continue;
           }
           // A brake stops everything in flight, newest first — stopping only
-          // the newest would leave an older running turn alive (dsh/prime
-          // serialize turns, so a queued one is waiting on the running one).
+          // the newest would leave an older running turn alive (0g-harness and
+          // prime serialize turns, so a queued one is waiting on the running one).
           const inFlight = inFlightIds(rows);
           if (!inFlight.length) { out('nothing in flight from this session — /tasks to list; a finished task cannot be cancelled\n'); continue; }
           if (s.client?.cancelTask) {
@@ -2528,7 +2860,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (id && !s.client?.cancelTask) {
           // An id was asked for but this image has no task-level cancel: do
           // NOT silently interrupt "whatever is running" instead — but on
-          // dsh/prime the bridge-wide interrupt DOES stop the running turn,
+          // 0g-harness and prime the agent-wide interrupt DOES stop the running turn,
           // so point there instead of claiming nothing can be done.
           out(s.client?.interrupt
             ? '(this agent image has no per-task cancel — the bridge interrupt stops the current running turn; try /cancel with no id)\n'
@@ -2546,6 +2878,27 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing to stop, or: ${r.note ?? 'not supported'})\n`);
         continue;
       }
+      if (line === '/inbox' || line === '/inbox all') {
+        if (!s.client) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
+        if (!s.client.inbox) { out('(no inbox on this agent: its framework does not run work in the background)\n'); continue; }
+        const all = line === '/inbox all';
+        const page = await s.client.inbox(all ? { after: 0 } : {});
+        if (!page.data.length) { out(all ? 'the inbox is empty\n' : 'no new messages — /inbox all shows the ones already read\n'); continue; }
+        out(page.data.map(renderInboxMessage).join('\n'));
+        const through = Math.max(...page.data.map((m) => m.seq));
+        if (through > page.read_through) await s.client.ackInbox?.(through).catch(() => undefined);
+        continue;
+      }
+      if (line === '/schedules') {
+        if (!s.client) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
+        if (!s.client.schedules) { out('(no reminders on this agent: its framework does not support them)\n'); continue; }
+        const r = await s.client.schedules();
+        if (!r.enabled) { out('reminders are off on this agent (the "schedule" switch in /settings others)\n'); continue; }
+        if (!r.data.length) { out('no reminders set — the agent sets one when you ask it to remind you of something\n'); continue; }
+        for (const l of renderSchedules(r.data, Date.now())) out(`${l}\n`);
+        out('to remove one, ask the agent to\n');
+        continue;
+      }
       if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
     } catch (e) {
       // Show the remedy too: an error whose whole point is "do this instead"
@@ -2559,7 +2912,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (!s.client.chatStream) { out('(chat unavailable on this agent)\n'); continue; }
     messages.push({ role: 'user', content: line });
     // `model` is a per-framework selector some gateways require (openclaw
-    // does; the dsh/prime bridges ignore it). Send it when known, omit it
+    // does; 0g-harness and the prime bridge ignore it). Send it when known, omit it
     // otherwise — and only if the framework rejects that, ask once and retry.
     let retriedWithPick = false;
     for (;;) {
@@ -2599,7 +2952,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       const onActivity = process.stdout.isTTY
         ? (label: string): void => {
             // "did work this turn" detector, across bridges' label dialects:
-            // dsh "tool/call bash", prime "tool_execution_start — bash" /
+            // 0g-harness "tool/call bash", prime "tool_execution_start — bash" /
             // "bash_command_start", hermes "tool/call web_search". Thinking
             // alone doesn't count — a think-only turn with no output is still
             // a failure worth reporting.
@@ -2704,7 +3057,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue; // retry the same user message once with the selector
       }
       // A turn that ran tools but produced no text is WORK, not failure —
-      // dsh agents legitimately end tool-only turns silently. Say what
+      // 0g-harness agents legitimately end tool-only turns silently. Say what
       // happened instead of crying wolf (the true-failure path — no deltas,
       // no activity — still reports as an error).
       // Displaced by another window (occupancy.go): WeChat semantics — this
@@ -2734,5 +3087,6 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   }
   } finally {
     irq.brake = null; // leaving the session: idle-Esc no longer targets this agent
+    inbox.stop();
   }
 }

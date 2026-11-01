@@ -11,9 +11,9 @@ bridge,见 §13)。第四个 `claudecode`(CLI 型框架,
 经 HTTP bridge 托管)是当初用来验证 seam 的探针,**已下线**——每次请求
 现拉起的 CLI 托不住这个平台真正要的"owner 委托、可对外调用的服务"
 (openclaw 的常驻 server 才行)。适配器代码已移除,但移植过程的经验正是
-这份契约里很多条款的由来,见 §12 实录。第五个 `dsh`(DeepSeek Harness)
-是一个由 Cordis 插件组合出来的 harness,由 sealed 自建的桥来驱动;组合和
-能力档位见 `internal/framework/dsh/README.zh.md`,移植实录见 §14。
+这份契约里很多条款的由来,见 §12 实录。第五个 `0g-harness`(旧名 `dsh`)
+是平台自己的 harness,用 DeepSeek Harness(DSH)的插件组合而成,由 sealed 作为框架进程运行;
+组合和能力档位见 `internal/framework/harness/README.zh.md`,移植实录见 §14。
 
 权威来源是代码:接口定义在
 [`internal/framework/framework.go`](internal/framework/framework.go);
@@ -85,7 +85,7 @@ sealed 的五个组件各自通过一个窄切面消费它:
   个模式),这样它的度量跟着 sealed 镜像哈希走。接入一个我们已有生态的新
   框架不需要新镜像,顶多加一行热缓存;新生态则需要。这是设计意图;今天实际发布
   的并非如此:openclaw 跑在 `sealed/Dockerfile` 上(FROM `images/openclaw/`
-  base),同样是 node 的 dsh 有自己的 `images/dsh/`,`images/sealed/` 不构建任何
+  base),同样是 node 的 0g-harness 有自己的 `images/harness/`,`images/sealed/` 不构建任何
   实际发布的镜像。
 
 - **owner 的配置从头到尾归 core,只剩最后一步归你。** attestor 把 owner 的
@@ -181,7 +181,7 @@ sealed 的五个组件各自通过一个窄切面消费它:
   | openclaw(`openclaw.go:164`) | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `~/.openclaw/openclaw.json`,每次 spawn 重新渲染 |
   | hermes(`hermes.go:143`) | `framework`、`SOUL.md`、`memories/`、`skills/` | `~/.hermes/config.yaml`,每次 spawn 重新渲染 |
   | prime-agent(`prime.go:162`) | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `~/.prime/agent/models.json`,每次 spawn 重新渲染 |
-  | dsh(`dsh.go:153`) | `framework`、`APPEND_SYSTEM.md`、`skills/` | 没有——桥进程的环境变量 |
+  | 0g-harness(`harness.go:167`) | `framework`、`APPEND_SYSTEM.md`、`skills/` | 没有——harness 进程的环境变量 |
 
   `openclaw.json`、`config.yaml`、`models.json`、`settings.yaml` 曾经都是
   role,直到 owner 的 settings 文档成为推理 pin 的持久归宿。把一个派生产物
@@ -358,15 +358,15 @@ role,为它拒绝启动比部分迁移更糟。
 
 ——从不书写任何框架的配置 schema。**`system_prompt` 那一半**的翻译是你的
 adapter 的职责:映射到你自己的路径驱动产物上(openclaw → `SOUL.md`,
-hermes → `SOUL.md`,prime 和 dsh → `APPEND_SYSTEM.md`)。忽略 `persona`
+hermes → `SOUL.md`,prime 和 0g-harness → `APPEND_SYSTEM.md`)。忽略 `persona`
 的 adapter 会把 owner 在 mint 时写的 prompt 静默丢掉——claudecode 移植初版
 恰好带着这个 bug 出厂,这条规则因此成文。
 
 **`inference` 那一半已经不归你持久化了。** 推理 pin 的归宿是 owner 的
 settings 文档(§5.5),`RenderSettings` 会在每次 spawn 前从它重建框架配置,
 所以摄入写下去的东西过一会就被覆盖。留一份副本只会制造第二个真相源,而且
-恰恰在文档为空的那些开机上,陈旧的那份会赢。所以 prime 和 dsh 只把种子里的
-pin 记进日志、不落盘(`prime/persona.go:114-135`、`dsh/persona.go:123-135`);
+恰恰在文档为空的那些开机上,陈旧的那份会赢。所以 prime 和 0g-harness 只把种子里的
+pin 记进日志、不落盘(`prime/persona.go:114-135`、`harness/persona.go:123-135`);
 openclaw 和 hermes 仍然写,但现在只对"文档里没有 model"的 agent 有意义
 (`hermes/ingest.go:51-55`)。框架无法兑现种子的某部分时,记日志、保留自己
 的默认值,不要写下框架解析不了的配置。
@@ -378,8 +378,8 @@ openclaw 和 hermes 仍然写,但现在只对"文档里没有 model"的 agent �
 ### 5.5 设置:`RenderSettings`
 
 `RenderSettings(ctx, s settings.Resolved) error` 把 owner 的配置放到**这个**
-框架读得到的地方——openclaw 和 hermes 是配置文件,prime-agent 和 dsh 是桥进程
-的环境变量(prime 还会写一份 `models.json` provider 注册,因为那是给它的 SDK
+框架读得到的地方——openclaw 和 hermes 是配置文件,prime-agent 是桥进程的环境变量,
+0g-harness 是 harness 进程的环境变量(prime 还会写一份 `models.json` provider 注册,因为那是给它的 SDK
 注册一个没有内置 provider 的唯一办法)。这是整条配置通道里唯一没法共享的一步,
 因为只有你的 adapter 懂你框架的方言。
 
@@ -403,7 +403,7 @@ provider 回退到 compute 的 endpoint 或 key。见
 Facts/Endpoint 这个拆分是承重的,也正是"原生 provider 现在照样拿得到
 reasoning bound"的原因。两者原本共用一个结构、挡在同一个
 `provider == "0g-compute"` 判断后面,所以选原生 provider 会连 bound 带 endpoint
-一起被静默跳过——hermes 和 dsh 都犯过(`inference/zgcompute.go:57-65`)。Facts
+一起被静默跳过——hermes 和 0g-harness 的适配器都犯过(`inference/zgcompute.go:57-65`)。Facts
 对每个 provider 都适用;只有 `Endpoint` 以"是否平台路由"为门。
 
 三个 accessor 封装了你不该自己重造的 gating:
@@ -439,10 +439,10 @@ reasoning bound"的原因。两者原本共用一个结构、挡在同一个
 今天四个随包 adapter 没有一个渲染进被追踪路径——`openclaw.json` 在
 `workspace/` 旁边而不是里面,`config.yaml` 在 hermes 明确的"永不追踪"清单上
 (`hermes/paths.go`),`models.json` 在 `primeHome` 之下但不在任何被追踪路径下
-(`prime/paths.go`),dsh 渲染的是环境变量。所以对今天的 adapter 而言,这条既是
+(`prime/paths.go`),0g-harness 渲染的是环境变量。所以对今天的 adapter 而言,这条既是
 给"第一个真的渲染进 role 的 adapter"留的保证,也是一条朴素的运维理由:渲染每次
 spawn 都跑,一个字节逐次开机都变的文件谁也没法推理。四个 adapter 还是都测了
-(openclaw 和 dsh 的 `TestRenderSettings_Idempotent`、hermes 的
+(openclaw 和 0g-harness 的 `TestRenderSettings_Idempotent`、hermes 的
 `TestRenderIdempotent`、prime 的 `TestRenderSettingsIsIdempotent`),包括目录
 故障下的那次(`TestRenderSettings_OutageRenderIsIdempotent`)——因为"把事实
 顺延下来"本身也必须是不动点。
@@ -454,10 +454,10 @@ effort bound、输出预算,以及任何凭据或 per-boot token。
 
 **是顺序、不是排除清单**,拦住 overlay 关掉平台的保护——比如钉死一个过期的
 base URL,或者关掉 `Effort()` 三态特意要守住的 reasoning bound。排除清单得一个
-键一个键地维护,而它悄悄漏掉的那个键,永远是下一个被加进来的。dsh 在自己的合并
+键一个键地维护,而它悄悄漏掉的那个键,永远是下一个被加进来的。0g-harness 适配器在自己的合并
 处把这点写明了:今天那里的顺序只是双保险——`parseKnobs` 只读它认识的键、每个键
 落在固定的变量名下,owner 写什么都撞不到平台变量——但当以后有人加一个新 knob 时,
-是这个顺序而不是某份清单让它继续成立(`dsh/settings.go:settingsEnv`)。
+是这个顺序而不是某份清单让它继续成立(`harness/settings.go:settingsEnv`)。
 
 上面的 gating 推出来的一条推论:**平台并不真的知道的值就不写,也不去擦掉磁盘上
 已有的值。** 只有 `CatalogSourced` 时才用 `Facts` 写平台键;否则把上一份条目的
@@ -527,8 +527,8 @@ sealed 编出来、看上去像手工设定的数字
 三条路径里有两条跑在进程还不存在、或正在被替换的时刻,所以**不要对 owner 或
 agent 写的任何东西报错**。PreStart 路径上的错误不是"一次被拒的推送",而是一个
 起不来的 agent——而且会一直起不来,因为造成它的那份文档正是 attestor 存着的那份。
-dsh 把 overlay 里每一个畸形值退回出厂默认并记日志,超范围、类型不对、整个不是
-对象,一个策略处理到底(`dsh/settings.go:parseKnobs`);openclaw 把解析不了的
+0g-harness 把 overlay 里每一个畸形值退回出厂默认并记日志,超范围、类型不对、整个不是
+对象,一个策略处理到底(`harness/settings.go:parseKnobs`);openclaw 把解析不了的
 `openclaw.json` 挪到一边重建,而不是把 parse 错误抛出去——那曾经既致命又自我
 延续:Start 没有成功的渲染就拒绝运行,而又没有任何东西修这个文件,agent 一直
 离线到有人重置容器(`openclaw/inference.go:loadConfigForRender`)。硬错误留给
@@ -542,7 +542,7 @@ dsh 把 overlay 里每一个畸形值退回出厂默认并记日志,超范围、
 (§5.4)——而可选的 `SeededSettings() (settings.Doc, bool)` 就是 adapter 把回收
 到的文档交还给平台的方式。`main.go` **只在**已存文档没有 model 时才问它,所以
 真正的 owner 文档永远压过回收来的那份;拿到后用 `report.SeedSettings` 持久化
-(`main.go:649-677`)。
+(`main.go:735-764`)。
 
 时机就是全部意义所在。uploader 会按 `Roles()` 重建链上条目表并整体替换提交,所以
 watcher 第一个 tick 就会把这个已不再声明的 role 丢掉。如果那之前 pin 没被读出来
@@ -551,11 +551,11 @@ watcher 第一个 tick 就会把这个已不再声明的 role 丢掉。如果那
 `report.SeedSettings` 用 agentSeal 而不是 owner key 签名,因为开机时没有 owner
 在场。所以 attestor 必须把它当作严格弱于 owner 写入的东西:**只做 seed**,行上
 已经有 settings 就拒绝。容器可以找回一份丢失的文档;它绝不能改动 owner 亲自写下
-的那份(`report/report.go:66-85`)。这个调用是 best-effort ——失败只记日志,agent
+的那份(`report/report.go:134-138`)。这个调用是 best-effort ——失败只记日志,agent
 无论如何跑在回收到的 pin 上,下次开机再试。
 
-今天实现这个接口的 adapter 恰好只有一个:dsh,为它已下线的 `settings.yaml` role
-(`dsh/settings.go:286-338`)。openclaw、hermes、prime 都没实现,所以这三个上面
+今天实现这个接口的 adapter 恰好只有一个:0g-harness,为它已下线的 `settings.yaml` role
+(`harness/settings.go:305-357`)。openclaw、hermes、prime 都没实现,所以这三个上面
 的"通道之前"的 agent 会用 attestor 已经存着的那份文档开机;prime 的
 `HandleLegacy` 把这件事写得明明白白,并称把这些 pin 抬进文档"是平台的活",尚未
 落地(`prime/persona.go:114-135`)。你的框架曾经有过链上追踪的 pin 就实现它;等
@@ -675,7 +675,7 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 `Provider`、`Model`、`ZGComputeRouted`、`OwnerThinking` 还在结构里,但都是死的。
 凭据和 pin 一律从 `settings.Resolved` 取——读 `RuntimeContext.APIKey` 正是那个
 "平台路由的 endpoint 被空着 key 拨出去、线上 401"的缺陷
-(`openclaw/spawn.go:335-342`、`dsh/spawn.go:225-228`)。
+(`openclaw/spawn.go:335-342`、`harness/spawn.go:155-158`)。
 
 剩下的拿来做什么是 adapter 的策略,但 openclaw adapter 是参考实现:它往
 agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY)、
@@ -713,7 +713,7 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
   agent 的教义里*(见 [AGENT_DOCTRINE.zh.md](AGENT_DOCTRINE.zh.md));
   你的 adapter 应该装一套等价于 openclaw SOUL 规则的东西,让来自外部
   prompt 的签名请求被拒绝。如果你的 adapter 把 socket 桥接成 agent
-  工具(像 dsh 的 `seal_sign` 那样),它只能转发到这几个端点,**绝不**
+  工具(像 0g-harness 的 `seal_sign` 那样),它只能转发到这几个端点,**绝不**
   能加裸 hash 或 `0x00` 签名路径。任何一条都会让 agent 能伪造
   serve-proof。
 - **`/log`、`/log.html`、`/log/agent`(`.html`)** ——bootstrap 和
@@ -768,7 +768,7 @@ func TestConformance(t *testing.T) {
 }
 ```
 
-四个树内 adapter 都在跑它(`openclaw/`、`hermes/`、`prime/`、`dsh/` 的
+四个树内 adapter 都在跑它(`openclaw/`、`hermes/`、`prime/`、`harness/` 的
 `conformance_test.go`;已下线的 claudecode 移植当时也跑);它对 openclaw 的第一次运行就当场
 抓出两个真实 bug(§12)——把 conformance 红灯当成白捡的生产事故看待。
 
@@ -872,7 +872,7 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
    - **绝不移交 `$HOME`;把你的目录树链接进 agent 的家目录。** agent 有自己
      的家目录 `/home/agent`,它是 agent 运行的一切进程的 `HOME`,也是
      `AgentCommand` 的默认工作目录(spawn 可以把另一个 agent 拥有的目录设为
-     `Dir`,prime 和 dsh 的 bridge 就设成各自的框架目录树);`/root` 保持
+     `Dir`,prime 的 bridge 和 0g-harness 就设成各自的框架目录树);`/root` 保持
      `root:root 0711`。只对你的框架目录树调用 `privsep.OwnTree`(它会拒绝
      `/`、root 家目录、任何 PATH 目录或 sealed 可执行文件的祖先目录,以及
      sealed 状态目录里、或 sealed 所运行二进制的包目录里的任何东西),再调用
@@ -977,10 +977,11 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
     列表,所以不会读成未追踪路径)、版本白名单 +
     `ReconcileHow` 命令,以及——仅当你某个**被追踪** role 本身是按键过滤的
     文件时——`ConfigFile` + `ConfigKeys`,它们渲染出"只看这几个顶层键"那段。
-    prime 的 `harness_state.json` 是这一对最后的用户;openclaw、hermes、dsh
-    都留空,改为把自己渲染出来的配置文件列在 `Untracked` 里,明白告诉 agent
-    平台每次开机都会重写那些键、而且文件里什么都活不过一次容器重置
-    (`openclaw/platformtext.go:35`)。
+    prime 的 `harness_state.json` 是这一对最后的用户;openclaw、hermes、0g-harness
+    都留空。openclaw 和 hermes 改为把自己渲染出来的配置文件列在 `Untracked` 里,
+    明白告诉 agent 平台每次开机都会重写那些键、而且文件里什么都活不过一次容器重置
+    (`openclaw/platformtext.go:35`);0g-harness 不渲染文件,它的 `Untracked` 说明
+    模型和路由根本不是它家目录里的文件。
     `platform.AssembleAgentDoc(pc, facts)` 把平台那几段和你渲染出的事实拼起来
     ——单文件框架(hermes)整份注入一个 context 文件;openclaw 把平台段分散到
     IDENTITY/SOUL/TOOLS,但事实同样经 `platform.RenderFrameworkFacts` 取得。
@@ -1088,7 +1089,7 @@ dashboard),严格按本文档的契约实现,坏什么修什么。发现按严�
 17. 按框架分镜像被一个通用镜像取代(`images/sealed/`):框架安装是
     热缓存、claudecode bridge `go:embed` 进二进制、attestor allowlist
     只挂一个 hash。净效果:attestor 完全框架无关——它对框架的全部
-    知识只剩一张不透明名字清单。(此后 hermes、prime、dsh 各自发布了自己的
+    知识只剩一张不透明名字清单。(此后 hermes、prime、0g-harness 各自发布了自己的
     镜像,openclaw 从 `sealed/Dockerfile` 发布;`images/sealed/` 不构建任何实际
     发布的镜像。)
 18. 第 12 条毛边被生态解决:0g-compute 上线了 Anthropic 兼容端点
@@ -1247,30 +1248,32 @@ Start 校验已安装版本与 binding 是否一致,不一致就明确失败;并
 
 ## 14. 移植实录:接入 DeepSeek Harness(DSH)(2026-08)——第四个框架
 
-本节记这次移植的设计决策;组合与能力档位见
-[`internal/framework/dsh/README.zh.md`](internal/framework/dsh/README.zh.md)。
+本节记这次移植的设计决策。移植出的框架就是 0g-harness(旧名 `dsh`);组合与能力档位见
+[`internal/framework/harness/README.zh.md`](internal/framework/harness/README.zh.md)。
 
 DSH(`@deepseek-ai/dsh`)是一个由 Cordis 插件组合出来的 harness:模型、工具、
 skill、会话、存储、乃至系统提示本身,每一样都是独立版本化、独立可替换的插件包
 (约 50 个)。跟 openclaw、hermes、prime-agent 不同,它没有"框架自己的那个配置
-文件"这种东西——组合本身(装哪些插件、什么顺序、什么配置)就是本 adapter 写的
-平台结构:它放在 sealed 自己的桥里(`bridge/bridge.mjs`,go:embed 进二进制,
-Start 时落盘),跟本仓库为 prime-agent 自建 HTTP bridge 是同一件事。状态那一半
+文件"这种东西——组合本身(装哪些插件、什么顺序、什么配置)就是平台结构:它放在
+[0g-harness](https://github.com/0gfoundation/0g-harness)(`src/composition.mjs`)
+里,由 0g-harness 镜像在构建时安装。状态那一半
 ——`Roles`、`Defaults`、`Restore`/`EvolutionFor`、`HandleLegacy["persona"]`、
 `FrameworkFacts`——在 `conformance.Run` 之外还配了 persona 注入的专项测试;
-settings 通道落地后,渲染本身也有专项测试(`dsh/settings_test.go`:幂等、
+settings 通道落地后,渲染本身也有专项测试(`harness/settings_test.go`:幂等、
 overlay 解析、以及从已下线 role 回收 pin)。
 
 **角色集,以及跟另外三个 adapter 不一样的地方:**
 
-1. **`framework`** —— 协议保留的 binding leaf,跟每个 adapter 一样。DSH 的
-   release 序列和 npm 版本号是**同一个**序列(不像 prime-agent 的 tarball/npm
-   分裂),所以白名单直接说 npm 版本号。
+1. **`framework`** —— 协议保留的 binding leaf,跟每个 adapter 一样。白名单写的是
+   0g-harness 的版本号(它的 `package.json`);harness 的 `npm-shrinkwrap.json` 锁定它
+   下面的 DSH 包,所以一个 harness 版本对应一棵确定的依赖树。用旧名 `dsh` 铸造、
+   钉着 DSH 版本号的 binding,按本框架读入,并在 agent 第一次提交时改写
+   (`harness/harness.go` 的 `legacyFrameworkName`)。
 2. **`APPEND_SYSTEM.md`** —— owner persona,原样字节。DSH 没有 prime-agent
    `DefaultResourceLoader` 那种"从文件追加到系统提示"的原生约定;它自己的
    `persona` 概念是插件组合里的一个**配置值**,那是这个 adapter 自己撰写的
-   平台结构,不是 agent 状态。所以这个角色的字节靠 bridge 自己的代码
-   送到模型面前——boot 稳定之后调一次 `ctx.systemPrompt.section()`——而不是
+   平台结构,不是 agent 状态。所以这个角色的字节靠 harness 自己的代码
+   送到模型面前——启动时从 `SEAL_PERSONA_PATH` 指向的文件填进人设位置——而不是
    经过 DSH 自己会读的某个文件。这也意味着跟 prime-agent 一样不需要剥
    marker:没有任何平台产出的文字会跟这个角色的字节共用一处。
 3. **完全没有配置 role** —— 而且这条规则正是在这个 adapter 身上成型的。它
@@ -1279,12 +1282,12 @@ overlay 解析、以及从已下线 role 回收 pin)。
    `persona` 种子在第一次漂移提交后就从链上消失,所以这个 pin 需要一个路径
    驱动的持久归宿。owner 的 settings 文档是更好的归宿(§5.5),于是这个 role
    没了,文件也一起没了——没有东西写 `$DSH_HOME/settings.yaml`,没有东西读它,
-   `stripSecrets` 和它需要的 JSON/YAML 双形态拆分都已删除。桥仍然**故意不挂**
+   `stripSecrets` 和它需要的 JSON/YAML 双形态拆分都已删除。harness **故意不挂**
    `@deepseek-ai/dsh-settings-file`——它的热重载会把那个文件叠在组合之上,
    agent 改一下就能给自己注入任意推理路由;安全性质没变,只是已经没有东西
-   需要它保护了。"这个框架从哪读设置"现在的答案是桥进程的**环境变量**:
+   需要它保护了。"这个框架从哪读设置"的答案是 harness 进程的**环境变量**:
    `RenderSettings` 确定性地算出这些变量,`Start` 把它们交给它 spawn 的进程
-   (`dsh/settings.go:15-34`)。唯一残留的痕迹是"role 还在时铸造的 agent"链上
+   (`harness/settings.go:15-34`)。唯一残留的痕迹是"role 还在时铸造的 agent"链上
    仍带着的那条记录,`HandleLegacy` 会从里面把 pin 读出来,只读一次——这个
    adapter 是 `framework.LegacySettingsSeeder` 唯一的实现者(§5.5)。
 4. **`skills/`** —— `DirectoryManifest`,指向 `$DSH_HOME/skills/`,DSH 自己
@@ -1317,23 +1320,26 @@ skill、推理 pin),跟 openclaw、hermes 追踪的是同一个面;DSH 自己的
 `NO_PROVIDER`)——不需要另造一套等价机制:该有的形状是一个全放行的批准策略
 (约束 agent 的是 doctrine,不是一个权限弹窗),以及干脆不装那个结构化提问
 工具,让问题像在 openclaw、prime-agent 上一样以普通文字冒出来——这是免费的,
-因为 bridge 进程里那个 `Agent` 对象本来就长期存活,一句普通的后续消息就已经
+因为 harness 进程里那个 `Agent` 对象本来就长期存活,一句普通的后续消息就已经
 能接上同一个 turn 的上下文,不需要另开一条应答通道。
 
-**进程那一半。**桥(`bridge/bridge.mjs` + 两个平台插件 `seal-tools.mjs` /
-`seal-guard.mjs`,全部 go:embed)在进程内组出整棵插件树——不走 loader、不走
-profile、不吃 `$DSH_HOME` 的任何 patch 层,所以组合跟着 sealed 镜像哈希走,
-agent 改自己家目录也改不动下次启动挂什么。桥常驻一个 `Agent` 对象、turn 串行,
-对外一个 OpenAI 形状的 `/v1/chat/completions`(靠 `session/event` 的
-`text-delta` 块做流式)。约束 agent 的是 doctrine 而不是权限弹窗:不装审批 UI,
-沙盒模式 `danger-full-access`——隔离墙是 privsep 的内核 uid 拆分,不是 DSH 自带
-的 sandbox 栈。`@deepseek-ai/dsh-*` 全家族在镜像构建期 npm 安装、按
-`whitelist.go` 逐包精确钉版本(这个家族的 `latest` dist-tag 互不一致,只能钉
-精确版本),`verifyInstalled` 把白名单和镜像不一致变成响亮的启动失败——和 §13
-讲 prime-agent 安装的度量理由相同。每个能力插件是什么、其余为什么故意不挂,
-见组合文档 [`internal/framework/dsh/README.zh.md`](internal/framework/dsh/README.zh.md)。
+**进程那一半。**0g-harness(连同平台插件 `seal-tools`、`seal-guard`、
+`subagent-guard`)在进程内组出整棵插件树——不走 loader、不走 profile、不吃
+`$DSH_HOME` 的任何 patch 层;0g-harness 镜像在构建时装一个确定版本的 harness,依赖树
+锁定,所以组合跟着镜像哈希走,agent 改自己家目录也改不动下次启动挂什么。harness
+常驻一个 `Agent` 对象,owner 的轮次一次跑一个,每一轮的输出交给开启这一轮的一方:
+owner 的请求,或者(agent 自己开启的轮次,比如后台任务结束、提醒到点)收件箱。
+它对外提供 `/v1/chat/completions`(靠 `session/event` 的 `text-delta` 块做流式)、
+`/v1/responses`,以及 `FrameworkRoutes` 在 `/hello` 里按 kind 公布的收件箱 / 事件
+流 / 任务 / 定时接口。约束 agent 的是 doctrine 而不是权限弹窗:不装审批 UI,沙盒
+模式 `danger-full-access`——隔离墙是 privsep 的内核 uid 拆分,不是 DSH 自带的
+sandbox 栈。harness 把 `@deepseek-ai/dsh-*` 全家族钉在精确版本(这个家族的
+`latest` dist-tag 互不一致,只能钉精确版本),镜像构建时检查装上的 0g-harness 版本
+等于 `whitelist.go` 写进 `framework` role 的版本,不一致就构建失败——和 §13 讲
+prime-agent 安装的度量理由相同,只是在做镜像的地方检查。每个能力插件是什么、其余
+为什么故意不挂,见组合文档 [`internal/framework/harness/README.zh.md`](internal/framework/harness/README.zh.md)。
 
-这次移植给清单加了一条规则:**内嵌的桥要先对着构建好的镜像跑一遍再发**——
-`go build` 只把 JS 原样嵌进去、不校验它,所以模块形状类的错误(对只有具名导出
-的插件模块用 default import、把 `Local*` provider 和它已经注册过服务的基类
-同时挂上)只会在启动时暴露成一个永远不 listen 的容器。
+这次移植给清单加了一条规则:**框架进程要先用真实的依赖包跑一遍再发**——模块
+形状类的错误(对只有具名导出的插件模块用 default import、把 `Local*` provider
+和它已经注册过服务的基类同时挂上)只会在启动时暴露成一个永远不 listen 的容器。
+0g-harness 的端到端测试就是用锁定的依赖树跑它的真实进程。

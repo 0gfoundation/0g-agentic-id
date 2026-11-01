@@ -22,10 +22,12 @@
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use attestor_shared::sandbox::{check_owner_env, CanonicalSignedMessage};
 use attestor_shared::{JobPayload, RetryRequest, StageStatus};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
+use base64::Engine as _;
 use serde_json::json;
 
 pub async fn handle(
@@ -47,7 +49,19 @@ pub async fn handle(
     // container is created and no seal is handed out — so the cheaper owner
     // field check is retained for that path.
     match &req.sandbox_envelope {
-        Some(env) => authorize_lifecycle(&state, &d, env).await?,
+        Some(env) => {
+            authorize_lifecycle(&state, &d, env).await?;
+            // The worker may create a container from it: only the inference
+            // key may ride the owner's env, refused here rather than at the
+            // sandbox create.
+            let msg_bytes = base64::engine::general_purpose::STANDARD
+                .decode(env.signed_message_b64.as_bytes())
+                .map_err(|e| ApiError::bad_request(format!("envelope base64: {e}")))?;
+            let canonical: CanonicalSignedMessage = serde_json::from_slice(&msg_bytes)
+                .map_err(|e| ApiError::bad_request(format!("envelope JSON: {e}")))?;
+            check_owner_env(&canonical.payload)
+                .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
+        }
         None => {
             if d.owner != req.owner {
                 return Err(ApiError::unauthorized("owner mismatch"));
@@ -224,11 +238,11 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings: None,
             settings_last_good: None,
             settings_version: 0,
@@ -407,6 +421,29 @@ mod tests {
             .expect("owner envelope must be accepted");
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(s.jobs.submitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_envelope_env_key_other_than_the_inference_key_is_400() {
+        let s = make_setup();
+        let env = attestor_shared::mocks::signed_envelope_with_payload(
+            &OWNER_PRIV,
+            "create",
+            "",
+            serde_json::json!({ "env": { "API_KEY": "sk", "GODEBUG": "x509sha1=1" } }),
+        );
+        let req = RetryRequest {
+            seal_id: s.seal_id,
+            owner: env.wallet_address,
+            sandbox_envelope: Some(env),
+        };
+        let err = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .err()
+            .expect("refused before any job");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("GODEBUG"), "{}", err.message);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -71,7 +71,7 @@ const PARENT = {
   agent_id: '0x1d2', // 466
   owner: HUMAN_OWNER,
   agent_seal_addr: PARENT_SEAL_ADDR,
-  framework: 'dsh',
+  framework: '0g-harness',
   agent_card: { name: 'wilbert', url: 'http://127.0.0.1:9999/hello/card' },
   phase: 'running',
   created_at: '2026-10-21T00:00:00Z',
@@ -82,7 +82,7 @@ const CHILD = {
   // lowercase variant of the parent's seal: the annotation must still match
   owner: PARENT_SEAL_LOWER,
   agent_seal_addr: `0x${'a1b2c3d4e5'.repeat(4)}`,
-  framework: 'dsh',
+  framework: '0g-harness',
   agent_card: { name: 'selftest-agent' },
   phase: 'stopped',
   created_at: '2026-10-21T00:00:00Z',
@@ -109,7 +109,7 @@ const OWN_UNMINTED = {
   seal_id: `0x${'ef'.repeat(32)}`,
   owner: MY_WALLET,
   agent_seal_addr: `0x${'b7c8d9e0f1'.repeat(4)}`,
-  framework: 'dsh',
+  framework: '0g-harness',
   agent_card: {},
   phase: 'deploying',
   created_at: '2026-10-21T00:00:00Z',
@@ -130,8 +130,8 @@ const EVIL = {
   seal_id: `0x${'13'.repeat(32)}`,
   agent_id: '0x210', // 528
   owner: HUMAN_OWNER,
-  framework: 'dsh',
-  agent_card: { name: 'nice\n466   stopped  dsh  — — — FORGED-ROW\u001b[2J' },
+  framework: '0g-harness',
+  agent_card: { name: 'nice\n466   stopped  0g-harness  — — — FORGED-ROW\u001b[2J' },
   phase: 'running',
   created_at: '2026-10-21T00:00:00Z',
 };
@@ -193,13 +193,13 @@ test('list human mode: AGENTSEAL/FRAMEWORK columns + nesting annotation', async 
     // columns out of alignment — REPL convention)
     assert.ok(header.indexOf('NAME') > header.indexOf('OWNER'), 'NAME is the last column');
     // the parent row: human wallet owner, own agentSeal, no annotation
-    assert.match(r.stdout, /running\s+dsh\s+0xa932…9330\s+0x2AB7…a0B3\s+wilbert\b/);
+    assert.match(r.stdout, /running\s+0g-harness\s+0xa932…9330\s+0x2AB7…a0B3\s+wilbert\b/);
     assert.doesNotMatch(r.stdout, /0x2AB7…a0B3 ⇄/);
     // the child row: owner is the parent's seal → explicit annotation,
     // case-folded match (child's owner is the lowercase variant)
-    assert.match(r.stdout, /stopped\s+dsh\s+0xa1b2…d4e5\s+0xa932…9330 ⇄ #466\s+selftest-agent\b/);
+    assert.match(r.stdout, /stopped\s+0g-harness\s+0xa1b2…d4e5\s+0xa932…9330 ⇄ #466\s+selftest-agent\b/);
     // framework values render in their own column
-    assert.match(r.stdout, /running\s+dsh/);
+    assert.match(r.stdout, /running\s+0g-harness/);
   } finally {
     server.closeAllConnections?.();
     server.close();
@@ -238,7 +238,7 @@ test('list --phase: the annotation survives a filter that hides the parent', asy
     });
     assert.equal(r.code, 0);
     assert.doesNotMatch(r.stdout, /wilbert/, 'parent filtered out of view');
-    assert.match(r.stdout, /stopped\s+dsh\s+0xa1b2…d4e5\s+0xa932…9330 ⇄ #466\s+selftest-agent\b/);
+    assert.match(r.stdout, /stopped\s+0g-harness\s+0xa1b2…d4e5\s+0xa932…9330 ⇄ #466\s+selftest-agent\b/);
     assert.match(r.stdout, /1 deployment\(s\) \(phase=stopped\)/);
   } finally {
     server.closeAllConnections?.();
@@ -271,10 +271,10 @@ test('list --mine: owner tier WHERE owner = $1 — own rows only; nesting is pub
     assert.doesNotMatch(r.stdout, /selftest-agent/, 'child owned by agent seal not in --mine');
     assert.doesNotMatch(r.stdout, /⇄/, 'no nesting annotation possible in the owner tier');
     // your own rows are: the minted parent + the unminted own row
-    assert.match(r.stdout, /running\s+dsh\s+0xa932…9330\s+0x[0-9a-fA-F]{4}…[0-9a-fA-F]{4}/);
+    assert.match(r.stdout, /running\s+0g-harness\s+0xa932…9330\s+0x[0-9a-fA-F]{4}…[0-9a-fA-F]{4}/);
     // unminted own row: sealId prefix handle in AGENTID + AGENTSEAL shown
     // (the owner tier carries agent_seal_addr unconditionally)
-    assert.match(r.stdout, /0xefefefefef\s+deploying\s+dsh\s+0xb7c8…e0f1\s+/);
+    assert.match(r.stdout, /0xefefefefef\s+deploying\s+0g-harness\s+0xb7c8…e0f1\s+/);
     // 2 rows served (parent + unminted), not 3 and not just the public one
     assert.match(r.stdout, /2 deployment\(s\)/);
   } finally {
@@ -326,7 +326,7 @@ test('list human mode: case-fold match in the OTHER direction (checksummed owner
 });
 
 test('list human mode: owner-controlled NAME cannot forge rows', async () => {
-  // EVIL's name embeds a full fake row ("466   stopped  dsh  …") after a
+  // EVIL's name embeds a full fake row ("466   stopped  0g-harness  …") after a
   // newline, plus an ANSI clear-screen. With C0/C1 stripped and the cell
   // truncated, the fake row must NOT render: no stdout line starts with
   // the forged pattern, and the table still has exactly one row per record.
@@ -375,7 +375,7 @@ test('list: a 6-digit agentId owner annotation is not truncated into another id'
     agent_id: '0x1e240', // 123456 — the parent the child is annotated to
     owner: HUMAN_OWNER,
     agent_seal_addr: PARENT_SEAL_ADDR,
-    framework: 'dsh',
+    framework: '0g-harness',
     agent_card: { name: 'six-digit-parent' },
     phase: 'running',
     created_at: '2026-10-21T00:00:00Z',
@@ -384,7 +384,7 @@ test('list: a 6-digit agentId owner annotation is not truncated into another id'
     seal_id: `0x${'78'.repeat(32)}`,
     agent_id: '0x1e241', // 123457
     owner: PARENT_SEAL_ADDR, // owned by SIX's seal → `⇄ #123456`
-    framework: 'dsh',
+    framework: '0g-harness',
     agent_card: { name: 'child-of-six' },
     phase: 'running',
     created_at: '2026-10-21T00:00:00Z',
@@ -442,7 +442,7 @@ test('REPL listing row: NAME goes through the row renderer the loop uses', async
   // exported row renderer (the same one the interactive loop calls), not
   // just the shared helper underneath it.
   const { renderListRow } = await import('../dist/cli/commands/interactive.js');
-  const evil = { agentId: 528, phase: 'running', sealId: `0x${'13'.repeat(32)}`, name: 'nice\n466   stopped  dsh  — — — FORGED-ROW\u001b[2J', owned: ' ' };
+  const evil = { agentId: 528, phase: 'running', sealId: `0x${'13'.repeat(32)}`, name: 'nice\n466   stopped  0g-harness  — — — FORGED-ROW\u001b[2J', owned: ' ' };
   const line = renderListRow(evil, null);
   // the row is ONE line: only the trailing newline, none in the middle
   assert.doesNotMatch(line.slice(0, -1), /\n/, 'no row break in the middle');
@@ -454,7 +454,7 @@ test('REPL listing row: NAME goes through the row renderer the loop uses', async
 test('REPL listing: FRAMEWORK, AGENTSEAL and the ⇄ annotation, aligned with its header', async () => {
   const { renderListRow, renderListHeader } = await import('../dist/cli/commands/interactive.js');
   const { sealToAgentMap } = await import('../dist/cli/commands/cells.js');
-  const parent = { agentId: 466n, phase: 'running', sealId: PARENT.seal_id, name: 'wilbert', framework: 'dsh', agentSeal: PARENT_SEAL_ADDR };
+  const parent = { agentId: 466n, phase: 'running', sealId: PARENT.seal_id, name: 'wilbert', framework: '0g-harness', agentSeal: PARENT_SEAL_ADDR };
   const child = { agentId: 492n, phase: 'stopped', sealId: CHILD.seal_id, name: 'selftest-agent', framework: 'hermes', agentSeal: CHILD.agent_seal_addr };
   const map = sealToAgentMap([parent, child]);
   const header = renderListHeader();
@@ -481,7 +481,7 @@ test('REPL list loop: owner-tier fields for an unminted own row, the annotation,
   const MINE_SEAL = `0x${'c0ffee12'.repeat(5)}`;
   const PENDING = {
     seal_id: `0x${'16'.repeat(32)}`,
-    framework: 'dsh',
+    framework: '0g-harness',
     agent_card: { name: 'pending-mine' },
     phase: 'deploying',
     created_at: '2026-10-27T00:00:00Z',
@@ -537,7 +537,7 @@ test('list: the OWNER cell is sanitized even though it never truncates', async (
     // address halves at the ends (shortAddr keeps first-6/last-4 raw chars)
     owner: '0xAAA\u001b[2J\n\u001b[8mBBBB',
     agent_seal_addr: PARENT_SEAL_ADDR,
-    framework: 'dsh',
+    framework: '0g-harness',
     agent_card: { name: 'dirty-owner-row' },
     phase: 'running',
     created_at: '2026-10-21T00:00:00Z',
@@ -568,7 +568,7 @@ test('trustedCell: a full-width cell leaves a separator before NAME', async () =
     agent_id: '0x3b9ac9ff', // 999999999 — 9-digit agentId
     owner: HUMAN_OWNER,
     agent_seal_addr: PARENT_SEAL_ADDR,
-    framework: 'dsh',
+    framework: '0g-harness',
     agent_card: { name: 'nine' },
     phase: 'running',
     created_at: '2026-10-21T00:00:00Z',
@@ -577,7 +577,7 @@ test('trustedCell: a full-width cell leaves a separator before NAME', async () =
     seal_id: `0x${'93'.repeat(32)}`,
     agent_id: '0x3b9aca00',
     owner: PARENT_SEAL_ADDR, // ⇄ #999999999 — 22 chars + full-width test
-    framework: 'dsh',
+    framework: '0g-harness',
     agent_card: { name: 'nine-child' },
     phase: 'running',
     created_at: '2026-10-21T00:00:00Z',

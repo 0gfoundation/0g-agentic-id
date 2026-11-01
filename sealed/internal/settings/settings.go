@@ -253,7 +253,8 @@ const RequestOutputCeiling = 32768
 // more AND a "developer"-role system prompt; replayed with it as "system",
 // the same request went through 65 times out of 65 (2026-10-16), and zg
 // compute confirmed (2026-10-19) that Tencent's and 0G's self-hosted
-// backends do not support the role. dsh now sends "system" (bridge.mjs).
+// backends do not support the role. 0g-harness sends "system" (its
+// composition.mjs).
 func (r Resolved) RequestMaxTokens() int {
 	mt := r.PersistableMaxTokens()
 	if mt > RequestOutputCeiling {

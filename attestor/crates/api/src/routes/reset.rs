@@ -29,7 +29,7 @@
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use attestor_shared::sandbox::CanonicalSignedMessage;
+use attestor_shared::sandbox::{check_owner_env, CanonicalSignedMessage};
 use attestor_shared::{JobPayload, LifecycleRequest};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -62,6 +62,10 @@ pub async fn handle(
             canonical.action
         )));
     }
+    // Only the inference key may ride the owner's env: refused here, not
+    // when the job reaches the sandbox create.
+    check_owner_env(&canonical.payload)
+        .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
 
     // Real owner authorization: the create envelope must be signed by the
     // current on-chain owner. The previous `req.owner == d.owner` check
@@ -241,11 +245,11 @@ mod tests {
             container_stage: StageStatus::Confirmed { at: now },
             sandbox_id: Some("sb-old".into()),
             provisioned_at: Some(now),
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings: None,
             settings_last_good: None,
             settings_version: 0,
@@ -378,6 +382,54 @@ mod tests {
             .err()
             .expect("must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_env_key_other_than_the_inference_key_is_400() {
+        let s = make_setup();
+        let env = attestor_shared::mocks::signed_envelope_with_payload(
+            &OWNER_PRIV,
+            "create",
+            "",
+            serde_json::json!({ "env": { "API_KEY": "sk", "HTTPS_PROXY": "http://proxy.example" } }),
+        );
+        let req = LifecycleRequest {
+            seal_id: s.seal_id,
+            owner: env.wallet_address,
+            sandbox_envelope: env,
+            framework: None,
+        };
+        let err = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .err()
+            .expect("refused before any job");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message
+                .contains("may carry only API_KEY and SEAL_SECRET_ENV")
+                && err.message.contains("HTTPS_PROXY"),
+            "{}",
+            err.message
+        );
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+
+        // The inference key alone is accepted.
+        let env = attestor_shared::mocks::signed_envelope_with_payload(
+            &OWNER_PRIV,
+            "create",
+            "",
+            serde_json::json!({ "env": { "SEAL_SECRET_ENV": "c2VhbGVk" } }),
+        );
+        let req = LifecycleRequest {
+            seal_id: s.seal_id,
+            owner: env.wallet_address,
+            sandbox_envelope: env,
+            framework: None,
+        };
+        let (status, _) = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect("accepted");
+        assert_eq!(status, StatusCode::ACCEPTED);
     }
 
     #[tokio::test]

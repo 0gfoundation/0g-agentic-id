@@ -2,13 +2,14 @@
 //! lifecycle actions.
 
 mod jobs;
+mod sweep;
 
 use attestor_shared::{
     chain::connect_http as chain_connect_http,
     crypto::RealCrypto,
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
-    kms::{derive_subkey, KmsClient, MockKmsClient, TappKmsClient, JOB_ENCRYPTION_KEY_INFO},
+    kms::{KmsClient, MockKmsClient, TappKmsClient},
     mocks::{MockSandbox, MockStorage},
     oss::OssClient,
     repo::{self, PostgresDeploymentRepo},
@@ -21,6 +22,16 @@ use jobs::Ctx;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+/// A running job refreshes its liveness stamp this often.
+const JOB_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// A running job whose stamp is older than this lost its worker (ten missed
+/// heartbeats) and is reaped. Liveness, not age, decides: a job's duration
+/// is unbounded (a deploy uploads its iData entries one after another, each
+/// within the storage client's 750 s budget), and a job that is still
+/// executing keeps heartbeating.
+const JOB_ABANDONED_AFTER_SECS: i64 = 5 * 60;
 
 /// `VERIFIED_FEEDBACK_ADDR` value for the container env. Unset → the key is
 /// STILL injected, empty: extra_env overrides the deployer-signed payload's
@@ -70,14 +81,11 @@ async fn main() -> anyhow::Result<()> {
     let attestor_identity = identities.attestor;
     let discovery = identities.sandbox;
 
-    // Resolve app-scoped key from KMS (same source as api).
+    // KMS for per-seal agentSeal derivation (same source as api).
     let kms = build_kms_client(&cfg).await?;
     attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
-    let app_key = kms.app_key().await?;
-    let job_key = derive_subkey(&app_key, JOB_ENCRYPTION_KEY_INFO);
 
     let crypto = Arc::new(RealCrypto::new(
-        app_key,
         kms.clone(),
         cfg.chain_id,
         cfg.agentic_id_addr,
@@ -151,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
-    let queue = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
+    let queue = PostgresJobQueue::new(pool.clone());
     let events = PostgresEventBus::connect(pool.clone()).await?;
 
     // OSS client is required for the deploy path (setAgentURI second
@@ -174,12 +182,15 @@ async fn main() -> anyhow::Result<()> {
         oss,
     };
 
-    // background sweep task — three responsibilities, same 60s tick:
+    // background sweep task — four responsibilities, same 60s tick:
     //  (a) job-queue retention (delete done/failed older than threshold)
-    //  (b) provision deadline (flip stuck container_stage=Submitted to
+    //  (b) job reaper (fail, never requeue, running jobs whose worker
+    //      stopped heartbeating and pending relay jobs whose owner envelope
+    //      expired; settle the stages an abandoned job left in flight)
+    //  (c) provision deadline (flip stuck container_stage=Submitted to
     //      Failed once `now > provision_deadline`, publish events)
-    //  (c) heartbeat staleness (flip running rows whose sealed runtime
-    //      has stopped reporting to Stopped, publish events)
+    //  (d) heartbeat staleness (reconcile running rows whose sealed runtime
+    //      has stopped reporting against their sandbox; see sweep.rs)
     {
         let queue = queue.clone();
         let retention = cfg.job_retention_seconds;
@@ -188,12 +199,21 @@ async fn main() -> anyhow::Result<()> {
         let sandbox = ctx.sandbox.clone();
         let sandbox_proxy_addr = cfg.sandbox_proxy_addr.clone();
         let agent_serve_port = cfg.agent_serve_port;
+        // sealed reports through the provider-signed attestor TLS statement;
+        // the sweep checks that the provider serves one, as the api relay
+        // does, before it reads a stale heartbeat as a dead agent.
+        let mut reports = match (&discovery, &attestor_identity) {
+            (Some(sandbox), Some(attestor)) => sweep::ReportPath::pinned(
+                Arc::new(attestor_shared::identity::DiscoveredTlsSource {
+                    sandbox: sandbox.clone(),
+                    attestor: attestor.clone(),
+                }),
+                cfg.chain_id,
+                cfg.tapp_registry_addr,
+            ),
+            _ => sweep::ReportPath::unpinned(),
+        };
         tokio::spawn(async move {
-            // 15 minutes = 3 missed 5-min heartbeats. Sandbox-side
-            // terminations (balance exhaustion, manual kill, hardware
-            // failure) all surface within one threshold window.
-            const HEARTBEAT_STALENESS_SECS: i64 = 15 * 60;
-
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
 
@@ -204,7 +224,16 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => tracing::warn!(error = %e, "job sweep failed"),
                 }
 
-                // (b) Provision deadline.
+                // (b) Job reaper.
+                jobs::reap_and_settle(
+                    queue.as_ref(),
+                    deployments.as_ref(),
+                    events.as_ref(),
+                    JOB_ABANDONED_AFTER_SECS,
+                )
+                .await;
+
+                // (c) Provision deadline.
                 let now = chrono::Utc::now();
                 let timeouts = match deployments
                     .flip_provision_timeouts(now, "provision timeout".to_string())
@@ -232,154 +261,26 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // (c) Heartbeat staleness — reconcile against the sandbox
-                // instead of blindly flipping Failed. For each stale runner
-                // we check the sandbox's real state and act accordingly,
-                // reaping (admin_delete) confirmed-dead sandboxes so they
-                // don't linger as orphans, while preserving stopped ones for
-                // the owner to Resume.
-                let candidates = match deployments
-                    .stale_running_candidates(now, HEARTBEAT_STALENESS_SECS)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "stale-candidate query failed");
-                        continue;
-                    }
+                // (d) Heartbeat staleness. The /healthz probe confirms a
+                // started sandbox is really serving, and is the fallback
+                // liveness signal when get_sandbox itself is unavailable.
+                let healthz_ok = |sb: String| {
+                    let url = attestor_shared::agent_card::build_healthz_url(
+                        &sandbox_proxy_addr,
+                        &sb,
+                        agent_serve_port,
+                    );
+                    async move { attestor_shared::agent_card::agent_is_healthy(&url).await }
                 };
-
-                // What to do with a stale runner after inspecting its sandbox.
-                enum Act {
-                    Skip,               // actually alive (healthz ok) — leave it
-                    Stop(String),       // sandbox preserved → Stopped (resumable)
-                    Fail(String, bool), // → Failed; bool = reap (admin_delete)
-                }
-
-                for (seal_id, sandbox_id) in candidates {
-                    let Some(sb) = sandbox_id.filter(|s| !s.is_empty()) else {
-                        // No sandbox to reconcile against; leave for an operator.
-                        continue;
-                    };
-                    // Probe the agent's /healthz directly — used both to confirm
-                    // a "started" sandbox is really serving, and as the fallback
-                    // liveness signal when get_sandbox itself is unavailable.
-                    let healthz_ok = || async {
-                        let url = attestor_shared::agent_card::build_healthz_url(
-                            &sandbox_proxy_addr,
-                            &sb,
-                            agent_serve_port,
-                        );
-                        attestor_shared::agent_card::agent_is_healthy(&url).await
-                    };
-
-                    let act = match sandbox.get_sandbox(&sb).await {
-                        // Gone already — flip Failed, nothing to reap.
-                        Ok(None) => {
-                            Act::Fail("container missing (sandbox deleted)".to_string(), false)
-                        }
-                        Ok(Some(ref i)) => match i.state.as_str() {
-                            // Sandbox up but heartbeat stale: confirm with a
-                            // /healthz probe before declaring the agent dead,
-                            // so we don't reap a healthy-but-isolated agent.
-                            "started" | "starting" => {
-                                if healthz_ok().await {
-                                    Act::Skip
-                                } else {
-                                    Act::Fail(
-                                        "agent unreachable (heartbeat stale + /healthz down)"
-                                            .to_string(),
-                                        true,
-                                    )
-                                }
-                            }
-                            // Sandbox runtime explicitly reports broken → reap.
-                            "error" => Act::Fail("sandbox error".to_string(), true),
-                            // Anything else — stopped / stopping / archived /
-                            // archiving / any future transitional state — is
-                            // "not running but preserved" → resumable. Flip
-                            // Stopped, NEVER reap. Safe default: an unrecognized
-                            // state must not delete a still-live sandbox (we
-                            // already mis-Failed "archiving" once by enumerating).
-                            other => Act::Stop(format!("sandbox {other}")),
-                        },
-                        // get_sandbox unavailable — e.g. the provider 500s on a
-                        // destroyed/error sandbox (its state machine can't report
-                        // it; see 0g-sandbox#50), or a genuine transient. Don't
-                        // skip forever, or a dead agent stays "running". The
-                        // heartbeat is already stale (candidate filter), so fall
-                        // back to a direct /healthz probe as an independent
-                        // liveness signal: unreachable there too → confidently
-                        // dead → Failed + reap; still reachable → alive, just a
-                        // flaky get_sandbox → leave it. Never reaps on one signal.
-                        Err(e) => {
-                            if healthz_ok().await {
-                                tracing::debug!(?seal_id, sandbox_id = %sb, error = %e, "sweep: get_sandbox failed but /healthz ok — leaving alone");
-                                Act::Skip
-                            } else {
-                                tracing::warn!(?seal_id, sandbox_id = %sb, error = %e, "sweep: get_sandbox failed + /healthz down — reaping unreachable agent");
-                                Act::Fail(
-                                    "agent unreachable (get_sandbox unavailable + heartbeat stale + /healthz down)"
-                                        .to_string(),
-                                    true,
-                                )
-                            }
-                        }
-                    };
-
-                    match act {
-                        Act::Skip => {
-                            tracing::debug!(?seal_id, sandbox_id = %sb, "sweep: heartbeat stale but /healthz ok — leaving alone");
-                        }
-                        Act::Stop(reason) => {
-                            if let Err(e) = deployments
-                                .set_container_stage(
-                                    seal_id,
-                                    attestor_shared::StageStatus::Stopped {
-                                        at: now,
-                                        reason: reason.clone(),
-                                    },
-                                )
-                                .await
-                            {
-                                tracing::warn!(?seal_id, error = %e, "sweep: set Stopped failed");
-                            }
-                            let _ = events
-                                .publish(attestor_shared::WsEvent::ContainerStopped {
-                                    seal_id,
-                                    reason,
-                                })
-                                .await;
-                            tracing::info!(?seal_id, sandbox_id = %sb, "sweep: sandbox stopped → c=Stopped");
-                        }
-                        Act::Fail(reason, reap) => {
-                            if reap {
-                                if let Err(e) = sandbox.admin_delete(&sb).await {
-                                    tracing::warn!(?seal_id, sandbox_id = %sb, error = %e, "sweep: admin_delete failed (non-fatal)");
-                                }
-                            }
-                            if let Err(e) = deployments
-                                .set_container_stage(
-                                    seal_id,
-                                    attestor_shared::StageStatus::Failed {
-                                        at: now,
-                                        reason: reason.clone(),
-                                    },
-                                )
-                                .await
-                            {
-                                tracing::warn!(?seal_id, error = %e, "sweep: set Failed failed");
-                            }
-                            let _ = events
-                                .publish(attestor_shared::WsEvent::ContainerFailed {
-                                    seal_id,
-                                    reason,
-                                })
-                                .await;
-                            tracing::info!(?seal_id, sandbox_id = %sb, reaped = reap, "sweep: → c=Failed");
-                        }
-                    }
-                }
+                sweep::reconcile_stale_runners(
+                    deployments.as_ref(),
+                    sandbox.as_ref(),
+                    events.as_ref(),
+                    &mut reports,
+                    healthz_ok,
+                    now,
+                )
+                .await;
             }
         });
     }
@@ -388,16 +289,31 @@ async fn main() -> anyhow::Result<()> {
     loop {
         match queue.claim_next(&worker_id).await {
             Ok(Some((job_id, payload))) => {
-                tracing::info!(%job_id, ?payload, "claimed job");
-                let res = jobs::run(&ctx, payload).await;
+                // Every claimed job ends with a `job done`, `job failed` or
+                // reaped line, so the worker log alone shows whether the
+                // queue is drained.
+                let kind = payload.kind();
+                let seal_id = payload.seal_id();
+                tracing::info!(%job_id, kind, ?seal_id, "claimed job");
+                let res = jobs::run_heartbeating(
+                    queue.clone(),
+                    job_id,
+                    JOB_HEARTBEAT,
+                    jobs::run(&ctx, payload),
+                )
+                .await;
                 match res {
-                    Ok(()) => {
+                    // Reaped while running (logged by run_heartbeating): the
+                    // reaper owns the row.
+                    None => {}
+                    Some(Ok(())) => {
                         if let Err(e) = queue.complete(job_id).await {
                             tracing::error!(error = %e, %job_id, "failed to mark complete");
                         }
+                        tracing::info!(%job_id, kind, ?seal_id, "job done");
                     }
-                    Err(e) => {
-                        tracing::error!(error = ?e, %job_id, "job failed");
+                    Some(Err(e)) => {
+                        tracing::error!(error = ?e, %job_id, kind, ?seal_id, "job failed");
                         let _ = queue.fail(job_id, &e.to_string()).await;
                     }
                 }
