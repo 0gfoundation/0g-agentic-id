@@ -104,16 +104,22 @@ evidence 或 Scan 读取公开 app signer，完成上述 AgenticID 绑定及 san
 
 创建 sandbox 时，在 owner 签名的环境变量之后始终覆盖 `ATTESTOR_URL`（HTTPS locator，
 去掉末尾 `/`）、`SEAL_BOOT_TICKET` 以及链/indexer 配置；不再把 TLS 信任写进环境变量。
-owner 签名的环境变量中如有键不是合法变量名（`[A-Za-z_][A-Za-z0-9_]*`），attestor 拒绝
-create：运行时按 `KEY=VALUE` 拼接条目，含 `=` 的键可能给 attestor 设置的变量多加一条。
-这些覆盖只作用于 attestor 自己创建的容器；直接在 provider 创建的 sealed sandbox 可以带任意
+owner 签名的环境变量只能包含 `API_KEY` 和 `SEAL_SECRET_ENV`（推理 key，明文或加密给
+agent），SDK 和 console 也只发送这两个；含有其他键的 create 在发出之前就被拒绝。这涵盖
+含 `=` 的键（运行时按 `KEY=VALUE` 拼接条目，这样的键可能给 attestor 设置的变量多加一条）、
+attestor 自己的变量，以及 sealed 自身进程会读取的变量，如 `SSL_CERT_FILE`、`HTTPS_PROXY`、
+`GODEBUG` 或 `DAYTONA_SANDBOX_ID`（owner 的条目会取代 runner 的）。
+这些规则只作用于 attestor 自己创建的容器；直接在 provider 创建的 sealed sandbox 可以带任意
 环境变量，因此 `/provision`（见下文）只接受 attestor 自己 create 出的那个容器的首次启动。
 provider 返回任何 sandbox 时都会删除 `SEAL_BOOT_TICKET`，与 `SANDBOX_SEAL_KEY` 相同。
 每次 create 前 attestor 都会重新确认 AgenticID 仍信任它自己的 app 实例。在 sealed create
 （attestor 发起的每次 create 都是）中，sandbox provider 在写入自己的 `SANDBOX_SEAL_KEY`
 与 v3 证书之前，会从调用方环境变量中删除 `ATTESTOR_TLS_DESCRIPTOR`、
-`ATTESTOR_ALLOW_UNPINNED_DEV`、`TEE_SIGNER_ADDRESS` 以及所有 `SANDBOX_*` 键，因此 provider
-签发证书的容器无法打开 dev bypass。
+`ATTESTOR_ALLOW_UNPINNED_DEV`、`TEE_SIGNER_ADDRESS`、`SSL_CERT_FILE`、`SSL_CERT_DIR`
+以及所有 `SANDBOX_*` 键，因此 provider 签发证书的容器无法打开 dev bypass，也无法增加 CA
+根证书。`SSL_CERT_FILE` 可以指向一个 root 所有、内容却由调用方环境变量决定的文件，如
+`/proc/self/environ`。sealed 启动时也会自己删除这两个 CA 变量，所以无论容器由哪个 provider
+版本创建，它的 CA 都来自镜像。
 
 provider 用与证书相同的 key，把本 attestor app 的 TLS SPKI pin（来自它自己的 attestor
 身份解析，每份声明最长 300 秒）签成 EIP-712 `AttestorTLS`，并在 `GET /api/attestor-tls`

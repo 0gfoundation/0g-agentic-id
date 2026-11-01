@@ -128,19 +128,27 @@ making tapp's app startup depend on API business readiness.
 
 Sandbox creation always overrides `ATTESTOR_URL` (the HTTPS locator without a trailing
 `/`), `SEAL_BOOT_TICKET` and the chain/indexer settings after the owner-signed
-environment; it writes no TLS trust into the environment. It refuses a create
-whose owner-signed environment has a key that is not a variable name
-(`[A-Za-z_][A-Za-z0-9_]*`): the runtime joins entries as `KEY=VALUE`, so a key
-holding `=` could add a second entry for a variable the attestor sets. These overrides
+environment; it writes no TLS trust into the environment. The owner-signed
+environment may carry only `API_KEY` and `SEAL_SECRET_ENV` (the inference key, in
+clear or sealed to the agent), which is all the SDK and the console send; a create
+with any other key is refused before anything is sent. That covers a key holding
+`=` (the runtime joins entries as `KEY=VALUE`, so it could add a second entry for a
+variable the attestor sets), the attestor's own variables, and the variables
+sealed's own process reads, such as `SSL_CERT_FILE`, `HTTPS_PROXY`, `GODEBUG` or
+`DAYTONA_SANDBOX_ID` (an owner entry would replace the runner's). These rules
 cover the containers the attestor creates; a sealed sandbox created at the provider
 directly can carry any environment, which is why `/provision` (below) accepts a first
 boot only from the container the attestor's own create made. The provider removes
 `SEAL_BOOT_TICKET`, like `SANDBOX_SEAL_KEY`, from every sandbox it returns. Before every create the
 attestor rechecks that AgenticID still trusts its own app instance. On a sealed create,
 which is every create the attestor makes, the sandbox provider strips
-`ATTESTOR_TLS_DESCRIPTOR`, `ATTESTOR_ALLOW_UNPINNED_DEV`, `TEE_SIGNER_ADDRESS` and every
-`SANDBOX_*` key from the caller's environment before writing its own `SANDBOX_SEAL_KEY`
-and v3 certificate, so a container the provider certifies cannot enable the dev bypass.
+`ATTESTOR_TLS_DESCRIPTOR`, `ATTESTOR_ALLOW_UNPINNED_DEV`, `TEE_SIGNER_ADDRESS`,
+`SSL_CERT_FILE`, `SSL_CERT_DIR` and every `SANDBOX_*` key from the caller's environment
+before writing its own `SANDBOX_SEAL_KEY` and v3 certificate, so a container the
+provider certifies cannot enable the dev bypass or add CA roots. `SSL_CERT_FILE` could
+name a root-owned file whose contents the caller's environment sets, such as
+`/proc/self/environ`. sealed also removes both CA variables itself at boot, so its CAs
+come from the image whichever provider build created the container.
 
 The provider signs the TLS SPKI pins of this attestor app (from its own attestor
 identity resolution, at most 300 seconds per statement) with the same key as the

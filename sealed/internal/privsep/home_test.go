@@ -603,125 +603,45 @@ func TestACLGrantsWrite(t *testing.T) {
 	}
 }
 
-// sealed's own CA locations are kept only when they name root-only files
-// (as resolved paths), and removed otherwise: an agent-writable CA file, a
-// directory holding a link to an agent-writable file, an agent-owned or
-// world-writable regular file, or a FIFO.
+// sealed's own CA locations are removed whatever they name, so its TLS
+// trusts the image's store only: a root-owned file whose contents the
+// caller sets (/proc/self/environ, which holds the caller's other
+// variables), any other CA file or directory, or an empty value. Nothing
+// is logged when neither is set.
 func TestScrubTrustEnv(t *testing.T) {
-	base := rootOnlyBase(t)
-	ca := filepath.Join(base, "ca.pem")
+	ca := filepath.Join(t.TempDir(), "ca.pem")
 	mustWrite(t, ca, "-----BEGIN CERTIFICATE-----\n")
-	if err := os.Chmod(ca, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(base, "ca-link.pem")
-	mustSymlink(t, ca, link)
-	certs := filepath.Join(base, "certs")
-	if err := os.Mkdir(certs, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	mustSymlink(t, ca, filepath.Join(certs, "a.pem"))
-	agentFile := filepath.Join(t.TempDir(), "agent-ca.pem") // under /tmp: not root-only
-	mustWrite(t, agentFile, "x")
-	badDir := filepath.Join(base, "bad")
-	if err := os.Mkdir(badDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	mustSymlink(t, agentFile, filepath.Join(badDir, "b.pem"))
-	fifoDir := filepath.Join(base, "fifo")
-	if err := os.Mkdir(fifoDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Mkfifo(filepath.Join(fifoDir, "c.pem"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A root-only directory with a root-only PEM beside one another uid
-	// owns, or one anyone can write: crypto/x509 would trust what either
-	// holds.
-	foreignDir := filepath.Join(base, "foreign")
-	openDir := filepath.Join(base, "open")
-	for _, d := range []string{foreignDir, openDir} {
-		if err := os.Mkdir(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		mustWrite(t, filepath.Join(d, "good.pem"), "-----BEGIN CERTIFICATE-----\n")
-	}
-	foreignPEM := filepath.Join(foreignDir, "agent.pem")
-	mustWrite(t, foreignPEM, "-----BEGIN CERTIFICATE-----\n")
-	if err := os.Chown(foreignPEM, testUID, testUID); err != nil {
-		t.Fatal(err)
-	}
-	openPEM := filepath.Join(openDir, "anyone.pem")
-	mustWrite(t, openPEM, "-----BEGIN CERTIFICATE-----\n")
-	if err := os.Chmod(openPEM, 0o666); err != nil {
-		t.Fatal(err)
-	}
-
-	rel := func(p string) string { return strings.TrimPrefix(p, "/") }
-	cases := []struct {
-		name, file, dir string
-		wantFile        string // "" = removed
-		wantDir         string
-		cwd             string // working directory for a relative location
-		wantLine        string // a returned line must name it
-	}{
-		{"root-only file, through a link", link, "", ca, "", "", ""},
-		{"agent-writable file", agentFile, "", "", "", "", ""},
-		{"missing file", filepath.Join(base, "none.pem"), "", "", "", "", ""},
-		{"root-only directory", "", certs, "", certs, "", ""},
-		{"directory with a foreign entry", "", badDir, "", "", "", ""},
-		{"directory with a FIFO", "", fifoDir, "", "", "", ""},
-		{"directory with an agent-owned file", "", foreignDir, "", "", "", foreignPEM},
-		{"directory with a world-writable file", "", openDir, "", "", "", openPEM},
-		{"directory with a world-writable file beside a good one", "", openDir + ":" + certs, "", certs, "", openPEM},
-		{"mixed directories", "", badDir + ":" + certs, "", certs, "", ""},
-		// A relative location names a file against the working directory,
-		// as crypto/x509 would open it; it is checked and kept as the
-		// absolute path it resolves to, and never sends the check into a
-		// walk that cannot reach "/".
-		{"relative file from /", rel(link), "", ca, "", "/", ""},
-		{"relative file from its directory", "ca-link.pem", "", ca, "", base, ""},
-		{"relative missing file from /", "etc/ssl/none.pem", "", "", "", "/", ""},
-		{"relative agent-writable file", filepath.Base(agentFile), "", "", "", filepath.Dir(agentFile), ""},
-		{"relative directory from /", "", rel(certs), "", certs, "/", ""},
-		{"relative directories from base", "", "bad:certs", "", certs, base, ""},
+	cases := []struct{ name, file, dir string }{
+		{"process environment as the CA file", "/proc/self/environ", ""},
+		{"CA file", ca, ""},
+		{"CA directory", "", filepath.Dir(ca)},
+		{"both, the directory as a list", ca, filepath.Dir(ca) + ":/etc/ssl/certs"},
+		{"empty values", "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.cwd != "" {
-				t.Chdir(tc.cwd)
-			}
-			if tc.file != "" {
-				t.Setenv("SSL_CERT_FILE", tc.file)
-			} else {
-				t.Setenv("SSL_CERT_FILE", "")
-				os.Unsetenv("SSL_CERT_FILE")
-			}
-			if tc.dir != "" {
-				t.Setenv("SSL_CERT_DIR", tc.dir)
-			} else {
-				t.Setenv("SSL_CERT_DIR", "")
-				os.Unsetenv("SSL_CERT_DIR")
-			}
-			done := make(chan []string, 1)
-			go func() { done <- ScrubTrustEnv() }()
-			var lines []string
-			select {
-			case lines = <-done:
-			case <-time.After(10 * time.Second):
-				t.Fatal("ScrubTrustEnv did not return")
-			}
-			if tc.wantLine != "" && !strings.Contains(strings.Join(lines, "\n"), tc.wantLine) {
-				t.Errorf("ScrubTrustEnv lines %q do not name %s", lines, tc.wantLine)
-			}
-			got, ok := os.LookupEnv("SSL_CERT_FILE")
-			if tc.file != "" && (ok != (tc.wantFile != "") || got != tc.wantFile) {
-				t.Errorf("SSL_CERT_FILE = %q (set %v), want %q", got, ok, tc.wantFile)
-			}
-			got, ok = os.LookupEnv("SSL_CERT_DIR")
-			if tc.dir != "" && (ok != (tc.wantDir != "") || got != tc.wantDir) {
-				t.Errorf("SSL_CERT_DIR = %q (set %v), want %q", got, ok, tc.wantDir)
+			// Both are set in every case (the last with empty values): a
+			// set variable is removed and named whatever its value.
+			t.Setenv("SSL_CERT_FILE", tc.file)
+			t.Setenv("SSL_CERT_DIR", tc.dir)
+			lines := ScrubTrustEnv()
+			for _, name := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
+				if v, ok := os.LookupEnv(name); ok {
+					t.Errorf("%s = %q still set", name, v)
+				}
+				if !strings.Contains(strings.Join(lines, "\n"), name+"=") {
+					t.Errorf("ScrubTrustEnv lines %q do not name %s", lines, name)
+				}
 			}
 		})
 	}
+	t.Run("neither set", func(t *testing.T) {
+		for _, name := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
+			t.Setenv(name, "")
+			os.Unsetenv(name)
+		}
+		if lines := ScrubTrustEnv(); len(lines) != 0 {
+			t.Errorf("ScrubTrustEnv with nothing set logged %q", lines)
+		}
+	})
 }

@@ -918,17 +918,24 @@ invariants (`internal/privsep`):
   trust store and its toolchains' root-owned configuration). sealed's own
   process runs as root with that same environment, and the same rule
   applies to it: at boot, before its first TLS connection (chain RPC, the
-  attestor, the storage indexer, the inference router), it keeps
-  `SSL_CERT_FILE` and `SSL_CERT_DIR` only when they name root-only files,
-  and removes them otherwise (`ScrubTrustEnv`), so the CAs it trusts come
-  from the image; and before its first log line, which is what makes Go
-  read the time zone `TZ` names (a blocking, link-following read), it keeps
-  `TZ` only when it names, or with `TZ` unset `/etc/localtime` is, a
-  root-only zone file Go can load, and sets `TZ=UTC` otherwise
+  attestor, the storage indexer, the inference router), it removes
+  `SSL_CERT_FILE` and `SSL_CERT_DIR` whatever they name (`ScrubTrustEnv`),
+  so the CAs it trusts come from the image. Keeping them when they name
+  root-only files would not be enough: `/proc/self/environ` is a
+  root-owned 0400 file whose contents are the caller's other variables, so
+  a PEM in one of them would be trusted. No image sets either variable. The
+  provider also strips both from every sealed create, and the attestor
+  relays no owner variable but `API_KEY` and `SEAL_SECRET_ENV`
+  ([application identity](../attestor/APP_IDENTITY.md)); sealed's own
+  removal depends on neither. Before its first log line, which is what
+  makes Go read the time zone `TZ` names (a blocking, link-following read),
+  it keeps `TZ` only when it names, or with `TZ` unset `/etc/localtime` is,
+  a root-only zone file Go can load, and sets `TZ=UTC` otherwise
   (`ScrubTimeEnv`; a zone that loads also keeps Go from falling back to
-  `$GOROOT/lib/time/zoneinfo.zip`). Those, and the proxy endpoints, are the
-  deploy-set variables sealed's own process reads; `ZONEINFO` is read only
-  by `time.LoadLocation`, which sealed does not call. Proxy endpoints apply to sealed's own clients too: a proxy
+  `$GOROOT/lib/time/zoneinfo.zip`). `TZ` and the proxy endpoints are then
+  the path and network variables from the deploy environment that sealed's
+  own process reads; `ZONEINFO` is read only by `time.LoadLocation`, which
+  sealed does not call. Proxy endpoints apply to sealed's own clients too: a proxy
   sees which hosts are contacted, but cannot read or alter a TLS connection
   (an endpoint configured as plain `http` has no such protection, with or
   without a proxy). The provisioning reply is encrypted to the container's

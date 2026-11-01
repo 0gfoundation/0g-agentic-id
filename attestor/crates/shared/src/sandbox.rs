@@ -276,27 +276,30 @@ where
     }
 }
 
-/// `^[A-Za-z_][A-Za-z0-9_]*$`: a name the container runtime cannot read as
-/// anything but one variable.
-fn is_env_name(key: &str) -> bool {
-    let mut chars = key.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
+/// The only variables a deployer-signed create may carry: the inference key,
+/// in clear (`API_KEY`) or sealed to the agent (`SEAL_SECRET_ENV`), which is
+/// all the SDK and the console send. sealed reads every other variable of
+/// its own environment as configuration the attestor, the provider or the
+/// image sets (or as something it must not trust: CA and time-zone
+/// locations, proxy endpoints, the Go runtime's settings), and gives each
+/// framework only variables it names itself, so no other owner variable has
+/// a consumer.
+const OWNER_ENV_KEYS: [&str; 2] = ["API_KEY", "SEAL_SECRET_ENV"];
 
 /// Overlay the attestor-controlled env (`ATTESTOR_URL` + `extra_env`) onto a
-/// create body's `env`, creating the object if the payload has none. Always
-/// OVERRIDES a same-named key from the deployer-signed payload — including
-/// with an empty value, which is how an unset attestor setting (e.g. a blank
-/// `VERIFIED_FEEDBACK_ADDR`) still blocks a payload-supplied one. Pulled out
-/// of `create()` so the override is unit-testable without an HTTP round-trip.
+/// create body's `env`, creating the object if the payload has none. An
+/// attestor value is written even when empty, which is how an unset attestor
+/// setting (e.g. a blank `VERIFIED_FEEDBACK_ADDR`) still reaches the
+/// container as unset. Pulled out of `create()` so it is unit-testable
+/// without an HTTP round-trip.
 ///
-/// A payload key that is not a plain variable name is refused: the runtime
-/// joins each entry as `KEY=VALUE`, so a key such as `CHAIN_RPC_URL=https://x/`
-/// would become a second `CHAIN_RPC_URL` entry beside the attestor's, and
-/// either one may win.
+/// The deployer-signed payload may carry only [`OWNER_ENV_KEYS`]; any other
+/// key is refused before anything is written. That covers the attestor's own
+/// keys, a key such as `CHAIN_RPC_URL=https://x/` (the runtime joins each
+/// entry as `KEY=VALUE`, so it would become a second `CHAIN_RPC_URL` entry
+/// beside the attestor's), and the variables sealed's own process would
+/// read: `SSL_CERT_FILE`, `HTTPS_PROXY`, `GODEBUG`, `DAYTONA_SANDBOX_ID`
+/// (whose later entry would replace the runner's) and the like.
 fn apply_attestor_env(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     attestor_public_url: &str,
@@ -308,9 +311,13 @@ fn apply_attestor_env(
     let env_obj = env_val.as_object_mut().ok_or_else(|| {
         anyhow::anyhow!("sandbox create: canonical.payload.env must be a JSON object")
     })?;
-    if !env_obj.keys().all(|key| is_env_name(key)) {
+    if let Some(key) = env_obj
+        .keys()
+        .find(|key| !OWNER_ENV_KEYS.contains(&key.as_str()))
+    {
+        let key: String = key.chars().take(64).collect();
         anyhow::bail!(
-            "sandbox create: canonical.payload.env has a key that is not a variable name ([A-Za-z_][A-Za-z0-9_]*)"
+            "sandbox create: canonical.payload.env may carry only API_KEY and SEAL_SECRET_ENV, not {key:?}"
         );
     }
     env_obj.insert(
@@ -329,9 +336,9 @@ pub struct HttpSandbox {
     /// the sandbox create body as `env.ATTESTOR_URL`.
     attestor_public_url: String,
     /// Additional `(KEY, VALUE)` pairs injected into the container's env on
-    /// top of `ATTESTOR_URL`: the canonical chain / storage / contract config,
-    /// overriding the owner-signed payload (`apply_attestor_env` also refuses
-    /// payload keys that could smuggle a duplicate entry). This holds for the
+    /// top of `ATTESTOR_URL`: the canonical chain / storage / contract config.
+    /// The owner-signed payload may set only the inference key variables
+    /// (`apply_attestor_env` refuses any other key). This holds for the
     /// containers this attestor creates. A sealed sandbox created at the
     /// provider directly can carry any env, so `/provision` hands the agent
     /// key only to the container this attestor's own create made: the first
@@ -511,8 +518,8 @@ impl SandboxClient for HttpSandbox {
         // Sandbox's auth middleware only validates the three X- headers
         // against `signed_message_b64` — it does NOT cross-check that the
         // HTTP body matches `canonical.payload`. That lets us inherit the
-        // user's payload (so their snapshot / sealed / env flow through)
-        // while injecting two attestor-controlled fields:
+        // user's payload (so their snapshot / sealed / inference key env flow
+        // through) while injecting two attestor-controlled fields:
         //   - top-level `seal_id`: sandbox's protocol slot; sandbox signs
         //     this and delivers it to the container (sealed-state / identity
         //     channel), so the container never trusts user-supplied env.
@@ -1202,6 +1209,19 @@ mod tests {
     #[test]
     fn attestor_url_is_normalized_and_never_from_the_payload() {
         let mut obj = serde_json::json!({"env": {"ATTESTOR_URL": "http://attacker"}});
+        let err = apply_attestor_env(
+            obj.as_object_mut().unwrap(),
+            "https://attestor.example/",
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("\"ATTESTOR_URL\""), "{err}");
+        assert_eq!(
+            obj["env"]["ATTESTOR_URL"], "http://attacker",
+            "nothing written"
+        );
+
+        let mut obj = serde_json::json!({"env": {}});
         apply_attestor_env(
             obj.as_object_mut().unwrap(),
             "https://attestor.example/",
@@ -1316,20 +1336,13 @@ mod tests {
     }
 
     #[test]
-    fn attestor_env_overrides_payload_env_including_blank() {
-        // The deployer signs the payload, so its env is untrusted for the
-        // keys the attestor owns: a smuggled ServeProof validator (or chain
-        // config) must be overwritten — by an EMPTY value too, which is what
-        // the worker injects for VERIFIED_FEEDBACK_ADDR when the attestor
-        // has none configured (sealed then emits no X-Agent-Proof).
+    fn attestor_env_is_written_beside_the_owner_key_including_blank() {
+        // The attestor's own values are written even when EMPTY, which is
+        // what the worker injects for VERIFIED_FEEDBACK_ADDR when the
+        // attestor has none configured (sealed then emits no X-Agent-Proof).
         let mut obj = serde_json::json!({
             "snapshot": "img",
-            "env": {
-                "API_KEY": "sk-owner",
-                "ATTESTOR_URL": "http://evil",
-                "AGENTIC_ID_ADDR": "0xbad",
-                "VERIFIED_FEEDBACK_ADDR": "0x00000000000000000000000000000000000000ee",
-            },
+            "env": { "API_KEY": "sk-owner" },
         });
         let extra = vec![
             ("AGENTIC_ID_ADDR".to_string(), "0xa9".to_string()),
@@ -1339,14 +1352,12 @@ mod tests {
         let env = &obj["env"];
         assert_eq!(env["ATTESTOR_URL"], "http://attestor");
         assert_eq!(env["AGENTIC_ID_ADDR"], "0xa9");
-        assert_eq!(
-            env["VERIFIED_FEEDBACK_ADDR"], "",
-            "blank must still override"
-        );
-        // Keys the attestor does not own pass through untouched.
+        assert_eq!(env["VERIFIED_FEEDBACK_ADDR"], "", "blank is still written");
+        // The owner's key passes through untouched.
         assert_eq!(env["API_KEY"], "sk-owner");
 
-        // Configured value overrides likewise.
+        // A configured value is written likewise.
+        let mut obj = serde_json::json!({ "env": { "API_KEY": "sk-owner" } });
         let extra = vec![(
             "VERIFIED_FEEDBACK_ADDR".to_string(),
             "0x00000000000000000000000000000000000000b7".to_string(),
@@ -1359,26 +1370,64 @@ mod tests {
     }
 
     #[test]
-    fn attestor_env_refuses_keys_that_are_not_variable_names() {
-        // A '='-bearing key would reach the runtime as a duplicate of an
-        // attestor-owned variable.
+    fn attestor_env_accepts_only_the_owner_key_variables() {
+        // The attestor's own keys, '='-bearing keys (which would reach the
+        // runtime as a duplicate of an attestor-owned variable), and every
+        // variable sealed's own process would read are refused, before
+        // anything is written.
         for key in [
+            "ATTESTOR_URL",
+            "SEAL_BOOT_TICKET",
+            "AGENTIC_ID_ADDR",
+            "VERIFIED_FEEDBACK_ADDR",
             "CHAIN_RPC_URL=https://rpc.example/?x",
-            "AGENTIC_ID_ADDR=0x0",
+            "API_KEY=x",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "TZ",
+            "GODEBUG",
+            "DAYTONA_SANDBOX_ID",
+            "AGENT_FRAMEWORK",
+            "ATTESTOR_ALLOW_UNPINNED_DEV",
+            "SANDBOX_SEAL_KEY",
+            "SEAL_OWNER_THINKING",
+            "api_key",
+            "API_KEY ",
             "",
-            "1ABC",
-            "A-B",
-            "A B",
             "A\nB",
-            "Ä",
         ] {
-            let mut obj = serde_json::json!({ "env": { key: "" } });
+            let mut obj = serde_json::json!({ "env": { "API_KEY": "sk", key: "v" } });
             let err = apply_attestor_env(obj.as_object_mut().unwrap(), "http://attestor", &[])
                 .unwrap_err();
-            assert!(err.to_string().contains("not a variable name"), "{key:?}: {err}");
+            assert!(
+                err.to_string()
+                    .contains("may carry only API_KEY and SEAL_SECRET_ENV"),
+                "{key:?}: {err}"
+            );
+            assert_eq!(
+                obj["env"].as_object().unwrap().len(),
+                2,
+                "{key:?}: nothing written"
+            );
         }
-        let mut obj = serde_json::json!({ "env": { "_A1": "x", "SEAL_SECRET_ENV": "y", "a": "z" } });
-        apply_attestor_env(obj.as_object_mut().unwrap(), "http://attestor", &[]).unwrap();
+        // A long key is named only by its first 64 characters.
+        let long = "X".repeat(4096);
+        let mut obj = serde_json::json!({ "env": { long.as_str(): "" } });
+        let err =
+            apply_attestor_env(obj.as_object_mut().unwrap(), "http://attestor", &[]).unwrap_err();
+        assert!(err.to_string().len() < 200, "{err}");
+        for env in [
+            serde_json::json!({}),
+            serde_json::json!({ "API_KEY": "sk" }),
+            serde_json::json!({ "SEAL_SECRET_ENV": "c2VhbGVk" }),
+            serde_json::json!({ "API_KEY": "sk", "SEAL_SECRET_ENV": "c2VhbGVk" }),
+        ] {
+            let mut obj = serde_json::json!({ "env": env });
+            apply_attestor_env(obj.as_object_mut().unwrap(), "http://attestor", &[]).unwrap();
+        }
     }
 
     #[test]
