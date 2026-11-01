@@ -970,6 +970,13 @@ export class AgentApi {
    *    supplies the key, pass its {@link sealApiKey} output as
    *    `sealedSecretEnv` instead of `apiKey`, so the key never reaches the
    *    signer at all.
+   *
+   * Both shapes, like {@link reset}, first store the default model
+   * (`DEFAULT_PERSONA_INFERENCE`) as the agent's settings document when it
+   * has none and could boot without a model: a clone, or an agent that has
+   * provisioned before (`needsDefaultSettings`). That write is one more
+   * owner signature, made after every check that can refuse the call; an
+   * existing document is never replaced.
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
   start(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void>;
@@ -991,6 +998,16 @@ export class AgentApi {
    * signed envelope in clear (`secretEnv`, default `'auto'`; `'sealed'`
    * refuses the clear path). The attestor keeps no reusable copy, which
    * is WHY it must be passed again on every recreate.
+   *
+   * An agent with no settings document boots on the model pinned in its
+   * minted persona, which leaves the chain at its first commit. So when the
+   * agent has none and is a clone or has provisioned before
+   * (`needsDefaultSettings`), the default model (`DEFAULT_PERSONA_INFERENCE`,
+   * 0g-compute) is stored as its first document before the envelope is
+   * signed (one more owner signature, after every check that can refuse the
+   * call); an existing document is never replaced. Such an agent cannot be
+   * reset onto another `provider` until its settings name one: write them
+   * with {@link setSettings} first.
    */
   reset(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
     return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });

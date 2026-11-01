@@ -34,7 +34,8 @@ export type {
   AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
 } from './AgentClient';
 export { mcpServices } from './AgentClient';
-export { defaultIData } from './AttestorClient';
+export { defaultIData, DEFAULT_PERSONA_INFERENCE, deploymentFactsOf, needsDefaultSettings, storeDefaultSettings } from './AttestorClient';
+export type { DeploymentFacts } from './AttestorClient';
 export type { DefaultIDataParams } from './AttestorClient';
 export type { AgenticIDConfig as AgentDNAConfig, AgenticIDConfig } from './context';
 

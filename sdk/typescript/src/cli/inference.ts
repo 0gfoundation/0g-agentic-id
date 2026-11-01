@@ -3,7 +3,10 @@ import type { Hash } from 'viem';
 import { inferenceKeyFromEnv, loadApiKey } from './config';
 import { CliError } from './errors';
 import { requiresMintFirst } from '../Providers';
-import { DEFAULT_PERSONA_INFERENCE } from '../AttestorClient';
+import {
+  DEFAULT_PERSONA_INFERENCE, deploymentFactsOf, needsDefaultSettings, storeDefaultSettings,
+  type DeploymentFacts,
+} from '../AttestorClient';
 
 /** Deploy using the current registry's routing requirements. Called after
  * the wizard's prompts/preflight so an edited compute route is rechecked. */
@@ -54,17 +57,11 @@ export async function agentInferenceProvider(ag: AgenticID, sealId: Hash): Promi
   return checkedProvider(settings?.provider ?? '0g-compute');
 }
 
-/** What the attestor's deployment row says about an agent's history. */
-export interface DeploymentFacts {
-  /** A container of this agent has provisioned before. */
-  provisioned: boolean;
-  /** The agent is a clone. */
-  clone: boolean;
-}
+export type { DeploymentFacts };
 
 /** Read {@link DeploymentFacts} from the public `/deployment/:sealId`. */
 export async function readDeploymentFacts(attestorUrl: string, sealId: Hash): Promise<DeploymentFacts> {
-  let row: { provisioned_at?: string | null; clone_params?: unknown };
+  let row: Record<string, unknown>;
   try {
     const r = await fetch(`${attestorUrl.replace(/\/$/, '')}/deployment/${sealId}`, { signal: AbortSignal.timeout(10_000) });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -74,7 +71,7 @@ export async function readDeploymentFacts(attestorUrl: string, sealId: Hash): Pr
       remedy: 'check the attestor is reachable, then repeat the command',
     });
   }
-  return { provisioned: !!row.provisioned_at, clone: row.clone_params != null };
+  return deploymentFactsOf(row);
 }
 
 /** The provider a reset uses, and the settings document it stores first. */
@@ -87,18 +84,16 @@ export interface ResetInferencePlan {
 }
 
 /**
- * The provider a reset uses. An agent with no settings document boots on the
- * model pinned in its minted persona while that pin is on chain. The pin
- * leaves the chain at the agent's first commit, so an agent that has
- * provisioned before, or a clone (whose source may have committed), would
- * come up without a model: only those first get the pin a fresh deploy starts
- * from. Nothing is written here; {@link applyResetInference} stores the
- * document once the owner has passed the reset's prompts.
+ * The provider a reset uses, and whether the default model is stored first:
+ * the SDK's rule ({@link needsDefaultSettings}, which `start` and `reset`
+ * also apply). Nothing is written here; {@link applyResetInference} stores the
+ * document once the owner has passed the reset's prompts, so a reset
+ * cancelled at a prompt writes nothing.
  */
 export async function resetInferencePlan(ag: AgenticID, sealId: Hash, facts: DeploymentFacts): Promise<ResetInferencePlan> {
   const { settings, version } = await ag.agent.getSettings(sealId);
   if (settings === null && version === 0) {
-    if (facts.provisioned || facts.clone) {
+    if (needsDefaultSettings(facts, version)) {
       const seed = { ...DEFAULT_PERSONA_INFERENCE };
       return { provider: seed.provider, seed };
     }
@@ -118,8 +113,12 @@ export async function applyResetInference(
   note: (line: string) => void,
 ): Promise<void> {
   if (plan.seed) {
-    await ag.agent.setSettings(sealId, plan.seed, { baseVersion: 0 });
-    note(`no settings yet: set provider=${plan.seed.provider} model=${plan.seed.model} (change them with settings)\n`);
+    // A document written since the plan was made is kept, not replaced.
+    if (await storeDefaultSettings(ag.agent, sealId)) {
+      note(`no settings yet: set provider=${plan.seed.provider} model=${plan.seed.model} (change them with settings)\n`);
+    } else {
+      note('settings were written meanwhile: kept\n');
+    }
   } else if (plan.note) {
     note(plan.note);
   }
