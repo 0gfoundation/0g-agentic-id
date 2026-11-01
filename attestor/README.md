@@ -153,18 +153,18 @@ on dev would first meet the live provider with every agent already offline.
    report `running` from the 1.3 container before the worker has replaced
    it, and their deploy wizard does not limit 0g-harness agents to models
    with tool use. Publish 0.2.2 and its compatibility package in the
-   [release order](../sdk/typescript/MIGRATION.md#release-order), with 0.2.2
-   as the `latest` dist-tag (what `0g-agentdna update` installs). Dist-tags
-   are shared by every network, so `latest` also reaches owners on networks
-   still on 1.3 (mainnet until its own 1.4 rollout), whose attestors name the
-   harness `dsh`; 0.2.2 reads `dsh` as `0g-harness`. Until every network runs
-   1.4, publish as `latest` only a version that still works against a 1.3
-   attestor, and use another dist-tag for one that does not. Then set
-   `ATTESTOR_CLI_LATEST=0.2.2` and an `ATTESTOR_CLI_NOTES` line asking CLI
-   owners to update before they reset, and restart the api. Check:
-   `npm view @0gfoundation/0g-agentdna dist-tags.latest` prints `0.2.2`, and
-   `GET /config` shows `"cli_latest":"0.2.2"`.
-7. **Announce.** CLI owners update (`0g-agentdna update`), then owners reset
+   [release order](../sdk/typescript/MIGRATION.md#release-order) under the
+   `next` dist-tag. Dist-tags are shared by every network, and `latest` is
+   what `0g-agentdna update` and a plain install pick up, so `latest` stays on
+   the version networks still on 1.3 use (mainnet until its own 1.4 rollout)
+   and moves to 0.2.2 only when every network runs 1.4. On the network being
+   rolled, set `ATTESTOR_CLI_LATEST=0.2.2` and an `ATTESTOR_CLI_NOTES` line
+   telling CLI owners to run `npm install -g @0gfoundation/0g-agentdna@0.2.2`
+   before they reset (`update` would install `latest`), and restart the api.
+   Check: `npm view @0gfoundation/0g-agentdna dist-tags.next` prints `0.2.2`,
+   `dist-tags.latest` is unchanged, and `GET /config` shows
+   `"cli_latest":"0.2.2"`.
+7. **Announce.** CLI owners install 0.2.2 (`npm install -g @0gfoundation/0g-agentdna@0.2.2`), then owners reset
    their agents. Every agent whose container predates 1.4 has been offline
    since step 4 and shows `stopped`, and a reset is the only way back: a
    resume (`/start` with `start`) of a sandbox created before 1.4 is refused

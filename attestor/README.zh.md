@@ -120,17 +120,15 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
 6. **发布 SDK。**1.4 的 CLI 是 `@0gfoundation/0g-agentdna` 0.2.2。npm 上已有的版本
    （0.2.0、0.2.1）早于它：它们的 `reset` 可能在 worker 替换容器之前就从 1.3 容器读到
    `running` 并报告完成，部署向导也不会把 0g-harness agent 限定为支持工具调用的模型。
-   按[发布顺序](../sdk/typescript/MIGRATION.zh.md#发布顺序)发布 0.2.2 及其兼容包，并让
-   `latest` dist-tag 指向 0.2.2（`0g-agentdna update` 安装的就是它）。dist-tag 由所有网络
-   共用，所以 `latest` 也会到达仍在 1.3 的网络上的 owner（mainnet 在其自身的 1.4 升级之前
-   即是如此），这些网络的 attestor 把 harness 称为 `dsh`；0.2.2 会把 `dsh` 当作
-   `0g-harness`。在所有网络都运行 1.4 之前，只把仍能对接 1.3 attestor 的版本发布为
-   `latest`，不能对接的版本用其他 dist-tag 发布。然后设置
-   `ATTESTOR_CLI_LATEST=0.2.2`，以及一行提醒 CLI 用户在 reset 前先更新的
-   `ATTESTOR_CLI_NOTES`，并重启 api。检查：
-   `npm view @0gfoundation/0g-agentdna dist-tags.latest` 输出 `0.2.2`，
-   `GET /config` 显示 `"cli_latest":"0.2.2"`。
-7. **公告。**使用 CLI 的 owner 先更新（`0g-agentdna update`），然后 owner reset 自己的
+   按[发布顺序](../sdk/typescript/MIGRATION.zh.md#发布顺序)发布 0.2.2 及其兼容包，
+   使用 `next` dist-tag。dist-tag 由所有网络共用，而 `0g-agentdna update` 和普通安装都取
+   `latest`，所以 `latest` 保持在仍在 1.3 的网络所用的版本上（mainnet 在其自身的 1.4 升级
+   之前即是如此），等所有网络都运行 1.4 后再指向 0.2.2。在正在升级的网络上设置
+   `ATTESTOR_CLI_LATEST=0.2.2`，以及一行 `ATTESTOR_CLI_NOTES`，提醒 CLI 用户在 reset 前
+   先执行 `npm install -g @0gfoundation/0g-agentdna@0.2.2`（`update` 会装 `latest`），
+   并重启 api。检查：`npm view @0gfoundation/0g-agentdna dist-tags.next` 输出 `0.2.2`，
+   `dist-tags.latest` 不变，`GET /config` 显示 `"cli_latest":"0.2.2"`。
+7. **公告。**使用 CLI 的 owner 先更新（`npm install -g @0gfoundation/0g-agentdna@0.2.2`），然后 owner reset 自己的
    agent。容器创建于 1.4 之前的 agent 自第 4 步起都已下线，显示为 `stopped`，只有 reset
    才能恢复：1.4 之前创建的 sandbox 不能 resume（`/start` 带 `start`），会得到 409，因为
    那个运行时无法 provision。preflight 要求时，owner 需重新确认 provider（SDK `ack()`）。
