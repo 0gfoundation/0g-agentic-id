@@ -128,7 +128,7 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
    先执行 `npm install -g @0gfoundation/0g-agentdna@0.2.2`（`update` 会装 `latest`），
    并重启 api。检查：`npm view @0gfoundation/0g-agentdna dist-tags.next` 输出 `0.2.2`，
    `dist-tags.latest` 不变，`GET /config` 显示 `"cli_latest":"0.2.2"`。
-7. **公告。**使用 CLI 的 owner 先更新（`npm install -g @0gfoundation/0g-agentdna@0.2.2`），然后 owner reset 自己的
+7. **公告。**使用 CLI 的 owner 先更新（`npm install -g @0gfoundation/0g-agentdna@0.2.2`）。公告里要写明这条安装命令：0.2.2 之前的 CLI 会提示 `update available … 0g-agentdna update`，而 `update` 装的是 `latest`，不是 0.2.2。CLI 需要 Node.js 18 或更高版本，在 Node 16 上会报 `fetch is not defined`。然后 owner reset 自己的
    agent。容器创建于 1.4 之前的 agent 自第 4 步起都已下线，显示为 `stopped`，只有 reset
    才能恢复：1.4 之前创建的 sandbox 不能 resume（`/start` 带 `start`），会得到 409，因为
    那个运行时无法 provision。preflight 要求时，owner 需重新确认 provider（SDK `ack()`）。

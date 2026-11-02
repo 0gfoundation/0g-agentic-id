@@ -164,7 +164,11 @@ on dev would first meet the live provider with every agent already offline.
    Check: `npm view @0gfoundation/0g-agentdna dist-tags.next` prints `0.2.2`,
    `dist-tags.latest` is unchanged, and `GET /config` shows
    `"cli_latest":"0.2.2"`.
-7. **Announce.** CLI owners install 0.2.2 (`npm install -g @0gfoundation/0g-agentdna@0.2.2`), then owners reset
+7. **Announce.** CLI owners install 0.2.2 (`npm install -g @0gfoundation/0g-agentdna@0.2.2`).
+   Name that install command in the announcement: a CLI before
+   0.2.2 prints `update available … 0g-agentdna update`, and `update`
+   installs `latest`, not 0.2.2. The CLI needs Node.js 18 or later; on Node 16
+   it stops with `fetch is not defined`. Then owners reset
    their agents. Every agent whose container predates 1.4 has been offline
    since step 4 and shows `stopped`, and a reset is the only way back: a
    resume (`/start` with `start`) of a sandbox created before 1.4 is refused
