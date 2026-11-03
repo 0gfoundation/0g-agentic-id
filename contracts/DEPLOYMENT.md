@@ -567,10 +567,10 @@ contracts): the mainnet attestor's stable signer
 CloneGate `0x1d33…0303` (tx
 `0x738cc36c3dba4d659a2a3062b5b53447b8c9c622d1e9c5900066431bac1159b8`), both on
 2026-11-02 by the vault. The attestor's pre-1.3 address-only entry
-`0x6a81d9024e7e4ccc5d5fff1a5c782cd3c99b4482` is still listed but has no
-binding, so `isTrustedAttestor` reads `false` for it; `removeTrustedAttestor`
-on it is the remaining cleanup
-([`attestor/APP_IDENTITY.md`](../attestor/APP_IDENTITY.md) step 5).
+`0x6a81d9024e7e4ccc5d5fff1a5c782cd3c99b4482` was removed on 2026-11-03 by the
+vault (`removeTrustedAttestor`, tx
+`0x5c3ecd570fb3c63c0ca26e00cd9551523765da7fc15a5478350539048176e2ec`, block
+49163847; [`attestor/APP_IDENTITY.md`](../attestor/APP_IDENTITY.md) step 5).
 
 ### 6.3 Superseded / do not use
 
@@ -691,8 +691,8 @@ Changelog:
     48521460, 2026-10-28 07:01 UTC, delay 86400 — ready, and executable by
     anyone, from 2026-10-29 07:01 UTC), `executeBatch`
     `0xadfc230a47f2d0eebbe5457576060ac75591d06c379ba6e36f06418ebadac97b` (block
-    49064412, 2026-11-02 14:29 UTC, in the release window). Bindings and the
-    switch (2026-11-03 01:47 UTC): §6.2m; the old entry is still to be removed.
+    49064412, 2026-11-02 14:29 UTC, in the release window). Bindings, the
+    switch (2026-11-03 01:47 UTC) and the old entry's removal (14:05 UTC): §6.2m.
 
 - **AgenticID 1.2.0 + TEEDataVerifier 1.2.0 — dev beacon-upgraded
   2026-10-21, test 2026-10-23; mainnet TEEDataVerifier 2026-11-02 (AgenticID
