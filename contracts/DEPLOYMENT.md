@@ -363,11 +363,13 @@ constructor argument. Browser
 > **Three canonical-bound environments run in parallel** — pick the set by env
 > (attestor `/config` values as of 2026-10-19):
 > - **mainnet** (§6.2m, chain 16661) — AgenticID `0x92F6…`. **This is what the
->   production attestor (`agenticid.0g.ai`) serves**: `GET /config` →
+>   production attestor (`agentdna.0g.ai`; `agenticid.0g.ai` until 2026-11-03,
+>   still answering) serves**: `GET /config` →
 >   `chain_id 16661`, `agentic_id_addr = 0x92f6…`,
 >   `verified_feedback_addr = 0x6663…`.
 > - **test** (§6.1, Galileo 16602) — AgenticID `0x3449…`, owner `0x9C58…`.
->   **Served by the testnet attestor (`agenticid-testnet.0g.ai`)**:
+>   **Served by the testnet attestor (`agentdna-testnet.0g.ai`;
+>   `agenticid-testnet.0g.ai` until 2026-11-03, still answering)**:
 >   `chain_id 16602`, `agentic_id_addr = 0x3449…`,
 >   `verified_feedback_addr = 0xc0c9…`. (Until mainnet launched, this set was
 >   what `agenticid.0g.ai` served — checked live 2026-07-30.)
@@ -416,7 +418,7 @@ contracts the attestor is configured with, **not** deployed by this repo's
 `Deploy.s.sol`); the addresses above are what `GET https://agenticid.0g.ai/config`
 served (`tapp_registry_addr` / `sandbox_serving_addr`, checked live
 2026-07-30) while that host still fronted this set. Today the testnet
-attestor (`agenticid-testnet.0g.ai`) fronts it — re-checked 2026-10-19 on
+attestor (`agentdna-testnet.0g.ai`, formerly `agenticid-testnet.0g.ai`) fronts it — re-checked 2026-10-19 on
 `agenticid-testnet.0g.ai/config`: unchanged. Together with the three
 proxies above they form the five-address `ContractAddresses` set the SDK needs.
 
@@ -499,7 +501,8 @@ like `ATTESTOR_TAPP_REGISTRY_ADDR`); read both from the dev-host attestor's
 ### 6.2m mainnet environment — 2026-09-09 (0G mainnet, chain 16661)
 
 Full stack via `Deploy.s.sol` (RPC `https://evmrpc.0g.ai`). **The production
-attestor `agenticid.0g.ai` serves this set** (§6 header).
+attestor `agentdna.0g.ai` (formerly `agenticid.0g.ai`, which still answers)
+serves this set** (§6 header).
 
 **Governance — as read on chain 2026-10-19, re-read 2026-11-03** (`owner()` /
 `pauser()` / `teeOracleAddress()` / `getMinDelay()` / `hasRole` /
