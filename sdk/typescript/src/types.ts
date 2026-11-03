@@ -1,6 +1,6 @@
 /**
  * @file types.ts
- * @description All TypeScript types for the 0G AgenticID SDK, mirroring the Solidity structs and enums.
+ * @description All TypeScript types for the 0G AgentDNA SDK, mirroring the Solidity structs and enums.
  */
 
 /**

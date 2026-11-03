@@ -113,7 +113,7 @@ function assertFeedbackValueInRange(value: bigint, valueDecimals: number): void 
 
 /**
  * Internal client for the reputation pair (canonical ERC-8004 registry +
- * VerifiedFeedbackRegistry). Consumers use the `AgenticID` facade's
+ * VerifiedFeedbackRegistry). Consumers use the `AgentDNA` facade's
  * `reputation` namespace, not this directly.
  */
 export class ReputationClient {

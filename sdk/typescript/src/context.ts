@@ -1,6 +1,6 @@
 /**
  * @file context.ts
- * @description Shared config + runtime context for the AgenticID facade and its
+ * @description Shared config + runtime context for the AgentDNA facade and its
  * internal per-contract clients. Constructed once; passed to each sub-client.
  */
 
@@ -16,7 +16,7 @@ import {
 import { privateKeyToAccount } from 'viem/accounts';
 import { ZERO_G_TESTNET, RPC_URL, type ContractAddresses } from './constants';
 
-/** Public config for `new AgenticID(config)`. */
+/** Public config for `new AgentDNA(config)` (exported as `AgentDNAConfig`). */
 export interface AgenticIDConfig {
   /** RPC endpoint. Defaults to the 0G Galileo testnet RPC. */
   rpcUrl?: string;

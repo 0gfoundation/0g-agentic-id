@@ -37,7 +37,7 @@ export const ZERO_G_MAINNET = {
 } as const;
 
 /**
- * Contract address set — pass one explicitly to `new AgenticID({ addresses })`.
+ * Contract address set — pass one explicitly to `new AgentDNA({ addresses })`.
  *
  * Addresses are a deployment artifact, NOT baked into the SDK: an RPC + these
  * addresses fully determine the target contracts, and keeping them out of the
@@ -67,7 +67,7 @@ export interface ContractAddresses {
 }
 
 /**
- * Default RPC URL for the 0G Galileo Testnet (override via `AgenticID({ rpcUrl })`).
+ * Default RPC URL for the 0G Galileo Testnet (override via `new AgentDNA({ rpcUrl })`).
  */
 export const RPC_URL = 'https://evmrpc-testnet.0g.ai';
 

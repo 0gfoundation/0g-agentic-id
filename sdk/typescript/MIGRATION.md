@@ -48,6 +48,14 @@ directory is left intact. A failed move stops with a migration error instead
 of creating an empty replacement. Existing `AGENTIC_*` environment variables
 remain supported.
 
+The public attestors' earlier addresses, `https://agenticid.0g.ai` and
+`https://agenticid-testnet.0g.ai`, are now `https://agentdna.0g.ai` and
+`https://agentdna-testnet.0g.ai`; both names reach the same attestor. From
+0.2.3 the CLI replaces a saved earlier address with the current one on its next
+run, moves its secret-env downgrade pin along, and says so on stderr. An
+`AGENTIC_ATTESTOR_URL` set in the environment is left as it is; update it
+yourself (`doctor` points it out). SDK code that passes an earlier address
+keeps working; switch it to the current one.
 
 The old credential field `apiKey` is atomically converted to
 `inferenceKeys["0g-compute"]`, preserving wallet and other provider keys.

@@ -9,7 +9,7 @@
 // Read-only end to end: no mint, no sandbox, no gas — costs nothing.
 //
 // Usage:
-//   AGENTIC_ATTESTOR_URL=https://agenticid.0g.ai node scripts/cli-smoke.cjs
+//   AGENTIC_ATTESTOR_URL=https://agentdna.0g.ai node scripts/cli-smoke.cjs
 //
 // Optional:
 //   AGENTIC_PRIVATE_KEY=0x…  unlocks the owner-tier legs (doctor wallet

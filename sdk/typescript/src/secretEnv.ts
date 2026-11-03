@@ -118,7 +118,7 @@ export function randomBytes(n: number): Uint8Array {
     cryptoObj = (require('crypto') as { webcrypto?: WebCrypto }).webcrypto;
   }
   if (!cryptoObj?.getRandomValues) {
-    throw new Error('AgenticID SDK: no WebCrypto available (need a browser or Node >= 18 with crypto.webcrypto)');
+    throw new Error('AgentDNA SDK: no WebCrypto available (need a browser or Node >= 18 with crypto.webcrypto)');
   }
   cryptoObj.getRandomValues(a);
   return a;

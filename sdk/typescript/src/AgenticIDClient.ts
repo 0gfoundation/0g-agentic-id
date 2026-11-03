@@ -1,7 +1,7 @@
 /**
  * @file AgenticIDClient.ts
  * @description Internal client for the AgenticID contract (seal-bound transfer +
- * the reads that transfer/clone/reputation use). Consumers use the `AgenticID`
+ * the reads that transfer/clone/reputation use). Consumers use the `AgentDNA`
  * facade's `agent` namespace, not this directly.
  */
 
