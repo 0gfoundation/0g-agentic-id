@@ -356,16 +356,20 @@ constructor argument. Browser
 > (dev **2026-10-21**, test **2026-10-23**) and AgenticID 1.3.0 (dev
 > **2026-10-26**, test **2026-10-27**); every `VERSION()`,
 > `beacon.implementation()`, pause flag and attestor binding in §6.1 / §6.2
-> was re-read on chain **2026-10-28**.
+> was re-read on chain **2026-10-28**. Mainnet took the same versions in one
+> batch on **2026-11-02** (AgenticID straight from 1.1.0 to 1.3.0); §6.2m was
+> re-read on chain **2026-11-03**.
 >
 > **Three canonical-bound environments run in parallel** — pick the set by env
 > (attestor `/config` values as of 2026-10-19):
 > - **mainnet** (§6.2m, chain 16661) — AgenticID `0x92F6…`. **This is what the
->   production attestor (`agenticid.0g.ai`) serves**: `GET /config` →
+>   production attestor (`agentdna.0g.ai`; `agenticid.0g.ai` until 2026-11-03,
+>   still answering) serves**: `GET /config` →
 >   `chain_id 16661`, `agentic_id_addr = 0x92f6…`,
 >   `verified_feedback_addr = 0x6663…`.
 > - **test** (§6.1, Galileo 16602) — AgenticID `0x3449…`, owner `0x9C58…`.
->   **Served by the testnet attestor (`agenticid-testnet.0g.ai`)**:
+>   **Served by the testnet attestor (`agentdna-testnet.0g.ai`;
+>   `agenticid-testnet.0g.ai` until 2026-11-03, still answering)**:
 >   `chain_id 16602`, `agentic_id_addr = 0x3449…`,
 >   `verified_feedback_addr = 0xc0c9…`. (Until mainnet launched, this set was
 >   what `agenticid.0g.ai` served — checked live 2026-07-30.)
@@ -414,7 +418,7 @@ contracts the attestor is configured with, **not** deployed by this repo's
 `Deploy.s.sol`); the addresses above are what `GET https://agenticid.0g.ai/config`
 served (`tapp_registry_addr` / `sandbox_serving_addr`, checked live
 2026-07-30) while that host still fronted this set. Today the testnet
-attestor (`agenticid-testnet.0g.ai`) fronts it — re-checked 2026-10-19 on
+attestor (`agentdna-testnet.0g.ai`, formerly `agenticid-testnet.0g.ai`) fronts it — re-checked 2026-10-19 on
 `agenticid-testnet.0g.ai/config`: unchanged. Together with the three
 proxies above they form the five-address `ContractAddresses` set the SDK needs.
 
@@ -428,9 +432,9 @@ stable signer `0xc6c43480a5219e7d260ea3edd0a721b6800d0d19` (tx
 CloneGate `0xACcD…Bb89` (tx
 `0xa56a5d7149f668183dfc2205b7e3b8f34ca72891e0274c2928d8158d0a9a58f1`). The
 attestor's pre-1.3 address-only entry `0x0193bAE3f74f62FF2B4Bf21D648d0F2c0111B89C`
-is still listed but has no binding, so `isTrustedAttestor` reads `false` for it;
-`removeTrustedAttestor` on it is the remaining cleanup
-([`attestor/APP_IDENTITY.md`](../attestor/APP_IDENTITY.md) step 5).
+was removed on 2026-11-04 by the owner (`removeTrustedAttestor`, tx
+`0xe8510c01fa8cb77c201c134f8d1a7b35daa6fa3285615d2da34433c5f32c50c2`, block
+63766801; [`attestor/APP_IDENTITY.md`](../attestor/APP_IDENTITY.md) step 5).
 
 **Governance is deliberately lightweight (testnet):** owner = pauser = TEE
 oracle = one EOA, `minDelay=0`, the same EOA as Timelock
@@ -497,11 +501,13 @@ like `ATTESTOR_TAPP_REGISTRY_ADDR`); read both from the dev-host attestor's
 ### 6.2m mainnet environment — 2026-09-09 (0G mainnet, chain 16661)
 
 Full stack via `Deploy.s.sol` (RPC `https://evmrpc.0g.ai`). **The production
-attestor `agenticid.0g.ai` serves this set** (§6 header).
+attestor `agentdna.0g.ai` (formerly `agenticid.0g.ai`, which still answers)
+serves this set** (§6 header).
 
-**Governance — as read on chain 2026-10-19** (`owner()` / `pauser()` /
-`teeOracleAddress()` / `getMinDelay()` / `hasRole`, plus the Timelock's
-`RoleGranted` / `RoleRevoked` / `MinDelayChange` logs):
+**Governance — as read on chain 2026-10-19, re-read 2026-11-03** (`owner()` /
+`pauser()` / `teeOracleAddress()` / `getMinDelay()` / `hasRole` /
+`pendingOwner()`, plus the Timelock's `RoleGranted` / `RoleRevoked` /
+`MinDelayChange` logs; `pendingOwner()` is zero on all three):
 
 - **Owner** of AgenticID, VerifiedFeedbackRegistry and TEEDataVerifier,
   **pauser** of all three, and the TEEDataVerifier **TEE oracle** =
@@ -527,21 +533,44 @@ which mainnet-checklist items are satisfied and which remain.
 
 | Contract | Address |
 |---|---|
-| AgenticID proxy | `0x92F66386092883f738032c472424255362A2CC6d` (1.1.0; 1.3.0 pending — §7) |
-| AgenticID impl / beacon | `0xAa63e6B6260402F9f0bFA9Fe4Df749d44C588817` / `0x882FCD3c3B7b32EB53B11886B024cf656456F21C` |
-| VerifiedFeedback proxy | `0x666391a61f3980bF942CE8C3CC8DfD7f2F7b2f4C` (1.1.0; anchors canonical rep `0x8004BAa1…9b63`; 1.2.0 pending — §7; record its upgrade block here — no pre-cut marks exist, §7) |
-| VerifiedFeedback impl / beacon | `0x2943075CcC8123Ce31c1f7c8950Ac4371144FD31` / `0x1C23A210806568bf0815c3289E56719325c36827` |
-| CloneGate proxy | `0x1d33086b367a9dF4b4f4d7A29b35fC1187380303` (1.0.1; allowlisted via addTrustedAttestor; 1.1.0 pending — §7) |
-| CloneGate impl / beacon | `0xfb7617A73eDc3C0a20B36e5744bb4fbED70A4E29` / `0x941fAb5f87799F7EA60427a216A6386207CEc186` |
+| AgenticID proxy | `0x92F66386092883f738032c472424255362A2CC6d` (**1.3.0**, instance-bound attestors — beacon-upgraded 2026-11-02 straight from 1.1.0; §7) |
+| AgenticID impl / beacon | `0x2503f5B751A57d375F92A2eF7E879fa659c5b3c9` (links AttestorAppBindingLib `0xC786…A2ee`; previous: 1.1.0 `0xAa63e6B6260402F9f0bFA9Fe4Df749d44C588817`) / `0x882FCD3c3B7b32EB53B11886B024cf656456F21C` |
+| AttestorAppBindingLib (linked library — stateless, no proxy) | `0xC786e015D85B6B0028D219628b3E4e740908A2ee` (deployed 2026-10-28 with the 1.3.0 impl) |
+| VerifiedFeedback proxy | `0x666391a61f3980bF942CE8C3CC8DfD7f2F7b2f4C` (**1.2.0**, beacon-upgraded 2026-11-02, **upgrade block 49064412**; it had emitted no log before that block, so there are no pre-cut marks, §7; anchors canonical rep `0x8004BAa1…9b63`) |
+| VerifiedFeedback impl / beacon | `0xe8625870DB276850Ab150f772a77e5f3f229D79e` (previous: 1.1.0 `0x2943075CcC8123Ce31c1f7c8950Ac4371144FD31`) / `0x1C23A210806568bf0815c3289E56719325c36827` |
+| CloneGate proxy | `0x1d33086b367a9dF4b4f4d7A29b35fC1187380303` (**1.1.0**, beacon-upgraded 2026-11-02, §7; a trusted attestor of AgenticID, bound to the attestor app, below) |
+| CloneGate impl / beacon | `0xf8f018E6a09b00EfA6B9f6810a4b3AFd20591034` (previous: 1.0.1 `0xfb7617A73eDc3C0a20B36e5744bb4fbED70A4E29`) / `0x941fAb5f87799F7EA60427a216A6386207CEc186` |
 | StandardCloneAuthorizer | `0xEa7C23874a7530C9dd42c6C2CDAa52Eab0E19FF9` |
 | FeedbackBatcher (no beacon) | `0x8FbB46AeDc21e1f5CD853d014F47642Fa65d80B8` (v4) |
-| TEEDataVerifier proxy | `0x6867b17d0092E8d497D1b5110484138285E4D1B2` (1.1.0; 1.2.0 pending — §7) |
-| TEEDataVerifier impl / beacon | `0x6D82f34CD671E4593A7E3BCDa253B23a2722403a` / `0xf74242B94dc958c3973Eb3e6219435c5956563fC` |
+| TEEDataVerifier proxy | `0x6867b17d0092E8d497D1b5110484138285E4D1B2` (**1.2.0**, beacon-upgraded 2026-11-02, §7) |
+| TEEDataVerifier impl / beacon | `0xdA63c7920C371DBF6c5526c85EECd726bF0f18ec` (previous: 1.1.0 `0x6D82f34CD671E4593A7E3BCDa253B23a2722403a`) / `0xf74242B94dc958c3973Eb3e6219435c5956563fC` |
 | TimelockController | `0x399ab112B03104f20524Df0f9a4A2F0C199A0cF7` (`minDelay` 86400; proposer + canceller + admin = the vault, admin also self; open execution) |
 | Canonical ERC-8004 identity / reputation | `0x8004A169…a432` / `0x8004BAa1…9b63` (v2.0.0, pre-existing) |
 | TappRegistry (attestor infra, external) | `0x54874F536301c993922Dd95097e3902e7FBfe612` (from `agenticid.0g.ai` `GET /config` `tapp_registry_addr`, 2026-10-19) |
 | SandboxServing (attestor infra, external) | `0x650C16a491ad52dB6b7f3053bCaD650cb43d2206` (from `agenticid.0g.ai` `GET /config` `sandbox_serving_addr`, 2026-10-19) |
 | owner / pauser / proposer / canceller / TEE-oracle | `0xc0603224dE8c3B910a4487368E476e19dC6127cF` (Fordefi MPC vault; since 2026-10-16, superseding `0x8760…621d`) |
+
+The four 2026-10-28 impls and the library were deployed by `0x9C58…80Bb`,
+which holds no role on them or on this stack (the beacons belong to the
+Timelock); each runtime is identical to testnet's, AgenticID's up to its
+library address, and all five are verified on chainscan.
+
+**Trusted attestors (AgenticID 1.3.0, read on chain 2026-11-03).**
+`instanceBoundAttestorsRequired()` = `true` since 2026-11-03 01:47 UTC (tx
+`0x3f4af7aae5bf133de50bacd1871ff8a925b899aa25aa41c6df4ffb0f0dbe2512`, block
+49112339, by the vault). Two addresses are bound, both to TappRegistry
+`0x5487…e612`, app `0g-agentic-id`, `registeredAt` 1789010188, app owner
+`0x9C58…80Bb` (the attestor app's owner on the registry, not a role on these
+contracts): the mainnet attestor's stable signer
+`0x4a862762e75501671458d7d3974fb62f0ca5eb31` (tx
+`0xc19ebc95ba5ccd5ac0abef6a69f1b97dd55718414351b1dbeb6ac911da91c9d4`) and
+CloneGate `0x1d33…0303` (tx
+`0x738cc36c3dba4d659a2a3062b5b53447b8c9c622d1e9c5900066431bac1159b8`), both on
+2026-11-02 by the vault. The attestor's pre-1.3 address-only entry
+`0x6a81d9024e7e4ccc5d5fff1a5c782cd3c99b4482` was removed on 2026-11-03 by the
+vault (`removeTrustedAttestor`, tx
+`0x5c3ecd570fb3c63c0ca26e00cd9551523765da7fc15a5478350539048176e2ec`, block
+49163847; [`attestor/APP_IDENTITY.md`](../attestor/APP_IDENTITY.md) step 5).
 
 ### 6.3 Superseded / do not use
 
@@ -565,29 +594,29 @@ which mainnet-checklist items are satisfied and which remain.
 ## 7. Contract versions & changelog
 
 Current impl versions (`VERSION()` and `beacon.implementation()` read on
-chain 2026-10-28 on all three environments; the date is when that version's
-beacon upgrade executed):
+chain 2026-10-28 on dev and test, 2026-11-03 on mainnet; the date is when
+that version's beacon upgrade executed):
 
 | Contract | dev VERSION | test VERSION | mainnet VERSION |
 |---|---|---|---|
-| AgenticID | **1.3.0** (2026-10-26) | **1.3.0** (2026-10-27) | **1.1.0** |
-| TEEDataVerifier | **1.2.0** (2026-10-21) | **1.2.0** (2026-10-23) | **1.1.0** |
+| AgenticID | **1.3.0** (2026-10-26) | **1.3.0** (2026-10-27) | **1.3.0** (2026-11-02) |
+| TEEDataVerifier | **1.2.0** (2026-10-21) | **1.2.0** (2026-10-23) | **1.2.0** (2026-11-02) |
 | AgenticIDReputationRegistry (deprecated) | **1.2.0**, paused | **1.2.0**, paused | — (not deployed) |
-| VerifiedFeedbackRegistry | **1.2.0** (2026-10-21) | **1.2.0** (2026-10-23) | **1.1.0** |
-| CloneGate | **1.1.0** (2026-10-21) | **1.1.0** (2026-10-23) | **1.0.1** |
+| VerifiedFeedbackRegistry | **1.2.0** (2026-10-21) | **1.2.0** (2026-10-23) | **1.2.0** (2026-11-02) |
+| CloneGate | **1.1.0** (2026-10-21) | **1.1.0** (2026-10-23) | **1.1.0** (2026-11-02) |
 
-> dev and test are at parity and run the source's versions: AgenticID
-> **1.3.0** (instance-bound attestors required on both, §6.1 / §6.2),
+> All three environments are at parity and run the source's versions: AgenticID
+> **1.3.0** (instance-bound attestors required on all three, §6.1 / §6.2 / §6.2m),
 > TEEDataVerifier **1.2.0**, VerifiedFeedbackRegistry **1.2.0** and CloneGate
-> **1.1.0**. Mainnet still runs 1.1.0 / 1.1.0 / 1.1.0 / 1.0.1; its upgrade is
-> pending (changelog entries below). Each environment has its own impls (dev
+> **1.1.0**. Mainnet moved to them on 2026-11-02, AgenticID straight from 1.1.0
+> (changelog entries below). Each environment has its own impls (dev
 > and test deployed separately on the same chain). The 1.2.0 / 1.1.0 impls
 > are solc 0.8.24 builds (optimizer runs 200, via-IR — the `foundry.toml` of
 > `27aef57`); AgenticID 1.3.0 and its library are built with the current
 > settings (solc 0.8.38, runs 1, Cancun, `bytecode_hash = "none"`;
-> UPGRADING.md §1). Every dev / test impl and both libraries are verified on
+> UPGRADING.md §1). Every impl and all three libraries are verified on
 > chainscan with the settings they were built with (the 1.3.0 impls with their
-> library's link address); verify mainnet's new impls and library the same way. The
+> library's link address). The
 > deprecated fork's source reads **1.3.0** only because a shared base changed
 > under it; it is never to be deployed, and its deployed 1.2.0 instances are
 > paused. Policy-mode cloning (issue #133) shipped as the **CloneGate
@@ -596,8 +625,8 @@ beacon upgrade executed):
 
 Changelog:
 
-- **AgenticID 1.3.0 — dev beacon-upgraded 2026-10-26, test 2026-10-27;
-  mainnet pending** — instance-bound trusted attestors (app identities,
+- **AgenticID 1.3.0 — dev beacon-upgraded 2026-10-26, test 2026-10-27,
+  mainnet 2026-11-02** — instance-bound trusted attestors (app identities,
   [`attestor/APP_IDENTITY.md`](../attestor/APP_IDENTITY.md)). Minor per
   UPGRADING.md: beacon upgrade; two fields appended after `agentSealBound` in
   AgenticID's ERC-7201 struct (`attestorAppBindings`,
@@ -648,16 +677,26 @@ Changelog:
     `0xfdf08cc1811c89ebd48cb2b4b9ba81e601c860a1bd8fd1859d73753348e1134e`);
     schedule `0xcb7a5636b1b5b88c1f48b97a26e97c3c2df77d2c29b3a649c5872038ae6263f6`,
     execute `0x3db4a0321b3a04ba786ef5688ef7866b392da24424412012a9b592887d2e275d`
-    (block 62366042, 08:40 UTC). Bindings and the switch (09:30 UTC): §6.1;
-    the old entry is still to be removed.
-  - mainnet: pending. AgenticID goes 1.1.0 → 1.3.0 directly (no 1.2.0 impl
-    there), together with TEEDataVerifier 1.2.0 — the pair must move together
-    (1.2.0 entry below) — and with VerifiedFeedbackRegistry 1.2.0 and CloneGate
-    1.1.0.
+    (block 62366042, 08:40 UTC). Bindings, the switch (09:30 UTC) and the old
+    entry's removal (2026-11-04 06:18 UTC): §6.1.
+  - mainnet, 2026-11-02: straight from 1.1.0 (no 1.2.0 impl there), in one
+    batch with TEEDataVerifier 1.2.0 — the pair must move together (1.2.0 entry
+    below) — VerifiedFeedbackRegistry 1.2.0 and CloneGate 1.1.0. Library
+    `0xC786e015D85B6B0028D219628b3E4e740908A2ee` (tx
+    `0x472e892f9ed8578ceec5c13a4b63254ff176f48ae0284816caaec15acc67d1db`), impl
+    `0x2503f5B751A57d375F92A2eF7E879fa659c5b3c9` (tx
+    `0x06f143f5d64dce23d8d254151037a308b1a247f7b5706f69a7b1b1056b7c26a2`), both
+    2026-10-28; the vault's `scheduleBatch` of the four beacon upgrades
+    `0xcbe7ee0a3110db54d86d2291e8b5fe7ee8a352daec730d18795628c30feb7a00` (block
+    48521460, 2026-10-28 07:01 UTC, delay 86400 — ready, and executable by
+    anyone, from 2026-10-29 07:01 UTC), `executeBatch`
+    `0xadfc230a47f2d0eebbe5457576060ac75591d06c379ba6e36f06418ebadac97b` (block
+    49064412, 2026-11-02 14:29 UTC, in the release window). Bindings, the
+    switch (2026-11-03 01:47 UTC) and the old entry's removal (14:05 UTC): §6.2m.
 
 - **AgenticID 1.2.0 + TEEDataVerifier 1.2.0 — dev beacon-upgraded
-  2026-10-21, test 2026-10-23; mainnet pending (AgenticID goes straight to
-  1.3.0 there, above)** — governance hardening
+  2026-10-21, test 2026-10-23; mainnet TEEDataVerifier 2026-11-02 (AgenticID
+  went straight to 1.3.0 there, above)** — governance hardening
   (audit FIND-12 / FIND-16) and the audit's Low fixes (FIND-05 / 06 / 07 / 08
   / 11 / 14, item 4). Minor per UPGRADING.md: beacon upgrade, no existing
   storage moves (AgenticID appends one mapping); AgenticID's ABI only gains
@@ -741,11 +780,15 @@ Changelog:
     TEEDataVerifier impl `0xA45431FAee1d5c5324d2b47333eCb8BAABecc1dd`
     (schedule `0xfd69e68be239fd44649d90eeb484d12412b891e59d812286d23d320f6ae82112`,
     execute `0xa4ed388cdf34d4829f22526a1e3aaffbfc166c30548d6eb38372f345c07737ff`).
-  - mainnet: pending — TEEDataVerifier 1.2.0 with AgenticID 1.3.0.
+  - mainnet, 2026-11-02: TEEDataVerifier impl
+    `0xdA63c7920C371DBF6c5526c85EECd726bF0f18ec` (tx
+    `0x5d69a9276c5e4bb35218b87a40638528f7ab3b012c503734d9827015b2e9a962`,
+    2026-10-28), in the AgenticID 1.3.0 batch (above); AgenticID has no 1.2.0
+    impl there.
 
 - **VerifiedFeedbackRegistry 1.2.0 — dev beacon-upgraded 2026-10-21
-  (upgrade block 61259384), test 2026-10-23 (upgrade block 61618272);
-  mainnet pending** — ServeProof hardening (audit
+  (upgrade block 61259384), test 2026-10-23 (upgrade block 61618272),
+  mainnet 2026-11-02 (upgrade block 49064412)** — ServeProof hardening (audit
   FIND-01 / FIND-02 / FIND-16) and the audit's Low fixes on this contract
   (item 5). Minor per UPGRADING.md: beacon upgrade, storage unchanged, ABI
   gains only the two-step-ownership surface of (4) plus the errors and the
@@ -778,8 +821,8 @@ Changelog:
   are not assured to be authentic. Record each environment's upgrade block
   (the block of the `ExecuteUpgrade` transaction) in §6 so readers and
   indexers can drop `FeedbackVerified` logs below it (dev 61259384, test
-  61618272). Mainnet's VF proxy (§6.2m) has none to drop: it had emitted no
-  `FeedbackVerified` log as of 2026-10-28. **Hard-cut rollout — one window.**
+  61618272, mainnet 49064412). Mainnet's VF proxy (§6.2m) has none to drop: it
+  had emitted no log at all before its upgrade block. **Hard-cut rollout — one window.**
   The ordering is a correctness dependency, not hygiene: old images' proofs
   stop verifying the moment the beacon lands, and new images' proofs verify
   nowhere before it does. Each step ends with a check — confirm it before
@@ -862,7 +905,11 @@ Changelog:
     schedule `0x1d508eb9fa0078640541b357ce38b16b9516fda20af6a4bd4c9d25f1f1606c44`,
     execute `0x6dbae4f2b6ef8c1a218cef85434ad2ba848c9b2e7d4e2378b690ca62e2488d51`
     (block 61618272, 03:04 UTC).
-  - mainnet: pending.
+  - mainnet, 2026-11-02: impl `0xe8625870DB276850Ab150f772a77e5f3f229D79e` (tx
+    `0x54148746b6c1a94eb6c2590c122e8188e7d97f5dd2d61ac2c815e7cb2f9d87a4`,
+    2026-10-28), in the AgenticID 1.3.0 batch (execute
+    `0xadfc230a…c97b`, block 49064412, 14:29 UTC). The old sealed images'
+    framework hashes stay allowed until every agent has reset (above, after step 5).
 
 - **AgenticIDReputationRegistry (deprecated fork) 1.3.0 — source only, never
   to be deployed.** Bumped because the shared `NonceRegistryUpgradeable`
@@ -870,8 +917,8 @@ Changelog:
   2 hours–365 days, range-checked `initialize`, `NonceMaxAgeUpdated`). The
   deployed 1.2.0 instances keep the unrestricted setter; they must be paused
   (VerifiedFeedbackRegistry 1.2.0 entry, step 1), not upgraded.
-- **CloneGate 1.1.0 — dev beacon-upgraded 2026-10-21, test 2026-10-23;
-  mainnet pending** — `cloneFrom` rejects a `newAgentSeal` equal to the
+- **CloneGate 1.1.0 — dev beacon-upgraded 2026-10-21, test 2026-10-23,
+  mainnet 2026-11-02** — `cloneFrom` rejects a `newAgentSeal` equal to the
   source's agentSeal (`CloneGateSourceSealReused`; audit FIND-08). AgenticID
   1.2.0 refuses any reused seal address, but only tracks seals bound after
   its own upgrade — this check also covers older sources. Minor per
@@ -883,7 +930,9 @@ Changelog:
   2026-10-23, impl `0xDE66098EB524095fBa7a5d019464867AE321cCd1` (schedule
   `0x8c7e104e634f8958e545810364eee1e1308b93fc0c0edd9bc8f3c364d2f0d58a`,
   execute `0x67948491bd9bf0a0d8158154b7be74be2d87c862e07c2e5ad5cf6f52646f2e9c`);
-  mainnet pending.
+  mainnet 2026-11-02, impl `0xf8f018E6a09b00EfA6B9f6810a4b3AFd20591034` (tx
+  `0x3396faf13035b55468cc36f45315a72d2412e0521c0dc1a120d7baa8974b7a2f`,
+  2026-10-28), in the AgenticID 1.3.0 batch.
 - **CloneGate 1.0.1, dev beacon-upgraded 2026-08-29** —
   `CloneGateArityMismatch` reports the sealedKeys length when that side
   mismatches (was always dataHashes.length; review F5). Diagnostic-only.
@@ -1004,7 +1053,8 @@ Changelog:
   keep their own.
 - The suite uses `CanonicalIdentityRegistryMock`; `CanonicalForkIntegration.t.sol`
   runs against the real registry when `FORK_RPC` is set.
-- **Mainnet checklist** (state of §6.2m as read on chain 2026-10-19):
+- **Mainnet checklist** (state of §6.2m as read on chain 2026-10-19, re-read
+  2026-11-03):
   - **Done — owner / pauser / proposer / canceller moved to the Fordefi MPC
     vault `0xc060…27cF`** instead of the multisig this list originally asked
     for: no single private key; whether a transaction needs more than one
@@ -1022,10 +1072,11 @@ Changelog:
   - **Open — real TEE oracle:** `teeOracleAddress()` is currently the vault, not
     a TEE-held signer; rotate with `setTeeOracleAddress` (1.2.0 rejects zero
     and emits `TeeOracleUpdated`).
-  - **Open — AgenticID 1.3.0, TEEDataVerifier / VerifiedFeedbackRegistry
-    1.2.0, CloneGate 1.1.0:** two-step ownership + setter guards, the
-    ServeProof cut and instance-bound attestors (§7; running on dev / test
-    since 2026-10-21 → 2026-10-27).
+  - **Done — AgenticID 1.3.0, TEEDataVerifier / VerifiedFeedbackRegistry
+    1.2.0, CloneGate 1.1.0** (2026-11-02): two-step ownership + setter guards,
+    the ServeProof cut and instance-bound attestors (§7, §6.2m). Left: remove
+    the attestor's old address-only entry and, once every agent has reset, the
+    old framework hashes.
   - **Recommended (not verifiable from chain):** a Fordefi approval policy
     that requires a human quorum for any vault transaction targeting the
     governance contracts (AgenticID / VerifiedFeedbackRegistry /
