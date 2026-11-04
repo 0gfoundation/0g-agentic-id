@@ -205,7 +205,7 @@ func (be bridgeEnv) environ() []string {
 	if be.rt.AgentSeal != "" {
 		env = append(env, "AGENT_SEAL="+be.rt.AgentSeal)
 	}
-	return env
+	return append(env, be.rt.CredentialEnv()...)
 }
 
 func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {

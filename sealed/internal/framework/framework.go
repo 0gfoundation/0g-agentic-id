@@ -452,6 +452,51 @@ type RuntimeContext struct {
 	// Sealed runtime metadata.
 	SealedVersion string // git short hash of sealed binary; empty if unavailable
 	FrameworkHash string // "0x"+sha256 sealed image hash; signed into serve-proofs as the AgenticID Framework code hash
+
+	// Credential proxy (internal/credproxy). All empty when it is off.
+	CredProxy      string // explicit form prefix: http://127.0.0.1:<port>/<token>
+	CredHTTPSProxy string // HTTPS_PROXY value: http://agent:<token>@127.0.0.1:<port>
+	CredCAFile     string // the proxy's per-boot root alone
+	CredCABundle   string // system roots followed by the proxy's root
+	CredSock       string // harness credential socket
+	CredRevealSock string // socket that hands out revealed values
+}
+
+// credentialCAVars name the CA-location variables, read by the tools a
+// harness runs, that replace a tool's trust store. They get the bundle
+// (system roots + the proxy root) so ordinary hosts still verify.
+var credentialCAVars = []string{
+	"SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+	"GIT_SSL_CAINFO", "AWS_CA_BUNDLE", "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+}
+
+// CredentialEnv is the environment that sends a framework's tools through
+// sealed's credential proxy: HTTPS_PROXY for the intercepting form, the CA
+// variables pointing at the proxy's root, and the explicit prefix and
+// sockets for tools that call them directly. Every adapter appends it to
+// the framework's environment; it is empty when the proxy is off.
+func (rt RuntimeContext) CredentialEnv() []string {
+	if rt.CredHTTPSProxy == "" {
+		return nil
+	}
+	env := []string{
+		"SEAL_CRED_PROXY=" + rt.CredProxy,
+		"HTTPS_PROXY=" + rt.CredHTTPSProxy,
+		"https_proxy=" + rt.CredHTTPSProxy,
+		"NO_PROXY=localhost,127.0.0.1,::1",
+		"no_proxy=localhost,127.0.0.1,::1",
+		"NODE_EXTRA_CA_CERTS=" + rt.CredCAFile,
+	}
+	for _, name := range credentialCAVars {
+		env = append(env, name+"="+rt.CredCABundle)
+	}
+	if rt.CredSock != "" {
+		env = append(env, "SEAL_CRED_SOCKET="+rt.CredSock)
+	}
+	if rt.CredRevealSock != "" {
+		env = append(env, "SEAL_CRED_REVEAL_SOCKET="+rt.CredRevealSock)
+	}
+	return env
 }
 
 // StartResult is what an adapter returns when its agent process is up and

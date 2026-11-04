@@ -454,7 +454,7 @@ func gatewayEnv(apiKeyEnv, apiKey string, rt framework.RuntimeContext) []string 
 	if rt.AgentSeal != "" {
 		env = append(env, "AGENT_SEAL="+rt.AgentSeal)
 	}
-	return env
+	return append(env, rt.CredentialEnv()...)
 }
 
 // stateEnv tells openclaw where its tree is, so that it never finds it

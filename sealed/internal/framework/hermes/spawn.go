@@ -591,7 +591,7 @@ func gatewayEnv(apiKeyEnv, inferenceKey, apiServerKey string, rt framework.Runti
 	if rt.AgentSeal != "" {
 		envWhitelist = append(envWhitelist, "AGENT_SEAL="+rt.AgentSeal)
 	}
-	return envWhitelist
+	return append(envWhitelist, rt.CredentialEnv()...)
 }
 
 // waitForListen polls TCP-connect to addr until success or timeout.
