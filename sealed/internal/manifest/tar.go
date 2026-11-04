@@ -95,16 +95,10 @@ func packDirTo(dir string, out io.Writer) error {
 		return err
 	}
 
-	gz, err := gzip.NewWriterLevel(out, gzip.BestCompression)
+	gz, err := deterministicGzip(out)
 	if err != nil {
-		return fmt.Errorf("manifest: gzip writer: %w", err)
+		return err
 	}
-	// Zero gzip header metadata for determinism.
-	gz.ModTime = time.Time{}
-	gz.Name = ""
-	gz.Comment = ""
-	gz.OS = 255 // "unknown" — avoids OS-specific default
-
 	tw := tar.NewWriter(gz)
 
 	budget := maxPackTotal
@@ -145,6 +139,91 @@ func packDirTo(dir string, out io.Writer) error {
 		return fmt.Errorf("manifest: close gzip: %w", err)
 	}
 	return nil
+}
+
+// deterministicGzip returns the compressor every archive here is written
+// with: best compression, and no header metadata that varies by host.
+func deterministicGzip(out io.Writer) (*gzip.Writer, error) {
+	gz, err := gzip.NewWriterLevel(out, gzip.BestCompression)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: gzip writer: %w", err)
+	}
+	gz.ModTime = time.Time{}
+	gz.Name = ""
+	gz.Comment = ""
+	gz.OS = 255 // "unknown" — avoids OS-specific default
+	return gz, nil
+}
+
+// ScrubArchive returns the archive PackDir would produce if every file in
+// tgz had been passed through scrub first. It returns tgz itself when scrub
+// changes no file, so an archive with nothing to scrub keeps its hash. The
+// result is a function of tgz alone: the same archive scrubs to the same
+// bytes on every pass.
+func ScrubArchive(tgz []byte, scrub func([]byte) []byte) ([]byte, error) {
+	gr, err := gzip.NewReader(bytes.NewReader(tgz))
+	if err != nil {
+		return nil, fmt.Errorf("manifest: gzip reader: %w", err)
+	}
+	defer gr.Close()
+	tr := tar.NewReader(gr)
+
+	var buf bytes.Buffer
+	gz, err := deterministicGzip(&buf)
+	if err != nil {
+		return nil, err
+	}
+	tw := tar.NewWriter(gz)
+	changed := false
+	remaining := maxUnpackTotal
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("manifest: tar next: %w", err)
+		}
+		out := &tar.Header{Name: hdr.Name, Typeflag: hdr.Typeflag, Mode: hdr.Mode, Format: tar.FormatPAX}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := tw.WriteHeader(out); err != nil {
+				return nil, fmt.Errorf("manifest: write header %s: %w", hdr.Name, err)
+			}
+		case tar.TypeReg:
+			if hdr.Size > remaining {
+				return nil, fmt.Errorf("manifest: archive decompresses to more than %d bytes", maxUnpackTotal)
+			}
+			remaining -= hdr.Size
+			content, err := io.ReadAll(io.LimitReader(tr, hdr.Size))
+			if err != nil {
+				return nil, fmt.Errorf("manifest: read %s: %w", hdr.Name, err)
+			}
+			scrubbed := scrub(content)
+			if !bytes.Equal(scrubbed, content) {
+				changed = true
+			}
+			out.Size = int64(len(scrubbed))
+			if err := tw.WriteHeader(out); err != nil {
+				return nil, fmt.Errorf("manifest: write header %s: %w", hdr.Name, err)
+			}
+			if _, err := tw.Write(scrubbed); err != nil {
+				return nil, fmt.Errorf("manifest: write %s: %w", hdr.Name, err)
+			}
+		default:
+			return nil, fmt.Errorf("manifest: unsupported tar typeflag %d in %q", hdr.Typeflag, hdr.Name)
+		}
+	}
+	if !changed {
+		return tgz, nil
+	}
+	if err := tw.Close(); err != nil {
+		return nil, fmt.Errorf("manifest: close tar: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return nil, fmt.Errorf("manifest: close gzip: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // packFile streams the regular file full into tw under hdr, opened once

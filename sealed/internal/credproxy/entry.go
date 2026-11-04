@@ -114,6 +114,7 @@ func NormalizeHost(hostport string) string {
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]*Entry
+	gen     uint64 // advances on every change to the entries
 	now     func() time.Time
 }
 
@@ -136,6 +137,7 @@ func (r *Registry) Replace(entries []*Entry) error {
 	}
 	r.mu.Lock()
 	r.entries = next
+	r.gen++
 	r.mu.Unlock()
 	return nil
 }
@@ -147,6 +149,7 @@ func (r *Registry) Put(e *Entry) error {
 	}
 	r.mu.Lock()
 	r.entries[e.Name] = e
+	r.gen++
 	r.mu.Unlock()
 	return nil
 }
@@ -155,6 +158,7 @@ func (r *Registry) Put(e *Entry) error {
 func (r *Registry) Delete(name string) {
 	r.mu.Lock()
 	delete(r.entries, name)
+	r.gen++
 	r.mu.Unlock()
 }
 

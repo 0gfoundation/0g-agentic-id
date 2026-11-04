@@ -89,6 +89,7 @@ type Server struct {
 
 	readSettings        SettingsReader
 	credentials         CredentialService
+	scrubber            Scrubber
 	readRuntimeSettings func() RuntimeSettings
 	applySettings       SettingsApplier
 	applyClear          ClearApplier
@@ -766,6 +767,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	// No credential value leaves through here, whatever the backend put in
+	// its response: headers and body are scrubbed before they are relayed,
+	// and before a serve-proof is computed, so the proof covers the bytes
+	// the caller receives.
+	s.scrubResponse(resp)
 
 	// An SSE stream can't be buffered + signed: the serve-proof signs a complete
 	// body, which a stream doesn't have until it ends. Relay it verbatim with

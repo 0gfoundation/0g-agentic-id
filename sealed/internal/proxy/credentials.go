@@ -24,6 +24,40 @@ type CredentialService interface {
 	AuditSince(after int64) []credentials.AuditRecord
 }
 
+// Scrubber replaces the credential values sealed holds with their
+// placeholders (credproxy.Registry).
+type Scrubber interface {
+	Scrub(b []byte) []byte
+	ScrubReader(src io.Reader) io.Reader
+}
+
+// SetScrubber installs what the proxy scrubs agent responses with.
+func (s *Server) SetScrubber(sc Scrubber) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scrubber = sc
+}
+
+// scrubResponse replaces credential values in resp's headers and, as it is
+// read, its body.
+func (s *Server) scrubResponse(resp *http.Response) {
+	s.mu.RLock()
+	sc := s.scrubber
+	s.mu.RUnlock()
+	if sc == nil {
+		return
+	}
+	for _, vs := range resp.Header {
+		for i, v := range vs {
+			vs[i] = string(sc.Scrub([]byte(v)))
+		}
+	}
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{sc.ScrubReader(resp.Body), resp.Body}
+}
+
 // maxCredentialBody bounds a credential set push: definitions and sealed
 // values for every entry.
 const maxCredentialBody = 256 << 10

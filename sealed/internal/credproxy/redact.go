@@ -151,3 +151,28 @@ func (rr *redactReader) Read(p []byte) (int, error) {
 	rr.out = rr.out[n:]
 	return n, nil
 }
+
+// Generation advances whenever the entries change, so a caller caching
+// scrubbed content knows when to scrub again.
+func (r *Registry) Generation() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.gen
+}
+
+// Len is the number of entries sealed holds.
+func (r *Registry) Len() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.entries)
+}
+
+// Scrub returns b with every value sealed holds replaced by its placeholder,
+// in the encodings the proxy redacts. b comes back unchanged (the same
+// slice) when nothing matched.
+func (r *Registry) Scrub(b []byte) []byte { return newRedactor(r.secrets()).apply(b) }
+
+// ScrubReader streams src with every value sealed holds now replaced by its
+// placeholder, holding back only what could begin a value split across
+// reads.
+func (r *Registry) ScrubReader(src io.Reader) io.Reader { return newRedactor(r.secrets()).reader(src) }

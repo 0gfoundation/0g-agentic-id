@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -184,5 +185,45 @@ func TestCredentialRoutes_NotReady(t *testing.T) {
 	s.handleCredentials(w, credReq(sign, http.MethodGet, "/_seal/credentials", "0GSealCredentials", ""))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("HTTP %d, want 503 before the store is installed", w.Code)
+	}
+}
+
+// scrubValues replaces one value, as credproxy.Registry does.
+type scrubValues struct{ value string }
+
+func (v scrubValues) Scrub(b []byte) []byte {
+	return []byte(strings.ReplaceAll(string(b), v.value, "[[credential:github]]"))
+}
+func (v scrubValues) ScrubReader(src io.Reader) io.Reader {
+	b, _ := io.ReadAll(src)
+	return strings.NewReader(string(v.Scrub(b)))
+}
+
+// A registered service that echoes a credential value: the caller gets the
+// placeholder, in the body and in headers.
+func TestProxy_ScrubsCredentialValuesFromAgentResponses(t *testing.T) {
+	const value = "ghp_the_value_itself_0123456789"
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Debug", "token="+value)
+		_, _ = w.Write([]byte(`{"token":"` + value + `"}`))
+	}))
+	defer backend.Close()
+
+	ag := state.New()
+	ag.Set([]byte{1}, backend.URL, "deadbeef", "0x00", "1", "0x00", "1", "0x00", "")
+	s := &Server{agent: ag}
+	s.SetScrubber(scrubValues{value})
+	s.services = []ServiceEntry{{Path: "/api/echo", Method: http.MethodGet, Backend: backend.URL}}
+
+	w := httptest.NewRecorder()
+	s.handleProxy(w, httptest.NewRequest(http.MethodGet, "/api/echo", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), value) || strings.Contains(w.Header().Get("X-Debug"), value) {
+		t.Fatalf("the value left: body %s, header %q", w.Body.String(), w.Header().Get("X-Debug"))
+	}
+	if !strings.Contains(w.Body.String(), "[[credential:github]]") {
+		t.Fatalf("body %s", w.Body.String())
 	}
 }
