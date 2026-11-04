@@ -295,6 +295,10 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		})
 	}
 
+	// The credential proxy and store come up before the framework, so the
+	// framework's first environment already points its tools at them.
+	credRT := startCredentials(cfg, res, agentSealPriv, prov, sealedProxy)
+
 	logger.Logf("")
 	logger.Logf("--- Starting agent ---")
 	// onFailed is invoked by the manager exactly once if the supervisor
@@ -305,7 +309,7 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		currentStatus.SupervisorFailed("supervisor exhausted retries: " + err.Error())
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "supervisor exhausted retries: "+err.Error(), cfg.StatusBinding)
 	}
-	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, sealedProxy, onFailed); err != nil {
+	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, credRT, sealedProxy, onFailed); err != nil {
 		logger.Logf("FAIL agent: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", err.Error(), cfg.StatusBinding)
 		return
@@ -629,6 +633,7 @@ func startAgent(
 	res *chainBootstrapResult,
 	agentSealPriv []byte,
 	settingsBlob []byte,
+	credRT framework.RuntimeContext,
 	sealedProxy *proxy.Server,
 	onFailed func(err error),
 ) error {
@@ -863,6 +868,14 @@ func startAgent(
 			// AgenticID Framework code hash = the sealed image measurement
 			// the provider certified (image_hash), as the contract's bytes32.
 			FrameworkHash: cfg.Attestation.FrameworkHash(),
+
+			// Credential proxy and sockets (startCredentials); empty when off.
+			CredProxy:      credRT.CredProxy,
+			CredHTTPSProxy: credRT.CredHTTPSProxy,
+			CredCAFile:     credRT.CredCAFile,
+			CredCABundle:   credRT.CredCABundle,
+			CredSock:       credRT.CredSock,
+			CredRevealSock: credRT.CredRevealSock,
 		},
 		AgentSealPriv: agentSealPriv,
 		SealID:        sealID,

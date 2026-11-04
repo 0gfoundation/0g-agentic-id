@@ -88,6 +88,7 @@ type Server struct {
 	synth *synthHub
 
 	readSettings        SettingsReader
+	credentials         CredentialService
 	readRuntimeSettings func() RuntimeSettings
 	applySettings       SettingsApplier
 	applyClear          ClearApplier
@@ -282,6 +283,10 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/claim", s.handleClaim)
 	mux.HandleFunc("/_seal/clear", s.handleClear)
 	mux.HandleFunc("/_seal/compact", s.handleCompact)
+	mux.HandleFunc("/_seal/credentials", s.handleCredentials)
+	mux.HandleFunc("/_seal/credentials/pending", s.handleCredentialPending)
+	mux.HandleFunc("/_seal/credentials/decide", s.handleCredentialDecide)
+	mux.HandleFunc("/_seal/credentials/audit", s.handleCredentialAudit)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {

@@ -54,7 +54,8 @@ type Server struct {
 	transport *http.Transport
 }
 
-var errPrivateAddress = errors.New("target resolves to a private, loopback, link-local or metadata address")
+// ErrPrivateAddress is returned by SafeDial for a refused address.
+var ErrPrivateAddress = errors.New("target resolves to a private, loopback, link-local or metadata address")
 
 // New builds a Server.
 func New(cfg Config) *Server {
@@ -181,8 +182,8 @@ func (s *Server) proxyAuthOK(r *http.Request) bool {
 func (s *Server) tunnel(w http.ResponseWriter, hj http.Hijacker, r *http.Request, target string) {
 	up, err := s.dial(r.Context(), "tcp", target)
 	if err != nil {
-		if errors.Is(err, errPrivateAddress) {
-			writeErr(w, refuse(http.StatusForbidden, "private_address", "%s", errPrivateAddress.Error()))
+		if errors.Is(err, ErrPrivateAddress) {
+			writeErr(w, refuse(http.StatusForbidden, "private_address", "%s", ErrPrivateAddress.Error()))
 		} else {
 			writeErr(w, refuse(http.StatusBadGateway, "upstream_error", "cannot reach %s", target))
 		}
@@ -308,8 +309,8 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 	resp, err := s.transport.RoundTrip(out)
 	if err != nil {
 		e := refuse(http.StatusBadGateway, "upstream_error", "upstream request to %s failed", host)
-		if errors.Is(err, errPrivateAddress) {
-			e = refuse(http.StatusForbidden, "private_address", "%s", errPrivateAddress.Error())
+		if errors.Is(err, ErrPrivateAddress) {
+			e = refuse(http.StatusForbidden, "private_address", "%s", ErrPrivateAddress.Error())
 		}
 		s.record(names, host, r.Method, e.Status, e.Code)
 		writeErr(w, e)
@@ -458,13 +459,17 @@ func hostOnly(host string) string {
 	return strings.Trim(host, "[]")
 }
 
-// dial resolves addr and refuses any address a proxy must never reach on the
-// agent's behalf, then dials the vetted IP (so a second lookup cannot swap
-// in a different one).
 func (s *Server) dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	if s.cfg.Dial != nil {
 		return s.cfg.Dial(ctx, network, addr)
 	}
+	return SafeDial(ctx, network, addr)
+}
+
+// SafeDial resolves addr and refuses any address sealed must never reach on
+// the agent's behalf (private, loopback, link-local, metadata), then dials
+// the vetted IP, so a second lookup cannot swap in a different one.
+func SafeDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -475,7 +480,7 @@ func (s *Server) dial(ctx context.Context, network, addr string) (net.Conn, erro
 	}
 	for _, ip := range ips {
 		if blockedIP(ip.IP) {
-			return nil, errPrivateAddress
+			return nil, ErrPrivateAddress
 		}
 	}
 	var d net.Dialer
