@@ -197,10 +197,39 @@ pub async fn handle_post(
         // The row belongs to an earlier ownership: start over.
         state.credentials.clear(req.seal_id).await?;
     }
+    // Writebacks for definitions the new set leaves as they were carry over
+    // (a rotated refresh token, a login); the rest end with their definition.
+    let mut carried = serde_json::Map::new();
+    if let Some(c) = current.as_ref().filter(|_| base > 0) {
+        if let Some(wbs) = c.writebacks.as_object() {
+            for (name, w) in wbs {
+                let def_hash = w
+                    .get("def_hash")
+                    .and_then(|h| h.as_str())
+                    .unwrap_or_default();
+                if req
+                    .document
+                    .set
+                    .entries
+                    .iter()
+                    .any(|e| &e.name == name && e.def_hash.eq_ignore_ascii_case(def_hash))
+                {
+                    carried.insert(name.clone(), w.clone());
+                }
+            }
+        }
+    }
     let doc = serde_json::to_value(&req.document).map_err(|e| ApiError::internal(e.to_string()))?;
     match state
         .credentials
-        .put(req.seal_id, owner, epoch, base, doc)
+        .put(
+            req.seal_id,
+            owner,
+            epoch,
+            base,
+            doc,
+            serde_json::Value::Object(carried),
+        )
         .await?
     {
         Some(version) => {
@@ -244,13 +273,20 @@ pub async fn handle_writeback(
         .get(req.seal_id)
         .await?
         .ok_or_else(|| ApiError::not_found("no credential set for this agent"))?;
-    if stored.version as u64 != req.writeback.set_version {
-        return Err(ApiError::conflict(
-            "stale_manifest: the writeback names an older credential set version",
-        ));
-    }
     let doc: Document =
         serde_json::from_value(stored.document).map_err(|e| ApiError::internal(e.to_string()))?;
+    // Bound to the entry's definition: one the owner has since changed is
+    // over.
+    if !doc
+        .set
+        .entries
+        .iter()
+        .any(|e| e.name == req.name && e.def_hash.eq_ignore_ascii_case(&req.writeback.def_hash))
+    {
+        return Err(ApiError::conflict(
+            "stale_definition: the writeback is for a definition the owner has replaced",
+        ));
+    }
     let def_b64 = doc
         .defs
         .get(&req.name)
@@ -748,16 +784,21 @@ mod tests {
             .unwrap();
     }
 
-    fn writeback(s: &Setup, key: &PrivateKeySigner, boot: &str) -> WritebackRequest {
+    /// A writeback of gcp, for the definition `document` builds with this
+    /// writeback permission.
+    fn writeback(s: &Setup, key: &PrivateKeySigner, boot: &str, allowed: bool) -> WritebackRequest {
+        let def_hash = document(s, &s.owner, 1, 0, allowed).set.entries[0]
+            .def_hash
+            .clone();
         let ct = b"rotated refresh token, sealed".to_vec();
-        let msg = writeback_message(s.seal_id, "gcp", 1, boot, &ct);
+        let msg = writeback_message(s.seal_id, "gcp", &def_hash, boot, &ct);
         let sig = key.sign_hash_sync(&keccak256(msg.as_bytes())).unwrap();
         WritebackRequest {
             seal_id: s.seal_id,
             name: "gcp".into(),
             writeback: Writeback {
                 ciphertext: b64e(&ct),
-                set_version: 1,
+                def_hash,
                 boot_id: boot.into(),
                 signature: format!("0x{}", hex::encode(sig.as_bytes())),
             },
@@ -775,18 +816,45 @@ mod tests {
         let boot_hex = format!("{boot:#x}");
         let _ = handle_writeback(
             State(s.state.clone()),
-            Json(writeback(&s, &s.agent_seal, &boot_hex)),
+            Json(writeback(&s, &s.agent_seal, &boot_hex, true)),
         )
         .await
         .unwrap();
         let stored = s.creds.get(s.seal_id).await.unwrap().unwrap();
         assert_eq!(stored.writebacks["gcp"]["boot_id"], boot_hex);
 
+        // The owner stores a new set that keeps gcp's definition: its
+        // writeback carries over. One that changes it ends the writeback.
+        let _ = write(&s, &s.owner, 1, &document(&s, &s.owner, 2, 0, true))
+            .await
+            .unwrap();
+        let stored = s.creds.get(s.seal_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.writebacks["gcp"]["boot_id"], boot_hex,
+            "carried over"
+        );
+        let _ = write(&s, &s.owner, 2, &document(&s, &s.owner, 3, 0, false))
+            .await
+            .unwrap();
+        let stored = s.creds.get(s.seal_id).await.unwrap().unwrap();
+        assert!(
+            stored.writebacks.get("gcp").is_none(),
+            "ended with its definition"
+        );
+        // A writeback for the replaced definition is refused.
+        let err = handle_writeback(
+            State(s.state.clone()),
+            Json(writeback(&s, &s.agent_seal, &boot_hex, true)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+
         let other_boot = format!("{:#x}", B256::repeat_byte(0x43));
         assert!(
             handle_writeback(
                 State(s.state.clone()),
-                Json(writeback(&s, &s.agent_seal, &other_boot))
+                Json(writeback(&s, &s.agent_seal, &other_boot, true))
             )
             .await
             .is_err(),
@@ -795,7 +863,7 @@ mod tests {
         assert!(
             handle_writeback(
                 State(s.state.clone()),
-                Json(writeback(&s, &s.owner, &boot_hex))
+                Json(writeback(&s, &s.owner, &boot_hex, true))
             )
             .await
             .is_err(),
@@ -813,7 +881,7 @@ mod tests {
         s.creds.set_boot_id(s.seal_id, boot);
         let err = handle_writeback(
             State(s.state.clone()),
-            Json(writeback(&s, &s.agent_seal, &format!("{boot:#x}"))),
+            Json(writeback(&s, &s.agent_seal, &format!("{boot:#x}"), false)),
         )
         .await
         .unwrap_err();
@@ -953,7 +1021,7 @@ mod tests {
             "gone": def("gone", now - 60),
         }});
         s.creds
-            .put(s.seal_id, s.owner.address(), 0, 0, doc)
+            .put(s.seal_id, s.owner.address(), 0, 0, doc, json!({}))
             .await
             .unwrap();
         // No address yet: nothing sent, and nothing spent.

@@ -112,6 +112,7 @@ type Store struct {
 	mu            sync.Mutex
 	version       uint64
 	defs          map[string]*Definition
+	defHashes     map[string]string // the signed hash of each definition
 	values        map[string][]byte
 	derived       map[string]derived
 	pending       map[string]*Pending // by auth_req_id
@@ -171,7 +172,7 @@ func NewStore(env Env, reg *credproxy.Registry) *Store {
 	}
 	return &Store{
 		env: env, reg: reg,
-		defs: map[string]*Definition{}, values: map[string][]byte{}, derived: map[string]derived{},
+		defs: map[string]*Definition{}, defHashes: map[string]string{}, values: map[string][]byte{}, derived: map[string]derived{},
 		pending: map[string]*Pending{}, approvals: map[string]Approval{}, tokenMu: map[string]*sync.Mutex{},
 		logins: map[string]*loginAttempt{}, refreshTimers: map[string]*time.Timer{},
 		events: newEventLog(), now: time.Now,
@@ -223,8 +224,19 @@ func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Ope
 	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	before := s.defs
-	s.version, s.defs, s.values = o.Set.Version, o.Defs, o.Values
+	before, beforeHashes, beforeValues := s.defs, s.defHashes, s.values
+	hashes := map[string]string{}
+	for _, e := range o.Set.Entries {
+		hashes[e.Name] = strings.ToLower(e.DefHash)
+	}
+	// A value sealed obtained (a rotation, a login) outlives a new set that
+	// leaves its definition as it was: the owner changed something else.
+	for name, d := range o.Defs {
+		if d.Writeback && beforeHashes[name] != "" && beforeHashes[name] == hashes[name] && beforeValues[name] != nil {
+			o.Values[name] = beforeValues[name]
+		}
+	}
+	s.version, s.defs, s.defHashes, s.values = o.Set.Version, o.Defs, hashes, o.Values
 	// Login entries refresh their access token themselves.
 	for name, t := range s.refreshTimers {
 		t.Stop()
@@ -271,7 +283,7 @@ func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Ope
 func (s *Store) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.defs, s.values, s.derived = map[string]*Definition{}, map[string][]byte{}, map[string]derived{}
+	s.defs, s.defHashes, s.values, s.derived = map[string]*Definition{}, map[string]string{}, map[string][]byte{}, map[string]derived{}
 	s.pending, s.approvals = map[string]*Pending{}, map[string]Approval{}
 	s.logins = map[string]*loginAttempt{}
 	for name, t := range s.refreshTimers {

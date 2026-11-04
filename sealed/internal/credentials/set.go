@@ -171,19 +171,21 @@ type valuePlaintext struct {
 }
 
 // Writeback is a value sealed itself obtained (a rotated refresh token, or a
-// login) and stored at the attestor, signed by agentSeal.
+// login) and stored at the attestor, signed by agentSeal. It is bound to the
+// entry's definition (its hash in the owner's set), so it stays valid while
+// the owner changes other entries and ends when the owner changes this one.
 type Writeback struct {
 	Ciphertext string `json:"ciphertext"`
-	SetVersion uint64 `json:"set_version"`
+	DefHash    string `json:"def_hash"`
 	BootID     string `json:"boot_id"`
 	Signature  string `json:"signature"`
 }
 
 // WritebackMessage is what agentSeal signs (keccak256, no EIP-191 prefix).
 // The sign socket offers no raw-hash signing, so the harness cannot forge it.
-func WritebackMessage(sealID, name string, setVersion uint64, bootID string, ciphertext []byte) []byte {
-	return []byte(fmt.Sprintf("CredentialWriteback.v1:%s:%s:%d:%s:%s",
-		strings.ToLower(sealID), name, setVersion, bootID, crypto.Keccak256Hash(ciphertext).Hex()))
+func WritebackMessage(sealID, name, defHash, bootID string, ciphertext []byte) []byte {
+	return []byte(fmt.Sprintf("CredentialWriteback.v1:%s:%s:%s:%s:%s",
+		strings.ToLower(sealID), name, strings.ToLower(defHash), bootID, crypto.Keccak256Hash(ciphertext).Hex()))
 }
 
 // Document is a signed set with its definitions, values and writebacks, as
@@ -282,7 +284,7 @@ func openEntry(doc Document, e SetEntry, c Check) (*Definition, []byte, string) 
 	if !credproxy.ValidName(def.Name) || strings.HasPrefix(def.Name, "derived:") {
 		return nil, nil, "name is not valid for an owner entry"
 	}
-	ct, err := chooseCiphertext(doc, &def, c)
+	ct, err := chooseCiphertext(doc, e, &def, c)
 	if err != nil {
 		return nil, nil, err.Error()
 	}
@@ -302,12 +304,12 @@ func openEntry(doc Document, e SetEntry, c Check) (*Definition, []byte, string) 
 }
 
 // chooseCiphertext prefers a valid writeback (a rotated or logged-in value
-// sealed stored for this set version) over the owner's value.
-func chooseCiphertext(doc Document, def *Definition, c Check) ([]byte, error) {
-	if wb, ok := doc.Writebacks[def.Name]; ok && def.Writeback && wb.SetVersion == doc.Set.Version {
+// sealed stored for this very definition) over the owner's value.
+func chooseCiphertext(doc Document, e SetEntry, def *Definition, c Check) ([]byte, error) {
+	if wb, ok := doc.Writebacks[def.Name]; ok && def.Writeback && strings.EqualFold(wb.DefHash, e.DefHash) {
 		ct, err := base64.StdEncoding.DecodeString(wb.Ciphertext)
 		if err == nil {
-			msg := WritebackMessage(c.SealID, def.Name, wb.SetVersion, wb.BootID, ct)
+			msg := WritebackMessage(c.SealID, def.Name, wb.DefHash, wb.BootID, ct)
 			if sig, derr := hexSig(wb.Signature); derr == nil {
 				if pub, perr := crypto.SigToPub(crypto.Keccak256(msg), sig); perr == nil && crypto.PubkeyToAddress(*pub) == c.AgentSeal {
 					return ct, nil

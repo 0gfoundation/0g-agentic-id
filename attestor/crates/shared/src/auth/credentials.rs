@@ -85,12 +85,14 @@ pub struct SetWire {
     pub entries: Vec<SetEntry>,
 }
 
-/// A value sealed obtained and wrote back.
+/// A value sealed obtained and wrote back. It is bound to the entry's
+/// definition (its hash in the owner's set): it stays valid while the owner
+/// changes other entries, and ends when the owner changes this one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Writeback {
     pub ciphertext: String,
-    pub set_version: u64,
+    pub def_hash: String,
     pub boot_id: String,
     pub signature: String,
 }
@@ -253,13 +255,14 @@ pub fn validate_document(
 pub fn writeback_message(
     seal_id: SealId,
     name: &str,
-    set_version: u64,
+    def_hash: &str,
     boot_id: &str,
     ciphertext: &[u8],
 ) -> String {
     format!(
-        "CredentialWriteback.v1:0x{}:{name}:{set_version}:{boot_id}:{}",
+        "CredentialWriteback.v1:0x{}:{name}:{}:{boot_id}:{}",
         hex::encode(seal_id.as_slice()),
+        def_hash.to_ascii_lowercase(),
         keccak256(ciphertext)
     )
 }
@@ -272,7 +275,7 @@ pub fn verify_writeback(
     agent_seal: Address,
 ) -> anyhow::Result<()> {
     let ct = b64(&w.ciphertext)?;
-    let msg = writeback_message(seal_id, name, w.set_version, &w.boot_id, &ct);
+    let msg = writeback_message(seal_id, name, &w.def_hash, &w.boot_id, &ct);
     let signer = recover_prehash_signer(
         &keccak256(msg.as_bytes()).0,
         &signature_bytes(&w.signature)?,
@@ -519,11 +522,17 @@ mod tests {
         let seal_key = PrivateKeySigner::random();
         let seal_id = B256::from_str(SEAL).unwrap();
         let ct = b"rotated".to_vec();
-        let msg = writeback_message(seal_id, "gcp", 3, "0xboot", &ct);
+        let def_hash = "0xAB00000000000000000000000000000000000000000000000000000000000001";
+        let msg = writeback_message(seal_id, "gcp", def_hash, "0xboot", &ct);
+        // The same string sealed's WritebackMessage produces.
+        assert_eq!(
+            msg,
+            "CredentialWriteback.v1:0x0fb3604de692a0a2ceae1d9e655d0dc28a8a81340534df4ba5c9a66a375f7c8f:gcp:0xab00000000000000000000000000000000000000000000000000000000000001:0xboot:0xeacb26800d47aea80d40d70980c9726defc50d7b4f14e3ad1d74ae435ef5948e"
+        );
         let sig = seal_key.sign_hash_sync(&keccak256(msg.as_bytes())).unwrap();
         let w = Writeback {
             ciphertext: b64e(&ct),
-            set_version: 3,
+            def_hash: def_hash.into(),
             boot_id: "0xboot".into(),
             signature: format!("0x{}", hex::encode(sig.as_bytes())),
         };

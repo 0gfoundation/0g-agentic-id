@@ -150,8 +150,9 @@ func TestWritebackPreferredWhenSignedBySeal(t *testing.T) {
 	doc.Signature = f.sign(t, digest, f.owner)
 
 	ct, _ := SealValue(f.sealECIES.PublicKey, crypto.PubkeyToAddress(f.owner.PublicKey), testSeal, f.domain.ChainID, "rt", []byte("rotated_refresh_token"))
-	msg := WritebackMessage(testSeal, "rt", 3, "boot-1", ct)
-	doc.Writebacks = map[string]Writeback{"rt": {Ciphertext: base64.StdEncoding.EncodeToString(ct), SetVersion: 3, BootID: "boot-1",
+	defHash := doc.Set.Entries[0].DefHash
+	msg := WritebackMessage(testSeal, "rt", defHash, "boot-1", ct)
+	doc.Writebacks = map[string]Writeback{"rt": {Ciphertext: base64.StdEncoding.EncodeToString(ct), DefHash: defHash, BootID: "boot-1",
 		Signature: f.sign(t, crypto.Keccak256Hash(msg), f.seal)}}
 	o, err := Open(doc, f.check())
 	if err != nil {
@@ -161,10 +162,19 @@ func TestWritebackPreferredWhenSignedBySeal(t *testing.T) {
 		t.Fatalf("got %q", o.Values["rt"])
 	}
 	// A writeback signed by anyone else is ignored.
-	doc.Writebacks["rt"] = Writeback{Ciphertext: doc.Writebacks["rt"].Ciphertext, SetVersion: 3, BootID: "boot-1", Signature: f.sign(t, crypto.Keccak256Hash(msg), f.owner)}
+	good := doc.Writebacks["rt"]
+	doc.Writebacks["rt"] = Writeback{Ciphertext: good.Ciphertext, DefHash: defHash, BootID: "boot-1", Signature: f.sign(t, crypto.Keccak256Hash(msg), f.owner)}
 	o, _ = Open(doc, f.check())
 	if string(o.Values["rt"]) != "old_refresh_token" {
 		t.Fatalf("an unsigned writeback won: %q", o.Values["rt"])
+	}
+	// So is one made for another definition of the entry: the owner changed it.
+	other := crypto.Keccak256Hash([]byte("another definition")).Hex()
+	omsg := WritebackMessage(testSeal, "rt", other, "boot-1", ct)
+	doc.Writebacks["rt"] = Writeback{Ciphertext: good.Ciphertext, DefHash: other, BootID: "boot-1", Signature: f.sign(t, crypto.Keccak256Hash(omsg), f.seal)}
+	o, _ = Open(doc, f.check())
+	if string(o.Values["rt"]) != "old_refresh_token" {
+		t.Fatalf("a writeback for another definition won: %q", o.Values["rt"])
 	}
 }
 
@@ -198,5 +208,15 @@ func TestDigestVectors(t *testing.T) {
 		RequestDigest: crypto.Keccak256Hash([]byte("d")).Hex(), ExpiresAt: 1800000000}
 	if h, _ := a.Digest(d); h.Hex() != "0x9d253d4f6dee2cc9d68bd5a5a7df81c1ac83910b7f26338eef2dd729ee8d879a" {
 		t.Fatalf("Approval digest %s", h.Hex())
+	}
+}
+
+// The writeback message, character for character as the attestor's
+// writeback_message builds it.
+func TestWritebackMessageMatchesAttestor(t *testing.T) {
+	got := string(WritebackMessage(testSeal, "gcp", "0xAB00000000000000000000000000000000000000000000000000000000000001", "0xboot", []byte("rotated")))
+	want := "CredentialWriteback.v1:0x0fb3604de692a0a2ceae1d9e655d0dc28a8a81340534df4ba5c9a66a375f7c8f:gcp:0xab00000000000000000000000000000000000000000000000000000000000001:0xboot:0xeacb26800d47aea80d40d70980c9726defc50d7b4f14e3ad1d74ae435ef5948e"
+	if got != want {
+		t.Fatalf("\ngot  %s\nwant %s", got, want)
 	}
 }

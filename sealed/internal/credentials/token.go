@@ -289,13 +289,13 @@ func (s *Store) rotate(ctx context.Context, def *Definition, value []byte) {
 	s.mu.Lock()
 	s.values[def.Name] = value
 	s.syncRegistryLocked()
-	version := s.version
+	defHash := s.defHashes[def.Name]
 	s.mu.Unlock()
 	if !def.Writeback || s.env.Writeback == nil {
 		s.env.Logf("credentials: %q rotated; no writeback configured, the new value lives until restart", def.Name)
 		return
 	}
-	wb, err := s.signWriteback(ctx, def.Name, value, version)
+	wb, err := s.signWriteback(ctx, def.Name, value, defHash)
 	if err != nil {
 		s.env.Logf("credentials: %q rotated but could not be sealed for writeback: %v", def.Name, err)
 		return
@@ -331,7 +331,7 @@ func (s *Store) retryWriteback(name string, wb Writeback, value []byte) {
 	}
 }
 
-func (s *Store) signWriteback(ctx context.Context, name string, value []byte, version uint64) (Writeback, error) {
+func (s *Store) signWriteback(ctx context.Context, name string, value []byte, defHash string) (Writeback, error) {
 	owner, err := s.env.LiveOwner(ctx)
 	if err != nil {
 		return Writeback{}, err
@@ -345,10 +345,10 @@ func (s *Store) signWriteback(ctx context.Context, name string, value []byte, ve
 	if err != nil {
 		return Writeback{}, err
 	}
-	sig, err := crypto.Sign(crypto.Keccak256(WritebackMessage(s.env.SealID, name, version, s.env.BootID, ct)), key)
+	sig, err := crypto.Sign(crypto.Keccak256(WritebackMessage(s.env.SealID, name, defHash, s.env.BootID, ct)), key)
 	if err != nil {
 		return Writeback{}, err
 	}
 	sig[64] += 27
-	return Writeback{Ciphertext: base64.StdEncoding.EncodeToString(ct), SetVersion: version, BootID: s.env.BootID, Signature: hexutil.Encode(sig)}, nil
+	return Writeback{Ciphertext: base64.StdEncoding.EncodeToString(ct), DefHash: defHash, BootID: s.env.BootID, Signature: hexutil.Encode(sig)}, nil
 }

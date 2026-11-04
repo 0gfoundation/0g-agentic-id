@@ -37,8 +37,9 @@ pub struct PendingCount {
 pub trait CredentialRepo: Send + Sync {
     async fn get(&self, seal_id: SealId) -> anyhow::Result<Option<StoredCredentials>>;
     /// Store `document` as version `base_version + 1` if the stored version
-    /// is still `base_version` (0 when none). Writebacks of the replaced
-    /// version are dropped. Returns the new version, or None when stale.
+    /// is still `base_version` (0 when none), with `writebacks` (those of
+    /// the replaced version whose definitions it keeps). Returns the new
+    /// version, or None when stale.
     async fn put(
         &self,
         seal_id: SealId,
@@ -46,6 +47,7 @@ pub trait CredentialRepo: Send + Sync {
         owner_epoch: i64,
         base_version: i64,
         document: serde_json::Value,
+        writebacks: serde_json::Value,
     ) -> anyhow::Result<Option<i64>>;
     /// Record one writeback if the stored set is still `set_version`.
     async fn put_writeback(
@@ -129,16 +131,17 @@ impl CredentialRepo for PostgresCredentialRepo {
         owner_epoch: i64,
         base_version: i64,
         document: serde_json::Value,
+        writebacks: serde_json::Value,
     ) -> anyhow::Result<Option<i64>> {
         // INSERT when no set exists and base is 0; otherwise a compare-and-
         // swap on version. Either statement is the whole race window.
         let row = if base_version == 0 {
             sqlx::query(
                 "INSERT INTO credential_sets (seal_id, owner, owner_epoch, version, document, writebacks)
-                 VALUES ($1, $2, $3, 1, $4, '{}'::jsonb)
+                 VALUES ($1, $2, $3, 1, $4, $5)
                  ON CONFLICT (seal_id) DO UPDATE
                    SET owner = EXCLUDED.owner, owner_epoch = EXCLUDED.owner_epoch, version = 1,
-                       document = EXCLUDED.document, writebacks = '{}'::jsonb, updated_at = now()
+                       document = EXCLUDED.document, writebacks = EXCLUDED.writebacks, updated_at = now()
                    WHERE credential_sets.version = 0
                  RETURNING version",
             )
@@ -146,13 +149,14 @@ impl CredentialRepo for PostgresCredentialRepo {
             .bind(owner.as_slice())
             .bind(owner_epoch)
             .bind(&document)
+            .bind(&writebacks)
             .fetch_optional(&self.pool)
             .await?
         } else {
             sqlx::query(
                 "UPDATE credential_sets
                  SET owner = $2, owner_epoch = $3, version = version + 1, document = $4,
-                     writebacks = '{}'::jsonb, updated_at = now()
+                     writebacks = $6, updated_at = now()
                  WHERE seal_id = $1 AND version = $5
                  RETURNING version",
             )
@@ -161,6 +165,7 @@ impl CredentialRepo for PostgresCredentialRepo {
             .bind(owner_epoch)
             .bind(&document)
             .bind(base_version)
+            .bind(&writebacks)
             .fetch_optional(&self.pool)
             .await?
         };
@@ -411,6 +416,7 @@ impl CredentialRepo for InMemoryCredentialRepo {
         owner_epoch: i64,
         base_version: i64,
         document: serde_json::Value,
+        writebacks: serde_json::Value,
     ) -> anyhow::Result<Option<i64>> {
         let mut s = self.inner.lock().unwrap();
         let current = s.sets.get(&seal_id).map(|c| c.version).unwrap_or(0);
@@ -424,7 +430,7 @@ impl CredentialRepo for InMemoryCredentialRepo {
                 owner_epoch,
                 version: base_version + 1,
                 document,
-                writebacks: serde_json::json!({}),
+                writebacks,
             },
         );
         Ok(Some(base_version + 1))

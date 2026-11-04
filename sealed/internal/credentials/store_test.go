@@ -118,7 +118,7 @@ func TestTokenRequestRotatesAndWritesBack(t *testing.T) {
 	if e := reg.Get("gcp"); e == nil || string(e.Value) != "rt_new" {
 		t.Fatal("refresh token not rotated")
 	}
-	if len(wrote) != 1 || wrote[0].SetVersion != 1 {
+	if len(wrote) != 1 || !strings.EqualFold(wrote[0].DefHash, doc.Set.Entries[0].DefHash) {
 		t.Fatalf("writebacks %+v", wrote)
 	}
 	// The written-back value opens at the next boot.
@@ -266,5 +266,54 @@ func TestHandlersNeverReturnValues(t *testing.T) {
 	s.RevealHandler().ServeHTTP(rec, httptest.NewRequest("POST", "/credentials/reveal", strings.NewReader(`{"name":"github","reason":"x"}`)))
 	if rec.Code != 403 || !strings.Contains(rec.Body.String(), `"auth_req_id"`) || strings.Contains(rec.Body.String(), "ghp_secretvalue") {
 		t.Fatalf("reveal: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A new set that leaves a rotated entry's definition as it was keeps the
+// rotated value; one that changes the definition takes the owner's value.
+func TestRotatedValueSurvivesUnrelatedChange(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"at","refresh_token":"rt_rotated"}`))
+	}))
+	defer ts.Close()
+	f := newFixture(t)
+	s, reg, _ := f.store(t, func(context.Context, string, Writeback) error { return nil }, ts.Client())
+	mk := func(version uint64, values map[string]string, desc string) Document {
+		doc := f.doc(t, version, values)
+		f.editDefs(t, &doc, func(d *Definition) {
+			if d.Name == "gcp" {
+				d.Use, d.Writeback, d.Positions, d.Description = credproxy.UseTokenOnly, true, nil, desc
+				d.TokenRequest = &TokenRequest{URL: ts.URL, Fields: map[string]string{"refresh_token": "{v}"}, RotateField: "refresh_token"}
+			}
+		})
+		return doc
+	}
+	first := mk(1, map[string]string{"gcp": "rt_owner"}, "a")
+	if _, err := s.Load(context.Background(), first, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, cerr := s.Token(context.Background(), "gcp", nil); cerr != nil {
+		t.Fatal(cerr)
+	}
+	// The owner adds another entry; gcp's definition and value bytes are
+	// carried over as they were, as the SDK does for an entry left alone.
+	v2 := f.doc(t, 2, map[string]string{"github": "ghp_value_0123"})
+	v2.Defs["gcp"], v2.Values["gcp"] = first.Defs["gcp"], first.Values["gcp"]
+	v2.Set.Entries = append(v2.Set.Entries, first.Set.Entries[0])
+	digest, _ := v2.Set.Digest(f.domain)
+	v2.Signature = f.sign(t, digest, f.owner)
+	if _, err := s.Load(context.Background(), v2, 0); err != nil {
+		t.Fatal(err)
+	}
+	if e := reg.Get("gcp"); e == nil || string(e.Value) != "rt_rotated" {
+		t.Fatalf("rotated value lost: %v", e)
+	}
+	// The owner changes gcp itself: their value wins.
+	if _, err := s.Load(context.Background(), mk(3, map[string]string{"gcp": "rt_owner_new"}, "b"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if e := reg.Get("gcp"); e == nil || string(e.Value) != "rt_owner_new" {
+		t.Fatalf("got %v", e)
 	}
 }
