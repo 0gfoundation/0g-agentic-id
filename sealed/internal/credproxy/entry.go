@@ -59,6 +59,7 @@ type Entry struct {
 	Hosts     []string // normalized: lower case, no trailing dot, ":port" only when not 443
 	Positions []Position
 	Use       Use
+	Signer    *Signer // Use == UseSign: how the value signs
 	Value     []byte
 	ExpiresAt time.Time // zero = no expiry
 }
@@ -208,6 +209,10 @@ func (r *Registry) secrets() map[string][]byte {
 	return out
 }
 
+// Validate reports whether e can be served (hosts, positions, use, signer);
+// Replace refuses a set holding one that cannot.
+func (e *Entry) Validate() error { return e.validate() }
+
 func (e *Entry) validate() error {
 	if !ValidName(e.Name) {
 		return fmt.Errorf("credential name %q is not valid", e.Name)
@@ -251,7 +256,7 @@ func (e *Entry) validate() error {
 			return fmt.Errorf("credential %q: unknown position kind %q", e.Name, p.Kind)
 		}
 	}
-	return nil
+	return e.validateSigner()
 }
 
 // forbiddenHeader names headers a credential may never be written into.

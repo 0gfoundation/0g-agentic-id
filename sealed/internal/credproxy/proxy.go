@@ -283,10 +283,18 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 	out := r.Clone(r.Context())
 	out.RequestURI = ""
 	stripHop(out.Header)
-	body, names, ferr := s.cfg.Registry.fillRequest(out, host, small)
+	body, names, minted, ferr := s.cfg.Registry.fillRequest(out, host, small)
 	if ferr != nil {
 		s.record(names, host, r.Method, ferr.Status, ferr.Code)
 		writeErr(w, ferr)
+		return
+	}
+	// Signing comes last, over the request as it will be sent.
+	signedWith, serr := s.cfg.Registry.signRequest(out, host, body, large != nil)
+	names = append(names, signedWith...)
+	if serr != nil {
+		s.record(names, host, r.Method, serr.Status, serr.Code)
+		writeErr(w, serr)
 		return
 	}
 	if large != nil {
@@ -302,7 +310,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 	}
 	out.Header.Set("Accept-Encoding", "identity")
 	if ws {
-		s.websocket(w, out, host, names)
+		s.websocket(w, out, host, names, minted)
 		return
 	}
 
@@ -323,7 +331,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 		writeErr(w, e)
 		return
 	}
-	red := newRedactor(s.cfg.Registry.secrets())
+	red := newRedactor(s.cfg.Registry.secrets(), minted)
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, red.applyString(v))
@@ -360,7 +368,7 @@ func copyFlush(w http.ResponseWriter, src io.Reader) {
 // websocket relays an upgraded HTTP/1.1 connection. The extension header is
 // dropped so frames stay uncompressed, and values in server frames are masked
 // byte-for-byte, which keeps every frame length intact.
-func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string, names []string) {
+func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string, names []string, minted map[string][]byte) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		writeErr(w, refuse(http.StatusBadRequest, "bad_target", "WebSocket needs HTTP/1.1 toward the proxy"))
@@ -378,7 +386,7 @@ func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string
 	s.record(names, host, out.Method, resp.StatusCode, "")
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		defer resp.Body.Close()
-		red := newRedactor(s.cfg.Registry.secrets())
+		red := newRedactor(s.cfg.Registry.secrets(), minted)
 		for k, vs := range resp.Header {
 			for _, v := range vs {
 				w.Header().Add(k, red.applyString(v))
@@ -406,7 +414,7 @@ func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string
 	if err := resp.Write(conn); err != nil {
 		return
 	}
-	mask := newMaskRedactor(s.cfg.Registry.secrets())
+	mask := newMaskRedactor(s.cfg.Registry.secrets(), minted)
 	go func() {
 		_, _ = io.Copy(up, buf.Reader)
 		up.Close()

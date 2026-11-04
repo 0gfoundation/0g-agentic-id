@@ -76,9 +76,13 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 			return nil, tokenErr(http.StatusForbidden, "not_allowed", "parameter %q is not allowed for %q", k, name)
 		}
 	}
+	own, oerr := s.templateValue(name, value)
+	if oerr != nil {
+		return nil, oerr
+	}
 	fields := map[string]string{}
 	for k, tmpl := range tr.Fields {
-		v, err := s.expand(tmpl, value)
+		v, err := s.expand(tmpl, own)
 		if err != nil {
 			return nil, err
 		}
@@ -203,12 +207,31 @@ func (s *Store) expand(tmpl string, own []byte) (string, *credproxy.Error) {
 
 func (s *Store) refValue(name string) (string, *credproxy.Error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	v, ok := s.values[name]
+	s.mu.Unlock()
 	if !ok || v == nil {
 		return "", tokenErr(http.StatusNotFound, "unknown_entry", "the template refers to %q, which is not loaded", name)
 	}
-	return string(v), nil
+	tv, err := s.templateValue(name, v)
+	return string(tv), err
+}
+
+// templateValue is what an entry stands for in a token request: its value,
+// or for a jwt signing entry a token freshly minted from its key. Any other
+// signing key is never sent.
+func (s *Store) templateValue(name string, value []byte) ([]byte, *credproxy.Error) {
+	e := s.reg.Get(name)
+	if e == nil || e.Use != credproxy.UseSign {
+		return value, nil
+	}
+	if e.Signer == nil || e.Signer.Method != credproxy.SignJWT {
+		return nil, tokenErr(http.StatusForbidden, "not_allowed", "credential %q is a signing key and is never sent", name)
+	}
+	tok, err := credproxy.MintJWT(e, s.now())
+	if err != nil {
+		return nil, tokenErr(http.StatusInternalServerError, "sign_failed", "credential %q could not mint a token", name)
+	}
+	return tok, nil
 }
 
 // parseTokenResponse reads a JSON object, or the form encoding some token

@@ -155,7 +155,7 @@ type Definition struct {
 	AllowReveal  bool                 `json:"allow_reveal,omitempty"`
 	Writeback    bool                 `json:"writeback,omitempty"`
 	TokenRequest *TokenRequest        `json:"token_request,omitempty"`
-	Signer       json.RawMessage      `json:"signer,omitempty"`
+	Signer       *credproxy.Signer    `json:"signer,omitempty"`
 	MCP          json.RawMessage      `json:"mcp,omitempty"`
 }
 
@@ -293,6 +293,11 @@ func openEntry(doc Document, e SetEntry, c Check) (*Definition, []byte, string) 
 	if err != nil {
 		return nil, nil, err.Error()
 	}
+	// An entry the proxy cannot serve is left out here, with its reason,
+	// rather than failing the whole set where the proxy loads it.
+	if err := def.Entry(value).Validate(); err != nil {
+		return nil, nil, err.Error()
+	}
 	return &def, value, ""
 }
 
@@ -361,6 +366,7 @@ func (d *Definition) Entry(value []byte) *credproxy.Entry {
 		Hosts:     append([]string(nil), d.Hosts...),
 		Positions: append([]credproxy.Position(nil), d.Positions...),
 		Use:       d.Use,
+		Signer:    d.Signer,
 		Value:     value,
 	}
 	if d.ExpiresAt > 0 {

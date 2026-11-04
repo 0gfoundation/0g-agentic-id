@@ -82,15 +82,18 @@ type Pending struct {
 
 // EntryInfo is what the harness may know about an entry: never its value.
 type EntryInfo struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description,omitempty"`
-	Source      string   `json:"source"` // owner | derived
-	From        string   `json:"from,omitempty"`
-	Use         string   `json:"use"`
-	Hosts       []string `json:"hosts"`
-	ExpiresAt   int64    `json:"expires_at,omitempty"`
-	AllowReveal bool     `json:"allow_reveal"`
-	Placeholder string   `json:"placeholder"`
+	Name        string               `json:"name"`
+	Description string               `json:"description,omitempty"`
+	Source      string               `json:"source"` // owner | derived
+	From        string               `json:"from,omitempty"`
+	Use         string               `json:"use"`
+	Hosts       []string             `json:"hosts"`
+	Positions   []credproxy.Position `json:"positions"`
+	// Signer says how a signing entry is used (no secret in it).
+	Signer      *credproxy.Signer `json:"signer,omitempty"`
+	ExpiresAt   int64             `json:"expires_at,omitempty"`
+	AllowReveal bool              `json:"allow_reveal"`
+	Placeholder string            `json:"placeholder"`
 }
 
 type derived struct {
@@ -283,12 +286,18 @@ func (s *Store) List() []EntryInfo {
 			continue
 		}
 		out = append(out, EntryInfo{Name: name, Description: d.Description, Source: "owner", Use: string(useOf(d)),
-			Hosts: d.Hosts, ExpiresAt: d.ExpiresAt, AllowReveal: d.AllowReveal, Placeholder: credproxy.Placeholder(name)})
+			Hosts: d.Hosts, Positions: d.Positions, Signer: d.Signer, ExpiresAt: d.ExpiresAt, AllowReveal: d.AllowReveal,
+			Placeholder: credproxy.Placeholder(name)})
 	}
 	for name, d := range s.derived {
 		src := s.defs[d.from]
+		var positions []credproxy.Position
+		if e := s.reg.Get(name); e != nil {
+			positions = e.Positions
+		}
 		out = append(out, EntryInfo{Name: name, Source: "derived", From: d.from, Use: string(credproxy.UseInject),
-			Hosts: d.hosts, ExpiresAt: d.expiresAt, AllowReveal: src != nil && src.AllowReveal, Placeholder: credproxy.Placeholder(name)})
+			Hosts: d.hosts, Positions: positions, ExpiresAt: d.expiresAt, AllowReveal: src != nil && src.AllowReveal,
+			Placeholder: credproxy.Placeholder(name)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out

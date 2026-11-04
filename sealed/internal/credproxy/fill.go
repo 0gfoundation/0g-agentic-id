@@ -33,10 +33,11 @@ func refuse(status int, code, format string, args ...any) *Error {
 
 // filler resolves the placeholders of one request bound for host.
 type filler struct {
-	reg  *Registry
-	host string
-	now  time.Time
-	used []string
+	reg    *Registry
+	host   string
+	now    time.Time
+	used   []string
+	minted map[string][]byte // jwt entries: the token this request carries
 }
 
 // entry checks that name may be filled into a request for f.host.
@@ -48,10 +49,10 @@ func (f *filler) entry(name string) (*Entry, *Error) {
 	if !e.ExpiresAt.IsZero() && f.now.After(e.ExpiresAt) {
 		return nil, refuse(http.StatusGone, "expired", "credential %q has expired", name)
 	}
-	switch e.Use {
-	case UseTokenOnly:
+	switch {
+	case e.Use == UseTokenOnly:
 		return nil, refuse(http.StatusForbidden, "token_only", "credential %q may only be used in a token request", name)
-	case UseSign:
+	case e.Use == UseSign && (e.Signer == nil || e.Signer.Method != SignJWT):
 		return nil, refuse(http.StatusForbidden, "position_not_allowed", "credential %q is a signing key and is never written into a request", name)
 	}
 	allowed := false
@@ -65,6 +66,24 @@ func (f *filler) entry(name string) (*Entry, *Error) {
 		return nil, refuse(http.StatusForbidden, "host_not_allowed", "credential %q may not be sent to %s", name, f.host)
 	}
 	f.used = append(f.used, name)
+	if e.Use == UseSign {
+		// A jwt entry stands for a token minted from its key, the same one
+		// wherever it appears in this request.
+		tok, ok := f.minted[name]
+		if !ok {
+			var err error
+			if tok, err = MintJWT(e, f.now); err != nil {
+				return nil, refuse(http.StatusInternalServerError, "sign_failed", "credential %q could not mint a token", name)
+			}
+			if f.minted == nil {
+				f.minted = map[string][]byte{}
+			}
+			f.minted[name] = tok
+		}
+		cp := *e
+		cp.Value = tok
+		return &cp, nil
+	}
 	return e, nil
 }
 
@@ -78,20 +97,21 @@ func single(s, where string) (string, *Error) {
 }
 
 // fillRequest rewrites req (bound for host) and body in place of their
-// placeholders. It returns the new body and the entry names used. Nothing is
-// changed when it returns an error.
-func (r *Registry) fillRequest(req *http.Request, host string, body []byte) ([]byte, []string, *Error) {
+// placeholders. It returns the new body, the entry names used and the tokens
+// minted for jwt entries (by entry name). Nothing is changed when it returns
+// an error.
+func (r *Registry) fillRequest(req *http.Request, host string, body []byte) ([]byte, []string, map[string][]byte, *Error) {
 	f := &filler{reg: r, host: NormalizeHost(host), now: r.now()}
 
 	header := req.Header.Clone()
 	for k, vs := range header {
 		if strings.Contains(k, "[[credential:") {
-			return nil, nil, refuse(http.StatusForbidden, "position_not_allowed", "a placeholder may not stand in a header name")
+			return nil, nil, nil, refuse(http.StatusForbidden, "position_not_allowed", "a placeholder may not stand in a header name")
 		}
 		for i, v := range vs {
 			nv, err := f.fillHeader(k, v)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			vs[i] = nv
 		}
@@ -99,15 +119,15 @@ func (r *Registry) fillRequest(req *http.Request, host string, body []byte) ([]b
 
 	path, err := f.fillPath(req.URL.EscapedPath())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	query, err := f.fillQuery(req.URL.RawQuery)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	newBody, err := f.fillBody(req.Header.Get("Content-Type"), body)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	req.Header = header
@@ -123,7 +143,7 @@ func (r *Registry) fillRequest(req *http.Request, host string, body []byte) ([]b
 		Path: decoded, RawPath: path, ForceQuery: old.ForceQuery, RawQuery: query,
 		Fragment: old.Fragment, RawFragment: old.RawFragment,
 	}
-	return newBody, f.used, nil
+	return newBody, f.used, f.minted, nil
 }
 
 func (f *filler) fillHeader(name, v string) (string, *Error) {

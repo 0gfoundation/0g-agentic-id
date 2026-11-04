@@ -24,13 +24,15 @@ type redactForm struct{ match, repl []byte }
 // alignments a value can take inside a longer base64 run.
 type redactor struct{ forms []redactForm }
 
-func newRedactor(secrets map[string][]byte) *redactor { return buildRedactor(secrets, false) }
+func newRedactor(secrets ...map[string][]byte) *redactor { return buildRedactor(false, secrets...) }
 
 // newMaskRedactor replaces each match with as many '*' as it has bytes, for
 // streams whose framing a change in length would break (WebSocket).
-func newMaskRedactor(secrets map[string][]byte) *redactor { return buildRedactor(secrets, true) }
+func newMaskRedactor(secrets ...map[string][]byte) *redactor { return buildRedactor(true, secrets...) }
 
-func buildRedactor(secrets map[string][]byte, mask bool) *redactor {
+// buildRedactor covers every value of every set, each replaced by its
+// entry's placeholder (a minted token by the placeholder that stood for it).
+func buildRedactor(mask bool, sets ...map[string][]byte) *redactor {
 	r := &redactor{}
 	seen := map[string]bool{}
 	add := func(match string, min int, repl []byte) {
@@ -43,34 +45,40 @@ func buildRedactor(secrets map[string][]byte, mask bool) *redactor {
 		}
 		r.forms = append(r.forms, redactForm{match: []byte(match), repl: repl})
 	}
-	names := make([]string, 0, len(secrets))
-	for n := range secrets {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		v := secrets[name]
-		repl := []byte(Placeholder(name))
-		add(string(v), minRawRedact, repl)
-		add(url.QueryEscape(string(v)), minEncodedRedact, repl)
-		add(url.PathEscape(string(v)), minEncodedRedact, repl)
-		if q, err := json.Marshal(string(v)); err == nil {
-			add(string(q[1:len(q)-1]), minEncodedRedact, repl)
+	for _, secrets := range sets {
+		names := make([]string, 0, len(secrets))
+		for n := range secrets {
+			names = append(names, n)
 		}
-		for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
-			for k := 0; k < 3; k++ {
-				full := enc.EncodeToString(append(make([]byte, k), v...))
-				start, end := (8*k+5)/6, (8*(k+len(v)))/6
-				if end > start {
-					add(full[start:end], minEncodedRedact, repl)
-				}
-			}
+		sort.Strings(names)
+		for _, name := range names {
+			addValue(add, name, secrets[name])
 		}
 	}
 	// Longest first, so a longer encoding is replaced before a shorter one
 	// that happens to be its substring.
 	sort.SliceStable(r.forms, func(i, j int) bool { return len(r.forms[i].match) > len(r.forms[j].match) })
 	return r
+}
+
+// addValue registers v in each encoding it may travel in.
+func addValue(add func(match string, min int, repl []byte), name string, v []byte) {
+	repl := []byte(Placeholder(name))
+	add(string(v), minRawRedact, repl)
+	add(url.QueryEscape(string(v)), minEncodedRedact, repl)
+	add(url.PathEscape(string(v)), minEncodedRedact, repl)
+	if q, err := json.Marshal(string(v)); err == nil {
+		add(string(q[1:len(q)-1]), minEncodedRedact, repl)
+	}
+	for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
+		for k := 0; k < 3; k++ {
+			full := enc.EncodeToString(append(make([]byte, k), v...))
+			start, end := (8*k+5)/6, (8*(k+len(v)))/6
+			if end > start {
+				add(full[start:end], minEncodedRedact, repl)
+			}
+		}
+	}
 }
 
 func (r *redactor) apply(b []byte) []byte {

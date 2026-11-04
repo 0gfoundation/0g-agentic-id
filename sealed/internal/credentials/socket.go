@@ -37,9 +37,9 @@ func readJSON(r *http.Request, v any) *credproxy.Error {
 	return nil
 }
 
-// HarnessHandler serves /run/seal-cred.sock: list, token requests, requests
-// for the owner, deleting derived entries, and events. It never returns a
-// value.
+// HarnessHandler serves /run/seal-cred.sock: list, token requests, wallet
+// signatures, requests for the owner, deleting derived entries, and events.
+// It never returns a value.
 func (s *Store) HarnessHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /credentials", func(w http.ResponseWriter, r *http.Request) {
@@ -66,7 +66,17 @@ func (s *Store) HarnessHandler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"entries": out})
 	})
 	mux.HandleFunc("POST /credentials/sign", func(w http.ResponseWriter, r *http.Request) {
-		writeErr(w, &credproxy.Error{Status: http.StatusNotImplemented, Code: "not_allowed", Message: "signing credentials are not available in this version"})
+		var in SignRequest
+		if e := readJSON(r, &in); e != nil {
+			writeErr(w, e)
+			return
+		}
+		out, e := s.WalletSign(in)
+		if e != nil {
+			writeErr(w, e)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
 	})
 	mux.HandleFunc("POST /credentials/request", func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
