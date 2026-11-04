@@ -129,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         chain,
         sandbox,
         deployments,
+        credentials: attestor_shared::credentials_repo::PostgresCredentialRepo::new(pool.clone()),
         idempotency,
         jobs,
         events,

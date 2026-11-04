@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/crypto"
 
@@ -61,6 +62,19 @@ func statusMessage(sealID, status, detail, token, digest string) string {
 	return fmt.Sprintf("StatusReport.v2:0x%s:%s:%s:%x:%s", sealID, status, detail, h, digest)
 }
 
+// statusMessageV3 appends the number of credential requests waiting for the
+// owner, which the attestor shows the owner across agents.
+func statusMessageV3(sealID, status, detail, token, digest string, pending int) string {
+	h := sha256.Sum256([]byte(token))
+	return fmt.Sprintf("StatusReport.v3:0x%s:%s:%s:%x:%s:%d", sealID, status, detail, h, digest, pending)
+}
+
+var credentialsPending atomic.Pointer[func() int]
+
+// SetCredentialsPending makes every later report carry the pending
+// credential-request count f returns (StatusReport.v3).
+func SetCredentialsPending(f func() int) { credentialsPending.Store(&f) }
+
 // Status posts a status report (running / error / warning / starting / stopping)
 // for a sealId under this boot's receipt. Failures are logged; this is a
 // best-effort notification.
@@ -71,6 +85,11 @@ func Status(attestorURL string, agentSealPriv []byte, sealID, status, errorDetai
 		return
 	}
 	msg := statusMessage(sealID, status, errorDetail, token, digest)
+	pending := -1
+	if f := credentialsPending.Load(); f != nil {
+		pending = (*f)()
+		msg = statusMessageV3(sealID, status, errorDetail, token, digest, pending)
+	}
 	hash := crypto.Keccak256([]byte(msg))
 	priv, err := crypto.ToECDSA(agentSealPriv)
 	if err != nil {
@@ -93,6 +112,9 @@ func Status(attestorURL string, agentSealPriv []byte, sealID, status, errorDetai
 	}
 	if digest != "" {
 		body["settings_digest"] = "0x" + digest
+	}
+	if pending >= 0 {
+		body["credentials_pending"] = pending
 	}
 	reqBody, _ := json.Marshal(body)
 

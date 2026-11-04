@@ -20,6 +20,7 @@ pub struct AppState {
     pub sandbox: Arc<dyn SandboxClient>,
 
     pub deployments: Arc<dyn DeploymentRepo>,
+    pub credentials: Arc<dyn attestor_shared::credentials_repo::CredentialRepo>,
     pub idempotency: Arc<dyn IdempotencyStore>,
     pub jobs: Arc<dyn JobQueue>,
     pub events: Arc<dyn EventBus>,

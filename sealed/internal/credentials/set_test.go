@@ -182,3 +182,21 @@ func TestApprovalDigestStable(t *testing.T) {
 		t.Fatal("expiry is not covered by the approval digest")
 	}
 }
+
+// TestDigestVectors pins the EIP-712 digests. The attestor (Rust) and the SDK
+// (TypeScript) assert the same values; viem's hashTypedData produces them too.
+func TestDigestVectors(t *testing.T) {
+	d := Domain{ChainID: 16602, Contract: common.HexToAddress("0x5BB5000000000000000000000000000000000001")}
+	set := CredentialSet{SealID: testSeal, OwnerEpoch: 7, Version: 3, Entries: []SetEntry{
+		{Name: "github", DefHash: crypto.Keccak256Hash([]byte("def-github")).Hex()},
+		{Name: "gcp", DefHash: crypto.Keccak256Hash([]byte("def-gcp")).Hex()},
+	}}
+	if h, _ := set.Digest(d); h.Hex() != "0xb176433ffedb59fd89cececf370cb5d8ba9ce6d526d51b4734fd4e278e6d1c76" {
+		t.Fatalf("CredentialSet digest %s", h.Hex())
+	}
+	a := Approval{SealID: testSeal, BootID: crypto.Keccak256Hash([]byte("boot")).Hex(), AuthReqID: crypto.Keccak256Hash([]byte("req")).Hex(),
+		RequestDigest: crypto.Keccak256Hash([]byte("d")).Hex(), ExpiresAt: 1800000000}
+	if h, _ := a.Digest(d); h.Hex() != "0x9d253d4f6dee2cc9d68bd5a5a7df81c1ac83910b7f26338eef2dd729ee8d879a" {
+		t.Fatalf("Approval digest %s", h.Hex())
+	}
+}

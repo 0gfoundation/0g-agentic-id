@@ -334,6 +334,23 @@ async fn provision(
         None => None,
     };
 
+    // The owner's credential set, sealed to the same key, with the values the
+    // container wrote back merged in. Only a set signed for the current
+    // ownership is served. Like settings, a failure here never stops a boot.
+    let encrypted_credentials = credentials_for_boot(state, req.seal_id)
+        .await
+        .and_then(|bytes| match state.crypto.ecies_encrypt(&bytes, &record.pubkey) {
+            Ok(ct) => Some(alloy::primitives::Bytes::from(ct)),
+            Err(e) => {
+                tracing::warn!(
+                    seal_id = ?req.seal_id,
+                    error = %e,
+                    "encrypt credentials failed; provisioning without them"
+                );
+                None
+            }
+        });
+
     // A fresh opaque status token per boot; only its hash is stored, beside
     // the settings actually served.
     let token = status::new_status_token();
@@ -371,8 +388,32 @@ async fn provision(
     Ok(ProvisionResponse {
         encrypted_agent_seal_priv: encrypted.into(),
         encrypted_settings,
+        encrypted_credentials,
         encrypted_status_binding: encrypted_status_binding.into(),
     })
+}
+
+/// The credential set to hand this boot: `{"document": …, "owner_epoch": n}`,
+/// or None when there is none for the current ownership.
+async fn credentials_for_boot(state: &AppState, seal_id: SealId) -> Option<Vec<u8>> {
+    let epoch = match state.credentials.epoch(seal_id).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(seal_id = ?seal_id, error = %e, "credential epoch lookup failed");
+            return None;
+        }
+    };
+    let stored = match state.credentials.get(seal_id).await {
+        Ok(Some(c)) if c.owner_epoch == epoch => c,
+        Ok(_) => return None,
+        Err(e) => {
+            tracing::warn!(seal_id = ?seal_id, error = %e, "credential lookup failed");
+            return None;
+        }
+    };
+    let mut document = stored.document;
+    document["writebacks"] = stored.writebacks;
+    serde_json::to_vec(&serde_json::json!({"document": document, "owner_epoch": epoch})).ok()
 }
 
 /// `validFrameworkHashes` membership. A chain error (wrong contract, RPC
@@ -738,6 +779,7 @@ pub(crate) mod tests {
             chain: Arc::new(MockChain::new()),
             sandbox: Arc::new(ConfigurableSandbox::new()),
             deployments: repo.clone(),
+            credentials: attestor_shared::credentials_repo::in_memory(),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             jobs: Arc::new(InMemoryJobQueue::new()),
             events: Arc::new(InMemoryEventBus::new()),

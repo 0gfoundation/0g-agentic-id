@@ -30,6 +30,7 @@ import (
 	"seal-verify/internal/privsep"
 	"seal-verify/internal/provision"
 	"seal-verify/internal/proxy"
+	"seal-verify/internal/report"
 )
 
 // Where the credential proxy's pieces live in the container. The CA files
@@ -137,6 +138,8 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 	if initial, err := liveOwner(context.Background()); err == nil {
 		go watchOwner(store, liveOwner, initial)
 	}
+	report.SetCredentialsPending(store.PendingCount)
+	go reportPendingChanges(cfg, agentSealPriv, store)
 	logger.Logf("OK   credential proxy listening on 127.0.0.1:%d", port)
 	return framework.RuntimeContext{
 		CredProxy:      fmt.Sprintf("http://127.0.0.1:%d/%s", port, token),
@@ -179,6 +182,27 @@ func watchOwner(store *credentials.Store, liveOwner func(context.Context) (commo
 		logger.Logf("credentials: owner changed from %s to %s; every credential cleared", owner.Hex(), now.Hex())
 		store.Clear()
 		owner = now
+	}
+}
+
+// reportPendingChanges sends a status report as soon as a request starts
+// waiting for the owner (or is decided), instead of at the next heartbeat,
+// so the owner's cross-agent view is current within seconds.
+func reportPendingChanges(cfg *config.Bootstrap, agentSealPriv []byte, store *credentials.Store) {
+	var after uint64
+	for {
+		events := store.Events(context.Background(), after, time.Minute)
+		changed := false
+		for _, e := range events {
+			after = e.Seq
+			if e.Type == "pending_opened" || e.Type == "pending_decided" || e.Type == "cleared" {
+				changed = true
+			}
+		}
+		if changed {
+			level, msg := currentStatus.Get()
+			report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, msg, cfg.StatusBinding)
+		}
 	}
 }
 

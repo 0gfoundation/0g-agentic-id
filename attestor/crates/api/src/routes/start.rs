@@ -303,6 +303,7 @@ mod tests {
             chain,
             sandbox: Arc::new(attestor_shared::mocks::MockSandbox),
             deployments: deployments.clone(),
+            credentials: attestor_shared::credentials_repo::in_memory(),
             idempotency,
             jobs: jobs.clone(),
             events,

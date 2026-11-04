@@ -1,0 +1,646 @@
+//! Owner credential sets for sealed's credential proxy (`auth::credentials`).
+//!
+//! - `GET  /credentials?seal_id=`  owner-signed read: the stored set, its
+//!   writebacks, and the ownership epoch the next set must be signed for.
+//! - `POST /credentials`           owner-signed write, compare-and-swap on
+//!   the version (settings grammar under `AgenticID.Credentials.v1`).
+//! - `POST /credentials/writeback` the container: a value sealed obtained
+//!   (rotated refresh token, login), signed by agentSeal, bound to the
+//!   current boot and set version.
+//! - `GET  /credentials/pending`   owner-signed: pending-request counts of
+//!   every agent the signer owns.
+//!
+//! attestor never sees a value: definitions are checked against the signed
+//! hashes, values only by the hash of their ciphertext.
+
+use crate::error::{ApiError, ApiResult};
+use crate::state::AppState;
+use alloy::primitives::{Address, B256};
+use attestor_shared::auth::credentials::{
+    parse_owner_message, parse_pending_message, validate_document, verify_writeback, Document,
+    Expect, Writeback, CREDENTIALS_DOMAIN, MAX_DOCUMENT_BYTES,
+};
+use attestor_shared::auth::settings::settings_digest_hex;
+use attestor_shared::sandbox::eip191_digest;
+use attestor_shared::{Deployment, SealId};
+use axum::body::Bytes;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::Json;
+use base64::Engine as _;
+use chrono::Utc;
+use serde::Deserialize;
+use serde_json::json;
+use std::str::FromStr;
+
+const AUTH_WINDOW_SECS: i64 = 300;
+
+fn header_str(headers: &HeaderMap, name: &'static str) -> ApiResult<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .ok_or_else(|| ApiError::unauthorized(format!("missing {name}")))
+}
+
+fn header_sig(headers: &HeaderMap) -> ApiResult<Vec<u8>> {
+    hex::decode(header_str(headers, "X-Auth-Signature")?.trim_start_matches("0x"))
+        .map_err(|_| ApiError::bad_request("X-Auth-Signature must be hex"))
+}
+
+fn fresh(ts: i64) -> ApiResult<()> {
+    if (Utc::now().timestamp() - ts).abs() > AUTH_WINDOW_SECS {
+        return Err(ApiError::unauthorized(
+            "stale or future X-Auth-Message timestamp",
+        ));
+    }
+    Ok(())
+}
+
+async fn load(state: &AppState, seal_id: SealId) -> ApiResult<Deployment> {
+    state
+        .deployments
+        .get(seal_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("unknown seal_id"))
+}
+
+/// The agent's owner right now, from the chain (never the indexed column).
+async fn live_owner(state: &AppState, d: &Deployment) -> ApiResult<Address> {
+    let agent_id = d
+        .agent_id
+        .ok_or_else(|| ApiError::conflict("the agent is not minted yet"))?;
+    state
+        .chain
+        .owner_of(agent_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("owner_of: {e}")))
+}
+
+async fn signer_of(state: &AppState, msg: &str, sig: &[u8]) -> ApiResult<Address> {
+    state
+        .crypto
+        .recover_signer(&eip191_digest(msg.as_bytes()), sig)
+        .map_err(|e| ApiError::unauthorized(format!("signature recover failed: {e}")))
+}
+
+#[derive(Deserialize)]
+pub struct ReadParams {
+    seal_id: String,
+}
+
+pub async fn handle_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ReadParams>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let seal_id = B256::from_str(&q.seal_id).map_err(|_| ApiError::bad_request("bad seal_id"))?;
+    let msg = header_str(&headers, "X-Auth-Message")?;
+    let sig = header_sig(&headers)?;
+    let parsed = parse_owner_message(CREDENTIALS_DOMAIN, &msg)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    fresh(parsed.timestamp)?;
+    if parsed.seal_id != seal_id || parsed.digest_hex.is_some() {
+        return Err(ApiError::bad_request(
+            "X-Auth-Message is not a read of this seal",
+        ));
+    }
+    let d = load(&state, seal_id).await?;
+    if signer_of(&state, &msg, &sig).await? != live_owner(&state, &d).await? {
+        return Err(ApiError::unauthorized(
+            "signer is not the current owner of this agent",
+        ));
+    }
+    let epoch = state.credentials.epoch(seal_id).await?;
+    Ok(Json(match state.credentials.get(seal_id).await? {
+        // A set signed for an earlier ownership is never served.
+        Some(c) if c.owner_epoch == epoch => json!({
+            "version": c.version, "owner_epoch": epoch,
+            "document": c.document, "writebacks": c.writebacks,
+        }),
+        _ => json!({"version": 0, "owner_epoch": epoch, "document": null, "writebacks": {}}),
+    }))
+}
+
+pub async fn handle_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    if body.len() > MAX_DOCUMENT_BYTES {
+        return Err(ApiError::bad_request("credential set too large"));
+    }
+    let msg = header_str(&headers, "X-Auth-Message")?;
+    let sig = header_sig(&headers)?;
+    let parsed = parse_owner_message(CREDENTIALS_DOMAIN, &msg)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    fresh(parsed.timestamp)?;
+    let digest = parsed.digest_hex.as_deref().ok_or_else(|| {
+        ApiError::bad_request("X-Auth-Message for a write must end with the body digest")
+    })?;
+    if settings_digest_hex(&body) != digest {
+        return Err(ApiError::bad_request(
+            "body digest in X-Auth-Message does not match the body",
+        ));
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WriteRequest {
+        seal_id: SealId,
+        base_version: i64,
+        document: Document,
+    }
+    let req: WriteRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request(format!("invalid credential write: {e}")))?;
+    if req.seal_id != parsed.seal_id || req.base_version != parsed.base_version {
+        return Err(ApiError::bad_request(
+            "seal_id or base_version in the body does not match X-Auth-Message",
+        ));
+    }
+    let d = load(&state, req.seal_id).await?;
+    let owner = live_owner(&state, &d).await?;
+    if signer_of(&state, &msg, &sig).await? != owner {
+        return Err(ApiError::unauthorized(
+            "signer is not the current owner of this agent",
+        ));
+    }
+    let epoch = state.credentials.epoch(req.seal_id).await?;
+    let current = state.credentials.get(req.seal_id).await?;
+    // A set left from an earlier ownership does not count as the base.
+    let base = match &current {
+        Some(c) if c.owner_epoch == epoch => c.version,
+        _ => 0,
+    };
+    if req.base_version != base {
+        return Err(ApiError::conflict(format!(
+            "credentials have moved on: this write was made against {}, the current version is {base}",
+            req.base_version
+        ))
+        .with_details(json!({"version": base, "owner_epoch": epoch})));
+    }
+    validate_document(
+        &req.document,
+        &Expect {
+            seal_id: req.seal_id,
+            chain_id: state.cfg.chain_id,
+            contract: state.cfg.agentic_id_addr,
+            owner,
+            owner_epoch: epoch as u64,
+            base_version: base as u64,
+        },
+    )
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if current.is_some() && base == 0 {
+        // The row belongs to an earlier ownership: start over.
+        state.credentials.clear(req.seal_id).await?;
+    }
+    let doc = serde_json::to_value(&req.document).map_err(|e| ApiError::internal(e.to_string()))?;
+    match state
+        .credentials
+        .put(req.seal_id, owner, epoch, base, doc)
+        .await?
+    {
+        Some(version) => {
+            tracing::info!(seal_id = ?req.seal_id, version, entries = req.document.set.entries.len(), "credential set stored");
+            Ok((
+                StatusCode::OK,
+                Json(json!({"ok": true, "version": version, "owner_epoch": epoch})),
+            ))
+        }
+        None => Err(ApiError::conflict(
+            "credentials changed while this write was checked; re-read and retry",
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WritebackRequest {
+    seal_id: SealId,
+    name: String,
+    writeback: Writeback,
+}
+
+pub async fn handle_writeback(
+    State(state): State<AppState>,
+    Json(req): Json<WritebackRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let d = load(&state, req.seal_id).await?;
+    verify_writeback(req.seal_id, &req.name, &req.writeback, d.agent_seal_addr)
+        .map_err(|e| ApiError::unauthorized(e.to_string()))?;
+    let boot = state.credentials.current_boot_id(req.seal_id).await?;
+    if boot.map(|b| format!("{b:#x}")).as_deref()
+        != Some(req.writeback.boot_id.to_ascii_lowercase().as_str())
+    {
+        return Err(ApiError::forbidden(
+            "not_current_boot: the writeback is from a container that is not the current one",
+        ));
+    }
+    let stored = state
+        .credentials
+        .get(req.seal_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("no credential set for this agent"))?;
+    if stored.version as u64 != req.writeback.set_version {
+        return Err(ApiError::conflict(
+            "stale_manifest: the writeback names an older credential set version",
+        ));
+    }
+    let doc: Document =
+        serde_json::from_value(stored.document).map_err(|e| ApiError::internal(e.to_string()))?;
+    let def_b64 = doc
+        .defs
+        .get(&req.name)
+        .ok_or_else(|| ApiError::not_found("no such credential in the current set"))?;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(def_b64)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let def: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|e| ApiError::internal(e.to_string()))?;
+    if def.get("writeback").and_then(|v| v.as_bool()) != Some(true) {
+        return Err(ApiError::forbidden(
+            "writeback_not_allowed: the owner did not allow writebacks for this credential",
+        ));
+    }
+    let w = serde_json::to_value(&req.writeback).map_err(|e| ApiError::internal(e.to_string()))?;
+    if !state
+        .credentials
+        .put_writeback(req.seal_id, &req.name, stored.version, w)
+        .await?
+    {
+        return Err(ApiError::conflict(
+            "stale_manifest: the credential set changed",
+        ));
+    }
+    tracing::info!(seal_id = ?req.seal_id, name = %req.name, "credential writeback stored");
+    Ok(Json(json!({"ok": true})))
+}
+
+pub async fn handle_pending(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let msg = header_str(&headers, "X-Auth-Message")?;
+    let sig = header_sig(&headers)?;
+    let (owner, ts) =
+        parse_pending_message(&msg).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    fresh(ts)?;
+    if signer_of(&state, &msg, &sig).await? != owner {
+        return Err(ApiError::unauthorized(
+            "signer does not match the owner in X-Auth-Message",
+        ));
+    }
+    let mut out = Vec::new();
+    for p in state.credentials.pending_for_owner(owner).await? {
+        // Only agents the signer still owns: a sold agent's count is not
+        // the seller's to see.
+        let Some(d) = state.deployments.get(p.seal_id).await? else {
+            continue;
+        };
+        if live_owner(&state, &d).await.ok() != Some(owner) {
+            continue;
+        }
+        out.push(json!({
+            "seal_id": p.seal_id, "agent_id": d.agent_id.map(|a| a.to_string()),
+            "pending": p.pending, "updated_at": p.updated_at,
+        }));
+    }
+    Ok(Json(json!(out)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::provision::tests::test_config;
+    use alloy::primitives::keccak256;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::SignerSync;
+    use attestor_shared::auth::credentials::{
+        owner_message, pending_message, writeback_message, SetEntry, SetWire,
+    };
+    use attestor_shared::credentials_repo::{CredentialRepo, InMemoryCredentialRepo};
+    use attestor_shared::crypto::RealCrypto;
+    use attestor_shared::mocks::{
+        InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
+        MockChain, MockSandbox,
+    };
+    use attestor_shared::{derive_phase, StageStatus};
+    use axum::http::HeaderValue;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    const SEAL: [u8; 32] = [0xaa; 32];
+
+    struct Setup {
+        state: AppState,
+        owner: PrivateKeySigner,
+        agent_seal: PrivateKeySigner,
+        seal_id: SealId,
+        chain: Arc<MockChain>,
+        creds: Arc<InMemoryCredentialRepo>,
+    }
+
+    fn setup() -> Setup {
+        let owner = PrivateKeySigner::random();
+        let agent_seal = PrivateKeySigner::random();
+        let repo = Arc::new(InMemoryDeploymentRepo::new());
+        let seal_id = B256::from_slice(&SEAL);
+        let now = Utc::now();
+        repo.seed(Deployment {
+            seal_id,
+            agent_seal_addr: agent_seal.address(),
+            owner: owner.address(),
+            agent_id: Some(alloy::primitives::U256::from(7u64)),
+            agent_uri: String::new(),
+            agent_card: serde_json::Value::Object(Default::default()),
+            i_data: Vec::new(),
+            framework: None,
+            clone_params: None,
+            phase: derive_phase(
+                &StageStatus::NotStarted,
+                &StageStatus::NotStarted,
+                &StageStatus::NotStarted,
+            ),
+            storage_stage: StageStatus::NotStarted,
+            mint_stage: StageStatus::NotStarted,
+            container_stage: StageStatus::NotStarted,
+            sandbox_id: Some("sb-1".into()),
+            provisioned_at: None,
+            container_record: None,
+            provision_deadline: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
+            container_status: None,
+            settings: None,
+            settings_last_good: None,
+            settings_version: 0,
+            settings_confirmed_version: 0,
+            settings_attempts: 0,
+            created_at: now,
+            updated_at: now,
+        });
+        let chain = Arc::new(MockChain::new());
+        chain.set_owner_of(owner.address());
+        let creds = Arc::new(InMemoryCredentialRepo::default());
+        let state = AppState {
+            providers: Arc::new(
+                attestor_shared::provider_registry::MemoryProviderRegistry::default(),
+            ),
+            cfg: test_config(),
+            crypto: Arc::new(RealCrypto::new_for_test([0u8; 32])),
+            chain: chain.clone(),
+            sandbox: Arc::new(MockSandbox),
+            deployments: repo,
+            credentials: creds.clone(),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            jobs: Arc::new(InMemoryJobQueue::new()),
+            events: Arc::new(InMemoryEventBus::new()),
+        };
+        Setup {
+            state,
+            owner,
+            agent_seal,
+            seal_id,
+            chain,
+            creds,
+        }
+    }
+
+    fn headers(signer: &PrivateKeySigner, msg: &str) -> HeaderMap {
+        let sig: Vec<u8> = signer
+            .sign_hash_sync(&B256::from(eip191_digest(msg.as_bytes())))
+            .unwrap()
+            .into();
+        let mut h = HeaderMap::new();
+        h.insert("X-Auth-Message", HeaderValue::from_str(msg).unwrap());
+        h.insert(
+            "X-Auth-Signature",
+            HeaderValue::from_str(&format!("0x{}", hex::encode(sig))).unwrap(),
+        );
+        h
+    }
+
+    fn b64e(b: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
+
+    /// A document with one entry, signed by `signer` for `version`/`epoch`.
+    fn document(
+        s: &Setup,
+        signer: &PrivateKeySigner,
+        version: u64,
+        epoch: u64,
+        writeback: bool,
+    ) -> Document {
+        let ct = b"ciphertext sealed to the agent".to_vec();
+        let def = json!({"v":1,"name":"gcp","hosts":["oauth2.googleapis.com"],"use":"token_only",
+            "value_hash": format!("{}", keccak256(&ct)), "writeback": writeback});
+        let raw = serde_json::to_vec(&def).unwrap();
+        let set = SetWire {
+            seal_id: format!("{:#x}", s.seal_id),
+            owner_epoch: epoch,
+            version,
+            entries: vec![SetEntry {
+                name: "gcp".into(),
+                def_hash: format!("{}", keccak256(&raw)),
+            }],
+        };
+        let digest = set
+            .signing_hash(s.state.cfg.chain_id, s.state.cfg.agentic_id_addr)
+            .unwrap();
+        Document {
+            set,
+            signature: format!(
+                "0x{}",
+                hex::encode(signer.sign_hash_sync(&digest).unwrap().as_bytes())
+            ),
+            defs: [("gcp".to_string(), b64e(&raw))].into(),
+            values: [("gcp".to_string(), b64e(&ct))].into(),
+            writebacks: BTreeMap::new(),
+        }
+    }
+
+    async fn write(
+        s: &Setup,
+        signer: &PrivateKeySigner,
+        base: i64,
+        doc: &Document,
+    ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+        let body = serde_json::to_vec(
+            &json!({"seal_id": format!("{:#x}", s.seal_id), "base_version": base, "document": doc}),
+        )
+        .unwrap();
+        let msg = owner_message(
+            CREDENTIALS_DOMAIN,
+            s.seal_id,
+            Utc::now().timestamp(),
+            base,
+            Some(&settings_digest_hex(&body)),
+        );
+        handle_post(
+            State(s.state.clone()),
+            headers(signer, &msg),
+            Bytes::from(body),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn owner_writes_and_reads_the_set() {
+        let s = setup();
+        let (status, resp) = write(&s, &s.owner, 0, &document(&s, &s.owner, 1, 0, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            (status, resp.0["version"].as_i64()),
+            (StatusCode::OK, Some(1))
+        );
+        let msg = owner_message(
+            CREDENTIALS_DOMAIN,
+            s.seal_id,
+            Utc::now().timestamp(),
+            0,
+            None,
+        );
+        let read = handle_get(
+            State(s.state.clone()),
+            headers(&s.owner, &msg),
+            Query(ReadParams {
+                seal_id: format!("{:#x}", s.seal_id),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.0["version"], 1);
+        assert_eq!(read.0["document"]["set"]["entries"][0]["name"], "gcp");
+    }
+
+    #[tokio::test]
+    async fn refusals() {
+        let s = setup();
+        let stranger = PrivateKeySigner::random();
+        assert!(
+            write(&s, &stranger, 0, &document(&s, &stranger, 1, 0, false))
+                .await
+                .is_err(),
+            "not the owner"
+        );
+        assert!(
+            write(&s, &s.owner, 0, &document(&s, &stranger, 1, 0, false))
+                .await
+                .is_err(),
+            "set signed by a stranger"
+        );
+        let _ = write(&s, &s.owner, 0, &document(&s, &s.owner, 1, 0, false))
+            .await
+            .unwrap();
+        let err = write(&s, &s.owner, 0, &document(&s, &s.owner, 1, 0, false))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT, "stale base");
+        // After a transfer the epoch moves: a set for the old epoch is refused
+        // and the old set is no longer served.
+        s.creds.set_epoch(s.seal_id, 123).await.unwrap();
+        assert!(
+            write(&s, &s.owner, 0, &document(&s, &s.owner, 1, 0, false))
+                .await
+                .is_err(),
+            "old epoch"
+        );
+        let _ = write(&s, &s.owner, 0, &document(&s, &s.owner, 1, 123, false))
+            .await
+            .unwrap();
+    }
+
+    fn writeback(s: &Setup, key: &PrivateKeySigner, boot: &str) -> WritebackRequest {
+        let ct = b"rotated refresh token, sealed".to_vec();
+        let msg = writeback_message(s.seal_id, "gcp", 1, boot, &ct);
+        let sig = key.sign_hash_sync(&keccak256(msg.as_bytes())).unwrap();
+        WritebackRequest {
+            seal_id: s.seal_id,
+            name: "gcp".into(),
+            writeback: Writeback {
+                ciphertext: b64e(&ct),
+                set_version: 1,
+                boot_id: boot.into(),
+                signature: format!("0x{}", hex::encode(sig.as_bytes())),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn writeback_from_the_current_boot_is_stored() {
+        let s = setup();
+        let _ = write(&s, &s.owner, 0, &document(&s, &s.owner, 1, 0, true))
+            .await
+            .unwrap();
+        let boot = B256::repeat_byte(0x42);
+        s.creds.set_boot_id(s.seal_id, boot);
+        let boot_hex = format!("{boot:#x}");
+        let _ = handle_writeback(
+            State(s.state.clone()),
+            Json(writeback(&s, &s.agent_seal, &boot_hex)),
+        )
+        .await
+        .unwrap();
+        let stored = s.creds.get(s.seal_id).await.unwrap().unwrap();
+        assert_eq!(stored.writebacks["gcp"]["boot_id"], boot_hex);
+
+        let other_boot = format!("{:#x}", B256::repeat_byte(0x43));
+        assert!(
+            handle_writeback(
+                State(s.state.clone()),
+                Json(writeback(&s, &s.agent_seal, &other_boot))
+            )
+            .await
+            .is_err(),
+            "old boot"
+        );
+        assert!(
+            handle_writeback(
+                State(s.state.clone()),
+                Json(writeback(&s, &s.owner, &boot_hex))
+            )
+            .await
+            .is_err(),
+            "not the seal"
+        );
+    }
+
+    #[tokio::test]
+    async fn writeback_needs_the_owners_permission() {
+        let s = setup();
+        let _ = write(&s, &s.owner, 0, &document(&s, &s.owner, 1, 0, false))
+            .await
+            .unwrap();
+        let boot = B256::repeat_byte(0x42);
+        s.creds.set_boot_id(s.seal_id, boot);
+        let err = handle_writeback(
+            State(s.state.clone()),
+            Json(writeback(&s, &s.agent_seal, &format!("{boot:#x}"))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn pending_counts_only_for_agents_the_signer_owns() {
+        let s = setup();
+        let _ = write(&s, &s.owner, 0, &document(&s, &s.owner, 1, 0, false))
+            .await
+            .unwrap();
+        s.creds.set_pending(s.seal_id, 2).await.unwrap();
+        let msg = pending_message(s.owner.address(), Utc::now().timestamp());
+        let out = handle_pending(State(s.state.clone()), headers(&s.owner, &msg))
+            .await
+            .unwrap();
+        assert_eq!(out.0[0]["pending"], 2);
+        // Sold: the seller no longer sees it.
+        s.chain.set_owner_of(PrivateKeySigner::random().address());
+        let out = handle_pending(State(s.state.clone()), headers(&s.owner, &msg))
+            .await
+            .unwrap();
+        assert_eq!(out.0.as_array().unwrap().len(), 0);
+    }
+}

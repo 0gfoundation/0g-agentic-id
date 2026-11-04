@@ -6,6 +6,7 @@ pub mod auth;
 pub mod avatar;
 pub mod chain;
 pub mod config;
+pub mod credentials_repo;
 pub mod crypto;
 pub mod error;
 pub mod events;

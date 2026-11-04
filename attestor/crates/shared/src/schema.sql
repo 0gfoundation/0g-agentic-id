@@ -289,3 +289,26 @@ ALTER TABLE inference_provider_registry ADD COLUMN IF NOT EXISTS publisher BYTEA
 -- No acceptance MAC: the table lives on the tapp FDE volume, and every read
 -- re-checks the row's environment and version.
 ALTER TABLE inference_provider_registry DROP COLUMN IF EXISTS acceptance_mac;
+
+-- ── Owner credential sets (sealed credential proxy) ──────────────────────
+-- One row per seal: the owner-signed set (auth::credentials) as posted,
+-- the values the container wrote back for that version, and its last
+-- reported pending-request count. Deleted when the agent changes hands.
+CREATE TABLE IF NOT EXISTS credential_sets (
+    seal_id     BYTEA PRIMARY KEY,
+    owner       BYTEA  NOT NULL,
+    owner_epoch BIGINT NOT NULL DEFAULT 0,
+    version     BIGINT NOT NULL DEFAULT 0,
+    document    JSONB  NOT NULL,
+    writebacks  JSONB  NOT NULL DEFAULT '{}'::jsonb,
+    pending     INT    NOT NULL DEFAULT 0,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_credential_sets_owner ON credential_sets (owner);
+-- Ownership epoch per seal: the block of the agent's last transfer (0 =
+-- never transferred). A set signed for an earlier epoch is refused, so a set
+-- the agent's earlier owner signed can never be reinstated.
+CREATE TABLE IF NOT EXISTS credential_epochs (
+    seal_id BYTEA PRIMARY KEY,
+    epoch   BIGINT NOT NULL
+);

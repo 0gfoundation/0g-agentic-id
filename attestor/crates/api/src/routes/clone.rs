@@ -468,6 +468,7 @@ mod tests {
             chain: chain.clone(),
             sandbox: Arc::new(MockSandbox),
             deployments,
+            credentials: attestor_shared::credentials_repo::in_memory(),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             jobs: jobs.clone(),
             events: Arc::new(InMemoryEventBus::new()),

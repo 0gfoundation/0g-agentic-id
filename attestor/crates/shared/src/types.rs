@@ -1226,6 +1226,12 @@ pub struct ProvisionResponse {
     /// up unconfigured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_settings: Option<Bytes>,
+    /// The owner's credential set for this agent (`auth::credentials`) with
+    /// the container's writebacks merged in and the ownership epoch it was
+    /// signed for, ECIES-encrypted to the same container key. Omitted when
+    /// there is no set for the current ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_credentials: Option<Bytes>,
     /// ECIES-encrypted `{"token":"<64 lowercase hex>"}`: the opaque per-boot
     /// status token. The attestor stores only its SHA-256.
     pub encrypted_status_binding: Bytes,
@@ -1259,6 +1265,10 @@ pub struct StatusReport {
     pub status_binding: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_digest: Option<B256>,
+    /// Credential requests waiting for the owner (sealed's credential
+    /// store). Present only in `StatusReport.v3`, which signs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_pending: Option<u32>,
     /// Raw ECDSA signature (65 bytes, V ∈ {27,28}) produced by the
     /// container's `agentSeal_priv` over `keccak256(canonical_message)`,
     /// where `canonical_message` is a colon-joined ASCII string
