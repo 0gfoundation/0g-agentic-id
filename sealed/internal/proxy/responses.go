@@ -370,6 +370,9 @@ func (s *Server) runSynthTurn(rec *synthRecord, chatUpstream, token string, inpu
 		return
 	}
 	defer resp.Body.Close()
+	// No credential value reaches the stored result (proxy.go does the
+	// same for every relayed response).
+	s.scrubResponse(resp)
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		fail(fmt.Sprintf("upstream %d: %.500s", resp.StatusCode, string(msg)))
