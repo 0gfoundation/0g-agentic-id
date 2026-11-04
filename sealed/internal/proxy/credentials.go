@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"html"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"seal-verify/internal/credentials"
 )
@@ -22,6 +24,8 @@ type CredentialService interface {
 	PendingList() []credentials.Pending
 	Decide(ctx context.Context, authReqID, decision string, a *credentials.Approval, sig string) error
 	AuditSince(after int64) []credentials.AuditRecord
+	StartLogin(ctx context.Context, name, redirectURI string) (string, error)
+	FinishLogin(ctx context.Context, state, code, oauthError string) (string, error)
 }
 
 // Scrubber replaces the credential values sealed holds with their
@@ -217,4 +221,75 @@ func (s *Server) handleCredentialAudit(w http.ResponseWriter, r *http.Request) {
 		recs = []credentials.AuditRecord{}
 	}
 	writeJSON(w, http.StatusOK, recs)
+}
+
+// oauthCallbackPath is where an authorization server returns the owner
+// after a login: this agent's public address, so the code reaches sealed
+// and nothing else.
+const oauthCallbackPath = "/_seal/oauth/callback"
+
+// handleCredentialLogin starts the owner's login to a login entry's MCP
+// server and returns the URL the owner opens. Owner-signed: the login gives
+// the agent the owner's account at that server.
+func (s *Server) handleCredentialLogin(w http.ResponseWriter, r *http.Request) {
+	c, sealID, owner, ok := s.credentialService(w)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, ok := readSignedBody(w, r, s, "0GSealCredLogin", sealID, owner)
+	if !ok {
+		return
+	}
+	var in struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(body, &in); err != nil || in.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "bad_request", "message": "give the entry name"})
+		return
+	}
+	if s.publicURL == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "no_public_url", "message": "this agent has no public address for the login to return to"})
+		return
+	}
+	u, err := c.StartLogin(r.Context(), in.Name, strings.TrimRight(s.publicURL, "/")+oauthCallbackPath)
+	if err != nil {
+		var le *credentials.LoginError
+		status := http.StatusBadGateway
+		if errors.As(err, &le) && strings.HasPrefix(le.Reason, "no login entry") {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"code": "login_failed", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"authorize_url": u})
+}
+
+// handleOAuthCallback is where the owner's browser lands after consenting.
+// It carries no owner signature: the one-time state, known only to sealed
+// and to the authorization server it sent the owner to, is what binds the
+// code to the login the owner started.
+func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	c, _, _, ok := s.credentialService(w)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	name, err := c.FinishLogin(r.Context(), q.Get("state"), q.Get("code"), q.Get("error"))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "<!doctype html><title>Login failed</title><p>Login failed: "+html.EscapeString(err.Error())+"</p>")
+		return
+	}
+	_, _ = io.WriteString(w, "<!doctype html><title>Logged in</title><p>The agent is logged in for "+html.EscapeString(name)+". You can close this page.</p>")
 }

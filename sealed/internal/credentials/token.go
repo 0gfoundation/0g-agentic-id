@@ -208,6 +208,7 @@ func (s *Store) expand(tmpl string, own []byte) (string, *credproxy.Error) {
 func (s *Store) refValue(name string) (string, *credproxy.Error) {
 	s.mu.Lock()
 	v, ok := s.values[name]
+	v = usableValue(s.defs[name], v)
 	s.mu.Unlock()
 	if !ok || v == nil {
 		return "", tokenErr(http.StatusNotFound, "unknown_entry", "the template refers to %q, which is not loaded", name)

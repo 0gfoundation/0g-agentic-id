@@ -109,17 +109,19 @@ type Store struct {
 
 	auditMu sync.Mutex
 
-	mu        sync.Mutex
-	version   uint64
-	defs      map[string]*Definition
-	values    map[string][]byte
-	derived   map[string]derived
-	pending   map[string]*Pending // by auth_req_id
-	approvals map[string]Approval // by request digest
-	tokenMu   map[string]*sync.Mutex
-	events    *eventLog
-	auditLog  []AuditRecord
-	now       func() time.Time
+	mu            sync.Mutex
+	version       uint64
+	defs          map[string]*Definition
+	values        map[string][]byte
+	derived       map[string]derived
+	pending       map[string]*Pending // by auth_req_id
+	approvals     map[string]Approval // by request digest
+	tokenMu       map[string]*sync.Mutex
+	logins        map[string]*loginAttempt // by OAuth state
+	refreshTimers map[string]*time.Timer   // login entries, by name
+	events        *eventLog
+	auditLog      []AuditRecord
+	now           func() time.Time
 }
 
 const auditKeep = 1000
@@ -171,6 +173,7 @@ func NewStore(env Env, reg *credproxy.Registry) *Store {
 		env: env, reg: reg,
 		defs: map[string]*Definition{}, values: map[string][]byte{}, derived: map[string]derived{},
 		pending: map[string]*Pending{}, approvals: map[string]Approval{}, tokenMu: map[string]*sync.Mutex{},
+		logins: map[string]*loginAttempt{}, refreshTimers: map[string]*time.Timer{},
 		events: newEventLog(), now: time.Now,
 	}
 }
@@ -210,10 +213,29 @@ func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Ope
 			return nil, err
 		}
 	}
+	// Refreshes are scheduled once the lock below is released (this defer
+	// runs after the Unlock deferred under it).
+	var refresh []func()
+	defer func() {
+		for _, f := range refresh {
+			f()
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	before := s.defs
 	s.version, s.defs, s.values = o.Set.Version, o.Defs, o.Values
+	// Login entries refresh their access token themselves.
+	for name, t := range s.refreshTimers {
+		t.Stop()
+		delete(s.refreshTimers, name)
+	}
+	for name, d := range s.defs {
+		if st, ok := parseMCPState(s.values[name]); ok && d.MCP != nil {
+			name := name
+			refresh = append(refresh, func() { s.scheduleRefresh(name, st) })
+		}
+	}
 	for name, d := range s.derived {
 		if _, ok := s.defs[d.from]; !ok {
 			delete(s.derived, name)
@@ -251,6 +273,11 @@ func (s *Store) Clear() {
 	defer s.mu.Unlock()
 	s.defs, s.values, s.derived = map[string]*Definition{}, map[string][]byte{}, map[string]derived{}
 	s.pending, s.approvals = map[string]*Pending{}, map[string]Approval{}
+	s.logins = map[string]*loginAttempt{}
+	for name, t := range s.refreshTimers {
+		t.Stop()
+		delete(s.refreshTimers, name)
+	}
 	_ = s.reg.Replace(nil)
 	s.events.add(Event{Type: "cleared"})
 }
@@ -393,7 +420,7 @@ func sourceOf(from string) string {
 // or its source's for a derived entry), and the source name for derived ones.
 func (s *Store) valueLocked(name string) ([]byte, *Definition, string) {
 	if d, ok := s.defs[name]; ok {
-		return s.values[name], d, ""
+		return usableValue(d, s.values[name]), d, ""
 	}
 	if d, ok := s.derived[name]; ok {
 		if e := s.reg.Get(name); e != nil && s.defs[d.from] != nil {

@@ -17,10 +17,11 @@ import (
 
 // fakeCredentials records what the owner routes hand the store.
 type fakeCredentials struct {
-	loaded    []credentials.Document
-	loadErr   error
-	decided   []string
-	decideErr error
+	loaded        []credentials.Document
+	loadErr       error
+	decided       []string
+	decideErr     error
+	loginRedirect string
 }
 
 func (f *fakeCredentials) Load(_ context.Context, doc credentials.Document, _ uint64) (*credentials.Opened, error) {
@@ -45,6 +46,16 @@ func (f *fakeCredentials) Decide(_ context.Context, id, decision string, _ *cred
 	return nil
 }
 func (f *fakeCredentials) AuditSince(int64) []credentials.AuditRecord { return nil }
+func (f *fakeCredentials) StartLogin(_ context.Context, name, redirect string) (string, error) {
+	f.loginRedirect = redirect
+	return "https://auth.example/authorize?state=s1", nil
+}
+func (f *fakeCredentials) FinishLogin(_ context.Context, state, code, _ string) (string, error) {
+	if state != "s1" || code == "" {
+		return "", &credentials.LoginError{Reason: "this login link is unknown or has expired; start the login again"}
+	}
+	return "linear", nil
+}
 
 const credAudience = "http://agent.example:8080"
 
@@ -225,5 +236,37 @@ func TestProxy_ScrubsCredentialValuesFromAgentResponses(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "[[credential:github]]") {
 		t.Fatalf("body %s", w.Body.String())
+	}
+}
+
+func TestCredentialLoginRoutes(t *testing.T) {
+	sign, owner := mustKey(t)
+	s, f := credServer(t, owner)
+	body := `{"name":"linear"}`
+	w := httptest.NewRecorder()
+	s.handleCredentialLogin(w, credReq(sign, http.MethodPost, "/_seal/credentials/login", "0GSealCredLogin", body))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "auth.example/authorize") {
+		t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
+	}
+	if f.loginRedirect != credAudience+"/_seal/oauth/callback" {
+		t.Fatalf("redirect %q", f.loginRedirect)
+	}
+	// Only the owner starts a login.
+	other, _ := mustKey(t)
+	w = httptest.NewRecorder()
+	s.handleCredentialLogin(w, credReq(other, http.MethodPost, "/_seal/credentials/login", "0GSealCredLogin", body))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("HTTP %d for a stranger", w.Code)
+	}
+	// The callback needs the state sealed issued; what it echoes is escaped.
+	w = httptest.NewRecorder()
+	s.handleOAuthCallback(w, httptest.NewRequest(http.MethodGet, "/_seal/oauth/callback?state=s1&code=c", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "logged in for linear") {
+		t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	s.handleOAuthCallback(w, httptest.NewRequest(http.MethodGet, "/_seal/oauth/callback?state=forged&code=%3Cscript%3E", nil))
+	if w.Code != http.StatusBadRequest || strings.Contains(w.Body.String(), "<script>") {
+		t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
 	}
 }

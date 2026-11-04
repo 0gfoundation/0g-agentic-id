@@ -156,7 +156,7 @@ type Definition struct {
 	Writeback    bool                 `json:"writeback,omitempty"`
 	TokenRequest *TokenRequest        `json:"token_request,omitempty"`
 	Signer       *credproxy.Signer    `json:"signer,omitempty"`
-	MCP          json.RawMessage      `json:"mcp,omitempty"`
+	MCP          *MCPSpec             `json:"mcp,omitempty"`
 }
 
 // valuePlaintext is what a value's ciphertext holds.
@@ -316,7 +316,7 @@ func chooseCiphertext(doc Document, def *Definition, c Check) ([]byte, error) {
 		}
 	}
 	if def.ValueHash == "" {
-		if len(def.MCP) > 0 {
+		if def.MCP != nil {
 			return nil, nil
 		}
 		return nil, errors.New("definition has no value hash")
@@ -361,6 +361,13 @@ func SealValue(pub *eciesgo.PublicKey, owner common.Address, sealID string, chai
 
 // Entry converts a definition and its value into a proxy entry.
 func (d *Definition) Entry(value []byte) *credproxy.Entry {
+	var loginExpiry int64
+	if d.MCP != nil {
+		// A login entry serves its access token, never the stored state.
+		if st, ok := parseMCPState(value); ok {
+			value, loginExpiry = []byte(st.AccessToken), st.ExpiresAt
+		}
+	}
 	e := &credproxy.Entry{
 		Name:      d.Name,
 		Hosts:     append([]string(nil), d.Hosts...),
@@ -371,6 +378,9 @@ func (d *Definition) Entry(value []byte) *credproxy.Entry {
 	}
 	if d.ExpiresAt > 0 {
 		e.ExpiresAt = time.Unix(d.ExpiresAt, 0)
+	}
+	if loginExpiry > 0 && (e.ExpiresAt.IsZero() || loginExpiry < d.ExpiresAt) {
+		e.ExpiresAt = time.Unix(loginExpiry, 0)
 	}
 	return e
 }
