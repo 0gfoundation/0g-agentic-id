@@ -432,9 +432,9 @@ stable signer `0xc6c43480a5219e7d260ea3edd0a721b6800d0d19` (tx
 CloneGate `0xACcD…Bb89` (tx
 `0xa56a5d7149f668183dfc2205b7e3b8f34ca72891e0274c2928d8158d0a9a58f1`). The
 attestor's pre-1.3 address-only entry `0x0193bAE3f74f62FF2B4Bf21D648d0F2c0111B89C`
-is still listed but has no binding, so `isTrustedAttestor` reads `false` for it;
-`removeTrustedAttestor` on it is the remaining cleanup
-([`attestor/APP_IDENTITY.md`](../attestor/APP_IDENTITY.md) step 5).
+was removed on 2026-11-04 by the owner (`removeTrustedAttestor`, tx
+`0xe8510c01fa8cb77c201c134f8d1a7b35daa6fa3285615d2da34433c5f32c50c2`, block
+63766801; [`attestor/APP_IDENTITY.md`](../attestor/APP_IDENTITY.md) step 5).
 
 **Governance is deliberately lightweight (testnet):** owner = pauser = TEE
 oracle = one EOA, `minDelay=0`, the same EOA as Timelock
@@ -677,8 +677,8 @@ Changelog:
     `0xfdf08cc1811c89ebd48cb2b4b9ba81e601c860a1bd8fd1859d73753348e1134e`);
     schedule `0xcb7a5636b1b5b88c1f48b97a26e97c3c2df77d2c29b3a649c5872038ae6263f6`,
     execute `0x3db4a0321b3a04ba786ef5688ef7866b392da24424412012a9b592887d2e275d`
-    (block 62366042, 08:40 UTC). Bindings and the switch (09:30 UTC): §6.1;
-    the old entry is still to be removed.
+    (block 62366042, 08:40 UTC). Bindings, the switch (09:30 UTC) and the old
+    entry's removal (2026-11-04 06:18 UTC): §6.1.
   - mainnet, 2026-11-02: straight from 1.1.0 (no 1.2.0 impl there), in one
     batch with TEEDataVerifier 1.2.0 — the pair must move together (1.2.0 entry
     below) — VerifiedFeedbackRegistry 1.2.0 and CloneGate 1.1.0. Library
