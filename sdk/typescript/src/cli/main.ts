@@ -15,8 +15,9 @@ import { parseArgs } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { CliError, toCliError, EXIT } from './errors';
-import { emitError, print } from './envelope';
+import { emitError, note, print } from './envelope';
 import { readEnv } from './env';
+import { moveRenamedAttestor } from './config';
 import type { CommandContext, CommandRun } from './types';
 import { run as doctor } from './commands/doctor';
 import { run as status } from './commands/status';
@@ -133,8 +134,12 @@ ENVIRONMENT
   AGENTIC_PRIVATE_KEY    optional. Owner key (0x… hex). Env only — there is
                          deliberately no flag for it.
   AGENTIC_RPC_URL        optional. Overrides the RPC the attestor advertises.
-  AGENTIC_API_KEY        optional. Inference key for deploy/reset; overrides
-                         the one stored by login.
+  AGENTDNA_API_KEY_PROVIDER / AGENTDNA_API_KEY
+                         optional, set together. Inference key for deploy/
+                         reset with that provider (e.g. openai); overrides the
+                         one stored by login. A key without its provider is
+                         refused.
+  AGENTIC_API_KEY        optional. Legacy override for the 0g-compute key only.
   AGENTIC_VERIFIED_FEEDBACK_ADDR / AGENTIC_FEEDBACK_BATCHER_ADDR
                          optional. Reputation-pair address overrides for
                          attestors whose /config doesn't advertise them yet.
@@ -195,6 +200,11 @@ async function main(): Promise<number> {
   const [first, ...rest] = positionals;
   const isCommand = !!first && first in COMMANDS;
   const run = isCommand ? COMMANDS[first] : interactive;
+
+  // The public attestors were renamed: a saved earlier address moves to the
+  // current one before the environment is read.
+  const moved = moveRenamedAttestor();
+  if (moved) note(`saved attestor address updated: ${moved.from} → ${moved.to} (same attestor, new name)`);
 
   const ctx: CommandContext = {
     env: readEnv(),

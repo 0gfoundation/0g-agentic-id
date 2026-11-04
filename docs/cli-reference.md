@@ -1,6 +1,6 @@
 # 0g-agentdna CLI Reference
 
-> Matches `@0gfoundation/0g-agentdna` ≥ 0.2.2 · the CLI ships inside the SDK package — no separate install
+> Matches `@0gfoundation/0g-agentdna` ≥ 0.2.3 · the CLI ships inside the SDK package — no separate install
 > Every command, flag, and exit code below was verified against `sdk/typescript/src/cli/` source
 
 ## 1. Installation & Mental Model
@@ -43,9 +43,10 @@ Environment variables **always override** the config files — CI and one-off ru
 
 | Variable | Required | Notes |
 |---|---|---|
-| `AGENTIC_ATTESTOR_URL` | yes (for writes) | attestor base URL — **one URL pins the whole environment** (contracts, RPC, appIds all come from its `/config`). Production `https://agenticid.0g.ai`, testnet `https://agenticid-testnet.0g.ai` |
+| `AGENTIC_ATTESTOR_URL` | yes (for writes) | attestor base URL — **one URL pins the whole environment** (contracts, RPC, appIds all come from its `/config`). Production `https://agentdna.0g.ai`, testnet `https://agentdna-testnet.0g.ai` |
 | `AGENTIC_PRIVATE_KEY` | no | owner key (`0x…` hex). **Env only — there is deliberately no `--key` flag.** Unlocks all write operations and owner-signed surfaces |
 | `AGENTIC_RPC_URL` | no | overrides the RPC the attestor advertises |
+| `AGENTDNA_API_KEY_PROVIDER` + `AGENTDNA_API_KEY` | no | set together: the inference key for deploy/reset with that provider (e.g. `openai`), overriding the one stored by `login`. A key without its provider is refused |
 | `AGENTIC_API_KEY` | no | legacy compute-only inference key (deploy/reset); other providers use their matching key stored by `login` |
 | `AGENTIC_VERIFIED_FEEDBACK_ADDR` | no | reputation-pair address override, for attestors whose `/config` doesn't advertise them yet |
 | `AGENTIC_FEEDBACK_BATCHER_ADDR` | no | FeedbackBatcher address override, same situation |
@@ -60,7 +61,7 @@ Persisted files under `~/.config/0g-agentdna/`:
 | `credentials` | owner key + provider-scoped inference keys (JSON) | 0600 |
 | `proofs.json` | the rating-ticket jar | 0600 |
 
-Legacy config is migrated automatically from `~/.config/0g-agenticid/`; see the [migration guide](../sdk/typescript/MIGRATION.md).
+Legacy config is migrated automatically from `~/.config/0g-agenticid/`; see the [migration guide](../sdk/typescript/MIGRATION.md). A saved earlier address of a public attestor (`https://agenticid.0g.ai`, `https://agenticid-testnet.0g.ai`) is replaced with its current name on the next run.
 
 ## 4. Subcommands
 

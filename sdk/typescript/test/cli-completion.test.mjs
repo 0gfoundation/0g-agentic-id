@@ -82,7 +82,7 @@ test('compareVersions: suffixed and garbage parts never mis-trigger', () => {
 
 test('hostOf: hostname out of a URL, graceful on garbage', () => {
   assert.equal(hostOf('https://attestor.35-225-105-127.sslip.io'), 'attestor.35-225-105-127.sslip.io');
-  assert.equal(hostOf('https://agenticid.0g.ai/'), 'agenticid.0g.ai');
+  assert.equal(hostOf('https://agentdna.0g.ai/'), 'agentdna.0g.ai');
   assert.equal(hostOf(undefined), 'unset');
   assert.equal(hostOf('not a url'), 'not a url'.slice(0, 24));
 });

@@ -16,6 +16,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { MIN_SANDBOX_BALANCE_WEI, type AgenticID } from '../../AgenticID';
 import { RPC_URL } from '../../constants';
 import { buildClient } from '../sdk';
+import { renamedAttestor } from '../config';
 import { CliError, type ErrorCode } from '../errors';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
@@ -63,12 +64,17 @@ export async function run(ctx: CommandContext): Promise<void> {
     checks.push({
       name: 'attestor', status: 'fail', code: 'MISSING_ATTESTOR_URL',
       detail: 'AGENTIC_ATTESTOR_URL is not set',
-      remedy: 'export AGENTIC_ATTESTOR_URL=https://agenticid.0g.ai   # or your own attestor',
+      remedy: 'export AGENTIC_ATTESTOR_URL=https://agentdna.0g.ai   # or your own attestor',
     });
   } else {
     try {
       cfg = await fetchJson(`${env.attestorUrl}/config`);
-      checks.push({ name: 'attestor', status: 'pass', detail: env.attestorUrl });
+      // A saved earlier name was moved at startup; one set in the env stays.
+      const current = renamedAttestor(env.attestorUrl);
+      checks.push({
+        name: 'attestor', status: 'pass',
+        detail: current ? `${env.attestorUrl} (now ${current}; the earlier name still answers — update AGENTIC_ATTESTOR_URL)` : env.attestorUrl,
+      });
     } catch (e) {
       checks.push({
         name: 'attestor', status: 'fail', code: 'ATTESTOR_UNREACHABLE',

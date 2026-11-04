@@ -1,7 +1,7 @@
 /**
  * @file AttestorClient.ts
  * @description Internal client for attestor HTTP endpoints: seal-bound deploy +
- * clone. Consumers use the `AgenticID` facade's `agent` namespace.
+ * clone. Consumers use the `AgentDNA` facade's `agent` namespace.
  *
  * Neither is an on-chain call. The owner signs a canonical envelope (EIP-191) and
  * POSTs it; the attestor verifies the signer and drives the mint. Deploy also

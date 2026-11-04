@@ -457,8 +457,8 @@ export class AgentApi {
     }
     if (agentId === undefined && this.hasAccount()) {
       console.warn(
-        `[agentic-sdk] client(${base}): /hello carried no X-Agent-Proof, so the agentId is unknown — ` +
-          'this handle has NO owner ops (chat/logs) although this AgenticID holds a key. ' +
+        `[0g-agentdna] client(${base}): /hello carried no X-Agent-Proof, so the agentId is unknown — ` +
+          'this handle has NO owner ops (chat/logs) although this AgentDNA client holds a key. ' +
           'Pass { agentId } (or call client(agentId)) to connect as the owner.',
       );
     }
@@ -1281,7 +1281,6 @@ export class ReputationApi {
   waitForTransaction(txHash: Hash): Promise<TransactionReceipt> { return this.rep.waitForTransaction(txHash); }
 }
 
-/** The AgenticID SDK entry point. */
 /** Attestor-wide operations, authorized by its current Tapp owner. */
 export class AdminApi {
   constructor(private readonly attestor: AttestorClient) {}
@@ -1293,6 +1292,8 @@ export class AdminApi {
   publishSignedProviders(update: { document: string; signature: `0x${string}` }) { return this.attestor.publishSignedProviders(update); }
 }
 
+/** The AgentDNA SDK entry point, exported as `AgentDNA` (`AgenticID` is the
+ *  legacy alias). */
 export class AgenticID {
   readonly agent: AgentApi;
   readonly admin: AdminApi;

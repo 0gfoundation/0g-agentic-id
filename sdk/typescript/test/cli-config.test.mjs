@@ -7,11 +7,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync, statSync, mkdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, statSync, mkdirSync, existsSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { loadConfig, saveConfig, loadCredentials, saveKey, saveApiKey, loadKey, loadApiKey, configPaths } from '../dist/cli/config.js';
+import {
+  loadConfig, saveConfig, loadCredentials, saveKey, saveApiKey, loadKey, loadApiKey, configPaths,
+  loadSecretEnvPins, recordSecretEnvPin, moveRenamedAttestor, renamedAttestor,
+} from '../dist/cli/config.js';
 import { readEnv } from '../dist/cli/env.js';
 
 const KEY = `0x${'ab'.repeat(32)}`;
@@ -61,6 +64,42 @@ test('config.json round-trips and strips the trailing slash', () => {
   const env = freshEnv();
   saveConfig({ attestorUrl: 'https://a.example/' }, env);
   assert.equal(loadConfig(env).attestorUrl, 'https://a.example');
+});
+
+test('an earlier public attestor address moves to its current name once, with its secret-env pin', () => {
+  const env = freshEnv();
+  saveConfig({ attestorUrl: 'https://agenticid.0g.ai/', rpcUrl: 'https://rpc.example' }, env);
+  recordSecretEnvPin('https://agenticid.0g.ai', env);
+  assert.deepEqual(moveRenamedAttestor(env), { from: 'https://agenticid.0g.ai', to: 'https://agentdna.0g.ai' });
+  assert.equal(loadConfig(env).attestorUrl, 'https://agentdna.0g.ai');
+  assert.equal(loadConfig(env).rpcUrl, 'https://rpc.example');
+  // The pin is copied; the earlier one stays for a URL still set in the env.
+  assert.deepEqual(loadSecretEnvPins(env), { 'https://agenticid.0g.ai': true, 'https://agentdna.0g.ai': true });
+  assert.equal(moveRenamedAttestor(env), null);
+});
+
+test('the testnet name moves too, without inventing a pin; other addresses stay', () => {
+  const env = freshEnv();
+  saveConfig({ attestorUrl: 'https://AgenticID-testnet.0g.ai' }, env);
+  assert.deepEqual(moveRenamedAttestor(env), { from: 'https://AgenticID-testnet.0g.ai', to: 'https://agentdna-testnet.0g.ai' });
+  assert.deepEqual(loadSecretEnvPins(env), {});
+
+  const other = freshEnv();
+  saveConfig({ attestorUrl: 'https://attestor.example' }, other);
+  assert.equal(moveRenamedAttestor(other), null);
+  assert.equal(loadConfig(other).attestorUrl, 'https://attestor.example');
+  assert.equal(moveRenamedAttestor(freshEnv()), null);
+  assert.equal(renamedAttestor('https://agenticid.0g.ai.evil.example'), undefined);
+  assert.equal(renamedAttestor('constructor'), undefined);
+});
+
+test('an unwritable pin keeps the earlier address saved', { skip: process.getuid?.() === 0 && 'root ignores file modes' }, () => {
+  const env = freshEnv();
+  saveConfig({ attestorUrl: 'https://agenticid.0g.ai' }, env);
+  recordSecretEnvPin('https://agenticid.0g.ai', env);
+  chmodSync(join(configPaths(env).dir, 'secret-env-pins.json'), 0o444);
+  assert.equal(moveRenamedAttestor(env), null);
+  assert.equal(loadConfig(env).attestorUrl, 'https://agenticid.0g.ai');
 });
 
 test('both secrets live in one 0600 credentials JSON', () => {

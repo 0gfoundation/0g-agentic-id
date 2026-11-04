@@ -14,7 +14,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -185,6 +185,19 @@ test('unknown flag --json: exit 2, BAD_FLAG', async () => {
   const r = await run(['doctor', '--bogus', '--json']);
   assert.equal(r.code, 2);
   assert.equal(JSON.parse(r.stdout).error.code, 'BAD_FLAG');
+});
+
+test('a saved earlier attestor address moves to its current name at startup, noted on stderr', async () => {
+  const XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), 'agcli-'));
+  const dir = join(XDG_CONFIG_HOME, '0g-agentdna');
+  mkdirSync(dir);
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ attestorUrl: 'https://agenticid.0g.ai' }));
+  // `status` without an agent fails before any network call.
+  const r = await run(['status', '--json'], { XDG_CONFIG_HOME });
+  assert.equal(r.code, 2);
+  assert.equal(JSON.parse(r.stdout).error.code, 'BAD_AGENT_REF');
+  assert.match(r.stderr, /saved attestor address updated: https:\/\/agenticid\.0g\.ai → https:\/\/agentdna\.0g\.ai/);
+  assert.equal(JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8')).attestorUrl, 'https://agentdna.0g.ai');
 });
 
 test('list --mine without key: exit 3, WALLET_REQUIRED with remedy', async () => {

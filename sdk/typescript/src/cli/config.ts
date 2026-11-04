@@ -106,6 +106,42 @@ export function saveConfig(patch: FileConfig, env: NodeJS.ProcessEnv = process.e
   writeFileSync(config, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o644 });
 }
 
+/** Earlier addresses of the public attestors → their current ones. Each pair
+ *  is one attestor (same machine, same attested TLS key) answering under both
+ *  names, so a saved earlier address keeps working; moving it lets the old
+ *  name retire. */
+const RENAMED_ATTESTORS = new Map<string, string>([
+  ['https://agenticid.0g.ai', 'https://agentdna.0g.ai'],
+  ['https://agenticid-testnet.0g.ai', 'https://agentdna-testnet.0g.ai'],
+]);
+
+/** The current address of a renamed public attestor, or undefined. */
+export function renamedAttestor(url: string): string | undefined {
+  return RENAMED_ATTESTORS.get(url.replace(/\/$/, '').toLowerCase());
+}
+
+/** Move a saved earlier attestor address to the current one. Its secret-env
+ *  pin moves along: without it the next contact would count as a first one.
+ *  Returns the move, or null when there is nothing to move or the files can't
+ *  be written (the earlier address still answers, so nothing breaks). */
+export function moveRenamedAttestor(env: NodeJS.ProcessEnv = process.env): { from: string; to: string } | null {
+  const from = loadConfig(env).attestorUrl;
+  const to = from ? renamedAttestor(from) : undefined;
+  if (!from || !to) return null;
+  // Pin first: a failed write then leaves the earlier address saved, never
+  // the current one without its pin.
+  if (loadSecretEnvPins(env)[from]) {
+    recordSecretEnvPin(to, env);
+    if (!loadSecretEnvPins(env)[to]) return null;
+  }
+  try {
+    saveConfig({ attestorUrl: to }, env);
+  } catch {
+    return null;
+  }
+  return { from, to };
+}
+
 /** Owner key and provider-scoped inference keys, stored at 0600. */
 export interface Credentials {
   privateKey?: `0x${string}`;

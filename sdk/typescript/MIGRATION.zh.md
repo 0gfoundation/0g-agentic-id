@@ -39,6 +39,11 @@ npm install -g @0gfoundation/0g-agentdna
 如果新旧目录同时存在，使用 AgentDNA 目录，保留旧目录。如果移动失败，明确报告
 迁移错误，不创建空配置替代。已有的 `AGENTIC_*` 环境变量继续支持。
 
+公共 attestor 的旧地址 `https://agenticid.0g.ai`、`https://agenticid-testnet.0g.ai`
+现为 `https://agentdna.0g.ai`、`https://agentdna-testnet.0g.ai`，新旧地址指向同一个
+attestor。从 0.2.3 起，CLI 在下次运行时把保存的旧地址换成新地址，secret-env
+降级保护记录随之迁移，并在 stderr 提示。环境变量 `AGENTIC_ATTESTOR_URL` 保持
+不变，请自行更新（`doctor` 会提示）。SDK 代码传入旧地址仍可用，建议换成新地址。
 
 旧凭据字段 `apiKey` 会原子转换为 `inferenceKeys["0g-compute"]`，保留钱包及
 其他 provider 的 key。旧 `AGENTIC_API_KEY` / `API_KEY` 覆盖仅属于 compute。

@@ -1,6 +1,6 @@
 /**
  * @file sdk.ts
- * @description Shared bootstrap: CliEnv → AgenticID facade. The single place
+ * @description Shared bootstrap: CliEnv → AgentDNA facade. The single place
  * the CLI constructs the SDK client — doctor/status/list all reuse it, so the
  * env→client semantics can never drift between commands (this is the shared
  * artifact that made B/C/D "parallel with a hidden shared piece"; it lands in

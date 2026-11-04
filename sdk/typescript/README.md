@@ -38,8 +38,8 @@ Backends (AgenticID / the canonical ERC-8004 ReputationRegistry + VerifiedFeedba
 ```ts
 import { AgentDNA } from '@0gfoundation/0g-agentdna';
 
-// 0G mainnet; for the Galileo testnet use 'https://agenticid-testnet.0g.ai'
-const ag = await AgentDNA.fromAttestor('https://agenticid.0g.ai', {
+// 0G mainnet; for the Galileo testnet use 'https://agentdna-testnet.0g.ai'
+const ag = await AgentDNA.fromAttestor('https://agentdna.0g.ai', {
   account: process.env.PRIVATE_KEY as `0x${string}`,   // omit for read-only
 });
 ```

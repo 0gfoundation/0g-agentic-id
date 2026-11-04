@@ -56,7 +56,7 @@ export function readEnv(env: NodeJS.ProcessEnv = process.env): CliEnv {
 export function requireAttestorUrl(env: CliEnv): string {
   if (!env.attestorUrl) {
     throw new CliError('MISSING_ATTESTOR_URL', 'AGENTIC_ATTESTOR_URL is not set — the CLI cannot reach an environment without it', {
-      remedy: 'export AGENTIC_ATTESTOR_URL=https://agenticid.0g.ai   # or your own attestor',
+      remedy: 'export AGENTIC_ATTESTOR_URL=https://agentdna.0g.ai   # or your own attestor',
     });
   }
   return env.attestorUrl;

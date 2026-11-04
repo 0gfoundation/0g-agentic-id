@@ -472,8 +472,8 @@ top-up), `ag.reputation` (capture a TEE-signed serve-proof, verify it,
 submit/read on-chain feedback), plus top-level trust-root ack and
 prepaid sandbox deposit. Hides the contract set and the attestor HTTP
 API behind one config object; every snippet in it runs against a live
-deployment — `https://agenticid.0g.ai` (as written) is 0G mainnet; point it at
-`https://agenticid-testnet.0g.ai` for the Galileo testnet.
+deployment — `https://agentdna.0g.ai` (as written) is 0G mainnet; point it at
+`https://agentdna-testnet.0g.ai` for the Galileo testnet.
 
 Existing CLI users can follow the [AgentDNA migration guide](sdk/typescript/MIGRATION.md).
 

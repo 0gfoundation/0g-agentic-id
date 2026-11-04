@@ -8,12 +8,12 @@ Protocol docs & full source: **[github.com/0gfoundation/0g-agentic-id](https://g
 
 ## Setup
 
-**Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs. The public 0G attestors are `https://agenticid.0g.ai` (0G mainnet, chain 16661 — real funds) and `https://agenticid-testnet.0g.ai` (0G Galileo testnet, chain 16602):
+**Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs. The public 0G attestors are `https://agentdna.0g.ai` (0G mainnet, chain 16661 — real funds) and `https://agentdna-testnet.0g.ai` (0G Galileo testnet, chain 16602):
 
 ```ts
 import { AgentDNA } from '@0gfoundation/0g-agentdna';
 
-const ag = await AgentDNA.fromAttestor('https://agenticid.0g.ai', {
+const ag = await AgentDNA.fromAttestor('https://agentdna.0g.ai', {
   account: process.env.PRIVATE_KEY as `0x${string}`,   // omit for read-only; env values are string|undefined, so strict TS needs the assertion
 });
 // Verifying addresses out-of-band instead of trusting the attestor?
@@ -66,9 +66,9 @@ const ag = new AgentDNA({
 **Mainnet by hand.** `rpcUrl` and `chain` default independently to Galileo (`https://evmrpc-testnet.0g.ai` / `ZERO_G_TESTNET`, chain 16602). For the 0G mainnet set (`contracts/DEPLOYMENT.md` §6.2m, chain 16661) pass **both**: `rpcUrl` picks the node, `chain` the chain id every write is signed for — mainnet addresses with the default chain sign every tx for 16602, so writes fail.
 
 ```ts
-import { AgenticID, ZERO_G_MAINNET } from '@0gfoundation/0g-agenticid-sdk';
+import { AgentDNA, ZERO_G_MAINNET } from '@0gfoundation/0g-agentdna';
 
-const main = new AgenticID({
+const main = new AgentDNA({
   addresses,                       // the §6.2m set
   account: process.env.PRIVATE_KEY as `0x${string}`,
   rpcUrl: 'https://evmrpc.0g.ai',
@@ -76,7 +76,7 @@ const main = new AgenticID({
 });
 ```
 
-Or skip the hand wiring: `AgenticID.fromAttestor('https://agenticid.0g.ai', …)` takes the addresses, RPC and chain from the attestor's `/config`.
+Or skip the hand wiring: `AgentDNA.fromAttestor('https://agentdna.0g.ai', …)` takes the addresses, RPC and chain from the attestor's `/config`.
 
 **What you pass grows with what you do** — three tiers:
 
@@ -917,7 +917,7 @@ digest change does not close it.
 
 Contract addresses are a **deployment artifact, not baked into the SDK** — an RPC + these addresses fully determine the target contracts, and keeping them out of the library means a proxy upgrade or redeploy can't silently stale a bundled constant.
 
-**Source of truth: the attestor's `GET /config`** — `AgentDNA.fromAttestor(url)` reads it and fills every address for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel: on 0G mainnet (`chainId 16661`, served by `https://agenticid.0g.ai`) and on 0G Galileo Testnet (`chainId 16602`, e.g. `https://agenticid-testnet.0g.ai`). To wire addresses manually instead, copy the set into a `ContractAddresses` object (shape above), or load them from your own config/env.
+**Source of truth: the attestor's `GET /config`** — `AgentDNA.fromAttestor(url)` reads it and fills every address for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel: on 0G mainnet (`chainId 16661`, served by `https://agentdna.0g.ai`) and on 0G Galileo Testnet (`chainId 16602`, e.g. `https://agentdna-testnet.0g.ai`). To wire addresses manually instead, copy the set into a `ContractAddresses` object (shape above), or load them from your own config/env.
 
 The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` (viem chains), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
 
@@ -1016,7 +1016,7 @@ Configuration persists under `~/.config/0g-agentdna/` — `config.json` (attesto
 Environment variables (override the config files):
 
 ```bash
-export AGENTIC_ATTESTOR_URL=https://agenticid.0g.ai   # required — one URL selects the environment
+export AGENTIC_ATTESTOR_URL=https://agentdna.0g.ai    # required — one URL selects the environment
 export AGENTIC_PRIVATE_KEY=0x…                        # optional — owner surfaces; env only, no flag by design
 export AGENTIC_RPC_URL=https://…                      # optional — overrides the attestor-advertised RPC
 ```
