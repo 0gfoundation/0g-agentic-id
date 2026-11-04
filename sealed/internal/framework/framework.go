@@ -475,6 +475,10 @@ var credentialCAVars = []string{
 // variables pointing at the proxy's root, and the explicit prefix and
 // sockets for tools that call them directly. Every adapter appends it to
 // the framework's environment; it is empty when the proxy is off.
+// gitCredentialHelper answers git's "get" with the credential socket's
+// username and placeholder for the host git names.
+const gitCredentialHelper = `!f() { test "$1" = get || exit 0; h=$(sed -n 's/^host=//p'); test -n "$h" && curl -sf --unix-socket "$SEAL_CRED_SOCKET" "http://localhost/credentials/git?host=$h" || true; }; f`
+
 func (rt RuntimeContext) CredentialEnv() []string {
 	if rt.CredHTTPSProxy == "" {
 		return nil
@@ -492,6 +496,15 @@ func (rt RuntimeContext) CredentialEnv() []string {
 	}
 	if rt.CredSock != "" {
 		env = append(env, "SEAL_CRED_SOCKET="+rt.CredSock)
+		// git over HTTPS asks the credential socket for the placeholder of
+		// an entry that allows Basic auth on that host; the proxy fills the
+		// real value in. Nothing comes back for other hosts, and git moves
+		// on to whatever helper it has.
+		env = append(env,
+			"GIT_CONFIG_COUNT=1",
+			"GIT_CONFIG_KEY_0=credential.helper",
+			"GIT_CONFIG_VALUE_0="+gitCredentialHelper,
+		)
 	}
 	if rt.CredRevealSock != "" {
 		env = append(env, "SEAL_CRED_REVEAL_SOCKET="+rt.CredRevealSock)

@@ -49,6 +49,17 @@ func (s *Store) HarnessHandler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, list)
 	})
+	// git's credential helper: the username and the placeholder for host,
+	// in git's own key=value form.
+	mux.HandleFunc("GET /credentials/git", func(w http.ResponseWriter, r *http.Request) {
+		user, name, ok := s.reg.BasicFor(r.URL.Query().Get("host"))
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "username="+user+"\npassword="+credproxy.Placeholder(name)+"\n")
+	})
 	mux.HandleFunc("POST /credentials/token", func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
 			Name   string            `json:"name"`

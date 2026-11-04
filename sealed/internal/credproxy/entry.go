@@ -198,6 +198,24 @@ func (r *Registry) InterceptsHost(host string) bool {
 	return false
 }
 
+// BasicFor names the first entry (by name) that may go to host as a Basic
+// auth password, with the fixed username it goes with.
+func (r *Registry) BasicFor(host string) (username, name string, ok bool) {
+	host = NormalizeHost(host)
+	for _, n := range r.Names() {
+		e := r.Get(n)
+		if e == nil || e.Use != UseInject || !hostAllowed(e, host) {
+			continue
+		}
+		for _, p := range e.Positions {
+			if p.Kind == PosBasic {
+				return p.Username, n, true
+			}
+		}
+	}
+	return "", "", false
+}
+
 // secrets snapshots name → value for redaction.
 func (r *Registry) secrets() map[string][]byte {
 	r.mu.RLock()

@@ -317,3 +317,28 @@ func TestRotatedValueSurvivesUnrelatedChange(t *testing.T) {
 		t.Fatalf("got %v", e)
 	}
 }
+
+// git's helper gets the placeholder for a host whose entry allows Basic.
+func TestGitCredentialHelperRoute(t *testing.T) {
+	f := newFixture(t)
+	s, _, _ := f.store(t, nil, nil)
+	doc := f.doc(t, 1, map[string]string{"gh": "ghp_value_0123"})
+	f.editDefs(t, &doc, func(d *Definition) {
+		d.Hosts = []string{"github.com"}
+		d.Positions = []credproxy.Position{{Kind: credproxy.PosBasic, Username: "x-access-token"}}
+	})
+	if _, err := s.Load(context.Background(), doc, 0); err != nil {
+		t.Fatal(err)
+	}
+	h := s.HarnessHandler()
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/credentials/git?host=github.com", nil))
+	if w.Code != http.StatusOK || w.Body.String() != "username=x-access-token\npassword=[[credential:gh]]\n" {
+		t.Fatalf("HTTP %d: %q", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/credentials/git?host=gitlab.com", nil))
+	if w.Code != http.StatusNotFound || w.Body.Len() != 0 {
+		t.Fatalf("another host got %d %q", w.Code, w.Body.String())
+	}
+}
