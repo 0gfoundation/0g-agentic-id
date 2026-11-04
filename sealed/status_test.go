@@ -242,3 +242,51 @@ func TestRuntimeStatus_PinnedWarningOverridesRunning(t *testing.T) {
 		t.Fatalf("cleared pin: (%q, %q)", level, msg)
 	}
 }
+
+func TestSupervisorFailureCannotBeClearedByDriftOrHeartbeat(t *testing.T) {
+	s := &runtimeStatus{level: "running"}
+	s.SupervisorFailed("supervisor exhausted retries")
+	s.Set("running", "")
+	level, message := s.Get()
+	if level != "error" || message != "supervisor exhausted retries" {
+		t.Fatal("upload recovery revived a dead process")
+	}
+	s.Set("warning", "needs funds")
+	level, _ = s.Get()
+	if level != "error" {
+		t.Fatal("warning hid the supervisor failure")
+	}
+	s.SupervisorRecovered()
+	level, _ = s.Get()
+	if level != "warning" {
+		t.Fatal("confirmed process recovery did not release supervisor failure")
+	}
+}
+
+// Settings that give the agent no usable model show as a warning (the agent
+// is up but cannot answer) until a settings push applies.
+func TestRuntimeStatus_SettingsIssueShowsUntilCleared(t *testing.T) {
+	s := &runtimeStatus{level: "running"}
+	if prev := s.SettingsIssue("owner settings: model is required"); prev != "running" {
+		t.Fatalf("SettingsIssue returned %q", prev)
+	}
+	if level, msg := s.Get(); level != "warning" || msg != "owner settings: model is required" {
+		t.Fatalf("settings issue Get = (%q, %q)", level, msg)
+	}
+	s.Pin("secret_env_not_applied: owner_mismatch")
+	if _, msg := s.Get(); msg != "secret_env_not_applied: owner_mismatch" {
+		t.Fatalf("the credential pin comes first, got %q", msg)
+	}
+	s.Pin("")
+	s.Set("error", "openclaw exit")
+	if level, _ := s.Get(); level != "error" {
+		t.Fatalf("an error must win over the settings issue, got %q", level)
+	}
+	s.Set("running", "")
+	if prev := s.SettingsIssue(""); prev != "warning" {
+		t.Fatalf("clearing returned %q", prev)
+	}
+	if level, msg := s.Get(); level != "running" || msg != "" {
+		t.Fatalf("cleared: (%q, %q)", level, msg)
+	}
+}

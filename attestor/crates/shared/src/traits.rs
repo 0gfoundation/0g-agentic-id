@@ -3,7 +3,7 @@
 
 use crate::events::WsEvent;
 use crate::types::*;
-use alloy::primitives::{Address, Bytes, B256, TxHash};
+use alloy::primitives::{Address, Bytes, TxHash, B256};
 use async_trait::async_trait;
 
 // ── Chain ───────────────────────────────────────────────────────────────
@@ -19,15 +19,21 @@ pub trait ChainClient: Send + Sync {
     async fn is_valid_framework_hash(&self, hash: ImageHash) -> anyhow::Result<bool>;
     async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool>;
 
-    /// Returns whether `addr` is a currently-active node signer of the
-    /// configured sandbox app in TappRegistry. Used by `/provision` to
-    /// validate that the recovered sandbox attestation signer is one
-    /// the sandbox provider has registered (and rotations propagate
-    /// without an attestor restart).
-    ///
-    /// Returns `Err` when TappRegistry isn't wired in the chain client
-    /// — the attestor requires it to be configured.
-    async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool>;
+    /// Live owner of this attestor's Tapp, used for administrative writes.
+    async fn tapp_app_owner(&self, _registry: Address, _app_id: &str) -> anyhow::Result<Address> {
+        anyhow::bail!("Tapp owner lookup not implemented")
+    }
+
+    /// EIP-1271 verification for contract-wallet owners. Implementations must
+    /// fail closed; the default never grants a contract signature.
+    async fn is_valid_contract_signature(
+        &self,
+        _owner: Address,
+        _digest: [u8; 32],
+        _signature: &[u8],
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 
     /// TappRegistry.isAcknowledged(user, appId) — whether `user` has acked
     /// `app_id` at its CURRENT ackVersion. Used by the deploy-edge
@@ -57,10 +63,8 @@ pub trait ChainClient: Send + Sync {
 
     /// ERC-7857 `intelligentDatasOf(agentId)` view. Returns the on-chain
     /// (description, dataHash) list. Used by indexer reconstruction.
-    async fn intelligent_datas_of(
-        &self,
-        agent_id: AgentId,
-    ) -> anyhow::Result<Vec<IntelligentData>>;
+    async fn intelligent_datas_of(&self, agent_id: AgentId)
+        -> anyhow::Result<Vec<IntelligentData>>;
 
     /// ERC-7857 `sealedKeysOf(agentId)` view — the per-iData sealed data
     /// keys (ECIES to the agent's agentSeal), in the same order as
@@ -99,16 +103,18 @@ pub trait ChainClient: Send + Sync {
     /// from current data and resubmit).
     async fn clone_from(&self, params: CloneFromParams) -> anyhow::Result<TxHash>;
 
+    /// VerifiedFeedbackRegistry `getIdentityRegistry()` on `registry` — the
+    /// AgenticID that registry verifies ServeProofs against. Read once at
+    /// startup (`chain::check_verified_feedback_anchor`). An address with no
+    /// code, or a call that reverts, is an `Err`.
+    async fn identity_registry_of(&self, registry: Address) -> anyhow::Result<Address>;
+
     /// ERC-8004 `setAgentURI(agentId, uri)`. AgenticID has authorized
     /// trusted attestors to call this, so the attestor EOA can write the
     /// AgentCard URL after OSS upload without going through the owner.
     /// Two-phase deploy: mint with empty URI first, fill via this call
     /// once the canonical AgentCard JSON is uploaded.
-    async fn set_agent_uri(
-        &self,
-        agent_id: AgentId,
-        uri: String,
-    ) -> anyhow::Result<TxHash>;
+    async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash>;
 }
 
 // ── Crypto ──────────────────────────────────────────────────────────────
@@ -133,15 +139,7 @@ pub trait CryptoModule: Send + Sync {
     fn random_key_32(&self) -> [u8; 32];
     fn keccak256(&self, data: &[u8]) -> [u8; 32];
 
-    /// HMAC-SHA256 over `data` with a binding key derived per `info` from
-    /// the app-scoped KMS key via HKDF (`HKDF(app_key, info) → key`,
-    /// then `HMAC-SHA256(key, data) → 32 bytes`). `info` is a domain
-    /// separator string so the same master secret can back independent
-    /// MACs (`"agentic-id.container-pubkey-binding.v1"` etc.) without
-    /// cross-protocol attacks.
-    fn hmac_binding(&self, info: &[u8], data: &[u8]) -> [u8; 32];
-
-    /// Recover signer from (eth personal_sign digest, 65-byte signature).
+    /// Recover signer from a 32-byte prehash and a 65-byte signature.
     fn recover_signer(&self, digest: &[u8; 32], signature: &[u8]) -> anyhow::Result<Address>;
 }
 
@@ -164,6 +162,23 @@ pub trait StorageClient: Send + Sync {
 // ── Sandbox ─────────────────────────────────────────────────────────────
 #[async_trait]
 pub trait SandboxClient: Send + Sync {
+    /// The latest provider-signed attestor TLS statement, relayed
+    /// byte-identical for sealed. Clients without a relay have none.
+    async fn attestor_tls_statement(
+        &self,
+        _provider: Address,
+    ) -> Result<Bytes, crate::attestor_tls::RelayError> {
+        Err(crate::attestor_tls::RelayError::Unavailable)
+    }
+    /// Full authenticated issuer scope used by workload attestations. Explicit
+    /// mocks must configure it; the default never authorizes an arbitrary key.
+    async fn authenticated_service_identity(&self) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
+        Ok(None)
+    }
+    /// Current authenticated connection metadata; mock implementations may omit it.
+    async fn service_identity(&self) -> anyhow::Result<Option<(Address, String)>> {
+        Ok(None)
+    }
     /// Create a new sandbox container for `seal_id`. The user-signed
     /// `envelope` (action="create") is relayed as the three X-Wallet-*
     /// headers. Returns sandbox's id + lifecycle state so callers can
@@ -173,24 +188,17 @@ pub trait SandboxClient: Send + Sync {
         &self,
         seal_id: SealId,
         envelope: &SandboxEnvelope,
+        boot_ticket: Option<&str>,
     ) -> anyhow::Result<SandboxCreateResponse>;
 
     /// Resume a previously stopped sandbox. Envelope action="start",
     /// resource_id=<sandbox_id>. Sandbox's HTTP path is
     /// `POST /api/sandbox/:id/start` with empty body.
-    async fn start(
-        &self,
-        seal_id: SealId,
-        envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()>;
+    async fn start(&self, seal_id: SealId, envelope: &SandboxEnvelope) -> anyhow::Result<()>;
 
     /// Stop a running sandbox. Envelope action="stop",
     /// resource_id=<sandbox_id>. Sandbox path: `POST /api/sandbox/:id/stop`.
-    async fn stop(
-        &self,
-        seal_id: SealId,
-        envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()>;
+    async fn stop(&self, seal_id: SealId, envelope: &SandboxEnvelope) -> anyhow::Result<()>;
 
     /// Permanently destroy a sandbox using attestor admin auth (no
     /// owner-signed envelope). Used in two scenarios:
@@ -205,8 +213,10 @@ pub trait SandboxClient: Send + Sync {
     async fn admin_delete(&self, sandbox_id: &str) -> anyhow::Result<()>;
 
     /// Read-only sandbox lookup using attestor admin auth. Used by the
-    /// `/probe` route to verify a deployment marked Running actually
-    /// has a live container on the sandbox side.
+    /// `/probe` route and the worker's heartbeat sweep to verify a
+    /// deployment marked Running actually has a live container on the
+    /// sandbox side, and by the worker's start/stop jobs to check the
+    /// provider's state before a no-op and after a failed call.
     /// - `Ok(Some(info))` → sandbox exists; `info.state` is sandbox's
     ///   current lifecycle state ("started", "stopped", "archived", …).
     /// - `Ok(None)`       → sandbox 404 (gone). Caller should flip the
@@ -232,50 +242,63 @@ pub trait DeploymentRepo: Send + Sync {
     async fn set_mint_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()>;
     async fn set_container_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()>;
 
+    /// A reconciler's verdict (the heartbeat sweep, `/probe`): apply `stage`
+    /// only while the row is still what the reconciler inspected, i.e. the
+    /// same `sandbox_id`, a container stage whose state tag is
+    /// `expected_state`, and, with `stale_before`, a last heartbeat older
+    /// than that. A lifecycle job that moved the row on in the meantime (a
+    /// reset onto a new sandbox, a resume) keeps it. Stopped and Failed
+    /// revoke the boot binding as `set_container_stage` does. Returns whether
+    /// the stage was applied.
+    async fn set_container_stage_if(
+        &self,
+        seal_id: SealId,
+        sandbox_id: &str,
+        expected_state: &str,
+        stale_before: Option<chrono::DateTime<chrono::Utc>>,
+        stage: StageStatus,
+    ) -> anyhow::Result<bool>;
+
     /// Reset the container track after the sandbox is torn down on ownership
     /// transfer: container_stage → NotStarted, sandbox_id → NULL,
     /// provisioned_at → NULL. With storage + mint still Confirmed this yields
+    /// With expected_sandbox, return false if a newer sandbox or authorized
+    /// create replaced it. No newer generation may be revoked by stale cleanup.
     /// phase `Ready` ("provisioned on chain + storage, no running container —
     /// the new owner brings it online via a fresh deploy"), rather than
     /// `Stopped` (implies resumable; the sandbox is deleted) or `Failed`
     /// (implies a crash). Recomputes + persists phase.
-    async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()>;
+    async fn reset_container_track(
+        &self,
+        seal_id: SealId,
+        expected_sandbox: Option<&str>,
+    ) -> anyhow::Result<bool>;
 
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()>;
 
     /// Update the recorded framework (reset/first-start harness switch).
     async fn set_framework(&self, seal_id: SealId, framework: String) -> anyhow::Result<()>;
 
-    /// Persist 0g-sandbox's resource id after container track submits.
-    async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()>;
-
-    /// Persist the container's `(pubkey, mac)` pair on first /provision.
-    /// `mac` is `HMAC(binding_key, seal_id || pubkey)` — the binding_key
-    /// lives only in attestor memory (HKDF from master secret), so DB
-    /// tampering is detectable at verify time.
-    async fn set_container_binding(
+    /// Persist 0g-sandbox's resource id after container track submits, with
+    /// the container key the provider certified for it. Both are bound to
+    /// the enabled boot authorization: its first provision must come from
+    /// this sandbox's container.
+    async fn set_sandbox_id(
         &self,
         seal_id: SealId,
-        pubkey: Vec<u8>,
-        mac: Vec<u8>,
+        sandbox_id: String,
+        container_pubkey: Option<Vec<u8>>,
     ) -> anyhow::Result<()>;
 
-    /// Clear the container `(pubkey, mac)` binding, keyed by agent_id.
-    /// Called on ownership transfer: the inherited binding is what lets a
-    /// resumed container skip the attestation freshness window, so dropping
-    /// it forces the next /provision to re-establish a binding via a fresh
-    /// attestation. A stale prior owner's container (reused SANDBOX_SEAL_KEY,
-    /// old `issued_at`) then fails freshness and cannot re-provision.
-    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()>;
-
-    /// Stamp the deployment row when `POST /provision` succeeds — proves
-    /// the container authenticated via sandbox attestation and received
-    /// its encrypted `agentSeal_priv`.
-    async fn mark_provisioned(
+    /// Revoke the prior owner's binding and container record, preserving an
+    /// authorized boot that belongs to the live chain owner. Return the
+    /// captured old sandbox to clean up; never resolve a queued teardown to a
+    /// later sandbox ID.
+    async fn clear_container_binding(
         &self,
-        seal_id: SealId,
-        at: chrono::DateTime<chrono::Utc>,
-    ) -> anyhow::Result<()>;
+        agent_id: AgentId,
+        live_owner: Address,
+    ) -> anyhow::Result<Option<String>>;
 
     async fn set_owner(&self, agent_id: AgentId, new_owner: Address) -> anyhow::Result<()>;
 
@@ -346,21 +369,29 @@ pub trait DeploymentRepo: Send + Sync {
     ) -> anyhow::Result<()>;
 
     /// Record a `/provision` validation failure for visibility. When
-    /// `mark_failed` is true, ALSO flip `container_stage` to Failed
-    /// (use for permanent errors like wrong image_hash, signer
-    /// mismatch, malformed pubkey — anything that won't fix on
-    /// container retry). Atomic with the stage update.
+    /// `mark_failed` is true, ALSO flip `container_stage` to Failed and
+    /// clear the provision deadline (use for permanent errors like wrong
+    /// image_hash, signer mismatch, malformed pubkey — anything that won't
+    /// fix on container retry). Atomic with the stage update.
+    ///
+    /// `generation`: the boot generation the rejected request was
+    /// authorized under. The row is left alone unless that generation is
+    /// still the enabled one, so a late rejection cannot overwrite a reset
+    /// or stop that happened meanwhile. `None` records unconditionally.
+    /// Returns whether the row was written.
     async fn record_provision_error(
         &self,
         seal_id: SealId,
         reason: String,
         mark_failed: bool,
-    ) -> anyhow::Result<()>;
+        generation: Option<i64>,
+    ) -> anyhow::Result<bool>;
 
     /// Atomically flip every deployment whose `provision_deadline` has
     /// passed AND whose `container_stage` is still `Submitted` to
-    /// `Failed { reason }`. Returns the affected `seal_id`s so the
-    /// caller can publish `WsEvent::ContainerFailed`.
+    /// `Failed { reason }`, clearing the spent deadline. Returns the
+    /// affected `seal_id`s so the caller can publish
+    /// `WsEvent::ContainerFailed`.
     ///
     /// Used by the worker sweep loop to convert "container never
     /// reached /provision" silent stuck-state into an observable
@@ -427,6 +458,59 @@ pub trait DeploymentRepo: Send + Sync {
         base_version: i64,
     ) -> anyhow::Result<Option<i64>>;
 
+    /// An owner-authorized fresh sandbox retries the current unconfirmed
+    /// document before falling back. Reset only the boot counter, preserving
+    /// content, versions and last-known-good. The expected version prevents
+    /// resetting another revision's attempts during a concurrent settings write.
+    async fn retry_settings(&self, seal_id: SealId, version: i64) -> anyhow::Result<bool>;
+
+    /// Start an owner-authorized generation. Some(ticket) creates a new
+    /// sandbox: it stamps `ticket_issued_at` and clears the container record,
+    /// so the new container must present a certificate, and the last
+    /// `/provision` rejection, which was about the old one. None resumes the
+    /// existing ticket and keeps the record; it returns None when no ticket
+    /// was ever issued. Both clear the last status report, which described
+    /// an earlier boot.
+    async fn prepare_status_boot(
+        &self,
+        seal_id: SealId,
+        ticket: Option<[u8; 32]>,
+        owner: Address,
+    ) -> anyhow::Result<Option<i64>>;
+    async fn boot_authorization(
+        &self,
+        seal_id: SealId,
+    ) -> anyhow::Result<Option<crate::auth::status::BootAuthorization>>;
+    /// In one transaction: compare-and-set the boot claim (enabled,
+    /// generation, ticket, strictly newer `started_at`, persisted sandbox),
+    /// install the status token hash and the served settings, write
+    /// `record` unless an identical one is already recorded, and clear the
+    /// last `/provision` rejection and status report. A different
+    /// recorded container, or any failed compare, returns false and writes
+    /// nothing.
+    async fn bind_status_boot(
+        &self,
+        seal_id: SealId,
+        record: &ContainerRecord,
+        token_hash: [u8; 32],
+        served: Option<crate::auth::status::ServedSettings>,
+        claim: &crate::auth::status::BootClaim,
+    ) -> anyhow::Result<bool>;
+    /// Apply liveness/stage only while `token_hash` is the current boot's
+    /// token and a sandbox is still tracked. `applied_digest` (a running or
+    /// warning report's applied settings) confirms the current settings
+    /// version only when it equals the digest that boot was served.
+    /// `status` (the report's level and reason) is kept as the row's
+    /// `container_status` in the same write.
+    async fn apply_status_report(
+        &self,
+        seal_id: SealId,
+        token_hash: [u8; 32],
+        stage: StageStatus,
+        applied_digest: Option<B256>,
+        status: &ContainerStatus,
+    ) -> anyhow::Result<bool>;
+
     /// Write a document ONLY onto a row that has never had one — the
     /// container-seeded recovery path (`POST /settings/seed`), which is
     /// agentSeal-signed and so must never be able to overwrite what an owner
@@ -441,6 +525,8 @@ pub trait DeploymentRepo: Send + Sync {
         settings: serde_json::Value,
     ) -> anyhow::Result<Option<i64>>;
 
+    /// Counter-based fixture helper. Runtime reports MUST use
+    /// `apply_status_report` with the current status token instead.
     /// Promote `settings` to last-known-good: a container reported `running`
     /// on it.
     ///
@@ -469,21 +555,68 @@ pub trait DeploymentRepo: Send + Sync {
     /// Count one boot served the current unconfirmed document and return the
     /// new attempt count. Bumps only while
     /// `settings_version > settings_confirmed_version` (re-checked in the
-    /// statement, so it is atomic against a concurrent promotion); returns
+    /// statement, so it is atomic against a concurrent promotion), and only
+    /// for the expected document version and authorized generation; returns
     /// `None` when the document is already confirmed and nothing was
     /// counted. `/provision` uses the count to decide whether this boot gets
     /// the new document (first attempt) or the last one that worked.
-    async fn note_settings_attempt(&self, seal_id: SealId) -> anyhow::Result<Option<i32>>;
+    ///
+    /// `boot` is the claiming container's boot ID. A request from the boot
+    /// that made the last counted attempt (a retried `/provision`) is not
+    /// counted again: it gets the current count back, so it is served the
+    /// same document. `None` always counts.
+    async fn note_settings_attempt(
+        &self,
+        seal_id: SealId,
+        version: i64,
+        generation: Option<i64>,
+        boot: Option<B256>,
+    ) -> anyhow::Result<Option<i32>>;
+
+    /// Settle the stages an abandoned job (`ReapCause::Abandoned`) left in
+    /// flight, in one transaction:
+    ///   - storage `Submitted` → `Failed`, so `/retry` re-uploads;
+    ///   - with `starts_identity` (`JobPayload::starts_identity`), storage
+    ///     and mint `NotStarted` → `Failed`: nothing else starts them;
+    ///   - container `Submitted` without a provision deadline gets
+    ///     `container_deadline`, under the same condition as
+    ///     `set_provision_deadline`, leaving the outcome to the
+    ///     provision-timeout sweep (the container may still provision).
+    /// Mint `Submitted` is left alone: its transaction may have landed, and
+    /// `/retry` reconciles it by receipt. Every other stage is untouched.
+    async fn resolve_abandoned_stages(
+        &self,
+        seal_id: SealId,
+        starts_identity: bool,
+        reason: String,
+        now: chrono::DateTime<chrono::Utc>,
+        container_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<AbandonedStages>;
 
     /// Read-only: running deployments whose last heartbeat is older than
-    /// `now - threshold_secs`. Returns `(seal_id, sandbox_id)` so the caller
-    /// (the worker's reconcile sweep) can check each sandbox's real state and
-    /// decide Stopped vs Failed vs reap — instead of blindly flipping Failed.
+    /// `now - threshold_secs`, so the caller (the worker's reconcile sweep)
+    /// can check each sandbox's real state and decide Stopped vs Failed vs
+    /// reap — instead of blindly flipping Failed.
     async fn stale_running_candidates(
         &self,
         now: chrono::DateTime<chrono::Utc>,
         threshold_secs: i64,
-    ) -> anyhow::Result<Vec<(SealId, Option<String>)>>;
+    ) -> anyhow::Result<Vec<StaleRunner>>;
+}
+
+/// A running deployment whose last heartbeat is older than the staleness
+/// window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRunner {
+    pub seal_id: SealId,
+    pub sandbox_id: Option<String>,
+    /// Whether the current container completed a 1.4 provision (the row
+    /// holds its container record), so it holds a status token and a silent
+    /// heartbeat means it stopped reporting. False for a container created
+    /// before 1.4, whose reports the attestor refuses, and after an
+    /// ownership change revoked the container: such a heartbeat is stale
+    /// whether or not the agent is alive.
+    pub can_report: bool,
 }
 
 // ── Idempotency ─────────────────────────────────────────────────────────
@@ -500,12 +633,34 @@ pub trait IdempotencyStore: Send + Sync {
 pub trait JobQueue: Send + Sync {
     async fn submit(&self, payload: JobPayload) -> anyhow::Result<JobId>;
     async fn claim_next(&self, worker_id: &str) -> anyhow::Result<Option<(JobId, JobPayload)>>;
+    /// Mark a running job done. A job that is no longer running (the reaper
+    /// failed it) keeps its status.
     async fn complete(&self, job_id: JobId) -> anyhow::Result<()>;
+    /// Mark a running job failed. A job that is no longer running keeps its
+    /// status and error.
     async fn fail(&self, job_id: JobId, error: &str) -> anyhow::Result<()>;
 
     /// Permanently delete done/failed jobs whose `completed_at` is older
     /// than `older_than_secs`. Returns the number of rows deleted.
     async fn sweep_expired(&self, older_than_secs: i64) -> anyhow::Result<u64>;
+
+    /// Refresh the liveness stamp of a running job. The worker calls it on
+    /// a fixed interval for as long as the job executes. `false`: the job is
+    /// no longer running (the reaper failed it), so the worker stops it.
+    async fn heartbeat(&self, job_id: JobId) -> anyhow::Result<bool>;
+
+    /// Mark failed, without requeueing, every running job whose liveness
+    /// stamp is older than `abandoned_after_secs` (`ReapCause::Abandoned`)
+    /// and every pending job whose owner envelope has expired or is about to
+    /// (`ReapCause::Expired`; the claim skips those), clearing payloads.
+    /// Returns those jobs plus every job reaped earlier whose settlement was
+    /// not recorded with `mark_reap_settled`, so a settlement that failed, or
+    /// was cut short by a worker exit, is retried on the next sweep.
+    async fn reap(&self, abandoned_after_secs: i64) -> anyhow::Result<Vec<ReapedJob>>;
+
+    /// Record that a reaped job's follow-up ran. Until then `reap` returns
+    /// the job again and the retention sweep keeps its row.
+    async fn mark_reap_settled(&self, job_id: JobId) -> anyhow::Result<()>;
 }
 
 // ── Event bus (Postgres LISTEN/NOTIFY backed) ──────────────────────────

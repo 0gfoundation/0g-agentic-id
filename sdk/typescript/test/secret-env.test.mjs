@@ -205,6 +205,69 @@ test('sealSecretEnv rejects a value that is not a curve point', () => {
   assert.throws(() => sealSecretEnv('0x02' + '00'.repeat(32), OWNER, { API_KEY: KEY }));
 });
 
+test('v2 secret env binds the inference provider inside the ciphertext', () => {
+  assert.deepEqual(openSecretEnv(sealSecretEnv(SEAL_PUB,OWNER,{ API_KEY:KEY },'openai')), {
+    v:2,owner:getAddress(OWNER),provider:'openai',env:{ API_KEY:KEY },
+  });
+  assert.throws(() => sealSecretEnv(SEAL_PUB,OWNER,{ API_KEY:KEY },'https://wrong.example'),/provider/);
+});
+
+const BOUND_CONFIG = {
+  sandbox_snapshot:'new-sealed',secret_env_scheme:SECRET_ENV_SCHEME,
+  inference_capabilities:[{ image:'new-sealed',providers:['0g-compute','openai','anthropic'],secret_env_versions:[1,2] }],
+};
+
+for (const op of ['start','reset','retry']) {
+  test(`${op} sends only a provider-bound sealed key for a non-compute provider`, async () => {
+    await withAttestor({ config:BOUND_CONFIG },async(a)=>{
+      const { c,signed } = client(a.port);
+      const params = { sealId:SEAL_ID,provider:'openai',apiKey:KEY };
+      if (op === 'retry') await c.retry(params); else await c.lifecycle(op,params);
+      assert.equal(a.posts.length,1);
+      const envelope = JSON.parse(Buffer.from(a.posts[0].body.sandbox_envelope.signed_message_b64, 'base64').toString());
+      assert.deepEqual(Object.keys(envelope.payload.env),[SECRET_ENV_VAR]);
+      assert.equal(openSecretEnv(envelope.payload.env[SECRET_ENV_VAR]).provider,'openai');
+      assert.equal(openSecretEnv(envelope.payload.env[SECRET_ENV_VAR]).v,2);
+      assert.ok(signed.every((message)=>!message.includes(KEY)));
+    });
+  });
+}
+
+test('provider binding refuses an old or different image before any owner signature', async () => {
+  for (const config of [
+    { sandbox_snapshot:'new-sealed',secret_env_scheme:SECRET_ENV_SCHEME },
+    { ...BOUND_CONFIG,sandbox_snapshot:'old-sealed' },
+  ]) {
+    await withAttestor({ config },async(a)=>{
+      const { c,signed } = client(a.port);
+      await assert.rejects(c.lifecycle('reset',{ sealId:SEAL_ID,provider:'openai',apiKey:KEY }),
+        (error)=>error.code === 'provider_binding_unsupported');
+      assert.equal(signed.length,0);
+      assert.equal(a.posts.length,0);
+    });
+  }
+});
+
+test('a capability disappearing mid-call cannot downgrade a non-compute key to plaintext', async () => {
+  let reads=0;
+  await withAttestor({ config:()=>++reads < 3 ? BOUND_CONFIG : { sandbox_snapshot:'new-sealed' } },async(a)=>{
+    const { c,signed } = client(a.port);
+    await assert.rejects(c.lifecycle('reset',{ sealId:SEAL_ID,provider:'openai',apiKey:KEY }),SecretEnvRefusedError);
+    assert.equal(signed.length,0);
+    assert.equal(a.posts.length,0);
+  });
+});
+
+test('one-shot non-compute deploy refuses before signing because the agent key does not exist yet', async () => {
+  await withAttestor({ config:BOUND_CONFIG },async(a)=>{
+    const { c,signed } = client(a.port);
+    await assert.rejects(c.deploy({ name:'a',description:'b',inference:{ provider:'openai',model:'m' },sandbox:{ apiKey:KEY } }),
+      (error)=>error.code === 'sealed_needs_agent');
+    assert.equal(signed.length,0);
+    assert.equal(a.posts.length,0);
+  });
+});
+
 // ── 2. lifecycle calls seal the key ─────────────────────────────────────────
 
 for (const op of ['start', 'reset', 'retry']) {
@@ -501,7 +564,7 @@ test('a bare reset resolves the sealed image from the deployment row', async () 
   });
 });
 
-test('an explicit framework wins over the row, and no row read happens', async () => {
+test('an explicit framework wins over the row', async () => {
   const config = {
     sandbox_snapshot: '0g-sealed',
     secret_env_scheme: SECRET_ENV_SCHEME,
@@ -511,7 +574,8 @@ test('an explicit framework wins over the row, and no row read happens', async (
     const { c, signed } = client(a.port);
     await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY, framework: 'hermes' });
     assert.equal(JSON.parse(signed[0]).payload.snapshot, '0g-sealed-hermes');
-    assert.ok(!a.hits.some((h) => h.startsWith('/deployment/')), 'no row read when the caller chose');
+    // The row is still read, for the settings rule (default-settings tests),
+    // but its framework does not pick the image.
   });
 });
 
@@ -532,12 +596,64 @@ test('an unreadable deployment row refuses instead of defaulting the image', asy
   });
 });
 
+test('a row whose framework /config does not offer refuses instead of defaulting the image', async () => {
+  const config = {
+    sandbox_snapshot: '0g-sealed',
+    secret_env_scheme: SECRET_ENV_SCHEME,
+    frameworks: [{ name: 'openclaw' }, { name: 'dsh', image: '0g-sealed-dsh' }],
+  };
+  await withAttestor({ config, rowFramework: '0g-harness' }, async (a) => {
+    const { c, signed } = client(a.port);
+    await assert.rejects(
+      c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY }),
+      /framework "0g-harness" is not offered by this attestor/,
+    );
+    assert.equal(signed.length, 0, 'nothing was signed');
+  });
+});
+
 test('a row with no framework still gets the default image', async () => {
   const config = { sandbox_snapshot: '0g-sealed', secret_env_scheme: SECRET_ENV_SCHEME };
   await withAttestor({ config, rowFramework: null }, async (a) => {
     const { c, signed } = client(a.port);
     await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY });
     assert.equal(JSON.parse(signed[0]).payload.snapshot, '0g-sealed');
+  });
+});
+
+// A deploy with the caller's own iData signs the image of the framework that
+// iData binds, not the default (openclaw) snapshot.
+const HERMES_IDATA = [
+  { role: 'framework', plaintext: { name: 'hermes', schema_version: 1 }, extra: {} },
+  { role: 'persona', plaintext: { system_prompt: 'x', inference: { provider: '0g-compute', model: 'm' } }, extra: {} },
+];
+const HERMES_CONFIG = {
+  sandbox_snapshot: '0g-sealed',
+  secret_env_scheme: SECRET_ENV_SCHEME,
+  frameworks: [{ name: 'openclaw' }, { name: 'hermes', image: '0g-sealed-hermes' }],
+};
+
+test("a deploy with its own iData signs the image of the iData's framework", async () => {
+  await withAttestor({ config: HERMES_CONFIG }, async (a) => {
+    const { c, signed } = client(a.port);
+    await c.deploy({ name: 'n', description: 'd', iData: HERMES_IDATA, sandbox: { apiKey: KEY } });
+    assert.equal(signed.length, 2, 'deploy canonical + create envelope');
+    assert.equal(JSON.parse(signed[1]).payload.snapshot, '0g-sealed-hermes');
+    // The same name passed as `framework` agrees and changes nothing.
+    await c.deploy({ name: 'n', description: 'd', iData: HERMES_IDATA, framework: 'hermes', sandbox: { apiKey: KEY } });
+    assert.equal(JSON.parse(signed[3]).payload.snapshot, '0g-sealed-hermes');
+  });
+});
+
+test("a deploy whose framework disagrees with its iData's binding is refused before signing", async () => {
+  await withAttestor({ config: HERMES_CONFIG }, async (a) => {
+    const { c, signed } = client(a.port);
+    await assert.rejects(
+      c.deploy({ name: 'n', description: 'd', iData: HERMES_IDATA, framework: 'openclaw', sandbox: { apiKey: KEY } }),
+      /framework "openclaw" disagrees with the iData's framework binding "hermes"/,
+    );
+    assert.equal(signed.length, 0, 'nothing was signed');
+    assert.equal(a.posts.length, 0);
   });
 });
 
@@ -652,6 +768,19 @@ test('sealedSecretEnv refuses conflicting inputs and values that are not a seale
     // Base64 of something that is not ECIES output.
     const notEcies = Buffer.from('x'.repeat(200)).toString('base64');
     await assert.rejects(c.lifecycle('reset', { sealId: SEAL_ID, sealedSecretEnv: notEcies }), refused('invalid_sealed_secret_env'));
+    assert.equal(signed.length, 0);
+    assert.equal(a.posts.length, 0);
+  });
+});
+
+
+test('non-compute recreation refuses a missing bound key before signing or submitting', async () => {
+  await withAttestor({}, async (a) => {
+    const { c, signed } = client(a.port);
+    for (const op of ['start', 'reset', 'retry']) {
+      const params = { sealId: SEAL_ID, provider: 'openai' };
+      await assert.rejects(op === 'retry' ? c.retry(params) : c.lifecycle(op, params), refused('invalid_input'));
+    }
     assert.equal(signed.length, 0);
     assert.equal(a.posts.length, 0);
   });

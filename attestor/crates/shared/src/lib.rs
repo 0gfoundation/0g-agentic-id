@@ -1,6 +1,7 @@
 //! Shared types, traits, implementations for the Attestor backend.
 
 pub mod agent_card;
+pub mod attestor_tls;
 pub mod auth;
 pub mod avatar;
 pub mod chain;
@@ -10,10 +11,15 @@ pub mod error;
 pub mod events;
 pub mod events_bus;
 pub mod i_data_validate;
+pub mod identity;
+pub mod image_attestation;
 pub mod jobs;
 pub mod kms;
 pub mod mocks;
+pub mod nonce_submit;
 pub mod oss;
+pub mod provider_registry;
+pub mod pinned_tls;
 pub mod repo;
 pub mod retry;
 pub mod sandbox;
@@ -28,7 +34,7 @@ pub use error::{AttestorError, Result};
 pub use events::WsEvent;
 pub use traits::{
     ChainClient, CryptoModule, DeploymentRepo, EventBus, EventSubscription, IdempotencyStore,
-    JobQueue, SandboxClient, StorageClient,
+    JobQueue, SandboxClient, StaleRunner, StorageClient,
 };
 pub use types::*;
 

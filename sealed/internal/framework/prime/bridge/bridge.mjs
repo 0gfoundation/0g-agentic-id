@@ -680,7 +680,7 @@ async function runTurn(session, text, onDelta, onActivity) {
 			}
 			// A non-text message_update is the model THINKING (reasoning deltas —
 			// prime's reasoning-capable models emit these before any answer). Like
-			// dsh, surface it as a throttled "thinking" activity so a long silent
+			// 0g-harness, surface it as a throttled "thinking" activity so a long silent
 			// pre-answer phase isn't mistaken for a hang. Throttle: reasoning
 			// fires many deltas/sec.
 			if (e && onActivity && /reason|think/i.test(e.type || "")) {
@@ -832,7 +832,7 @@ async function handleChat(req, res) {
 						// Also ride the chat stream as an SSE COMMENT so the owner's
 						// CLI can render a ⚙ status line — a prime turn is mostly
 						// silent (thinking, tools, subagents) and an un-narrated
-						// stream looks dead. Mirrors the dsh bridge's `: activity`.
+						// stream looks dead. Mirrors 0g-harness's `: activity`.
 						// SSE comments are ignored by any spec-compliant client that
 						// doesn't opt in, so this is backward-safe.
 						safeWrite(`: activity ${line}\n\n`);

@@ -305,6 +305,33 @@ func (c *Client) Update(
 	return signed.Hash(), nil
 }
 
+// getIdentityRegistrySelector is VerifiedFeedbackRegistry.getIdentityRegistry()
+// — the AgenticID (identity registry) the registry verifies serve-proofs
+// against.
+var getIdentityRegistrySelector = crypto.Keccak256([]byte("getIdentityRegistry()"))[:4]
+
+// IdentityRegistryOf reads getIdentityRegistry() from the
+// VerifiedFeedbackRegistry at validator. An address with no code, a reverted
+// call or a return that is not one ABI-encoded address is an error — the
+// caller then treats the validator as unanchored.
+func (c *Client) IdentityRegistryOf(ctx context.Context, validator common.Address) (common.Address, error) {
+	code, err := c.eth.CodeAt(ctx, validator, nil)
+	if err != nil {
+		return common.Address{}, fmt.Errorf("getCode(%s): %w", validator.Hex(), err)
+	}
+	if len(code) == 0 {
+		return common.Address{}, fmt.Errorf("no contract code at %s", validator.Hex())
+	}
+	out, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &validator, Data: getIdentityRegistrySelector}, nil)
+	if err != nil {
+		return common.Address{}, fmt.Errorf("getIdentityRegistry() on %s: %w", validator.Hex(), err)
+	}
+	if len(out) != 32 || new(big.Int).SetBytes(out[:12]).Sign() != 0 {
+		return common.Address{}, fmt.Errorf("getIdentityRegistry() on %s: return is not an address (%d bytes)", validator.Hex(), len(out))
+	}
+	return common.BytesToAddress(out[12:]), nil
+}
+
 // HexSealID parses a hex-encoded (with or without 0x prefix) seal_id to a
 // fixed-size [32]byte. Convenience helper used at startup.
 func HexSealID(s string) ([32]byte, error) {

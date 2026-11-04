@@ -36,6 +36,15 @@ type ServiceEntry struct {
 	Description  string `json:"description,omitempty"`   // one short sentence
 	InputExample string `json:"input_example,omitempty"` // literal JSON body, if any
 	Backend      string `json:"backend"`                 // loopback upstream: http://127.0.0.1:<port>
+	// Transport marks the service's protocol for consumers. Empty (the
+	// default) = a plain HTTP endpoint. "mcp" = an MCP server endpoint: the
+	// backend speaks the MCP streamable-HTTP protocol (JSON-RPC over POST),
+	// so an MCP-capable client can mount <public-url><path> as an MCP server
+	// and the agent's tools become the client's tools. MCP routes must be
+	// POST: the proxy pins one method per path, and POST is the protocol's
+	// workhorse (a stateless server never needs the optional GET SSE
+	// channel, which the one-method pin could not serve anyway).
+	Transport string `json:"transport,omitempty"` // "" (plain HTTP) | "mcp"
 }
 
 // reservedPrefixes are platform-owned paths an agent service may not shadow.
@@ -79,6 +88,18 @@ func validateServices(in []ServiceEntry) ([]ServiceEntry, error) {
 		}
 		if e.InputExample != "" && !json.Valid([]byte(e.InputExample)) {
 			return nil, fmt.Errorf("services[%d].input_example is not valid JSON", i)
+		}
+		switch e.Transport {
+		case "":
+		case "mcp":
+			// The one-method-per-path pin meets MCP's POST workhorse: a
+			// non-POST MCP route would be unauditable on arrival (405 on
+			// every JSON-RPC request).
+			if m != http.MethodPost {
+				return nil, fmt.Errorf("services[%d].transport %q requires method POST, got %q", i, e.Transport, m)
+			}
+		default:
+			return nil, fmt.Errorf("services[%d].transport %q is not a known transport (\"\" or \"mcp\")", i, e.Transport)
 		}
 		out = append(out, e)
 	}
@@ -142,6 +163,7 @@ func servicesForHello(entries []ServiceEntry) []report.Service {
 			Method:       e.Method,
 			Description:  e.Description,
 			InputExample: e.InputExample,
+			Transport:    e.Transport,
 		})
 	}
 	return out

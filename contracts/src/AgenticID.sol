@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 import {IAgenticID} from "./interfaces/IAgenticID.sol";
 import {IERC8004IdentityRegistry, MetadataEntry} from "./interfaces/IERC8004IdentityRegistry.sol";
@@ -16,6 +16,14 @@ import {ERC8004CanonicalBoundUpgradeable} from "./ERC8004CanonicalBoundUpgradeab
 import {ERC7857IDataStorageUpgradeable} from "./extensions/ERC7857IDataStorageUpgradeable.sol";
 import {ERC7857AuthorizeUpgradeable} from "./extensions/ERC7857AuthorizeUpgradeable.sol";
 import {ERC7857CloneableUpgradeable} from "./extensions/ERC7857CloneableUpgradeable.sol";
+import {
+    AttestorAppBinding,
+    AttestorAppBindingLib,
+    IAttestorAppBindingErrors,
+    IAttestorAppRegistry,
+    AgenticIDInvalidAttestorBinding,
+    AgenticIDAppInstanceMismatch
+} from "./AttestorAppBindingLib.sol";
 
 /// @notice Caller is not a trusted attestor.
 error AgenticIDNotTrustedAttestor();
@@ -25,6 +33,11 @@ error AgenticIDSealIdTaken(bytes32 sealId, uint256 existingAgentId);
 
 /// @notice The agent already has an agentSeal set. Seals are one-time bindings.
 error AgenticIDSealAlreadySet(uint256 agentId);
+
+/// @notice The agentSeal address is already bound to another agent. One seal
+///         per agent: a shared seal could update both agents' iData and sign
+///         ServeProofs for both (audit FIND-08).
+error AgenticIDAgentSealTaken(address agentSeal);
 
 /// @notice agentSeal or sealId is the zero value. Both must be non-zero.
 error AgenticIDZeroSeal();
@@ -36,6 +49,9 @@ error AgenticIDUseRegisterWithData();
 
 /// @notice Caller is not the pauser.
 error AgenticIDNotPauser();
+
+/// @notice An owner setter was given the zero address (setVerifier).
+error AgenticIDZeroAddress();
 
 /// @notice update / updateAt was called by an address that is not
 ///         the agent's bound agentSeal. Once a seal is bound, iData
@@ -86,6 +102,14 @@ error AgenticIDCannotCloneSealedAgent(uint256 agentId);
 ///      this contract custodies the canonical token and assigns agentId from the
 ///      canonical global counter (see {ERC8004CanonicalBoundUpgradeable}).
 ///
+///      Ownership is two-step (Ownable2StepUpgradeable, since 1.2.0): the
+///      owner proposes with transferOwnership and the new owner must
+///      acceptOwnership, so a mistyped address can't strand the admin
+///      surface. Owner calls are direct (not timelocked); only beacon
+///      upgrades go through the Timelock. The linked 1.3.0 build sits 33 B
+///      under EIP-170 (test/Eip170Size.t.sol) — measure
+///      `forge build --sizes --skip test --skip script` on any change.
+///
 ///      agentSeal / sealId are one-time bindings per agentId and persist across
 ///      transfers. _update only needs to exist for diamond disambiguation:
 ///        AgenticID (no-op)
@@ -98,7 +122,8 @@ contract AgenticID is
     ERC7857IDataStorageUpgradeable,
     ERC7857AuthorizeUpgradeable,
     ERC7857CloneableUpgradeable,
-    OwnableUpgradeable
+    Ownable2StepUpgradeable,
+    IAttestorAppBindingErrors
 {
     // ── Storage ───────────────────────────────────────────────────────────────
 
@@ -107,19 +132,55 @@ contract AgenticID is
         mapping(uint256 => address) agentSeals;
         mapping(uint256 => bytes32) agentIdToSealId;
         mapping(bytes32 => uint256) sealIdToAgentId;
-        mapping(address => bool)    trustedAttestors;
-        mapping(bytes32 => bool)    validFrameworkHashes;
-        address                     pauser;
+        mapping(address => bool) trustedAttestors;
+        mapping(bytes32 => bool) validFrameworkHashes;
+        address pauser;
         // Explicit existence bit for sealId bindings. Required because the
         // canonical registry numbers agentIds from 0 (and the live registry
         // already has an agentId 0 owned by a third party): sealIdToAgentId == 0
         // is ambiguous between "unbound" and "bound to agent 0", so uniqueness
         // and existence checks key off this flag instead of the zero sentinel.
         mapping(bytes32 => bool)    sealIdBound;
+        // Every agentSeal address bound since 1.2.0 (appended field — append-
+        // safe in this namespaced struct). Seals bound before the upgrade are
+        // not in the set; the attestor derives each seal from a fresh sealId,
+        // so those are distinct by construction.
+        mapping(address => bool)    agentSealBound;
+        // 1.3.0: append after every 1.2.0 field so an upgraded proxy retains
+        // the lifetime agentSeal binding map at its existing slot.
+        mapping(address => AttestorAppBinding) attestorAppBindings;
+        bool instanceBoundAttestorsRequired;
     }
 
     /// @notice Current implementation version. Bump on every upgrade.
-    /// @dev 1.1.0 — audit security fixes (beacon upgrade): iTransferFrom writes
+    /// @dev 1.3.0 — instance-bound stable attestors with one-way legacy migration.
+    ///      Append-only storage after the 1.2.0 lifetime agentSeal binding map.
+    ///      1.2.0 — governance hardening (beacon upgrade; audit FIND-12 /
+    ///      FIND-16): ownership becomes two-step (Ownable2StepUpgradeable —
+    ///      transferOwnership only proposes, the new owner must
+    ///      acceptOwnership; adds pendingOwner / acceptOwnership +
+    ///      OwnershipTransferStarted, pending owner kept in OZ's ERC-7201
+    ///      namespace, so no existing storage moves); setVerifier rejects
+    ///      address(0) (AgenticIDZeroAddress) and emits VerifierUpdated. ABI
+    ///      additions only. EIP-170: Ownable2Step + the setter guard cost
+    ///      ~400 B against 9 B of 1.1.0 headroom; folding register /
+    ///      registerWithSeal into the shared _mintWithData (same checks, same
+    ///      order, same events) pays for it. (The PR #145 "1.2.0" never
+    ///      reached chain — its impl exceeded EIP-170; this is a different
+    ///      build.) Audit Low fixes in the same build: transfer / clone
+    ///      proofs are token- and action-bound — _proofCheck passes (tokenId,
+    ///      from, isClone) to verifyTransferValidity, isClone read from
+    ///      msg.sig, whose selector changes, so this impl and
+    ///      TEEDataVerifier 1.2.0 must land in the same window (FIND-05); a
+    ///      bound agentSeal address cannot be bound to a second agent
+    ///      (AgenticIDAgentSealTaken; appended `agentSealBound` mapping —
+    ///      seals bound before the upgrade are not in it, FIND-08);
+    ///      setAgentURI / setMetadata / setAgentWallet revert while paused and
+    ///      revokeAuthorization / clearAuthorizedUsers no longer do (FIND-11);
+    ///      getMetadata / getAgentWallet revert for an agentId with no local
+    ///      token (FIND-14). One shared owner check (_requireAgentOwner) pays
+    ///      for these under EIP-170.
+    ///      1.1.0 — audit security fixes (beacon upgrade): iTransferFrom writes
     ///      sealed keys before the receiver callback and iTransferFrom/iCloneFrom
     ///      are nonReentrant, so a re-entrant receiver can't desync ownership from
     ///      the stored keys; the external setAgentSeal entrypoint is removed (a
@@ -127,9 +188,15 @@ contract AgenticID is
     ///      function) + new reentrancy-guard storage (ERC-7201 namespaced, no
     ///      collision); no existing storage layout change.
     ///      1.0.0 — initial.
-    string public constant VERSION = "1.1.0";
+    string public constant VERSION = "1.3.0";
+
+    event TrustedAttestorAppBound(
+        address indexed attestor, address indexed registry, string appId, uint256 registeredAt
+    );
+    event InstanceBoundAttestorsRequired();
 
     event PauserUpdated(address indexed previousPauser, address indexed newPauser);
+    event VerifierUpdated(address indexed previousVerifier, address indexed newVerifier);
 
     // keccak256(abi.encode(uint256(keccak256("0g.storage.AgenticID")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant AgenticIDStorageLocation =
@@ -166,8 +233,16 @@ contract AgenticID is
     // ── ERC-165 ───────────────────────────────────────────────────────────────
 
     function supportsInterface(bytes4 interfaceId)
-        public view virtual
-        override(IERC165, ERC8004CanonicalBoundUpgradeable, ERC7857IDataStorageUpgradeable, ERC7857AuthorizeUpgradeable, ERC7857CloneableUpgradeable)
+        public
+        view
+        virtual
+        override(
+            IERC165,
+            ERC8004CanonicalBoundUpgradeable,
+            ERC7857IDataStorageUpgradeable,
+            ERC7857AuthorizeUpgradeable,
+            ERC7857CloneableUpgradeable
+        )
         returns (bool)
     {
         return interfaceId == type(IAgenticID).interfaceId || super.supportsInterface(interfaceId);
@@ -187,7 +262,8 @@ contract AgenticID is
     // only via iTransferFrom, which atomically re-encrypts the dataKey to the buyer.
 
     function transferFrom(address from, address to, uint256 tokenId)
-        public virtual
+        public
+        virtual
         override(ERC7857Upgradeable, ERC721Upgradeable, IERC721)
         whenNotPaused
     {
@@ -199,19 +275,18 @@ contract AgenticID is
     }
 
     function safeTransferFrom(address from, address to, uint256 tokenId, bytes memory data)
-        public virtual
+        public
+        virtual
         override(ERC7857Upgradeable, ERC721Upgradeable, IERC721)
-        whenNotPaused
     {
-        if (_getAgenticIDStorage().agentSeals[tokenId] != address(0)) {
-            ERC721Upgradeable.safeTransferFrom(from, to, tokenId, data);
-        } else {
-            super.safeTransferFrom(from, to, tokenId, data);
-        }
+        // ERC721 dispatches through our virtual transferFrom, which owns
+        // the pause gate and seal/non-seal decision before the callback.
+        ERC721Upgradeable.safeTransferFrom(from, to, tokenId, data);
     }
 
     function iTransferFrom(address from, address to, uint256 tokenId, TransferValidityProof[] calldata proofs)
-        public virtual
+        public
+        virtual
         override(ERC7857Upgradeable, IERC7857)
         returns (SealedKeyEntry[] memory)
     {
@@ -222,7 +297,8 @@ contract AgenticID is
     }
 
     function iCloneFrom(address from, address to, uint256 tokenId, TransferValidityProof[] calldata proofs)
-        public virtual
+        public
+        virtual
         override(ERC7857CloneableUpgradeable)
         returns (uint256)
     {
@@ -233,32 +309,40 @@ contract AgenticID is
     }
 
     function tokenURI(uint256 tokenId)
-        public view virtual
+        public
+        view
+        virtual
         override(ERC8004CanonicalBoundUpgradeable, ERC721Upgradeable)
         returns (string memory)
     {
         return super.tokenURI(tokenId);
     }
 
+    /// @dev setAgentURI / setMetadata / setAgentWallet are blocked while
+    ///      paused, so a pause also freezes a compromised attestor's URI
+    ///      rewrites (audit FIND-11).
+    function _beforeCanonicalWrite() internal view override {
+        _requireNotPaused();
+    }
+
     /// @dev Allow trusted attestors to set the URI in addition to the token
     ///      owner. Deploy flow mints first (with empty URI), then the
     ///      attestor uploads the canonical AgentCard JSON to off-chain
     ///      storage and writes the resulting URL back via setAgentURI.
-    function _authorizeSetAgentURI(uint256 agentId)
-        internal view virtual
-        override(ERC8004CanonicalBoundUpgradeable)
-    {
+    function _authorizeSetAgentURI(uint256 agentId) internal view virtual override(ERC8004CanonicalBoundUpgradeable) {
         // The token must have a local counterpart before anyone — including a
         // trusted attestor — may write its URI. Checked before the attestor
         // short-circuit so an attestor can't rewrite the canonical URI of a
         // token with no local record.
         _requireOwned(agentId);
-        if (_getAgenticIDStorage().trustedAttestors[msg.sender]) return;
+        if (isTrustedAttestor(msg.sender)) return;
         super._authorizeSetAgentURI(agentId);
     }
 
     function _intelligentDatasOf(uint256 tokenId)
-        internal view virtual
+        internal
+        view
+        virtual
         override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)
         returns (IntelligentData[] memory)
     {
@@ -266,45 +350,43 @@ contract AgenticID is
     }
 
     function _intelligentDatasLengthOf(uint256 tokenId)
-        internal view virtual
+        internal
+        view
+        virtual
         override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)
         returns (uint256)
     {
         return super._intelligentDatasLengthOf(tokenId);
     }
 
-    function _updateData(
-        uint256 tokenId,
-        IntelligentData[] memory newDatas,
-        bytes[] memory sealedKeys
-    )
-        internal virtual
+    function _updateData(uint256 tokenId, IntelligentData[] memory newDatas, bytes[] memory sealedKeys)
+        internal
+        virtual
         override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)
     {
         super._updateData(tokenId, newDatas, sealedKeys);
     }
 
-    function _updateDataAt(
-        uint256 tokenId,
-        uint256 index,
-        IntelligentData memory newData,
-        bytes memory sealedKey
-    )
-        internal virtual
+    function _updateDataAt(uint256 tokenId, uint256 index, IntelligentData memory newData, bytes memory sealedKey)
+        internal
+        virtual
         override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)
     {
         super._updateDataAt(tokenId, index, newData, sealedKey);
     }
 
     function _updateSealedKeys(uint256 tokenId, bytes[] memory sealedKeys)
-        internal virtual
+        internal
+        virtual
         override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)
     {
         super._updateSealedKeys(tokenId, sealedKeys);
     }
 
     function _sealedKeysOf(uint256 tokenId)
-        internal view virtual
+        internal
+        view
+        virtual
         override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)
         returns (bytes[] memory)
     {
@@ -327,12 +409,10 @@ contract AgenticID is
     // no one able to update it. Owner still controls transfer / authorize
     // / setAgentURI in both branches.
 
-    function update(
-        uint256 tokenId,
-        IntelligentData[] calldata newDatas,
-        bytes[] calldata sealedKeys
-    )
-        public override(ERC7857IDataStorageUpgradeable) whenNotPaused
+    function update(uint256 tokenId, IntelligentData[] calldata newDatas, bytes[] calldata sealedKeys)
+        public
+        override(ERC7857IDataStorageUpgradeable)
+        whenNotPaused
     {
         _authorizeIDataUpdate(tokenId);
         if (newDatas.length == 0) revert ERC7857EmptyData();
@@ -342,13 +422,10 @@ contract AgenticID is
         _updateData(tokenId, newDatas, sealedKeys);
     }
 
-    function updateAt(
-        uint256 tokenId,
-        uint256 index,
-        IntelligentData calldata newData,
-        bytes calldata sealedKey
-    )
-        public override(ERC7857IDataStorageUpgradeable) whenNotPaused
+    function updateAt(uint256 tokenId, uint256 index, IntelligentData calldata newData, bytes calldata sealedKey)
+        public
+        override(ERC7857IDataStorageUpgradeable)
+        whenNotPaused
     {
         _authorizeIDataUpdate(tokenId);
         _updateDataAt(tokenId, index, newData, sealedKey);
@@ -384,22 +461,31 @@ contract AgenticID is
 
     // Disable base ERC-8004 register overloads — IntelligentData is required.
     function register()
-        external pure
+        external
+        pure
         override(ERC8004CanonicalBoundUpgradeable, IERC8004IdentityRegistry)
         returns (uint256)
-    { revert AgenticIDUseRegisterWithData(); }
+    {
+        revert AgenticIDUseRegisterWithData();
+    }
 
     function register(string calldata)
-        external pure
+        external
+        pure
         override(ERC8004CanonicalBoundUpgradeable, IERC8004IdentityRegistry)
         returns (uint256)
-    { revert AgenticIDUseRegisterWithData(); }
+    {
+        revert AgenticIDUseRegisterWithData();
+    }
 
     function register(string calldata, MetadataEntry[] calldata)
-        external pure
+        external
+        pure
         override(ERC8004CanonicalBoundUpgradeable, IERC8004IdentityRegistry)
         returns (uint256)
-    { revert AgenticIDUseRegisterWithData(); }
+    {
+        revert AgenticIDUseRegisterWithData();
+    }
 
     /// @notice Register a new agent. Mints to msg.sender.
     /// @dev sealedKeys[i] corresponds to intelligentDatas[i].dataHash. The contract
@@ -412,13 +498,7 @@ contract AgenticID is
         IntelligentData[] calldata intelligentDatas,
         bytes[] calldata sealedKeys
     ) external whenNotPaused returns (uint256 agentId) {
-        if (intelligentDatas.length == 0) revert ERC7857EmptyData();
-        if (intelligentDatas.length != sealedKeys.length) {
-            revert ERC7857SealedKeyArityMismatch(intelligentDatas.length, sealedKeys.length);
-        }
-        agentId = _mintAgent(msg.sender, agentURI);
-        _setMetadataBatch(agentId, metadata);
-        _updateData(agentId, intelligentDatas, sealedKeys);
+        agentId = _mintWithData(msg.sender, agentURI, metadata, intelligentDatas, sealedKeys);
         _emitMintedKeys(agentId, msg.sender, intelligentDatas, sealedKeys);
     }
 
@@ -440,8 +520,23 @@ contract AgenticID is
         address agentSeal_,
         bytes32 sealId
     ) external whenNotPaused returns (uint256 agentId) {
-        if (!_getAgenticIDStorage().trustedAttestors[msg.sender]) revert AgenticIDNotTrustedAttestor();
+        if (!isTrustedAttestor(msg.sender)) revert AgenticIDNotTrustedAttestor();
 
+        agentId = _mintWithData(to, agentURI, metadata, intelligentDatas, sealedKeys);
+        _setAgentSeal(agentId, agentSeal_, sealId);
+        _emitMintedKeys(agentId, to, intelligentDatas, sealedKeys);
+    }
+
+    /// @dev Shared body of register / registerWithSeal: validate the iData /
+    ///      sealedKeys arity, mint, write metadata, store the iData. One copy
+    ///      instead of two is what keeps 1.2.0 under EIP-170.
+    function _mintWithData(
+        address to,
+        string calldata agentURI,
+        MetadataEntry[] calldata metadata,
+        IntelligentData[] calldata intelligentDatas,
+        bytes[] calldata sealedKeys
+    ) private returns (uint256 agentId) {
         if (intelligentDatas.length == 0) revert ERC7857EmptyData();
         if (intelligentDatas.length != sealedKeys.length) {
             revert ERC7857SealedKeyArityMismatch(intelligentDatas.length, sealedKeys.length);
@@ -449,8 +544,6 @@ contract AgenticID is
         agentId = _mintAgent(to, agentURI);
         _setMetadataBatch(agentId, metadata);
         _updateData(agentId, intelligentDatas, sealedKeys);
-        _setAgentSeal(agentId, agentSeal_, sealId);
-        _emitMintedKeys(agentId, to, intelligentDatas, sealedKeys);
     }
 
     // ── Mint sealed-key emission ──────────────────────────────────────────────
@@ -463,14 +556,12 @@ contract AgenticID is
         IntelligentData[] calldata iDatas,
         bytes[] calldata sealedKeys
     ) internal {
-        // Arity is checked by the public callers (register / registerWithSeal)
-        // before reaching here, using ERC7857SealedKeyArityMismatch.
+        // Arity is checked in _mintWithData (shared by register /
+        // registerWithSeal) before reaching here, using
+        // ERC7857SealedKeyArityMismatch.
         SealedKeyEntry[] memory entries = new SealedKeyEntry[](iDatas.length);
         for (uint256 i = 0; i < iDatas.length; i++) {
-            entries[i] = SealedKeyEntry({
-                dataHash: iDatas[i].dataHash,
-                sealedKey: sealedKeys[i]
-            });
+            entries[i] = SealedKeyEntry({dataHash: iDatas[i].dataHash, sealedKey: sealedKeys[i]});
         }
         emit ITransferred(address(0), to, agentId, entries);
     }
@@ -500,10 +591,15 @@ contract AgenticID is
         // is a valid (third-party) agent on the canonical registry.
         if ($.sealIdBound[sealId]) revert AgenticIDSealIdTaken(sealId, $.sealIdToAgentId[sealId]);
 
+        // The seal address must be fresh too — one seal, one agent. Never
+        // cleared: seals are lifetime bindings, so a used address stays used.
+        if ($.agentSealBound[agentSeal_]) revert AgenticIDAgentSealTaken(agentSeal_);
+
         $.agentSeals[agentId]      = agentSeal_;
         $.agentIdToSealId[agentId] = sealId;
         $.sealIdToAgentId[sealId]  = agentId;
         $.sealIdBound[sealId]      = true;
+        $.agentSealBound[agentSeal_] = true;
 
         emit AgentSealSet(agentId, agentSeal_, sealId);
     }
@@ -534,12 +630,44 @@ contract AgenticID is
     }
 
     function removeTrustedAttestor(address attestor) external onlyOwner {
-        delete _getAgenticIDStorage().trustedAttestors[attestor];
-        emit TrustedAttestorRemoved(attestor);
+        AgenticIDStorage storage s = _getAgenticIDStorage();
+        AttestorAppBindingLib.remove(s.attestorAppBindings, s.trustedAttestors, attestor);
     }
 
-    function isTrustedAttestor(address attestor) external view returns (bool) {
-        return _getAgenticIDStorage().trustedAttestors[attestor];
+    /// Bind the stable service key to one live registration, never just a reusable appId.
+    function bindTrustedAttestorApp(address attestor, address registry, string memory appId, uint256 registeredAt)
+        external
+        onlyOwner
+    {
+        AgenticIDStorage storage s = _getAgenticIDStorage();
+        AttestorAppBindingLib.bind(
+            s.attestorAppBindings, s.trustedAttestors, attestor, registry, appId, registeredAt
+        );
+    }
+
+    /// One-way migration. Bind every production attestor before enabling this mode.
+    function requireInstanceBoundAttestors() external onlyOwner {
+        _getAgenticIDStorage().instanceBoundAttestorsRequired = true;
+        emit InstanceBoundAttestorsRequired();
+    }
+
+    function instanceBoundAttestorsRequired() external view returns (bool) {
+        return _getAgenticIDStorage().instanceBoundAttestorsRequired;
+    }
+
+    function trustedAttestorAppBinding(address attestor)
+        external
+        view
+        returns (address registry, string memory appId, uint256 registeredAt, address appOwner)
+    {
+        AttestorAppBinding storage b = _getAgenticIDStorage().attestorAppBindings[attestor];
+        return (b.registry, b.appId, b.registeredAt, b.appOwner);
+    }
+
+    function isTrustedAttestor(address attestor) public view returns (bool) {
+        AgenticIDStorage storage s = _getAgenticIDStorage();
+        if (!s.trustedAttestors[attestor]) return false;
+        return AttestorAppBindingLib.isCurrent(s.attestorAppBindings[attestor], s.instanceBoundAttestorsRequired);
     }
 
     // ── Valid framework hashes ────────────────────────────────────────────────
@@ -583,6 +711,8 @@ contract AgenticID is
     // ── Admin ─────────────────────────────────────────────────────────────────
 
     function setVerifier(address newVerifier) external onlyOwner {
+        if (newVerifier == address(0)) revert AgenticIDZeroAddress();
+        emit VerifierUpdated(address(verifier()), newVerifier);
         _setVerifier(newVerifier);
     }
 
@@ -596,7 +726,8 @@ contract AgenticID is
     // for the token's lifetime, so clearing would leave the token permanently unsealable.
 
     function _update(address to, uint256 tokenId, address auth)
-        internal virtual
+        internal
+        virtual
         override(ERC721Upgradeable, ERC8004CanonicalBoundUpgradeable, ERC7857AuthorizeUpgradeable)
         returns (address)
     {

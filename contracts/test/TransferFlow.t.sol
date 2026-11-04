@@ -13,6 +13,8 @@ import {DataVerifierDataHashMismatch} from "../src/verifiers/BaseDataVerifier.so
 import {NonceExpired, NonceAlreadyUsed} from "../src/utils/NonceRegistryUpgradeable.sol";
 import {IERC7857, SealedKeyEntry} from "../src/interfaces/IERC7857.sol";
 import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 import {
     OracleType,
     AccessProof,
@@ -48,10 +50,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         bytes memory opNonce = bytes("op-nonce-1");
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", apNonce, deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", apNonce, deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, opNonce, deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, opNonce, deadline
         );
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
@@ -87,10 +89,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-emit"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap-emit"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-emit"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-emit"), deadline
         );
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
         proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
@@ -114,10 +116,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            keccak256("wrong-hash"),
+            agentId, sellerWallet.addr, keccak256("wrong-hash"),
             SEALED_KEY_NEW,
             buyerPubkey,
             bytes("op-nonce"),
@@ -150,10 +152,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-nonce"), deadline, delegateWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap-nonce"), deadline, delegateWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
         );
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
@@ -174,10 +176,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-nonce"), deadline, strangerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap-nonce"), deadline, strangerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
         );
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
@@ -197,10 +199,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         bytes memory buyerPubkey = _pubkey(buyerWallet);
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
         );
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
@@ -226,10 +228,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         bytes memory sharedNonce = bytes("replay-nonce");
 
         AccessProof memory ap1 = _mkAccessProof(
-            dataHash1, "", sharedNonce, deadline, buyerWallet.privateKey
+            agentId1, sellerWallet.addr, dataHash1, "", sharedNonce, deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op1 = _mkOwnershipProof(
-            dataHash1, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce-1"), deadline
+            agentId1, sellerWallet.addr, dataHash1, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce-1"), deadline
         );
         TransferValidityProof[] memory proofs1 = new TransferValidityProof[](1);
         proofs1[0] = TransferValidityProof({accessProof: ap1, ownershipProof: op1});
@@ -238,10 +240,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId1, proofs1);
 
         AccessProof memory ap2 = _mkAccessProof(
-            dataHash2, "", sharedNonce, deadline, buyerWallet.privateKey
+            agentId2, sellerWallet.addr, dataHash2, "", sharedNonce, deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op2 = _mkOwnershipProof(
-            dataHash2, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce-2"), deadline
+            agentId2, sellerWallet.addr, dataHash2, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce-2"), deadline
         );
         TransferValidityProof[] memory proofs2 = new TransferValidityProof[](1);
         proofs2[0] = TransferValidityProof({accessProof: ap2, ownershipProof: op2});
@@ -263,10 +265,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProofSignedBy(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline, imposterPk
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline, imposterPk
         );
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
@@ -284,10 +286,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
         );
         op.oracleType = OracleType.ZKP;
 
@@ -308,10 +310,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, customPubkey, bytes("ap-nonce"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, customPubkey, bytes("ap-nonce"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, customPubkey, bytes("op-nonce"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, customPubkey, bytes("op-nonce"), deadline
         );
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
@@ -331,10 +333,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, apCustomKey, bytes("ap-nonce"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, apCustomKey, bytes("ap-nonce"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, opCustomKey, bytes("op-nonce"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, opCustomKey, bytes("op-nonce"), deadline
         );
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
@@ -354,10 +356,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, shortPubkey, bytes("op-nonce"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, shortPubkey, bytes("op-nonce"), deadline
         );
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
@@ -377,10 +379,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-nonce"), deadline, otherReceiver.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap-nonce"), deadline, otherReceiver.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
         );
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
@@ -410,10 +412,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHashes[0], "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHashes[0], "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHashes[0], SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
+            agentId, sellerWallet.addr, dataHashes[0], SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
         );
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
@@ -460,10 +462,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         bytes memory buyerPubkey = _pubkey(buyerWallet);
         uint256 deadline = block.timestamp + 1 hours;
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-sb"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap-sb"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-sb"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-sb"), deadline
         );
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
         proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
@@ -497,7 +499,7 @@ contract TransferFlowTest is AgenticIDTestBase {
         // Buyer signs the HONEST split: targetPubkey = "", nonce = kAtt ‖ apTail.
         // (In Ethereum mode the empty target means "seal to my own key".)
         bytes32 innerHonest = keccak256(abi.encode(
-            block.chainid, address(agenticId), dataHash,
+            block.chainid, address(agenticId), agentId, sellerWallet.addr, false, dataHash,
             bytes(""), abi.encodePacked(kAtt, apTail), deadline
         ));
         bytes memory buyerSig = _sign(buyerWallet.privateKey, _eip191HexHash(innerHonest));
@@ -511,13 +513,14 @@ contract TransferFlowTest is AgenticIDTestBase {
             proof: buyerSig         // unchanged buyer signature
         });
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, kAtt, bytes("op-resplit"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, kAtt, bytes("op-resplit"), deadline
         );
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
         proofs[0] = TransferValidityProof({accessProof: apReSplit, ownershipProof: op});
 
+        // Recovers to a non-buyer address, so _proofCheck rejects the assistant.
         vm.prank(sellerWallet.addr);
-        vm.expectRevert(); // buyer sig recovers to a non-buyer address → rejected
+        vm.expectRevert(IERC7857.ERC7857InvalidProof.selector);
         agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
 
         assertEq(agenticId.ownerOf(agentId), sellerWallet.addr, "token stayed with seller");
@@ -534,7 +537,7 @@ contract TransferFlowTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-osplit"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap-osplit"), deadline, buyerWallet.privateKey
         );
 
         // Oracle signs sealedKey = A ‖ B (concatenated); attacker re-splits so
@@ -543,7 +546,7 @@ contract TransferFlowTest is AgenticIDTestBase {
         bytes memory keyTail = hex"bbbb";
         bytes memory opNonce = bytes("op-osplit");
         bytes32 innerHonest = keccak256(abi.encode(
-            block.chainid, address(agenticId), dataHash,
+            block.chainid, address(agenticId), agentId, sellerWallet.addr, false, dataHash,
             abi.encodePacked(keyHead, keyTail), buyerPubkey, opNonce, deadline
         ));
         bytes memory oracleSig = _sign(oraclePk, _eip191HexHash(innerHonest));
@@ -570,6 +573,11 @@ contract TransferFlowTest is AgenticIDTestBase {
     ///      chain). This is the canonical reference any off-chain buyer signer —
     ///      which lives outside this repo — must reproduce. If the on-chain
     ///      encoding drifts, this constant changes and the assertion fails.
+    ///      Reproduce: cast keccak $(cast abi-encode
+    ///      "f(uint256,address,uint256,address,bool,bytes32,bytes,bytes,uint256)"
+    ///      16602 0x…A9 7 0x…F0 false 0x11…11 0x22…22 0x3333 1700003600).
+    ///      (The 1.1.0 preimage, without tokenId / from / isClone, gave
+    ///      0x23cf25e6….)
     function test_accessProofDigest_knownAnswerVector() public pure {
         bytes memory targetPubkey = new bytes(64);
         for (uint256 i = 0; i < 64; i++) targetPubkey[i] = 0x22;
@@ -578,6 +586,9 @@ contract TransferFlowTest is AgenticIDTestBase {
         bytes32 digest = keccak256(abi.encode(
             uint256(16602),                                   // chainId
             address(0x00000000000000000000000000000000000000A9), // erc7857
+            uint256(7),                                       // tokenId
+            address(0x00000000000000000000000000000000000000F0), // from
+            false,                                            // isClone (a transfer)
             bytes32(0x1111111111111111111111111111111111111111111111111111111111111111), // dataHash
             targetPubkey,
             nonce,
@@ -586,9 +597,212 @@ contract TransferFlowTest is AgenticIDTestBase {
 
         assertEq(
             digest,
-            0x23cf25e6103163928e91c5c7a4efe48f9a4405856f1b236f15beb4c5d754b0ff,
+            0xa214dbe416dd1ed72a69b8dacbf31e3279ea538c0d385419fa0d03b77014557f,
             "AccessProof digest drifted from the cross-component known-answer vector"
         );
+    }
+
+    /// @dev Known-answer vector for the TEE OwnershipProof digest — the
+    ///      reference the (future, off-repo) oracle signer must reproduce. Same
+    ///      literals as the AccessProof vector, plus sealedKey 0x4444 and nonce
+    ///      0x5555. Reproduce with cast as above, signature
+    ///      "f(uint256,address,uint256,address,bool,bytes32,bytes,bytes,bytes,uint256)".
+    function test_ownershipProofDigest_knownAnswerVector() public pure {
+        bytes memory targetPubkey = new bytes(64);
+        for (uint256 i = 0; i < 64; i++) targetPubkey[i] = 0x22;
+
+        bytes32 digest = keccak256(abi.encode(
+            uint256(16602),                                   // chainId
+            address(0x00000000000000000000000000000000000000A9), // erc7857
+            uint256(7),                                       // tokenId
+            address(0x00000000000000000000000000000000000000F0), // from
+            false,                                            // isClone (a transfer)
+            bytes32(0x1111111111111111111111111111111111111111111111111111111111111111), // dataHash
+            hex"4444",                                        // sealedKey
+            targetPubkey,
+            hex"5555",                                        // nonce
+            uint256(1700003600)                               // deadline
+        ));
+
+        assertEq(
+            digest,
+            0x5845ca7b0c0372c6268501702c2d40e65898177830d2c1a75452ec7c321df67c,
+            "OwnershipProof digest drifted from the cross-component known-answer vector"
+        );
+    }
+
+    // ── Token binding (1.2.0: FIND-05) ────────────────────────────────────────
+
+    function _proofsFor(
+        uint256 tokenId,
+        address from,
+        bytes32 dataHash,
+        Vm.Wallet memory to,
+        bytes memory apNonce,
+        bytes memory opNonce
+    ) internal view returns (TransferValidityProof[] memory proofs) {
+        uint256 deadline = block.timestamp + 1 hours;
+        proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({
+            accessProof: _mkAccessProof(tokenId, from, dataHash, "", apNonce, deadline, to.privateKey),
+            ownershipProof: _mkOwnershipProof(tokenId, from, dataHash, SEALED_KEY_NEW, _pubkey(to), opNonce, deadline)
+        });
+    }
+
+    /// @dev `register` never checks the caller can decrypt the dataHash it
+    ///      declares, so anyone can mint a look-alike carrying the victim's
+    ///      dataHash. Copying the genuine sale's proofs from the mempool onto
+    ///      the look-alike used to pass every check (and burn both nonces).
+    ///      Token-bound proofs fail on it, and the genuine sale still lands.
+    function test_iTransferFrom_lookalikeCannotRedeemCopiedProofs() public {
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+        TransferValidityProof[] memory proofs =
+            _proofsFor(agentId, sellerWallet.addr, dataHash, buyerWallet, "ap-genuine", "op-genuine");
+
+        address attacker = makeAddr("attacker");
+        IntelligentData[] memory datas = new IntelligentData[](1);
+        datas[0] = IntelligentData({dataDescription: "d", dataHash: dataHash});
+        bytes[] memory keys = new bytes[](1);
+        keys[0] = SEALED_KEY_ORIGINAL;
+        vm.prank(attacker);
+        uint256 lookalike = agenticId.register("", new MetadataEntry[](0), datas, keys);
+
+        vm.prank(attacker);
+        vm.expectRevert(TEEDataVerifierInvalidSignature.selector);
+        agenticId.iTransferFrom(attacker, buyerWallet.addr, lookalike, proofs);
+
+        vm.prank(sellerWallet.addr);
+        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
+        assertEq(agenticId.ownerOf(agentId), buyerWallet.addr, "genuine sale unaffected");
+        assertEq(agenticId.ownerOf(lookalike), attacker, "look-alike never moved");
+    }
+
+    /// @dev Proofs signed for one owner do not verify for the same token
+    ///      under another owner (`from` is part of both preimages).
+    function test_iTransferFrom_proofsBoundToFrom() public {
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+        address other = makeAddr("other-owner");
+        TransferValidityProof[] memory proofs =
+            _proofsFor(agentId, other, dataHash, buyerWallet, "ap-from", "op-from");
+
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(TEEDataVerifierInvalidSignature.selector);
+        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
+    }
+
+    /// @dev The buyer's access proof is bound on its own: paired with an
+    ///      oracle proof genuinely issued for a look-alike, the buyer's
+    ///      signature (made for the real token) recovers to someone else.
+    function test_iTransferFrom_accessProofBoundToToken() public {
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+        uint256 deadline = block.timestamp + 1 hours;
+        AccessProof memory buyerAp =
+            _mkAccessProof(agentId, sellerWallet.addr, dataHash, "", "ap-real", deadline, buyerWallet.privateKey);
+
+        address attacker = makeAddr("attacker");
+        IntelligentData[] memory datas = new IntelligentData[](1);
+        datas[0] = IntelligentData({dataDescription: "d", dataHash: dataHash});
+        bytes[] memory keys = new bytes[](1);
+        keys[0] = SEALED_KEY_ORIGINAL;
+        vm.prank(attacker);
+        uint256 lookalike = agenticId.register("", new MetadataEntry[](0), datas, keys);
+
+        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({
+            accessProof: buyerAp,
+            ownershipProof: _mkOwnershipProof(
+                lookalike, attacker, dataHash, SEALED_KEY_NEW, _pubkey(buyerWallet), "op-fake", deadline
+            )
+        });
+        vm.prank(attacker);
+        vm.expectRevert(IERC7857.ERC7857InvalidProof.selector);
+        agenticId.iTransferFrom(attacker, buyerWallet.addr, lookalike, proofs);
+
+        // Control: the same access proof completes the real sale.
+        proofs[0].ownershipProof = _mkOwnershipProof(
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, _pubkey(buyerWallet), "op-real", deadline
+        );
+        vm.prank(sellerWallet.addr);
+        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
+        assertEq(agenticId.ownerOf(agentId), buyerWallet.addr, "buyer's proof works on the real token");
+    }
+
+    /// @dev Proofs are bound to the action too: a buyer's clone proofs (the
+    ///      buyer asked for a copy) do not move the original.
+    function test_iTransferFrom_rejectsCloneProofs() public {
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+        uint256 deadline = block.timestamp + 1 hours;
+        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({
+            accessProof: _mkCloneAccessProof(
+                agentId, sellerWallet.addr, dataHash, "", "ap-c", deadline, buyerWallet.privateKey
+            ),
+            ownershipProof: _mkCloneOwnershipProof(
+                agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, _pubkey(buyerWallet), "op-c", deadline
+            )
+        });
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(TEEDataVerifierInvalidSignature.selector);
+        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
+
+        // Control: the same proofs clone.
+        vm.prank(sellerWallet.addr);
+        uint256 cloneId = agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
+        assertEq(agenticId.ownerOf(cloneId), buyerWallet.addr, "clone proofs clone");
+        assertEq(agenticId.ownerOf(agentId), sellerWallet.addr, "original stays");
+    }
+
+    // ── Ownership nonce scope (1.2.0) ─────────────────────────────────────────
+
+    /// @dev Ownership nonces are keyed per token: an oracle proof for another
+    ///      token that carries the same nonce bytes cannot burn this one.
+    function test_iTransferFrom_ownershipNonceScopedPerToken() public {
+        (uint256 id1, bytes32 dh1) = _selfMintData(sellerWallet.addr, 0);
+        (uint256 id2, bytes32 dh2) = _selfMintData(sellerWallet.addr, 1);
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory buyerPubkey = _pubkey(buyerWallet);
+
+        vm.startPrank(sellerWallet.addr);
+        for (uint256 k = 0; k < 2; k++) {
+            (uint256 id, bytes32 dh) = k == 0 ? (id1, dh1) : (id2, dh2);
+            TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+            proofs[0] = TransferValidityProof({
+                accessProof: _mkAccessProof(
+                    id, sellerWallet.addr, dh, "", abi.encodePacked("ap-", k), deadline, buyerWallet.privateKey
+                ),
+                ownershipProof: _mkOwnershipProof(
+                    id, sellerWallet.addr, dh, SEALED_KEY_NEW, buyerPubkey, "same-op-nonce", deadline
+                )
+            });
+            agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, id, proofs);
+        }
+        vm.stopPrank();
+        assertEq(agenticId.ownerOf(id2), buyerWallet.addr, "second token, same ownership nonce bytes");
+    }
+
+    // ── Access nonce scope (1.2.0: FIND-06) ───────────────────────────────────
+
+    /// @dev Access nonces are keyed per signer: two unrelated buyers who pick
+    ///      the same nonce bytes both complete. (The same signer reusing a
+    ///      nonce still reverts — test_iTransferFrom_revertsOnAccessNonceReplay.)
+    function test_iTransferFrom_accessNonceScopedPerSigner() public {
+        (uint256 id1, bytes32 dh1) = _selfMintData(sellerWallet.addr, 0);
+        (uint256 id2, bytes32 dh2) = _selfMintData(sellerWallet.addr, 1);
+        Vm.Wallet memory buyer2 = vm.createWallet("buyer2");
+
+        vm.startPrank(sellerWallet.addr);
+        agenticId.iTransferFrom(
+            sellerWallet.addr, buyerWallet.addr, id1,
+            _proofsFor(id1, sellerWallet.addr, dh1, buyerWallet, "same-nonce", "op-1")
+        );
+        agenticId.iTransferFrom(
+            sellerWallet.addr, buyer2.addr, id2,
+            _proofsFor(id2, sellerWallet.addr, dh2, buyer2, "same-nonce", "op-2")
+        );
+        vm.stopPrank();
+
+        assertEq(agenticId.ownerOf(id1), buyerWallet.addr, "first buyer");
+        assertEq(agenticId.ownerOf(id2), buyer2.addr, "second buyer, same nonce bytes");
     }
 
     // ── Receiver reentrancy ───────────────────────────────────────────────────
@@ -613,10 +827,10 @@ contract TransferFlowTest is AgenticIDTestBase {
         bytes memory malKey = hex"c0ffee";
         uint256 deadline = block.timestamp + 1 hours;
         AccessProof memory ap = _mkAccessProof(
-            dataHash, malKey, bytes("re-ap"), deadline, delegate.privateKey
+            agentId, sellerWallet.addr, dataHash, malKey, bytes("re-ap"), deadline, delegate.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, malKey, bytes("re-op"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, malKey, bytes("re-op"), deadline
         );
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
         proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});

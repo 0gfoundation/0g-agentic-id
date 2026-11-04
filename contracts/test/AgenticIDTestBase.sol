@@ -94,24 +94,67 @@ abstract contract AgenticIDTestBase is Test {
         );
     }
 
-    /// @dev EIP-191 raw-32-byte variant used by ServeProof / setAgentWallet.
-    ///      Matches MessageHashUtils.toEthSignedMessageHash(bytes32).
+    /// @dev EIP-191 raw-32-byte (personal_sign) variant. Matches
+    ///      MessageHashUtils.toEthSignedMessageHash(bytes32). The deprecated
+    ///      fork registry's ServeProof format (Reputation / UpgradeReputation
+    ///      suites); against VerifiedFeedbackRegistry >= 1.2.0 it is the
+    ///      legacy / attacker format that must be rejected — exactly what the
+    ///      sealed sign socket's /sign/personal_sign returns for 32 bytes.
     function _eip191RawHash(bytes32 inner) internal pure returns (bytes32) {
         return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", inner));
     }
 
+    /// @dev EIP-191 version 0x00 ("data with intended validator") variant —
+    ///      the ServeProof digest since VerifiedFeedbackRegistry 1.2.0:
+    ///      keccak256(0x19 ‖ 0x00 ‖ validator ‖ inner), validator = the
+    ///      registry proxy. Spelled out byte-wise (not via MessageHashUtils)
+    ///      so the suites cross-check the contract's library call.
+    function _eip191ValidatorHash(address validator, bytes32 inner) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(hex"1900", validator, inner));
+    }
+
     // ── Transfer proof builders ───────────────────────────────────────────────
 
+    /// @dev Access proof for an iTransferFrom of `tokenId` out of `from`.
     function _mkAccessProof(
+        uint256 tokenId,
+        address from,
         bytes32 dataHash,
         bytes memory targetPubkey,
         bytes memory nonce,
         uint256 deadline,
         uint256 signerPk
     ) internal view returns (AccessProof memory) {
-        // Mirror the verifier's domain-separated preimage: abi.encode(chainId, erc7857, <fields>).
+        return _mkAccessProofFor(false, tokenId, from, dataHash, targetPubkey, nonce, deadline, signerPk);
+    }
+
+    /// @dev Access proof for an iCloneFrom of `tokenId` out of `from`.
+    function _mkCloneAccessProof(
+        uint256 tokenId,
+        address from,
+        bytes32 dataHash,
+        bytes memory targetPubkey,
+        bytes memory nonce,
+        uint256 deadline,
+        uint256 signerPk
+    ) internal view returns (AccessProof memory) {
+        return _mkAccessProofFor(true, tokenId, from, dataHash, targetPubkey, nonce, deadline, signerPk);
+    }
+
+    function _mkAccessProofFor(
+        bool isClone,
+        uint256 tokenId,
+        address from,
+        bytes32 dataHash,
+        bytes memory targetPubkey,
+        bytes memory nonce,
+        uint256 deadline,
+        uint256 signerPk
+    ) internal view returns (AccessProof memory) {
+        // Mirror the verifier's domain-separated, token- and action-bound
+        // preimage: abi.encode(chainId, erc7857, tokenId, from, isClone, <fields>).
         bytes32 inner = keccak256(abi.encode(
-            block.chainid, address(agenticId), dataHash, targetPubkey, nonce, deadline
+            block.chainid, address(agenticId), tokenId, from, isClone, dataHash, targetPubkey, nonce, deadline
         ));
         return AccessProof({
             dataHash: dataHash,
@@ -123,18 +166,37 @@ abstract contract AgenticIDTestBase is Test {
     }
 
     function _mkOwnershipProof(
+        uint256 tokenId,
+        address from,
         bytes32 dataHash,
         bytes memory sealedKey,
         bytes memory targetPubkey,
         bytes memory nonce,
         uint256 deadline
     ) internal view returns (OwnershipProof memory) {
-        return _mkOwnershipProofSignedBy(
-            dataHash, sealedKey, targetPubkey, nonce, deadline, oraclePk
+        return _mkOwnershipProofFor(
+            false, tokenId, from, dataHash, sealedKey, targetPubkey, nonce, deadline, oraclePk
+        );
+    }
+
+    /// @dev Oracle ownership proof for an iCloneFrom of `tokenId` out of `from`.
+    function _mkCloneOwnershipProof(
+        uint256 tokenId,
+        address from,
+        bytes32 dataHash,
+        bytes memory sealedKey,
+        bytes memory targetPubkey,
+        bytes memory nonce,
+        uint256 deadline
+    ) internal view returns (OwnershipProof memory) {
+        return _mkOwnershipProofFor(
+            true, tokenId, from, dataHash, sealedKey, targetPubkey, nonce, deadline, oraclePk
         );
     }
 
     function _mkOwnershipProofSignedBy(
+        uint256 tokenId,
+        address from,
         bytes32 dataHash,
         bytes memory sealedKey,
         bytes memory targetPubkey,
@@ -142,9 +204,27 @@ abstract contract AgenticIDTestBase is Test {
         uint256 deadline,
         uint256 signerPk
     ) internal view returns (OwnershipProof memory) {
-        // Mirror the verifier's domain-separated preimage: abi.encode(chainId, erc7857, <fields>).
+        return _mkOwnershipProofFor(
+            false, tokenId, from, dataHash, sealedKey, targetPubkey, nonce, deadline, signerPk
+        );
+    }
+
+    function _mkOwnershipProofFor(
+        bool isClone,
+        uint256 tokenId,
+        address from,
+        bytes32 dataHash,
+        bytes memory sealedKey,
+        bytes memory targetPubkey,
+        bytes memory nonce,
+        uint256 deadline,
+        uint256 signerPk
+    ) internal view returns (OwnershipProof memory) {
+        // Mirror the verifier's domain-separated, token- and action-bound
+        // preimage: abi.encode(chainId, erc7857, tokenId, from, isClone, <fields>).
         bytes32 inner = keccak256(abi.encode(
-            block.chainid, address(agenticId), dataHash, sealedKey, targetPubkey, nonce, deadline
+            block.chainid, address(agenticId), tokenId, from, isClone,
+            dataHash, sealedKey, targetPubkey, nonce, deadline
         ));
         return OwnershipProof({
             oracleType: OracleType.TEE,

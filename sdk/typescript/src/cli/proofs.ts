@@ -17,6 +17,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ServeProof, TaskReveal } from '../types';
+import type { ProofVerification } from '../ServeSession';
 import { configPaths } from './config';
 
 /** A saved ticket: the proof plus its receipt materials and provenance. */
@@ -30,6 +31,7 @@ export interface SavedProof {
     agentId: string; submitter: `0x${string}`; timestamp: string; deadline: string;
     taskHash: `0x${string}`; dataHashes: `0x${string}`[]; frameworkHash: `0x${string}`;
     signature: `0x${string}`;
+    validator?: `0x${string}`; // envelope diagnostics: lets `rate` tell a registry mismatch from a bad ticket
   };
   task: TaskReveal;
 }
@@ -77,6 +79,7 @@ export function saveProof(proof: ServeProof, task: TaskReveal, endpoint: string)
       dataHashes: proof.dataHashes,
       frameworkHash: proof.frameworkHash,
       signature: proof.signature,
+      ...(proof.validator ? { validator: proof.validator } : {}),
     },
     task,
   };
@@ -111,6 +114,36 @@ export function removeProof(signature: `0x${string}`): void {
   writeJar(loadJar().filter((e) => e.proof.signature !== signature));
 }
 
+/**
+ * Whether the registry would redeem this ticket, judged on exactly what
+ * VerifiedFeedbackRegistry checks: not expired, and a signature that verifies
+ * against the registry configured here. `dataOnChain` is NOT one of them —
+ * the registry never compares a proof's dataHashes with the agent's current
+ * iData (it records them as the version that served), so a ticket whose
+ * agent has since committed new state still redeems. `rate` shows that case
+ * as an informational note, not a failure.
+ */
+export function ticketRedeemable(
+  v: Pick<ProofVerification, 'notExpired' | 'registryMatches' | 'signerMatches'>,
+): boolean {
+  return v.notExpired && v.registryMatches && v.signerMatches;
+}
+
+/**
+ * What `rate` does with a ticket that is not `ticketRedeemable`.
+ * `'burn'` only on a defect of the ticket itself — expired, or a signature
+ * that does not verify against the registry it names. `'keep'` when the
+ * failure is this side's configuration (no registry configured, or the
+ * ticket names a different one): the ticket may still redeem once that is
+ * fixed. `dataOnChain` never burns a ticket (see `ticketRedeemable`).
+ */
+export function ticketDisposition(
+  v: Pick<ProofVerification, 'notExpired' | 'registryMatches' | 'signerMatches'>,
+): 'burn' | 'keep' {
+  const defect = !v.notExpired || (v.registryMatches && !v.signerMatches);
+  return defect ? 'burn' : 'keep';
+}
+
 /** Rehydrate the bigint fields for SDK submission. */
 export function toServeProof(e: SavedProof): ServeProof {
   return {
@@ -122,5 +155,6 @@ export function toServeProof(e: SavedProof): ServeProof {
     dataHashes: e.proof.dataHashes,
     frameworkHash: e.proof.frameworkHash,
     signature: e.proof.signature,
+    ...(e.proof.validator ? { validator: e.proof.validator } : {}),
   };
 }

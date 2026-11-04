@@ -439,16 +439,21 @@ func platformModel(s settings.Resolved, c reasoningClaim) modelEntry {
 // model itself: endpoint, wire API, credential reference, output budget and
 // the reasoning flags. Whatever the overlay said about these keys, this wins.
 func routedProvider(s settings.Resolved, c reasoningClaim) providerCfg {
+	compatibility := map[string]bool{}
+	for key, value := range inference.EndpointCompatibility(s.Endpoint, s.Provider) {
+		if flag, ok := value.(bool); ok {
+			compatibility[key] = flag
+		}
+	}
 	return providerCfg{
 		BaseURL:    s.Endpoint.BaseURL,
 		API:        wireAPI(s.Endpoint.Format),
 		APIKey:     apiKeyEnvRef,
 		AuthHeader: true,
 		// supportsDeveloperRole is off because a third-party
-		// OpenAI-compatible endpoint generally does not understand the
-		// `developer` role. It is the platform's to state here and only here:
-		// this endpoint is one the platform wired.
-		Compat: c.compat(map[string]bool{"supportsDeveloperRole": false}),
+		// Compatibility belongs to this provider's trusted definition;
+		// compute-specific flags must not constrain other endpoints.
+		Compat: c.compat(compatibility),
 		Models: []modelEntry{platformModel(s, c)},
 	}
 }

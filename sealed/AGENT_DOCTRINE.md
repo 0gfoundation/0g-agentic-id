@@ -15,6 +15,10 @@ POST /sign/typed_data     EIP-712
 POST /sign/transaction    raw RLP
 ```
 
+None of them signs a raw hash or EIP-191 version `0x00` data. That is
+the domain your serve-proofs are signed in, so nothing you sign through
+the socket can stand in for one.
+
 ---
 
 ## 2. What you can see
@@ -54,20 +58,31 @@ You have only one externally bound port: **`:8080`**, listened by the
 sealed proxy. `AGENT_PUBLIC_URL` always points to it. `:8080` is
 hard-coded by the sealed runtime and not overridable.
 
-Every response is **automatically** stamped with an `X-Agent-Proof`
-header by the sealed proxy. The envelope signed:
+Responses on the signed routes — `/hello`, `/_seal/auth` and your
+registered `/api/*` services — are **automatically** stamped with an
+`X-Agent-Proof` header by the sealed proxy, whenever the runtime has a
+serve-proof validator (the `serve-proof validator` row of your injected
+runtime snapshot; `none` there means nothing is signed). The framework's
+own chat/UI routes — their SSE streams included — and WebSocket upgrades
+are never signed. Your `/api/*` responses are always buffered to
+completion and then signed, SSE included, so a service should return
+short, discrete responses rather than a long stream. The envelope signed:
 
 ```
 {
-  agent_id, timestamp, deadline,
-  task_hash, data_hashes, framework_hash
+  agent_id, submitter, timestamp, deadline,
+  task_hash, data_hashes, framework_hash,
+  validator
 }
 ```
 
 where `task_hash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖
-keccak256(respBody) ‖ status)` folds the request/response transcript. Signed
-under EIP-191 with `agent_seal_priv`, JWT-style packed into
-`0x<sig>.<base64-envelope>` and written into the header.
+keccak256(respBody) ‖ status)` folds the request/response transcript, and
+`submitter` is the caller's declared `X-Client-Address`, the only address
+that can redeem the proof. Signed with `agent_seal_priv` under EIP-191
+version `0x00` ("data with intended validator"), bound to the
+VerifiedFeedbackRegistry named in `validator`, then JWT-style packed
+into `0x<sig>.<base64-envelope>` and written into the header.
 
 A port you bind yourself is not on this signing channel. Responses
 through it carry no `X-Agent-Proof`, and cryptographically have nothing

@@ -1,7 +1,7 @@
 /**
  * @file AttestorClient.ts
  * @description Internal client for attestor HTTP endpoints: seal-bound deploy +
- * clone. Consumers use the `AgenticID` facade's `agent` namespace.
+ * clone. Consumers use the `AgentDNA` facade's `agent` namespace.
  *
  * Neither is an on-chain call. The owner signs a canonical envelope (EIP-191) and
  * POSTs it; the attestor verifies the signer and drives the mint. Deploy also
@@ -10,12 +10,13 @@
 
 import type { Address } from 'viem';
 import { getAddress, hexToBytes, isAddress, keccak256 } from 'viem';
-import { requireWallet, type Ctx } from './context';
+import { requireWallet, type Ctx, type AttestorPublicConfig } from './context';
+import { listInferenceProviders, ProviderRegistryClient, routeHash, registrySigningMessage, acceptedRegistryDigest, validateProvider, type InferenceProvider, type ProviderRegistrySnapshot } from './Providers';
 import { SDK_VERSION } from './constants';
-import { agenticIDAbi, cloneGateAbi } from './abi';
+import { agenticIDAbi, cloneGateAbi, tappRegistryAbi } from './abi';
 import {
   canonicalSettings, modelAdvisory, settingsAuthMessage, SettingsConflictError, sha256Hex,
-  type SettingsDoc,
+  THINKING_LEVELS, type SettingsDoc,
 } from './Settings';
 import {
   SECRET_ENV_SCHEME,
@@ -80,6 +81,58 @@ export interface IDataInput {
   extra?: Record<string, unknown>;
 }
 
+/** The persona inference pin a fresh deploy starts from (the 0G router's own model). */
+export const DEFAULT_PERSONA_INFERENCE = { provider: '0g-compute', model: '0gm-1.0-35b-a3b' } as const;
+
+/** What an agent's public deployment row says about its history, for
+ *  {@link needsDefaultSettings}. */
+export interface DeploymentFacts {
+  /** A container of this agent has provisioned before (`provisioned_at`). */
+  provisioned: boolean;
+  /** The agent is a clone (`clone_params`). */
+  clone: boolean;
+}
+
+/** Read {@link DeploymentFacts} from a raw `GET /deployment/:sealId` row. */
+export function deploymentFactsOf(row: Record<string, unknown>): DeploymentFacts {
+  return { provisioned: !!row.provisioned_at, clone: row.clone_params != null };
+}
+
+/**
+ * Whether a start or reset must first store {@link DEFAULT_PERSONA_INFERENCE}
+ * as the agent's settings document. `settingsVersion` is the document's
+ * version (0: the agent has none).
+ *
+ * An agent with no settings document boots on the model pinned in its minted
+ * persona while that pin is on chain, and its container then stores the pin
+ * as the agent's settings. The pin leaves the chain at the agent's first
+ * commit, so an agent that has provisioned before, or a clone (whose source
+ * may have committed), would come up with no model: only those get the
+ * default. An agent that has a document keeps it.
+ */
+export function needsDefaultSettings(facts: DeploymentFacts, settingsVersion: number): boolean {
+  return settingsVersion === 0 && (facts.provisioned || facts.clone);
+}
+
+/**
+ * Store {@link DEFAULT_PERSONA_INFERENCE} as the agent's FIRST settings
+ * document (owner-signed, `baseVersion: 0`). Returns false when the agent
+ * already has one (the write is refused with a version conflict): that
+ * document is kept, never overwritten.
+ */
+export async function storeDefaultSettings(
+  api: { setSettings(sealId: `0x${string}`, settings: SettingsDoc, opts: { baseVersion: number }): Promise<unknown> },
+  sealId: `0x${string}`,
+): Promise<boolean> {
+  try {
+    await api.setSettings(sealId, { ...DEFAULT_PERSONA_INFERENCE }, { baseVersion: 0 });
+    return true;
+  } catch (e) {
+    if (e instanceof SettingsConflictError) return false;
+    throw e;
+  }
+}
+
 /** Inputs for {@link defaultIData}. */
 export interface DefaultIDataParams {
   /** Framework name for the binding; default "openclaw". */
@@ -114,11 +167,19 @@ export function defaultIData(p: DefaultIDataParams): IDataInput[] {
       role: 'persona',
       plaintext: {
         system_prompt: `You are ${p.name}. ${p.description}\n`,
-        inference: p.inference ?? { provider: '0g-compute', model: '0gm-1.0-35b-a3b' },
+        inference: p.inference ?? { ...DEFAULT_PERSONA_INFERENCE },
       },
       extra: {},
     },
   ];
+}
+
+/** The name in an iData's `role="framework"` binding, as the attestor reads
+ *  it (`plaintext.name`, trimmed); undefined when there is none. */
+function iDataFramework(iData: IDataInput[]): string | undefined {
+  const binding = iData.find((entry) => entry.role === 'framework')?.plaintext as { name?: unknown } | undefined;
+  const name = typeof binding?.name === 'string' ? binding.name.trim() : '';
+  return name || undefined;
 }
 
 export interface DeployParams {
@@ -149,7 +210,9 @@ export interface DeployParams {
    * need to know a framework's image. CLIENT-SIDE for the binding: it feeds
    * `defaultIData()` when `iData` is omitted — the on-chain binding inside
    * i_data is the single source of truth (validated against `GET /config`'s
-   * `frameworks[]` before mint). Ignored when you pass your own `iData`.
+   * `frameworks[]` before mint). With your own `iData`, the image follows
+   * that iData's `role="framework"` binding; you may omit this, and a value
+   * that names another framework is refused before anything is signed.
    */
   framework?: string;
   /** Inference pin for the SDK-built default persona (defaults to
@@ -280,7 +343,10 @@ export class AttestorClient {
   /** In-memory half of the secret-env sticky pin (see secretEnvScheme). */
   private schemeSeen = false;
 
-  constructor(private readonly ctx: Ctx) {}
+  constructor(private readonly ctx: Ctx, initialConfig?: AttestorPublicConfig) {
+    this.remoteRegistrySeen = initialConfig?.provider_registry_schema === 1;
+    this.schemeSeen = initialConfig?.secret_env_scheme === SECRET_ENV_SCHEME;
+  }
 
   private baseUrl(): string {
     if (!this.ctx.attestorUrl) throw new Error('attestorUrl is required for deploy/clone');
@@ -335,8 +401,8 @@ export class AttestorClient {
    *  (0g-sandbox#93 envelope binding), sandbox endpoint (effective balance),
    *  and future needs ride the same round-trip. {} on failure: every
    *  consumer already degrades on missing fields. */
-  private cfgPromise: Promise<Record<string, string | undefined>> | undefined;
-  private attestorConfig(opts?: { fresh?: boolean }): Promise<Record<string, string | undefined>> {
+  private cfgPromise: Promise<AttestorPublicConfig> | undefined;
+  private attestorConfig(opts?: { fresh?: boolean }): Promise<AttestorPublicConfig> {
     // `fresh` re-reads (and re-memoizes) /config: the secret-env decision
     // must see an operator's flag change on a long-lived client.
     if (opts?.fresh) this.cfgPromise = undefined;
@@ -348,7 +414,7 @@ export class AttestorClient {
         // An error page is not a config: treat a non-2xx like a network
         // failure (consumers degrade on {}, and the memo is cleared).
         if (!r.ok) throw new Error(`GET /config: HTTP ${r.status}`);
-        return r.json() as Promise<Record<string, string | undefined>>;
+        return r.json() as Promise<AttestorPublicConfig>;
       })
       .catch(() => { this.cfgPromise = undefined; return {}; });
     return this.cfgPromise;
@@ -385,6 +451,41 @@ export class AttestorClient {
   }
 
   /**
+   * The agent's public deployment row (`GET /deployment/:sealId`). An
+   * unreadable row refuses, naming `purpose`: the call that needs it posts to
+   * the same attestor anyway, and guessing past it is how an agent boots on
+   * the wrong image or without a model.
+   */
+  private async deploymentRow(sealId: `0x${string}`, purpose: string): Promise<Record<string, unknown>> {
+    try {
+      const r = await fetch(`${this.baseUrl()}/deployment/${sealId}`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const row = (await r.json()) as unknown;
+      if (!row || typeof row !== 'object') throw new Error('not a JSON object');
+      return row as Record<string, unknown>;
+    } catch (e) {
+      throw new Error(
+        `cannot read /deployment/${sealId} to ${purpose} (${errMsg(e)}); ` +
+          "retry, or pass `framework` (or `sealedImage`) explicitly",
+      );
+    }
+  }
+
+  /**
+   * The settings document a start or reset of this agent stores before it
+   * signs, per {@link needsDefaultSettings}, or null. Reads the row's
+   * `settings_version`; a row without it (an attestor that predates the
+   * settings channel) gets nothing stored.
+   */
+  private defaultSettingsFor(row: Record<string, unknown>): { provider: string; model: string } | null {
+    const version = row.settings_version;
+    if (typeof version !== 'number') return null;
+    return needsDefaultSettings(deploymentFactsOf(row), version) ? { ...DEFAULT_PERSONA_INFERENCE } : null;
+  }
+
+  /**
    * Resolve the sealed image name: an explicit value wins; otherwise the
    * image `GET /config` declares for `framework` (frameworks whose runtime
    * isn't in the default snapshot — hermes etc. — carry their own image);
@@ -393,13 +494,18 @@ export class AttestorClient {
    * create envelope makes the provider fail ("sealed containers require an
    * image or snapshot"), so /config is the source of truth.
    */
-  private async resolveSealedImage(explicit?: string, framework?: string, sealId?: `0x${string}`): Promise<string> {
+  private async resolveSealedImage(
+    explicit?: string,
+    framework?: string,
+    sealId?: `0x${string}`,
+    row?: { framework?: unknown },
+  ): Promise<string> {
     if (explicit) return explicit;
     let fw = framework;
     // An existing agent already knows what it is: its deployment row records
     // the framework. Without this read, a bare reset/start/retry of a
-    // hermes/prime/dsh agent fell back to the DEFAULT (openclaw) image and
-    // booted a container without its framework installed (observed live,
+    // hermes/prime/0g-harness agent fell back to the DEFAULT (openclaw) image
+    // and booted a container without its framework installed (observed live,
     // agent 452) — the CLI wizard papered over it by asking; the SDK is the
     // right place for the lookup. An UNREADABLE row refuses rather than
     // falling through: silently choosing the default image re-creates the
@@ -408,31 +514,122 @@ export class AttestorClient {
     // never-provisioned agent) still gets the default — that is data, not a
     // failed read.
     if (!fw && sealId) {
-      let row: { framework?: string | null };
-      try {
-        const r = await fetch(`${this.baseUrl()}/deployment/${sealId}`, {
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        row = (await r.json()) as { framework?: string | null };
-      } catch (e) {
-        throw new Error(
-          `cannot read /deployment/${sealId} to pick the sealed image (${errMsg(e)}); ` +
-            "retry, or pass `framework` (or `sealedImage`) explicitly",
-        );
-      }
-      fw = row.framework ?? undefined;
+      const known = row ?? (await this.deploymentRow(sealId, 'pick the sealed image'));
+      fw = typeof known.framework === 'string' ? known.framework : undefined;
     }
     // Rides the instance's memoized /config (review #154 N3a) — this was the
     // one remaining uncached fetch on the deploy/reset/first-start path.
     const cfg: any = await this.attestorConfig();
     if (fw && Array.isArray(cfg?.frameworks)) {
       const entry = cfg.frameworks.find((f: any) => f?.name === fw);
-      if (entry?.image) return entry.image;
+      // A framework this attestor does not offer has no image here. The
+      // default snapshot belongs to another framework, and booting the agent
+      // on it fails only once the container is up, so refuse instead.
+      if (!entry) {
+        const offered = cfg.frameworks.map((f: any) => f?.name).filter(Boolean).join(', ');
+        throw new Error(
+          `framework "${fw}" is not offered by this attestor (GET /config frameworks: ${offered || 'none'}); ` +
+            'pass `framework` (or `sealedImage`) explicitly, or ask the operator to configure it',
+        );
+      }
+      if (entry.image) return entry.image;
     }
     return (cfg && cfg.sandbox_snapshot) || '';
   }
 
+
+  private providerRegistry?: ProviderRegistryClient;
+  private remoteRegistrySeen = false;
+
+  listProviders(): InferenceProvider[] { return this.providerRegistry?.list() ?? listInferenceProviders(); }
+
+  async getProviderRegistry(): Promise<ProviderRegistrySnapshot> {
+    if (!this.ctx.attestorUrl) return { version: 0, providers: listInferenceProviders() };
+    const cfg = await this.attestorConfig({ fresh: true });
+    this.providerRegistry ??= new ProviderRegistryClient(this.ctx.attestorUrl);
+    if (Object.keys(cfg).length === 0) throw new SecretEnvRefusedError('config_unreadable', 'cannot read GET /config to resolve inference providers');
+    if (cfg.provider_registry_schema !== 1) {
+      if (this.remoteRegistrySeen) throw new Error('provider registry capability was withdrawn');
+      return { version: 0, providers: this.listProviders() };
+    }
+    this.remoteRegistrySeen = true;
+    return this.providerRegistry.refresh({ chainId: this.ctx.chain?.id,
+      contract: this.ctx.addresses?.agenticID, appId: cfg.attestor_app_id, tappRegistry: this.ctx.addresses?.tappRegistry, version: cfg.provider_registry_version, digest: cfg.provider_registry_digest });
+  }
+
+  async providerDefinition(id: string): Promise<InferenceProvider> {
+    const provider = (await this.getProviderRegistry()).providers.find((entry) => entry.id === id);
+    if (!provider) throw new Error(`UNSUPPORTED_INFERENCE_PROVIDER: ${id}`);
+    return provider;
+  }
+
+  /** Build an owner-authorized publication request. Contract-wallet owners
+   * can obtain their signature externally and call publishSignedProviders. */
+  async prepareProviderUpdate(providers: InferenceProvider[], baseVersion: number): Promise<{ document: string; message: string; owner: Address }> {
+    if (!Number.isSafeInteger(baseVersion) || baseVersion < 0) throw new Error('invalid provider base version');
+    providers.forEach(validateProvider);
+    if (!providers.length || providers.length > 128 || new Set(providers.map((p) => p.id)).size !== providers.length || !providers.some((p) => p.id === '0g-compute')) throw new Error('invalid provider registry');
+    const cfg = await this.attestorConfig({ fresh: true });
+    const registry = this.ctx.addresses.tappRegistry;
+    if (!registry || /^0x0{40}$/i.test(registry) || !cfg.attestor_app_id) throw new Error('attestor TappRegistry/app ID is not configured');
+    const info = await this.ctx.publicClient.readContract({ address: registry, abi: tappRegistryAbi,
+      functionName: 'getAppInfo', args: [cfg.attestor_app_id] });
+    const owner = info.owner;
+    if (/^0x0{40}$/i.test(owner)) throw new Error('attestor Tapp has no owner');
+    if (!this.ctx.addresses.agenticID) throw new Error('provider update requires an AgenticID contract');
+    const document = JSON.stringify({ schema: 1, chain_id: this.ctx.chain.id, agentic_id_addr: this.ctx.addresses.agenticID,
+      tapp_registry_addr: registry, attestor_app_id: cfg.attestor_app_id, base_version: baseVersion, expires_at: Math.floor(Date.now() / 1000) + 180, providers });
+    if (new TextEncoder().encode(document).length > 256 * 1024) throw new Error('provider document too large');
+    return { document, message: registrySigningMessage(document), owner };
+  }
+
+  async publishSignedProviders(update: { document: string; signature: `0x${string}` }): Promise<{ version: number }> {
+    const response = await fetch(`${this.baseUrl()}/admin/inference/providers`, { method: 'PUT',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify(update), signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) throw new Error(`provider update: HTTP ${response.status} ${await response.text()}`);
+    return response.json() as Promise<{ version: number }>;
+  }
+
+  async updateProviders(providers: InferenceProvider[], baseVersion: number): Promise<{ version: number }> {
+    const { account, walletClient } = requireWallet(this.ctx);
+    const prepared = await this.prepareProviderUpdate(providers, baseVersion);
+    if (prepared.owner.toLowerCase() !== account.address.toLowerCase()) throw new Error('wallet is not the current attestor Tapp owner; contract wallets can use prepareProviderUpdate/publishSignedProviders');
+    const signature = await walletClient.signMessage({ account, message: prepared.message });
+    return this.publishSignedProviders({ document: prepared.document, signature });
+  }
+
+  private async credentialRoute(provider: string, image: string | undefined, sealId: `0x${string}` | undefined): Promise<{ hash: string; registry: import('./Providers').ProviderRegistryPin } | undefined> {
+    const accepted = await this.getProviderRegistry();
+    const definition = accepted.providers.find((p) => p.id === provider);
+    if (!definition) throw new Error(`UNSUPPORTED_INFERENCE_PROVIDER: ${provider}`);
+    const builtin = listInferenceProviders().find((entry) => entry.id === provider);
+    const changed = !builtin || routeHash(builtin) !== routeHash(definition);
+    if (changed && !sealId) throw new SecretEnvRefusedError('sealed_needs_agent', SEALED_NEEDS_AGENT);
+    const cfg = await this.attestorConfig();
+    const snapshot = image ?? (sealId ? await this.resolveSealedImage(undefined, undefined, sealId) : undefined);
+    const capable = cfg.inference_capabilities?.some((entry) => entry.image === snapshot && entry.secret_env_versions.includes(3)
+      && (definition.native ? entry.providers.includes(provider) : definition.formats.every((format) => entry.formats?.includes(format))));
+    if (changed && !capable) throw new SecretEnvRefusedError('provider_binding_unsupported', `image ${snapshot || '(unknown)'} does not support dynamic provider routes for ${provider}`);
+    return capable && sealId ? { hash: routeHash(definition), registry: { version: accepted.version,
+      ...(accepted.version > 0 ? { digest: acceptedRegistryDigest(accepted.document!, accepted.signature!) } : {}) } } : undefined;
+  }
+
+  /** Verify support for an exact runtime image before signing an owner action. */
+  async assertProviderSupported(provider: string, options: { sealId?: `0x${string}`; framework?: string; sealedImage?: string } = {}): Promise<void> {
+    const definition = await this.providerDefinition(provider);
+    const builtin = listInferenceProviders().find((entry) => entry.id === provider);
+    const changed = !builtin || routeHash(builtin) !== routeHash(definition);
+    if (provider === '0g-compute' && !changed) return;
+    const cfg = await this.attestorConfig({ fresh: true });
+    const image = await this.resolveSealedImage(options.sealedImage, options.framework, options.sealId);
+    const capabilities = Array.isArray(cfg.inference_capabilities) ? cfg.inference_capabilities : [];
+    const supported = !!image && cfg.secret_env_scheme === SECRET_ENV_SCHEME && capabilities.some((entry) =>
+      entry.image === image && (
+        (!changed && entry.providers.includes(provider) && entry.secret_env_versions.includes(2)) ||
+        (entry.secret_env_versions.includes(3) && (definition.native ? entry.providers.includes(provider) : definition.formats.every((format) => entry.formats?.includes(format))))));
+    if (!supported) throw new SecretEnvRefusedError('provider_binding_unsupported',
+      `image ${image || '(unknown)'} does not advertise provider-bound credentials for ${provider}; upgrade the sealed image and its attestor capabilities first`);
+  }
 
   /**
    * The agent's agentSeal public key (compressed hex), verified before
@@ -501,10 +698,14 @@ export class AttestorClient {
    * does. Throws {@link SecretEnvRefusedError}; returns the base64 value for
    * `env.SEAL_SECRET_ENV`.
    */
-  async sealApiKey(params: { sealId: `0x${string}`; owner: Address; apiKey: string }): Promise<string> {
+  async sealApiKey(params: { sealId: `0x${string}`; owner: Address; apiKey: string; provider?: string; framework?: string; sealedImage?: string }): Promise<string> {
     if (!params.apiKey) throw new SecretEnvRefusedError('invalid_input', 'sealApiKey: apiKey is required');
     if (!isAddress(params.owner)) throw new SecretEnvRefusedError('invalid_input', 'sealApiKey: owner is not an address');
     await this.requireSecretEnvScheme('sealApiKey');
+    const provider = params.provider ?? '0g-compute';
+    await this.assertProviderSupported(provider, params);
+    const image = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
+    const boundRoute = await this.credentialRoute(provider, image, params.sealId);
     const { pubkey, onChain } = await this.verifiedAgentSeal(params.sealId);
     if (onChain) {
       let chainOwner: Address;
@@ -526,7 +727,7 @@ export class AttestorClient {
         );
       }
     }
-    return sealSecretEnv(pubkey, params.owner, { API_KEY: params.apiKey });
+    return sealSecretEnv(pubkey, params.owner, { API_KEY: params.apiKey }, boundRoute || provider !== '0g-compute' ? provider : undefined, boundRoute?.hash, boundRoute?.registry);
   }
 
   /** On-chain agentId + agentSeal of a minted agent; null before the mint
@@ -619,14 +820,16 @@ export class AttestorClient {
    *  EVERY boot (including a resume, which a create-time variable misses) and
    *  can be changed without a recreate. See {@link SettingsDoc}. */
   private async sandboxEnv(p: {
+    image?: string;
     sealId?: `0x${string}`;
     apiKey?: string;
+    provider?: string;
     sealedSecretEnv?: string;
     mode?: SecretEnvMode;
   }): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
     if (p.apiKey || p.sealedSecretEnv !== undefined) {
-      Object.assign(env, await this.keyEnv(p.apiKey, p.sealedSecretEnv, p.mode ?? 'auto', p.sealId));
+      Object.assign(env, await this.keyEnv(p.apiKey, p.sealedSecretEnv, p.mode ?? 'auto', p.sealId, p.provider, p.image));
     }
     return env;
   }
@@ -653,8 +856,21 @@ export class AttestorClient {
     sealedSecretEnv: string | undefined,
     mode: SecretEnvMode,
     sealId?: `0x${string}`,
+    provider = '0g-compute',
+    image?: string,
   ): Promise<Record<string, string>> {
     assertSecretEnvMode(mode);
+    const boundRoute = await this.credentialRoute(provider, image, sealId);
+    if (boundRoute) {
+      if (mode === 'plaintext') throw new SecretEnvRefusedError('provider_binding_unsupported', 'dynamic routes require sealed credentials');
+      mode = 'sealed';
+    }
+    if (provider !== '0g-compute') {
+      if (!sealId) throw new SecretEnvRefusedError('sealed_needs_agent', SEALED_NEEDS_AGENT);
+      if (mode === 'plaintext') throw new SecretEnvRefusedError('provider_binding_unsupported', 'non-compute providers require a provider-bound sealed key');
+      await this.assertProviderSupported(provider, { sealId, sealedImage: image });
+      mode = 'sealed';
+    }
     if (sealedSecretEnv !== undefined) {
       if (apiKey) {
         throw new SecretEnvRefusedError('conflicting_inputs', 'pass apiKey or sealedSecretEnv, not both');
@@ -679,7 +895,7 @@ export class AttestorClient {
     }
     const { account } = requireWallet(this.ctx);
     const pubkey = await this.agentSealPubkey(sealId);
-    return { [SECRET_ENV_VAR]: sealSecretEnv(pubkey, account.address, { API_KEY: apiKey }) };
+    return { [SECRET_ENV_VAR]: sealSecretEnv(pubkey, account.address, { API_KEY: apiKey }, boundRoute || provider !== '0g-compute' ? provider : undefined, boundRoute?.hash, boundRoute?.registry) };
   }
 
   /** Sandbox "create" envelope for deploy (relayed to the provider). */
@@ -706,6 +922,16 @@ export class AttestorClient {
    * the way to force a fresh boot (e.g. after a new sealed image, or
    * stuck-state recovery). All are owner-signed; the attestor + sandbox
    * both re-verify.
+   *
+   * `start` and `reset` first read the agent's public deployment row. When
+   * the agent has no settings document and is a clone or has provisioned
+   * before ({@link needsDefaultSettings}), the boot would come up with no
+   * model, so {@link DEFAULT_PERSONA_INFERENCE} is stored as its first
+   * document (one more owner signature) before the envelope is signed. That
+   * write comes after every check that can refuse the call, so a refused
+   * call writes nothing; a document that already exists is never replaced.
+   * Such an agent cannot be started on another `provider` until its settings
+   * name one: the call refuses before anything is written or signed.
    */
   async lifecycle(
     op: 'stop' | 'start' | 'reset',
@@ -725,6 +951,8 @@ export class AttestorClient {
        *  comes back alive but can't call its model. Sealed to the agent when
        *  the attestor supports it (see `secretEnv`). */
       apiKey?: string;
+      /** Credential provider; defaults to legacy compute. */
+      provider?: string;
       /** The key already sealed to this agent (the value {@link sealApiKey}
        *  returned, e.g. on an integrator's server), in place of `apiKey`:
        *  signed verbatim as `SEAL_SECRET_ENV`, so the key never has to reach
@@ -737,35 +965,66 @@ export class AttestorClient {
   ): Promise<void> {
     const { account } = requireWallet(this.ctx);
     const ttl = params.envelopeTtlSec ?? 180;
-    let envelope;
     // `reset`, OR a first-time `start` of a never-provisioned (mint-only)
     // agent: both spin a FRESH container via the `create` envelope. A `start`
     // WITH a sandboxId resumes an existing (stopped) container instead.
-    if (op === 'reset' || (op === 'start' && !params.sandboxId)) {
-      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
-      envelope = await this.signEnvelope(
-        'create',
-        '',
-        {
-          snapshot,
-          sealed: true,
-          ...(params.apiKey || params.sealedSecretEnv !== undefined
-            ? {
-                env: await this.sandboxEnv({
-                  sealId: params.sealId,
-                  apiKey: params.apiKey,
-                  sealedSecretEnv: params.sealedSecretEnv,
-                  mode: params.secretEnv,
-                }),
-              }
-            : {}),
-        },
-        ttl,
-      );
-    } else {
-      if (!params.sandboxId) throw new Error(`${op}: sandboxId is required`);
-      envelope = await this.signEnvelope(op, params.sandboxId, {}, ttl);
+    const create = op === 'reset' || (op === 'start' && !params.sandboxId);
+    if (!create && !params.sandboxId) throw new Error(`${op}: sandboxId is required`);
+    if (create && params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined) {
+      throw new SecretEnvRefusedError('invalid_input', `reset/start for ${params.provider} requires its API key`);
     }
+    // Every boot a start or reset brings about is served the agent's settings
+    // document, so an agent that would boot with no model gets the default
+    // one stored first (see needsDefaultSettings). The row is read, and every
+    // check below that can refuse runs, before anything is written or signed.
+    let seed: { provider: string; model: string } | null = null;
+    let row: Record<string, unknown> | undefined;
+    if (op !== 'stop') {
+      row = await this.deploymentRow(
+        params.sealId,
+        create && !params.sealedImage && !params.framework
+          ? "pick the sealed image and check the agent's settings"
+          : "check the agent's settings",
+      );
+      seed = this.defaultSettingsFor(row);
+      if (seed && params.provider && params.provider !== seed.provider) {
+        throw new Error(
+          `${op}: agent ${params.sealId} has no settings document and could boot with no model; ` +
+            `write its settings (provider ${params.provider} and a model) with setSettings first`,
+        );
+      }
+    }
+    let action: string = op;
+    let resourceId = params.sandboxId ?? '';
+    let payload: Record<string, unknown> = {};
+    if (create) {
+      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId, row);
+      action = 'create';
+      resourceId = '';
+      payload = {
+        snapshot,
+        sealed: true,
+        ...(params.apiKey || params.sealedSecretEnv !== undefined
+          ? {
+              env: await this.sandboxEnv({
+                sealId: params.sealId,
+                provider: params.provider,
+                image: snapshot,
+                apiKey: params.apiKey,
+                sealedSecretEnv: params.sealedSecretEnv,
+                mode: params.secretEnv,
+              }),
+            }
+          : {}),
+      };
+    }
+    if (seed) {
+      await storeDefaultSettings(
+        { setSettings: (sealId, settings, opts) => this.setSettings({ sealId, settings, baseVersion: opts.baseVersion }) },
+        params.sealId,
+      );
+    }
+    const envelope = await this.signEnvelope(action, resourceId, payload, ttl);
     // A no-sandboxId `start` still POSTs /start; the attestor dispatches on the
     // envelope action (create → fresh provision, start → resume).
     const path = op === 'reset' ? '/reset' : `/${op}`;
@@ -867,8 +1126,17 @@ export class AttestorClient {
     onWarn?: (warning: string) => void;
   }): Promise<{ version: number }> {
     const { walletClient, account } = requireWallet(this.ctx);
+    // The container refuses any other level (Go settings.Levels, compared
+    // case-insensitively); storing one would only fail the live push and
+    // then reach the next boot.
+    const thinking = params.settings.thinking as string | undefined;
+    if (thinking !== undefined && thinking.trim() !== ''
+      && !(THINKING_LEVELS as readonly string[]).includes(thinking.trim().toLowerCase())) {
+      throw new Error(`setSettings: thinking must be one of ${THINKING_LEVELS.join('|')}, got "${thinking}"`);
+    }
+    if (params.settings.provider) await this.assertProviderSupported(params.settings.provider, { sealId: params.sealId });
     if (params.onWarn) {
-      for (const w of await modelAdvisory(params.settings)) params.onWarn(w);
+      for (const w of await modelAdvisory(params.settings, await this.providerDefinition(params.settings.provider ?? '0g-compute'))) params.onWarn(w);
     }
     // ONE serialization: hashed here, spliced into the body below.
     const canonical = canonicalSettings(params.settings);
@@ -951,6 +1219,7 @@ export class AttestorClient {
     framework?: string;
     sealedImage?: string;
     apiKey?: string;
+    provider?: string;
     /** In place of `apiKey`: the key already sealed to this agent; see
      *  {@link lifecycle}'s `sealedSecretEnv`. */
     sealedSecretEnv?: string;
@@ -958,6 +1227,9 @@ export class AttestorClient {
     secretEnv?: SecretEnvMode;
     envelopeTtlSec?: number;
   }): Promise<void> {
+    if (params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined) {
+      throw new SecretEnvRefusedError('invalid_input', `retry for ${params.provider} requires its API key`);
+    }
     const { account } = requireWallet(this.ctx);
     const body: Record<string, unknown> = { seal_id: params.sealId, owner: account.address };
     if (params.apiKey || params.sealedSecretEnv !== undefined) {
@@ -970,6 +1242,8 @@ export class AttestorClient {
           sealed: true,
           env: await this.sandboxEnv({
             sealId: params.sealId,
+            provider: params.provider,
+            image: snapshot,
             apiKey: params.apiKey,
             sealedSecretEnv: params.sealedSecretEnv,
             mode: params.secretEnv,
@@ -999,6 +1273,10 @@ export class AttestorClient {
     // Fail before the first signature: a one-shot deploy signs its create
     // envelope before the agent exists, so it can never seal the key.
     assertSecretEnvMode(params.sandbox?.secretEnv);
+    const seed = params.iData?.find((entry) => entry.role === 'persona')?.plaintext as { inference?: { provider?: string } } | undefined;
+    const provider = seed?.inference?.provider ?? params.inference?.provider ?? '0g-compute';
+    await this.providerDefinition(provider);
+    if (params.sandbox && provider !== '0g-compute') throw new SecretEnvRefusedError('sealed_needs_agent', SEALED_NEEDS_AGENT);
     if (params.sandbox?.apiKey && params.sandbox.secretEnv === 'sealed') {
       throw new SecretEnvRefusedError('sealed_needs_agent', SEALED_NEEDS_AGENT);
     }
@@ -1013,6 +1291,18 @@ export class AttestorClient {
           inference: params.inference,
         });
     const iData = source.map((d) => ({ role: d.role, plaintext: d.plaintext, extra: d.extra ?? {} }));
+    // The create envelope's image follows the framework the agent is minted
+    // with: a caller's own iData binds it, and the default snapshot belongs
+    // to openclaw, so signing it for a hermes binding would boot the agent
+    // on an image without its runtime.
+    const bound = params.iData?.length ? iDataFramework(params.iData) : undefined;
+    if (bound && params.framework && params.framework !== bound) {
+      throw new Error(
+        `framework "${params.framework}" disagrees with the iData's framework binding "${bound}"; ` +
+          'omit `framework` or bind the same name',
+      );
+    }
+    const framework = bound ?? params.framework;
 
     // Owner canonical — must match CanonicalDeploy (order is irrelevant; the
     // attestor deserializes then re-checks each field).
@@ -1029,7 +1319,7 @@ export class AttestorClient {
     // Provision only when a sandbox is given; omit it → mint-only deploy
     // (attestor mints, no container — the agent lands Offline).
     const sandbox_envelope = params.sandbox
-      ? await this.sandboxEnvelope(params.sandbox, params.envelopeTtlSec ?? 180, params.framework)
+      ? await this.sandboxEnvelope(params.sandbox, params.envelopeTtlSec ?? 180, framework)
       : undefined;
 
     return this.post('/deploy', {

@@ -303,6 +303,17 @@
  },
  {
   "type": "error",
+  "name": "CloneGateSourceSealReused",
+  "inputs": [
+   {
+    "name": "agentSeal",
+    "type": "address",
+    "internalType": "address"
+   }
+  ]
+ },
+ {
+  "type": "error",
   "name": "InvalidInitialization",
   "inputs": []
  },

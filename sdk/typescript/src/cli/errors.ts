@@ -1,6 +1,6 @@
 /**
  * @file errors.ts
- * @description Error codes + exit-code semantics for the `0g-agenticid` CLI —
+ * @description Error codes + exit-code semantics for the `0g-agentdna` CLI —
  * part of the gene-layer contract (spec v0.03 §2.3) consumed by scripts and
  * agents. Both the code strings and the code→exit mapping are APPEND-ONLY:
  * adding a code is fine, renaming or renumbering is a breaking change.
@@ -33,6 +33,8 @@ export type ErrorCode =
   | 'PREFLIGHT_ACK'
   | 'PREFLIGHT_BALANCE'
   | 'SETTINGS_CONFLICT'
+  | 'INFERENCE_KEY_REQUIRED'
+  | 'INFERENCE_PROVIDER_UNSUPPORTED'
   // exit 4 — timeout
   | 'TIMEOUT'
   // exit 5 — auth/ownership
@@ -67,6 +69,8 @@ const EXIT_BY_CODE: Record<ErrorCode, number> = {
   // caller has looked at `details.current`, which is why this is an error and
   // not a silent retry.
   SETTINGS_CONFLICT: EXIT.REMEDIABLE,
+  INFERENCE_KEY_REQUIRED: EXIT.REMEDIABLE,
+  INFERENCE_PROVIDER_UNSUPPORTED: EXIT.REMEDIABLE,
   TIMEOUT: EXIT.TIMEOUT,
   AUTH_REJECTED: EXIT.AUTH,
 };
@@ -101,5 +105,10 @@ export class CliError extends Error {
 /** Wrap any thrown value into a CliError (unknown → exit 1). */
 export function toCliError(e: unknown): CliError {
   if (e instanceof CliError) return e;
+  if (e instanceof Error && (e as Error & { code?: string }).code === 'provider_binding_unsupported') {
+    return new CliError('INFERENCE_PROVIDER_UNSUPPORTED', e.message, {
+      remedy: 'ask the attestor operator to enable provider-bound credentials for this runtime image, then retry',
+    });
+  }
   return new CliError('UNKNOWN', e instanceof Error ? e.message : String(e));
 }

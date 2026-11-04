@@ -4,13 +4,27 @@ pragma solidity ^0.8.20;
 import {IERC8004ReputationRegistry} from "./IERC8004ReputationRegistry.sol";
 
 /// @notice Proof of a real service interaction, signed by agentSeal inside the TEE.
-/// @dev agentSeal private key never leaves TEE memory, so the owner cannot forge
-///      this proof. dataHashes and frameworkHash are recorded as audit data —
+/// @dev The agentSeal private key never leaves TEE memory — but key custody
+///      alone does NOT make this proof unforgeable: the agent process inside
+///      the TEE can have the sealed sign socket sign messages with agentSeal,
+///      so the verifier's signed digest must be a preimage the socket never
+///      produces. dataHashes and frameworkHash are recorded as audit data —
 ///      they are part of the signed message and therefore trusted, but are NOT
 ///      re-verified against on-chain state at submission time.
-///      Signed payload: keccak256(abi.encode(block.chainid, identityRegistry,
-///          submitter, agentId, timestamp, deadline, taskHash,
+///      Inner hash: proofHash = keccak256(abi.encode(block.chainid,
+///          identityRegistry, submitter, agentId, timestamp, deadline, taskHash,
 ///          keccak256(abi.encodePacked(dataHashes)), frameworkHash)).
+///      Signed digest (signed raw) depends on the verifier:
+///        - VerifiedFeedbackRegistry >= 1.2.0: keccak256(0x19 ‖ 0x00 ‖
+///          registry proxy ‖ proofHash) — EIP-191 version 0x00, bound to that
+///          one registry. The sign socket only signs 0x19 0x45 (personal_sign),
+///          0x19 0x01 (typed_data) or socket-built transaction preimages, so
+///          the agent cannot forge it offline.
+///        - the DEPRECATED AgenticIDReputationRegistry: the legacy
+///          toEthSignedMessageHash(proofHash) personal_sign wrap — exactly what
+///          the socket's /sign/personal_sign returns for a 32-byte message, so
+///          the agent process CAN forge proofs this fork accepts (audit
+///          FIND-01). Live fork instances must be paused.
 ///      Replay protection: nonce key is keccak256("SERVEPROOF" ‖ agentId ‖ signature)
 ///      — the signature is unique per sealed payload so it doubles as the nonce.
 ///
@@ -45,7 +59,8 @@ struct ServeProof {
     ///      — that lives in the agent's config data.
     ///      Stored for auditability; not validated against any whitelist.
     bytes32   frameworkHash;
-    /// @dev ECDSA signature over the fields above, signed by agentSeal.
+    /// @dev ECDSA signature by agentSeal over the verifier's signed digest of
+    ///      the fields above (see the struct natspec — differs per verifier).
     bytes     signature;
 }
 
@@ -53,10 +68,17 @@ struct ServeProof {
 error AgenticIDProofRequired();
 
 /// @title AgenticID Reputation Registry
-/// @notice Extends ERC-8004 Reputation Registry to require a TEE-signed ServeProof
+/// @notice DEPRECATED — superseded by VerifiedFeedbackRegistry. It still
+///         verifies the legacy personal_sign ServeProof digest, which the agent
+///         process can obtain for any proofHash from its own sign socket (audit
+///         FIND-01), so guarantee 1 below does NOT hold: live instances must be
+///         paused by their pauser no later than the VerifiedFeedbackRegistry
+///         1.2.0 cut. Original design:
+///
+///         Extends ERC-8004 Reputation Registry to require a TEE-signed ServeProof
 ///         on every feedback submission, providing two guarantees:
 ///
-///         1. Anti-Sybil: no real service call → no TEE-signed proof → no feedback accepted.
+///         1. Anti-Sybil (as designed): no real service call → no TEE-signed proof → no feedback accepted.
 ///
 ///         2. Data transparency: each reputation record stores dataHashes and
 ///            frameworkHash on-chain so buyers can compare them against the
@@ -99,7 +121,8 @@ interface IAgenticIDReputationRegistry is IERC8004ReputationRegistry {
     /// @notice Submit feedback backed by a TEE-signed serve proof.
     /// @dev The contract verifies:
     ///      1. proof.signature is valid against the agentSeal registered for agentId,
-    ///         over a digest bound to this chain + identity registry.
+    ///         over a digest bound to this chain + identity registry (legacy
+    ///         personal_sign wrap — see the ServeProof natspec).
     ///      2. proof.submitter == msg.sender (only the declared client may redeem).
     ///      The agentSeal signature alone proves TEE origin and binds the proof to the
     ///      specific data and framework that performed the service; dataHashes and

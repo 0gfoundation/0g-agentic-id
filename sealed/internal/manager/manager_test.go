@@ -379,3 +379,59 @@ func TestPreStartFailureAbortsStart(t *testing.T) {
 		t.Fatal("adapter.Start must not run after a failed PreStart")
 	}
 }
+
+// armState passes the serve-proof fields to state.Agent.Set as adjacent
+// positional strings (…, chainID, identityAddr, validator). A swap there would
+// still compile and silently make every proof unredeemable, so pin the whole
+// RuntimeContext → armState → state.Agent path with distinct values, on the
+// initial Start and again after a Reload replays the captured params.
+func TestArmState_ProofFieldsFromRuntime(t *testing.T) {
+	agent := state.New()
+	m := New(&fakeAdapter{}, agent, Config{MaxRetries: 1, LivenessProbeInterval: time.Hour})
+	const (
+		agentID       = "42"
+		frameworkHash = "0x4444444444444444444444444444444444444444444444444444444444444444"
+		chainID       = "16602"
+		identityAddr  = "0x00000000000000000000000000000000000000A9"
+		validator     = "0x00000000000000000000000000000000000000B7"
+		sealID        = "0x5ea1"
+		owner         = "0x00000000000000000000000000000000000000C1"
+	)
+	err := m.Start(context.Background(), StartParams{
+		AgentSealPriv: []byte{0x01},
+		SealID:        sealID,
+		Owner:         owner,
+		Runtime: framework.RuntimeContext{
+			AgentID:              agentID,
+			FrameworkHash:        frameworkHash,
+			ChainID:              chainID,
+			ContractAddr:         identityAddr,
+			VerifiedFeedbackAddr: validator,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer m.Stop(context.Background())
+
+	check := func(when string) {
+		t.Helper()
+		gotChain, gotIdentity, gotValidator := agent.ProofDomain()
+		if gotChain != chainID || gotIdentity != identityAddr || gotValidator != validator {
+			t.Fatalf("%s: ProofDomain = (%q, %q, %q), want (%q, %q, %q)",
+				when, gotChain, gotIdentity, gotValidator, chainID, identityAddr, validator)
+		}
+		gotAgentID, gotFw := agent.ProofIdentity()
+		if gotAgentID != agentID || gotFw != frameworkHash {
+			t.Fatalf("%s: ProofIdentity = (%q, %q), want (%q, %q)", when, gotAgentID, gotFw, agentID, frameworkHash)
+		}
+		if _, _, gotSeal, gotOwner, _ := agent.Snapshot(); gotSeal != sealID || gotOwner != owner {
+			t.Fatalf("%s: Snapshot sealID/owner = (%q, %q), want (%q, %q)", when, gotSeal, gotOwner, sealID, owner)
+		}
+	}
+	check("after Start")
+	if err := m.Reload(context.Background()); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	check("after Reload")
+}

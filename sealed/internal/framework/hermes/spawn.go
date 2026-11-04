@@ -85,21 +85,22 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	// v1 gap — how to expose a service (register at $SEAL_SIGN_SOCK/services).
 	// Marker-delimited; evoSoulMD strips it so only the persona reaches chain.
 	pc := platform.Build(platform.RuntimeSnapshot{
-		SealedVersion:    rt.SealedVersion,
-		FrameworkVersion: probeHermesVersion(ctx),
-		WhitelistMax:     whitelistMax(),
-		AgentSeal:        rt.AgentSeal,
-		AgentID:          rt.AgentID,
-		Owner:            rt.Owner,
-		ChainRPC:         rt.ChainRPC,
-		ContractAddr:     rt.ContractAddr,
-		AttestorURL:      rt.AttestorURL,
-		PublicURL:        rt.PublicURL,
-		SealSignSock:     rt.SealSignSock,
-		Provider:         provider,
-		Model:            model,
-		ZGComputeRouted:  rs.Endpoint != nil,
-		BootTime:         time.Now(),
+		SealedVersion:       rt.SealedVersion,
+		FrameworkVersion:    probeHermesVersion(ctx),
+		WhitelistMax:        whitelistMax(),
+		AgentSeal:           rt.AgentSeal,
+		AgentID:             rt.AgentID,
+		Owner:               rt.Owner,
+		ChainRPC:            rt.ChainRPC,
+		ContractAddr:        rt.ContractAddr,
+		ServeProofValidator: rt.VerifiedFeedbackAddr,
+		AttestorURL:         rt.AttestorURL,
+		PublicURL:           rt.PublicURL,
+		SealSignSock:        rt.SealSignSock,
+		Provider:            provider,
+		Model:               model,
+		ZGComputeRouted:     rs.Endpoint != nil && provider == "0g-compute",
+		BootTime:            time.Now(),
 	})
 	if err := upsertSoulMD(pc, a.FrameworkFacts()); err != nil {
 		logger.Logf("warn: inject platform context into SOUL.md: %v", err)

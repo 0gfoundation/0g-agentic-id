@@ -29,7 +29,7 @@
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use attestor_shared::sandbox::CanonicalSignedMessage;
+use attestor_shared::sandbox::{check_owner_env, CanonicalSignedMessage};
 use attestor_shared::{JobPayload, LifecycleRequest};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -62,6 +62,10 @@ pub async fn handle(
             canonical.action
         )));
     }
+    // Only the inference key may ride the owner's env: refused here, not
+    // when the job reaches the sandbox create.
+    check_owner_env(&canonical.payload)
+        .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
 
     // Real owner authorization: the create envelope must be signed by the
     // current on-chain owner. The previous `req.owner == d.owner` check
@@ -88,7 +92,10 @@ pub async fn handle(
                 supported.join(", ")
             )));
         }
-        state.deployments.set_framework(req.seal_id, fw.clone()).await?;
+        state
+            .deployments
+            .set_framework(req.seal_id, fw.clone())
+            .await?;
     }
 
     state
@@ -153,11 +160,15 @@ mod tests {
             tee_data_verifier_addr: None,
             console_enabled: true,
             secret_env_enabled: false,
+
             cli_latest: String::new(),
             cli_notes: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
-            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
+            frameworks: vec![attestor_shared::Framework {
+                name: "openclaw".into(),
+                image: None,
+            }],
             tapp_socket: None,
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
@@ -181,7 +192,12 @@ mod tests {
     /// A lifecycle request whose envelope is validly signed by `priv_bytes`.
     fn signed_req(seal_id: SealId, priv_bytes: &[u8; 32], action: &str) -> LifecycleRequest {
         let env = attestor_shared::mocks::signed_envelope(priv_bytes, action);
-        LifecycleRequest { seal_id, owner: env.wallet_address, sandbox_envelope: env, framework: None }
+        LifecycleRequest {
+            seal_id,
+            owner: env.wallet_address,
+            sandbox_envelope: env,
+            framework: None,
+        }
     }
 
     struct Setup {
@@ -229,11 +245,11 @@ mod tests {
             container_stage: StageStatus::Confirmed { at: now },
             sandbox_id: Some("sb-old".into()),
             provisioned_at: Some(now),
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings: None,
             settings_last_good: None,
             settings_version: 0,
@@ -245,6 +261,9 @@ mod tests {
         deployments.seed(d);
 
         let state = AppState {
+            providers: Arc::new(
+                attestor_shared::provider_registry::MemoryProviderRegistry::default(),
+            ),
             cfg: test_config(),
             crypto,
             chain: chain.clone(),
@@ -254,7 +273,14 @@ mod tests {
             jobs: jobs.clone(),
             events,
         };
-        Setup { state, deployments, jobs, chain, owner, seal_id }
+        Setup {
+            state,
+            deployments,
+            jobs,
+            chain,
+            owner,
+            seal_id,
+        }
     }
 
     fn envelope_with_action(action: &str) -> SandboxEnvelope {
@@ -359,6 +385,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_env_key_other_than_the_inference_key_is_400() {
+        let s = make_setup();
+        let env = attestor_shared::mocks::signed_envelope_with_payload(
+            &OWNER_PRIV,
+            "create",
+            "",
+            serde_json::json!({ "env": { "API_KEY": "sk", "HTTPS_PROXY": "http://proxy.example" } }),
+        );
+        let req = LifecycleRequest {
+            seal_id: s.seal_id,
+            owner: env.wallet_address,
+            sandbox_envelope: env,
+            framework: None,
+        };
+        let err = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .err()
+            .expect("refused before any job");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message
+                .contains("may carry only API_KEY and SEAL_SECRET_ENV")
+                && err.message.contains("HTTPS_PROXY"),
+            "{}",
+            err.message
+        );
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+
+        // The inference key alone is accepted.
+        let env = attestor_shared::mocks::signed_envelope_with_payload(
+            &OWNER_PRIV,
+            "create",
+            "",
+            serde_json::json!({ "env": { "SEAL_SECRET_ENV": "c2VhbGVk" } }),
+        );
+        let req = LifecycleRequest {
+            seal_id: s.seal_id,
+            owner: env.wallet_address,
+            sandbox_envelope: env,
+            framework: None,
+        };
+        let (status, _) = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect("accepted");
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
     async fn unknown_seal_id_is_404() {
         let s = make_setup();
         let req = lifecycle_req(B256::repeat_byte(0xfe), s.owner, "create");
@@ -385,12 +459,7 @@ mod tests {
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
         assert!(s.jobs.submitted.lock().unwrap().is_empty());
         // deployment row untouched
-        let d = s
-            .deployments
-            .get(s.seal_id)
-            .await
-            .unwrap()
-            .expect("seeded");
+        let d = s.deployments.get(s.seal_id).await.unwrap().expect("seeded");
         assert_eq!(d.sandbox_id.as_deref(), Some("sb-old"));
     }
 

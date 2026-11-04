@@ -26,11 +26,46 @@ service TappService {
   // Get application secret key (private key) - local access only
   rpc GetAppSecretKey(GetAppSecretKeyRequest) returns (GetAppSecretKeyResponse);
 
+  // Stable app signing identity from KMS (fixed provider material), socket only.
+  rpc GetAppSigner(GetAppSignerRequest) returns (GetAppSignerResponse);
+
+  // Get the app's TLS key and certificate - local access only.
+  // The app writes two PEM files and points its server at them; no crypto work is left
+  // to it. Where the key comes from is a deployment choice — see key_source in the
+  // response, which decides whether the public key survives a restart.
+  rpc GetAppTlsCert(GetAppTlsCertRequest) returns (GetAppTlsCertResponse);
+
+  // A certificate signing request for a name of the caller's choosing, signed by the
+  // app's TLS key.
+  //
+  // Public on purpose. A signing request carries a public key, a name, and a signature
+  // proving the requester holds the private half — nothing the certificate it becomes
+  // would not also publish. GetAppTlsCert stays socket-only because it hands over the
+  // private key; this hands over none, and gating it would put an operator with shell
+  // access between an app and its own certificate renewal for no gain.
+  //
+  // Why a request rather than the certificate GetAppTlsCert already returns: that one is
+  // issued for <app-id>.tapp.0g.ai, and a public CA validates the names in the request
+  // against the ones being ordered. Reusing it would fail every time. The key is the same
+  // either way, which is what matters — a certificate issued from this carries the public
+  // key the attestation already commits to, so a browser matching the CA's name and a
+  // verifier matching the attested key both pass, reading different fields.
+  rpc GetAppCsr(GetAppCsrRequest) returns (GetAppCsrResponse);
+
   // Get application information
   rpc GetAppInfo(GetAppInfoRequest) returns (GetAppInfoResponse);
 
+  // List all apps currently on the server
+  rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
+
   // Get TAPP service configuration
   rpc GetTappInfo(GetTappInfoRequest) returns (GetTappInfoResponse);
+
+  // Resolve another app through this tapp's configured, TLS-pinned Scan.
+  // Unix socket only. The caller supplies the registry scope, never the Scan
+  // URL or trust pin. Does not require KMS configuration or fetch any secret.
+  rpc ResolveAppIdentity(ResolveAppIdentityRequest)
+      returns (ResolveAppIdentityResponse);
 
   // Get service status and health information
   rpc GetServiceStatus(GetServiceStatusRequest)
@@ -90,6 +125,33 @@ service TappService {
   // tapp signs the KMS request with its in-memory key, decrypts the response, and returns plaintext.
   rpc GetSecretResource(GetSecretResourceRequest)
       returns (GetSecretResourceResponse);
+
+  // Claim this tapp: set owner + runtime configuration in one atomic measured step.
+  // The signer of the request becomes the tapp owner; chain and KBS config are
+  // applied immediately. Succeeds exactly once per boot; the full config is
+  // extended into the runtime measurement (RTMR) so verifiers see the complete
+  // runtime setup in the attestation evidence. Fails with ALREADY_EXISTS once claimed.
+  //
+  // Two modes:
+  //   Pre-baked: owner/chain/kbs in config.toml → claimed automatically at startup.
+  //   Dynamic:   image ships empty; first ClaimConfig call configures everything.
+  rpc ClaimConfig(ClaimConfigRequest) returns (ClaimConfigResponse);
+
+  // Replace the trust anchors this tapp uses — which KMS cluster it fetches key
+  // material from, and which verifier it believes about that cluster's identity.
+  //
+  // ClaimConfig fixes these for the life of a boot, which does not survive contact
+  // with reality: the verifier's TLS key is re-derived on every one of ITS boots, so
+  // a single verifier restart would otherwise invalidate the pin on every tapp at
+  // once and require re-claiming the fleet.
+  //
+  // Owner only, and every call is extended into the runtime measurement carrying the
+  // resulting state in full. The measurement is what makes mutability safe rather
+  // than a regression: the event log is append-only, so pointing a node at a
+  // counterfeit verifier for five minutes leaves a permanent record anyone reading
+  // the evidence can see. Mutable-and-unmeasured would be strictly worse than fixed.
+  rpc UpdateTrustAnchors(UpdateTrustAnchorsRequest)
+      returns (UpdateTrustAnchorsResponse);
 }
 
 enum LogLevel {
@@ -131,6 +193,11 @@ message StartAppRequest {
   string app_id = 2;  // Application identifier for key binding
   repeated MountFile mount_files =
       3;  // Files to mount (mapped by source_path from compose volumes)
+  // Pull images and compute measurements (compose/volumes/image hashes)
+  // WITHOUT starting containers. Used by the CLI to register the app
+  // on-chain before it actually runs; a follow-up StartApp (without this
+  // flag) then starts the containers from the cached images.
+  bool measure_only = 4;
 }
 
 message StartAppResponse {
@@ -138,6 +205,11 @@ message StartAppResponse {
   string message = 2;
   string task_id = 3;   // Async task identifier for tracking progress
   int64 timestamp = 4;  // Timestamp of the start request
+  // Compose lint findings: data placed where the encrypted volume cannot
+  // protect it, and privilege escapes. Warnings, not errors — the start
+  // proceeds; these exist so the person who wrote the compose SEES them
+  // (a warning only in the server log protects nobody).
+  repeated string compose_warnings = 5;
 }
 
 // Stop App Messages
@@ -160,6 +232,10 @@ message TaskResult {
   string app_id = 1;    // Application identifier (on success)
   string deployer = 2;  // Deployer EVM address (on success)
   string error = 3;     // Error message (on failure)
+  // Measurements, set only for measure_only tasks (see StartAppRequest).
+  string compose_hash = 4;                // Hash of compose file content
+  map<string, string> volumes_hash = 5;   // Map: file_name -> hash
+  map<string, string> image_hash = 6;     // Map: service_name -> image digest
 }
 
 message GetTaskStatusResponse {
@@ -200,8 +276,17 @@ message ListAppMeasurementsResponse {
 // Get Evidence Messages
 message GetEvidenceRequest {
   string app_id = 1;  // Application identifier
-                      // The EVM address (owner) of the app will be
-                      // automatically used as report_data
+
+  // Optional challenge, at most 64 bytes, echoed into the quote's report_data.
+  //
+  // A quote says nothing about when it was produced, so a cached blob looks exactly
+  // like a fresh one. A caller that sends a random value per request can tell them
+  // apart. A caller that fetches once and serves the result to many readers (and
+  // reports it "as of" a timestamp) sends nothing and leaves the field out.
+  //
+  // report_data is sha512 of the `runtime_data` object returned alongside the quote;
+  // see tapp_common::report_data.
+  bytes nonce = 2;
 }
 
 message GetEvidenceResponse {
@@ -216,30 +301,106 @@ message GetEvidenceResponse {
 // Get App Key Messages (replaces GetPubkey)
 message GetAppKeyRequest {
   string app_id = 1;            // Application identifier
-  string key_type = 2;          // Key type: "ethereum", "rsa", "ec"
+  reserved 2, 5;
+  reserved "key_type", "x25519";
   bytes additional_data = 3;    // Additional binding data
   string kbs_resource_uri = 4;  // KBS resource URI for key material
-  bool x25519 = 5;              // Use X25519 key pair
 }
 
 message GetAppKeyResponse {
   bool success = 1;
   string message = 2;
 
-  // Key material (format depends on key_type)
+  // Fixed node-signer public key (64-byte secp256k1, no SEC1 prefix)
   bytes public_key = 3;  // Public key bytes
-  // Ethereum-specific fields (when key_type="ethereum")
+  // Ethereum address of the fixed node signer
   bytes eth_address = 4;        // 20-byte Ethereum address
-  bytes x25519_public_key = 5;  // 32-byte X25519 public key
+  reserved 5;
+  reserved "x25519_public_key";
   // Key provenance
   string key_source = 6;  // Source: "kbs", "in-memory"
+}
+
+// Dedicated app signer. Uses the existing hex(provider) KMS namespace so its
+// secp256k1 address remains stable and compatible with existing sandbox providers.
+message GetAppSignerRequest { string app_id = 1; }
+message GetAppSignerResponse {
+  bool success = 1;
+  string message = 2;
+  bytes secret = 3; // SENSITIVE: raw 32-byte secp256k1 scalar; socket only
+  bytes public_key = 4; // 33-byte SEC1 compressed
+  bytes eth_address = 5;
+  string key_source = 6;
+  string derivation = 7;
+  string commitment_scheme = 8;
+  bytes commitment = 9;
+  bool measured_in_evidence = 10;
+}
+
+// Get App TLS Cert Messages (local access only — carries a private key)
+message GetAppTlsCertRequest {
+  string app_id = 1;  // Application identifier
+}
+
+message GetAppTlsCertResponse {
+  bool success = 1;
+  string message = 2;
+
+  // The two files an ordinary TLS server wants. No crypto work left for the app.
+  string key_pem = 3;
+  string cert_pem = 4;
+
+  // "ca" when a CA signed it, "self-signed" when none is configured. Self-signed is
+  // not a lesser certificate here: what a verifier checks is the public key against
+  // the quote, not the issuer. The issuer matters only to clients that will not do
+  // that check — browsers, anything using a system trust store.
+  string issuer = 5;
+
+  // Always present, so the certificate can be reissued by whatever authority the
+  // deployer prefers (Let's Encrypt, their own CA) without asking for the key again.
+  string csr_pem = 6;
+
+  // sha256 of the SubjectPublicKeyInfo, hex. This is the value the quote's report_data
+  // commits to, so a verifier compares this against the key it was handed during the
+  // handshake. Returned here to save every caller re-deriving it.
+  string public_key_sha256 = 7;
+
+  // "local" or "kms" — where the private key came from. This decides whether the public
+  // key survives a restart, so a client choosing to pin it needs to know: "local" is
+  // bound to this instance and changes when it restarts, "kms" is stable and shared by
+  // every node of the app.
+  string key_source = 8;
+}
+
+message GetAppCsrRequest {
+  string app_id = 1;
+
+  // The name to request, e.g. "api.example.com". Required: there is no useful default,
+  // since the point of asking is that the caller wants a name this service did not choose.
+  string domain = 2;
+}
+
+message GetAppCsrResponse {
+  bool success = 1;
+  string message = 2;
+  string csr_pem = 3;
+
+  // sha256 of the SubjectPublicKeyInfo, hex. The same value the quote's report_data
+  // commits to, returned so a caller can confirm the request carries the attested key
+  // before paying a CA to certify it.
+  string public_key_sha256 = 4;
+
+  // "local" or "kms" — whether this key survives a restart. A CA-issued certificate for a
+  // local key is void the moment the node reboots, which matters before starting an ACME
+  // order against a rate limit.
+  string key_source = 5;
 }
 
 // Get App Secret Key Messages (local access only)
 message GetAppSecretKeyRequest {
   string app_id = 1;    // Application identifier
-  string key_type = 2;  // Key type: "ethereum", "rsa", "ec"
-  bool x25519 = 3;      // Use X25519 key pair
+  reserved 2, 3;
+  reserved "key_type", "x25519";
 }
 
 message GetAppSecretKeyResponse {
@@ -250,7 +411,8 @@ message GetAppSecretKeyResponse {
   bytes private_key = 3;        // Private key bytes (32 bytes for Ethereum)
   bytes public_key = 4;         // Public key bytes (for verification)
   bytes eth_address = 5;        // Ethereum address (if applicable)
-  bytes x25519_public_key = 6;  // 32-byte X25519 public key
+  reserved 6;
+  reserved "x25519_public_key";
 }
 
 message GetAppInfoRequest {
@@ -267,6 +429,21 @@ message GetAppInfoResponse {
   map<string, string> volumes_hash = 6;  // Map: file_name -> hash
   string compose_content = 7;
   map<string, string> image_hash = 9;  // Map: service_name -> image_hash
+}
+
+// List Apps Messages
+message ListAppsRequest {}
+
+message AppSummary {
+  string app_id = 1;
+  string owner = 2;
+  string compose_hash = 3;
+  uint32 image_count = 4;  // number of service images in the compose
+}
+
+message ListAppsResponse {
+  bool success = 1;
+  repeated AppSummary apps = 2;
 }
 
 // Get TAPP Info Messages
@@ -308,12 +485,20 @@ message KbsConfigInfo {
   RetryConfigInfo retry = 4;
 }
 
+
 message TappConfigInfo {
   LoggingConfigInfo logging = 1;
   ServerConfigInfo server = 2;
   BootConfigInfo boot = 3;
-  KbsConfigInfo kbs = 4;  // Null if KBS is not configured
+  KbsConfigInfo kbs = 4;   // Null if KBS is not configured
   bool kbs_enabled = 5;
+  reserved 6;  // was the claimed chain (see ClaimConfigRequest)
+  reserved "chain";
+
+  // Live trust anchors (see UpdateTrustAnchors). Empty when none is configured, which
+  // means KMS node identities cannot be checked — not that they are checked and pass.
+  string scan_url = 7;
+  string scan_public_key = 8;
 }
 
 message GetTappInfoResponse {
@@ -321,6 +506,72 @@ message GetTappInfoResponse {
   string message = 2;
   TappConfigInfo config = 3;
   string version = 4;  // TAPP service version
+}
+
+// App ids are scoped by chain and TappRegistry, not globally unique.
+message ResolveAppIdentityRequest {
+  uint64 chain_id = 1;
+  string registry_address = 2;
+  string app_id = 3;
+}
+
+message ResolvedAppNodeIdentity {
+  // Registered, attested node signer. This is NOT a KMS-derived service signer
+  // (for example a SandboxServing provider); those require a separate binding.
+  string node_signer = 1;
+  // Management/evidence endpoint, not the app's business-service URL.
+  string tee_url = 2;
+  // SHA256 of the APP TLS SubjectPublicKeyInfo, 0x-prefixed hex. Do not use
+  // this pin for tee_url: the management listener has its own TLS identity.
+  string tls_spki_sha256 = 3;
+  int64 checked_at = 4;
+  // Acceptance deadline: min(Scan's expiry, checked_at + 300 seconds).
+  // The result is a cached observation, not proof of liveness after checked_at.
+  int64 expires_at = 5;
+  string tcb_status = 6;
+  repeated string advisories = 7;
+  string image_env = 8;
+  // Stable application signer, derived from an authenticated typed identity.
+  // Empty when the app has not acquired one; never substitute node_signer.
+  string app_signer = 9;
+  repeated ResolvedKeyIdentity identities = 10;
+  repeated ResolvedKeyCommitment key_commitments = 11;
+  // Number of commitments with no replayed event recording attested KMS transport.
+  uint64 kms_unchecked = 12;
+}
+
+message ResolvedKeyCommitment {
+  string commitment = 1;
+  string material = 2;
+  string scheme = 3;
+}
+
+message ResolvedKeyIdentity {
+  string algorithm = 1;
+  string derivation = 2;
+  ResolvedKeyCommitment key_ref = 3;
+  string key_source = 4;
+  string public_key = 5;
+  string public_key_encoding = 6;
+  string role = 7;
+}
+
+message ResolveAppIdentityResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 chain_id = 3;
+  string registry_address = 4;
+  string app_id = 5;
+  repeated ResolvedAppNodeIdentity nodes = 6;
+  // The single live trust-anchor snapshot used for this lookup.
+  string scan_url = 7;
+  string scan_public_key = 8;
+  uint64 scanned_to_block = 9;
+  int64 resolved_at = 10;
+  // Current TappRegistry registration instance, never an observation timestamp.
+  uint64 registered_at = 11;
+  // Future typed service identities / commitment binding proofs can be added
+  // as new fields. Nodes above must never be relabelled as service identities.
 }
 
 // Service Status Messages
@@ -581,9 +832,11 @@ message ContainerStatus {
 message GetSecretResourceRequest {
   string app_id = 1;
   // Optional hex-encoded derivation material, forwarded verbatim to KMS
-  // /app-key (0g-kms#1). Empty = app-scoped key (today's behavior). For
-  // AgenticID = chainId (u64 BE) | contract (20B) | sealId (32B). Passthrough
-  // tracked as 0g-tapp#33; field number to be confirmed with tapp-server.
+  // /app-key, which binds it into the derived key alongside app_id (e.g.
+  // AgenticID: chainId || contractAddress || sealId). Absent/empty derives
+  // purely from the app_id namespace, as before. From tapp-server 0.11.0 it is
+  // refused (INVALID_ARGUMENT) unless it is hex (digits in either case, with an
+  // optional 0x) of at most 256 bytes: it is written into the app's evidence.
   string material = 2;
 }
 
@@ -591,4 +844,84 @@ message GetSecretResourceResponse {
   bool success = 1;
   string message = 2;
   bytes secret = 3;  // plaintext KMS-derived app key
+
+  // Generic KMS bytes do not imply any signing algorithm.
+  reserved 4, 5;
+  reserved "eth_address", "compressed_public_key";
+  string commitment_scheme = 6;
+  bytes commitment = 7; // canonical 32-byte big-endian BN254 scalar field element
+  bool measured_in_evidence = 8; // true only after the measurement was written
+
+}
+
+// ClaimConfig Messages
+message ClaimConfigRequest {
+  // Owner is the EVM address recovered from the request signature
+  // (x-signature / x-timestamp metadata) — no explicit field needed.
+
+  // 1, 2 were chain_rpc_url / chain_contract_address: a node "belonging" to one
+  // registry was only ever a recorded label — registration is the CLI's, against
+  // whatever registry it is pointed at, and the KMS checks its own — so one node can
+  // be registered on several chains. Older clients still sending them are ignored.
+  reserved 1, 2;
+  reserved "chain_rpc_url", "chain_contract_address";
+
+  // Optional: KMS cluster node URLs (e.g. "http://kms-1:9091").
+  // When provided, the KMS client is initialized on this call (no config.toml
+  // [kbs] section needed). Ignored if KBS was already configured at startup.
+  repeated string kbs_node_urls = 3;
+
+  // Optional: where app TLS private keys come from — "local" (default) or "kms".
+  //
+  // Here rather than in config.toml for the same reason the owner is: config.toml
+  // lives in the CVM image, so a field there means a separate image and a separate
+  // set of reference values per choice. Claimed instead, the image stays generic and
+  // the choice becomes a measured fact a verifier can read out of the event log —
+  // which matters, because it decides whether the attested public key survives a
+  // restart.
+  string tls_key_source = 4;
+
+  // Optional: the verifier this tapp believes, and the key that proves it is talking
+  // to that verifier and not to something answering in its place. Both or neither —
+  // see UpdateTrustAnchorsRequest, which can change them later.
+  string scan_url = 5;
+  string scan_public_key = 6;
+}
+
+message ClaimConfigResponse {
+  bool success = 1;
+  string message = 2;
+  string owner_address = 3;  // The claimed owner address (normalized)
+  int64 timestamp = 4;       // Claim timestamp
+}
+
+message UpdateTrustAnchorsRequest {
+  // Empty = leave unchanged. Replaces the cluster wholesale rather than merging,
+  // because a set of nodes is what is being trusted, not each URL independently.
+  repeated string kbs_node_urls = 1;
+
+  // The verifier to ask about a KMS node's attested TLS key, and the sha256 of that
+  // verifier's own TLS SubjectPublicKeyInfo (`0x…`, 32 bytes).
+  //
+  // These move together and are validated together. A URL without a pin is an
+  // unauthenticated channel carrying an assertion, which is worse than having no
+  // verifier configured at all — the answer would be trusted and is rewritable by
+  // anyone on the path. A pin without a URL names nothing. `scan_url` must be
+  // https for the same reason: a pinned key over plaintext proves nothing.
+  //
+  // Both empty = leave unchanged.
+  string scan_url = 2;
+  string scan_public_key = 3;
+}
+
+message UpdateTrustAnchorsResponse {
+  bool success = 1;
+  string message = 2;
+
+  // The resulting anchors, so a caller confirms what took effect rather than
+  // assuming its request was applied verbatim.
+  repeated string kbs_node_urls = 3;
+  string scan_url = 4;
+  string scan_public_key = 5;
+  int64 timestamp = 6;
 }

@@ -36,7 +36,7 @@ export interface Assignment {
   value: string | ThinkingLevel | unknown | undefined;
 }
 
-const USAGE = '0g-agenticid settings <agent> [provider=… model=… thinking=low|high|max others=<json>]';
+const USAGE = '0g-agentdna settings <agent> [provider=… model=… thinking=low|high|max others=<json>]';
 
 /** How to quote a JSON value, in either place it can be typed. */
 const FRAMEWORK_QUOTING =
@@ -88,6 +88,47 @@ export function parseAssignments(args: string[]): Assignment[] {
     out.push({ key: key as SettingsKey, value: raw });
   }
   return out;
+}
+
+/** `others` keys only the 0g-harness adapter reads (sealed `harness/settings.go`). */
+export const HARNESS_ONLY_KEYS = ['toolJobs', 'subagents', 'schedule', 'maxParallelToolCalls'] as const;
+
+/**
+ * Whether `framework` names the 0g-harness adapter. `dsh` is its name before
+ * AgentDNA 1.4, and an attestor not yet upgraded still reports it in
+ * deployment rows and `/config` (sealed reads the old name the same way,
+ * `legacyFrameworkName`). The 1.3 `dsh` adapter reads `toolJobs` and
+ * `maxParallelToolCalls` and ignores `others` keys it does not know.
+ */
+export function isHarnessFramework(framework: string | null | undefined): boolean {
+  return framework === '0g-harness' || framework === 'dsh';
+}
+
+/**
+ * Refuse 0g-harness switches in `others=` for an agent known to run another
+ * framework, before anything is signed. There `others` is that framework's
+ * own configuration, so the switch does nothing, and openclaw goes further:
+ * it refuses a key it does not know, and the adapter then drops the whole
+ * `others` section, the owner's other keys with it. An unknown framework (a
+ * legacy row) is not refused: nothing says the write is wrong, and neither is
+ * `dsh`, the harness's name on a network that still runs AgentDNA 1.3.
+ */
+export function assertOthersFitFramework(assignments: Assignment[], framework: string | null | undefined): void {
+  if (!framework || isHarnessFramework(framework)) return;
+  const others = assignments.find((a) => a.key === 'others')?.value;
+  if (!others || typeof others !== 'object' || Array.isArray(others)) return;
+  const hits = HARNESS_ONLY_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(others, k));
+  if (!hits.length) return;
+  const named = hits.map((k) => `"${k}"`).join(', ');
+  const plural = hits.length > 1;
+  throw new CliError(
+    'BAD_FLAG',
+    `${named} ${plural ? 'are 0g-harness switches' : 'is a 0g-harness switch'}; this agent runs ${framework}, which does not read ${plural ? 'them' : 'it'}` +
+      (framework === 'openclaw'
+        ? ' (openclaw refuses keys it does not know, and the whole others section is then dropped)'
+        : ''),
+    { remedy: `leave ${plural ? 'them' : 'it'} out of others=: background jobs, subagents and reminders are 0g-harness features` },
+  );
 }
 
 /** Merge assignments onto the stored document, producing the document to write. */

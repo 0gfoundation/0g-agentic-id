@@ -5,7 +5,8 @@ import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {
     AgenticIDNotTrustedAttestor,
     AgenticIDZeroSeal,
-    AgenticIDSealIdTaken
+    AgenticIDSealIdTaken,
+    AgenticIDAgentSealTaken
 } from "../src/AgenticID.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
@@ -99,5 +100,29 @@ contract AgentSealTest is AgenticIDTestBase {
         vm.prank(alice);
         vm.expectRevert(AgenticIDNotTrustedAttestor.selector);
         agenticId.registerWithSeal(alice, "", m, d, k, SEAL_ADDR_A, SEAL_ID_A);
+    }
+
+    // ── One seal address per agent (1.2.0: FIND-08) ───────────────────────────
+
+    /// @dev A shared seal could update both agents' iData and sign ServeProofs
+    ///      for both, so a bound seal address cannot be bound again — even under
+    ///      a fresh sealId.
+    function test_registerWithSeal_revertsOnReusedAgentSeal() public {
+        IntelligentData[] memory datas = new IntelligentData[](1);
+        datas[0] = IntelligentData({dataDescription: "d", dataHash: keccak256("seal-a")});
+        bytes[] memory keys = new bytes[](1);
+        keys[0] = SEALED_KEY_ORIGINAL;
+        MetadataEntry[] memory none = new MetadataEntry[](0);
+
+        vm.prank(attestor);
+        agenticId.registerWithSeal(alice, "", none, datas, keys, SEAL_ADDR_A, SEAL_ID_A);
+
+        vm.prank(attestor);
+        vm.expectRevert(abi.encodeWithSelector(AgenticIDAgentSealTaken.selector, SEAL_ADDR_A));
+        agenticId.registerWithSeal(bob, "", none, datas, keys, SEAL_ADDR_A, SEAL_ID_B);
+
+        vm.prank(attestor);
+        uint256 second = agenticId.registerWithSeal(bob, "", none, datas, keys, SEAL_ADDR_B, SEAL_ID_B);
+        assertEq(agenticId.getAgentSeal(second), SEAL_ADDR_B, "a fresh seal still binds");
     }
 }

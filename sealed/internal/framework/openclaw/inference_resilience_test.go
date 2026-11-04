@@ -455,6 +455,38 @@ func TestRenderSettings_OwnerDeclaredProviderIsNotPruned(t *testing.T) {
 	}
 }
 
+func TestRenderSettings_NativePinnedProviderCannotBeRedirectedByOverlay(t *testing.T) {
+	useTempHome(t)
+	s := settings.Resolved{Doc: settings.Doc{Provider: "anthropic", Model: "native-model",
+		Others: json.RawMessage(`{"models":{"providers":{"anthropic":{"baseUrl":"https://wrong.example","api":"anthropic-messages","apiKey":"stale"},"other":{"baseUrl":"https://other.example"}}}}`)}}
+	cfg := renderInto(t, s)
+	providers := cfg["models"].(map[string]any)["providers"].(map[string]any)
+	if _, found := providers["anthropic"]; found {
+		t.Fatal("native endpoint was redefined by the overlay")
+	}
+	if _, found := providers["other"]; !found {
+		t.Fatal("unrelated owner provider was pruned")
+	}
+}
+
+func TestRenderSettings_ManagedPartnerKeepsItsOwnLabelAndCompatibility(t *testing.T) {
+	useTempHome(t)
+	s := settings.Resolved{Doc: settings.Doc{Provider: "partner", Model: "m"},
+		Endpoint: &inference.Endpoint{ProviderID: "partner", Format: inference.WireOpenAI, BaseURL: "https://partner.example/v1", EnvKey: "OPENAI_API_KEY", Compatibility: map[string]any{"supportsDeveloperRole": true}}}
+	cfg := renderInto(t, s)
+	if got := primaryPin(t, cfg); got != "partner/m" {
+		t.Fatalf("wrong pin: %s", got)
+	}
+	entry := providerEntry(t, cfg, "partner")
+	compat := firstModelDef(t, entry)["compat"].(map[string]any)
+	if compat["supportsDeveloperRole"] != true {
+		t.Fatal("0G compatibility overrode partner defaults")
+	}
+	if _, present := compat["requiresStringContent"]; present {
+		t.Fatal("0G-only compatibility leaked to a partner")
+	}
+}
+
 // ── a document openclaw cannot pin ──────────────────────────────────────────
 
 // Doc.Validate permits a model with no provider. openclaw indexes its config

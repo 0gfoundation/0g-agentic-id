@@ -22,10 +22,12 @@
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use attestor_shared::sandbox::{check_owner_env, CanonicalSignedMessage};
 use attestor_shared::{JobPayload, RetryRequest, StageStatus};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
+use base64::Engine as _;
 use serde_json::json;
 
 pub async fn handle(
@@ -47,7 +49,19 @@ pub async fn handle(
     // container is created and no seal is handed out — so the cheaper owner
     // field check is retained for that path.
     match &req.sandbox_envelope {
-        Some(env) => authorize_lifecycle(&state, &d, env).await?,
+        Some(env) => {
+            authorize_lifecycle(&state, &d, env).await?;
+            // The worker may create a container from it: only the inference
+            // key may ride the owner's env, refused here rather than at the
+            // sandbox create.
+            let msg_bytes = base64::engine::general_purpose::STANDARD
+                .decode(env.signed_message_b64.as_bytes())
+                .map_err(|e| ApiError::bad_request(format!("envelope base64: {e}")))?;
+            let canonical: CanonicalSignedMessage = serde_json::from_slice(&msg_bytes)
+                .map_err(|e| ApiError::bad_request(format!("envelope JSON: {e}")))?;
+            check_owner_env(&canonical.payload)
+                .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
+        }
         None => {
             if d.owner != req.owner {
                 return Err(ApiError::unauthorized("owner mismatch"));
@@ -88,6 +102,7 @@ pub async fn handle(
 mod tests {
     use super::*;
     use alloy::primitives::{Address, B256};
+    use alloy::primitives::{Bytes, U256};
     use attestor_shared::crypto::RealCrypto;
     use attestor_shared::mocks::{
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
@@ -97,7 +112,6 @@ mod tests {
         derive_phase, Config, Deployment, DeploymentRepo, IDataArtifact, JobPayload, SealId,
         StageStatus, StorageRoot,
     };
-    use alloy::primitives::{Bytes, U256};
     use chrono::Utc;
     use std::sync::Arc;
 
@@ -151,11 +165,15 @@ mod tests {
             tee_data_verifier_addr: None,
             console_enabled: true,
             secret_env_enabled: false,
+
             cli_latest: String::new(),
             cli_notes: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
-            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
+            frameworks: vec![attestor_shared::Framework {
+                name: "openclaw".into(),
+                image: None,
+            }],
             tapp_socket: None,
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
@@ -205,20 +223,26 @@ mod tests {
             framework: None,
             clone_params: None,
             phase: derive_phase(
-                &StageStatus::Failed { at: now, reason: "x".into() },
+                &StageStatus::Failed {
+                    at: now,
+                    reason: "x".into(),
+                },
                 &StageStatus::NotStarted,
                 &StageStatus::NotStarted,
             ),
-            storage_stage: StageStatus::Failed { at: now, reason: "x".into() },
+            storage_stage: StageStatus::Failed {
+                at: now,
+                reason: "x".into(),
+            },
             mint_stage: StageStatus::NotStarted,
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings: None,
             settings_last_good: None,
             settings_version: 0,
@@ -230,6 +254,9 @@ mod tests {
         deployments.seed(d);
 
         let state = AppState {
+            providers: Arc::new(
+                attestor_shared::provider_registry::MemoryProviderRegistry::default(),
+            ),
             cfg: test_config(),
             crypto,
             chain,
@@ -239,13 +266,23 @@ mod tests {
             jobs: jobs.clone(),
             events,
         };
-        Setup { state, deployments, jobs, owner, seal_id }
+        Setup {
+            state,
+            deployments,
+            jobs,
+            owner,
+            seal_id,
+        }
     }
 
     #[tokio::test]
     async fn happy_path_enqueues_resume_deploy() {
         let s = make_setup();
-        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        let req = RetryRequest {
+            seal_id: s.seal_id,
+            owner: s.owner,
+            sandbox_envelope: None,
+        };
         let (status, _) = handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("must accept");
@@ -267,7 +304,11 @@ mod tests {
             let mut g = s.deployments.by_seal.lock().unwrap();
             g.get_mut(&s.seal_id).unwrap().i_data = vec![test_artifact()];
         }
-        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        let req = RetryRequest {
+            seal_id: s.seal_id,
+            owner: s.owner,
+            sandbox_envelope: None,
+        };
         handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("must accept");
@@ -294,14 +335,22 @@ mod tests {
             d.i_data = vec![test_artifact()];
             d.agent_id = Some(U256::from(9u64)); // minted, but storage still Failed
         }
-        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        let req = RetryRequest {
+            seal_id: s.seal_id,
+            owner: s.owner,
+            sandbox_envelope: None,
+        };
         handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("must accept");
         let submitted = s.jobs.submitted.lock().unwrap();
         match &submitted[0] {
             JobPayload::ResumeDeploy { artifacts, .. } => {
-                assert_eq!(artifacts.len(), 1, "post-mint storage retry must carry the ciphertext");
+                assert_eq!(
+                    artifacts.len(),
+                    1,
+                    "post-mint storage retry must carry the ciphertext"
+                );
             }
             other => panic!("expected ResumeDeploy, got {other:?}"),
         }
@@ -320,14 +369,21 @@ mod tests {
             d.agent_id = Some(U256::from(9u64)); // minted
             d.storage_stage = StageStatus::Confirmed { at: Utc::now() };
         }
-        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        let req = RetryRequest {
+            seal_id: s.seal_id,
+            owner: s.owner,
+            sandbox_envelope: None,
+        };
         handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("must accept");
         let submitted = s.jobs.submitted.lock().unwrap();
         match &submitted[0] {
             JobPayload::ResumeDeploy { artifacts, .. } => {
-                assert!(artifacts.is_empty(), "storage-confirmed retry carries nothing");
+                assert!(
+                    artifacts.is_empty(),
+                    "storage-confirmed retry carries nothing"
+                );
             }
             other => panic!("expected ResumeDeploy, got {other:?}"),
         }
@@ -368,6 +424,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_envelope_env_key_other_than_the_inference_key_is_400() {
+        let s = make_setup();
+        let env = attestor_shared::mocks::signed_envelope_with_payload(
+            &OWNER_PRIV,
+            "create",
+            "",
+            serde_json::json!({ "env": { "API_KEY": "sk", "GODEBUG": "x509sha1=1" } }),
+        );
+        let req = RetryRequest {
+            seal_id: s.seal_id,
+            owner: env.wallet_address,
+            sandbox_envelope: Some(env),
+        };
+        let err = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .err()
+            .expect("refused before any job");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("GODEBUG"), "{}", err.message);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn unknown_seal_id_is_404() {
         let s = make_setup();
         let req = RetryRequest {
@@ -401,8 +480,10 @@ mod tests {
             .err()
             .expect("must reject");
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
-        assert!(s.jobs.submitted.lock().unwrap().is_empty(),
-            "owner-mismatch must not enqueue a job");
+        assert!(
+            s.jobs.submitted.lock().unwrap().is_empty(),
+            "owner-mismatch must not enqueue a job"
+        );
     }
 
     #[tokio::test]
@@ -412,7 +493,11 @@ mod tests {
         // would race with whatever the worker is doing.
         let s = make_setup();
         let before = s.deployments.get(s.seal_id).await.unwrap().unwrap();
-        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        let req = RetryRequest {
+            seal_id: s.seal_id,
+            owner: s.owner,
+            sandbox_envelope: None,
+        };
         let _ = handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("must accept");

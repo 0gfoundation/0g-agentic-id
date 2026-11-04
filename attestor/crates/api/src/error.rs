@@ -89,6 +89,15 @@ impl ApiError {
         }
     }
 
+    pub fn unavailable(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "unavailable",
+            message: msg.into(),
+            details: None,
+        }
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
@@ -35,9 +35,15 @@ error DataVerifierNotPauser();
 ///
 ///         Subclasses implement `_verifyOwnershipProof` for their specific oracle
 ///         (TEE, ZKP, etc.) and call `__BaseDataVerifier_init` in their initializer.
+///
+/// @dev Ownership is two-step (Ownable2StepUpgradeable; TEEDataVerifier 1.2.0+):
+///      transferOwnership proposes, the new owner calls acceptOwnership. The
+///      pending owner lives in OZ's ERC-7201 namespace
+///      (openzeppelin.storage.Ownable2Step), so the swap from OwnableUpgradeable
+///      moves no existing storage.
 abstract contract BaseDataVerifier is
     IERC7857DataVerifier,
-    OwnableUpgradeable,
+    Ownable2StepUpgradeable,
     PausableUpgradeable,
     ReentrancyGuardUpgradeable,
     NonceRegistryUpgradeable
@@ -117,15 +123,23 @@ abstract contract BaseDataVerifier is
     // ── Nonce key derivation ──────────────────────────────────────────────────
 
     /// @dev Transfer access proof nonce key:
-    ///      keccak256("ERC7857_TRANSFER_ACCESS" ‖ msg.sender ‖ nonce).
-    function _accessNonceKey(bytes memory nonce) internal view returns (bytes32) {
-        return keccak256(abi.encode(_TRANSFER_ACCESS_TAG, msg.sender, nonce));
+    ///      keccak256("ERC7857_TRANSFER_ACCESS" ‖ msg.sender ‖ signer ‖ nonce).
+    ///      Scoped per signer (audit FIND-06): unrelated buyers that pick the
+    ///      same nonce bytes no longer collide, and nobody can burn a pending
+    ///      transfer's nonce with an access proof of their own. Storage key
+    ///      only — the signed message is unaffected.
+    function _accessNonceKey(address signer, bytes memory nonce) internal view returns (bytes32) {
+        return keccak256(abi.encode(_TRANSFER_ACCESS_TAG, msg.sender, signer, nonce));
     }
 
     /// @dev Transfer ownership proof nonce key:
-    ///      keccak256("ERC7857_TRANSFER_OWNERSHIP" ‖ msg.sender ‖ nonce).
-    function _ownershipNonceKey(bytes memory nonce) internal view returns (bytes32) {
-        return keccak256(abi.encode(_TRANSFER_OWNERSHIP_TAG, msg.sender, nonce));
+    ///      keccak256("ERC7857_TRANSFER_OWNERSHIP" ‖ msg.sender ‖ tokenId ‖ nonce).
+    ///      Scoped per token (1.2.0): an oracle proof for another token that
+    ///      happens to carry a pending transfer's nonce can no longer burn it.
+    ///      A proof only verifies for its own token, so per-token replay
+    ///      protection is complete.
+    function _ownershipNonceKey(uint256 tokenId, bytes memory nonce) internal view returns (bytes32) {
+        return keccak256(abi.encode(_TRANSFER_OWNERSHIP_TAG, msg.sender, tokenId, nonce));
     }
 
     // ── EIP-191 hash ──────────────────────────────────────────────────────────
@@ -143,8 +157,14 @@ abstract contract BaseDataVerifier is
     // ── Access proof ──────────────────────────────────────────────────────────
 
     /// @dev Signed message:
-    ///      keccak256(abi.encode(chainId, erc7857, dataHash, targetPubkey, nonce, deadline)).
-    ///      Uses abi.encode, NOT encodePacked: targetPubkey and nonce are adjacent
+    ///      keccak256(abi.encode(chainId, erc7857, tokenId, from, isClone, dataHash, targetPubkey, nonce, deadline)).
+    ///      `tokenId` / `from` bind the proof to the token being moved and its
+    ///      owner (audit FIND-05): without them a proof copied from the mempool
+    ///      verified on a look-alike token that merely declared the same
+    ///      dataHash, so the buyer could be handed an impostor token while
+    ///      both nonces burned. `isClone` binds the action, so a buyer's
+    ///      transfer proof cannot be redeemed as a clone (the seller keeping
+    ///      the original). Uses abi.encode, NOT encodePacked: targetPubkey and nonce are adjacent
     ///      dynamic-length fields, and packing them omits the length boundary so a
     ///      signature over one (targetPubkey, nonce) split is equally valid for a
     ///      different split — letting a re-split seal the data to an attacker's key.
@@ -154,11 +174,11 @@ abstract contract BaseDataVerifier is
     ///      AccessProof cannot be replayed against the same dataHash on another
     ///      chain or another token contract. NOTE: the off-chain buyer signer MUST
     ///      match this encoding exactly.
-    function _verifyAccessProof(AccessProof calldata ap, address erc7857)
-        internal view returns (address accessAssistant)
-    {
+    function _verifyAccessProof(
+        AccessProof calldata ap, address erc7857, uint256 tokenId, address from, bool isClone
+    ) internal view returns (address accessAssistant) {
         bytes32 inner = keccak256(abi.encode(
-            block.chainid, erc7857, ap.dataHash, ap.targetPubkey, ap.nonce, ap.deadline
+            block.chainid, erc7857, tokenId, from, isClone, ap.dataHash, ap.targetPubkey, ap.nonce, ap.deadline
         ));
         accessAssistant = _eip191Hash(inner).recover(ap.proof);
         if (accessAssistant == address(0)) revert DataVerifierInvalidAccessProof();
@@ -167,12 +187,18 @@ abstract contract BaseDataVerifier is
     // ── Ownership proof (oracle-specific) ─────────────────────────────────────
 
     /// @dev Subclasses verify the oracle-specific ownership proof for the given
-    ///      ERC-7857 token contract. Must revert on failure.
-    function _verifyOwnershipProof(OwnershipProof calldata op, address erc7857) internal virtual;
+    ///      ERC-7857 token contract, token, owner and action. Must revert on
+    ///      failure.
+    function _verifyOwnershipProof(
+        OwnershipProof calldata op, address erc7857, uint256 tokenId, address from, bool isClone
+    ) internal virtual;
 
     // ── IERC7857DataVerifier ──────────────────────────────────────────────────
 
     function verifyTransferValidity(
+        uint256 tokenId,
+        address from,
+        bool isClone,
         TransferValidityProof[] calldata proofs
     ) external virtual override whenNotPaused nonReentrant returns (TransferValidityProofOutput[] memory outputs) {
         outputs = new TransferValidityProofOutput[](proofs.length);
@@ -187,11 +213,11 @@ abstract contract BaseDataVerifier is
 
             if (ap.dataHash != op.dataHash) revert DataVerifierDataHashMismatch();
 
-            address accessAssistant = _verifyAccessProof(ap, erc7857);
-            _verifyOwnershipProof(op, erc7857); // reverts on failure
+            address accessAssistant = _verifyAccessProof(ap, erc7857, tokenId, from, isClone);
+            _verifyOwnershipProof(op, erc7857, tokenId, from, isClone); // reverts on failure
 
-            _checkAndMarkNonce(_accessNonceKey(ap.nonce),    ap.deadline);
-            _checkAndMarkNonce(_ownershipNonceKey(op.nonce), op.deadline);
+            _checkAndMarkNonce(_accessNonceKey(accessAssistant, ap.nonce), ap.deadline);
+            _checkAndMarkNonce(_ownershipNonceKey(tokenId, op.nonce), op.deadline);
 
             outputs[i] = TransferValidityProofOutput({
                 oracleType:          op.oracleType,

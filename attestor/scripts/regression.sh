@@ -7,14 +7,18 @@
 #   ATTESTOR_URL     attestor base URL           (default http://localhost:8080)
 #   OWNER_PRIV       funded owner key (required) — gas + sandbox balance; the
 #                    self-contained legs also fund ephemeral wallets from it
+#   MODEL_ID         compute model for the source identity smoke (optional)
 #   API_KEY          inference key injected into containers (default a dummy;
 #                    fine — the checks don't exercise the model)
 #   VERIFIED_FEEDBACK_ADDR  VerifiedFeedbackRegistry bound to this AgenticID
 #                    (canonical 8004 reputation registry is discovered from
-#                    it); if unset, the feedback/lifecycle leg is skipped
+#                    it); if unset, the feedback/lifecycle leg is skipped.
+#                    Must equal /config verified_feedback_addr (the
+#                    validator containers sign ServeProofs for) — a mismatch
+#                    aborts before any gas is spent
 #   FEEDBACK_BATCHER_ADDR  optional EIP-7702 batcher for the atomic feedback
 #                    path; unset falls back to /config, then to two txs
-#   RUN_UNIT=1       also run the free T0 suites (cargo/go) first
+#   RUN_UNIT=1       also run the free T0 suites (cargo/go/npm test) first
 #   SKIP_TRANSFER=1  skip the (slow, ~10 min) self-contained transfer-live leg
 #
 # Free negative checks always run. Every live leg spends testnet gas +
@@ -50,21 +54,42 @@ step() { # step "name" cmd...
 skip() { NAMES+=("$1"); RESULTS+=("SKIP"); printf '\n── %s: SKIPPED (%s) ──\n' "$1" "$2"; }
 
 # ── SDK build (needed by the .cjs legs) ───────────────────────────────
-if [ ! -f "$SDK/dist/index.js" ]; then
-  echo "building SDK…"; (cd "$SDK" && npm ci --silent && npm run build --silent) || { echo "SDK build failed"; exit 1; }
+# Build the working tree even if dist already exists: an old artifact would
+# silently test an earlier SDK against the candidate attestor/runtime.
+echo "building SDK…"
+(cd "$SDK" && { [ -d node_modules ] || npm ci --silent; } && npm run build --silent) || { echo "SDK build failed"; exit 1; }
+
+# ── ServeProof validator sanity (free) ───────────────────────────────
+# Containers sign ServeProofs for /config's verified_feedback_addr only; a
+# different registry would reject every proof the feedback leg submits.
+if [ -n "${VERIFIED_FEEDBACK_ADDR:-}" ]; then
+  CFG_VF=$(curl -fsS "$API/config" | jq -r '.verified_feedback_addr // empty')
+  if [ "$(echo "$CFG_VF" | tr '[:upper:]' '[:lower:]')" != "$(echo "$VERIFIED_FEEDBACK_ADDR" | tr '[:upper:]' '[:lower:]')" ]; then
+    echo "VERIFIED_FEEDBACK_ADDR=$VERIFIED_FEEDBACK_ADDR != /config verified_feedback_addr=${CFG_VF:-<unset>} — aborting"
+    exit 1
+  fi
 fi
+
+# ── SDK build (needed by the .cjs legs) ───────────────────────────────
+# Always rebuild: dist/ is not versioned with the source, and a stale one
+# (e.g. a 0.1.x build left from an older checkout) would drive every leg with
+# an outdated ServeProof scheme. Install deps only when they are missing.
+echo "building SDK…"
+(cd "$SDK" && { [ -d node_modules ] || npm ci --silent; } && npm run build --silent) || { echo "SDK build failed"; exit 1; }
 
 # ── T0 unit (optional, free) ──────────────────────────────────────────
 if [ "${RUN_UNIT:-0}" = "1" ]; then
   step "T0 attestor cargo test" bash -c "cd '$ROOT/attestor' && cargo test --workspace --quiet"
   step "T0 sealed go test"      bash -c "cd '$ROOT/sealed' && go test ./... >/dev/null"
+  # Also pins the console's and verify-agent.sh's ServeProof digest copies.
+  step "T0 sdk npm test"        bash -c "cd '$SDK' && npm test >/dev/null"
 fi
 
 # ── negative path (free) ──────────────────────────────────────────────
 step "smoke (negative deploy → 400)" bash -c "cd '$SDK' && node scripts/smoke.cjs"
 
 # ── CLI smoke, public tier (free): read paths + the WALLET_REQUIRED gates ──
-step "cli-smoke (public tier + gates)" bash -c "cd '$SDK' && AGENTIC_ATTESTOR_URL='$API' node scripts/cli-smoke.cjs"
+step "cli-smoke (public tier + gates)" bash -c "cd '$SDK' && env -u OWNER_PRIV -u AGENTIC_PRIVATE_KEY -u AGENTDNA_PRIVATE_KEY AGENTIC_ATTESTOR_URL='$API' node scripts/cli-smoke.cjs"
 
 # ── deploy a fresh source, capture its coordinates ────────────────────
 DEPLOY_LOG="$(mktemp)"
@@ -82,9 +107,7 @@ if [ -n "${SEAL_ID:-}" ]; then
   AGENT_ID=$((AGENT_HEX))
   SANDBOX=$(echo "$ROW" | jq -r .sandbox_id)
   SEAL_ADDR=$(echo "$ROW" | jq -r .agent_seal_addr)
-  PROXY=$(curl -fsS "$API/config" | jq -r .sandbox_proxy_addr)
-  PORT=$(curl -fsS "$API/config" | jq -r .agent_serve_port)
-  AGENT_URL="http://${PORT}-${SANDBOX}.${PROXY}"
+  AGENT_URL=$(echo "$ROW" | jq -er '.agent_card.url | sub("/hello$"; "")')
   echo "source: agent_id=$AGENT_ID seal=$SEAL_ID sandbox=$SANDBOX url=$AGENT_URL"
 
   # CLI owner tier against the fresh deployment: doctor all six green,
@@ -100,8 +123,8 @@ if [ -n "${SEAL_ID:-}" ]; then
   # clone + feedback + transfer + owner gate (consumes the source via transfer, so LAST among source-bound legs).
   # Re-derive the URL first: agent-e2e's reset above recreated the container
   # with a NEW sandbox_id, so the deploy-time AGENT_URL is now stale.
-  SANDBOX=$(owner_deployments | jq -r --arg s "$SEAL_ID" '.[] | select(.seal_id==$s) | .sandbox_id')
-  AGENT_URL="http://${PORT}-${SANDBOX}.${PROXY}"
+  ROW=$(owner_deployments | jq -c --arg s "$SEAL_ID" '.[] | select(.seal_id==$s)')
+  AGENT_URL=$(echo "$ROW" | jq -er '.agent_card.url | sub("/hello$"; "")')
   echo "source url refreshed post-reset: $AGENT_URL"
   if [ -n "${VERIFIED_FEEDBACK_ADDR:-}" ]; then
     step "lifecycle-e2e (clone+feedback+transfer+gate)" bash -c "cd '$SDK' && AGENT_URL='$AGENT_URL' SEAL_ID='$SEAL_ID' AGENT_ID='$AGENT_ID' VERIFIED_FEEDBACK_ADDR='$VERIFIED_FEEDBACK_ADDR' FEEDBACK_BATCHER_ADDR='${FEEDBACK_BATCHER_ADDR:-}' node scripts/lifecycle-e2e.cjs"

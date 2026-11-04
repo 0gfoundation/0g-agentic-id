@@ -49,7 +49,9 @@ contract ERC7857AuthorizeUpgradeable is IERC7857Authorize, ERC7857Upgradeable {
         }
     }
 
-    function revokeAuthorization(uint256 tokenId, address user) public virtual whenNotPaused {
+    /// @dev Not pause-gated, like clearAuthorizedUsers: revoking only takes a
+    ///      privilege away, so owners keep it during an incident (audit FIND-11).
+    function revokeAuthorization(uint256 tokenId, address user) public virtual {
         if (_ownerOf(tokenId) != msg.sender) revert ERC721InvalidSender(msg.sender);
         if (user == address(0)) revert ERC7857InvalidAuthorizedUser(user);
 
@@ -59,7 +61,7 @@ contract ERC7857AuthorizeUpgradeable is IERC7857Authorize, ERC7857Upgradeable {
         emit AuthorizationRevoked(msg.sender, user, tokenId);
     }
 
-    function clearAuthorizedUsers(uint256 tokenId) public virtual whenNotPaused {
+    function clearAuthorizedUsers(uint256 tokenId) public virtual {
         if (_ownerOf(tokenId) != msg.sender) revert ERC721IncorrectOwner(msg.sender, tokenId, _ownerOf(tokenId));
         _clearAuthorized(tokenId);
         emit AuthorizationCleared(msg.sender, tokenId);

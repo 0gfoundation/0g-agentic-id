@@ -42,8 +42,8 @@ test('L1 settings k=v completes after the agent id', () => {
   assert.ok(hits.includes('model=glm-5.3') && hits.includes('model=glm-5.2'));
 });
 
-test('provider= completes the one routed name', () => {
-  assert.deepEqual(completeTail('/settings', 'provider=', MODELS), ['provider=0g-compute']);
+test('provider= completes registered managed and native names', () => {
+  assert.deepEqual(completeTail('/settings', 'provider=', MODELS), ['provider=0g-compute', 'provider=openai', 'provider=anthropic']);
 });
 
 test('others= is opaque — no value suggestions', () => {
@@ -82,7 +82,7 @@ test('compareVersions: suffixed and garbage parts never mis-trigger', () => {
 
 test('hostOf: hostname out of a URL, graceful on garbage', () => {
   assert.equal(hostOf('https://attestor.35-225-105-127.sslip.io'), 'attestor.35-225-105-127.sslip.io');
-  assert.equal(hostOf('https://agenticid.0g.ai/'), 'agenticid.0g.ai');
+  assert.equal(hostOf('https://agentdna.0g.ai/'), 'agentdna.0g.ai');
   assert.equal(hostOf(undefined), 'unset');
   assert.equal(hostOf('not a url'), 'not a url'.slice(0, 24));
 });

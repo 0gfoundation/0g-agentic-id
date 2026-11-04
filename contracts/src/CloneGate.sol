@@ -22,6 +22,9 @@ error CloneGateDenied(uint256 sourceAgentId, address authorizer);
 error CloneGateDataHashMismatch(uint256 index, bytes32 onChain, bytes32 submitted);
 /// @notice dataHashes/sealedKeys length differs from the source's iData count.
 error CloneGateArityMismatch(uint256 expected, uint256 got);
+/// @notice newAgentSeal is the source agent's own seal — the clone must get a
+///         fresh one, or the source TEE could write the clone's mind.
+error CloneGateSourceSealReused(address agentSeal);
 
 /// @title CloneGate
 /// @notice Policy-mode cloning (issue #133) as a SATELLITE of AgenticID: the
@@ -62,7 +65,13 @@ contract CloneGate is Initializable, ReentrancyGuardUpgradeable {
     ///      the EIP-170 deploy limit).
     ///      1.0.1 — CloneGateArityMismatch reports the sealedKeys length when
     ///      that is the mismatched side (was always dataHashes.length).
-    string public constant VERSION = "1.0.1";
+    ///      1.1.0 — cloneFrom rejects a newAgentSeal equal to the source's
+    ///      agentSeal (CloneGateSourceSealReused; audit FIND-08). AgenticID
+    ///      1.2.0 refuses any reused seal address, but only tracks seals bound
+    ///      after its upgrade — this check also covers a source bound before
+    ///      it (other pre-upgrade seals stay untracked). New revert + error,
+    ///      no storage change.
+    string public constant VERSION = "1.1.0";
 
     /// @notice A token's clone policy was set or cleared (authorizer 0 = cleared).
     event CloneAuthorizerSet(uint256 indexed tokenId, address indexed authorizer, address owner);
@@ -187,6 +196,8 @@ contract CloneGate is Initializable, ReentrancyGuardUpgradeable {
         // unchanged (no try/catch) — deliberate, it preserves the policy's
         // diagnostic; a clean deny is `false` → CloneGateDenied.
         id.ownerOf(sourceAgentId);
+        address sourceSeal = id.getAgentSeal(sourceAgentId);
+        if (sourceSeal != address(0) && newAgentSeal == sourceSeal) revert CloneGateSourceSealReused(newAgentSeal);
         address authorizer = cloneAuthorizerOf(sourceAgentId);
         if (authorizer == address(0) ||
             !ICloneAuthorizer(authorizer).canClone(sourceAgentId, to, caller, authData)) {
@@ -211,7 +222,8 @@ contract CloneGate is Initializable, ReentrancyGuardUpgradeable {
 
         // Mint through the existing trusted path (this gate is allowlisted).
         // registerWithSeal enforces whenNotPaused, non-empty data, seal/sealId
-        // validity and sealId uniqueness, and emits the ITransferred mint
+        // validity, sealId uniqueness and (AgenticID 1.2.0+) agentSeal-address
+        // uniqueness, and emits the ITransferred mint
         // event — full parity with a direct attestor mint.
         agentId_ = id.registerWithSeal(
             to, "", new MetadataEntry[](0), datas, sealedKeys, newAgentSeal, newSealId

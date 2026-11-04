@@ -56,6 +56,7 @@ function mockAttestor({ stored = null, version = stored ? 3 : 0, status = 200 } 
         res.writeHead(code, { 'content-type': 'application/json' });
         res.end(JSON.stringify(o));
       };
+      if (req.method === 'GET' && url.pathname === '/config') return json(200, { chain_id: 16602 });
       if (req.method === 'POST' && url.pathname === '/settings') {
         last = { headers: req.headers, raw: Buffer.concat(chunks).toString('utf8') };
         if (status === 200) return json(200, { ok: true, version: 7 });
@@ -211,6 +212,22 @@ test('setSettings: a first write (no document yet) signs base version 0', async 
     await clientAt(cap.port).setSettings({ sealId: SEAL, settings: { model: 'm' }, baseVersion: 0 });
     assert.equal(cap.last().headers['x-auth-message'].split(':')[3], '0');
     assert.equal(JSON.parse(cap.last().raw).base_version, 0);
+  } finally {
+    cap.server.closeAllConnections?.();
+    cap.server.close();
+  }
+});
+
+test('setSettings: a thinking level the container refuses is refused before signing', async () => {
+  const cap = await mockAttestor();
+  try {
+    await assert.rejects(
+      clientAt(cap.port).setSettings({ sealId: SEAL, settings: { model: 'm', thinking: 'medium' }, baseVersion: 0 }),
+      /thinking must be one of low\|high\|max, got "medium"/,
+    );
+    assert.equal(cap.last(), null, 'nothing was sent');
+    // Go compares case-insensitively; so does the SDK.
+    await clientAt(cap.port).setSettings({ sealId: SEAL, settings: { model: 'm', thinking: 'HIGH' }, baseVersion: 0 });
   } finally {
     cap.server.closeAllConnections?.();
     cap.server.close();

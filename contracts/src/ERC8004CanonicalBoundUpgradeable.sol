@@ -174,30 +174,48 @@ abstract contract ERC8004CanonicalBoundUpgradeable is
     // indexers read them there. AgenticID intentionally does NOT re-emit them
     // on forward, to avoid duplicate events for one logical change.
     function setAgentURI(uint256 agentId, string calldata newURI) external {
+        _beforeCanonicalWrite();
         _authorizeSetAgentURI(agentId);
         _canonical().setAgentURI(agentId, newURI);
     }
 
+    /// @dev Reverts ERC721IncorrectOwner unless msg.sender owns the local
+    ///      token. One shared body for every owner-gated write here.
+    function _requireAgentOwner(uint256 agentId) internal view {
+        address owner_ = _ownerOf(agentId);
+        if (owner_ != msg.sender) revert ERC721IncorrectOwner(msg.sender, agentId, owner_);
+    }
+
+    /// @dev Runs first in every write that adds or changes the agent's
+    ///      canonical record — setAgentURI, setMetadata, setAgentWallet.
+    ///      AgenticID gates it on its pause (audit FIND-11). unsetAgentWallet
+    ///      deliberately skips it: removing a payment wallet only takes
+    ///      something away, so an owner can still do it during an incident.
+    function _beforeCanonicalWrite() internal view virtual {}
+
     /// @dev Authorize a setAgentURI call. Default: only the local token owner.
     ///      AgenticID widens this to also allow trusted attestors.
     function _authorizeSetAgentURI(uint256 agentId) internal view virtual {
-        if (_ownerOf(agentId) != msg.sender)
-            revert ERC721IncorrectOwner(msg.sender, agentId, _ownerOf(agentId));
+        _requireAgentOwner(agentId);
     }
 
     // ── Metadata (read-through / authorized write-forward) ─────────────────────
 
+    /// @dev Like tokenURI, answers only for agents with a local token — the
+    ///      canonical registry also holds third-party agents, which must not
+    ///      read as AgenticID agents through this ABI (audit FIND-14).
     function getMetadata(uint256 agentId, string memory metadataKey)
         external view returns (bytes memory)
     {
+        _requireOwned(agentId);
         return _canonical().getMetadata(agentId, metadataKey);
     }
 
     function setMetadata(uint256 agentId, string memory metadataKey, bytes memory metadataValue)
         external
     {
-        if (_ownerOf(agentId) != msg.sender)
-            revert ERC721IncorrectOwner(msg.sender, agentId, _ownerOf(agentId));
+        _beforeCanonicalWrite();
+        _requireAgentOwner(agentId);
         _setMetadataEntry(agentId, metadataKey, metadataValue);
     }
 
@@ -225,21 +243,22 @@ abstract contract ERC8004CanonicalBoundUpgradeable is
     // transfers — but it never does (custody), so AgenticID's _update mirrors the
     // clear explicitly on the *local* transfer instead.
 
+    /// @dev Local agents only — see getMetadata.
     function getAgentWallet(uint256 agentId) external view returns (address) {
+        _requireOwned(agentId);
         return _canonical().getAgentWallet(agentId);
     }
 
     function setAgentWallet(uint256 agentId, address newWallet, uint256 deadline, bytes calldata signature)
         external
     {
-        if (_ownerOf(agentId) != msg.sender)
-            revert ERC721IncorrectOwner(msg.sender, agentId, _ownerOf(agentId));
+        _beforeCanonicalWrite();
+        _requireAgentOwner(agentId);
         _canonical().setAgentWallet(agentId, newWallet, deadline, signature);
     }
 
     function unsetAgentWallet(uint256 agentId) external {
-        if (_ownerOf(agentId) != msg.sender)
-            revert ERC721IncorrectOwner(msg.sender, agentId, _ownerOf(agentId));
+        _requireAgentOwner(agentId);
         _canonical().unsetAgentWallet(agentId);
     }
 

@@ -1,6 +1,6 @@
 /**
  * @file update.ts
- * @description `0g-agenticid update` — self-update the CLI (it ships inside
+ * @description `0g-agentdna update` — self-update the CLI (it ships inside
  * the SDK npm package). Compares the running version against the npm
  * registry's latest and runs `npm install -g <pkg>@<latest>` when behind.
  *
@@ -10,14 +10,27 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, realpathSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { CliError } from '../errors';
 import { emitOk, note, print } from '../envelope';
 import type { CommandContext } from '../types';
 
-/** name + version of the package this CLI is running from. */
-function selfPackage(): { name: string; version: string; dir: string } {
+/** The legacy launcher owns the global bin links when installed through the
+ *  old package's updater. Update that package so npm can replace its own links
+ *  and bring along the matching AgentDNA dependency without EEXIST collisions. */
+export function selfPackage(entrypoint: string | undefined = process.argv[1]): { name: string; version: string; dir: string } {
+  if (entrypoint) {
+    try {
+      const dir = dirname(realpathSync(entrypoint));
+      const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
+        name: string; version: string; agentdnaLegacyBridge?: boolean;
+      };
+      if (pkg.name === '@0gfoundation/0g-agenticid-sdk' && pkg.agentdnaLegacyBridge === true) {
+        return { name: pkg.name, version: pkg.version, dir };
+      }
+    } catch { /* regular CLI entrypoints do not sit next to a bridge manifest */ }
+  }
   const dir = join(__dirname, '..', '..', '..'); // dist/cli/commands → package root
   const raw = readFileSync(join(dir, 'package.json'), 'utf8');
   const pkg = JSON.parse(raw) as { name: string; version: string };

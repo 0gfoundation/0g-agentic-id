@@ -90,7 +90,7 @@ ENV HOME=/root
 
 # Node from the official tarball rather than apt (debian's node is too old for
 # the SDK, and this image has no nvm base to lean on).
-ARG NODE_VERSION=24.15.0
+ARG NODE_VERSION=24.22.1
 #
 # --no-same-owner: the release tarball records its build user's uid/gid
 # (1001), and GNU tar run as root restores it by default — onto

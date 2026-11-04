@@ -14,6 +14,17 @@ pub struct Framework {
     pub image: Option<String>,
 }
 
+/// Capabilities of this release, attached to configured snapshots. Attestor and
+/// all advertised sealed runtimes are upgraded together; routes live in the registry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InferenceCapability {
+    pub image: String,
+    pub providers: Vec<String>,
+    pub secret_env_versions: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub chain_rpc: String,
@@ -59,8 +70,9 @@ pub struct Config {
     /// When true, all three binaries use `MockKmsClient`. When false,
     /// they use `TappKmsClient` (gRPC to tapp-server's `GetSecretResource`).
     pub mock_kms: bool,
-    /// Hex-encoded 32-byte app secret, only used when `mock_kms=true`.
-    /// Env schema mirrors `MOCK_APP_PRIVATE_KEY` for TEE.
+    /// Hex-encoded 32-byte secret the mock KMS derives every agentSeal from,
+    /// only used when `mock_kms=true`. Env schema mirrors
+    /// `MOCK_APP_PRIVATE_KEY` for TEE.
     pub mock_app_secret: Option<String>,
 
     /// When true, the worker uses `MockStorage` (keccak256 stand-in for
@@ -79,8 +91,8 @@ pub struct Config {
     /// `tapp_ip`/`tapp_port`, which are then ignored. Mount the socket into
     /// the container to use it, keeping the TEE-key/KMS RPCs off any TCP port.
     pub tapp_socket: Option<String>,
-    /// App identifier registered in TappRegistry. Shared by `GetAppSecretKey`
-    /// (TEE EOA) and `GetSecretResource` (KMS secret). Required when
+    /// App identifier registered in TappRegistry. Shared by `GetAppSigner`
+    /// (stable business EOA) and `GetSecretResource` (per-seal agentSeal keys). Required when
     /// either `mock_tee=false` or `mock_kms=false`. Also surfaced to the
     /// frontend as the "attestor" slot in the trust-roots ack modal.
     pub app_id: Option<String>,
@@ -113,9 +125,19 @@ pub struct Config {
     /// full environment from one URL — the attestor itself never calls it.
     /// New SDKs use `verified_feedback_addr` instead.
     pub reputation_registry_addr: Option<Address>,
-    /// VerifiedFeedbackRegistry bound to this AgenticID (TEE marks over the
-    /// canonical ERC-8004 reputation registry, which SDKs discover FROM it
-    /// via getCanonicalReputation). Same /config-discovery-only purpose.
+    /// VerifiedFeedbackRegistry PROXY bound to this AgenticID (TEE marks over
+    /// the canonical ERC-8004 reputation registry, which SDKs discover FROM
+    /// it via getCanonicalReputation). Served on GET /config like its
+    /// siblings, AND injected into every newly created container as
+    /// `VERIFIED_FEEDBACK_ADDR`: it is the ServeProof validator, i.e. the
+    /// sealed proxy signs keccak256(0x19 ‖ 0x00 ‖ this ‖ proofHash) (EIP-191
+    /// version 0x00), so proofs redeem only at this address. None (unset,
+    /// blank or the zero address) → /config serves null, the container gets a
+    /// blank value and emits no X-Agent-Proof. The attestor never writes to
+    /// it; worker and api make one view call at startup
+    /// (`chain::check_verified_feedback_anchor`): its getIdentityRegistry()
+    /// must equal `agentic_id_addr`, else startup fails. Parsed strictly: a
+    /// non-empty value that is not an address fails startup.
     pub verified_feedback_addr: Option<Address>,
     /// FeedbackBatcher — EIP-7702 delegate making the SDK's feedback flow
     /// atomic. Advertise ONLY on 7702-enabled chains: the SDK treats its
@@ -231,23 +253,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Returns `(tapp_registry_addr, sandbox_app_id)` when both are
-    /// configured — used by the chain client constructor to enable
-    /// `is_sandbox_node` lookups. Returns `None` when TappRegistry isn't
-    /// wired (mock / partial dev setups), so chain clients silently fall
-    /// back to env-configured single signers.
-    pub fn tapp_registry_for_chain(&self) -> Option<(Address, String)> {
-        if self.tapp_registry_addr == Address::ZERO {
-            return None;
-        }
-        match self.sandbox_app_id.as_deref() {
-            Some(s) if !s.is_empty() => {
-                Some((self.tapp_registry_addr, self.sandbox_app_id.clone().unwrap()))
-            }
-            _ => None,
-        }
-    }
-
     /// Supported framework names only — the deploy edge validates the
     /// binding's name against this (images are the SDK's concern at signing).
     pub fn framework_names(&self) -> Vec<String> {
@@ -274,7 +279,7 @@ impl Config {
 
             storage_indexer: env("ATTESTOR_STORAGE_INDEXER")?,
 
-            sandbox_endpoint: env("ATTESTOR_SANDBOX_ENDPOINT")?,
+            sandbox_endpoint: env_opt("ATTESTOR_SANDBOX_ENDPOINT").unwrap_or_default(),
             mock_sandbox: env_opt("MOCK_SANDBOX")
                 .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
                 .unwrap_or(true),
@@ -313,12 +318,13 @@ impl Config {
                 .and_then(|s| s.parse().ok()),
             reputation_registry_addr: env_opt("ATTESTOR_REPUTATION_ADDR")
                 .and_then(|s| s.parse().ok()),
-            verified_feedback_addr: env_opt("ATTESTOR_VERIFIED_FEEDBACK_ADDR")
-                .and_then(|s| s.parse().ok()),
+            // Strict, unlike its discovery-only siblings: this one becomes the
+            // containers' ServeProof validator, so a typo must fail startup
+            // rather than silently turn proofs off fleet-wide.
+            verified_feedback_addr: env_opt_addr("ATTESTOR_VERIFIED_FEEDBACK_ADDR")?,
             feedback_batcher_addr: env_opt("ATTESTOR_FEEDBACK_BATCHER_ADDR")
                 .and_then(|s| s.parse().ok()),
-            clone_gate_addr: env_opt("ATTESTOR_CLONE_GATE_ADDR")
-                .and_then(|s| s.parse().ok()),
+            clone_gate_addr: env_opt("ATTESTOR_CLONE_GATE_ADDR").and_then(|s| s.parse().ok()),
             standard_clone_authorizer_addr: env_opt("ATTESTOR_STANDARD_CLONE_AUTHORIZER_ADDR")
                 .and_then(|s| s.parse().ok()),
             tee_data_verifier_addr: env_opt("ATTESTOR_TEE_VERIFIER_ADDR")
@@ -343,7 +349,7 @@ impl Config {
             // fallback so a not-yet-migrated deployment keeps working.
             frameworks: parse_frameworks(
                 env_opt("ATTESTOR_FRAMEWORKS").or_else(|| env_opt("ATTESTOR_SUPPORTED_FRAMEWORKS")),
-            ),
+            )?,
             chain_priority_fee_gwei: env_opt("ATTESTOR_PRIORITY_FEE_GWEI")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),
@@ -425,10 +431,109 @@ fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
+// The release deploys attestor and its configured sealed images together.
+// Only configured images are advertised; explicit unknown images remain unsupported.
+fn runtime_capabilities(
+    enabled: bool,
+    default_image: &str,
+    frameworks: &[Framework],
+) -> Vec<InferenceCapability> {
+    if !enabled {
+        return Vec::new();
+    }
+    let mut images: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    if !default_image.trim().is_empty() {
+        images.insert(
+            default_image.to_string(),
+            vec!["openai".into(), "anthropic".into()],
+        );
+    }
+    for framework in frameworks {
+        let formats: &[&str] = match framework.name.as_str() {
+            "hermes" => &["openai"],
+            "openclaw" | "prime-agent" | "0g-harness" => &["openai", "anthropic"],
+            _ => continue,
+        };
+        let image = framework.image.as_deref().unwrap_or(default_image);
+        if image.trim().is_empty() {
+            continue;
+        }
+        images
+            .entry(image.to_string())
+            .and_modify(|current| current.retain(|f| formats.contains(&f.as_str())))
+            .or_insert_with(|| formats.iter().map(|f| (*f).to_string()).collect());
+    }
+    images
+        .into_iter()
+        .map(|(image, formats)| InferenceCapability {
+            image,
+            formats,
+            providers: vec!["0g-compute".into(), "openai".into(), "anthropic".into()],
+            secret_env_versions: vec![1, 2, 3],
+        })
+        .collect()
+}
+
+impl Config {
+    pub fn inference_capabilities(&self) -> Vec<InferenceCapability> {
+        runtime_capabilities(
+            self.secret_env_enabled,
+            &self.sandbox_snapshot,
+            &self.frameworks,
+        )
+    }
+}
+
+/// An optional address env var, parsed strictly: unset, blank or the zero
+/// address → None, but a non-empty value that is not an address is a startup
+/// error (a typo must not silently read as "unset"). The zero address names
+/// no contract, so it is treated as "unset" rather than served and injected
+/// as if it were one.
+fn env_opt_addr(key: &str) -> anyhow::Result<Option<Address>> {
+    parse_opt_addr(key, env_opt(key).as_deref())
+}
+
+fn parse_opt_addr(key: &str, raw: Option<&str>) -> anyhow::Result<Option<Address>> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => s
+            .parse::<Address>()
+            .map(|a| (a != Address::ZERO).then_some(a))
+            .map_err(|e| anyhow::anyhow!("invalid {key}={s:?}: {e}")),
+    }
+}
+
 /// Parse the `ATTESTOR_FRAMEWORKS` value: a comma list of `name[:image]`
 /// entries. `image` omitted → `None` (caller falls back to sandbox_snapshot).
 /// Empty / `None` → `[openclaw]` (an empty list would reject every deploy).
-fn parse_frameworks(raw: Option<String>) -> Vec<Framework> {
+/// Framework names sealed ships an adapter for.
+const KNOWN_FRAMEWORKS: [&str; 4] = ["openclaw", "hermes", "prime-agent", "0g-harness"];
+
+/// Parse `ATTESTOR_FRAMEWORKS`. `dsh` is refused: startup renames every `dsh`
+/// row to `0g-harness` (schema.sql), so a configuration still advertising
+/// `dsh` would no longer match those agents and would point new ones at the
+/// old image. A name sealed has no adapter for is logged.
+fn parse_frameworks(raw: Option<String>) -> anyhow::Result<Vec<Framework>> {
+    let frameworks = parse_framework_entries(raw);
+    if frameworks.iter().any(|f| f.name == "dsh") {
+        anyhow::bail!(
+            "ATTESTOR_FRAMEWORKS names `dsh`, which is now `0g-harness`: rename the entry and point it at the 0g-harness image"
+        );
+    }
+    for framework in &frameworks {
+        if !KNOWN_FRAMEWORKS.contains(&framework.name.as_str()) {
+            tracing::error!(
+                framework = %framework.name,
+                known = ?KNOWN_FRAMEWORKS,
+                "ATTESTOR_FRAMEWORKS names a framework sealed has no adapter for"
+            );
+        }
+    }
+    Ok(frameworks)
+}
+
+fn parse_framework_entries(raw: Option<String>) -> Vec<Framework> {
     let parsed: Vec<Framework> = raw
         .map(|s| {
             s.split(',')
@@ -446,7 +551,10 @@ fn parse_frameworks(raw: Option<String>) -> Vec<Framework> {
         })
         .unwrap_or_default();
     if parsed.is_empty() {
-        vec![Framework { name: "openclaw".to_string(), image: None }]
+        vec![Framework {
+            name: "openclaw".to_string(),
+            image: None,
+        }]
     } else {
         parsed
     }
@@ -455,6 +563,42 @@ fn parse_frameworks(raw: Option<String>) -> Vec<Framework> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_follow_the_release_and_configured_framework_images() {
+        let frameworks = parse_frameworks(Some(
+            "openclaw,hermes:hermes-new,prime-agent:prime-new,0g-harness:harness-new".into(),
+        )).unwrap();
+        let caps = runtime_capabilities(true, "openclaw-new", &frameworks);
+        assert_eq!(caps.len(), 4);
+        for capability in &caps {
+            assert_eq!(capability.secret_env_versions, vec![1, 2, 3]);
+            assert!(capability.providers.contains(&"openai".to_string()));
+            let expected = if capability.image == "hermes-new" {
+                vec!["openai"]
+            } else {
+                vec!["openai", "anthropic"]
+            };
+            assert_eq!(capability.formats, expected);
+        }
+        assert!(runtime_capabilities(false, "openclaw-new", &frameworks).is_empty());
+    }
+
+    #[test]
+    fn capabilities_do_not_advertise_unknown_images_or_protocols() {
+        let frameworks = parse_frameworks(Some(
+            "future:unknown-image,openclaw:shared,hermes:shared".into(),
+        )).unwrap();
+        let caps = runtime_capabilities(true, "default", &frameworks);
+        assert!(!caps.iter().any(|cap| cap.image == "unknown-image"));
+        assert_eq!(
+            caps.iter()
+                .find(|cap| cap.image == "shared")
+                .unwrap()
+                .formats,
+            vec!["openai"]
+        );
+    }
 
     #[test]
     fn secret_env_flag_is_opt_in() {
@@ -468,8 +612,42 @@ mod tests {
     }
 
     #[test]
+    fn opt_addr_blank_is_none_and_typo_is_an_error() {
+        const K: &str = "ATTESTOR_VERIFIED_FEEDBACK_ADDR";
+        // .env.example ships it blank → unset, not an error. The zero address
+        // names no registry: also unset (the worker warns, /config serves null).
+        for blank in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("0x0000000000000000000000000000000000000000"),
+            Some(" 0x0000000000000000000000000000000000000000 "),
+        ] {
+            assert_eq!(parse_opt_addr(K, blank).unwrap(), None, "{blank:?}");
+        }
+        let a = parse_opt_addr(K, Some(" 0x00000000000000000000000000000000000000B7 "))
+            .unwrap()
+            .expect("valid address");
+        assert_eq!(
+            format!("{a:#x}"),
+            "0x00000000000000000000000000000000000000b7"
+        );
+        // A typo must fail startup, not silently disable ServeProofs.
+        for bad in [
+            "0x1234",
+            "not-an-address",
+            "0x00000000000000000000000000000000000000ZZ",
+        ] {
+            let err = parse_opt_addr(K, Some(bad)).unwrap_err().to_string();
+            assert!(err.contains(K), "error must name the var: {err}");
+        }
+    }
+
+    #[test]
     fn parse_frameworks_name_and_image() {
-        let fws = parse_frameworks(Some("openclaw, hermes:0g-sealed-hermes ,prime:0g-sealed-prime".to_string()));
+        let fws = parse_frameworks(Some(
+            "openclaw, hermes:0g-sealed-hermes ,prime:0g-sealed-prime".to_string(),
+        )).unwrap();
         assert_eq!(fws.len(), 3);
         assert_eq!(fws[0].name, "openclaw");
         assert_eq!(fws[0].image, None); // no image → default snapshot
@@ -479,9 +657,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_frameworks_refuses_the_old_harness_name() {
+        let err = parse_frameworks(Some("openclaw,dsh:0g-sealed-dsh".into())).unwrap_err();
+        assert!(err.to_string().contains("0g-harness"), "{err}");
+        let fws = parse_frameworks(Some("openclaw,0g-harness:0g-sealed-harness".into())).unwrap();
+        assert_eq!(fws[1].name, "0g-harness");
+    }
+
+    #[test]
     fn parse_frameworks_empty_or_none_defaults_openclaw() {
         for raw in [None, Some(String::new()), Some("  ,  ".to_string())] {
-            let fws = parse_frameworks(raw);
+            let fws = parse_frameworks(raw).unwrap();
             assert_eq!(fws.len(), 1);
             assert_eq!(fws[0].name, "openclaw");
             assert_eq!(fws[0].image, None);
@@ -491,8 +677,11 @@ mod tests {
     #[test]
     fn parse_frameworks_legacy_names_only_still_works() {
         // legacy ATTESTOR_SUPPORTED_FRAMEWORKS value shape (no images)
-        let fws = parse_frameworks(Some("openclaw,hermes".to_string()));
-        assert_eq!(fws.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["openclaw", "hermes"]);
+        let fws = parse_frameworks(Some("openclaw,hermes".to_string())).unwrap();
+        assert_eq!(
+            fws.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["openclaw", "hermes"]
+        );
         assert!(fws.iter().all(|f| f.image.is_none()));
     }
 }

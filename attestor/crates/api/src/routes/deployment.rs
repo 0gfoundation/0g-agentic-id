@@ -1,4 +1,10 @@
 //! GET /deployment/:seal_id — fetch the current state of a deployment.
+//!
+//! Unauthenticated, and `/deployments` publishes every seal_id, so whatever
+//! the row serializes is readable fleet-wide. What must stay inside the
+//! process is kept out at the type (`#[serde(skip_serializing)]` on
+//! `Deployment`): the owner's settings document, the container pubkey and
+//! its master-secret-derived MAC, and the iData retry material.
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;

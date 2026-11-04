@@ -9,7 +9,7 @@ use attestor_shared::{
     crypto::RealCrypto,
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
-    kms::{derive_subkey, KmsClient, MockKmsClient, TappKmsClient, JOB_ENCRYPTION_KEY_INFO},
+    kms::{KmsClient, MockKmsClient, TappKmsClient},
     repo::{self, PostgresDeploymentRepo},
     Config,
 };
@@ -29,14 +29,12 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = repo::connect(&cfg.db_url).await?;
 
-    // KMS master so the indexer can re-derive agentSeal from sealId and
-    // detect "this AgentSealSet event belongs to us". Indexer never sends
-    // chain txs, so it doesn't need the TEE EOA key.
+    // KMS so the indexer can re-derive agentSeal from sealId and detect
+    // "this AgentSealSet event belongs to us". Indexer never sends chain
+    // txs, so it doesn't need the TEE EOA key.
     let kms = build_kms_client(&cfg).await?;
     attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
-    let app_key = kms.app_key().await?;
     let crypto = Arc::new(RealCrypto::new(
-        app_key,
         kms.clone(),
         cfg.chain_id,
         cfg.agentic_id_addr,
@@ -44,10 +42,8 @@ async fn main() -> anyhow::Result<()> {
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
     let events = PostgresEventBus::connect(pool.clone()).await?;
-    // Enqueue SandboxTeardown on transfer (Layer 2). Same job_key derivation
-    // as the worker so the encrypted payloads round-trip.
-    let job_key = derive_subkey(&app_key, JOB_ENCRYPTION_KEY_INFO);
-    let jobs = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
+    // Enqueues SandboxTeardown on transfer (Layer 2).
+    let jobs = PostgresJobQueue::new(pool.clone());
 
     let watcher = watcher::Watcher::new(&cfg, pool, crypto, deployments, events, jobs).await?;
     watcher.run().await

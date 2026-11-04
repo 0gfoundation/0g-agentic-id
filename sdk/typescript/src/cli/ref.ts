@@ -44,7 +44,7 @@ export function parseAgentRef(input: string | undefined): AgentRef {
     input
       ? `not an agent reference: "${input}" (expected a decimal agentId or a 0x… 64-hex sealId; ≥8 hex chars work as a unique prefix)`
       : 'missing <agent> argument (a decimal agentId or a 0x… 64-hex sealId)',
-    { remedy: '0g-agenticid status 33   |   0g-agenticid status 0x<64-hex sealId>' },
+    { remedy: '0g-agentdna status 33   |   0g-agentdna status 0x<64-hex sealId>' },
   );
 }
 

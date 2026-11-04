@@ -1,6 +1,6 @@
 /**
  * @file context.ts
- * @description Shared config + runtime context for the AgenticID facade and its
+ * @description Shared config + runtime context for the AgentDNA facade and its
  * internal per-contract clients. Constructed once; passed to each sub-client.
  */
 
@@ -16,7 +16,7 @@ import {
 import { privateKeyToAccount } from 'viem/accounts';
 import { ZERO_G_TESTNET, RPC_URL, type ContractAddresses } from './constants';
 
-/** Public config for `new AgenticID(config)`. */
+/** Public config for `new AgentDNA(config)` (exported as `AgentDNAConfig`). */
 export interface AgenticIDConfig {
   /** RPC endpoint. Defaults to the 0G Galileo testnet RPC. */
   rpcUrl?: string;
@@ -62,6 +62,7 @@ export interface AttestorPublicConfig {
   attestor_app_id?: string;
   kms_app_id?: string;
   sandbox_app_id?: string;
+  sandbox_endpoint?: string;
   sandbox_provider_addr?: `0x${string}`;
   sandbox_serving_addr?: `0x${string}`;
   /** Default sealed image when a framework declares none. */
@@ -73,6 +74,10 @@ export interface AttestorPublicConfig {
    *  (`'agent-seal-ecies-v1'`, issue #166): start/reset/retry then seal the
    *  inference key to the agent instead of signing it in clear. */
   secret_env_scheme?: string;
+  inference_capabilities?: Array<{ image: string; providers: string[]; secret_env_versions: number[]; formats?: string[] }>;
+  provider_registry_schema?: number;
+  provider_registry_version?: number;
+  provider_registry_digest?: string;
 }
 
 /** Resolved context shared by the internal clients. */

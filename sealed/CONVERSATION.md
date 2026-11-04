@@ -30,12 +30,16 @@ onboarding copy.
    not the proxy (a proxy that re-implements session management is a second,
    lossy source of truth), not the client (a window, not a store). A starting
    framework resumes the persisted conversation if one exists.
-2. **Exactly ONE conversation per agent.** Fixed identity (dsh already
-   hardcodes `SessionId('owner-chat')`). Multi-session is never enabled — a
+2. **Exactly ONE conversation per agent.** Fixed identity (0g-harness hardcodes
+   `SessionId('owner-chat')`). A second conversation is never enabled — a
    security decision, not a simplification: cross-session isolation would rest
    on unaudited upstream code, and shared long-term memory defeats it anyway.
    Matches the single-driver seat (CONFIG_SURFACE §8.1): one agent, one
-   timeline, one driver.
+   timeline, one driver. 0g-harness's subagents (an owner switch) run in sessions of
+   their own and are not a second conversation: one-shot workers for the same
+   owner, in memory only, never persisted, never addressable by a client, with
+   tools to read and nothing else. What they find reaches the one
+   conversation as a notice, and the agent's own turns carry it to the owner.
 3. **Stored on the container's writable layer, in an UNTRACKED path** —
    off-chain by construction: outside every chain-tracked role, so no watcher
    tick commits it and no transfer conveys it. Guaranteed by construction,
@@ -83,7 +87,7 @@ since #155), and the first two capabilities below exist to feed it. Synth
 serves any framework that declares no `kind:"responses"` route — today hermes
 and openclaw — by translating `/v1/responses` into the framework's chat API
 and supplying the long-task mechanics (resume via `starting_after`, cancel,
-the event record). Unlike the prime/dsh bridges it does not serialize turns.
+the event record). Unlike the prime bridge and 0g-harness, it does not serialize turns.
 Both gateways do ship a native `/v1/responses` (hermes `api_server.py`;
 openclaw `handleOpenResponsesHttpRequest`, keyed by `x-openclaw-session-key`),
 but neither implements `starting_after` resume. Follow-up, separate PR:
@@ -115,7 +119,7 @@ The four capabilities:
   answer 501 and the CLI clears its local echo only.
 - **`framework.SessionCompactor`** — run the harness's OWN compaction on
   demand: the older history becomes a summary, the newest part stays verbatim
-  (how much is the harness's: dsh keeps only its newest item, openclaw ~20K
+  (how much is the harness's: 0g-harness keeps only its newest item, openclaw ~20K
   tokens), the process keeps running. The proxy exposes an owner-signed
   `POST /_seal/compact` (tag `0GSealCompact`, the clear grammar, seat-gated)
   and the CLI gains `/compact`. Three guards a clear does not need: one compaction at
@@ -132,15 +136,15 @@ The four capabilities:
   and the outcome is logged. That matters because a long summary outlasts the
   client — Node's fetch gives up after 300s without an answer — so the CLI
   reports no answer as "still compacting, see /startuplog", not as a failure.
-  dsh asks its bridge (`POST /v1/compact` → the
-  composition's `compactNow`, queued behind a running turn, one pending at a
-  time; the summary is written by the model the bridge runs, at an output cap
+  The 0g-harness adapter asks the harness (`POST /v1/compact` → the
+  composition's `compactNow`, queued behind running turns until the agent is
+  idle, one pending at a time; the summary is written by the model the harness runs, at an output cap
   of 16384, below a turn's 32768 — the engine's own 8192 when the catalog
   gives no budget, `CONFIG_SURFACE.md` §3.2); openclaw runs
   its own `openclaw sessions compact <key>` against the running gateway, with
   the gateway URL and token passed by env (its edges: the openclaw traps
   below). Either answers "nothing to compact" (200, not a failure) when its
-  engine finds nothing to fold. The dsh bridge also answers it, without a
+  engine finds nothing to fold. 0g-harness also answers it, without a
   model call, when nothing has been said since the last `/compact`: offline,
   a second `/compact` right after one, or right after a restart, made another
   summary call and summarized the summary again. hermes and prime answer 501
@@ -158,22 +162,22 @@ only triggers it.
 |---|---|---|---|
 | **prime** | `bridge.mjs` + `sessionstore.mjs` (native `/v1/responses`) | `createAgentSession({ …, sessionManager: SessionManager.open(SEAL_CONVERSATION_FILE) })` — the SDK appends every entry (messages, tool calls, compaction, thinking) and `open()` rebuilds context on restart. File `/root/.prime-conversation/session/owner-chat.jsonl`, outside `primeHome`, handed to the agent user (`privsep.OwnTree`); one level below the handed-over directory because the SDK keeps each session's artifacts next to the session's directory, so they land in `/root/.prime-conversation/session-artifacts/`, inside the same tree (a file directly in `/root/.prime-conversation`, as an earlier sealed kept it, put them in root's home, at `/root/session-artifacts/<id>`; on an upgraded container, the boot moves that directory to `/root/.prime-conversation/session-artifacts` — `privsep.DeclareRelocation`, applied by `ReclaimHome` — and Start moves the file and its rotated siblings into `session/`, so a resumed conversation finds both its transcript and its session artifacts, the RLM session state and local harness state included). Self-rotation at the latest compaction entry (header kept, compaction entry re-parented to root, older lines discarded); a corrupt file quarantines (`.corrupt-<ts>`) and a fresh one opens. Verified on the real SDK: rotation 9209B→729B with context rebuilt; torn tail tolerated. | delete file + leftovers + session artifacts, restart |
 | **hermes** | its own gateway, bound via `ConversationSession` | the gateway is already stateful over HTTP: `X-Hermes-Session-Id` (Bearer `API_SERVER_KEY`, already set) loads history from `~/.hermes/state.db`, body's last message is the turn. The adapter mints and persists ONE id (in sealed's root-only state directory, `/var/lib/sealed/hermes-conversation-id` — not in the agent-writable home) and FOLLOWS the echoed id — compaction ends the parent session and continues on a child. Unsafe echoes (path-shaped, control chars) are never persisted. Invariant 7 note: the transcript store is hermes's own `state.db` — its store, its compaction; self-rotation does not apply to a file the harness owns. | mint a fresh id (old rows stay in hermes's db, unreferenced), restart |
-| **dsh** | `bridge.mjs` + `sessionstore.mjs` (native `/v1/responses`) | no backend ships (the `SessionPersistence` seam has no concrete subclass; `resume()` rejects). The bridge is the backend: every committed `session/event` of `owner-chat` appends via `packChunkRuns`; boot decodes (`decodeStorageRecord`) and seeds `ctx.agents.create({ seed, meta:{seedLength} })`; `interruptedTurnClosers` closes a mid-turn crash (closers appended, so the file balances); a seq guard skips re-emitted seed events. Rotation is necessarily cruder: a seed must be contiguous from seq 0, so the head cannot be cut — at the ceiling the store archives and the conversation restarts fresh, loudly. File `/root/.dsh/owner-chat.session.jsonl` (already classified untracked). Verified on the real SDK: append→load→`Session.fromRestore` (create's validator) passes; crash repair balances. | remove the log + leftovers, restart |
+| **0g-harness** | `src/store/sessionstore.mjs` (native `/v1/responses`) | no backend ships (the `SessionPersistence` seam has no concrete subclass; `resume()` rejects). The harness is the backend: every committed `session/event` of `owner-chat` appends via `packChunkRuns`, attached before the agent exists so a turn opened at creation (an overdue reminder) is written too; boot decodes (`decodeStorageRecord`) and seeds `ctx.agents.create({ seed })` as a resume, with no `seedLength` — that field is the fork boundary, and DSH folds pending inbox work and schedules only from the events after it; the turn records (inbox, tasks) sit next to the log as `<log>.records.jsonl`; `interruptedTurnClosers` closes a mid-turn crash (closers appended, so the file balances); a seq guard skips re-emitted seed events. Rotation is necessarily cruder: a seed must be contiguous from seq 0, so the head cannot be cut — at the ceiling the store archives and the conversation restarts fresh, loudly. File `/root/.dsh/owner-chat.session.jsonl` (already classified untracked). Verified on the real SDK: append→load→`Session.fromRestore` (create's validator) passes; crash repair balances; schedules and pending notices survive restarts. | remove the log and every `<log>.*` sibling (archives, turn records), restart |
 | **openclaw** | `ConversationSession` + `ConversationHistory`, in the adapter package | openclaw persists every gateway turn (`~/.openclaw/agents/main/sessions/<id>.jsonl`, `sessions.json` maps key→session) and its gateway REPLAYS the pinned session into every turn — one session for good, because the render sets `session.reset` to a policy that never goes stale (openclaw's default starts a new session daily; see the trap below). The adapter pins ONE session key (`x-openclaw-session-key`, persisted in sealed's root-only state directory, `/var/lib/sealed/openclaw-conversation-key`) so all stateful-door turns land in ONE session, and has the door send only the current turn (`ConversationHistory` returns none — see the trap below). The private format coupling (`sessions.json` shape, file naming) is quarantined in the openclaw package — the same kind of coupling it already has (it parses openclaw.json). Invariant 7 (re-verified 2026-10-19, see the trap below): openclaw's compaction APPENDS a `compaction` record and keeps every message line — `truncateAfterCompaction`, which would rotate the file, is opt-in and off — so the harness does not bound the file here; open. | rotate the key + remove the superseded session's files — transcript and trajectory record (openclaw's `sessions.json` is its own store — never rewritten from outside), restart |
 
 Source-verified traps, recorded:
 
 - prime's `createAgentSession` JSDoc advertises `continueSession: true` — **dead
   documentation**, nothing reads it. Persistence rides only `sessionManager`.
-- dsh's on-disk format is `SESSION_FORMAT_VERSION = 0`, no compatibility
+- DSH's on-disk format is `SESSION_FORMAT_VERSION = 0`, no compatibility
   promise — acceptable: the same image writes and reads it, and a format
   change arrives with an image change, which forces a recreate that clears
-  the file. Nothing but the bridge that wrote it may read it.
-- dsh event grammar: `user/message` events carry the message AS `data` (not
+  the file. Nothing but the harness that wrote it may read it.
+- DSH event grammar: `user/message` events carry the message AS `data` (not
   wrapped), surface events REQUIRE a `surfaceOp` marker, and messages must be
   identified (id'd) — `Session.fromRestore` validates all three, which is why
   the store smoke drives the real validator, not a lookalike.
-- dsh's Session CONSTRUCTOR appends a `session/end-seed` marker at
+- DSH's Session CONSTRUCTOR appends a `session/end-seed` marker at
   `seq = seed.length` when the seed does not already end with one — and never
   publishes it on `session/event`, so a firehose persister misses it and the
   SECOND restart bricks on the contiguity validator (review #169 blocker,
@@ -285,6 +289,8 @@ Source-verified traps, recorded:
 
 ## 6. Rollout — SHIPPED and T2 LIVE-VERIFIED (2026-09-29, dev)
 
+The records in this section name 0g-harness by its name at the time, dsh.
+
 The drill ran on all four frameworks (agents 436/449/450/452, images at
 cd547ec), every question asked by a BRAND-NEW client holding zero history —
 continuity could only come from the container:
@@ -319,13 +325,15 @@ Notes from the drill, recorded:
   long conversation); the follow logic is unit-tested, echo semantics read
   from gateway source.
 
-Repeatable regression guards (review follow-up 2): each bridge ships a
-`sessionstore_regression.mjs` next to its store — dsh replays the full
-4-generation scenario (the finding-1 invariant), crash repair and the stale
-stub; prime covers round-trip, compaction-point rotation and stub quarantine.
-They take the real SDK from `$DSH_SDK_ROOT` / `$PRIME_SDK_ROOT` (the built
-image's node_modules, or a `docker cp`-extracted tree) and SKIP cleanly when
-absent — the repo's convention for environment-gated tests.
+Repeatable regression guards (review follow-up 2): each store has a
+`sessionstore_regression.mjs` — 0g-harness's
+(`test/regression/`, run by its `npm test` on the harness's locked SDK tree),
+replays the full 4-generation scenario (the finding-1 invariant), crash repair
+and the stale stub; prime's, next to its bridge's store, covers round-trip,
+compaction-point rotation and stub quarantine. Either takes the real SDK from
+`$DSH_SDK_ROOT` / `$PRIME_SDK_ROOT` (a built image's node_modules, or a
+`docker cp`-extracted tree); prime's SKIPs cleanly when it is absent — the
+repo's convention for environment-gated tests.
 
 Original checklist (all shipped):
 

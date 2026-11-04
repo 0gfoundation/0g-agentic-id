@@ -1,4 +1,11 @@
-# The sealed sandbox image, node/openclaw flavour. Images are per
+# NOT the openclaw sealed image that ships. That one (zg-sealed/0g-sealed)
+# is built by sealed/Dockerfile, FROM the openclaw base that
+# sealed/images/openclaw/ builds; it was matched against the production
+# image by layer digest (#130). This file copies in no bootstrap binary (see
+# "No CMD" below). It is the universal-image target FRAMEWORK_ADAPTER.md
+# describes, for a deployment that ships it.
+#
+# A universal sealed sandbox image, node flavour. Images are per
 # framework runtime (this one carries node; images/hermes/ carries
 # python/uv — see that Dockerfile's header for why they're split), but
 # which adapter actually runs is still decided at boot by the agent's
@@ -37,13 +44,14 @@ FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:base-ubu
 # node >=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0 — the 0g-sandbox base
 # ships an older node in its nvm, so install the pinned version here
 # instead of relying on the base (same bump the openclaw image line took
-# via base-ubuntu22-node24).
-ARG NODE_VERSION=24.15.0
+# via base-ubuntu22-node24.22.1).
+ARG NODE_VERSION=24.22.1
 ENV NVM_DIR=/root/.nvm
 RUN . "$NVM_DIR/nvm.sh" && nvm install ${NODE_VERSION} && nvm alias default ${NODE_VERSION}
 
 # Fix PATH for non-interactive exec (toolbox process/execute does not load .bashrc).
 ENV PATH="/root/.nvm/versions/node/v${NODE_VERSION}/bin:${PATH}"
+RUN test "$(node --version)" = "v${NODE_VERSION}"
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):
 # sealed (root, PID 1) drops the agent process to it so the agent cannot

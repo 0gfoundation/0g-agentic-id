@@ -4,20 +4,21 @@
 //!
 //! - **No query param → public, minimal.** Anyone can list, but each row
 //!   carries only non-sensitive fields (seal_id, agent_id, owner-when-minted,
-//!   framework, agent_card, phase, created_at). Used by the Discovery page.
-//!   `owner` appears only for MINTED rows — chain-public via ownerOf anyway;
-//!   unminted rows keep it withheld. Deliberately omits `sandbox_id` and
-//!   provisioning stages/errors — those leaked fleet/URL enumeration to the
-//!   whole world.
+//!   agent_seal_addr-when-minted, framework, agent_card, phase, created_at).
+//!   Used by the Discovery page. `owner` and `agent_seal_addr` appear only
+//!   for MINTED rows — both chain-public once the agent exists (ownerOf /
+//!   getAgentSeal) anyway; unminted rows keep them withheld. Deliberately
+//!   omits `sandbox_id` and provisioning stages/errors — those leaked
+//!   fleet/URL enumeration to the whole world.
 //! - **`?owner=0x…` → authenticated, full(er).** Gated by an EIP-191 owner
 //!   signature (`X-Auth-Message` = `0GDeployments:<owner>:<ts>`,
 //!   `X-Auth-Signature`); the recovered signer must equal `<owner>` and the
 //!   timestamp must be fresh. Returns the operational fields an owner needs for
-//!   their own agents (stages, sandbox_id, provision error, …).
+//!   their own agents (stages, sandbox_id, provision error, the container's
+//!   last status report, …).
 //!
-//! Neither shape ever serializes `container_pubkey` / `container_pubkey_mac`
-//! (internal provision-binding material — the MAC is derived from the attestor
-//! master secret and must not leave the process), nor `i_data` /
+//! Neither shape ever serializes the container record (key, image and
+//! provider instance recorded at provision), nor `i_data` /
 //! `provision_deadline` / `last_provision_error_at` / `updated_at` (unused by
 //! any client).
 
@@ -25,7 +26,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use alloy::primitives::Address;
 use attestor_shared::sandbox::eip191_digest;
-use attestor_shared::{AgentId, Deployment, DeploymentPhase, SealId, StageStatus};
+use attestor_shared::{AgentId, ContainerStatus, Deployment, DeploymentPhase, SealId, StageStatus};
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
@@ -67,6 +68,13 @@ struct PublicDeployment {
     /// theater. Unminted rows keep it withheld — nothing is on chain yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     owner: Option<Address>,
+    /// Present only for MINTED rows (same gate as `owner`): the agent's
+    /// on-chain signing address, chain-public via getAgentSeal once the
+    /// agent exists. Lets listing consumers spot agent-owned agents
+    /// (an owner that is another listed row's agentSeal) without N×
+    /// per-row chain reads. Unminted rows keep it withheld.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_seal_addr: Option<Address>,
     #[serde(skip_serializing_if = "Option::is_none")]
     framework: Option<String>,
     agent_card: serde_json::Value,
@@ -79,6 +87,7 @@ impl From<Deployment> for PublicDeployment {
         Self {
             seal_id: d.seal_id,
             owner: d.agent_id.is_some().then_some(d.owner),
+            agent_seal_addr: d.agent_id.is_some().then_some(d.agent_seal_addr),
             agent_id: d.agent_id,
             framework: d.framework,
             agent_card: d.agent_card,
@@ -112,6 +121,11 @@ struct OwnerDeployment {
     provisioned_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_provision_error: Option<String>,
+    /// The current container's last `/status` report (`level`, `reason`,
+    /// `at`): `phase` shows a `warning` as running, so this is where a
+    /// running agent that cannot do its work shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container_status: Option<ContainerStatus>,
     // Deliberately no `settings`: the owner's configuration document is
     // served by `GET /settings` alone, which proves the caller is the LIVE
     // on-chain owner. This tier authenticates against the `owner` query
@@ -137,6 +151,7 @@ impl From<Deployment> for OwnerDeployment {
             container_stage: d.container_stage,
             provisioned_at: d.provisioned_at,
             last_provision_error: d.last_provision_error,
+            container_status: d.container_status,
         }
     }
 }
@@ -245,7 +260,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::json!({}),
             i_data: Vec::new(),
-            framework: Some("dsh".into()),
+            framework: Some("0g-harness".into()),
             clone_params: None,
             phase: DeploymentPhase::Deploying,
             storage_stage: StageStatus::NotStarted,
@@ -253,11 +268,11 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings: None,
             settings_last_good: None,
             settings_version: 0,
@@ -274,9 +289,34 @@ mod tests {
         // withheld — the ONLY genuinely private case (review #154 F4/F9).
         let minted = serde_json::to_value(PublicDeployment::from(row(true))).unwrap();
         assert!(minted.get("owner").is_some(), "minted rows expose owner");
-        assert_eq!(minted["framework"], "dsh");
+        assert_eq!(minted["framework"], "0g-harness");
         let unminted = serde_json::to_value(PublicDeployment::from(row(false))).unwrap();
         assert!(unminted.get("owner").is_none(), "unminted rows withhold owner");
+    }
+
+    #[test]
+    fn public_tier_agent_seal_only_when_minted() {
+        // Same gate as `owner`: the agentSeal address is chain-public via
+        // getAgentSeal once minted (#183-c4 — lets listings show agent-owned
+        // agents without per-row chain reads); before mint nothing is on
+        // chain, so it is withheld. The VALUE is asserted, not just presence
+        // — `then_some(d.owner)` (a copy-paste of the owner line) would pass
+        // an is_some() check while leaking the wrong address.
+        let minted = serde_json::to_value(PublicDeployment::from(row(true))).unwrap();
+        // serde serializes Address lowercase ({:#x}, not EIP-55 to_string) —
+        // compare against the same form so the assertion holds for addresses
+        // that actually contain a–f letters.
+        let expect = format!("{:#x}", Address::from([1u8; 20]));
+        assert_eq!(
+            minted.get("agent_seal_addr").and_then(|v| v.as_str()),
+            Some(expect.as_str()),
+            "minted rows expose agent_seal_addr — the deployment's seal, not the owner"
+        );
+        let unminted = serde_json::to_value(PublicDeployment::from(row(false))).unwrap();
+        assert!(
+            unminted.get("agent_seal_addr").is_none(),
+            "unminted rows withhold agent_seal_addr"
+        );
     }
 
     #[test]
@@ -291,5 +331,28 @@ mod tests {
         assert!(owner_tier.get("settings").is_none());
         let public_tier = serde_json::to_value(PublicDeployment::from(d)).unwrap();
         assert!(public_tier.get("settings").is_none());
+    }
+
+    #[test]
+    fn the_owner_tier_carries_the_last_container_status() {
+        // A warning shows as phase running; the owner reads why here. The
+        // public listing keeps omitting container detail.
+        let mut d = row(true);
+        d.container_status = Some(ContainerStatus {
+            level: attestor_shared::ContainerReportStatus::Warning,
+            reason: Some("owner settings unusable".into()),
+            at: Utc::now(),
+        });
+        let owner_tier = serde_json::to_value(OwnerDeployment::from(d.clone())).unwrap();
+        assert_eq!(owner_tier["container_status"]["level"], "warning");
+        assert_eq!(
+            owner_tier["container_status"]["reason"],
+            "owner settings unusable"
+        );
+        assert!(owner_tier["container_status"]["at"].is_string());
+        let public_tier = serde_json::to_value(PublicDeployment::from(d)).unwrap();
+        assert!(public_tier.get("container_status").is_none());
+        let none = serde_json::to_value(OwnerDeployment::from(row(true))).unwrap();
+        assert!(none.get("container_status").is_none());
     }
 }

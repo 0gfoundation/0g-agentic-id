@@ -1,11 +1,14 @@
 //! POST /stop — owner-initiated stop of a running sandbox.
 //! Enqueues a SandboxStop job; worker relays the owner-signed envelope to
-//! 0g-sandbox at `POST /api/sandbox/:id/stop`.
+//! 0g-sandbox at `POST /api/sandbox/:id/stop`. A stop signed for a sandbox
+//! other than the deployment's is refused with 409.
 
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use attestor_shared::sandbox::CanonicalSignedMessage;
+use attestor_shared::sandbox::{
+    envelope_names_sandbox, CanonicalSignedMessage, NOT_CURRENT_SANDBOX,
+};
 use attestor_shared::{JobPayload, LifecycleRequest};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -45,6 +48,15 @@ pub async fn handle(
     // unsigned, attacker-supplied field and was forgeable — see
     // {lifecycle_auth}.
     authorize_lifecycle(&state, &d, &req.sandbox_envelope).await?;
+
+    // The provider stops the sandbox the owner signed for (`resource_id`),
+    // while the worker records the deployment's sandbox as stopped and
+    // disables its status binding. A stop signed for another sandbox would
+    // mark a running agent stopped, so it is refused and the owner signs
+    // again for the current sandbox.
+    if !envelope_names_sandbox(&req.sandbox_envelope, d.sandbox_id.as_deref()) {
+        return Err(ApiError::conflict(NOT_CURRENT_SANDBOX));
+    }
 
     state
         .jobs
@@ -107,11 +119,15 @@ mod tests {
             tee_data_verifier_addr: None,
             console_enabled: true,
             secret_env_enabled: false,
+
             cli_latest: String::new(),
             cli_notes: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
-            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
+            frameworks: vec![attestor_shared::Framework {
+                name: "openclaw".into(),
+                image: None,
+            }],
             tapp_socket: None,
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
@@ -128,13 +144,23 @@ mod tests {
     const OWNER_PRIV: [u8; 32] = [0x11; 32];
     const ATTACKER_PRIV: [u8; 32] = [0x99; 32];
 
-    /// A lifecycle request whose envelope is validly signed by `priv_bytes`.
+    /// A lifecycle request whose envelope is validly signed by `priv_bytes`
+    /// and names the deployment's sandbox.
     fn signed_req(
         seal_id: SealId,
         priv_bytes: &[u8; 32],
         action: &str,
     ) -> attestor_shared::LifecycleRequest {
-        let env = attestor_shared::mocks::signed_envelope(priv_bytes, action);
+        signed_req_for(seal_id, priv_bytes, action, "sb-old")
+    }
+
+    fn signed_req_for(
+        seal_id: SealId,
+        priv_bytes: &[u8; 32],
+        action: &str,
+        resource_id: &str,
+    ) -> attestor_shared::LifecycleRequest {
+        let env = attestor_shared::mocks::signed_envelope_for(priv_bytes, action, resource_id);
         attestor_shared::LifecycleRequest {
             seal_id,
             owner: env.wallet_address,
@@ -182,11 +208,11 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: Some("sb-old".into()),
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            container_status: None,
             settings: None,
             settings_last_good: None,
             settings_version: 0,
@@ -198,6 +224,9 @@ mod tests {
         deployments.seed(d);
 
         let state = AppState {
+            providers: Arc::new(
+                attestor_shared::provider_registry::MemoryProviderRegistry::default(),
+            ),
             cfg: test_config(),
             crypto,
             chain,
@@ -207,7 +236,11 @@ mod tests {
             jobs: jobs.clone(),
             events,
         };
-        Setup { state, jobs, seal_id }
+        Setup {
+            state,
+            jobs,
+            seal_id,
+        }
     }
 
     #[tokio::test]
@@ -239,6 +272,26 @@ mod tests {
             .expect("must reject");
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
         assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stop_signed_for_another_sandbox_is_refused_with_409() {
+        // A stop for a sandbox id kept from before a reset would mark the
+        // running agent stopped while the provider stopped the other one.
+        for signed_for in ["sb-stale", ""] {
+            let s = make_setup();
+            let req = signed_req_for(s.seal_id, &OWNER_PRIV, "stop", signed_for);
+            let err = handle(axum::extract::State(s.state.clone()), Json(req))
+                .await
+                .expect_err("the envelope names another sandbox");
+            assert_eq!(err.status, StatusCode::CONFLICT, "{signed_for:?}");
+            assert!(
+                err.message.contains("not this agent's current sandbox"),
+                "{}",
+                err.message
+            );
+            assert!(s.jobs.submitted.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

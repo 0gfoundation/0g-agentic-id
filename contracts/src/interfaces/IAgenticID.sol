@@ -32,8 +32,11 @@ import {IntelligentData} from "./IERC7857Metadata.sol";
 ///         are bound to an agentId exactly once and are immutable for the token's
 ///         lifetime — they persist across transfers and cannot be rotated or replaced.
 ///
-/// @dev Implementors must also deploy an IAgenticIDReputationRegistry that accepts
-///      ServeProofs signed by the agentSeal registered here.
+/// @dev ServeProofs signed by the agentSeal registered here are redeemed at a
+///      VerifiedFeedbackRegistry, whose signed digest is bound to that
+///      registry's address (EIP-191 version 0x00). The deprecated
+///      IAgenticIDReputationRegistry fork must not be relied on — see its
+///      natspec.
 interface IAgenticID is IERC8004IdentityRegistry, IERC7857 {
 
     // ── Events ────────────────────────────────────────────────────────────────

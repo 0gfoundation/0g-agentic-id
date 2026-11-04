@@ -1,0 +1,84 @@
+{
+  "chain_id": 16602,
+  "agentic_id_addr": "0x1111111111111111111111111111111111111111",
+  "admin": "0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025",
+  "config": {
+    "provider_registry_schema": 1,
+    "provider_registry_version": 1,
+    "provider_registry_digest": "0x2a1c4cbeb55c16a9bb42a501c55606594f59d5f304fd3e7c55c3fffca61598c7",
+    "attestor_app_id": "attestor-test",
+    "tapp_registry_addr": "0x2222222222222222222222222222222222222222"
+  },
+  "snapshot": {
+    "version": 1,
+    "providers": [
+      {
+        "id": "0g-compute",
+        "name": "0G Compute",
+        "formats": [
+          "openai",
+          "anthropic"
+        ],
+        "defaultFormat": "openai",
+        "endpoints": {
+          "openai": "https://router-api.0g.ai/v1",
+          "anthropic": "https://router-api.0g.ai"
+        },
+        "modelCatalog": "https://router-api.0g.ai/v1/models",
+        "compatibility": {
+          "requiresStringContent": true,
+          "supportsStore": false,
+          "supportsDeveloperRole": false,
+          "supportsUsageInStreaming": false,
+          "supportsStrictMode": false,
+          "maxTokensField": "max_tokens"
+        }
+      },
+      {
+        "id": "openai",
+        "name": "OpenAI",
+        "native": true,
+        "formats": [
+          "openai"
+        ]
+      },
+      {
+        "id": "anthropic",
+        "name": "Anthropic",
+        "native": true,
+        "formats": [
+          "anthropic"
+        ]
+      },
+      {
+        "id": "partner",
+        "name": "Partner",
+        "formats": [
+          "openai"
+        ],
+        "defaultFormat": "openai",
+        "endpoints": {
+          "openai": "https://partner.example/v1"
+        },
+        "models": [
+          {
+            "id": "private-model",
+            "supported_formats": [
+              "openai"
+            ],
+            "supported_parameters": [
+              "tools",
+              "reasoning_effort"
+            ],
+            "context_length": 64000,
+            "max_completion_tokens": 12000
+          }
+        ]
+      }
+    ],
+    "document": "{\"schema\":1,\"chain_id\":16602,\"agentic_id_addr\":\"0x1111111111111111111111111111111111111111\",\"base_version\":0,\"expires_at\":4102444800,\"providers\":[{\"id\":\"0g-compute\",\"name\":\"0G Compute\",\"formats\":[\"openai\",\"anthropic\"],\"defaultFormat\":\"openai\",\"endpoints\":{\"openai\":\"https://router-api.0g.ai/v1\",\"anthropic\":\"https://router-api.0g.ai\"},\"modelCatalog\":\"https://router-api.0g.ai/v1/models\",\"compatibility\":{\"requiresStringContent\":true,\"supportsStore\":false,\"supportsDeveloperRole\":false,\"supportsUsageInStreaming\":false,\"supportsStrictMode\":false,\"maxTokensField\":\"max_tokens\"}},{\"id\":\"openai\",\"name\":\"OpenAI\",\"native\":true,\"formats\":[\"openai\"]},{\"id\":\"anthropic\",\"name\":\"Anthropic\",\"native\":true,\"formats\":[\"anthropic\"]},{\"id\":\"partner\",\"name\":\"Partner\",\"formats\":[\"openai\"],\"defaultFormat\":\"openai\",\"endpoints\":{\"openai\":\"https://partner.example/v1\"},\"models\":[{\"id\":\"private-model\",\"supported_formats\":[\"openai\"],\"supported_parameters\":[\"tools\",\"reasoning_effort\"],\"context_length\":64000,\"max_completion_tokens\":12000}]}],\"attestor_app_id\":\"attestor-test\",\"tapp_registry_addr\":\"0x2222222222222222222222222222222222222222\"}",
+    "signature": "0x65745e78e2c593deb30791fe52567e39dfea269af10a1e7317230b7353eccedf773e90b44dfdfae92dbc2fc4d7a51467f6780c12c9833f926968551ac03c4fa21b"
+  },
+  "route_hash": "0xed14f1f829fab4bdecdc17250f8c82450d950efc54ffe84ab8646486e206de71",
+  "secret_env_v3": "BAryLLt2+Jl3q8q+KU+wE7/nTrhqma5/6GgCBKnobScqg8y3VMTdoA7um6zV7LOu7jts7T7bSKGQusoMTnRD9cp7kkEgXNgMVLScZbry7GkFzTYXtuISJHqjV1dh8F1jnDKkTkYSVtDWvYFoYf73R8wk1O3QY90Gxf7UavZd/HAQZW+kcBth69Z5e5WvRYEU8COpxHeKLiHoUat8HOlFtzLaBLe/vJx/isi3jbSBrBzEWE75XdNvP1Xzc2620kH0a00jWqbt9bpfiZC+eVAi6v7wxk9VdkTVLLKVXFUfv8cf6go5cFvLsGjY7aUUgLGBFHgOgT0nLfYnvLP/VFMXNnHJfCrsQeik7ckFN7eYaZn0gpo2/1hNCcRYWf1DqWrnyYOMKBdSGjkKF7T9IGvk+COEZupBZYFMP3qJkPnCEDNP677iNKwXoy6WA/fPavuLHYi7qn/nsPKlXFN9LmLuo3Q346HCruhHiTiZxpTu8Eu3LGGCgiYXkLdheKvrJQvdOFESCjHVmMVxRktMsADEDw=="
+}

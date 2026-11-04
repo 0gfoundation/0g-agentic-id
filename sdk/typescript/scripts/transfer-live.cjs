@@ -18,7 +18,8 @@
 //   [API_KEY=sk-…] node scripts/transfer-live.cjs
 'use strict';
 const { AgenticID } = require('../dist/index.js');
-const { generatePrivateKey, privateKeyToAccount } = require('viem/accounts');
+const { privateKeyToAccount } = require('viem/accounts');
+const { createTestWallet } = require('./test-wallet.cjs');
 const { createWalletClient, http, parseEther } = require('viem');
 const { execSync } = require('child_process');
 
@@ -64,10 +65,9 @@ function mk(priv, cfg) {
   const A = mk(OWNER_PRIV, cfg);
   const ownerA = privateKeyToAccount(OWNER_PRIV).address;
   const provider = cfg.sandbox_provider_addr;
-  const proxy = cfg.sandbox_proxy_addr;
 
   // ── generate + fund wallet B ──────────────────────────────────────────
-  const privB = generatePrivateKey();
+  const { privateKey: privB } = createTestWallet('transfer-live');
   const acctB = privateKeyToAccount(privB);
   console.log(`· wallet B = ${acctB.address} (generated)`);
   const wc = createWalletClient({ account: privateKeyToAccount(OWNER_PRIV), transport: http(cfg.chain_rpc) });
@@ -139,19 +139,20 @@ function mk(priv, cfg) {
   check('deployment row owner == B (indexer synced)', ownedByB, `ownedByB=${ownedByB}`);
 
   // ── reachable + identity preserved under B ────────────────────────────
-  const base = `http://${cfg.agent_serve_port}-${row.sandboxId}.${proxy}`;
+  const base = (await B.agent.waitForRunning(sealId)).url;
   const proofHeader = await hdr(base);
   check('/hello reachable + X-Agent-Proof under new owner', !!proofHeader, base);
   if (proofHeader) {
     const proof = B.reputation.parseServeProofHeader(proofHeader);
     check('same agentSeal identity after transfer+recreate', proof.agentId === agentId,
       `proof.agentId=${proof.agentId}, sealAddr=${sealAddr}`);
+    check('transferred agent proof signature verifies', (await B.reputation.verifyProof(proof)).signerMatches);
   } else {
     check('same agentSeal identity after transfer+recreate', false, 'no proof header to parse');
   }
 
   console.log(fails === 0 ? '\n✅ transfer-live: all checks passed'
                           : `\n❌ transfer-live: ${fails} checks failed`);
-  console.log(`\nartifacts: source agentId=${agentId} now owned by ephemeral B=${acctB.address} (key discarded)`);
+  console.log(`\nartifacts: source agentId=${agentId} now owned by test B=${acctB.address} (key retained for cleanup)`);
   process.exit(fails === 0 ? 0 : 1);
 })().catch((e) => { console.error('ERR', e.message || e); process.exit(1); });

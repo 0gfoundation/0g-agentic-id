@@ -1,7 +1,7 @@
 /**
  * @file SandboxClient.ts
  * @description Internal client for trust-root ack (TappRegistry) + prepaid
- * sandbox balance (SandboxServing). Surfaced on the `AgenticID` facade as
+ * sandbox balance (SandboxServing). Surfaced on the `AgentDNA` facade as
  * top-level ops (`ack`/`ackStatus`/`deposit`/`getBalance`) — none is scoped to a
  * single agent. (Agent-seal gas top-up lives on the `agent` namespace.)
  *

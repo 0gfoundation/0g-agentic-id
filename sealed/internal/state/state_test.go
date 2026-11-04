@@ -181,7 +181,7 @@ func TestClear_ResetsSnapshots(t *testing.T) {
 
 func TestSnapshot_ReturnsCurrentHashes(t *testing.T) {
 	a := New()
-	a.Set([]byte("priv"), "http://up", "sid", "owner", "42", "0x"+strings.Repeat("ab", 32), "16602", "0xIdentityRegistry")
+	a.Set([]byte("priv"), "http://up", "sid", "owner", "42", "0x"+strings.Repeat("ab", 32), "16602", "0xIdentityRegistry", "0xValidator")
 	a.SeedChainSnapshot("config", "h1", "0xr1")
 	a.UpdateCurrentSnapshot("config", "h2")
 
@@ -192,6 +192,21 @@ func TestSnapshot_ReturnsCurrentHashes(t *testing.T) {
 	// DataHash is 0xr1 but that's a separate accessor.
 	if len(dh) != 1 || !ok || got.ContentHash != "h2" {
 		t.Errorf("Snapshot dataHashes = %v; want {config: {content=h2, ...}}", dh)
+	}
+}
+
+// The serve-proof validator rides Set → ProofDomain and is wiped by Clear,
+// so a cleared agent can never sign a proof bound to a stale registry.
+func TestProofDomain_CarriesValidatorAndClears(t *testing.T) {
+	a := New()
+	a.Set([]byte("priv"), "http://up", "sid", "owner", "42", "0x"+strings.Repeat("ab", 32), "16602", "0xIdentityRegistry", "0xValidator")
+	chainID, identity, validator := a.ProofDomain()
+	if chainID != "16602" || identity != "0xIdentityRegistry" || validator != "0xValidator" {
+		t.Fatalf("ProofDomain = (%q, %q, %q)", chainID, identity, validator)
+	}
+	a.Clear()
+	if chainID, identity, validator := a.ProofDomain(); chainID != "" || identity != "" || validator != "" {
+		t.Fatalf("ProofDomain after Clear = (%q, %q, %q); want all empty", chainID, identity, validator)
 	}
 }
 

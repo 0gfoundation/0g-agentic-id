@@ -5,15 +5,16 @@
 //!
 //!   * [`RetryPolicy::Idempotent`] — full retry on any «request didn't
 //!     reach server OR server hiccuped» class of error. Safe to use for
-//!     reads + same-key overwrites + lifecycle calls whose double-fire
-//!     is benign. Retries on `is_timeout / is_connect / is_request` and
-//!     on HTTP 5xx responses.
+//!     reads + same-key overwrites + calls whose double-fire is benign.
+//!     Retries on `is_timeout / is_connect / is_request` and on HTTP
+//!     5xx responses.
 //!
 //!   * [`RetryPolicy::Strict`] — only retry when we're *sure* the
 //!     request never landed (TCP `connect` failed). Used for
-//!     non-idempotent ops like `sandbox.create` where a sandbox-side
-//!     nonce dedup means a retry-after-server-processed produces an
-//!     orphan container.
+//!     non-idempotent ops like `sandbox.create`, where a
+//!     retry-after-server-processed produces an orphan container, and
+//!     for owner-signed `start`/`stop`, whose nonce the provider
+//!     consumes on first receipt so a resend can only be refused.
 //!
 //! Three attempts total (1 initial + 2 retries) with 200ms / 800ms
 //! backoff. The 5xx return-as-is on the last attempt lets the caller
@@ -65,6 +66,23 @@ fn is_retryable_err(e: &reqwest::Error, policy: RetryPolicy) -> bool {
 pub async fn retry_send<F, Fut>(
     op: &'static str,
     policy: RetryPolicy,
+    f: F,
+) -> anyhow::Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = reqwest::Result<reqwest::Response>>,
+{
+    retry_send_starting_by(op, policy, None, f).await
+}
+
+/// [`retry_send`], except that no attempt starts at or after `start_by`.
+/// An attempt already started is never cut off here: it runs to its own
+/// request timeout. Once `start_by` has passed, the next attempt (after a
+/// retryable error) is refused instead of started.
+pub async fn retry_send_starting_by<F, Fut>(
+    op: &'static str,
+    policy: RetryPolicy,
+    start_by: Option<tokio::time::Instant>,
     mut f: F,
 ) -> anyhow::Result<reqwest::Response>
 where
@@ -73,6 +91,13 @@ where
 {
     let mut last_err: Option<reqwest::Error> = None;
     for attempt in 1..=MAX_ATTEMPTS {
+        if start_by.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            let cause = last_err
+                .as_ref()
+                .map(|e| format!("; previous attempt: {e}"))
+                .unwrap_or_default();
+            anyhow::bail!("{op}: start deadline passed before attempt {attempt}{cause}");
+        }
         match f().await {
             Ok(resp) if !resp.status().is_server_error() => return Ok(resp),
             Ok(resp) => {
@@ -120,22 +145,34 @@ mod tests {
     // We don't synthesize reqwest::Response in tests — its constructor
     // surface is private and would pull in the `http` crate as a dev-
     // dep just to satisfy `From<http::Response<_>> for reqwest::Response`.
-    // Instead, exercise the retry counter via real reqwest calls
-    // against a closed port (gives genuine `is_connect()` errors).
+    // Instead, exercise the retry counter via real reqwest connector errors.
+    // Failing DNS is immediate and cannot turn into an unrelated total-request
+    // timeout when the test runner is busy, or depend on a host's open ports.
     // The 5xx-response branches are eyeball-reviewed; their logic is
     // a single line of state check each.
 
-    async fn hit_closed_port(counter: Arc<AtomicU32>) -> reqwest::Result<reqwest::Response> {
+    struct FailingDns;
+
+    impl reqwest::dns::Resolve for FailingDns {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            Box::pin(async {
+                Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test DNS failure").into())
+            })
+        }
+    }
+
+    async fn connect_error(counter: Arc<AtomicU32>) -> reqwest::Result<reqwest::Response> {
         counter.fetch_add(1, Ordering::SeqCst);
-        // 127.0.0.1:1 — privileged port nobody listens on; reqwest
-        // returns a connect-class error fast.
-        reqwest::Client::builder()
-            .timeout(Duration::from_millis(150))
+        let result = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(FailingDns))
             .build()
             .unwrap()
-            .get("http://127.0.0.1:1")
+            .get("http://retry.invalid")
             .send()
-            .await
+            .await;
+        assert!(result.as_ref().unwrap_err().is_connect(), "fixture must produce a connect error: {result:?}");
+        result
     }
 
     #[tokio::test]
@@ -145,11 +182,14 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
         let c = counter.clone();
         let err = retry_send("test-op", RetryPolicy::Idempotent, move || {
-            hit_closed_port(c.clone())
+            connect_error(c.clone())
         })
         .await
         .unwrap_err();
-        assert!(err.to_string().starts_with("test-op:"), "op label preserved: {err}");
+        assert!(
+            err.to_string().starts_with("test-op:"),
+            "op label preserved: {err}"
+        );
         assert_eq!(
             counter.load(Ordering::SeqCst),
             MAX_ATTEMPTS,
@@ -166,10 +206,45 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
         let c = counter.clone();
         let _ = retry_send("test-op", RetryPolicy::Strict, move || {
-            hit_closed_port(c.clone())
+            connect_error(c.clone())
         })
         .await
         .unwrap_err();
         assert_eq!(counter.load(Ordering::SeqCst), MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn no_attempt_starts_after_the_start_deadline() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+        let err = retry_send_starting_by(
+            "test-op",
+            RetryPolicy::Strict,
+            Some(tokio::time::Instant::now() + Duration::from_millis(100)),
+            move || connect_error(c.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the retry after the 200 ms backoff starts past the deadline"
+        );
+        assert!(err.to_string().contains("start deadline passed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_started_attempt_runs_past_the_start_deadline() {
+        let start_by = tokio::time::Instant::now() + Duration::from_millis(50);
+        let response =
+            retry_send_starting_by("test-op", RetryPolicy::Strict, Some(start_by), || async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                connect_error(Arc::new(AtomicU32::new(0))).await
+            })
+            .await;
+        let err = response.unwrap_err();
+        assert!(tokio::time::Instant::now() >= start_by + Duration::from_millis(150));
+        assert!(err.to_string().contains("start deadline passed"), "{err}");
+        assert!(err.to_string().contains("previous attempt"), "{err}");
     }
 }

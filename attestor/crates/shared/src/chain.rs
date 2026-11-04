@@ -17,6 +17,7 @@
 use crate::traits::ChainClient;
 use crate::types::*;
 use alloy::network::{Ethereum, EthereumWallet, Network, TransactionBuilder};
+use alloy::primitives::B256;
 use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::fillers::{ChainIdFiller, NonceFiller, NonceManager};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -33,18 +34,23 @@ sol!(
     #[sol(rpc)]
     #[derive(Debug)]
     AgenticID,
-    "../../../contracts/out/AgenticID.sol/AgenticID.json"
+    concat!(env!("OUT_DIR"), "/AgenticID.abi.json")
 );
 
-// TappRegistry — minimal inline interface (not a JSON-ABI import, to keep
-// this crate self-contained without a cross-repo dep on 0g-tapp). Add
-// methods here as the attestor needs them; today we only read the sandbox
-// app's active node list to validate /provision attestations.
+// Minimal TappRegistry interface for the owner acknowledgement preflight.
 sol!(
     #[sol(rpc)]
     interface TappRegistry {
-        function getNodeList(string calldata appId) external view returns (address[] memory);
+        struct AppInfo { bytes composeHash; bytes volumesHash; bytes[] imageHashes; address owner; uint256 registeredAt; }
+        function getAppInfo(string calldata appId) external view returns (AppInfo memory);
         function isAcknowledged(address user, string calldata appId) external view returns (bool);
+    }
+);
+
+sol!(
+    #[sol(rpc)]
+    interface IERC1271 {
+        function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4);
     }
 );
 
@@ -82,6 +88,93 @@ sol!(
         event ClonedFrom(uint256 indexed sourceAgentId, uint256 indexed newAgentId, address indexed to, address caller);
     }
 );
+
+// VerifiedFeedbackRegistry — only the anchor read the startup check makes
+// (`check_verified_feedback_anchor`). The attestor never writes to it.
+sol!(
+    #[sol(rpc)]
+    interface IVerifiedFeedbackAnchor {
+        function getIdentityRegistry() external view returns (address);
+    }
+);
+
+/// Attempts for the startup `getIdentityRegistry()` read; a definite
+/// mismatch is not retried.
+const ANCHOR_READ_ATTEMPTS: u32 = 3;
+
+/// Why `ATTESTOR_VERIFIED_FEEDBACK_ADDR` was refused at startup.
+#[derive(Debug, thiserror::Error)]
+pub enum VerifiedFeedbackAnchorError {
+    #[error(
+        "ATTESTOR_VERIFIED_FEEDBACK_ADDR {registry:#x} is not a readable VerifiedFeedbackRegistry \
+         proxy (getIdentityRegistry() failed: {reason}); set it to the proxy bound to \
+         ATTESTOR_AGENTIC_ID_ADDR {agentic_id:#x}, or leave it blank"
+    )]
+    Unreadable {
+        registry: Address,
+        agentic_id: Address,
+        reason: String,
+    },
+    #[error(
+        "ATTESTOR_VERIFIED_FEEDBACK_ADDR {registry:#x} is anchored to AgenticID {anchored:#x}, \
+         not ATTESTOR_AGENTIC_ID_ADDR {agentic_id:#x}: containers would sign ServeProofs that \
+         no registry for this AgenticID redeems"
+    )]
+    Mismatch {
+        registry: Address,
+        anchored: Address,
+        agentic_id: Address,
+    },
+}
+
+/// Startup guard for `ATTESTOR_VERIFIED_FEEDBACK_ADDR` (worker and api): the
+/// configured VerifiedFeedbackRegistry must report `getIdentityRegistry() ==
+/// ATTESTOR_AGENTIC_ID_ADDR`. The address is injected into every new
+/// container as its ServeProof validator and served on `GET /config`, and
+/// every off-chain verifier takes both addresses from that same /config, so a
+/// pasted impl/beacon address or another environment's proxy would otherwise
+/// pass every check but the registry's own. `None` (unset) skips the check.
+/// A read error is retried a few times before it fails startup.
+pub async fn check_verified_feedback_anchor(
+    chain: &dyn ChainClient,
+    verified_feedback: Option<Address>,
+    agentic_id: Address,
+) -> Result<(), VerifiedFeedbackAnchorError> {
+    let Some(registry) = verified_feedback else {
+        return Ok(());
+    };
+    let mut reason = String::new();
+    for attempt in 1..=ANCHOR_READ_ATTEMPTS {
+        match chain.identity_registry_of(registry).await {
+            Ok(anchored) if anchored == agentic_id => {
+                tracing::info!(
+                    registry = %format!("{registry:#x}"),
+                    "VerifiedFeedbackRegistry anchored to ATTESTOR_AGENTIC_ID_ADDR"
+                );
+                return Ok(());
+            }
+            Ok(anchored) => {
+                return Err(VerifiedFeedbackAnchorError::Mismatch {
+                    registry,
+                    anchored,
+                    agentic_id,
+                })
+            }
+            Err(e) => {
+                reason = format!("{e:#}");
+                if attempt < ANCHOR_READ_ATTEMPTS {
+                    tracing::warn!(attempt, error = %reason, "getIdentityRegistry() read failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    Err(VerifiedFeedbackAnchorError::Unreadable {
+        registry,
+        agentic_id,
+        reason,
+    })
+}
 
 /// Wall-time bound for the authorizer pre-check eth_call. A hostile or
 /// looping authorizer must not pin an attestor worker thread indefinitely;
@@ -160,10 +253,6 @@ where
     sender: Address,
     priority_fee_wei: u128,
     max_fee_wei: u128,
-    // TappRegistry + sandbox appId — present together iff TappRegistry is
-    // wired. Both unset → is_sandbox_node returns Ok(None) and the caller
-    // falls back to its env-configured single sandbox signer.
-    tapp_registry: Option<(Address, String)>,
     // Serializes the read-nonce→submit window for every write from `sender`.
     // SimpleNonceManager reads the pending nonce fresh on each send; without
     // this lock two concurrent sends read the same nonce and collide (#54:
@@ -171,6 +260,7 @@ where
     // across submit (sub-second), NOT the receipt wait, so txs still pipeline.
     // tokio Mutex (not std) because the guard is held across an `.await`.
     submit_lock: tokio::sync::Mutex<()>,
+    submit_pool: sqlx::PgPool,
     _t: PhantomData<T>,
 }
 
@@ -185,8 +275,8 @@ where
         sender: Address,
         priority_fee_gwei: u64,
         max_fee_gwei: u64,
-        tapp_registry: Option<(Address, String)>,
         clone_gate: Option<Address>,
+        submit_pool: sqlx::PgPool,
     ) -> Arc<Self> {
         Arc::new(Self {
             provider,
@@ -195,8 +285,8 @@ where
             sender,
             priority_fee_wei: priority_fee_gwei as u128 * GWEI_TO_WEI,
             max_fee_wei: max_fee_gwei as u128 * GWEI_TO_WEI,
-            tapp_registry,
             submit_lock: tokio::sync::Mutex::new(()),
+            submit_pool,
             _t: PhantomData,
         })
     }
@@ -225,18 +315,20 @@ pub fn connect_http(
     signer_priv: [u8; 32],
     priority_fee_gwei: u64,
     max_fee_gwei: u64,
-    tapp_registry: Option<(Address, String)>,
     clone_gate: Option<Address>,
+    submit_pool: sqlx::PgPool,
 ) -> anyhow::Result<Arc<dyn ChainClient>> {
     let signer = PrivateKeySigner::from_slice(&signer_priv)?;
     let sender = signer.address();
     let wallet = EthereumWallet::from(signer);
     let url: reqwest::Url = rpc_url.parse()?;
+    let transport = rpc_http_transport(url, crate::nonce_submit::RPC_TIMEOUT)?;
+    let is_local = transport.guess_local();
     let provider = ProviderBuilder::new()
         .filler(ChainIdFiller::default())
         .filler(NonceFiller::<PendingNonceManager>::default())
         .wallet(wallet)
-        .on_http(url);
+        .on_client(alloy::rpc::client::RpcClient::new(transport, is_local));
     // Startup marker so a live process proves which build/strategy is running
     // (a missing line means the binary predates the #54 fix — stale image).
     tracing::info!(sender = %sender, "chain client ready — mint nonce = pending-read + submit_lock (#54)");
@@ -246,10 +338,21 @@ pub fn connect_http(
         sender,
         priority_fee_gwei,
         max_fee_gwei,
-        tapp_registry,
         clone_gate,
+        submit_pool,
     );
     Ok(chain)
+}
+
+pub(crate) fn rpc_http_transport(
+    url: reqwest::Url,
+    timeout: std::time::Duration,
+) -> anyhow::Result<alloy::transports::http::Http<reqwest::Client>> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(crate::nonce_submit::CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .build()?;
+    Ok(alloy::transports::http::Http::with_client(client, url))
 }
 
 #[async_trait]
@@ -297,11 +400,7 @@ where
             .with_input(call_data);
 
         // Estimate gas limit, add 20% safety margin.
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -317,13 +416,17 @@ where
         // Serialize the nonce-read→submit window (see `submit_lock`). Guard is
         // released as soon as the tx is broadcast (pending nonce bumped), not
         // held through the receipt wait, so mints still pipeline into mempool.
-        let pending = {
-            let _guard = self.submit_lock.lock().await;
-            self.provider
-                .send_transaction(tx)
-                .await
-                .map_err(decode_err)?
-        };
+        let pending = crate::nonce_submit::with_nonce_lock(
+            &self.submit_pool,
+            self.sender.as_slice(),
+            "registerWithSeal",
+            crate::nonce_submit::SUBMIT_TIMEOUT,
+            || async {
+                let _guard = self.submit_lock.lock().await;
+                self.provider.send_transaction(tx).await.map_err(decode_err)
+            },
+        )
+        .await?;
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, "alloy: registerWithSeal submitted");
         Ok(tx_hash)
@@ -437,11 +540,7 @@ where
             .with_to(gate)
             .with_input(call_data);
 
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -454,13 +553,17 @@ where
             "alloy: sending cloneFrom (policy-gated mint)"
         );
 
-        let pending = {
-            let _guard = self.submit_lock.lock().await;
-            self.provider
-                .send_transaction(tx)
-                .await
-                .map_err(decode_err)?
-        };
+        let pending = crate::nonce_submit::with_nonce_lock(
+            &self.submit_pool,
+            self.sender.as_slice(),
+            "cloneFrom",
+            crate::nonce_submit::SUBMIT_TIMEOUT,
+            || async {
+                let _guard = self.submit_lock.lock().await;
+                self.provider.send_transaction(tx).await.map_err(decode_err)
+            },
+        )
+        .await?;
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, "alloy: cloneFrom submitted");
         Ok(tx_hash)
@@ -476,14 +579,41 @@ where
         Ok(c.isTrustedAttestor(addr).call().await?._0)
     }
 
-    async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool> {
-        let (registry_addr, app_id) = self
-            .tapp_registry
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("TappRegistry not configured (ATTESTOR_TAPP_REGISTRY_ADDR + ATTESTOR_SANDBOX_APP_ID required)"))?;
-        let r = TappRegistry::new(*registry_addr, self.provider.clone());
-        let nodes = r.getNodeList(app_id.clone()).call().await?._0;
-        Ok(nodes.iter().any(|n| *n == addr))
+    async fn identity_registry_of(&self, registry: Address) -> anyhow::Result<Address> {
+        let code = self.provider.get_code_at(registry).await?;
+        if code.is_empty() {
+            anyhow::bail!("no contract code at {registry:#x}");
+        }
+        let r = IVerifiedFeedbackAnchor::new(registry, self.provider.clone());
+        Ok(r.getIdentityRegistry().call().await?._0)
+    }
+
+    async fn tapp_app_owner(&self, registry: Address, app_id: &str) -> anyhow::Result<Address> {
+        let registry = TappRegistry::new(registry, self.provider.clone());
+        Ok(registry
+            .getAppInfo(app_id.to_string())
+            .call()
+            .await?
+            ._0
+            .owner)
+    }
+
+    async fn is_valid_contract_signature(
+        &self,
+        owner: Address,
+        digest: [u8; 32],
+        signature: &[u8],
+    ) -> anyhow::Result<bool> {
+        if self.provider.get_code_at(owner).await?.is_empty() {
+            return Ok(false);
+        }
+        let wallet = IERC1271::new(owner, self.provider.clone());
+        let result = wallet
+            .isValidSignature(B256::from(digest), Bytes::copy_from_slice(signature))
+            .call()
+            .await?
+            ._0;
+        Ok(result.as_slice() == [0x16, 0x26, 0xba, 0x7e])
     }
 
     async fn is_acknowledged(
@@ -533,11 +663,7 @@ where
         Ok(c.sealedKeysOf(agent_id).call().await?._0)
     }
 
-    async fn set_agent_uri(
-        &self,
-        agent_id: AgentId,
-        uri: String,
-    ) -> anyhow::Result<TxHash> {
+    async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash> {
         let call_data = AgenticID::setAgentURICall {
             agentId: agent_id,
             newURI: uri,
@@ -549,11 +675,7 @@ where
             .with_to(self.contract_addr)
             .with_input(call_data);
 
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -565,13 +687,17 @@ where
             "alloy: sending setAgentURI"
         );
 
-        let pending = {
-            let _guard = self.submit_lock.lock().await;
-            self.provider
-                .send_transaction(tx)
-                .await
-                .map_err(decode_err)?
-        };
+        let pending = crate::nonce_submit::with_nonce_lock(
+            &self.submit_pool,
+            self.sender.as_slice(),
+            "setAgentURI",
+            crate::nonce_submit::SUBMIT_TIMEOUT,
+            || async {
+                let _guard = self.submit_lock.lock().await;
+                self.provider.send_transaction(tx).await.map_err(decode_err)
+            },
+        )
+        .await?;
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, %agent_id, "alloy: setAgentURI submitted");
         Ok(tx_hash)
@@ -590,6 +716,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rpc_deadline_bounds_a_real_silent_http_peer() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let transport = rpc_http_transport(url, Duration::from_millis(50)).unwrap();
+        let provider = alloy::providers::RootProvider::<_, Ethereum>::new(
+            alloy::rpc::client::RpcClient::new(transport, true),
+        );
+        let request = tokio::spawn(async move { provider.get_block_number().await });
+        tokio::time::timeout(Duration::from_secs(2), received)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(300), request).await;
+        server.abort();
+        assert!(result
+            .expect("Alloy RPC ignored the HTTP request deadline")
+            .unwrap()
+            .is_err());
+    }
 
     /// `0x042a85a4` == selector of `AgenticIDNotTrustedAttestor()`.
     /// This is the exact error we saw in production (attestor EOA not
@@ -634,5 +794,63 @@ mod tests {
     fn decode_returns_none_for_unknown_selector() {
         let err = r#"execution reverted, data: "0xdeadbeef""#;
         assert!(decode_revert_data_in_error(err).is_none());
+    }
+
+    // ── check_verified_feedback_anchor ─────────────────────────────────
+
+    use crate::mocks::MockChain;
+
+    const AGENTIC_ID: Address = Address::repeat_byte(0xa9);
+    const VF: Address = Address::repeat_byte(0xb7);
+
+    #[tokio::test]
+    async fn anchor_check_skipped_when_unset() {
+        // The mock would fail the read — unset never reaches it.
+        let chain = MockChain::new();
+        check_verified_feedback_anchor(&chain, None, AGENTIC_ID)
+            .await
+            .expect("unset validator skips the check");
+    }
+
+    #[tokio::test]
+    async fn anchor_check_passes_when_anchored() {
+        let chain = MockChain::new();
+        chain.set_identity_registry(Some(AGENTIC_ID));
+        check_verified_feedback_anchor(&chain, Some(VF), AGENTIC_ID)
+            .await
+            .expect("anchored registry passes");
+    }
+
+    #[tokio::test]
+    async fn anchor_check_rejects_other_identity_registry() {
+        let chain = MockChain::new();
+        let other = Address::repeat_byte(0xc3);
+        chain.set_identity_registry(Some(other));
+        let err = check_verified_feedback_anchor(&chain, Some(VF), AGENTIC_ID)
+            .await
+            .expect_err("a registry bound to another AgenticID must fail startup");
+        assert!(
+            matches!(err, VerifiedFeedbackAnchorError::Mismatch { anchored, .. } if anchored == other),
+            "got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("ATTESTOR_VERIFIED_FEEDBACK_ADDR"), "{msg}");
+        assert!(msg.contains(&format!("{AGENTIC_ID:#x}")), "{msg}");
+        assert!(msg.contains(&format!("{other:#x}")), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn anchor_check_rejects_unreadable_registry() {
+        // No code / revert / RPC down: refused after the retries (~1.5s of
+        // backoff).
+        let chain = MockChain::new();
+        let err = check_verified_feedback_anchor(&chain, Some(VF), AGENTIC_ID)
+            .await
+            .expect_err("an unreadable registry must fail startup");
+        assert!(
+            matches!(err, VerifiedFeedbackAnchorError::Unreadable { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("getIdentityRegistry()"), "{err}");
     }
 }

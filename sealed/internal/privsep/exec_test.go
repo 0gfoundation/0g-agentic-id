@@ -304,7 +304,7 @@ func TestHardenSecuresHomeOnlyWithSplit(t *testing.T) {
 			func() error { order = append(order, "prepare"); return nil },
 			func() error { order = append(order, "reclaim"); return nil },
 			func() []string { listed = true; return nil })
-		// sealed's own CA locations are checked first, before anything
+		// sealed's own CA locations are removed first, before anything
 		// else runs, with or without the split.
 		want := "scrub,self"
 		if active {
@@ -327,7 +327,7 @@ func TestHardenSecuresHomeOnlyWithSplit(t *testing.T) {
 // Harden, main's only boot hook, hands harden the real steps in their
 // order: TestHardenSecuresHomeOnlyWithSplit checks what harden does with
 // them, this checks that Harden passes them (dropping ScrubTrustEnv, say,
-// would leave sealed's TLS trusting a CA file the agent can write, and
+// would leave sealed's TLS trusting a CA file the deploy request names, and
 // dropping ScrubTimeEnv would let its first log line read a zone file the
 // agent can write).
 func TestHardenWiresEveryStep(t *testing.T) {
