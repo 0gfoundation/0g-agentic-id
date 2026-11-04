@@ -55,8 +55,8 @@ sweep 还会把容器已经 15 min 没有发 `/status` 的 running deployment �
 `error` 则标为 failed 并删除 sandbox；其他非运行状态标为 stopped，owner 可以 resume。
 sandbox 处于 started，或 provider 查不到它的状态时，由 agent 的 `/healthz` 决定：
 不可达就把 agent 标为 failed 并删除 sandbox。这个判断依赖心跳过期，所以只适用于本可以
-上报的容器。首次 provision 不是在 1.4 下完成的容器无法上报：attestor 拒绝它的上报。
-对这样的容器只看 provider 的答复；不会探测它，也不会因为不可达而删除它。1.4 容器只有在
+上报的容器。首次 provision 不是在 0.4 下完成的容器无法上报：attestor 拒绝它的上报。
+对这样的容器只看 provider 的答复；不会探测它，也不会因为不可达而删除它。0.4 容器只有在
 provider 提供有效的 attestor TLS 声明（sealed 用它 pin 这个 attestor）时才能上报。
 因此 worker 每轮 sweep 都向 provider 取这份声明，只有在过去 15 min 的每次检查中
 provider 都提供了它，才把过期心跳当作故障；每次 worker 启动后也要先等这 15 min。
@@ -77,9 +77,9 @@ deploy，要留得更久（每个条目的上传预算是 750 s）。能连到�
 打 `job done` 或 `job failed`（或由 reaper 记为已 reap），以后排空队列只看
 worker 日志即可。
 
-### 升级到 AgentDNA 1.4
+### 升级到 AgentDNA 0.4
 
-1.4 同时改变 provider 证书（v3）、attestor TLS 声明和 `/provision` 请求，不兼容旧版本：
+0.4 同时改变 provider 证书（v3）、attestor TLS 声明和 `/provision` 请求，不兼容旧版本：
 每个 agent 都需要新容器。按顺序执行，每一步的检查通过之后再继续。
 
 开始第 1 步之前，要升级的 attestor、sealed 和 provider 镜像必须是用发布分支头构建、并已在
@@ -117,37 +117,37 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
    用了其他框架的镜像时，该 agent 的框架无法启动。sealed 日志
    出现 `attestor tls: statement accepted` 和 `OK   status reported`。被拒的 provision
    会出现在 api 日志里（`provision rejected`），也是该 agent 容器 stage 上的原因。
-6. **发布 SDK。**1.4 的 CLI 是 `@0gfoundation/0g-agentdna` 0.2.2。npm 上已有的版本
-   （0.2.0、0.2.1）早于它：它们的 `reset` 可能在 worker 替换容器之前就从 1.3 容器读到
+6. **发布 SDK。**AgentDNA 0.4 的第一个 CLI 是 `@0gfoundation/0g-agentdna` 0.2.2（从 0.4.0 起，版本号跟随发布号）。npm 上已有的版本
+   （0.2.0、0.2.1）早于它：它们的 `reset` 可能在 worker 替换容器之前就从 AgenticID 1.3 容器读到
    `running` 并报告完成，部署向导也不会把 0g-harness agent 限定为支持工具调用的模型。
    按[发布顺序](../sdk/typescript/MIGRATION.zh.md#发布顺序)发布 0.2.2 及其兼容包，
    使用 `next` dist-tag。dist-tag 由所有网络共用，而 `0g-agentdna update` 和普通安装都取
-   `latest`，所以 `latest` 保持在仍在 1.3 的网络所用的版本上（mainnet 在其自身的 1.4 升级
-   之前即是如此），等所有网络都运行 1.4 后再指向 0.2.2。在正在升级的网络上设置
+   `latest`，所以 `latest` 保持在仍在 AgenticID 1.3 的网络所用的版本上（mainnet 在其自身的 0.4 升级
+   之前即是如此），等所有网络都运行 0.4 后再指向 0.2.2。在正在升级的网络上设置
    `ATTESTOR_CLI_LATEST=0.2.2`，以及一行 `ATTESTOR_CLI_NOTES`，提醒 CLI 用户在 reset 前
    先执行 `npm install -g @0gfoundation/0g-agentdna@0.2.2`（`update` 会装 `latest`），
    并重启 api。检查：`npm view @0gfoundation/0g-agentdna dist-tags.next` 输出 `0.2.2`，
    `dist-tags.latest` 不变，`GET /config` 显示 `"cli_latest":"0.2.2"`。
 7. **公告。**使用 CLI 的 owner 先更新（`npm install -g @0gfoundation/0g-agentdna@0.2.2`）。公告里要写明这条安装命令：0.2.2 之前的 CLI 会提示 `update available … 0g-agentdna update`，而 `update` 装的是 `latest`，不是 0.2.2。CLI 需要 Node.js 18 或更高版本，在 Node 16 上会报 `fetch is not defined`。然后 owner reset 自己的
-   agent。容器创建于 1.4 之前的 agent 自第 4 步起都已下线，显示为 `stopped`，只有 reset
-   才能恢复：1.4 之前创建的 sandbox 不能 resume（`/start` 带 `start`），会得到 409，因为
+   agent。容器创建于 0.4 之前的 agent 自第 4 步起都已下线，显示为 `stopped`，只有 reset
+   才能恢复：0.4 之前创建的 sandbox 不能 resume（`/start` 带 `start`），会得到 409，因为
    那个运行时无法 provision。preflight 要求时，owner 需重新确认 provider（SDK `ack()`）。
    请 owner 错开 reset：worker 一次只跑一个 job，签名后约 150 s 内没开始执行的 reset
    会被丢弃，agent 保持原样。控制台显示 `request expired before it ran — sign it again`；
    0.2.2 的 CLI 会一直等新容器直到超时，然后提示 agent 没有上线、请重新 reset。
 
-   第 4 步 provider 升级时会 archive 所有运行中的 sandbox，所以容器创建于 1.4 之前的
+   第 4 步 provider 升级时会 archive 所有运行中的 sandbox，所以容器创建于 0.4 之前的
    agent 从那时起都已停止。心跳过期 15 min 后，sweep 发现它的 sandbox 已 archive，把它
-   标为 `stopped`。它已提交到链上和存储中的状态都保留，reset 即可恢复。仍在运行的 1.4
-   之前创建的容器（provider 没有 archive 它）同样无法上报：1.4 attestor 拒绝它的状态上报
-   （其 token 格式早于 1.4）。sweep 对它只按 provider 的答复处理（已删除、`error`、
+   标为 `stopped`。它已提交到链上和存储中的状态都保留，reset 即可恢复。仍在运行的 0.4
+   之前创建的容器（provider 没有 archive 它）同样无法上报：0.4 attestor 拒绝它的状态上报
+   （其 token 格式早于 0.4）。sweep 对它只按 provider 的答复处理（已删除、`error`、
    stopped 或 archived），否则保持 `running`；不会因为不可达而探测或删除它。
 
-**回滚。**1.4 attestor 是单向的：它的 schema 删除了 1.3 attestor 要读的列
+**回滚。**0.4 attestor 是单向的：它的 schema 删除了 AgenticID 1.3 attestor 要读的列
 （`inference_provider_registry.acceptance_mac`、`deployments.container_pubkey_mac`），
-在同一数据库上启动的 1.3 attestor 读不了 provider registry，且 `dsh` 行已改名为
-`0g-harness`；它也无法验证 1.4 创建的容器的 v3 证书，也解码不了 1.4 的 job。某一步检查失败时，按该步的处理方法向前修复，不要重新
-部署 1.3 镜像。
+在同一数据库上启动的 AgenticID 1.3 attestor 读不了 provider registry，且 `dsh` 行已改名为
+`0g-harness`；它也无法验证 0.4 创建的容器的 v3 证书，也解码不了 0.4 的 job。某一步检查失败时，按该步的处理方法向前修复，不要重新
+部署 AgenticID 1.3 镜像。
 
 ## Workspace
 
@@ -227,7 +227,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|---|
 | `POST /deploy` | 用户部署 agent。sandbox envelope 的 `env` 含 `API_KEY` / `SEAL_SECRET_ENV` 以外的键时返回 `400` 并指出该键 | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | 源 owner 为另一 owner 铸一个全新 agent，复用源的链上 iData（dataKey 重封给新 agentSeal）；落 Offline，由新 owner 自行上线 | owner EIP-191，校验签名者 == **链上实时 `ownerOf(source)`**（非自声明 owner） |
-| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。只有当前启动票据为其签发的 sandbox 才能 `start`（resume），否则返回 `409`：AgentDNA 1.4 之前创建的 sandbox（没有启动票据，或票据没有签发时间），以及 reset 的 create 失败后仍留在记录上的旧 sandbox，都无法 provision，需 reset。envelope 的 `resource_id` 不是该部署当前 sandbox 的 `start` 或 `stop` 同样返回 `409`（API 与 worker 都会检查），因此 reset 之前留存的 sandbox id 不会以该 agent 的名义被启动或停止。create envelope（reset、首次 provision 的 `start`、带 envelope 的 `retry`）的 `env` 含 `API_KEY` / `SEAL_SECRET_ENV` 以外的键时返回 `400` 并指出该键，不会排入任何任务 | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
+| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。只有当前启动票据为其签发的 sandbox 才能 `start`（resume），否则返回 `409`：AgentDNA 0.4 之前创建的 sandbox（没有启动票据，或票据没有签发时间），以及 reset 的 create 失败后仍留在记录上的旧 sandbox，都无法 provision，需 reset。envelope 的 `resource_id` 不是该部署当前 sandbox 的 `start` 或 `stop` 同样返回 `409`（API 与 worker 都会检查），因此 reset 之前留存的 sandbox id 不会以该 agent 的名义被启动或停止。create envelope（reset、首次 provision 的 `start`、带 envelope 的 `retry`）的 `env` 含 `API_KEY` / `SEAL_SECRET_ENV` 以外的键时返回 `400` 并指出该键，不会排入任何任务 | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
 | `GET /settings?seal_id=0x…` | owner 读自己的配置文档，连带当前 `version`（下一次写要签的 base）。文档是 owner 的，不进任何公开层——只有这一条路能读。响应还带 `confirmed_version` / `attempts` / `fallback_active`：客户端据此告诉 owner「上次推送没起来、agent 正跑着上一份文档、再推一次就是重试」| owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /settings` | owner 写 agent 的那一份配置文档。attestor 只当**不透明 blob** 存：不解析、不校验、不打日志，所以扩配置词表永远不用改 attestor。不上链——配置可随时重给，记忆不行。写是 compare-and-swap：base version 过期就 409 带 `current_version`，于是抓包重放回不去旧文档，两个客户端也不会互相无声覆盖 | owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<文档 sha256>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /probe` | 同步探活：失联容器 flip 到 `Failed`；sandbox 仍保留但没在跑的 flip 到 `Stopped`（可 Resume）| 无 |
