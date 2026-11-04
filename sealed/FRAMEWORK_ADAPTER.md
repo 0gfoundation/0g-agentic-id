@@ -779,6 +779,7 @@ fallback.
 | `VerifiedFeedbackAddr` | VerifiedFeedbackRegistry proxy from `VERIFIED_FEEDBACK_ADDR`; empty when that is unset, malformed or zero, or its `getIdentityRegistry()` is not `AGENTIC_ID_ADDR` | the serve-proof validator (EIP-191 version `0x00`). sealed signs with it itself — the adapter need not act on it; empty ⇒ no `X-Agent-Proof` on any route |
 | `SealedVersion` | sealed binary git hash | for proof/metadata surfaces |
 | `FrameworkHash` | `"0x"+sha256` of the sealed image | the AgenticID Framework code hash signed into serve-proofs |
+| `CredProxy`, `CredHTTPSProxy`, `CredCAFile`, `CredCABundle`, `CredSock`, `CredRevealSock` | the owner-credential proxy and its sockets ([CREDENTIALS.md](CREDENTIALS.md)); all empty when it is off | append `rt.CredentialEnv()` to the framework's environment, and pass `CredSock` / `CredRevealSock` into the `platform.RuntimeSnapshot` so the agent is told how to use its credentials |
 
 **What is deliberately NOT here: configuration.** `RuntimeContext` is captured
 at the initial Start and replayed verbatim on every restart, so anything

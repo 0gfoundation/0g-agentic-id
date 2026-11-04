@@ -664,6 +664,7 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 | `VerifiedFeedbackAddr` | 来自 `VERIFIED_FEEDBACK_ADDR` 的 VerifiedFeedbackRegistry proxy 地址;未设置、格式错误或为零地址,或其 `getIdentityRegistry()` 不是 `AGENTIC_ID_ADDR` 时为空 | serve-proof 的 validator(EIP-191 version `0x00`)。由 sealed 自己拿它签名——adapter 无需处理;为空 ⇒ 任何路由都不带 `X-Agent-Proof` |
 | `SealedVersion` | sealed 二进制的 git hash | 用于 proof/元数据表面 |
 | `FrameworkHash` | sealed 镜像的 `"0x"+sha256` | 签进 serve-proof 的 AgenticID Framework code hash |
+| `CredProxy`、`CredHTTPSProxy`、`CredCAFile`、`CredCABundle`、`CredSock`、`CredRevealSock` | owner 凭据代理及其 socket([CREDENTIALS.zh.md](CREDENTIALS.zh.md));代理关闭时全部为空 | 把 `rt.CredentialEnv()` 追加到框架的环境变量,并把 `CredSock` / `CredRevealSock` 传进 `platform.RuntimeSnapshot`,让 agent 知道如何使用凭据 |
 
 **这里刻意没有的东西:配置。** `RuntimeContext` 在首次 Start 时被捕获、之后
 每次重启原样重放,所以装在里面的东西就被冻在容器这一辈子里,运行期改的配置会被

@@ -27,6 +27,7 @@ One entry point: agent, reputation, and admin namespaces + top-level ops.
 |---|---|
 | `ag.agent` | agent lifecycle (deploy / clone / transfer), reads (owner, agentSeal, iData…), agent-seal gas top-up |
 | `ag.reputation` | capture a TEE-signed serve-proof, verify it, submit/read on-chain feedback |
+| `ag.credentials` | the owner's credentials for an agent's sealed credential proxy: set, remove, approve requests, MCP login, audit |
 | `ag.ack()` / `ag.ackStatus()` | acknowledge the TEE trust-root component set (attestor + kms + sandbox-provider) |
 | `ag.deposit()` / `ag.getBalance()` | fund / read the prepaid sandbox balance (pay-as-you-go runtime) |
 | `ag.getBalanceDetail()` / `ag.requestRefund()` / `ag.withdrawRefund()` | full 3-value account view; withdraw prepaid funds (time-locked two-step) |
@@ -235,6 +236,31 @@ await ag.reputation.getVerifiedSummaryForEndpoint(agentId, '/hello');    // per-
 await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackIndex: idx, responseURI: 'ipfs://…', responseHash: keccak256(toBytes('thanks')) });
 await ag.reputation.revokeFeedback(agentId, idx);          // → "0x…"
 ```
+
+## `ag.credentials` — owner credentials
+
+The agent writes `[[credential:<name>]]` where a key goes; sealed fills the value in on the way out, only for the hosts and request positions the owner allowed, and removes it from responses. Each value is sealed to the agent's agentSeal key here, in the client; the whole set is signed once (EIP-712 `CredentialSet`), stored at the attestor (compare-and-swap) and pushed to the running agent. The full model is in [`sealed/CREDENTIALS.md`](../../sealed/CREDENTIALS.md).
+
+```ts
+const { version } = await ag.credentials.get(sealId);   // definitions, never values
+await ag.credentials.put(sealId, [
+  { name: 'github', value: process.env.GITHUB_TOKEN, hosts: ['api.github.com'],
+    positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }] },
+], { baseVersion: version });                            // CredentialsConflictError when someone wrote meanwhile
+
+// an MCP server: define a login entry, then open the link the agent returns
+await ag.credentials.login(sealId, 'linear');           // → { authorizeUrl }
+
+// requests from the agent
+const waiting = await ag.credentials.pending(sealId);   // sealed's facts, and the agent's reason apart
+await ag.credentials.approveOnce(sealId, waiting[0].auth_req_id);   // one-time EIP-712 approval
+await ag.credentials.deny(sealId, waiting[0].auth_req_id);
+await ag.credentials.pendingCounts();                    // across every agent you own
+await ag.credentials.setNotifyAddress('you@example.org');
+await ag.credentials.audit(sealId);                      // what the agent did, never values
+```
+
+Entries without `value` keep their stored ciphertext; `remove()` and `setAllowReveal()` re-sign the rest. A signing entry (`use: 'sign'`) takes a `signer` (`sigv4`, `hmac`, `jwt`, `wallet`); a login entry takes `mcp: { url }` and no value.
 
 ## Top-level ops
 

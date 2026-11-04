@@ -1251,3 +1251,20 @@ In short: **the architecture trusts you with private operation of your
 agent, but does not protect you from the consequences of manipulating
 it badly**. The market does.
 
+## Owner credentials
+
+Third-party credentials an owner gives the agent stay in sealed, not in
+the framework the model drives ([CREDENTIALS.md](CREDENTIALS.md)). Each
+value is sealed to agentSeal in the owner's client and bound to the owner,
+agent, chain and entry name; the whole set is signed by the owner (EIP-712)
+and checked by sealed against the live on-chain owner and ownership epoch.
+The attestor stores the set and hands it to each boot but never sees a
+value, and cannot swap one: a value must match the hash in the owner's
+signed definition, or carry agentSeal's signature over a writeback bound
+to that definition. sealed fills values only for the hosts and positions
+the owner allowed, keeps them out of responses and of what it commits on
+chain, and gives one to the agent only with the owner's approval. What it
+does not cover: within a key's own permissions the agent may use it as it
+likes, and after a reset sealed trusts the attestor to serve the latest
+set (revoke a removed key at its provider).
+

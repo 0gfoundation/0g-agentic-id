@@ -17,7 +17,7 @@ One entry point, **two shapes**:
 | Interactive shell | bare `npx @0gfoundation/0g-agentdna` (optionally with an agent ref: `npx @0gfoundation/0g-agentdna 286`) | deploy, chat, rate — daily human use |
 | Script subcommands | `npx @0gfoundation/0g-agentdna <command>` | diagnostics & automation — all support `--json` |
 
-Key rule: **only `doctor` / `status` / `list` / `settings` / `providers` / `update` are reserved subcommands.** Any other positional is treated as an agent reference (decimal = agentId, `0x…` = sealId) and routes straight into that agent's session — command names and agent refs can never collide.
+Key rule: **only `doctor` / `status` / `list` / `settings` / `cred` / `providers` / `update` are reserved subcommands.** Any other positional is treated as an agent reference (decimal = agentId, `0x…` = sealId) and routes straight into that agent's session — command names and agent refs can never collide.
 
 Prerequisite: **Node.js ≥ 22** (recommended: `nvm install 22 && nvm use 22`).
 
@@ -88,6 +88,25 @@ Reads/writes the agent's configuration document (which model it thinks with, and
 - a write is a **compare-and-swap** against the version just read: if another client changed the document meanwhile, it is refused (exit 3, `SETTINGS_CONFLICT`) — **never silently overwritten**
 - a merged document with no `model` is refused before signing (the one state the container hard-fails on); the model is checked against the selected provider's catalog first — an absence is a stderr warning only, never a refusal
 
+### `cred <agent> [sub …]` and `cred pending|notify`
+
+The owner's credentials for the agent's sealed credential proxy (`sealed/CREDENTIALS.md`): the agent writes `[[credential:<name>]]` where a key goes, and sealed fills it in on the way out, only for the hosts and positions allowed, and hides it in responses. Every subcommand is owner-signed (`AGENTIC_PRIVATE_KEY`).
+
+| Subcommand | |
+|---|---|
+| `cred <agent>` / `ls` | list the stored entries (never values) |
+| `cred <agent> set <name> [k=v …]` | add or change one. The value is read from stdin when piped, else from a prompt that does not echo; never from an argument. Enter at the prompt keeps a stored value. Keys: `preset=github\|openai\|anthropic`, `host=a,b`, `header='Name: … {v} …'`, `basic=<user>`, `query=<param>`, `body=<field>`, `path=yes`, `use=inject\|token_only\|sign`, `signer=<json>` (with `use=sign`: `sigv4`, `hmac`, `jwt`, `wallet`), `reveal=yes\|no`, `expires=<YYYY-MM-DD\|unix>`, `desc=…`. `host=` replaces the hosts, any position key replaces the positions, the rest is kept |
+| `cred <agent> rm <name>` | remove one (revoke it at its provider too) |
+| `cred <agent> login <name> <mcp-url> [client_id=… client_secret_entry=… scope=a,b]` | log the agent in to an MCP server: defines the entry (Bearer on the server's host) if new or changed, prints the link to open, and waits for the login to land |
+| `cred <agent> reveal <name> on\|off` | let the agent read the value itself without asking each time |
+| `cred <agent> pending` | requests waiting: what sealed knows apart from what the agent says |
+| `cred <agent> approve\|deny <id>` | decide one (an id prefix is enough); `approve` signs a one-time EIP-712 approval. A request to add a credential or log in is answered by `set` / `login` |
+| `cred <agent> log [n]` | what the agent did with its credentials |
+| `cred pending` | pending counts on every agent you own |
+| `cred notify [<email>\|off]` | where you are emailed when an agent waits for you or a credential is about to expire |
+
+Writes are a compare-and-swap like `settings` (exit 3, `CREDENTIALS_CONFLICT`). A write is stored at the attestor and pushed to the running agent; when the agent is not running it applies at the next boot.
+
 ### `providers`
 
 Lists providers from the attestor registry (`--json` supported). Registry publication is an operations API / SDK admin action, authorized by the attestor Tapp owner; it is not a CLI command.
@@ -111,6 +130,7 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 | `start` / `stop` / `reset` / `retry <id>` | container lifecycle (owner-signed; on-chain identity unchanged). `reset` of an agent with no settings document first stores the default pin `provider=0g-compute model=0gm-1.0-35b-a3b` when the model pinned at mint may be gone (a clone, or an agent that has provisioned before), after the reset's prompts; a mint-only agent that never booted keeps the model chosen at mint (the deploy wizard's mint-only path also stores that choice as the settings document). `start` and `reset` wait for their own outcome: until the attestor's worker picks the request up they show `queued`, and the agent's previous state or failure does not end the wait |
 | `clone` / `transfer` / `grant` / `revoke` / `authorizer` | clone, transfer, clone-authorization management |
 | `settings <id> [k=v …]` | same semantics as the subcommand |
+| `cred <id> [sub …]`, `cred pending`, `cred notify` | same semantics as the subcommand; `login` prints the link and returns without waiting |
 | `balance` / `deposit [og]` / `withdraw [og]` | prepaid account: balance + burn rate / fund / refund withdrawal (time-locked; bare argument claims everything) |
 | `ack` | acknowledge the TEE trust root (implicit in deploy/start/reset) |
 | `login` | guided setup: attestor URL → owner key → provider → inference key (Enter keeps current; key input echoes `*`) |
@@ -120,7 +140,7 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 
 Type to talk. **Esc / Ctrl-C interrupts the turn in flight** (server-side cancel on every bundled framework) and also cancels a `/start` or `/reset` wait.
 
-Slash commands (verified against `interactive.ts`): `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [k=v …]` `/think [low|high|max]` `/clear` (wipes the conversation; chain-tracked memory untouched — unlike `/reset`) `/tasks` (on 0g-harness: every turn, background command and subagent, with who did it and who asked; elsewhere: this session's long tasks) `/result [id]` (on 0g-harness also a subagent's answer) `/cancel [id|all]` (stop tasks — bare form brakes everything this session knows to be in flight, newest first; with an id, just that one. The brake for turns that outlived their stream: Esc only cancels a turn the current connection started. /result <id> adopts an id into the session. On 0g-harness an id can be any task `/tasks` lists, and `all` stops everything running on the agent) `/inbox [all]` (0g-harness: what the agent said on its own — a background job finished, a reminder came due; bare: unread, `all`: the read ones too) `/schedules` (0g-harness: the reminders the agent set for itself) `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit` (alias `/exit`).
+Slash commands (verified against `interactive.ts`): `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [k=v …]` `/cred [sub …]` (this agent's credentials, as `cred <id>`) `/think [low|high|max]` `/clear` (wipes the conversation; chain-tracked memory untouched — unlike `/reset`) `/tasks` (on 0g-harness: every turn, background command and subagent, with who did it and who asked; elsewhere: this session's long tasks) `/result [id]` (on 0g-harness also a subagent's answer) `/cancel [id|all]` (stop tasks — bare form brakes everything this session knows to be in flight, newest first; with an id, just that one. The brake for turns that outlived their stream: Esc only cancels a turn the current connection started. /result <id> adopts an id into the session. On 0g-harness an id can be any task `/tasks` lists, and `all` stops everything running on the agent) `/inbox [all]` (0g-harness: what the agent said on its own — a background job finished, a reminder came due; bare: unread, `all`: the read ones too) `/schedules` (0g-harness: the reminders the agent set for itself) `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit` (alias `/exit`).
 
 On a 0g-harness agent, what the agent says on its own prints above the prompt as it arrives (during a command or a chat turn it waits for the next prompt), and what came while you were away prints when you enter the session. `/settings others=…` refuses the 0g-harness switches (`toolJobs`, `subagents`, `schedule`, `maxParallelToolCalls`) for an agent whose recorded framework is another one.
 
@@ -142,7 +162,7 @@ The framework used by `/reset` and the chat model selector is **picked by you** 
 | 0 | success | — |
 | 1 | unknown error (incl. NOT_IMPLEMENTED) | read the message |
 | 2 | usage error (incl. unknown command, bad flag, bad agent ref, agent not found) | branch on `error.code` to tell them apart |
-| 3 | **fixable precondition** (missing attestor URL, unreachable, wallet required, `SETTINGS_CONFLICT`, …) | read `error.remedy`, fix, retry |
+| 3 | **fixable precondition** (missing attestor URL, unreachable, wallet required, `SETTINGS_CONFLICT`, `CREDENTIALS_CONFLICT`, …) | read `error.remedy`, fix, retry |
 | 4 | timeout | check again later |
 | 5 | auth | stop |
 
@@ -155,5 +175,7 @@ npx @0gfoundation/0g-agentdna doctor                             # preflight che
 npx @0gfoundation/0g-agentdna status 33                          # one agent's full picture
 npx @0gfoundation/0g-agentdna settings 286                       # show config
 npx @0gfoundation/0g-agentdna settings 286 model=glm-5.3 thinking=high   # change model + effort
+echo "$GITHUB_TOKEN" | npx @0gfoundation/0g-agentdna cred 286 set github preset=github   # give the agent a GitHub token
+npx @0gfoundation/0g-agentdna cred 286 login linear https://mcp.linear.app/mcp     # log the agent in to an MCP server
 npx @0gfoundation/0g-agentdna list --mine --phase failed --json | jq -r '.data[].sealId'   # scripted
 ```

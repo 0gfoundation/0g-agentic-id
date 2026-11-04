@@ -1029,3 +1029,16 @@ owner 对 agent 行为有相当大的影响力 —— 这是设计如此，也�
 一句话：**架构信任你私下运行自己的 agent，但不保护你免于操纵不当的
 后果**。市场来处理后果。
 
+## owner 凭据
+
+owner 交给 agent 的第三方凭据保存在 sealed 里，不在模型驱动的框架里
+（[CREDENTIALS.zh.md](CREDENTIALS.zh.md)）。每个值在 owner 的客户端加密给
+agentSeal，并绑定 owner、agent、链和条目名；整个凭据集由 owner 签名
+（EIP-712），sealed 按链上现任 owner 和所有权纪元校验。attestor 保存凭据集
+并在每次启动时交给容器，但看不到值，也无法替换值：值必须与 owner 签名的
+定义里的 hash 一致，或者带有 agentSeal 对绑定该定义的写回的签名。sealed
+只在 owner 允许的域名和位置代填，把值挡在响应和上链内容之外，只有 owner
+同意时才交给 agent。不覆盖的部分：在密钥本身的权限范围内，agent 可以随意
+使用；reset 之后，sealed 依赖 attestor 提供最新的凭据集（删除的密钥要在
+服务商那边吊销）。
+

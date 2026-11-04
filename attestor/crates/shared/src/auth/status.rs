@@ -9,8 +9,9 @@
 //!
 //! Canonical format:
 //!   "StatusReport.v2:0x<seal>:<status>:<detail>:<status token SHA-256>:<applied settings SHA-256>"
+//!   "StatusReport.v3:…same fields…:<credential requests pending>"
 //!
-//! The `"StatusReport.v2:"` prefix is the domain tag — signatures for this
+//! The `"StatusReport.v2:"` / `"StatusReport.v3:"` prefix is the domain tag — signatures for this
 //! action cannot be replayed as a `/provision` boot claim
 //! (`"ProvisionBoot.v1:"`) or any future action with a distinct prefix.
 
