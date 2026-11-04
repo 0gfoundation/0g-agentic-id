@@ -23,7 +23,7 @@ use attestor_shared::auth::credentials::{
     verify_writeback, Document, Expect, Writeback, CREDENTIALS_DOMAIN, MAX_DOCUMENT_BYTES,
 };
 use attestor_shared::auth::settings::settings_digest_hex;
-use attestor_shared::notify::{pending_notice, valid_email};
+use attestor_shared::notify::{expiry_notice, pending_notice, valid_email};
 use attestor_shared::sandbox::eip191_digest;
 use attestor_shared::{Deployment, SealId};
 use axum::body::Bytes;
@@ -422,6 +422,77 @@ pub fn notify_pending(state: &AppState, seal_id: SealId) {
             tracing::warn!(seal_id = ?seal_id, error = %e, "pending notification not sent");
         }
     });
+}
+
+/// How far ahead an owner is reminded that a credential expires.
+const EXPIRY_NOTICE_SECS: i64 = 7 * 24 * 3600;
+
+/// Remind owners of credentials that expire within a week: once per entry,
+/// set version and expiry; only sets of the current ownership, only to the
+/// agent's live owner, and only once the owner has an address (a reminder
+/// not sent is not spent). Returns how many were sent.
+pub async fn remind_expiring(state: &AppState) -> anyhow::Result<usize> {
+    let Some(notify) = state.notify.clone() else {
+        return Ok(0);
+    };
+    let now = Utc::now().timestamp();
+    let mut sent = 0;
+    for (seal_id, set) in state.credentials.all_sets().await? {
+        let soon: Vec<(String, i64)> = definition_expiries(&set.document)
+            .into_iter()
+            .filter(|(_, at)| *at > now && *at <= now + EXPIRY_NOTICE_SECS)
+            .collect();
+        if soon.is_empty() || set.owner_epoch != state.credentials.epoch(seal_id).await? {
+            continue;
+        }
+        let Some(d) = state.deployments.get(seal_id).await? else {
+            continue;
+        };
+        if live_owner(state, &d).await.ok() != Some(set.owner) {
+            continue;
+        }
+        let Some(to) = state.credentials.notify_address(set.owner).await? else {
+            continue;
+        };
+        let agent = d
+            .agent_id
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| format!("{seal_id:#x}"));
+        for (name, at) in soon {
+            if !state
+                .credentials
+                .claim_reminder(seal_id, &name, set.version, at)
+                .await?
+            {
+                continue;
+            }
+            let (subject, text) = expiry_notice(&agent, &name, at);
+            match notify.notifier.send(&to, &subject, &text).await {
+                Ok(()) => sent += 1,
+                Err(e) => {
+                    tracing::warn!(seal_id = ?seal_id, error = %e, "expiry reminder not sent")
+                }
+            }
+        }
+    }
+    Ok(sent)
+}
+
+/// `(name, expires_at)` of every definition in a stored document that has
+/// an expiry. Definitions are not secret; values are never read here.
+fn definition_expiries(document: &serde_json::Value) -> Vec<(String, i64)> {
+    let Some(defs) = document.get("defs").and_then(|d| d.as_object()) else {
+        return Vec::new();
+    };
+    defs.iter()
+        .filter_map(|(name, b64)| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64.as_str()?)
+                .ok()?;
+            let def: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            Some((name.clone(), def.get("expires_at")?.as_i64()?))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -867,5 +938,36 @@ mod tests {
         notify_pending(&s.state, s.seal_id);
         settle().await;
         assert_eq!(s.sent.sent.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn owners_are_reminded_once_of_credentials_that_expire_within_a_week() {
+        let s = setup();
+        let now = Utc::now().timestamp();
+        let def = |name: &str, at: i64| {
+            b64e(&serde_json::to_vec(&json!({"v":1,"name":name,"expires_at":at})).unwrap())
+        };
+        let doc = json!({"defs": {
+            "soon": def("soon", now + 3 * 86400),
+            "later": def("later", now + 30 * 86400),
+            "gone": def("gone", now - 60),
+        }});
+        s.creds
+            .put(s.seal_id, s.owner.address(), 0, 0, doc)
+            .await
+            .unwrap();
+        // No address yet: nothing sent, and nothing spent.
+        assert_eq!(remind_expiring(&s.state).await.unwrap(), 0);
+        s.creds
+            .set_notify_address(s.owner.address(), Some("owner@example.org"))
+            .await
+            .unwrap();
+        assert_eq!(remind_expiring(&s.state).await.unwrap(), 1);
+        assert_eq!(remind_expiring(&s.state).await.unwrap(), 0);
+        let sent = s.sent.sent.lock().unwrap();
+        assert!(
+            sent[0].1.contains("credential soon")
+                && sent[0].2.contains("0g-agentdna cred 7 set soon")
+        );
     }
 }

@@ -153,6 +153,23 @@ pub fn pending_notice(agent: &str, pending: i32) -> (String, String) {
     (subject, text)
 }
 
+/// The message about one credential that expires soon.
+pub fn expiry_notice(agent: &str, name: &str, expires_at: i64) -> (String, String) {
+    let when = chrono::DateTime::from_timestamp(expires_at, 0)
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| expires_at.to_string());
+    let subject = format!("Agent {agent}: credential {name} expires {when}");
+    let text = format!(
+        "The credential {name} you gave agent {agent} expires {when}. After that the agent's \
+         requests that use it are refused.\n\n\
+         To replace it, get a new value from its provider and run:\n\n  \
+         0g-agentdna cred {agent} set {name} expires=<new date>\n\n\
+         You get this because you registered this address for credential notifications. \
+         To stop: 0g-agentdna cred notify off\n"
+    );
+    (subject, text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,7 +12,7 @@ mod attestor_tls;
 mod avatar;
 mod clone;
 mod config;
-mod credentials;
+pub(crate) mod credentials;
 mod deploy;
 mod deployment;
 mod deployments;
@@ -111,7 +111,10 @@ pub fn router(state: AppState) -> Router {
             "/credentials",
             get(credentials::handle_get).post(credentials::handle_post),
         )
-        .route("/credentials/writeback", post(credentials::handle_writeback))
+        .route(
+            "/credentials/writeback",
+            post(credentials::handle_writeback),
+        )
         .route("/credentials/pending", get(credentials::handle_pending))
         .route(
             "/credentials/notify",

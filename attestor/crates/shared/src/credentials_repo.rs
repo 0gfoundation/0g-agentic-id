@@ -72,6 +72,17 @@ pub trait CredentialRepo: Send + Sync {
     async fn notify_address(&self, owner: Address) -> anyhow::Result<Option<String>>;
     /// Set (Some) or remove (None) the owner's notification address.
     async fn set_notify_address(&self, owner: Address, email: Option<&str>) -> anyhow::Result<()>;
+    /// Every stored set, for the expiry sweep.
+    async fn all_sets(&self) -> anyhow::Result<Vec<(SealId, StoredCredentials)>>;
+    /// Claim the reminder for one entry's expiry: true the first time for
+    /// this (seal, name, set version, expiry), false after.
+    async fn claim_reminder(
+        &self,
+        seal_id: SealId,
+        name: &str,
+        version: i64,
+        expires_at: i64,
+    ) -> anyhow::Result<bool>;
     /// Drop the set and its pending count: the agent changed hands.
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()>;
     async fn epoch(&self, seal_id: SealId) -> anyhow::Result<i64>;
@@ -266,6 +277,50 @@ impl CredentialRepo for PostgresCredentialRepo {
         Ok(())
     }
 
+    async fn all_sets(&self) -> anyhow::Result<Vec<(SealId, StoredCredentials)>> {
+        let rows = sqlx::query(
+            "SELECT seal_id, owner, owner_epoch, version, document, writebacks FROM credential_sets",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let seal: &[u8] = r.try_get("seal_id")?;
+                let owner: &[u8] = r.try_get("owner")?;
+                Ok((
+                    B256::from_slice(seal),
+                    StoredCredentials {
+                        owner: Address::from_slice(owner),
+                        owner_epoch: r.try_get("owner_epoch")?,
+                        version: r.try_get("version")?,
+                        document: r.try_get("document")?,
+                        writebacks: r.try_get("writebacks")?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn claim_reminder(
+        &self,
+        seal_id: SealId,
+        name: &str,
+        version: i64,
+        expires_at: i64,
+    ) -> anyhow::Result<bool> {
+        let n = sqlx::query(
+            "INSERT INTO credential_reminders (seal_id, name, version, expires_at)
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(seal_id.as_slice())
+        .bind(name)
+        .bind(version)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() == 1)
+    }
+
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM credential_sets WHERE seal_id = $1")
             .bind(seal_id.as_slice())
@@ -321,6 +376,7 @@ pub struct InMemoryCredentialRepo {
 #[derive(Default)]
 struct InMemoryState {
     sets: HashMap<SealId, StoredCredentials>,
+    reminders: std::collections::HashSet<(SealId, String, i64, i64)>,
     pending: HashMap<SealId, PendingState>,
     notify: HashMap<Address, String>,
     epochs: HashMap<SealId, i64>,
@@ -451,6 +507,26 @@ impl CredentialRepo for InMemoryCredentialRepo {
             None => s.notify.remove(&owner),
         };
         Ok(())
+    }
+
+    async fn all_sets(&self) -> anyhow::Result<Vec<(SealId, StoredCredentials)>> {
+        let s = self.inner.lock().unwrap();
+        Ok(s.sets.iter().map(|(k, v)| (*k, v.clone())).collect())
+    }
+
+    async fn claim_reminder(
+        &self,
+        seal_id: SealId,
+        name: &str,
+        version: i64,
+        expires_at: i64,
+    ) -> anyhow::Result<bool> {
+        Ok(self.inner.lock().unwrap().reminders.insert((
+            seal_id,
+            name.to_string(),
+            version,
+            expires_at,
+        )))
     }
 
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()> {

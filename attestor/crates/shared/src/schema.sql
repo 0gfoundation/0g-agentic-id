@@ -321,6 +321,15 @@ CREATE TABLE IF NOT EXISTS credential_pending (
     notified_at      TIMESTAMPTZ,
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Expiry reminders already sent, one per entry, set version and expiry.
+CREATE TABLE IF NOT EXISTS credential_reminders (
+    seal_id    BYTEA  NOT NULL,
+    name       TEXT   NOT NULL,
+    version    BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    sent_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (seal_id, name, version, expires_at)
+);
 -- Where an owner wants to be told about pending requests (owner-signed).
 CREATE TABLE IF NOT EXISTS credential_notify (
     owner      BYTEA PRIMARY KEY,
