@@ -130,6 +130,8 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		AttestorURL:         rt.AttestorURL,
 		PublicURL:           rt.PublicURL,
 		SealSignSock:        rt.SealSignSock,
+		CredSock:            rt.CredSock,
+		CredRevealSock:      rt.CredRevealSock,
 		Provider:            provider,
 		Model:               model,
 		ZGComputeRouted:     isZGComputeRouted(provider),
