@@ -78,6 +78,7 @@ export {
   CREDENTIALS_DOMAIN_VERSION,
 } from './Credentials';
 export type {
+  CredentialSigner,
   CredentialInput,
   CredentialDefinition,
   CredentialDocument,

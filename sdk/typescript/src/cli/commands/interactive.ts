@@ -993,7 +993,8 @@ const L1_HELP_FULL = `manager commands
                           lists them (never values); set <name> [k=v …] adds
                           or changes one (preset=github|openai|anthropic,
                           host=, header='Name: … {v}', basic=, query=, body=,
-                          path=yes, reveal=yes|no, expires=, desc=; the value
+                          path=yes, use=sign signer=<json>, reveal=yes|no,
+                          expires=, desc=; the value
                           is asked for, not echoed); rm <name>; reveal <name>
                           on|off; pending; approve|deny <id>; log [n].
                           cred pending: counts on all your agents; cred

@@ -16,6 +16,7 @@ import type { AgenticID } from '../AgenticID';
 import {
   CredentialsConflictError,
   inputOf,
+  type CredentialSigner,
   type CredentialDefinition,
   type CredentialInput,
   type CredentialPosition,
@@ -25,10 +26,10 @@ import { CliError } from './errors';
 import { emitOk } from './envelope';
 
 /** The keys `cred <agent> set <name>` takes. */
-export const CRED_KEYS = ['preset', 'host', 'header', 'basic', 'query', 'body', 'path', 'use', 'reveal', 'expires', 'desc'] as const;
+export const CRED_KEYS = ['preset', 'host', 'header', 'basic', 'query', 'body', 'path', 'use', 'signer', 'reveal', 'expires', 'desc'] as const;
 
 const SET_USAGE =
-  "cred <agent> set <name> [preset=github|openai|anthropic] [host=a.example,b.example] [header='Authorization: Bearer {v}'] [basic=<user>] [query=<param>] [body=<field>] [path=yes] [use=inject|token_only] [reveal=yes|no] [expires=<YYYY-MM-DD|unix>] [desc=…]";
+  "cred <agent> set <name> [preset=github|openai|anthropic] [host=a.example,b.example] [header='Authorization: Bearer {v}'] [basic=<user>] [query=<param>] [body=<field>] [path=yes] [use=inject|token_only|sign] [signer=<json>] [reveal=yes|no] [expires=<YYYY-MM-DD|unix>] [desc=…]";
 
 export const CRED_USAGE = `usage:
   cred <agent>                         list the agent's credentials (never values)
@@ -92,7 +93,8 @@ function parseExpiry(raw: string): number {
 export interface CredPatch {
   hosts?: string[];
   positions?: CredentialPosition[];
-  use?: 'inject' | 'token_only';
+  use?: 'inject' | 'token_only' | 'sign';
+  signer?: CredentialSigner;
   allowReveal?: boolean;
   /** null clears it. */
   expiresAt?: number | null;
@@ -155,9 +157,21 @@ export function parseCredArgs(args: string[]): CredPatch {
         if (eq < 0 || yesNo('path', raw)) add('positions', [{ kind: 'path' }]);
         break;
       case 'use':
-        if (raw !== 'inject' && raw !== 'token_only') throw usage(`use= takes inject or token_only, not "${raw}"`);
+        if (raw !== 'inject' && raw !== 'token_only' && raw !== 'sign') throw usage(`use= takes inject, token_only or sign, not "${raw}"`);
         out.use = raw;
         break;
+      case 'signer': {
+        let v: unknown;
+        try {
+          v = JSON.parse(raw);
+        } catch {
+          throw usage(`signer= takes JSON, e.g. signer='{"method":"sigv4","access_key_id":"AKIA…","region":"us-east-1","service":"s3"}'`);
+        }
+        const m = (v as { method?: unknown })?.method;
+        if (m !== 'sigv4' && m !== 'hmac' && m !== 'jwt' && m !== 'wallet') throw usage('signer method is sigv4, hmac, jwt or wallet');
+        out.signer = v as CredentialSigner;
+        break;
+      }
       case 'reveal':
         out.allowReveal = yesNo('reveal', raw);
         break;
@@ -192,16 +206,21 @@ export function applyCredPatch(name: string, patch: CredPatch, base?: Credential
   if (patch.hosts) out.hosts = [...new Set(patch.hosts)];
   if (patch.positions) out.positions = patch.positions;
   if (patch.use) out.use = patch.use;
+  if (patch.signer) out.signer = patch.signer;
   if (patch.allowReveal !== undefined) out.allowReveal = patch.allowReveal;
   if (patch.expiresAt === null) delete out.expiresAt;
   else if (patch.expiresAt !== undefined) out.expiresAt = patch.expiresAt;
   if (patch.description === null) delete out.description;
   else if (patch.description !== undefined) out.description = patch.description;
   if (!out.description && patch.presetDescription) out.description = patch.presetDescription;
-  if ((out.use ?? 'inject') === 'inject') {
-    if (!out.hosts.length) throw usage(`${name} needs at least one host= (or a preset=)`);
-    if (!out.positions.length) throw usage(`${name} needs a position: header=, basic=, query=, body= or path=yes (or a preset=)`);
-  }
+  const use = out.use ?? 'inject';
+  if (use !== 'sign') delete out.signer;
+  if (use === 'sign' && !out.signer) throw usage(`${name} with use=sign needs signer=<json>`);
+  const method = out.signer?.method;
+  const needsHosts = use === 'inject' || method === 'sigv4' || method === 'hmac' || method === 'jwt';
+  const needsPositions = use === 'inject' || method === 'jwt';
+  if (needsHosts && !out.hosts.length) throw usage(`${name} needs at least one host= (or a preset=)`);
+  if (needsPositions && !out.positions.length) throw usage(`${name} needs a position: header=, basic=, query=, body= or path=yes (or a preset=)`);
   return out;
 }
 
@@ -230,6 +249,7 @@ export function renderCredentials(defs: CredentialDefinition[], version: number)
     lines.push(`  positions  ${d.positions.map(positionText).join(' · ') || '—'}`);
     const flags = [
       d.use !== 'inject' ? `use ${d.use}` : '',
+      d.signer ? `signs ${d.signer.method}${d.signer.method === 'sigv4' ? ` (${d.signer.access_key_id}, ${d.signer.region}/${d.signer.service})` : ''}` : '',
       d.allow_reveal ? 'reveal allowed' : '',
       d.writeback ? 'writeback' : '',
       d.token_request ? `token request → ${d.token_request.url}` : '',

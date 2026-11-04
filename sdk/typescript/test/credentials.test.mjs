@@ -221,6 +221,22 @@ test('cli: assignments change a stored entry and keep the rest', () => {
   assert.equal(e2.expiresAt, Date.UTC(2027, 0, 2) / 1000);
 });
 
+test('cli: signing entries', () => {
+  const aws = applyCredPatch('aws', parseCredArgs(['use=sign', 'host=s3.us-east-1.amazonaws.com',
+    'signer={"method":"sigv4","access_key_id":"AKIDEXAMPLE","region":"us-east-1","service":"s3"}']));
+  assert.equal(aws.use, 'sign');
+  assert.equal(aws.signer.method, 'sigv4');
+  assert.deepEqual(aws.positions, []);
+  const wallet = applyCredPatch('w', parseCredArgs(['use=sign', 'signer={"method":"wallet"}']));
+  assert.deepEqual([wallet.hosts, wallet.positions], [[], []]);
+  assert.throws(() => applyCredPatch('j', parseCredArgs(['use=sign', 'host=a.example', 'signer={"method":"jwt","alg":"RS256"}'])), /needs a position/);
+  assert.throws(() => applyCredPatch('x', parseCredArgs(['use=sign', 'host=a.example'])), /needs signer/);
+  assert.throws(() => parseCredArgs(['signer={"method":"rsa"}']), (e) => e.code === 'BAD_FLAG');
+  assert.throws(() => parseCredArgs(['signer=not json']), (e) => e.code === 'BAD_FLAG');
+  // A signer on an entry that does not sign is dropped, not sent.
+  assert.equal(applyCredPatch('p', parseCredArgs(['preset=openai', 'signer={"method":"wallet"}'])).signer, undefined);
+});
+
 test('cli: usage errors are raised before any I/O', () => {
   const bad = (args) => assert.throws(() => parseCredArgs(args), (e) => e.code === 'BAD_FLAG');
   bad(['header=Authorization: Bearer']);   // no {v}

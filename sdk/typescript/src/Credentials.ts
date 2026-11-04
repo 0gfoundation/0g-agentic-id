@@ -77,6 +77,28 @@ export interface TokenRequestTemplate {
   rotate_field?: string;
 }
 
+/**
+ * How a signing entry (`use: 'sign'`) uses its key, which is never written
+ * into a request: sealed signs AWS requests (sigv4) or HMAC-signed ones on
+ * their way out, mints a JWT where the entry's placeholder stands, or signs
+ * with a wallet through the agent's credential socket.
+ */
+export type CredentialSigner =
+  | { method: 'sigv4'; access_key_id: string; region: string; service: string; session_token_entry?: string }
+  | {
+      method: 'hmac';
+      /** Template over {method} {path} {query} {body} {timestamp} {header:<name>}. */
+      message: string;
+      header?: string;
+      param?: string;
+      algorithm?: 'sha256' | 'sha512' | 'sha1';
+      encoding?: 'hex' | 'base64';
+      prefix?: string;
+      timestamp_header?: string;
+    }
+  | { method: 'jwt'; alg: 'RS256' | 'ES256' | 'HS256'; kid?: string; claims?: Record<string, unknown>; ttl?: number }
+  | { method: 'wallet' };
+
 /** One credential as the owner sets it. */
 export interface CredentialInput {
   name: string;
@@ -86,6 +108,8 @@ export interface CredentialInput {
   positions: CredentialPosition[];
   /** `inject` (default), `token_only` (only feeds a token request), `sign`. */
   use?: 'inject' | 'token_only' | 'sign';
+  /** Required with `use: 'sign'`. */
+  signer?: CredentialSigner;
   description?: string;
   /** Unix seconds. */
   expiresAt?: number;
@@ -109,6 +133,7 @@ export interface CredentialDefinition {
   allow_reveal?: boolean;
   writeback?: boolean;
   token_request?: TokenRequestTemplate;
+  signer?: CredentialSigner;
 }
 
 /** The signed document, as sealed and the attestor read it. */
@@ -171,6 +196,7 @@ export function definitionOf(c: CredentialInput, valueHash: Hash): CredentialDef
   if (c.allowReveal) d.allow_reveal = true;
   if (c.writeback) d.writeback = true;
   if (c.tokenRequest) d.token_request = c.tokenRequest;
+  if (c.signer) d.signer = c.signer;
   return d;
 }
 
@@ -179,6 +205,7 @@ export function inputOf(d: CredentialDefinition): CredentialInput {
   return {
     name: d.name, hosts: d.hosts, positions: d.positions, use: d.use, description: d.description,
     expiresAt: d.expires_at, allowReveal: d.allow_reveal, writeback: d.writeback, tokenRequest: d.token_request,
+    signer: d.signer,
   };
 }
 

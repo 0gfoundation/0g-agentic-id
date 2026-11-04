@@ -124,7 +124,9 @@ COMMANDS
                      cred <agent> set <name> [k=v …]    add or change one.
                        Keys: preset=github|openai|anthropic, host=a,b,
                        header='Name: … {v} …', basic=<user>, query=<param>,
-                       body=<field>, path=yes, use=inject|token_only,
+                       body=<field>, path=yes, use=inject|token_only|sign,
+                       signer=<json> (with use=sign: sigv4, hmac, jwt or
+                       wallet; the key is never sent, sealed signs with it),
                        reveal=yes|no, expires=<YYYY-MM-DD|unix>, desc=…
                      cred <agent> rm <name>             remove one
                      cred <agent> reveal <name> on|off  the agent may read it
