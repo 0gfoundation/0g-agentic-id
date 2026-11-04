@@ -79,6 +79,7 @@ export {
 } from './Credentials';
 export type {
   CredentialSigner,
+  CredentialMCP,
   CredentialInput,
   CredentialDefinition,
   CredentialDocument,

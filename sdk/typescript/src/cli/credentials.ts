@@ -15,7 +15,9 @@ import type { Hash } from 'viem';
 import type { AgenticID } from '../AgenticID';
 import {
   CredentialsConflictError,
+  definitionOf,
   inputOf,
+  type CredentialMCP,
   type CredentialSigner,
   type CredentialDefinition,
   type CredentialInput,
@@ -36,6 +38,8 @@ export const CRED_USAGE = `usage:
   ${SET_USAGE}
                                        add or change one; the value is read from stdin or a prompt that does not echo
   cred <agent> rm <name>               remove one (revoke it at its provider as well)
+  cred <agent> login <name> <mcp-url> [client_id=… client_secret_entry=… scope=a,b]
+                                       log the agent in to an MCP server (you open a link); sealed keeps the tokens
   cred <agent> reveal <name> on|off    let the agent read the value itself without asking each time
   cred <agent> pending                 requests waiting for you
   cred <agent> approve <id>            approve one request once (an id prefix from pending is enough)
@@ -270,6 +274,8 @@ export function renderPending(list: PendingCredentialRequest[]): string[] {
     for (const [k, v] of Object.entries(p.facts ?? {})) lines.push(`  ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`);
     if (p.params && Object.keys(p.params).length) lines.push(`  params: ${JSON.stringify(p.params)}`);
     if (p.reason) lines.push(`  the agent says: ${JSON.stringify(p.reason)}`);
+    if (p.op === 'login') lines.push(`  answer: cred <agent> login ${p.name} ${p.params?.url ?? '<mcp-url>'}   (or deny)`);
+    if (p.op === 'add') lines.push(`  answer: cred <agent> set ${p.name} …   (or deny)`);
   }
   return lines;
 }
@@ -287,6 +293,8 @@ export function renderAudit(recs: AuditRecord[]): string[] {
 export interface CredIO {
   /** `--json`: emit one envelope instead of lines. */
   json: boolean;
+  /** Wait for a login to complete before returning (the one-shot command does; the REPL does not block). */
+  wait?: boolean;
   out(line: string): void;
   /** Read a value without echoing it. */
   secret(prompt: string): Promise<string>;
@@ -378,12 +386,80 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     case 'deny': {
       const base = agentUrl ?? (await cred.agentUrl(sealId));
       const item = pickPending(await cred.pending(sealId, { agentUrl: base }), rest[0]);
+      if (sub === 'approve' && item.op !== 'reveal') {
+        // Adding a credential or logging in is done, not approved.
+        throw new CliError('BAD_FLAG', `a request to ${item.op} ${item.name} is answered by doing it`, {
+          remedy: item.op === 'login' ? `cred <agent> login ${item.name} ${item.params?.url ?? '<mcp-url>'}` : `cred <agent> set ${item.name} …`,
+        });
+      }
       if (sub === 'approve') await cred.approveOnce(sealId, item.auth_req_id, { agentUrl: base });
       else await cred.deny(sealId, item.auth_req_id, { agentUrl: base });
       if (io.json) return emitOk({ sealId, authReqId: item.auth_req_id, decision: sub === 'approve' ? 'once' : 'deny' });
       io.out(sub === 'approve'
         ? `approved once: ${item.op} ${item.name}. The agent gets it when it sends the request again.`
         : `denied: ${item.op} ${item.name}`);
+      return;
+    }
+    case 'login': {
+      const name = checkCredName(rest[0]);
+      const mcpUrl = rest[1];
+      let parsed: URL | undefined;
+      try {
+        parsed = mcpUrl ? new URL(mcpUrl) : undefined;
+      } catch {
+        parsed = undefined;
+      }
+      if (!parsed || parsed.protocol !== 'https:') {
+        throw new CliError('BAD_FLAG', 'login needs the MCP server\'s https URL', { remedy: 'cred <agent> login linear https://mcp.linear.app/mcp' });
+      }
+      const mcp: CredentialMCP = { url: mcpUrl! };
+      for (const arg of rest.slice(2)) {
+        const [k, v = ''] = arg.split(/=(.*)/s);
+        if (k === 'client_id' && v) mcp.client_id = v;
+        else if (k === 'client_secret_entry' && v) mcp.client_secret_entry = checkCredName(v);
+        else if (k === 'scope' && v) mcp.scopes = v.split(',').map((x) => x.trim()).filter(Boolean);
+        else throw new CliError('BAD_FLAG', `unknown login option "${arg}"`, { remedy: 'client_id=… client_secret_entry=<entry> scope=a,b' });
+      }
+      const host = parsed.host.toLowerCase();
+      const want: CredentialInput = {
+        name, hosts: [host], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }],
+        description: `MCP server ${mcpUrl}`, mcp,
+      };
+      const cur = await cred.get(sealId);
+      const stored = cur.definitions.find((d) => d.name === name);
+      if (stored && !stored.mcp) throw new CliError('BAD_FLAG', `${name} is already a credential that is not a login`, { remedy: 'pick another name, or cred <agent> rm ' + name });
+      const base = agentUrl ?? (await cred.agentUrl(sealId));
+      const same = stored && JSON.stringify(definitionOf(inputOf(stored), '' as `0x${string}`)) === JSON.stringify(definitionOf({ ...want, description: stored.description }, '' as `0x${string}`));
+      if (!same) {
+        const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
+        const out = await cred.put(sealId, [...others, want], { baseVersion: cur.version, agentUrl: base }).catch(conflict);
+        if (out.pushWarning) {
+          throw new CliError('UNKNOWN', `the login entry is stored, but the running agent did not take it: ${out.pushWarning}`, {
+            remedy: 'start the agent, then run the same login command again',
+          });
+        }
+      }
+      const before = (await cred.loaded(sealId, { agentUrl: base }).catch(() => undefined))?.entries.find((e) => e.name === name);
+      const { authorizeUrl } = await cred.login(sealId, name, { agentUrl: base });
+      if (io.json) return emitOk({ sealId, name, authorizeUrl });
+      io.out(`Open this link to log the agent in to ${host} (valid 10 minutes):`);
+      io.out('');
+      io.out(`  ${authorizeUrl}`);
+      io.out('');
+      if (!io.wait) {
+        io.out(`When you have finished in the browser, \`cred <agent>\` lists ${name}; the agent uses [[credential:${name}]] as its bearer token for ${host}.`);
+        return;
+      }
+      io.out('waiting for the login to complete (Ctrl-C stops waiting, not the login)…');
+      for (const deadline = Date.now() + 10 * 60_000; Date.now() < deadline; ) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const now = (await cred.loaded(sealId, { agentUrl: base }).catch(() => undefined))?.entries.find((e) => e.name === name);
+        if (now && (!before || now.expires_at !== before.expires_at)) {
+          io.out(`logged in: the agent uses [[credential:${name}]] as its bearer token for ${host}`);
+          return;
+        }
+      }
+      io.out(`not completed within 10 minutes; start again with the same command`);
       return;
     }
     case 'log': {

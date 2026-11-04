@@ -99,6 +99,19 @@ export type CredentialSigner =
   | { method: 'jwt'; alg: 'RS256' | 'ES256' | 'HS256'; kid?: string; claims?: Record<string, unknown>; ttl?: number }
   | { method: 'wallet' };
 
+/**
+ * A login entry: the owner logs the agent in to the MCP server at `url`
+ * (OAuth with PKCE, run by sealed); sealed keeps and refreshes the tokens.
+ */
+export interface CredentialMCP {
+  url: string;
+  /** For a server that does not register clients itself. */
+  client_id?: string;
+  /** The entry holding that client's secret. */
+  client_secret_entry?: string;
+  scopes?: string[];
+}
+
 /** One credential as the owner sets it. */
 export interface CredentialInput {
   name: string;
@@ -110,6 +123,8 @@ export interface CredentialInput {
   use?: 'inject' | 'token_only' | 'sign';
   /** Required with `use: 'sign'`. */
   signer?: CredentialSigner;
+  /** A login entry; it takes no value (see {@link CredentialsApi.login}). */
+  mcp?: CredentialMCP;
   description?: string;
   /** Unix seconds. */
   expiresAt?: number;
@@ -134,6 +149,7 @@ export interface CredentialDefinition {
   writeback?: boolean;
   token_request?: TokenRequestTemplate;
   signer?: CredentialSigner;
+  mcp?: CredentialMCP;
 }
 
 /** The signed document, as sealed and the attestor read it. */
@@ -188,15 +204,22 @@ export function credentialPlaintext(p: { owner: Address; sealId: Hash; chainId: 
   return JSON.stringify({ v: 1, type: 'credential', owner: getAddress(p.owner), seal_id: p.sealId.toLowerCase(), chain_id: p.chainId, name: p.name, value: p.value });
 }
 
-/** Build a definition from an input and the ciphertext hash of its value. */
+/**
+ * Build a definition from an input and the ciphertext hash of its value.
+ * The bytes depend only on the definition, never on how the input was built
+ * (keys in one fixed order), so an entry stored again unchanged keeps its
+ * hash, and with it what sealed wrote back for it.
+ */
 export function definitionOf(c: CredentialInput, valueHash: Hash): CredentialDefinition {
   const d: CredentialDefinition = { v: 1, name: c.name, hosts: c.hosts, positions: c.positions, use: c.use ?? 'inject', value_hash: valueHash };
   if (c.description) d.description = c.description;
   if (c.expiresAt) d.expires_at = c.expiresAt;
   if (c.allowReveal) d.allow_reveal = true;
-  if (c.writeback) d.writeback = true;
+  // A login lives in writebacks.
+  if (c.writeback || c.mcp) d.writeback = true;
   if (c.tokenRequest) d.token_request = c.tokenRequest;
   if (c.signer) d.signer = c.signer;
+  if (c.mcp) d.mcp = c.mcp;
   return d;
 }
 
@@ -205,7 +228,7 @@ export function inputOf(d: CredentialDefinition): CredentialInput {
   return {
     name: d.name, hosts: d.hosts, positions: d.positions, use: d.use, description: d.description,
     expiresAt: d.expires_at, allowReveal: d.allow_reveal, writeback: d.writeback, tokenRequest: d.token_request,
-    signer: d.signer,
+    signer: d.signer, mcp: d.mcp,
   };
 }
 
@@ -316,6 +339,15 @@ export class CredentialsApi {
       if (!NAME_RE.test(e.name)) throw new Error(`credentials: invalid name ${JSON.stringify(e.name)}`);
       if (names.has(e.name)) throw new Error(`credentials: ${e.name} listed twice`);
       names.add(e.name);
+      if (e.mcp) {
+        // A login entry has no value of the owner's: sealed logs in and
+        // keeps the tokens.
+        if (e.value !== undefined) throw new Error(`credentials: ${e.name} is a login entry and takes no value`);
+        const defBytes = toBytes(JSON.stringify(definitionOf(e, '' as Hash)));
+        doc.defs[e.name] = b64(defBytes);
+        doc.set.entries.push({ name: e.name, def_hash: keccak256(defBytes) });
+        continue;
+      }
       let ciphertext: Uint8Array;
       if (e.value !== undefined) {
         ciphertext = eciesEncrypt(pubkey!, toBytes(credentialPlaintext({ owner: account.address, sealId: seal, chainId: this.ctx.chain.id, name: e.name, value: e.value })));
@@ -380,6 +412,26 @@ export class CredentialsApi {
     const base = agentUrl ?? (await this.agentUrl(sealId));
     const r = await this.sealRequest(sealId, base, '0GSealCredentials', '/_seal/credentials', JSON.stringify(doc));
     if (!r.ok) throw new Error(`push to the running agent failed: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+  }
+
+  /**
+   * Start the owner's login to a login entry's MCP server. Returns the link
+   * the owner opens to consent (valid 10 minutes); the authorization server
+   * returns the browser to the agent, which completes the login itself.
+   */
+  async login(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ authorizeUrl: string }> {
+    const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
+    const r = await this.sealRequest(sealId, base, '0GSealCredLogin', '/_seal/credentials/login', JSON.stringify({ name }));
+    if (!r.ok) throw new Error(`credentials.login: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    return { authorizeUrl: ((await r.json()) as { authorize_url: string }).authorize_url };
+  }
+
+  /** The entries the running agent has loaded (names and where they may go, never values). */
+  async loaded(sealId: Hash, opts?: { agentUrl?: string }): Promise<{ version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number }> }> {
+    const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
+    const r = await this.sealRequest(sealId, base, '0GSealCredentials', '/_seal/credentials');
+    if (!r.ok) throw new Error(`credentials.loaded: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    return (await r.json()) as { version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number }> };
   }
 
   /** Requests waiting for the owner on this agent, with sealed's facts and the agent's reason. */

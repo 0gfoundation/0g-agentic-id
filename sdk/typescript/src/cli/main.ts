@@ -112,7 +112,7 @@ COMMANDS
                    3, SETTINGS_CONFLICT) rather than overwriting them. The
                    model advisory uses its provider catalog. Provider changes
                    need a matching key and image support, then require reset.
-  cred <agent> [ls|set|rm|reveal|pending|approve|deny|log]
+  cred <agent> [ls|set|rm|login|reveal|pending|approve|deny|log]
                    The owner's credentials for the agent (API keys, tokens).
                    The agent writes [[credential:<name>]] where a key goes;
                    sealed fills it in on the way out, only for the hosts and
@@ -129,6 +129,11 @@ COMMANDS
                        wallet; the key is never sent, sealed signs with it),
                        reveal=yes|no, expires=<YYYY-MM-DD|unix>, desc=…
                      cred <agent> rm <name>             remove one
+                     cred <agent> login <name> <mcp-url>
+                                                        log the agent in to an MCP
+                                                        server: open the link it
+                                                        prints; sealed keeps the
+                                                        tokens and refreshes them
                      cred <agent> reveal <name> on|off  the agent may read it
                      cred <agent> pending               requests waiting
                      cred <agent> approve|deny <id>     decide one (id prefix)

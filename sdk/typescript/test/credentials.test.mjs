@@ -35,6 +35,8 @@ import {
   CredentialsConflictError,
   credentialSetTypes,
   approvalTypes,
+  definitionOf,
+  inputOf,
 } from '../dist/index.js';
 
 const SEAL_PRIV = '4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318';
@@ -161,6 +163,17 @@ test('put seals each value to the agent and signs one set', async () => {
   } finally {
     s.server.close();
   }
+});
+
+test('an entry stored again unchanged keeps its definition bytes (and so its writebacks)', () => {
+  const login = { name: 'linear', hosts: ['mcp.linear.app'], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }], mcp: { url: 'https://mcp.linear.app/mcp' } };
+  const first = JSON.stringify(definitionOf(login, ''));
+  const again = JSON.stringify(definitionOf(inputOf(JSON.parse(first)), ''));
+  assert.equal(again, first);
+  assert.equal(JSON.parse(first).writeback, true);
+  const rt = { name: 'gcp', hosts: [], positions: [], use: 'token_only', writeback: true, description: 'x', tokenRequest: { url: 'https://t.example', fields: { a: '{v}' }, take: [] } };
+  const d1 = JSON.stringify(definitionOf(rt, '0x01'));
+  assert.equal(JSON.stringify(definitionOf(inputOf(JSON.parse(d1)), '0x01')), d1);
 });
 
 test('a stale base version is refused before anything is signed', async () => {
@@ -296,4 +309,36 @@ test('cli: set on a stored name keeps its value when the prompt is left empty', 
   const ag2 = fakeAg([]);
   await assert.rejects(credOp(ag2, SEAL_ID, ['set', 'new', 'preset=openai'], { json: false, out: () => {}, secret: async () => '' }), /needs a value/);
   assert.equal(ag2.calls.length, 0);
+});
+
+test('cli: login defines the entry from the URL once, then prints the link', async () => {
+  const defs = [];
+  const calls = [];
+  const ag = {
+    credentials: {
+      get: async () => ({ version: defs.length, ownerEpoch: 0, document: null, definitions: [...defs] }),
+      put: async (_seal, entries, opts) => {
+        calls.push({ op: 'put', entries, opts });
+        defs.splice(0, defs.length, ...entries.map((e) => definitionOf(e, '')));
+        return { version: defs.length };
+      },
+      agentUrl: async () => 'https://agent.example',
+      loaded: async () => ({ version: 1, entries: [] }),
+      login: async (_seal, name) => { calls.push({ op: 'login', name }); return { authorizeUrl: 'https://auth.example/authorize?state=s' }; },
+    },
+  };
+  const lines = [];
+  const io = { json: false, out: (l) => lines.push(l), secret: async () => '' };
+  await credOp(ag, SEAL_ID, ['login', 'linear', 'https://mcp.linear.app/mcp', 'scope=read,write'], io);
+  const put = calls.find((c) => c.op === 'put');
+  const e = put.entries.find((x) => x.name === 'linear');
+  assert.deepEqual(e.hosts, ['mcp.linear.app']);
+  assert.deepEqual(e.positions, [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }]);
+  assert.deepEqual(e.mcp, { url: 'https://mcp.linear.app/mcp', scopes: ['read', 'write'] });
+  assert.ok(lines.some((l) => l.includes('https://auth.example/authorize?state=s')));
+  // Again, unchanged: no new set, just a new link.
+  calls.length = 0;
+  await credOp(ag, SEAL_ID, ['login', 'linear', 'https://mcp.linear.app/mcp', 'scope=read,write'], io);
+  assert.deepEqual(calls.map((c) => c.op), ['login']);
+  await assert.rejects(credOp(ag, SEAL_ID, ['login', 'linear', 'http://insecure.example/mcp'], io), (err) => err.code === 'BAD_FLAG');
 });
