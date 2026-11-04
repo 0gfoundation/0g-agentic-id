@@ -86,12 +86,15 @@ test('updater selects the bridge package that owns the global bin links', () => 
 
 test('legacy update --json queries the old package and reports its matching install command', () => {
   const install = bridgeInstall();
+  // The registry's latest is one minor ahead of this package, whatever its version.
+  const [major, minor] = JSON.parse(readFileSync(join(sdk, 'package.json'), 'utf8')).version.split('.').map(Number);
+  const latest = `${major}.${minor + 1}.0`;
   const mock = join(install.root, 'registry.cjs');
   writeFileSync(mock, `
     const assert = require('node:assert/strict');
     globalThis.fetch = async (url) => {
       assert.equal(String(url), 'https://registry.npmjs.org/%400gfoundation%2F0g-agenticid-sdk/latest');
-      return new Response(JSON.stringify({ version: '0.3.0' }), { status: 200 });
+      return new Response(JSON.stringify({ version: '${latest}' }), { status: 200 });
     };
   `);
   const result = spawnSync(process.execPath, ['--require', mock, join(install.bridge, 'cli.cjs'), 'update', '--json'], {
@@ -103,7 +106,7 @@ test('legacy update --json queries the old package and reports its matching inst
   assert.equal(envelope.ok, true);
   assert.equal(envelope.data.name, '@0gfoundation/0g-agenticid-sdk');
   assert.equal(envelope.data.updated, false);
-  assert.equal(envelope.data.remedy, 'npm install -g @0gfoundation/0g-agenticid-sdk@0.3.0');
+  assert.equal(envelope.data.remedy, `npm install -g @0gfoundation/0g-agenticid-sdk@${latest}`);
 });
 
 test('an arbitrary launcher manifest cannot redirect the updater to another package', () => {
