@@ -1,10 +1,12 @@
 //! Storage for owner credential sets (`auth::credentials`).
 //!
-//! One row per seal: the signed document as the owner posted it, the
-//! writebacks the container sent since, and the container's last reported
-//! pending-request count. Ownership epochs (the block of an agent's last
-//! transfer) live beside it: they exist before any set does, because the
-//! owner signs the first set against one.
+//! One row per seal: the signed document as the owner posted it and the
+//! writebacks the container sent since. Beside it, per seal, the ownership
+//! epoch (the block of the agent's last transfer: it exists before any set
+//! does, because the owner signs the first set against one) and the
+//! container's last reported pending-request count (an agent with no set can
+//! still ask for its first credential); per owner, the address notifications
+//! go to.
 
 use crate::types::SealId;
 use alloy::primitives::{Address, B256};
@@ -21,7 +23,6 @@ pub struct StoredCredentials {
     pub version: i64,
     pub document: serde_json::Value,
     pub writebacks: serde_json::Value,
-    pub pending: i32,
 }
 
 /// One agent's pending count, for the owner's cross-agent view.
@@ -54,9 +55,24 @@ pub trait CredentialRepo: Send + Sync {
         set_version: i64,
         writeback: serde_json::Value,
     ) -> anyhow::Result<bool>;
+    /// Record the container's pending-request count.
     async fn set_pending(&self, seal_id: SealId, pending: i32) -> anyhow::Result<()>;
-    async fn pending_for_owner(&self, owner: Address) -> anyhow::Result<Vec<PendingCount>>;
-    /// Drop the set: the agent changed hands.
+    /// The counts above zero among `seals`, most recently changed first.
+    async fn pending_counts(&self, seals: &[SealId]) -> anyhow::Result<Vec<PendingCount>>;
+    /// Claim a notification for this seal: when its count rose above the
+    /// count last notified and the last notification is at least
+    /// `cooldown_secs` old, record the count as notified and return it.
+    /// A count that falls lowers the mark, so a later rise notifies again.
+    async fn claim_notification(
+        &self,
+        seal_id: SealId,
+        cooldown_secs: i64,
+    ) -> anyhow::Result<Option<i32>>;
+    /// Where the owner wants to be told about pending requests.
+    async fn notify_address(&self, owner: Address) -> anyhow::Result<Option<String>>;
+    /// Set (Some) or remove (None) the owner's notification address.
+    async fn set_notify_address(&self, owner: Address, email: Option<&str>) -> anyhow::Result<()>;
+    /// Drop the set and its pending count: the agent changed hands.
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()>;
     async fn epoch(&self, seal_id: SealId) -> anyhow::Result<i64>;
     async fn set_epoch(&self, seal_id: SealId, epoch: i64) -> anyhow::Result<()>;
@@ -78,7 +94,7 @@ impl PostgresCredentialRepo {
 impl CredentialRepo for PostgresCredentialRepo {
     async fn get(&self, seal_id: SealId) -> anyhow::Result<Option<StoredCredentials>> {
         let row = sqlx::query(
-            "SELECT owner, owner_epoch, version, document, writebacks, pending
+            "SELECT owner, owner_epoch, version, document, writebacks
              FROM credential_sets WHERE seal_id = $1",
         )
         .bind(seal_id.as_slice())
@@ -92,7 +108,6 @@ impl CredentialRepo for PostgresCredentialRepo {
             version: r.try_get("version")?,
             document: r.try_get("document")?,
             writebacks: r.try_get("writebacks")?,
-            pending: r.try_get("pending")?,
         }))
     }
 
@@ -166,20 +181,29 @@ impl CredentialRepo for PostgresCredentialRepo {
     }
 
     async fn set_pending(&self, seal_id: SealId, pending: i32) -> anyhow::Result<()> {
-        sqlx::query("UPDATE credential_sets SET pending = $2, updated_at = now() WHERE seal_id = $1 AND pending <> $2")
-            .bind(seal_id.as_slice())
-            .bind(pending)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO credential_pending (seal_id, pending) VALUES ($1, $2)
+             ON CONFLICT (seal_id) DO UPDATE SET
+               pending = EXCLUDED.pending,
+               notified_pending = LEAST(credential_pending.notified_pending, EXCLUDED.pending),
+               updated_at = CASE WHEN credential_pending.pending = EXCLUDED.pending
+                                 THEN credential_pending.updated_at ELSE now() END",
+        )
+        .bind(seal_id.as_slice())
+        .bind(pending)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
-    async fn pending_for_owner(&self, owner: Address) -> anyhow::Result<Vec<PendingCount>> {
+    async fn pending_counts(&self, seals: &[SealId]) -> anyhow::Result<Vec<PendingCount>> {
+        let keys: Vec<Vec<u8>> = seals.iter().map(|s| s.to_vec()).collect();
         let rows = sqlx::query(
             "SELECT seal_id, pending, EXTRACT(EPOCH FROM updated_at)::BIGINT AS updated_at
-             FROM credential_sets WHERE owner = $1 AND pending > 0 ORDER BY updated_at DESC",
+             FROM credential_pending WHERE seal_id = ANY($1) AND pending > 0
+             ORDER BY updated_at DESC",
         )
-        .bind(owner.as_slice())
+        .bind(&keys)
         .fetch_all(&self.pool)
         .await?;
         rows.iter()
@@ -194,8 +218,60 @@ impl CredentialRepo for PostgresCredentialRepo {
             .collect()
     }
 
+    async fn claim_notification(
+        &self,
+        seal_id: SealId,
+        cooldown_secs: i64,
+    ) -> anyhow::Result<Option<i32>> {
+        Ok(sqlx::query_scalar(
+            "UPDATE credential_pending SET notified_pending = pending, notified_at = now()
+             WHERE seal_id = $1 AND pending > notified_pending
+               AND (notified_at IS NULL OR notified_at <= now() - $2::bigint * interval '1 second')
+             RETURNING pending",
+        )
+        .bind(seal_id.as_slice())
+        .bind(cooldown_secs)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn notify_address(&self, owner: Address) -> anyhow::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT email FROM credential_notify WHERE owner = $1")
+                .bind(owner.as_slice())
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn set_notify_address(&self, owner: Address, email: Option<&str>) -> anyhow::Result<()> {
+        match email {
+            Some(e) => {
+                sqlx::query(
+                    "INSERT INTO credential_notify (owner, email) VALUES ($1, $2)
+                     ON CONFLICT (owner) DO UPDATE SET email = EXCLUDED.email, updated_at = now()",
+                )
+                .bind(owner.as_slice())
+                .bind(e)
+                .execute(&self.pool)
+                .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM credential_notify WHERE owner = $1")
+                    .bind(owner.as_slice())
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM credential_sets WHERE seal_id = $1")
+            .bind(seal_id.as_slice())
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM credential_pending WHERE seal_id = $1")
             .bind(seal_id.as_slice())
             .execute(&self.pool)
             .await?;
@@ -245,9 +321,18 @@ pub struct InMemoryCredentialRepo {
 #[derive(Default)]
 struct InMemoryState {
     sets: HashMap<SealId, StoredCredentials>,
-    updated: HashMap<SealId, i64>,
+    pending: HashMap<SealId, PendingState>,
+    notify: HashMap<Address, String>,
     epochs: HashMap<SealId, i64>,
     boots: HashMap<SealId, B256>,
+}
+
+#[derive(Default)]
+struct PendingState {
+    pending: i32,
+    notified_pending: i32,
+    notified_at: Option<i64>,
+    updated_at: i64,
 }
 
 impl InMemoryCredentialRepo {
@@ -276,7 +361,6 @@ impl CredentialRepo for InMemoryCredentialRepo {
         if current != base_version {
             return Ok(None);
         }
-        let pending = s.sets.get(&seal_id).map(|c| c.pending).unwrap_or(0);
         s.sets.insert(
             seal_id,
             StoredCredentials {
@@ -285,7 +369,6 @@ impl CredentialRepo for InMemoryCredentialRepo {
                 version: base_version + 1,
                 document,
                 writebacks: serde_json::json!({}),
-                pending,
             },
         );
         Ok(Some(base_version + 1))
@@ -310,28 +393,70 @@ impl CredentialRepo for InMemoryCredentialRepo {
 
     async fn set_pending(&self, seal_id: SealId, pending: i32) -> anyhow::Result<()> {
         let mut s = self.inner.lock().unwrap();
-        if let Some(c) = s.sets.get_mut(&seal_id) {
-            c.pending = pending;
+        let p = s.pending.entry(seal_id).or_default();
+        if p.pending != pending {
+            p.updated_at = chrono_now();
         }
-        s.updated.insert(seal_id, chrono_now());
+        p.pending = pending;
+        p.notified_pending = p.notified_pending.min(pending);
         Ok(())
     }
 
-    async fn pending_for_owner(&self, owner: Address) -> anyhow::Result<Vec<PendingCount>> {
+    async fn pending_counts(&self, seals: &[SealId]) -> anyhow::Result<Vec<PendingCount>> {
         let s = self.inner.lock().unwrap();
-        Ok(s.sets
+        let mut out: Vec<PendingCount> = seals
             .iter()
-            .filter(|(_, c)| c.owner == owner && c.pending > 0)
-            .map(|(seal, c)| PendingCount {
-                seal_id: *seal,
-                pending: c.pending,
-                updated_at: s.updated.get(seal).copied().unwrap_or(0),
+            .filter_map(|seal| {
+                s.pending
+                    .get(seal)
+                    .filter(|p| p.pending > 0)
+                    .map(|p| PendingCount {
+                        seal_id: *seal,
+                        pending: p.pending,
+                        updated_at: p.updated_at,
+                    })
             })
-            .collect())
+            .collect();
+        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(out)
+    }
+
+    async fn claim_notification(
+        &self,
+        seal_id: SealId,
+        cooldown_secs: i64,
+    ) -> anyhow::Result<Option<i32>> {
+        let mut s = self.inner.lock().unwrap();
+        let now = chrono_now();
+        let Some(p) = s.pending.get_mut(&seal_id) else {
+            return Ok(None);
+        };
+        if p.pending <= p.notified_pending || p.notified_at.is_some_and(|t| t + cooldown_secs > now)
+        {
+            return Ok(None);
+        }
+        p.notified_pending = p.pending;
+        p.notified_at = Some(now);
+        Ok(Some(p.pending))
+    }
+
+    async fn notify_address(&self, owner: Address) -> anyhow::Result<Option<String>> {
+        Ok(self.inner.lock().unwrap().notify.get(&owner).cloned())
+    }
+
+    async fn set_notify_address(&self, owner: Address, email: Option<&str>) -> anyhow::Result<()> {
+        let mut s = self.inner.lock().unwrap();
+        match email {
+            Some(e) => s.notify.insert(owner, e.to_string()),
+            None => s.notify.remove(&owner),
+        };
+        Ok(())
     }
 
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()> {
-        self.inner.lock().unwrap().sets.remove(&seal_id);
+        let mut s = self.inner.lock().unwrap();
+        s.sets.remove(&seal_id);
+        s.pending.remove(&seal_id);
         Ok(())
     }
 

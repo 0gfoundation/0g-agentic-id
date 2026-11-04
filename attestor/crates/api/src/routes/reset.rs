@@ -270,6 +270,7 @@ mod tests {
             sandbox: Arc::new(attestor_shared::mocks::MockSandbox),
             deployments: deployments.clone(),
             credentials: attestor_shared::credentials_repo::in_memory(),
+            notify: None,
             idempotency,
             jobs: jobs.clone(),
             events,

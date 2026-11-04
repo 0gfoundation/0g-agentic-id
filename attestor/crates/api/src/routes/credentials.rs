@@ -9,6 +9,8 @@
 //!   current boot and set version.
 //! - `GET  /credentials/pending`   owner-signed: pending-request counts of
 //!   every agent the signer owns.
+//! - `GET|POST /credentials/notify` owner-signed: read or set the address the
+//!   owner is told at when an agent's pending count rises.
 //!
 //! attestor never sees a value: definitions are checked against the signed
 //! hashes, values only by the hash of their ciphertext.
@@ -17,10 +19,11 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use alloy::primitives::{Address, B256};
 use attestor_shared::auth::credentials::{
-    parse_owner_message, parse_pending_message, validate_document, verify_writeback, Document,
-    Expect, Writeback, CREDENTIALS_DOMAIN, MAX_DOCUMENT_BYTES,
+    parse_notify_message, parse_owner_message, parse_pending_message, validate_document,
+    verify_writeback, Document, Expect, Writeback, CREDENTIALS_DOMAIN, MAX_DOCUMENT_BYTES,
 };
 use attestor_shared::auth::settings::settings_digest_hex;
+use attestor_shared::notify::{pending_notice, valid_email};
 use attestor_shared::sandbox::eip191_digest;
 use attestor_shared::{Deployment, SealId};
 use axum::body::Bytes;
@@ -290,14 +293,16 @@ pub async fn handle_pending(
             "signer does not match the owner in X-Auth-Message",
         ));
     }
+    let rows: Vec<Deployment> = state.deployments.list_by_owner(owner).await?;
+    let seals: Vec<SealId> = rows.iter().map(|d| d.seal_id).collect();
     let mut out = Vec::new();
-    for p in state.credentials.pending_for_owner(owner).await? {
+    for p in state.credentials.pending_counts(&seals).await? {
         // Only agents the signer still owns: a sold agent's count is not
-        // the seller's to see.
-        let Some(d) = state.deployments.get(p.seal_id).await? else {
+        // the seller's to see, even before the index catches up.
+        let Some(d) = rows.iter().find(|d| d.seal_id == p.seal_id) else {
             continue;
         };
-        if live_owner(&state, &d).await.ok() != Some(owner) {
+        if live_owner(&state, d).await.ok() != Some(owner) {
             continue;
         }
         out.push(json!({
@@ -308,6 +313,117 @@ pub async fn handle_pending(
     Ok(Json(json!(out)))
 }
 
+/// Owner-signed read of the notification address, and whether this
+/// attestor sends notifications at all.
+pub async fn handle_notify_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let msg = header_str(&headers, "X-Auth-Message")?;
+    let sig = header_sig(&headers)?;
+    let (owner, ts, digest) =
+        parse_notify_message(&msg).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if digest.is_some() {
+        return Err(ApiError::bad_request(
+            "X-Auth-Message for a read carries no digest",
+        ));
+    }
+    fresh(ts)?;
+    if signer_of(&state, &msg, &sig).await? != owner {
+        return Err(ApiError::unauthorized(
+            "signer does not match the owner in X-Auth-Message",
+        ));
+    }
+    Ok(Json(json!({
+        "email": state.credentials.notify_address(owner).await?,
+        "enabled": state.notify.is_some(),
+    })))
+}
+
+/// Owner-signed write of the notification address: `{"email": "…"}` sets
+/// it, `{"email": null}` removes it.
+pub async fn handle_notify_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<serde_json::Value>> {
+    if body.len() > 1024 {
+        return Err(ApiError::bad_request("body too large"));
+    }
+    let msg = header_str(&headers, "X-Auth-Message")?;
+    let sig = header_sig(&headers)?;
+    let (owner, ts, digest) =
+        parse_notify_message(&msg).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    fresh(ts)?;
+    if digest.as_deref() != Some(settings_digest_hex(&body).as_str()) {
+        return Err(ApiError::bad_request(
+            "X-Auth-Message for a write must end with the digest of this body",
+        ));
+    }
+    if signer_of(&state, &msg, &sig).await? != owner {
+        return Err(ApiError::unauthorized(
+            "signer does not match the owner in X-Auth-Message",
+        ));
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NotifyRequest {
+        email: Option<String>,
+    }
+    let req: NotifyRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request(format!("invalid request: {e}")))?;
+    let email = req.email.map(|e| e.trim().to_string());
+    if let Some(e) = &email {
+        if !valid_email(e) {
+            return Err(ApiError::bad_request("not a single email address"));
+        }
+    }
+    state
+        .credentials
+        .set_notify_address(owner, email.as_deref())
+        .await?;
+    Ok(Json(
+        json!({"email": email, "enabled": state.notify.is_some()}),
+    ))
+}
+
+/// After a status report: tell the owner when the agent's pending count
+/// rose (at most once per cooldown per agent). Best effort and off the
+/// report's path; a failure is logged, never retried here (the next report
+/// claims again while the count stays above what was notified).
+pub fn notify_pending(state: &AppState, seal_id: SealId) {
+    let Some(notify) = state.notify.clone() else {
+        return;
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        let Ok(Some(pending)) = state
+            .credentials
+            .claim_notification(seal_id, notify.cooldown_secs)
+            .await
+        else {
+            return;
+        };
+        let Ok(Some(d)) = state.deployments.get(seal_id).await else {
+            return;
+        };
+        let Ok(owner) = live_owner(&state, &d).await else {
+            return;
+        };
+        let Ok(Some(to)) = state.credentials.notify_address(owner).await else {
+            return;
+        };
+        let agent = d
+            .agent_id
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| format!("{seal_id:#x}"));
+        let (subject, text) = pending_notice(&agent, pending);
+        if let Err(e) = notify.notifier.send(&to, &subject, &text).await {
+            tracing::warn!(seal_id = ?seal_id, error = %e, "pending notification not sent");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,14 +432,16 @@ mod tests {
     use alloy::signers::local::PrivateKeySigner;
     use alloy::signers::SignerSync;
     use attestor_shared::auth::credentials::{
-        owner_message, pending_message, writeback_message, SetEntry, SetWire,
+        notify_message, owner_message, pending_message, writeback_message, SetEntry, SetWire,
     };
+    use attestor_shared::auth::settings::settings_digest_hex;
     use attestor_shared::credentials_repo::{CredentialRepo, InMemoryCredentialRepo};
     use attestor_shared::crypto::RealCrypto;
     use attestor_shared::mocks::{
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
         MockChain, MockSandbox,
     };
+    use attestor_shared::notify::{OwnerNotify, RecordingNotifier};
     use attestor_shared::{derive_phase, StageStatus};
     use axum::http::HeaderValue;
     use std::collections::BTreeMap;
@@ -338,6 +456,7 @@ mod tests {
         seal_id: SealId,
         chain: Arc<MockChain>,
         creds: Arc<InMemoryCredentialRepo>,
+        sent: Arc<RecordingNotifier>,
     }
 
     fn setup() -> Setup {
@@ -382,6 +501,7 @@ mod tests {
         let chain = Arc::new(MockChain::new());
         chain.set_owner_of(owner.address());
         let creds = Arc::new(InMemoryCredentialRepo::default());
+        let sent = Arc::new(RecordingNotifier::default());
         let state = AppState {
             providers: Arc::new(
                 attestor_shared::provider_registry::MemoryProviderRegistry::default(),
@@ -392,6 +512,10 @@ mod tests {
             sandbox: Arc::new(MockSandbox),
             deployments: repo,
             credentials: creds.clone(),
+            notify: Some(Arc::new(OwnerNotify {
+                notifier: sent.clone(),
+                cooldown_secs: 0,
+            })),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             jobs: Arc::new(InMemoryJobQueue::new()),
             events: Arc::new(InMemoryEventBus::new()),
@@ -403,6 +527,7 @@ mod tests {
             seal_id,
             chain,
             creds,
+            sent,
         }
     }
 
@@ -626,10 +751,8 @@ mod tests {
 
     #[tokio::test]
     async fn pending_counts_only_for_agents_the_signer_owns() {
+        // No set stored: an agent can ask for its first credential.
         let s = setup();
-        let _ = write(&s, &s.owner, 0, &document(&s, &s.owner, 1, 0, false))
-            .await
-            .unwrap();
         s.creds.set_pending(s.seal_id, 2).await.unwrap();
         let msg = pending_message(s.owner.address(), Utc::now().timestamp());
         let out = handle_pending(State(s.state.clone()), headers(&s.owner, &msg))
@@ -642,5 +765,107 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.0.as_array().unwrap().len(), 0);
+    }
+
+    async fn set_notify(
+        s: &Setup,
+        signer: &PrivateKeySigner,
+        body: &str,
+    ) -> ApiResult<Json<serde_json::Value>> {
+        let msg = notify_message(
+            s.owner.address(),
+            Utc::now().timestamp(),
+            Some(&settings_digest_hex(body.as_bytes())),
+        );
+        handle_notify_post(
+            State(s.state.clone()),
+            headers(signer, &msg),
+            Bytes::from(body.to_string()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn owner_sets_reads_and_removes_the_notify_address() {
+        let s = setup();
+        let _ = set_notify(&s, &s.owner, r#"{"email":" owner@example.org "}"#)
+            .await
+            .unwrap();
+        let msg = notify_message(s.owner.address(), Utc::now().timestamp(), None);
+        let got = handle_notify_get(State(s.state.clone()), headers(&s.owner, &msg))
+            .await
+            .unwrap();
+        assert_eq!(got.0["email"], "owner@example.org");
+        assert_eq!(got.0["enabled"], true);
+
+        // Someone else cannot point the owner's notifications elsewhere.
+        let err = set_notify(
+            &s,
+            &PrivateKeySigner::random(),
+            r#"{"email":"x@example.org"}"#,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        // One plain address only.
+        for bad in [
+            r#"{"email":"a@example.org, b@example.com"}"#,
+            r#"{"email":"nope"}"#,
+            r#"{"to":"a@example.org"}"#,
+        ] {
+            assert_eq!(
+                set_notify(&s, &s.owner, bad).await.unwrap_err().status,
+                StatusCode::BAD_REQUEST,
+                "{bad}"
+            );
+        }
+        let _ = set_notify(&s, &s.owner, r#"{"email":null}"#).await.unwrap();
+        assert_eq!(
+            s.creds.notify_address(s.owner.address()).await.unwrap(),
+            None
+        );
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    #[tokio::test]
+    async fn a_rising_pending_count_notifies_the_owner_once() {
+        let s = setup();
+        s.creds
+            .set_notify_address(s.owner.address(), Some("owner@example.org"))
+            .await
+            .unwrap();
+        s.creds.set_pending(s.seal_id, 1).await.unwrap();
+        notify_pending(&s.state, s.seal_id);
+        settle().await;
+        {
+            let sent = s.sent.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            let (to, subject, text) = &sent[0];
+            assert_eq!(to, "owner@example.org");
+            assert!(subject.contains("Agent 7") && text.contains("0g-agentdna cred 7 pending"));
+        }
+        // The same count again: nothing new to say.
+        s.creds.set_pending(s.seal_id, 1).await.unwrap();
+        notify_pending(&s.state, s.seal_id);
+        settle().await;
+        assert_eq!(s.sent.sent.lock().unwrap().len(), 1);
+        // Down to zero, then a new request: told again.
+        s.creds.set_pending(s.seal_id, 0).await.unwrap();
+        s.creds.set_pending(s.seal_id, 1).await.unwrap();
+        notify_pending(&s.state, s.seal_id);
+        settle().await;
+        assert_eq!(s.sent.sent.lock().unwrap().len(), 2);
+        // A sold agent's requests are not the seller's to hear about.
+        s.chain.set_owner_of(PrivateKeySigner::random().address());
+        s.creds.set_pending(s.seal_id, 3).await.unwrap();
+        notify_pending(&s.state, s.seal_id);
+        settle().await;
+        assert_eq!(s.sent.sent.lock().unwrap().len(), 2);
     }
 }

@@ -130,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         sandbox,
         deployments,
         credentials: attestor_shared::credentials_repo::PostgresCredentialRepo::new(pool.clone()),
+        notify: attestor_shared::notify::OwnerNotify::from_env(),
         idempotency,
         jobs,
         events,

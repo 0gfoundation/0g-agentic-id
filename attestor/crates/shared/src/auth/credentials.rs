@@ -36,6 +36,8 @@ use std::str::FromStr;
 pub const CREDENTIALS_DOMAIN: &str = "AgenticID.Credentials.v1";
 /// Tag of the owner's cross-agent pending count read.
 pub const PENDING_DOMAIN: &str = "AgenticID.CredentialsPending.v1";
+/// Tag of the owner's messages that read or set where notifications go.
+pub const NOTIFY_DOMAIN: &str = "AgenticID.CredentialsNotify.v1";
 /// EIP-712 domain name and version.
 pub const DOMAIN_NAME: &str = "AgentDNA Credentials";
 pub const DOMAIN_VERSION: &str = "1";
@@ -359,6 +361,40 @@ pub fn parse_pending_message(msg: &str) -> anyhow::Result<(Address, i64)> {
         .parse()
         .map_err(|e| anyhow::anyhow!("bad timestamp: {e}"))?;
     Ok((owner, ts))
+}
+
+/// `"<NOTIFY_DOMAIN>:<owner>:<unix seconds>[:<sha256 hex of the body>]"`,
+/// signed by the owner to read (no digest) or set (digest) its notification
+/// address.
+pub fn notify_message(owner: Address, timestamp: i64, digest_hex: Option<&str>) -> String {
+    match digest_hex {
+        Some(d) => format!("{NOTIFY_DOMAIN}:{owner:#x}:{timestamp}:{d}"),
+        None => format!("{NOTIFY_DOMAIN}:{owner:#x}:{timestamp}"),
+    }
+}
+
+pub fn parse_notify_message(msg: &str) -> anyhow::Result<(Address, i64, Option<String>)> {
+    let parts: Vec<&str> = msg.split(':').collect();
+    anyhow::ensure!(
+        matches!(parts.len(), 3 | 4) && parts[0] == NOTIFY_DOMAIN,
+        "X-Auth-Message must be \"{NOTIFY_DOMAIN}:<owner>:<unix seconds>[:<sha256 hex>]\""
+    );
+    let owner = Address::from_str(parts[1]).map_err(|e| anyhow::anyhow!("bad owner: {e}"))?;
+    let ts: i64 = parts[2]
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad timestamp: {e}"))?;
+    let digest = match parts.get(3) {
+        Some(d) => {
+            let d = d.to_ascii_lowercase();
+            anyhow::ensure!(
+                d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()),
+                "bad digest: expected 64 hex chars"
+            );
+            Some(d)
+        }
+        None => None,
+    };
+    Ok((owner, ts, digest))
 }
 
 #[cfg(test)]

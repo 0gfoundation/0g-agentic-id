@@ -18,6 +18,7 @@ pub mod jobs;
 pub mod kms;
 pub mod mocks;
 pub mod nonce_submit;
+pub mod notify;
 pub mod oss;
 pub mod provider_registry;
 pub mod pinned_tls;

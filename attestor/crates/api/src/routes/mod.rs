@@ -113,6 +113,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/credentials/writeback", post(credentials::handle_writeback))
         .route("/credentials/pending", get(credentials::handle_pending))
+        .route(
+            "/credentials/notify",
+            get(credentials::handle_notify_get).post(credentials::handle_notify_post),
+        )
         .route("/start", post(start::handle))
         .route("/stop", post(stop::handle))
         .route("/retry", post(retry::handle))

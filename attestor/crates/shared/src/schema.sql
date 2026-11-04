@@ -291,9 +291,9 @@ ALTER TABLE inference_provider_registry ADD COLUMN IF NOT EXISTS publisher BYTEA
 ALTER TABLE inference_provider_registry DROP COLUMN IF EXISTS acceptance_mac;
 
 -- ── Owner credential sets (sealed credential proxy) ──────────────────────
--- One row per seal: the owner-signed set (auth::credentials) as posted,
--- the values the container wrote back for that version, and its last
--- reported pending-request count. Deleted when the agent changes hands.
+-- One row per seal: the owner-signed set (auth::credentials) as posted
+-- and the values the container wrote back for that version. Deleted when
+-- the agent changes hands.
 CREATE TABLE IF NOT EXISTS credential_sets (
     seal_id     BYTEA PRIMARY KEY,
     owner       BYTEA  NOT NULL,
@@ -301,7 +301,6 @@ CREATE TABLE IF NOT EXISTS credential_sets (
     version     BIGINT NOT NULL DEFAULT 0,
     document    JSONB  NOT NULL,
     writebacks  JSONB  NOT NULL DEFAULT '{}'::jsonb,
-    pending     INT    NOT NULL DEFAULT 0,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_credential_sets_owner ON credential_sets (owner);
@@ -311,4 +310,20 @@ CREATE INDEX IF NOT EXISTS idx_credential_sets_owner ON credential_sets (owner);
 CREATE TABLE IF NOT EXISTS credential_epochs (
     seal_id BYTEA PRIMARY KEY,
     epoch   BIGINT NOT NULL
+);
+-- The container's last reported count of requests waiting for the owner
+-- (signed status reports), and the count last notified, so the owner is
+-- told when it rises, not on every report.
+CREATE TABLE IF NOT EXISTS credential_pending (
+    seal_id          BYTEA PRIMARY KEY,
+    pending          INT NOT NULL DEFAULT 0,
+    notified_pending INT NOT NULL DEFAULT 0,
+    notified_at      TIMESTAMPTZ,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Where an owner wants to be told about pending requests (owner-signed).
+CREATE TABLE IF NOT EXISTS credential_notify (
+    owner      BYTEA PRIMARY KEY,
+    email      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
