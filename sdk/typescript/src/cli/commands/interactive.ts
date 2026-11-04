@@ -29,7 +29,7 @@ import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
 import { applyAssignments, assertModelPresent, assertOthersFitFramework, isHarnessFramework, parseAssignments, renderSettings } from '../settings';
-import { credOp } from '../credentials';
+import { credOp, credOwnerOp } from '../credentials';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
@@ -995,7 +995,9 @@ const L1_HELP_FULL = `manager commands
                           host=, header='Name: … {v}', basic=, query=, body=,
                           path=yes, reveal=yes|no, expires=, desc=; the value
                           is asked for, not echoed); rm <name>; reveal <name>
-                          on|off; pending; approve|deny <id>; log [n]
+                          on|off; pending; approve|deny <id>; log [n].
+                          cred pending: counts on all your agents; cred
+                          notify [email|off]: where you are emailed
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
                           Someone else's: goes through its fork policy — works
                           iff the seller granted YOUR wallet. Lands offline
@@ -1407,8 +1409,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'cred') {
         // The owner's credentials for an agent (cli/credentials.ts); every
         // subcommand is owner-signed.
-        if (!args[0]) { out('usage: cred <agentId|sealId> [ls|set|rm|reveal|pending|approve|deny|log] — `help` has the keys\n'); continue; }
+        if (!args[0]) { out('usage: cred <agentId|sealId> [ls|set|rm|reveal|pending|approve|deny|log] · cred pending · cred notify [email|off] — `help` has the keys\n'); continue; }
         const ag = await withWallet(ctx);
+        if (await credOwnerOp(ag, args, credIO(ask))) continue;
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
         await credOp(ag, row.sealId, args.slice(1), credIO(ask), row.phase === 'running' && row.url ? row.url : undefined);

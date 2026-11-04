@@ -91,6 +91,7 @@ function stub(stored = { version: 0, owner_epoch: 5, document: null, writebacks:
       if (req.method === 'POST' && url.pathname === '/credentials') return json(200, { ok: true, version: stored.version + 1 });
       if (req.method === 'GET' && url.pathname.startsWith('/deployment/')) return json(200, { seal_id: SEAL_ID, url: `http://127.0.0.1:${server.address().port}` });
       if (req.method === 'POST' && url.pathname === '/_seal/credentials') return json(200, { version: stored.version + 1, skipped: {} });
+      if (url.pathname === '/credentials/notify') return json(200, { email: req.method === 'POST' ? JSON.parse(body).email : null, enabled: true });
       json(404, { error: 'not found' });
     });
   });
@@ -171,6 +172,25 @@ test('a stale base version is refused before anything is signed', async () => {
       (e) => e instanceof CredentialsConflictError && e.currentVersion === 2,
     );
     assert.ok(!s.seen.some((r) => r.method === 'POST'), 'nothing may be written');
+  } finally {
+    s.server.close();
+  }
+});
+
+test('notify address: owner-signed read, and a write bound to its body', async () => {
+  const owner = privateKeyToAccount('0x' + '33'.repeat(32));
+  const s = await stub();
+  try {
+    const a = api(s.port, owner);
+    assert.deepEqual(await a.setNotifyAddress('owner@example.org'), { email: 'owner@example.org', enabled: true });
+    assert.deepEqual(await a.notifyAddress(), { email: null, enabled: true });
+    const [w, r] = s.seen.filter((x) => x.path === '/credentials/notify');
+    const lower = owner.address.toLowerCase();
+    assert.match(w.headers['x-auth-message'], new RegExp(`^AgenticID\\.CredentialsNotify\\.v1:${lower}:\\d+:${createHash('sha256').update(w.body).digest('hex')}$`));
+    assert.match(r.headers['x-auth-message'], new RegExp(`^AgenticID\\.CredentialsNotify\\.v1:${lower}:\\d+$`));
+    for (const x of [w, r]) {
+      assert.equal(await recoverMessageAddress({ message: x.headers['x-auth-message'], signature: x.headers['x-auth-signature'] }), owner.address);
+    }
   } finally {
     s.server.close();
   }

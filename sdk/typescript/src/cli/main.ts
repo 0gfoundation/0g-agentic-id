@@ -132,6 +132,7 @@ COMMANDS
                      cred <agent> approve|deny <id>     decide one (id prefix)
                      cred <agent> log [n]               what the agent did
                      cred pending                       counts, all your agents
+                     cred notify [<email>|off]          email when one waits
                    Owner-signed; needs AGENTIC_PRIVATE_KEY. A write is a
                    compare-and-swap like settings (CREDENTIALS_CONFLICT, exit 3).
   providers        Read the platform provider registry (--json for export).

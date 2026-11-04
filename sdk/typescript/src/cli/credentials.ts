@@ -40,7 +40,8 @@ export const CRED_USAGE = `usage:
   cred <agent> approve <id>            approve one request once (an id prefix from pending is enough)
   cred <agent> deny <id>               refuse one request
   cred <agent> log [n]                 what the agent did with its credentials (last n, default 50)
-  cred pending                         pending counts across every agent you own`;
+  cred pending                         pending counts across every agent you own
+  cred notify [<email>|off]            where you are emailed when an agent waits for you`;
 
 /**
  * Where common providers take their key. Each is the provider's documented
@@ -375,6 +376,40 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     default:
       throw new CliError('BAD_FLAG', `unknown cred subcommand "${sub}"`, { remedy: CRED_USAGE });
   }
+}
+
+/**
+ * The `cred` subcommands that take no agent: `pending` (counts across every
+ * agent the wallet owns) and `notify`. Returns false for anything else.
+ */
+export async function credOwnerOp(ag: AgenticID, args: string[], io: CredIO): Promise<boolean> {
+  const [sub, arg] = args;
+  if (sub === 'pending') {
+    // The attestor keeps each agent's count from its status reports.
+    const rows = (await ag.credentials.pendingCounts()).filter((r) => r.pending > 0);
+    if (io.json) {
+      emitOk({ agents: rows });
+      return true;
+    }
+    if (!rows.length) io.out('nothing waiting on any of your agents');
+    for (const r of rows) io.out(`${r.agent_id ?? r.seal_id.slice(0, 12)}  ${r.pending} waiting   (cred ${r.agent_id ?? r.seal_id} pending)`);
+    return true;
+  }
+  if (sub === 'notify') {
+    let out: { email: string | null; enabled: boolean };
+    if (arg === undefined) out = await ag.credentials.notifyAddress();
+    else if (/^(off|none|stop)$/i.test(arg)) out = await ag.credentials.setNotifyAddress(null);
+    else if (/^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/.test(arg)) out = await ag.credentials.setNotifyAddress(arg);
+    else throw new CliError('BAD_FLAG', `not an email address: "${arg}"`, { remedy: 'cred notify you@example.com   |   cred notify off' });
+    if (io.json) {
+      emitOk(out);
+      return true;
+    }
+    io.out(out.email ? `credential requests are emailed to ${out.email}` : 'no notification address set');
+    if (!out.enabled) io.out('note: this attestor does not send email; check `cred pending` instead');
+    return true;
+  }
+  return false;
 }
 
 /**

@@ -372,6 +372,30 @@ export class CredentialsApi {
     return (await r.json()) as Array<{ seal_id: string; agent_id: string | null; pending: number; updated_at: number }>;
   }
 
+  /** Where the attestor emails this wallet about pending requests, and whether it sends any. */
+  async notifyAddress(): Promise<{ email: string | null; enabled: boolean }> {
+    const { account } = requireWallet(this.ctx);
+    const message = `AgenticID.CredentialsNotify.v1:${account.address.toLowerCase()}:${Math.floor(Date.now() / 1000)}`;
+    const r = await fetch(`${this.attestorUrl()}/credentials/notify`, { headers: await this.ownerHeaders(message), signal: AbortSignal.timeout(10_000) });
+    if (!r.ok) throw new Error(`credentials.notifyAddress: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    return (await r.json()) as { email: string | null; enabled: boolean };
+  }
+
+  /** Set (an address) or stop (null) email about pending requests on any agent this wallet owns. */
+  async setNotifyAddress(email: string | null): Promise<{ email: string | null; enabled: boolean }> {
+    const { account } = requireWallet(this.ctx);
+    const body = JSON.stringify({ email });
+    const message = `AgenticID.CredentialsNotify.v1:${account.address.toLowerCase()}:${Math.floor(Date.now() / 1000)}:${await sha256Hex(body)}`;
+    const r = await fetch(`${this.attestorUrl()}/credentials/notify`, {
+      method: 'POST',
+      headers: { ...(await this.ownerHeaders(message)), 'content-type': 'application/json' },
+      body,
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) throw new Error(`credentials.setNotifyAddress: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    return (await r.json()) as { email: string | null; enabled: boolean };
+  }
+
   /**
    * Approve one pending request once: an EIP-712 Approval bound to this boot,
    * this request id and its digest, valid for `ttlSeconds` (default 1 h, never
