@@ -31,6 +31,7 @@ import { AgenticIDClient, type IntelligentDataResult } from './AgenticIDClient';
 import { ReputationClient } from './ReputationClient';
 import { SandboxClient } from './SandboxClient';
 import { AttestorClient, type CloneParams, type DeployParams, type DeployCloneResponse } from './AttestorClient';
+import { CredentialsApi } from './Credentials';
 import { sha256Hex, type SettingsDoc } from './Settings';
 import type { SecretEnvMode } from './secretEnv';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader, type TaskExchange } from './ServeSession';
@@ -1298,6 +1299,8 @@ export class AgenticID {
   readonly agent: AgentApi;
   readonly admin: AdminApi;
   readonly reputation: ReputationApi;
+  /** Owner credentials served by the agent's sealed credential proxy. */
+  readonly credentials: CredentialsApi;
   private readonly infra: SandboxClient;
   /** Long-lived so its instance caches (/config: provider address, sandbox
    *  endpoint) are paid once per session, not per call. */
@@ -1312,6 +1315,7 @@ export class AgenticID {
     this.infra = new SandboxClient(ctx);
     this.attestor = new AttestorClient(ctx, initialConfig);
     this.admin = new AdminApi(this.attestor);
+    this.credentials = new CredentialsApi(ctx, this.attestor);
   }
 
   /**

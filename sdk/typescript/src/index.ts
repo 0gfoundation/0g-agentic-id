@@ -66,6 +66,25 @@ export {
   fetchRouterModelIds,
 } from './Settings';
 export type { SettingsDoc, ThinkingLevel } from './Settings';
+export {
+  CredentialsApi,
+  CredentialsConflictError,
+  credentialSetTypes,
+  approvalTypes,
+  definitionOf,
+  inputOf,
+  credentialPlaintext,
+  CREDENTIALS_DOMAIN_NAME,
+  CREDENTIALS_DOMAIN_VERSION,
+} from './Credentials';
+export type {
+  CredentialInput,
+  CredentialDefinition,
+  CredentialDocument,
+  CredentialPosition,
+  TokenRequestTemplate,
+  PendingCredentialRequest,
+} from './Credentials';
 
 // ── Reputation: serve-proof transport + verification ──
 export {

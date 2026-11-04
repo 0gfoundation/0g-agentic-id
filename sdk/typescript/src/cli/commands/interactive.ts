@@ -29,6 +29,7 @@ import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
 import { applyAssignments, assertModelPresent, assertOthersFitFramework, isHarnessFramework, parseAssignments, renderSettings } from '../settings';
+import { credOp } from '../credentials';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
@@ -37,8 +38,8 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
-const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -422,7 +423,7 @@ function prefetchModelIds(ag: AgenticID): void {
 const L1_ARGS: Record<string, string[] | (() => string[])> = {
   use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT,
   retry: AGENT, clone: AGENT, transfer: AGENT, call: AGENT, rate: AGENT,
-  grant: AGENT, revoke: AGENT, authorizer: AGENT, settings: AGENT,
+  grant: AGENT, revoke: AGENT, authorizer: AGENT, settings: AGENT, cred: AGENT,
   list: ['--mine'],
 };
 const L2_ARGS: Record<string, string[] | (() => string[])> = {
@@ -431,6 +432,7 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/cancel': ['all'],
   '/inbox': ['all'],
   '/settings': ['provider=', 'model=', 'thinking=', 'others='],
+  '/cred': ['ls', 'set ', 'rm ', 'reveal ', 'pending', 'approve ', 'deny ', 'log'],
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
 
@@ -960,7 +962,7 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · hello <id> · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
+  'commands: list · use <id> · hello <id> · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · cred <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
@@ -987,6 +989,13 @@ const L1_HELP_FULL = `manager commands
                           it thinks with, and how hard); with assignments —
                           model=… provider=… thinking=low|high|max
                           others=<json> — merge and write it (owner-signed)
+  cred <id> [sub …]       the agent's credentials (API keys, tokens): bare
+                          lists them (never values); set <name> [k=v …] adds
+                          or changes one (preset=github|openai|anthropic,
+                          host=, header='Name: … {v}', basic=, query=, body=,
+                          path=yes, reveal=yes|no, expires=, desc=; the value
+                          is asked for, not echoed); rm <name>; reveal <name>
+                          on|off; pending; approve|deny <id>; log [n]
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
                           Someone else's: goes through its fork policy — works
                           iff the seller granted YOUR wallet. Lands offline
@@ -1392,6 +1401,17 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
         await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework);
+        continue;
+      }
+
+      if (cmd === 'cred') {
+        // The owner's credentials for an agent (cli/credentials.ts); every
+        // subcommand is owner-signed.
+        if (!args[0]) { out('usage: cred <agentId|sealId> [ls|set|rm|reveal|pending|approve|deny|log] — `help` has the keys\n'); continue; }
+        const ag = await withWallet(ctx);
+        const row = await findAgentRow(ag, args[0]);
+        if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
+        await credOp(ag, row.sealId, args.slice(1), credIO(ask), row.phase === 'running' && row.url ? row.url : undefined);
         continue;
       }
 
@@ -1961,6 +1981,11 @@ async function withWallet(ctx: CommandContext): Promise<AgenticID> {
   return clientFor(ctx, true);
 }
 
+/** How credOp talks inside the REPL: lines out, values through askSecret. */
+function credIO(ask: (q: string) => Promise<string>) {
+  return { json: false, out: (l: string) => out(`${l}\n`), secret: (p: string) => askSecret(ask, p) };
+}
+
 /** Prompt for a secret with the typed characters not echoed. readline has no
  *  native masking, so suppress stdout echo for the duration of the question. */
 function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise<string> {
@@ -2278,7 +2303,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /clear /compact /tasks /result /cancel /inbox /schedules /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /tasks /result /cancel /inbox /schedules /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -2298,6 +2323,11 @@ const L2_HELP_FULL = `session commands
                           others=<json> merge into it and write it back
                           (owner-signed). Applies at the next boot — /reset
                           applies it now
+  /cred [sub …]           this agent's credentials — same as \`cred <id>\` in the
+                          manager: bare lists, set <name> [k=v …], rm,
+                          reveal <name> on|off, pending, approve|deny <id>,
+                          log [n]. The agent writes [[credential:<name>]]
+                          where a key goes; sealed fills it in on the way out
   /think [low|high|max]   reasoning depth for thinking models (glm etc.) —
                           shorthand for /settings thinking=…, so it is written
                           to the owner's document (owner-signed) and applies at
@@ -2641,6 +2671,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // Owner-signed in both directions, so it needs the wallet client and
         // not the session's (possibly keyless) one.
         await settingsOp(await withWallet(ctx), s.sealId, tokenize(line).slice(1), s.client && s.url ? s.url : undefined, s.framework);
+        continue;
+      }
+      if (line === '/cred' || line.startsWith('/cred ')) {
+        await credOp(await withWallet(ctx), s.sealId, tokenize(line).slice(1), credIO(ask), s.client && s.url ? s.url : undefined);
         continue;
       }
       if (line === '/think' || line.startsWith('/think ')) {
