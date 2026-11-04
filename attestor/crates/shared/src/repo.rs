@@ -1204,7 +1204,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         // (running + heartbeat older than the window), but we hand the
         // candidates back so the worker can reconcile each against its
         // sandbox before deciding Stopped vs Failed vs reap. A container
-        // record exists only once the current container completed a 1.4
+        // record exists only once the current container completed a 0.4
         // provision (the schema clears records from earlier releases).
         let cutoff = now - chrono::Duration::seconds(threshold_secs);
         let rows = sqlx::query(
@@ -1500,11 +1500,11 @@ mod settings_retry_tests {
         sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner,storage_stage,mint_stage,container_stage,phase,sandbox_id,last_heartbeat) VALUES($1,$2,$2,$3,$3,$3,'running','sb-1',$4)")
             .bind(seal.as_slice()).bind(Address::ZERO.as_slice()).bind(&confirmed).bind(stale).execute(&pool).await.unwrap();
         let find = |all: Vec<crate::traits::StaleRunner>| all.into_iter().find(|c| c.seal_id == seal);
-        // A container from before 1.4: no container record.
+        // A container from before 0.4: no container record.
         let candidate = find(repo.stale_running_candidates(now, 900).await.unwrap()).unwrap();
         assert_eq!(candidate.sandbox_id.as_deref(), Some("sb-1"));
         assert!(!candidate.can_report);
-        // Its first 1.4 provision recorded the container.
+        // Its first 0.4 provision recorded the container.
         sqlx::query("UPDATE deployments SET container_pubkey=$2,container_image_hash=$3,provider_chain_id=1,provider_registry_address=$4,provider_app_id='sandbox',provider_registered_at=1,provider_signer=$4 WHERE seal_id=$1")
             .bind(seal.as_slice()).bind([2u8; 33].as_slice()).bind([0x11u8; 32].as_slice()).bind(Address::ZERO.as_slice()).execute(&pool).await.unwrap();
         assert!(find(repo.stale_running_candidates(now, 900).await.unwrap()).unwrap().can_report);

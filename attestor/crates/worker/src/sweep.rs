@@ -12,9 +12,9 @@
 //!
 //! The last case rests on the stale heartbeat, which means something only
 //! while the container could report:
-//!   - The container must hold a status token, which only a 1.4 provision
+//!   - The container must hold a status token, which only a 0.4 provision
 //!     issues ([`StaleRunner::can_report`]). The attestor refuses the reports
-//!     of a container created before 1.4, so its heartbeat stays stale while
+//!     of a container created before 0.4, so its heartbeat stays stale while
 //!     it serves; such a row is decided only by the provider's own answers
 //!     above, and is never probed or reaped for being unreachable. Its
 //!     owner's reset replaces the container.
@@ -138,7 +138,7 @@ enum Act {
     Skip,
     /// Reports could not have arrived: the stale heartbeat proves nothing.
     Hold,
-    /// The container cannot report at all (created before 1.4, or revoked
+    /// The container cannot report at all (created before 0.4, or revoked
     /// by an ownership change): only the provider's own answers count, and
     /// it gave none that ends the agent.
     Unreported,
@@ -284,7 +284,7 @@ pub async fn reconcile_stale_runners<H, F>(
                 continue;
             }
             Act::Unreported => {
-                tracing::debug!(?seal_id, sandbox_id = %sb, "sweep: heartbeat stale but the container cannot report (created before 1.4) — leaving alone");
+                tracing::debug!(?seal_id, sandbox_id = %sb, "sweep: heartbeat stale but the container cannot report (created before 0.4) — leaving alone");
                 continue;
             }
             Act::Stop(reason) => (
@@ -373,7 +373,7 @@ mod tests {
         ))
     }
 
-    /// A running row; `can_report` gives it the container record a 1.4
+    /// A running row; `can_report` gives it the container record a 0.4
     /// provision writes.
     fn running(repo: &InMemoryDeploymentRepo, last_heartbeat: DateTime<Utc>, can_report: bool) {
         let confirmed = serde_json::json!({"state": "confirmed", "at": last_heartbeat});
@@ -427,7 +427,7 @@ mod tests {
             Self::with_container(now, true)
         }
 
-        /// The same, for a container created before 1.4, which cannot
+        /// The same, for a container created before 0.4, which cannot
         /// report.
         fn legacy(now: DateTime<Utc>) -> Self {
             Self::with_container(now, false)
@@ -655,9 +655,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_container_that_cannot_report_is_never_probed_or_reaped() {
-        // A 1.3 container still serving: the provider answers started (or
-        // cannot be asked), its statement path is up, and the preview proxy
-        // fails the probe.
+        // An AgenticID 1.3 container still serving: the provider answers
+        // started (or cannot be asked), its statement path is up, and the
+        // preview proxy fails the probe.
         for (state, lookup_fails) in [
             (Some("started"), false),
             (Some("starting"), false),
