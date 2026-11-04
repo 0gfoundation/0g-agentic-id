@@ -13,7 +13,7 @@
 //!
 //! Frontend decides which to sign from the deployment's phase and stages;
 //! we just dispatch, except that a `start` of a sandbox that does not hold
-//! the agent's current boot ticket (one created before AgentDNA 1.4, or one
+//! the agent's current boot ticket (one created before AgentDNA 0.4, or one
 //! a reset whose create failed left on the row) is refused with 409: that
 //! container cannot provision, so only a `create` brings the agent back. A
 //! `start` signed for a sandbox other than the deployment's is also 409.
@@ -92,12 +92,12 @@ pub async fn handle(
 
     // Only the sandbox created under the agent's current boot ticket can be
     // resumed (`BootAuthorization::holds_current_ticket`). One created before
-    // 1.3 has no boot authorization, one created under 1.3 holds a ticket
-    // without an issue time, and one a reset left on the row when its create
-    // failed holds the ticket that reset superseded; none of them can
-    // provision against this attestor, so resuming it would bill a container
-    // that goes offline at the provision timeout. Only a new container
-    // (reset) brings the agent back.
+    // AgenticID 1.3 has no boot authorization, one created under AgenticID 1.3
+    // holds a ticket without an issue time, and one a reset left on the row
+    // when its create failed holds the ticket that reset superseded; none of
+    // them can provision against this attestor, so resuming it would bill a
+    // container that goes offline at the provision timeout. Only a new
+    // container (reset) brings the agent back.
     if action == "start"
         && !state
             .deployments
@@ -426,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn resuming_a_sandbox_with_no_boot_authorization_is_refused_with_409() {
-        // Created before 1.3: no boot ticket was ever issued for it.
+        // Created before AgenticID 1.3: no boot ticket was ever issued for it.
         let s = make_setup();
         let req = signed_req(s.seal_id, &OWNER_PRIV, "start");
         let err = handle(axum::extract::State(s.state.clone()), Json(req))

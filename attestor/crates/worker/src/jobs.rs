@@ -4051,7 +4051,7 @@ mod tests {
             .generation
     }
 
-    /// The boot authorization a successful 1.4 create leaves: a ticket with
+    /// The boot authorization a successful 0.4 create leaves: a ticket with
     /// an issue time that names the row's sandbox.
     async fn seed_boot_authorization(t: &TestCtx, seal: SealId) -> i64 {
         let generation = t
@@ -4568,8 +4568,9 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_start_of_a_sandbox_without_a_v3_ticket_is_not_started() {
-        // No boot authorization (created before 1.3), or a ticket without an
-        // issue time (created under 1.3): neither runtime can provision.
+        // No boot authorization (created before AgenticID 1.3), or a ticket
+        // without an issue time (created under AgenticID 1.3): neither runtime
+        // can provision.
         for ticket_issued_at in [None, Some(None)] {
             let t = make_test_ctx();
             let seal = dummy_seal();
@@ -4615,7 +4616,7 @@ mod tests {
             assert!(d.provision_deadline.is_none());
             assert!(warning_reasons(&t)
                 .iter()
-                .any(|r| r.contains("before AgentDNA 1.4")));
+                .any(|r| r.contains("before AgentDNA 0.4")));
         }
     }
 
@@ -5938,7 +5939,7 @@ mod tests {
             .unwrap();
         assert!(matches!(d4.container_stage, StageStatus::Confirmed { .. }));
         // An expired deadline left beside another stage (as releases before
-        // 1.4 left it on a failed boot) is not inherited by the next start
+        // 0.4 left it on a failed boot) is not inherited by the next start
         // or create, so it cannot fail that boot while its sandbox is still
         // being created.
         t.deployments

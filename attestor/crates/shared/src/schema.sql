@@ -67,7 +67,7 @@ UPDATE deployments SET container_pubkey = NULL
 -- NULL means "no deadline tracked" (legacy rows or no sandbox yet).
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provision_deadline TIMESTAMPTZ;
 -- A deadline is only live while the container stage is Submitted. Releases
--- before 1.4 failed a timed-out or refused boot without clearing it; such a
+-- before 0.4 failed a timed-out or refused boot without clearing it; such a
 -- leftover would fail the next boot of that agent while its sandbox is still
 -- being created.
 UPDATE deployments SET provision_deadline = NULL

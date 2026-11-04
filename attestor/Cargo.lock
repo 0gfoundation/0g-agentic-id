@@ -1068,7 +1068,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "attestor-api"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "attestor-indexer"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "attestor-shared"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "alloy",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "attestor-worker"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "alloy",
  "anyhow",

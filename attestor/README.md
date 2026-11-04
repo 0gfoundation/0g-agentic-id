@@ -69,10 +69,10 @@ not running marks it stopped, so the owner can resume it. A started sandbox,
 or one the provider cannot report, is decided by the agent's `/healthz`:
 unreachable marks the agent failed and deletes the sandbox. That verdict
 rests on the stale heartbeat, so it applies only to a container that could
-have reported. A container whose first provision did not run under 1.4
+have reported. A container whose first provision did not run under 0.4
 cannot: the attestor refuses its reports. For such a container only the
 provider's answers count; it is never probed, and never deleted for being
-unreachable. A 1.4 container can report only while the provider serves a
+unreachable. A 0.4 container can report only while the provider serves a
 valid attestor TLS statement, which sealed pins this attestor with. So the
 worker asks the provider for that statement on every sweep and acts on a
 stale heartbeat only once the provider has served it at every check for the
@@ -97,9 +97,9 @@ release on, the worker logs `job done` or `job failed` after every
 `claimed job` line (or the reaper logs the job as reaped), so a later drain
 can be read from the worker log alone.
 
-### Rolling out AgentDNA 1.4
+### Rolling out AgentDNA 0.4
 
-1.4 changes the provider certificate (v3), the attestor TLS statement and the
+0.4 changes the provider certificate (v3), the attestor TLS statement and the
 `/provision` request together, with no compatibility for the previous
 versions: every agent needs a new container. Run the steps in order and do not
 go on until each check passes.
@@ -148,15 +148,16 @@ on dev would first meet the live provider with every agent already offline.
    on another framework's image the agent's framework does not start. The sealed log shows `attestor tls: statement accepted` and
    `OK   status reported`. A refused provision is in the api log
    (`provision rejected`) and is the reason on the agent's container stage.
-6. **Publish the SDK.** The 1.4 CLI is `@0gfoundation/0g-agentdna` 0.2.2.
+6. **Publish the SDK.** The first CLI for AgentDNA 0.4 is `@0gfoundation/0g-agentdna` 0.2.2
+   (from 0.4.0 its version follows the release).
    The versions already on npm (0.2.0, 0.2.1) predate it: their `reset` can
-   report `running` from the 1.3 container before the worker has replaced
+   report `running` from the AgenticID 1.3 container before the worker has replaced
    it, and their deploy wizard does not limit 0g-harness agents to models
    with tool use. Publish 0.2.2 and its compatibility package in the
    [release order](../sdk/typescript/MIGRATION.md#release-order) under the
    `next` dist-tag. Dist-tags are shared by every network, and `latest` is
    what `0g-agentdna update` and a plain install pick up, so `latest` stays on
-   the version networks still on 1.3 use (mainnet until its own 1.4 rollout)
+   the version networks still on AgenticID 1.3 use (mainnet until its own 0.4 rollout)
    and moves to 0.2.2 only when every network runs 1.4. On the network being
    rolled, set `ATTESTOR_CLI_LATEST=0.2.2` and an `ATTESTOR_CLI_NOTES` line
    telling CLI owners to run `npm install -g @0gfoundation/0g-agentdna@0.2.2`
@@ -169,9 +170,9 @@ on dev would first meet the live provider with every agent already offline.
    0.2.2 prints `update available … 0g-agentdna update`, and `update`
    installs `latest`, not 0.2.2. The CLI needs Node.js 18 or later; on Node 16
    it stops with `fetch is not defined`. Then owners reset
-   their agents. Every agent whose container predates 1.4 has been offline
+   their agents. Every agent whose container predates 0.4 has been offline
    since step 4 and shows `stopped`, and a reset is the only way back: a
-   resume (`/start` with `start`) of a sandbox created before 1.4 is refused
+   resume (`/start` with `start`) of a sandbox created before 0.4 is refused
    with 409, because that runtime cannot provision. Owners
    acknowledge the provider again (SDK `ack()`) if the preflight asks. Ask
    owners to spread their resets: the worker runs one job at a time, and a
@@ -182,24 +183,24 @@ on dev would first meet the live provider with every agent already offline.
    come online and to run the reset again.
 
    The provider's roll in step 4 archives every running sandbox, so every
-   agent whose container predates 1.4 is down from then on. Once its
+   agent whose container predates 0.4 is down from then on. Once its
    heartbeat is 15 min old, the sweep finds its sandbox archived and marks it
    `stopped`. Its committed state on chain and in storage is kept, and a
-   reset brings it back. A container created before 1.4 that is still running
-   (one the provider did not archive) cannot report either: the 1.4 attestor
-   refuses its status reports (their token format predates 1.4). The sweep
+   reset brings it back. A container created before 0.4 that is still running
+   (one the provider did not archive) cannot report either: the 0.4 attestor
+   refuses its status reports (their token format predates 0.4). The sweep
    then acts only on the provider's answers for it (deleted, `error`, stopped
    or archived) and leaves it `running` otherwise; it never probes or deletes
    it for being unreachable.
 
-**Rolling back.** The 1.4 attestor is one-way: its schema drops columns a
-1.3 attestor reads (`inference_provider_registry.acceptance_mac`,
-`deployments.container_pubkey_mac`), so a 1.3 attestor started on the same
+**Rolling back.** The 0.4 attestor is one-way: its schema drops columns an
+AgenticID 1.3 attestor reads (`inference_provider_registry.acceptance_mac`,
+`deployments.container_pubkey_mac`), so an AgenticID 1.3 attestor started on the same
 database fails to read the provider registry, and finds `dsh` rows renamed
 to `0g-harness`; it also cannot verify the v3 certificates of the containers
-1.4 created, and cannot decode 1.4 jobs. If a
+0.4 created, and cannot decode 0.4 jobs. If a
 check fails, fix forward with that step's remedy rather than redeploying the
-1.3 image.
+AgenticID 1.3 image.
 
 ## Workspace
 
@@ -282,7 +283,7 @@ stay up.
 |---|---|---|
 | `POST /deploy` | User deploys an agent. A sandbox envelope whose `env` carries any key but `API_KEY` / `SEAL_SECRET_ENV` is a `400` naming the key | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | Source owner mints a brand-new agent for another owner, reusing the source's on-chain iData (dataKey re-sealed to a fresh agentSeal); lands Offline for the new owner to bring online | owner EIP-191, verified against the **live on-chain `ownerOf(source)`** (not a self-declared owner) |
-| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent. A `start` (resume) is `409` unless the agent's current boot ticket was issued for the deployment's sandbox: a sandbox created before AgentDNA 1.4 (no boot ticket, or one without an issue time), or the previous sandbox a reset leaves on the row when its create fails, cannot provision, so the agent needs a reset. A `start` or `stop` whose envelope `resource_id` is not the deployment's current sandbox is `409` too (the API and the worker both check), so a sandbox id kept from before a reset is never started or stopped in the agent's name. A create envelope (a reset, a first-provision `start`, a `retry` with an envelope) whose `env` carries any key but `API_KEY` / `SEAL_SECRET_ENV` is a `400` naming the key, before any job is queued | owner envelope, signature verified against the on-chain owner (`/retry` without an envelope is limited to idempotent attestor-side re-runs, gated by an owner-field match) |
+| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent. A `start` (resume) is `409` unless the agent's current boot ticket was issued for the deployment's sandbox: a sandbox created before AgentDNA 0.4 (no boot ticket, or one without an issue time), or the previous sandbox a reset leaves on the row when its create fails, cannot provision, so the agent needs a reset. A `start` or `stop` whose envelope `resource_id` is not the deployment's current sandbox is `409` too (the API and the worker both check), so a sandbox id kept from before a reset is never started or stopped in the agent's name. A create envelope (a reset, a first-provision `start`, a `retry` with an envelope) whose `env` carries any key but `API_KEY` / `SEAL_SECRET_ENV` is a `400` naming the key, before any job is queued | owner envelope, signature verified against the on-chain owner (`/retry` without an envelope is limited to idempotent attestor-side re-runs, gated by an owner-field match) |
 | `GET /settings?seal_id=0x…` | Owner reads the agent's configuration document and its current `version` (the base for the next write). The document is the owner's, so it is in no public tier — this is the only way to read it. The response also carries `confirmed_version` / `attempts` / `fallback_active`, so a client can tell the owner their last push did not boot, the agent is running the previous document, and pushing again is the retry | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` in `X-Auth-Message`, verified against the **live on-chain owner** |
 | `POST /settings` | Owner writes the agent's ONE configuration document. attestor stores it as an OPAQUE blob — it never parses, validates or logs the contents, so widening the settings vocabulary never touches attestor. Not on chain: configuration is re-suppliable, memory is not. Compare-and-swap: a stale base version is 409 with `current_version`, so a captured request cannot reinstate a superseded document and two clients cannot silently overwrite each other | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<sha256 of the document>` in `X-Auth-Message`, verified against the **live on-chain owner** |
 | `POST /probe` | Synchronous liveness probe; flips unreachable containers to `Failed` and preserved-but-not-running sandboxes to `Stopped` (resumable) | none |
