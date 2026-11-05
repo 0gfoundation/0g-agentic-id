@@ -281,7 +281,7 @@ func openEntry(doc Document, e SetEntry, c Check) (*Definition, []byte, string) 
 	if err := json.Unmarshal(raw, &def); err != nil || def.V != 1 || def.Name != e.Name {
 		return nil, nil, "definition is not valid"
 	}
-	if !credproxy.ValidName(def.Name) || strings.HasPrefix(def.Name, "derived:") {
+	if !credproxy.ValidName(def.Name) || strings.HasPrefix(def.Name, "derived:") || strings.HasPrefix(def.Name, "sealed:") {
 		return nil, nil, "name is not valid for an owner entry"
 	}
 	ct, err := chooseCiphertext(doc, e, &def, c)

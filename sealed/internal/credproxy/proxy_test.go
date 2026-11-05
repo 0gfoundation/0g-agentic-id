@@ -250,8 +250,6 @@ func TestExplicitRefusals(t *testing.T) {
 		{"token only", [2]string{"Authorization", "Bearer [[credential:rt]]"}, "", "", "/x", 403, "token_only"},
 		{"expired", [2]string{"Authorization", "Bearer [[credential:old]]"}, "", "", "/x", 410, "expired"},
 		{"query not allowed", [2]string{}, "", "", "/x?key=%5B%5Bcredential%3Agithub%5D%5D", 403, "position_not_allowed"},
-		{"nested json", [2]string{}, `{"a":{"token":"[[credential:github]]"}}`, "application/json", "/x", 403, "position_not_allowed"},
-		{"plain body", [2]string{}, `[[credential:github]]`, "text/plain", "/x", 403, "position_not_allowed"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -531,3 +529,42 @@ func TestWebSocketUpgradeMasksValue(t *testing.T) {
 }
 
 func bufioReader(c net.Conn) *bufio.Reader { return bufio.NewReader(c) }
+
+// A body is read only on a host where some entry may fill a body field (or
+// signs requests). Elsewhere it is relayed as it is, whatever its size: a
+// conversation or a model prompt that quotes a placeholder is not a request
+// to fill one, and placeholder text leaks nothing.
+func TestBodyOnlyReadWhereAnEntryNeedsIt(t *testing.T) {
+	ts, got := upstream(t)
+	h := newHarness(t, ts, &Entry{Name: "github", Hosts: []string{"example.com"},
+		Positions: []Position{{Kind: PosHeader, Name: "Authorization", Template: "Bearer {v}"}}, Value: []byte(secretValue)})
+	big := `{"messages":[{"content":"call it with [[credential:github]] ` + strings.Repeat("x", 100<<10) + `"}]}`
+	for _, body := range []string{`{"a":{"token":"[[credential:github]]"}}`, `[[credential:github]]`, big} {
+		req, _ := http.NewRequest("POST", h.explicitURL("/v1/chat"), strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer [[credential:github]]")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		readAll(t, resp)
+		g := got.snapshot()
+		if resp.StatusCode != 200 || g.body != body || g.header.Get("Authorization") != "Bearer "+secretValue {
+			t.Fatalf("HTTP %d; upstream body intact %v, header filled %v", resp.StatusCode, g.body == body, g.header.Get("Authorization") == "Bearer "+secretValue)
+		}
+	}
+
+	// A host where an entry does fill a body field still refuses a
+	// placeholder anywhere else in the body.
+	h2 := newHarness(t, ts)
+	req, _ := http.NewRequest("POST", h2.explicitURL("/x"), strings.NewReader(`{"a":{"token":"[[credential:github]]"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAll(t, resp)
+	if resp.StatusCode != 403 || resp.Header.Get("X-Seal-Credential-Error") != "position_not_allowed" {
+		t.Fatalf("got %d %q", resp.StatusCode, resp.Header.Get("X-Seal-Credential-Error"))
+	}
+}

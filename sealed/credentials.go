@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -143,14 +144,38 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 	report.SetCredentialsPending(store.PendingCount)
 	go reportPendingChanges(cfg, agentSealPriv, store)
 	logger.Logf("OK   credential proxy listening on 127.0.0.1:%d", port)
+	explicit := fmt.Sprintf("http://127.0.0.1:%d/%s", port, token)
 	return framework.RuntimeContext{
-		CredProxy:      fmt.Sprintf("http://127.0.0.1:%d/%s", port, token),
+		CredHold:       credHold(store, explicit),
+		CredProxy:      explicit,
 		CredHTTPSProxy: fmt.Sprintf("http://agent:%s@127.0.0.1:%d", token, port),
 		CredCAFile:     credCAPath,
 		CredCABundle:   credCABundlePath,
 		CredSock:       credSockPath,
 		CredRevealSock: credRevealSockPath,
 	}, reg
+}
+
+// credHold is RuntimeContext.CredHold: it keeps a value sealed supplies to
+// the framework (its inference key) as the entry "sealed:<name>", filled in
+// only in the given headers on baseURL's host, and returns baseURL reached
+// through the proxy's explicit form, with the placeholder that stands for
+// the value.
+func credHold(store *credentials.Store, explicit string) func(name, baseURL string, headers map[string]string, value []byte) (string, string, error) {
+	return func(name, baseURL string, headers map[string]string, value []byte) (string, string, error) {
+		u, err := url.Parse(baseURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.RawQuery != "" {
+			return "", "", fmt.Errorf("credentials: %q is not an https base URL", baseURL)
+		}
+		e := &credproxy.Entry{Name: "sealed:" + name, Hosts: []string{u.Host}, Use: credproxy.UseInject, Value: value}
+		for header, template := range headers {
+			e.Positions = append(e.Positions, credproxy.Position{Kind: credproxy.PosHeader, Name: header, Template: template})
+		}
+		if err := store.HoldSystem(e); err != nil {
+			return "", "", err
+		}
+		return explicit + "/https/" + u.Host + strings.TrimSuffix(u.EscapedPath(), "/"), credproxy.Placeholder(e.Name), nil
+	}
 }
 
 // writeCredentialCA writes the proxy root alone and after the image's system

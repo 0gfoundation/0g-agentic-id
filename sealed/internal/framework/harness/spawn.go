@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"seal-verify/internal/framework"
+	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/platform"
 	"seal-verify/internal/privsep"
@@ -89,6 +91,13 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		logger.Logf("warn: harness.Start: no inference key for this boot; provider %q must serve %s unauthenticated or the first turn fails", provider, model)
 	}
 
+	// The key stays in sealed when it can: the harness gets a placeholder and
+	// a base URL through the credential proxy, which fills the key in on the
+	// router's host only. The harness and every tool it runs then see the
+	// placeholder, never the key. Only a platform-routed model has a base URL
+	// sealed supplies; a framework built-in dials its own and keeps the key.
+	apiKey, modelBaseURL := holdInferenceKey(rendered.resolved.Endpoint, apiKey, rt)
+
 	if !initialized {
 		if token == "" {
 			var err error
@@ -130,10 +139,11 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	}
 
 	cmd, err := spawnBridge(bridgeEnv{
-		token:       token,
-		apiKey:      apiKey,
-		settingsEnv: rendered.env,
-		rt:          rt,
+		token:        token,
+		apiKey:       apiKey,
+		modelBaseURL: modelBaseURL,
+		settingsEnv:  rendered.env,
+		rt:           rt,
 	})
 	if err != nil {
 		return framework.StartResult{}, fmt.Errorf("harness.Start: %w", err)
@@ -160,6 +170,10 @@ type bridgeEnv struct {
 	// field is going away, and it is frozen at the first Start, so a key that
 	// changed since would be silently reverted by the next restart.
 	apiKey string
+	// modelBaseURL, when set, replaces the rendered SEAL_MODEL_BASE_URL: the
+	// router reached through the credential proxy, apiKey then being the
+	// placeholder the proxy fills.
+	modelBaseURL string
 	// settingsEnv is what RenderSettings produced (settings.go): the model
 	// pin, the endpoint wiring, the reasoning bound and the owner's
 	// composition knobs, already rendered as sorted KEY=VALUE entries.
@@ -191,7 +205,15 @@ func (be bridgeEnv) environ() []string {
 	}
 	// Everything the owner's settings decide (pin, endpoint, reasoning bound,
 	// composition knobs) — rendered once, deterministically, before Start.
-	env = append(env, be.settingsEnv...)
+	for _, kv := range be.settingsEnv {
+		if be.modelBaseURL != "" && strings.HasPrefix(kv, "SEAL_MODEL_BASE_URL=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	if be.modelBaseURL != "" {
+		env = append(env, "SEAL_MODEL_BASE_URL="+be.modelBaseURL)
+	}
 	if be.apiKey != "" {
 		// Resolved by ctx.credentials from the process env (top, read-only
 		// layer), so the key never touches a credentials file.
@@ -209,6 +231,27 @@ func (be bridgeEnv) environ() []string {
 	}
 	return append(env, be.rt.CredentialEnv()...)
 }
+
+// holdInferenceKey has sealed hold the key for a platform-routed model and
+// returns what the harness gets instead: the placeholder, and the router's
+// base URL through the credential proxy. Otherwise (no proxy, a framework
+// built-in endpoint, no key, or sealed could not hold it) the key and the
+// rendered base URL stand.
+func holdInferenceKey(ep *inference.Endpoint, apiKey string, rt framework.RuntimeContext) (key, baseURL string) {
+	if ep == nil || apiKey == "" || rt.CredHold == nil {
+		return apiKey, ""
+	}
+	base, placeholder, err := rt.CredHold("inference", ep.BaseURL, inferenceKeyHeaders, []byte(apiKey))
+	if err != nil {
+		logger.Logf("warn: harness.Start: the inference key could not be held by sealed (%v); the harness gets it itself", err)
+		return apiKey, ""
+	}
+	return placeholder, base
+}
+
+// inferenceKeyHeaders are where the inference key may be filled in: the
+// OpenAI wire's bearer token and the Anthropic wire's x-api-key.
+var inferenceKeyHeaders = map[string]string{"Authorization": "Bearer {v}", "x-api-key": "{v}"}
 
 func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 	logFile, err := framework.OpenLog(logName)

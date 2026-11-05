@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -115,8 +116,9 @@ type Store struct {
 	defHashes     map[string]string // the signed hash of each definition
 	values        map[string][]byte
 	derived       map[string]derived
-	pending       map[string]*Pending // by auth_req_id
-	approvals     map[string]Approval // by request digest
+	system        map[string]*credproxy.Entry // values sealed supplies to the framework
+	pending       map[string]*Pending         // by auth_req_id
+	approvals     map[string]Approval         // by request digest
 	tokenMu       map[string]*sync.Mutex
 	logins        map[string]*loginAttempt // by OAuth state
 	refreshTimers map[string]*time.Timer   // login entries, by name
@@ -174,7 +176,7 @@ func NewStore(env Env, reg *credproxy.Registry) *Store {
 		env: env, reg: reg,
 		defs: map[string]*Definition{}, defHashes: map[string]string{}, values: map[string][]byte{}, derived: map[string]derived{},
 		pending: map[string]*Pending{}, approvals: map[string]Approval{}, tokenMu: map[string]*sync.Mutex{},
-		logins: map[string]*loginAttempt{}, refreshTimers: map[string]*time.Timer{},
+		logins: map[string]*loginAttempt{}, refreshTimers: map[string]*time.Timer{}, system: map[string]*credproxy.Entry{},
 		events: newEventLog(), now: time.Now,
 	}
 }
@@ -286,6 +288,9 @@ func (s *Store) Clear() {
 	s.defs, s.defHashes, s.values, s.derived = map[string]*Definition{}, map[string]string{}, map[string][]byte{}, map[string]derived{}
 	s.pending, s.approvals = map[string]*Pending{}, map[string]Approval{}
 	s.logins = map[string]*loginAttempt{}
+	// What sealed supplied for the framework came with the previous owner's
+	// deployment: it goes too, until the new owner resets the agent.
+	s.system = map[string]*credproxy.Entry{}
 	for name, t := range s.refreshTimers {
 		t.Stop()
 		delete(s.refreshTimers, name)
@@ -310,9 +315,30 @@ func (s *Store) syncRegistryLocked() {
 			delete(s.derived, name)
 		}
 	}
+	for _, e := range s.system {
+		entries = append(entries, e)
+	}
 	if err := s.reg.Replace(entries); err != nil {
 		s.env.Logf("credentials: registry: %v", err)
 	}
+}
+
+// HoldSystem keeps a value sealed itself supplies to the framework (its
+// inference key) as an entry named "sealed:<name>": the framework gets the
+// placeholder, the proxy fills the value in, and nothing reveals it. A new
+// value for the same name replaces the old one.
+func (s *Store) HoldSystem(e *credproxy.Entry) error {
+	if !strings.HasPrefix(e.Name, "sealed:") {
+		return fmt.Errorf("a value sealed supplies is named sealed:<name>, not %q", e.Name)
+	}
+	if err := e.Validate(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.system[e.Name] = e
+	s.syncRegistryLocked()
+	return nil
 }
 
 // List describes every entry the harness may use.
@@ -447,7 +473,7 @@ func (s *Store) Request(op, name string, params map[string]string, reason string
 	if op != "add" && op != "login" {
 		return nil, &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "op must be add or login"}
 	}
-	if !credproxy.ValidName(name) || strings.HasPrefix(name, "derived:") {
+	if !credproxy.ValidName(name) || strings.Contains(name, ":") {
 		return nil, &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "invalid entry name"}
 	}
 	s.mu.Lock()

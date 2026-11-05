@@ -65,8 +65,9 @@ type Entry struct {
 }
 
 // namePattern is the grammar of an entry name inside a placeholder. Entries
-// sealed derives from a token request carry the "derived:" prefix.
-const namePattern = `(?:derived:)?[a-z0-9][a-z0-9._-]{0,62}`
+// sealed derives from a token request carry the "derived:" prefix; values
+// sealed itself supplies to the framework (its inference key) "sealed:".
+const namePattern = `(?:derived:|sealed:)?[a-z0-9][a-z0-9._-]{0,62}`
 
 var (
 	placeholderRe = regexp.MustCompile(`\[\[credential:(` + namePattern + `)\]\]`)
@@ -191,6 +192,28 @@ func (r *Registry) InterceptsHost(host string) bool {
 	for _, e := range r.entries {
 		for _, h := range e.Hosts {
 			if h == host {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// inspectsBody reports whether requests to host have their bodies read: some
+// entry for it may fill a body field, or signs requests to it (sigv4, hmac).
+func (r *Registry) inspectsBody(host string) bool {
+	host = NormalizeHost(host)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.entries {
+		if !hostAllowed(e, host) {
+			continue
+		}
+		if e.Use == UseSign && e.Signer != nil && (e.Signer.Method == SignSigV4 || e.Signer.Method == SignHMAC) {
+			return true
+		}
+		for _, p := range e.Positions {
+			if p.Kind == PosBody {
 				return true
 			}
 		}

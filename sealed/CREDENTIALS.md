@@ -19,7 +19,7 @@ An entry's **definition** is JSON, serialized once by the client and hashed as i
 
 | Field | Meaning |
 |---|---|
-| `v`, `name` | `1`; the name used in the placeholder (`[a-z0-9][a-z0-9._-]{0,62}`) |
+| `v`, `name` | `1`; the name used in the placeholder (`[a-z0-9][a-z0-9._-]{0,62}`; the prefixes `derived:` and `sealed:` are sealed's own) |
 | `hosts` | where it may be sent; exact match after normalization (lower case, no trailing dot, `:443` dropped) |
 | `positions` | where its placeholder may stand: `header` (`name`, `template` with one `{v}`), `basic` (fixed `username`, value is the password), `query` (`param`), `path` (a whole segment), `body` (a top-level JSON or form `field`) |
 | `use` | `inject` (default), `token_only` (only feeds a token request), `sign` (a key sealed signs with) |
@@ -30,6 +30,8 @@ An entry's **definition** is JSON, serialized once by the client and hashed as i
 | `allow_reveal` | the agent may read the value without asking each time |
 | `writeback` | sealed may store a value it obtained (rotation, login) for the next boot |
 | `expires_at`, `description` | Unix seconds; free text shown to the agent |
+
+One entry is one value used in several places: its positions hold on each of its hosts. A GitHub token, for one, serves both the API (`api.github.com`, `Authorization: Bearer`) and git (`github.com`, Basic) when the entry lists both hosts and both positions. A preset (`preset=github|openai|anthropic` in the CLI) is a shortcut the client expands into hosts, positions and a description; sealed never sees it.
 
 The **value** is ECIES-encrypted to the agent's agentSeal key in the client. Its plaintext binds it: `{"v":1,"type":"credential","owner","seal_id","chain_id","name","value"}`; sealed refuses one bound to another owner, agent, chain or name.
 
@@ -69,7 +71,7 @@ The CA is generated at each boot; its key stays in sealed's memory. The system t
 - requires the per-boot token; requires the CONNECT target, the TLS SNI and the `Host` to agree;
 - refuses to dial private, loopback, link-local, multicast, unspecified and metadata addresses; never follows a redirect;
 - fills each placeholder only for an allowed host and position, and refuses the whole request otherwise; never fills `Host`, `Content-Length`, `Transfer-Encoding`, `Cookie` or `Proxy-*`;
-- parses a body only up to 64 KiB (a placeholder in a larger body is refused);
+- reads a body only on a host where some entry may fill a body field or signs requests, and there only up to 64 KiB (a placeholder in a larger body is refused); anywhere else a body is relayed as it is, placeholder text and all, since nothing could be filled in it;
 - asks upstream for an unencoded body, and redacts every value it holds from response headers and the streamed body (raw, percent-encoded, JSON-escaped, base64 at each alignment; values under 6 bytes are not redacted); WebSocket frames are masked in place.
 
 A refusal is an HTTP error with `X-Seal-Credential-Error: <code>` and a JSON body `{code, message}` that never carries a value. Codes: `unknown_entry`, `expired` (410), `token_only`, `position_not_allowed`, `host_not_allowed`, `forbidden_header`, `body_too_large`, `private_address`, `bad_request`, `bad_target`, `target_mismatch`, `proxy_auth`, `not_allowed`, `sign_failed`, `upstream_error`, `internal`.
@@ -87,6 +89,12 @@ A refusal is an HTTP error with `X-Seal-Credential-Error: <code>` and a JSON bod
 | `GET /events?after=&wait=` | long-poll: `entry_added`, `entry_removed`, `pending_opened`, `pending_decided`, `cleared`, `writeback_failed` |
 
 **Reveal** (`$SEAL_CRED_REVEAL_SOCKET`, a socket of its own, so its access can be set apart from the routes above): `POST /credentials/reveal {name, reason}`. With `allow_reveal` it answers `{value}`. Otherwise 403 `authorization_pending` with an `auth_req_id`; the owner decides; the agent sends the same request again. 403 `access_denied` is a refusal. A login entry reveals its access token, never its stored login state.
+
+## The framework's inference key
+
+The key a framework calls its model with (the owner's `SEAL_SECRET_ENV`, sealed to agentSeal and opened by sealed after provisioning, or the legacy `API_KEY`) is held by sealed for **0g-harness on a platform-routed model** (0g-compute): it becomes the entry `sealed:inference`, filled in only as `Authorization: Bearer {v}` or `x-api-key: {v}` on the router's host. 0g-harness gets `SEAL_MODEL_API_KEY=[[credential:sealed:inference]]` and `SEAL_MODEL_BASE_URL` set to the router through the proxy's explicit form, so neither it nor any tool it runs can read the key. Nothing reveals that entry, and an owner change drops it with the rest. Adapters do this through `RuntimeContext.CredHold`.
+
+Everywhere else the framework still receives the key itself, and its tools can read it: 0g-harness on a framework built-in provider (`openai`, `anthropic`), openclaw and hermes (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`; hermes also writes it into its config file), and prime (`SEAL_MODEL_API_KEY`).
 
 ## Token requests and rotation
 
@@ -169,3 +177,4 @@ The SDK is `ag.credentials` (`sdk/typescript/src/Credentials.ts`); the CLI is `0
 - **Use is not limited.** Within a key's own permissions the agent may do anything with it, including deriving new keys or signing arbitrary content with a signing entry.
 - **Rollback after a reset.** sealed refuses a lower set version across stop/start, but after a reset or a new sandbox it trusts the attestor to serve the latest set. Revoke a removed key at its provider too.
 - **Other channels.** Non-HTTP protocols and browser sessions need a revealed value; response redaction is best effort.
+- **The framework's own traffic.** `HTTPS_PROXY` is in the framework's environment too. A host no entry names is tunnelled untouched, but the proxy refuses private-network addresses, so a framework whose HTTP client follows `HTTPS_PROXY` cannot reach a model (or anything else) on a private address.

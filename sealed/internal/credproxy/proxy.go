@@ -274,7 +274,7 @@ func isWebSocket(r *http.Request) bool {
 // forward fills r (already pointed at https://host), sends it, and streams
 // the response back redacted.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
-	small, large, berr := readBody(r)
+	small, large, berr := readBody(r, s.cfg.Registry.inspectsBody(host))
 	if berr != nil {
 		writeErr(w, berr)
 		return
@@ -430,12 +430,20 @@ func (s *Server) record(names []string, host, method string, status int, code st
 }
 
 // readBody buffers a body up to maxBodyBytes so placeholders in it can be
-// filled. A larger body is passed through untouched; if its first bytes
-// already show a placeholder it is refused instead, so a value is never left
-// unfilled without the harness hearing about it.
-func readBody(r *http.Request) ([]byte, io.ReadCloser, *Error) {
+// filled, or it can be signed. A larger body is passed through untouched; if
+// its first bytes already show a placeholder it is refused instead, so a
+// value is never left unfilled without the harness hearing about it.
+//
+// Only a host where some entry can fill a body field or must sign the body
+// has its bodies read at all. Anywhere else a body is relayed as it is,
+// whatever its size: bodies carry text (a conversation, an issue, a model
+// prompt) that may quote a placeholder, and nothing could be filled there.
+func readBody(r *http.Request, inspect bool) ([]byte, io.ReadCloser, *Error) {
 	if r.Body == nil || r.Body == http.NoBody {
 		return nil, nil, nil
+	}
+	if !inspect {
+		return nil, r.Body, nil
 	}
 	head, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {

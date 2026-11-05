@@ -460,6 +460,12 @@ type RuntimeContext struct {
 	CredCABundle   string // system roots followed by the proxy's root
 	CredSock       string // harness credential socket
 	CredRevealSock string // socket that hands out revealed values
+	// CredHold, when the proxy is on, has sealed hold a value it supplies
+	// to the framework (its inference key) instead of handing it over: the
+	// value is filled in only in the given headers (name → template with
+	// one {v}) on baseURL's host. It returns the base URL to use instead
+	// (through the proxy) and the placeholder to give the framework.
+	CredHold func(name, baseURL string, headers map[string]string, value []byte) (proxiedBaseURL, placeholder string, err error)
 }
 
 // credentialCAVars name the CA-location variables, read by the tools a

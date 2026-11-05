@@ -19,7 +19,7 @@ owner 把第三方凭据（API key、token、refresh token、签名密钥、MCP 
 
 | 字段 | 含义 |
 |---|---|
-| `v`、`name` | `1`；占位符里使用的名字（`[a-z0-9][a-z0-9._-]{0,62}`） |
+| `v`、`name` | `1`；占位符里使用的名字（`[a-z0-9][a-z0-9._-]{0,62}`；前缀 `derived:` 和 `sealed:` 归 sealed 自己使用） |
 | `hosts` | 允许发往的域名；规范化后精确匹配（小写、去掉末尾的点、省略 `:443`） |
 | `positions` | 占位符可以出现的位置：`header`（`name`，`template` 中含一个 `{v}`）、`basic`（固定 `username`，值作为密码）、`query`（`param`）、`path`（完整的一段）、`body`（JSON 或表单的顶层 `field`） |
 | `use` | `inject`（代填，默认）、`token_only`（只能用于换 token）、`sign`（由 sealed 用来签名的密钥） |
@@ -30,6 +30,8 @@ owner 把第三方凭据（API key、token、refresh token、签名密钥、MCP 
 | `allow_reveal` | agent 无需每次申请即可读取值 |
 | `writeback` | 允许 sealed 把自己获得的值（轮换、登录）存下来供下次启动使用 |
 | `expires_at`、`description` | Unix 秒；给 agent 看的自由文本 |
+
+一个条目是一个值，可以用在多个地方：条目的填写位置对它的每个域名都生效。例如一个 GitHub token，条目同时写上两个域名和两种位置，就既能用于 API（`api.github.com`，`Authorization: Bearer`），也能用于 git（`github.com`，Basic）。预设（CLI 里的 `preset=github|openai|anthropic`）是快捷方式，由客户端展开成域名、位置和说明；sealed 看不到预设。
 
 **值**在客户端用 ECIES 加密给 agent 的 agentSeal 公钥。明文绑定了归属：`{"v":1,"type":"credential","owner","seal_id","chain_id","name","value"}`；绑定到其他 owner、agent、链或名字的值，sealed 一律拒绝。
 
@@ -69,7 +71,7 @@ Entry(string name,bytes32 defHash)
 - 要求每次启动的令牌；要求 CONNECT 目标、TLS SNI 和 `Host` 三者一致；
 - 拒绝连接私网、回环、链路本地、组播、未指定和元数据地址；不跟随重定向；
 - 只在允许的域名和位置代填占位符，否则拒绝整个请求；从不往 `Host`、`Content-Length`、`Transfer-Encoding`、`Cookie`、`Proxy-*` 里填写；
-- 只解析 64 KiB 以内的请求体（更大的请求体里有占位符时拒绝）；
+- 只在有条目可以填写请求体字段或需要签名的域名上读取请求体，而且只读 64 KiB 以内（更大的请求体里有占位符时拒绝）；其他域名的请求体原样转发，其中的占位符文字也原样发出，因为那里没有可以填写的地方；
 - 要求上游不压缩，从响应头和流式响应体中去掉它持有的每个值（原文、百分号编码、JSON 转义、三种对齐的 base64；短于 6 字节的值不做遮盖）；WebSocket 帧原位遮盖。
 
 拒绝时返回 HTTP 错误，带 `X-Seal-Credential-Error: <代码>` 和 JSON 正文 `{code, message}`，其中不含值。代码：`unknown_entry`、`expired`（410）、`token_only`、`position_not_allowed`、`host_not_allowed`、`forbidden_header`、`body_too_large`、`private_address`、`bad_request`、`bad_target`、`target_mismatch`、`proxy_auth`、`not_allowed`、`sign_failed`、`upstream_error`、`internal`。
@@ -87,6 +89,12 @@ Entry(string name,bytes32 defHash)
 | `GET /events?after=&wait=` | 长轮询：`entry_added`、`entry_removed`、`pending_opened`、`pending_decided`、`cleared`、`writeback_failed` |
 
 **交出**（`$SEAL_CRED_REVEAL_SOCKET`，单独一个 socket，访问权限可以和上面的路由分开设置）：`POST /credentials/reveal {name, reason}`。设置了 `allow_reveal` 时返回 `{value}`。否则返回 403 `authorization_pending` 和 `auth_req_id`；owner 决定后，agent 原样重发请求。403 `access_denied` 表示被拒绝。登录条目交出的是 access token，不是存储的登录状态。
+
+## 框架的推理 key
+
+框架调用模型用的 key（owner 的 `SEAL_SECRET_ENV`，加密给 agentSeal、provision 之后由 sealed 解开；或旧的明文 `API_KEY`），对**走平台路由的模型（0g-compute）上的 0g-harness**由 sealed 保管：它成为条目 `sealed:inference`，只以 `Authorization: Bearer {v}` 或 `x-api-key: {v}` 填写，只发往路由的域名。0g-harness 拿到的是 `SEAL_MODEL_API_KEY=[[credential:sealed:inference]]`，`SEAL_MODEL_BASE_URL` 是经代理显式形式访问的路由地址，因此它和它运行的任何工具都读不到 key。这个条目不能交出，owner 变更时和其他条目一起清掉。adapter 通过 `RuntimeContext.CredHold` 做到这一点。
+
+其他情况下框架仍然直接拿到 key，它的工具也能读到：使用框架内置 provider（`openai`、`anthropic`）的 0g-harness，openclaw 和 hermes（`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`；hermes 还会写进自己的配置文件），以及 prime（`SEAL_MODEL_API_KEY`）。
 
 ## 换 token 与轮换
 
@@ -169,3 +177,4 @@ SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-
 - **不限制用途。** 在密钥本身的权限范围内，agent 可以做任何事，包括派生新密钥、用签名条目签任意内容。
 - **reset 之后的回滚。** sealed 在 stop/start 后拒绝更低的凭据集版本，但 reset 或新建 sandbox 之后，依赖 attestor 提供最新的凭据集。删除密钥时，也要在服务商那边吊销。
 - **其他通道。** 非 HTTP 协议和浏览器登录态需要交出值；响应遮盖是尽力而为。
+- **框架自己的流量。** 框架的环境变量里也有 `HTTPS_PROXY`。没有条目的域名原样转发通道，但代理拒绝连接私网地址，所以 HTTP 客户端遵循 `HTTPS_PROXY` 的框架，连不上私网地址上的模型（或其他服务）。
