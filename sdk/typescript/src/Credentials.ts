@@ -260,13 +260,18 @@ export class CredentialsApi {
     return { 'X-Auth-Message': message, 'X-Auth-Signature': signature };
   }
 
-  /** The agent's public URL (deployment row), for the container routes. */
+  /**
+   * The agent's public URL, for the container routes: the deployment row's
+   * `url`, else its AgentCard's (without the `/hello` path), as the CLI
+   * resolves it. The public row carries only the AgentCard's.
+   */
   async agentUrl(sealId: Hash): Promise<string> {
     const r = await fetch(`${this.attestorUrl()}/deployment/${sealId}`, { signal: AbortSignal.timeout(10_000) });
     if (!r.ok) throw new Error(`credentials: cannot read /deployment/${sealId}: HTTP ${r.status}`);
-    const row = (await r.json()) as { url?: string };
-    if (!row.url) throw new Error('credentials: the agent has no public URL yet (not running?)');
-    return row.url.replace(/\/$/, '');
+    const row = (await r.json()) as { url?: string; agent_card?: { url?: string } };
+    const url = row.url ?? row.agent_card?.url?.replace(/\/hello$/, '');
+    if (!url) throw new Error('credentials: the agent has no public URL yet (not running?)');
+    return url.replace(/\/$/, '');
   }
 
   /** Owner-signed read of the stored set (no values). */

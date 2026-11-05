@@ -468,6 +468,17 @@ type RuntimeContext struct {
 	CredHold func(name, baseURL string, headers map[string]string, value []byte) (proxiedBaseURL, placeholder string, err error)
 }
 
+// WithCredentials returns rt with every credential field (Cred*) taken from
+// c, the RuntimeContext startCredentials returned. One place copies them, so
+// a field added there reaches the adapters.
+func (rt RuntimeContext) WithCredentials(c RuntimeContext) RuntimeContext {
+	rt.CredProxy, rt.CredHTTPSProxy = c.CredProxy, c.CredHTTPSProxy
+	rt.CredCAFile, rt.CredCABundle = c.CredCAFile, c.CredCABundle
+	rt.CredSock, rt.CredRevealSock = c.CredSock, c.CredRevealSock
+	rt.CredHold = c.CredHold
+	return rt
+}
+
 // credentialCAVars name the CA-location variables, read by the tools a
 // harness runs, that replace a tool's trust store. They get the bundle
 // (system roots + the proxy root) so ordinary hosts still verify.

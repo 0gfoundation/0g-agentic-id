@@ -91,7 +91,8 @@ function stub(stored = { version: 0, owner_epoch: 5, document: null, writebacks:
       const json = (status, b) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
       if (req.method === 'GET' && url.pathname === '/credentials') return json(200, stored);
       if (req.method === 'POST' && url.pathname === '/credentials') return json(200, { ok: true, version: stored.version + 1 });
-      if (req.method === 'GET' && url.pathname.startsWith('/deployment/')) return json(200, { seal_id: SEAL_ID, url: `http://127.0.0.1:${server.address().port}` });
+      // The public row carries the AgentCard's URL only, as a live attestor serves it.
+      if (req.method === 'GET' && url.pathname.startsWith('/deployment/')) return json(200, { seal_id: SEAL_ID, agent_card: { url: `http://127.0.0.1:${server.address().port}/hello` } });
       if (req.method === 'POST' && url.pathname === '/_seal/credentials') return json(200, { version: stored.version + 1, skipped: {} });
       if (url.pathname === '/credentials/notify') return json(200, { email: req.method === 'POST' ? JSON.parse(body).email : null, enabled: true });
       json(404, { error: 'not found' });

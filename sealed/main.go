@@ -878,15 +878,7 @@ func startAgent(
 			// AgenticID Framework code hash = the sealed image measurement
 			// the provider certified (image_hash), as the contract's bytes32.
 			FrameworkHash: cfg.Attestation.FrameworkHash(),
-
-			// Credential proxy and sockets (startCredentials); empty when off.
-			CredProxy:      credRT.CredProxy,
-			CredHTTPSProxy: credRT.CredHTTPSProxy,
-			CredCAFile:     credRT.CredCAFile,
-			CredCABundle:   credRT.CredCABundle,
-			CredSock:       credRT.CredSock,
-			CredRevealSock: credRT.CredRevealSock,
-		},
+		}.WithCredentials(credRT), // credential proxy, sockets, CredHold (startCredentials); empty when off
 		AgentSealPriv: agentSealPriv,
 		SealID:        sealID,
 		Owner:         res.owner,
