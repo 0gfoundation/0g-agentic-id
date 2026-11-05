@@ -74,6 +74,8 @@ Entry(string name,bytes32 defHash)
 - 只在有条目可以填写请求体字段或需要签名的域名上读取请求体，而且只读 64 KiB 以内（更大的请求体里有占位符时拒绝）；其他域名的请求体原样转发，其中的占位符文字也原样发出，因为那里没有可以填写的地方；
 - 要求上游不压缩，从响应头和流式响应体中去掉它持有的每个值（原文、百分号编码、JSON 转义、三种对齐的 base64；短于 6 字节的值不做遮盖）；WebSocket 帧原位遮盖。
 
+代理填写过值的请求，其响应带 `X-Seal-Credential-Filled: <条目名>`：回显请求的服务会把占位符显示回来（值在返回途中被遮住），agent 靠这个响应头区分"填了"和"没填"。没有条目的域名走通道，那里什么都不填，也不报错，响应里不会有这个头。
+
 拒绝时返回 HTTP 错误，带 `X-Seal-Credential-Error: <代码>` 和 JSON 正文 `{code, message}`，其中不含值。代码：`unknown_entry`、`expired`（410）、`token_only`、`position_not_allowed`、`host_not_allowed`、`forbidden_header`、`body_too_large`、`private_address`、`bad_request`、`bad_target`、`target_mismatch`、`proxy_auth`、`not_allowed`、`sign_failed`、`upstream_error`、`internal`。
 
 **凭据 socket**（`$SEAL_CRED_SOCKET`，属于 agent 用户，JSON）：

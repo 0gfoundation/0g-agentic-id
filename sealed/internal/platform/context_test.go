@@ -92,7 +92,7 @@ func TestCapabilities_CredentialsSectionFollowsTheSocket(t *testing.T) {
 		t.Fatal("credentials described while they are off")
 	}
 	on := Build(RuntimeSnapshot{SealSignSock: "/s", AgentSeal: "0x01", CredSock: "/c", CredRevealSock: "/r"}).Capabilities
-	for _, want := range []string{"[[credential:<name>]]", "[[credential:derived:<name>]]", "$SEAL_CRED_SOCKET", "$SEAL_CRED_REVEAL_SOCKET", "$SEAL_CRED_PROXY", "authorization_pending", "X-Seal-Sign", "/credentials/sign"} {
+	for _, want := range []string{"[[credential:<name>]]", "[[credential:derived:<name>]]", "$SEAL_CRED_SOCKET", "$SEAL_CRED_REVEAL_SOCKET", "$SEAL_CRED_PROXY", "authorization_pending", "X-Seal-Sign", "/credentials/sign", "X-Seal-Credential-Filled"} {
 		if !strings.Contains(on, want) {
 			t.Fatalf("credentials section lacks %q", want)
 		}

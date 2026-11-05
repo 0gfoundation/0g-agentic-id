@@ -173,6 +173,10 @@ func TestExplicitHeaderFillAndRedact(t *testing.T) {
 	if len(h.uses) != 1 || h.uses[0].Names[0] != "github" || h.uses[0].Status != 200 {
 		t.Fatalf("audit records: %+v", h.uses)
 	}
+	// The echo shows the placeholder again; the header says it was filled.
+	if resp.Header.Get(FilledHeader) != "github" {
+		t.Fatalf("%s = %q", FilledHeader, resp.Header.Get(FilledHeader))
+	}
 }
 
 func TestExplicitPositions(t *testing.T) {

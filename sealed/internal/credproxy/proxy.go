@@ -339,9 +339,31 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 	}
 	stripHop(w.Header())
 	w.Header().Del("Content-Length")
+	setFilled(w.Header(), names)
 	w.WriteHeader(resp.StatusCode)
 	s.record(names, host, r.Method, resp.StatusCode, "")
 	copyFlush(w, red.reader(resp.Body))
+}
+
+// FilledHeader names, on a response, the entries whose values went out in
+// the request: an echo of the request shows their placeholders again (the
+// values are hidden on the way back), so this is how the harness tells a
+// filled request from one that was not.
+const FilledHeader = "X-Seal-Credential-Filled"
+
+func setFilled(h http.Header, names []string) {
+	h.Del(FilledHeader) // only the proxy says what it filled
+	seen := map[string]bool{}
+	var list []string
+	for _, n := range names {
+		if !seen[n] {
+			seen[n] = true
+			list = append(list, n)
+		}
+	}
+	if len(list) > 0 {
+		h.Set(FilledHeader, strings.Join(list, ","))
+	}
 }
 
 // copyFlush streams src to w, flushing after every read so event streams
@@ -394,6 +416,7 @@ func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string
 		}
 		stripHop(w.Header())
 		w.Header().Del("Content-Length")
+		setFilled(w.Header(), names)
 		w.WriteHeader(resp.StatusCode)
 		copyFlush(w, red.reader(resp.Body))
 		return

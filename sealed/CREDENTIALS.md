@@ -74,6 +74,8 @@ The CA is generated at each boot; its key stays in sealed's memory. The system t
 - reads a body only on a host where some entry may fill a body field or signs requests, and there only up to 64 KiB (a placeholder in a larger body is refused); anywhere else a body is relayed as it is, placeholder text and all, since nothing could be filled in it;
 - asks upstream for an unencoded body, and redacts every value it holds from response headers and the streamed body (raw, percent-encoded, JSON-escaped, base64 at each alignment; values under 6 bytes are not redacted); WebSocket frames are masked in place.
 
+A response to a request in which the proxy filled a value carries `X-Seal-Credential-Filled: <entry names>`: a service that echoes the request shows the placeholder again, since the value is hidden on the way back, and this header is how the agent tells a filled request from one that was not. A host no entry names is tunnelled, so nothing is filled there and there is no error either; its responses never carry the header.
+
 A refusal is an HTTP error with `X-Seal-Credential-Error: <code>` and a JSON body `{code, message}` that never carries a value. Codes: `unknown_entry`, `expired` (410), `token_only`, `position_not_allowed`, `host_not_allowed`, `forbidden_header`, `body_too_large`, `private_address`, `bad_request`, `bad_target`, `target_mismatch`, `proxy_auth`, `not_allowed`, `sign_failed`, `upstream_error`, `internal`.
 
 **The credential socket** (`$SEAL_CRED_SOCKET`, agent user, JSON):
