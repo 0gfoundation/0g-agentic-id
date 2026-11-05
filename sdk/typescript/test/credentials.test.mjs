@@ -343,3 +343,22 @@ test('cli: login defines the entry from the URL once, then prints the link', asy
   assert.deepEqual(calls.map((c) => c.op), ['login']);
   await assert.rejects(credOp(ag, SEAL_ID, ['login', 'linear', 'http://insecure.example/mcp'], io), (err) => err.code === 'BAD_FLAG');
 });
+
+test('cli: login waits until the agent reports a new login', async () => {
+  // A second login to the same server: the entry is listed throughout and
+  // only its logged_in_at says the new login is done.
+  let polls = 0;
+  const def = definitionOf({ name: 'linear', hosts: ['mcp.linear.app'], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }], mcp: { url: 'https://mcp.linear.app/mcp' } }, '');
+  const ag = {
+    credentials: {
+      get: async () => ({ version: 1, ownerEpoch: 0, document: null, definitions: [{ ...def, description: 'MCP server https://mcp.linear.app/mcp' }] }),
+      put: async () => { throw new Error('the definition is unchanged; nothing to store'); },
+      agentUrl: async () => 'https://agent.example',
+      loaded: async () => ({ version: 1, entries: [{ name: 'linear', source: 'owner', use: 'inject', hosts: ['mcp.linear.app'], logged_in_at: polls++ < 1 ? 100 : 200 }] }),
+      login: async () => ({ authorizeUrl: 'https://auth.example/authorize?state=s' }),
+    },
+  };
+  const lines = [];
+  await credOp(ag, SEAL_ID, ['login', 'linear', 'https://mcp.linear.app/mcp'], { json: false, wait: true, out: (l) => lines.push(l), secret: async () => '' });
+  assert.ok(lines.some((l) => l.startsWith('logged in:')), lines.join('\n'));
+});

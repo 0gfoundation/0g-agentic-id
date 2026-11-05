@@ -82,7 +82,7 @@ A refusal is an HTTP error with `X-Seal-Credential-Error: <code>` and a JSON bod
 
 | Route | |
 |---|---|
-| `GET /credentials` | entries: `name`, `description`, `source` (`owner` or `derived`), `use`, `hosts`, `positions`, `signer`, `expires_at`, `allow_reveal`, `placeholder` |
+| `GET /credentials` | entries: `name`, `description`, `source` (`owner` or `derived`), `use`, `hosts`, `positions`, `signer`, `expires_at`, `logged_in_at` (a login entry), `allow_reveal`, `placeholder`. A login entry is listed once its login is done |
 | `GET /credentials/git?host=` | git helper answer: `username=…` and `password=[[credential:…]]` for an entry that allows Basic there; 404 otherwise |
 | `POST /credentials/token` | `{name, params}`: run the entry's token request; returns the derived entries |
 | `POST /credentials/sign` | `{name, personal_sign \| typed_data \| transaction}`: sign with a wallet entry |
@@ -139,7 +139,7 @@ A login entry has `mcp.url` and no value of the owner's.
 1. The owner starts the login: `POST /_seal/credentials/login {name}` (owner-signed).
 2. sealed reads the server's protected resource metadata (RFC 9728, from the 401's `WWW-Authenticate` or the well-known path), then the authorization server's metadata (RFC 8414 or OpenID). It registers itself as a public client (RFC 7591) unless the entry gives a `client_id`, and answers with an authorization link carrying PKCE (S256), the `resource` indicator and a one-time `state`.
 3. The owner opens the link and consents. The browser returns to this agent's `<public URL>/_seal/oauth/callback`; the `state` (valid 10 minutes, used once) binds the code to that login. sealed exchanges the code with the verifier only it holds.
-4. The entry then serves the access token where the owner allowed it (Bearer on the server's host). sealed refreshes it a minute before it expires, keeps the rotated refresh token, and writes the login back. A refused refresh token becomes a `login` request for the owner.
+4. The entry then serves the access token where the owner allowed it (Bearer on the server's host). From then on `GET /credentials` lists it with `logged_in_at`, the agent's events show `entry_added`, and a `login` request for it is answered. sealed refreshes it a minute before it expires, keeps the rotated refresh token, and writes the login back. A refused refresh token becomes a `login` request for the owner.
 
 The agent configures the MCP server with the header `Authorization: Bearer [[credential:<name>]]`.
 

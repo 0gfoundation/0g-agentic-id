@@ -431,12 +431,16 @@ export class CredentialsApi {
     return { authorizeUrl: ((await r.json()) as { authorize_url: string }).authorize_url };
   }
 
-  /** The entries the running agent has loaded (names and where they may go, never values). */
-  async loaded(sealId: Hash, opts?: { agentUrl?: string }): Promise<{ version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number }> }> {
+  /**
+   * The entries the running agent has loaded (names and where they may go,
+   * never values). A login entry is listed once its login is done, with
+   * `logged_in_at`.
+   */
+  async loaded(sealId: Hash, opts?: { agentUrl?: string }): Promise<{ version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number; logged_in_at?: number }> }> {
     const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
     const r = await this.sealRequest(sealId, base, '0GSealCredentials', '/_seal/credentials');
     if (!r.ok) throw new Error(`credentials.loaded: HTTP ${r.status} ${await r.text().catch(() => '')}`);
-    return (await r.json()) as { version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number }> };
+    return (await r.json()) as { version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number; logged_in_at?: number }> };
   }
 
   /** Requests waiting for the owner on this agent, with sealed's facts and the agent's reason. */

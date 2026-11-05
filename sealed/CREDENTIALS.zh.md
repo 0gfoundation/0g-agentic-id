@@ -82,7 +82,7 @@ Entry(string name,bytes32 defHash)
 
 | 路由 | |
 |---|---|
-| `GET /credentials` | 条目列表：`name`、`description`、`source`（`owner` 或 `derived`）、`use`、`hosts`、`positions`、`signer`、`expires_at`、`allow_reveal`、`placeholder` |
+| `GET /credentials` | 条目列表：`name`、`description`、`source`（`owner` 或 `derived`）、`use`、`hosts`、`positions`、`signer`、`expires_at`、`logged_in_at`（登录条目）、`allow_reveal`、`placeholder`。登录条目在登录完成后才列出 |
 | `GET /credentials/git?host=` | git helper 的应答：该域名下允许 Basic 的条目的 `username=…` 和 `password=[[credential:…]]`；没有则 404 |
 | `POST /credentials/token` | `{name, params}`：执行条目的换 token 模板，返回换出的条目 |
 | `POST /credentials/sign` | `{name, personal_sign \| typed_data \| transaction}`：用钱包条目签名 |
@@ -139,7 +139,7 @@ CredentialWriteback.v1:<seal_id>:<name>:<def_hash>:<boot_id>:<keccak256(cipherte
 1. owner 发起登录：`POST /_seal/credentials/login {name}`（owner 签名）。
 2. sealed 读取 MCP 服务器的受保护资源元数据（RFC 9728，来自 401 的 `WWW-Authenticate` 或 well-known 路径），再读取授权服务器元数据（RFC 8414 或 OpenID）。条目没有给 `client_id` 时，sealed 以 public client 身份动态注册（RFC 7591），然后返回授权链接，链接带 PKCE（S256）、`resource` 和一次性的 `state`。
 3. owner 打开链接并同意。浏览器回到 agent 的 `<公开地址>/_seal/oauth/callback`；`state`（10 分钟内有效，只能用一次）把 code 绑定到这次登录。sealed 用只有它持有的 verifier 换取 token。
-4. 之后条目在 owner 允许的位置提供 access token（该服务器域名上的 Bearer）。sealed 在过期前一分钟刷新，保存轮换后的 refresh token，并写回登录状态。refresh token 被拒绝时，转为一条给 owner 的 `login` 待办。
+4. 之后条目在 owner 允许的位置提供 access token（该服务器域名上的 Bearer）。从这时起，`GET /credentials` 列出该条目并带 `logged_in_at`，agent 的事件里出现 `entry_added`，针对它的 `login` 待办也随之结案。sealed 在过期前一分钟刷新，保存轮换后的 refresh token，并写回登录状态。refresh token 被拒绝时，转为一条给 owner 的 `login` 待办。
 
 agent 在 MCP 配置中给该服务器加请求头 `Authorization: Bearer [[credential:<名字>]]`。
 

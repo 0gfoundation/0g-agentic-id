@@ -91,10 +91,12 @@ type EntryInfo struct {
 	Hosts       []string             `json:"hosts"`
 	Positions   []credproxy.Position `json:"positions"`
 	// Signer says how a signing entry is used (no secret in it).
-	Signer      *credproxy.Signer `json:"signer,omitempty"`
-	ExpiresAt   int64             `json:"expires_at,omitempty"`
-	AllowReveal bool              `json:"allow_reveal"`
-	Placeholder string            `json:"placeholder"`
+	Signer    *credproxy.Signer `json:"signer,omitempty"`
+	ExpiresAt int64             `json:"expires_at,omitempty"`
+	// LoggedInAt is when the owner last completed a login entry's login.
+	LoggedInAt  int64  `json:"logged_in_at,omitempty"`
+	AllowReveal bool   `json:"allow_reveal"`
+	Placeholder string `json:"placeholder"`
 }
 
 type derived struct {
@@ -256,20 +258,23 @@ func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Ope
 		}
 	}
 	s.syncRegistryLocked()
+	// An entry is there for the harness once it has a value: a login entry
+	// only after its login.
 	for name := range s.defs {
-		if _, was := before[name]; !was {
+		if s.values[name] != nil && beforeValues[name] == nil {
 			s.events.add(Event{Type: "entry_added", Name: name})
 		}
 	}
 	for name := range before {
-		if _, still := s.defs[name]; !still {
+		if beforeValues[name] != nil && s.values[name] == nil {
 			s.events.add(Event{Type: "entry_removed", Name: name})
 		}
 	}
-	// An add or login request is answered by the owner adding the entry.
+	// An add request is answered by the owner adding the entry (a login
+	// request, by the login: FinishLogin).
 	for id, p := range s.pending {
-		if (p.Op == "add" || p.Op == "login") && p.Status == "pending" {
-			if _, ok := s.defs[p.Name]; ok {
+		if p.Op == "add" && p.Status == "pending" {
+			if s.values[p.Name] != nil {
 				p.Status = "approved"
 				s.events.add(Event{Type: "pending_decided", Name: p.Name, AuthReqID: id, Status: p.Status})
 			}
@@ -347,12 +352,17 @@ func (s *Store) List() []EntryInfo {
 	defer s.mu.Unlock()
 	var out []EntryInfo
 	for name, d := range s.defs {
-		if _, ok := s.values[name]; !ok {
-			continue
+		v := s.values[name]
+		if v == nil {
+			continue // a login not done yet
 		}
-		out = append(out, EntryInfo{Name: name, Description: d.Description, Source: "owner", Use: string(useOf(d)),
+		info := EntryInfo{Name: name, Description: d.Description, Source: "owner", Use: string(useOf(d)),
 			Hosts: d.Hosts, Positions: d.Positions, Signer: d.Signer, ExpiresAt: d.ExpiresAt, AllowReveal: d.AllowReveal,
-			Placeholder: credproxy.Placeholder(name)})
+			Placeholder: credproxy.Placeholder(name)}
+		if st, ok := parseMCPState(v); ok && d.MCP != nil {
+			info.LoggedInAt = st.LoggedInAt
+		}
+		out = append(out, info)
 	}
 	for name, d := range s.derived {
 		src := s.defs[d.from]

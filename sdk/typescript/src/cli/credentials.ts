@@ -454,7 +454,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       for (const deadline = Date.now() + 10 * 60_000; Date.now() < deadline; ) {
         await new Promise((r) => setTimeout(r, 3000));
         const now = (await cred.loaded(sealId, { agentUrl: base }).catch(() => undefined))?.entries.find((e) => e.name === name);
-        if (now && (!before || now.expires_at !== before.expires_at)) {
+        if (now?.logged_in_at && now.logged_in_at !== before?.logged_in_at) {
           io.out(`logged in: the agent uses [[credential:${name}]] as its bearer token for ${host}`);
           return;
         }

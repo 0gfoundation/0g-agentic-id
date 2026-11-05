@@ -39,6 +39,7 @@ type mcpState struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token,omitempty"`
 	ExpiresAt    int64  `json:"expires_at,omitempty"`
+	LoggedInAt   int64  `json:"logged_in_at,omitempty"`
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret,omitempty"`
 	TokenURL     string `json:"token_url"`
@@ -193,12 +194,22 @@ func (s *Store) FinishLogin(ctx context.Context, state, code, oauthError string)
 		s.audit("login", a.name, a.tokenURL, "failed")
 		return a.name, err
 	}
-	st := &mcpState{V: 1, Type: "mcp_login", AccessToken: tok.access, RefreshToken: tok.refresh, ClientID: a.clientID,
-		ClientSecret: a.clientSecret, TokenURL: a.tokenURL, Resource: a.resource}
+	st := &mcpState{V: 1, Type: "mcp_login", AccessToken: tok.access, RefreshToken: tok.refresh, LoggedInAt: s.now().Unix(),
+		ClientID: a.clientID, ClientSecret: a.clientSecret, TokenURL: a.tokenURL, Resource: a.resource}
 	if tok.expiresIn > 0 {
 		st.ExpiresAt = s.now().Unix() + tok.expiresIn
 	}
 	s.applyLogin(ctx, a.name, st)
+	// A login request is answered by a completed login, not by the owner
+	// adding the entry.
+	s.mu.Lock()
+	for id, p := range s.pending {
+		if p.Op == "login" && p.Name == a.name && p.Status == "pending" {
+			p.Status = "approved"
+			s.events.add(Event{Type: "pending_decided", Name: p.Name, AuthReqID: id, Status: p.Status})
+		}
+	}
+	s.mu.Unlock()
 	s.audit("login", a.name, a.tokenURL, "ok")
 	return a.name, nil
 }
@@ -213,7 +224,7 @@ func (s *Store) applyLogin(ctx context.Context, name string, st *mcpState) {
 		s.mu.Unlock()
 		return // removed meanwhile
 	}
-	_, had := s.values[name]
+	had := s.values[name] != nil
 	s.mu.Unlock()
 	s.rotate(ctx, def, raw)
 	if !had {

@@ -115,6 +115,22 @@ func TestMCPLoginRefreshAndRevoke(t *testing.T) {
 	if reg.Get("linear") != nil {
 		t.Fatal("a login entry was served before the login")
 	}
+	if loggedIn(s, "linear") != -1 {
+		t.Fatal("a login entry was listed before the login")
+	}
+	// The agent asked for this login; the owner adding the entry does not answer it.
+	s.mu.Lock()
+	req := s.pendingForLocked("login", "linear", map[string]string{"url": auth.ts.URL + "/mcp"}, "", nil)
+	s.mu.Unlock()
+	if _, err := s.Load(context.Background(), doc, 0); err != nil {
+		t.Fatal(err)
+	}
+	if status(s, req.AuthReqID) != "pending" {
+		t.Fatal("a login request was answered before the login")
+	}
+	if added(s, "linear") {
+		t.Fatal("entry_added before the login")
+	}
 
 	const redirect = "https://8080-sandbox.preview.example/_seal/oauth/callback"
 	link, err := s.StartLogin(context.Background(), "linear", redirect)
@@ -148,6 +164,10 @@ func TestMCPLoginRefreshAndRevoke(t *testing.T) {
 	if e == nil || string(e.Value) != "at-1" || e.ExpiresAt.IsZero() {
 		t.Fatalf("entry after login: %+v", e)
 	}
+	first := loggedIn(s, "linear")
+	if first <= 0 || !added(s, "linear") || status(s, req.AuthReqID) != "approved" {
+		t.Fatalf("after login: listed at %d, entry_added %v, request %s", first, added(s, "linear"), status(s, req.AuthReqID))
+	}
 	// Revealing a login entry gives its access token, never the stored
 	// login state with the refresh token in it.
 	if v, cerr := s.Reveal("linear", ""); cerr != nil || string(v) != "at-1" {
@@ -178,4 +198,36 @@ func TestMCPLoginRefreshAndRevoke(t *testing.T) {
 	if !found {
 		t.Fatal("a revoked login did not ask the owner")
 	}
+	if loggedIn(s, "linear") != first {
+		t.Fatal("a refresh changed when the login was done")
+	}
+}
+
+// loggedIn is when List says the entry's login was done; -1 if not listed.
+func loggedIn(s *Store, name string) int64 {
+	for _, e := range s.List() {
+		if e.Name == name {
+			return e.LoggedInAt
+		}
+	}
+	return -1
+}
+
+func added(s *Store, name string) bool {
+	evs, _ := s.events.since(0)
+	for _, e := range evs {
+		if e.Type == "entry_added" && e.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func status(s *Store, id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p := s.pending[id]; p != nil {
+		return p.Status
+	}
+	return ""
 }
