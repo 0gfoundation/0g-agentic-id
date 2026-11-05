@@ -2133,7 +2133,7 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
 /**
  * Whether the deploy wizard offers `framework` only models with tool use: the
  * tool-driven frameworks, the harness under either of its names (`dsh` on a
- * network still on AgentDNA 1.3, see `isHarnessFramework`).
+ * network still on AgenticID 1.3, see `isHarnessFramework`).
  */
 export function frameworkNeedsToolModels(framework: string): boolean {
   return framework === 'openclaw' || framework === 'prime-agent' || isHarnessFramework(framework);

@@ -610,10 +610,10 @@ pub trait DeploymentRepo: Send + Sync {
 pub struct StaleRunner {
     pub seal_id: SealId,
     pub sandbox_id: Option<String>,
-    /// Whether the current container completed a 1.4 provision (the row
+    /// Whether the current container completed a 0.4 provision (the row
     /// holds its container record), so it holds a status token and a silent
     /// heartbeat means it stopped reporting. False for a container created
-    /// before 1.4, whose reports the attestor refuses, and after an
+    /// before 0.4, whose reports the attestor refuses, and after an
     /// ownership change revoked the container: such a heartbeat is stale
     /// whether or not the agent is alive.
     pub can_report: bool,
