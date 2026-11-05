@@ -62,7 +62,7 @@ Entry(string name,bytes32 defHash)
 | `SSL_CERT_FILE`、`CURL_CA_BUNDLE`、`REQUESTS_CA_BUNDLE`、`GIT_SSL_CAINFO`、`AWS_CA_BUNDLE`、`CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE` | `/etc/seal/credential-ca-bundle.pem`（系统根证书 + 代理的根证书） |
 | `SEAL_CRED_SOCKET` | `/run/seal-cred.sock` |
 | `SEAL_CRED_REVEAL_SOCKET` | `/run/seal-cred-reveal.sock` |
-| `GIT_CONFIG_COUNT`、`GIT_CONFIG_KEY_0`、`GIT_CONFIG_VALUE_0` | git 的 credential helper，由 `GET /credentials/git` 应答 |
+| `GIT_CONFIG_SYSTEM` | `/etc/seal/credential-gitconfig`：先包含镜像的 `/etc/gitconfig`，再设置 git 的 credential helper，由 `GET /credentials/git` 应答 |
 
 根证书每次启动生成，私钥只在 sealed 内存中。系统证书库不做改动。
 

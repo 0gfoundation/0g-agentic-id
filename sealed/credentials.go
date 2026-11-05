@@ -41,6 +41,7 @@ const (
 	credRevealSockPath = "/run/seal-cred-reveal.sock"
 	credCAPath         = "/etc/seal/credential-ca.pem"
 	credCABundlePath   = "/etc/seal/credential-ca-bundle.pem"
+	credGitConfigPath  = "/etc/seal/credential-gitconfig"
 	systemRootsPath    = "/etc/ssl/certs/ca-certificates.crt"
 	maxSystemRoots     = 4 << 20
 	ownerWatchInterval = time.Minute
@@ -86,7 +87,7 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 		logger.Logf("FAIL credentials: CA: %v", err)
 		return none, nil
 	}
-	if err := writeCredentialCA(ca); err != nil {
+	if err := writeCredentialFiles(ca); err != nil {
 		logger.Logf("FAIL credentials: %v", err)
 		return none, nil
 	}
@@ -153,6 +154,7 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 		CredCABundle:   credCABundlePath,
 		CredSock:       credSockPath,
 		CredRevealSock: credRevealSockPath,
+		CredGitConfig:  credGitConfigPath,
 	}, reg
 }
 
@@ -178,9 +180,10 @@ func credHold(store *credentials.Store, explicit string) func(name, baseURL stri
 	}
 }
 
-// writeCredentialCA writes the proxy root alone and after the image's system
-// roots. Both are certificates; the key never leaves memory.
-func writeCredentialCA(ca *credproxy.CA) error {
+// writeCredentialFiles writes the proxy root alone and after the image's
+// system roots (certificates; the key never leaves memory), and git's config
+// naming the credential helper.
+func writeCredentialFiles(ca *credproxy.CA) error {
 	system, err := privsep.ReadFile(systemRootsPath, maxSystemRoots)
 	if err != nil {
 		return fmt.Errorf("read system roots: %w", err)
@@ -193,6 +196,9 @@ func writeCredentialCA(ca *credproxy.CA) error {
 	}
 	if err := privsep.WriteFile(credCABundlePath, ca.Bundle(system), 0o644); err != nil {
 		return fmt.Errorf("write CA bundle: %w", err)
+	}
+	if err := privsep.WriteFile(credGitConfigPath, framework.GitConfig(), 0o644); err != nil {
+		return fmt.Errorf("write git config: %w", err)
 	}
 	return nil
 }

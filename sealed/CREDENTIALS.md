@@ -62,7 +62,7 @@ Every adapter appends `RuntimeContext.CredentialEnv()` to the framework's enviro
 | `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `GIT_SSL_CAINFO`, `AWS_CA_BUNDLE`, `CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE` | `/etc/seal/credential-ca-bundle.pem` (system roots + the proxy's root) |
 | `SEAL_CRED_SOCKET` | `/run/seal-cred.sock` |
 | `SEAL_CRED_REVEAL_SOCKET` | `/run/seal-cred-reveal.sock` |
-| `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0`, `GIT_CONFIG_VALUE_0` | git's credential helper, answered by `GET /credentials/git` |
+| `GIT_CONFIG_SYSTEM` | `/etc/seal/credential-gitconfig`: the image's `/etc/gitconfig`, then git's credential helper, answered by `GET /credentials/git` |
 
 The CA is generated at each boot; its key stays in sealed's memory. The system trust store is not changed.
 

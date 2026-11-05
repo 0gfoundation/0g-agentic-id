@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -460,6 +461,7 @@ type RuntimeContext struct {
 	CredCABundle   string // system roots followed by the proxy's root
 	CredSock       string // harness credential socket
 	CredRevealSock string // socket that hands out revealed values
+	CredGitConfig  string // git config file naming sealed's credential helper (GitConfig)
 	// CredHold, when the proxy is on, has sealed hold a value it supplies
 	// to the framework (its inference key) instead of handing it over: the
 	// value is filled in only in the given headers (name → template with
@@ -475,7 +477,7 @@ func (rt RuntimeContext) WithCredentials(c RuntimeContext) RuntimeContext {
 	rt.CredProxy, rt.CredHTTPSProxy = c.CredProxy, c.CredHTTPSProxy
 	rt.CredCAFile, rt.CredCABundle = c.CredCAFile, c.CredCABundle
 	rt.CredSock, rt.CredRevealSock = c.CredSock, c.CredRevealSock
-	rt.CredHold = c.CredHold
+	rt.CredGitConfig, rt.CredHold = c.CredGitConfig, c.CredHold
 	return rt
 }
 
@@ -496,6 +498,16 @@ var credentialCAVars = []string{
 // username and placeholder for the host git names.
 const gitCredentialHelper = `!f() { test "$1" = get || exit 0; h=$(sed -n 's/^host=//p'); test -n "$h" && curl -sf --unix-socket "$SEAL_CRED_SOCKET" "http://localhost/credentials/git?host=$h" || true; }; f`
 
+// GitConfig is the file sealed writes at CredGitConfig: the image's system
+// config, then the credential helper. git reads it as GIT_CONFIG_SYSTEM, a
+// name harnesses pass to their tools; GIT_CONFIG_KEY_<n> is not, where a
+// harness drops credential-shaped names (KEY, TOKEN, …) from its tools'
+// environment, and git then refuses every command.
+func GitConfig() []byte {
+	quoted := `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(gitCredentialHelper) + `"`
+	return []byte("[include]\n\tpath = /etc/gitconfig\n[credential]\n\thelper = " + quoted + "\n")
+}
+
 func (rt RuntimeContext) CredentialEnv() []string {
 	if rt.CredHTTPSProxy == "" {
 		return nil
@@ -513,15 +525,13 @@ func (rt RuntimeContext) CredentialEnv() []string {
 	}
 	if rt.CredSock != "" {
 		env = append(env, "SEAL_CRED_SOCKET="+rt.CredSock)
+	}
+	if rt.CredGitConfig != "" {
 		// git over HTTPS asks the credential socket for the placeholder of
 		// an entry that allows Basic auth on that host; the proxy fills the
 		// real value in. Nothing comes back for other hosts, and git moves
 		// on to whatever helper it has.
-		env = append(env,
-			"GIT_CONFIG_COUNT=1",
-			"GIT_CONFIG_KEY_0=credential.helper",
-			"GIT_CONFIG_VALUE_0="+gitCredentialHelper,
-		)
+		env = append(env, "GIT_CONFIG_SYSTEM="+rt.CredGitConfig)
 	}
 	if rt.CredRevealSock != "" {
 		env = append(env, "SEAL_CRED_REVEAL_SOCKET="+rt.CredRevealSock)

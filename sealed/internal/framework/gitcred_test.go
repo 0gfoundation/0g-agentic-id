@@ -6,13 +6,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
 
-// git, given only the credential environment, asks the credential socket
-// for github.com and gets the placeholder; for another host it gets
-// nothing and carries on.
+// git, given only the credential environment as a harness that drops
+// credential-shaped names passes it on, asks the credential socket for
+// github.com and gets the placeholder; for another host it gets nothing and
+// carries on.
 func TestGitCredentialHelperThroughGit(t *testing.T) {
 	for _, bin := range []string{"git", "curl"} {
 		if _, err := exec.LookPath(bin); err != nil {
@@ -34,7 +36,17 @@ func TestGitCredentialHelperThroughGit(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 		}))
 	}()
-	env := RuntimeContext{CredProxy: "http://127.0.0.1:1/t", CredHTTPSProxy: "http://agent:t@127.0.0.1:1", CredSock: sock}.CredentialEnv()
+	gitConfig := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(gitConfig, GitConfig(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var env []string
+	for _, kv := range (RuntimeContext{CredProxy: "http://127.0.0.1:1/t", CredHTTPSProxy: "http://agent:t@127.0.0.1:1", CredSock: sock, CredGitConfig: gitConfig}).CredentialEnv() {
+		// 0g-harness's tools (dsh) never see these names.
+		if name, _, _ := strings.Cut(kv, "="); !regexp.MustCompile(`(?i)KEY|PASSWORD|SECRET|TOKEN`).MatchString(name) {
+			env = append(env, kv)
+		}
+	}
 	fill := func(host string) string {
 		cmd := exec.Command("git", "credential", "fill")
 		cmd.Env = append([]string{"HOME=" + t.TempDir(), "PATH=" + os.Getenv("PATH"), "GIT_TERMINAL_PROMPT=0"}, env...)

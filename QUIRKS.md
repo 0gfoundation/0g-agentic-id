@@ -471,6 +471,18 @@ every SSE response sealed relays or synthesizes carries
 the header because a stream looks fine end to end: a finite stream hides the
 buffering, and only a live view (the CLI's notices, live typing) shows it.
 
+### 0g-harness's tools never see variables named like credentials
+
+dsh starts every tool process from its own environment minus the names
+matching `/KEY|PASSWORD|SECRET|TOKEN/i` (`SENSITIVE_ENV_PATTERN`,
+`@deepseek-ai/dsh-subprocess`). So git's credential helper reaches the
+agent's shell as `GIT_CONFIG_SYSTEM=/etc/seal/credential-gitconfig`, a file
+sealed writes, and not as `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/
+`GIT_CONFIG_VALUE_0`: dsh drops `GIT_CONFIG_KEY_0` and keeps the other two,
+and git then refuses every command (`missing config key GIT_CONFIG_KEY_0`;
+seen on dev, 2026-11-05). Any variable sealed adds to `CredentialEnv` must
+pass that pattern (`internal/framework/gitcred_test.go` applies it).
+
 ---
 
 ## Fault localization (serve-proof / sealed runtime)
