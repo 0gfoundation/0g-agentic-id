@@ -143,7 +143,7 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 		s.derived[dn] = derived{from: name, hosts: e.Hosts, expiresAt: exp}
 		s.mu.Unlock()
 		out = append(out, EntryInfo{Name: dn, Source: "derived", From: name, Use: string(credproxy.UseInject), Hosts: e.Hosts,
-			ExpiresAt: exp, AllowReveal: def.AllowReveal, Placeholder: credproxy.Placeholder(dn)})
+			Positions: e.Positions, ExpiresAt: exp, AllowReveal: def.AllowReveal, Placeholder: credproxy.Placeholder(dn)})
 	}
 	s.audit("token", name, tr.URL, "ok")
 	return out, nil

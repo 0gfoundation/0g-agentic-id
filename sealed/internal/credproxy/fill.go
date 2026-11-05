@@ -181,6 +181,9 @@ func (f *filler) fillHeader(name, v string) (string, *Error) {
 
 func (f *filler) fillBasic(decoded string) (string, *Error) {
 	user, pass, _ := strings.Cut(decoded, ":")
+	// `echo user:pass | base64` encodes a trailing newline; it is never part
+	// of the password the agent meant.
+	pass = strings.TrimRight(pass, "\r\n")
 	if strings.Contains(user, "[[credential:") {
 		return "", refuse(http.StatusForbidden, "position_not_allowed", "a placeholder may only stand in the Basic password")
 	}

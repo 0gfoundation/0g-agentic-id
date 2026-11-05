@@ -194,6 +194,13 @@ func TestExplicitPositions(t *testing.T) {
 		}, func(g snap) bool {
 			return g.header.Get("Authorization") == "Basic "+base64.StdEncoding.EncodeToString([]byte("x-access-token:"+secretValue))
 		}},
+		{"basic with trailing newline", func() *http.Request {
+			r, _ := http.NewRequest("GET", h.explicitURL("/repo.git/info/refs"), nil)
+			r.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("x-access-token:[[credential:github]]\n")))
+			return r
+		}, func(g snap) bool {
+			return g.header.Get("Authorization") == "Basic "+base64.StdEncoding.EncodeToString([]byte("x-access-token:"+secretValue))
+		}},
 		{"query", func() *http.Request {
 			r, _ := http.NewRequest("GET", h.explicitURL("/v1/x?a=1&key=%5B%5Bcredential%3Agithub%5D%5D"), nil)
 			return r

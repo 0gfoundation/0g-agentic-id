@@ -32,7 +32,7 @@ func readJSON(r *http.Request, v any) *credproxy.Error {
 	dec := json.NewDecoder(io.LimitReader(r.Body, maxSocketBody))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		return &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "invalid JSON body"}
+		return &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "invalid JSON body: " + err.Error()}
 	}
 	return nil
 }
