@@ -50,6 +50,9 @@ const (
 	maxParam        = 512
 	maxURLParam     = 2048
 	maxAuditResult  = 256
+	maxAuditHost    = 255
+	maxAuditNames   = 16
+	maxAuditName    = 80
 	maxCountKeys    = 64
 )
 
@@ -72,6 +75,10 @@ type AuditRecord struct {
 	// not listed. Time is then the latest use.
 	Count int        `json:"count,omitempty"`
 	First *time.Time `json:"first,omitempty"`
+	// repeat: the harness can cause this record as often as it likes (a
+	// token request, a failed signature, a reveal allowed in advance), so
+	// it is counted by kind rather than listed, and never pushes the rest out.
+	repeat bool
 }
 
 // Env is what the store needs from the running sealed.
@@ -131,7 +138,8 @@ type EntryInfo struct {
 
 type derived struct {
 	from      string
-	srcHash   string // the source definition it was obtained under
+	srcHash   string            // the source definition it was obtained under
+	params    map[string]string // the harness's parameters to its token request
 	hosts     []string
 	expiresAt int64
 }
@@ -154,9 +162,12 @@ type Store struct {
 
 	mu sync.Mutex
 	// owner is the owner the state belongs to (zero until first seen), and
-	// ownerAt when it was last confirmed on chain.
-	owner   common.Address
-	ownerAt time.Time
+	// ownerAt when the lookup that last confirmed it began. Lookups are
+	// numbered as they begin (lookupSeq); appliedSeq is the latest recorded.
+	owner      common.Address
+	ownerAt    time.Time
+	lookupSeq  uint64
+	appliedSeq uint64
 	// gen advances when everything is cleared: work begun before (a token
 	// request, a login, a decision) is dropped.
 	gen uint64
@@ -189,24 +200,41 @@ type AuditFile struct {
 }
 
 // addAudit keeps rec for the owner's audit route and hands it to Env.Audit,
-// which persists it. The successful uses of what sealed supplies itself are
-// counted, and proxy uses are kept apart from the rest, so neither pushes
-// reveals, decisions or token requests out of the log.
+// which persists it. What the harness can repeat at will is counted by kind,
+// and proxy uses are kept apart from the rest, so neither pushes reveals,
+// signatures or decisions out of the log.
 func (s *Store) addAudit(rec AuditRecord) {
-	if len(rec.Result) > maxAuditResult {
-		rec.Result = rec.Result[:maxAuditResult]
-	}
 	s.auditMu.Lock()
 	s.keepLocked(rec, 1)
 	s.auditMu.Unlock()
 	s.env.Audit(rec)
 }
 
+// boundAudit keeps a record small whatever the harness sent: a refused
+// request can name any host and any number of placeholders.
+func boundAudit(r AuditRecord) AuditRecord {
+	r.Result, r.Host = clip(r.Result, maxAuditResult), clip(r.Host, maxAuditHost)
+	if len(r.Names) == 0 {
+		return r
+	}
+	names := make([]string, 0, min(len(r.Names), maxAuditNames+1))
+	for i, n := range r.Names {
+		if i == maxAuditNames {
+			names = append(names, fmt.Sprintf("+%d more", len(r.Names)-maxAuditNames))
+			break
+		}
+		names = append(names, clip(n, maxAuditName))
+	}
+	r.Names = names
+	return r
+}
+
 func (s *Store) keepLocked(rec AuditRecord, n int) {
+	rec = boundAudit(rec)
 	switch {
 	case rec.Count > 0:
 		s.countLocked(rec, rec.Count)
-	case counted(rec):
+	case counted(rec) || rec.repeat:
 		s.countLocked(rec, n)
 	case rec.Op == "inject":
 		s.auditInject = appendKeep(s.auditInject, rec)
@@ -248,7 +276,7 @@ func (s *Store) countLocked(r AuditRecord, n int) {
 		first = *r.First
 	}
 	if _, ok := s.auditCounts[countKey(r)]; !ok && len(s.auditCounts) >= maxCountKeys {
-		r = AuditRecord{Op: r.Op, Names: []string{"sealed:*"}, Method: "OTHER", Result: r.Result, Time: r.Time}
+		r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: "more kinds, counted together", Time: r.Time, First: r.First}
 	}
 	c := s.auditCounts[countKey(r)]
 	if c == nil {
@@ -307,19 +335,17 @@ func (s *Store) decideSeedLocked() {
 }
 
 // AuditSnapshot is what to persist: every record, with the owner they
-// belong to. ok is false until the persisted records are decided (the owner
-// not yet known), so a boot never overwrites them early.
+// belong to, read together. ok is false until the persisted records are
+// decided (the owner not yet known), so a boot never overwrites them early.
 func (s *Store) AuditSnapshot() (f AuditFile, ok bool) {
 	s.mu.Lock()
-	owner := s.owner
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 	s.auditMu.Lock()
-	ready := s.auditReady && s.auditSeed == nil
-	s.auditMu.Unlock()
-	if !ready || owner == (common.Address{}) {
+	defer s.auditMu.Unlock()
+	if !s.auditReady || s.auditSeed != nil || s.owner == (common.Address{}) {
 		return AuditFile{}, false
 	}
-	return AuditFile{Owner: owner, Records: s.AuditSince(0)}, true
+	return AuditFile{Owner: s.owner, Records: s.auditSinceLocked(0)}, true
 }
 
 // AuditSince returns the records newer than after (Unix seconds), oldest
@@ -327,6 +353,10 @@ func (s *Store) AuditSnapshot() (f AuditFile, ok bool) {
 func (s *Store) AuditSince(after int64) []AuditRecord {
 	s.auditMu.Lock()
 	defer s.auditMu.Unlock()
+	return s.auditSinceLocked(after)
+}
+
+func (s *Store) auditSinceLocked(after int64) []AuditRecord {
 	var out []AuditRecord
 	for _, list := range [][]AuditRecord{s.auditLog, s.auditInject} {
 		for _, r := range list {
@@ -371,18 +401,54 @@ func (s *Store) Version() uint64 {
 	return s.version
 }
 
-// ObserveOwner records the live on-chain owner. The first one seen is the
-// owner the state belongs to; a different one later clears everything
-// (the previous owner's keys must not serve the new one) and is reported.
+// ObserveOwner records the live on-chain owner as of now. The first one
+// seen is the owner the state belongs to; a different one later clears
+// everything (the previous owner's keys must not serve the new one) and is
+// reported.
 func (s *Store) ObserveOwner(live common.Address) (changed bool) {
 	s.mu.Lock()
+	s.lookupSeq++
+	seq, at := s.lookupSeq, s.now()
+	s.mu.Unlock()
+	return s.observeOwner(live, seq, at)
+}
+
+// RefreshOwner looks the owner up on chain and records it (the watcher).
+func (s *Store) RefreshOwner(ctx context.Context) error {
+	_, err := s.lookupOwner(ctx)
+	return err
+}
+
+// lookupOwner asks the chain for the owner and records the answer, unless
+// a lookup begun later was recorded first: answers can arrive out of order,
+// and an older one must not undo a newer one.
+func (s *Store) lookupOwner(ctx context.Context) (common.Address, error) {
+	s.mu.Lock()
+	s.lookupSeq++
+	seq, started := s.lookupSeq, s.now()
+	s.mu.Unlock()
+	live, err := s.env.LiveOwner(ctx)
+	if err != nil {
+		return common.Address{}, err
+	}
+	s.observeOwner(live, seq, started)
+	return live, nil
+}
+
+// observeOwner records live as the owner at the time lookup seq began.
+func (s *Store) observeOwner(live common.Address, seq uint64, at time.Time) (changed bool) {
+	s.mu.Lock()
 	defer s.mu.Unlock()
+	if seq < s.appliedSeq {
+		return false
+	}
+	s.appliedSeq = seq
 	if s.owner != (common.Address{}) && live != s.owner {
 		s.env.Logf("credentials: owner changed from %s to %s; every credential cleared", s.owner.Hex(), live.Hex())
 		s.clearLocked()
 		changed = true
 	}
-	s.owner, s.ownerAt = live, s.now()
+	s.owner, s.ownerAt = live, at
 	s.auditMu.Lock()
 	s.decideSeedLocked()
 	s.auditMu.Unlock()
@@ -399,12 +465,10 @@ func (s *Store) ensureOwner(ctx context.Context) *credproxy.Error {
 	if fresh {
 		return nil
 	}
-	live, err := s.env.LiveOwner(ctx)
-	if err != nil {
+	if _, err := s.lookupOwner(ctx); err != nil {
 		return &credproxy.Error{Status: http.StatusServiceUnavailable, Code: "owner_unknown",
 			Message: "the agent's owner could not be confirmed on chain; try again"}
 	}
-	s.ObserveOwner(live)
 	return nil
 }
 
@@ -413,12 +477,11 @@ func (s *Store) ensureOwner(ctx context.Context) *credproxy.Error {
 func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Opened, error) {
 	s.loadMu.Lock()
 	defer s.loadMu.Unlock()
-	owner, err := s.env.LiveOwner(ctx)
+	// A new owner's set never meets the previous owner's state.
+	owner, err := s.lookupOwner(ctx)
 	if err != nil {
 		return nil, err
 	}
-	// A new owner's set never meets the previous owner's state.
-	s.ObserveOwner(owner)
 	var highest Mark
 	if s.env.Persist != nil {
 		if highest, err = s.env.Persist.LoadHighest(); err != nil {
@@ -715,7 +778,7 @@ func (s *Store) Reveal(ctx context.Context, name, reason string) ([]byte, *credp
 		return nil, &credproxy.Error{Status: http.StatusGone, Code: "expired", Message: "credential " + name + " has expired"}
 	}
 	if def.AllowReveal {
-		s.addAudit(AuditRecord{Time: s.now(), Op: "reveal", Names: []string{name}, Result: "allowed in advance"})
+		s.addAudit(AuditRecord{Time: s.now(), Op: "reveal", Names: []string{name}, Result: "allowed in advance", repeat: true})
 		return value, nil
 	}
 	// The approval is for this value: a token obtained or rotated since is
@@ -729,7 +792,16 @@ func (s *Store) Reveal(ctx context.Context, name, reason string) ([]byte, *credp
 			return value, nil
 		}
 	}
-	p, perr := s.pendingForLocked("reveal", name, nil, bind, reason, map[string]any{"source": sourceOf(from), "from": from, "hosts": def.Hosts, "expires_at": def.ExpiresAt})
+	// What the owner is shown is about the value asked for: for a derived
+	// token, where it goes and what it was obtained with.
+	facts := map[string]any{"source": sourceOf(from), "from": from, "hosts": def.Hosts, "expires_at": def.ExpiresAt}
+	if d, ok := s.derived[name]; ok {
+		facts["hosts"], facts["expires_at"] = d.hosts, d.expiresAt
+		if len(d.params) > 0 {
+			facts["params"] = d.params
+		}
+	}
+	p, perr := s.pendingForLocked("reveal", name, nil, bind, reason, facts)
 	if perr != nil {
 		return nil, perr
 	}
@@ -789,6 +861,13 @@ func (s *Store) Request(op, name string, params map[string]string, reason string
 		if len(k) > 64 || utf8.RuneCountInString(v) > limit {
 			return nil, &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "parameter " + k + " is too long"}
 		}
+		// What the owner is shown stays text: no control characters.
+		if hasControl(v) {
+			return nil, &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "parameter " + k + " holds control characters"}
+		}
+	}
+	if u, ok := params["url"]; ok && !strings.HasPrefix(u, "https://") {
+		return nil, &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "url must be https"}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -817,6 +896,11 @@ func (s *Store) Request(op, name string, params map[string]string, reason string
 func (s *Store) pendingForLocked(op, name string, params map[string]string, bind, reason string, facts map[string]any) (*Pending, *credproxy.Error) {
 	now := s.now().Unix()
 	digest := requestDigest(op, name, params, bind)
+	for d, a := range s.approvals {
+		if a.ExpiresAt < uint64(now) {
+			delete(s.approvals, d)
+		}
+	}
 	open := 0
 	var found *Pending
 	for id, p := range s.pending {
@@ -846,6 +930,12 @@ func (s *Store) pendingForLocked(op, name string, params map[string]string, bind
 	if utf8.RuneCountInString(reason) > maxReason {
 		reason = string([]rune(reason)[:maxReason])
 	}
+	reason = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+			return ' '
+		}
+		return r
+	}, reason)
 	p := &Pending{AuthReqID: newID(), Op: op, Name: name, Params: params, Facts: facts, Reason: reason,
 		RequestDigest: digest, BootID: BootIDHash(s.env.BootID), CreatedAt: now, ExpiresAt: now + int64(pendingTTL/time.Second), Status: "pending"}
 	s.pending[p.AuthReqID] = p
@@ -922,7 +1012,7 @@ func (s *Store) Decide(ctx context.Context, authReqID, decision string, a *Appro
 		!strings.EqualFold(a.AuthReqID, authReqID) || !strings.EqualFold(a.RequestDigest, p.RequestDigest) {
 		return errors.New("the approval is for another request, boot or agent")
 	}
-	if a.ExpiresAt < uint64(s.now().Unix()) || int64(a.ExpiresAt) > p.ExpiresAt {
+	if a.ExpiresAt < uint64(s.now().Unix()) || a.ExpiresAt > uint64(p.ExpiresAt) {
 		return errors.New("the approval has expired or outlives its request")
 	}
 	digest, err := a.Digest(s.env.Domain)
@@ -933,12 +1023,11 @@ func (s *Store) Decide(ctx context.Context, authReqID, decision string, a *Appro
 	if err != nil {
 		return err
 	}
-	owner, err := s.env.LiveOwner(ctx)
+	// A new owner never decides on what the previous owner's state holds.
+	owner, err := s.lookupOwner(ctx)
 	if err != nil {
 		return err
 	}
-	// A new owner never decides on what the previous owner's state holds.
-	s.ObserveOwner(owner)
 	if signer != owner {
 		return ErrWrongSigner
 	}
@@ -965,6 +1054,16 @@ func (s *Store) Record(r credproxy.Record) {
 		result = r.Code
 	}
 	s.addAudit(AuditRecord{Time: r.Time, Op: "inject", Names: r.Names, Host: r.Host, Method: auditMethod(r.Method), Result: result})
+}
+
+// hasControl reports whether v holds a control character (C0, DEL or C1).
+func hasControl(v string) bool {
+	for _, r := range v {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+			return true
+		}
+	}
+	return false
 }
 
 // auditMethod keeps an HTTP method as the log's own word: whatever the

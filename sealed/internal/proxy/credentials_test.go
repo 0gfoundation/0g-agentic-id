@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+
 	"seal-verify/internal/credentials"
 	"seal-verify/internal/state"
 )
@@ -23,6 +25,12 @@ type fakeCredentials struct {
 	decideErr     error
 	loginRedirect string
 	logins        []string
+	observed      []common.Address
+}
+
+func (f *fakeCredentials) ObserveOwner(o common.Address) bool {
+	f.observed = append(f.observed, o)
+	return false
 }
 
 func (f *fakeCredentials) Load(_ context.Context, doc credentials.Document, _ uint64) (*credentials.Opened, error) {
@@ -193,6 +201,18 @@ func TestCredentialRoutes_Decide(t *testing.T) {
 	s.handleCredentialDecide(w, credReq(sign, http.MethodPost, "/_seal/credentials/decide", "0GSealCredDecide", `{"auth_req_id":"0xbb","decision":"deny"}`))
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("HTTP %d, want 404 for a request that is not open", w.Code)
+	}
+}
+
+// Every credential route records the owner who signed it, so a new owner's
+// first request, a read included, clears the previous owner's state first.
+func TestCredentialRoutes_RecordTheSigner(t *testing.T) {
+	sign, owner := mustKey(t)
+	s, f := credServer(t, owner)
+	w := httptest.NewRecorder()
+	s.handleCredentials(w, credReq(sign, http.MethodGet, "/_seal/credentials", "0GSealCredentials", ""))
+	if w.Code != http.StatusOK || len(f.observed) != 1 || !strings.EqualFold(f.observed[0].Hex(), owner) {
+		t.Fatalf("HTTP %d, observed %v, owner %s", w.Code, f.observed, owner)
 	}
 }
 

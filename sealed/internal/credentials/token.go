@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -63,6 +64,14 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 	if err := s.ensureOwner(ctx); err != nil {
 		return nil, err
 	}
+	// A lock exists only for an entry the owner defined: the harness cannot
+	// grow the map with names of its own.
+	s.mu.Lock()
+	_, defined := s.defs[name]
+	s.mu.Unlock()
+	if !defined {
+		return nil, tokenErr(http.StatusNotFound, "unknown_entry", "no credential named %q", name)
+	}
 	lock := s.lockFor(name)
 	lock.Lock()
 	defer lock.Unlock()
@@ -86,6 +95,15 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 		if !contains(tr.Params, k) {
 			return nil, tokenErr(http.StatusForbidden, "not_allowed", "parameter %q is not allowed for %q", k, name)
 		}
+		// A field the owner's template sets is the owner's: a parameter
+		// adds a field, never replaces one.
+		if _, set := tr.Fields[k]; set {
+			return nil, tokenErr(http.StatusForbidden, "not_allowed", "parameter %q is set by the owner's template for %q", k, name)
+		}
+		// Shown to the owner with a derived token's reveal request.
+		if len(params[k]) > maxParam || hasControl(params[k]) {
+			return nil, tokenErr(http.StatusBadRequest, "bad_request", "parameter %q is too long or holds control characters", k)
+		}
 	}
 	own, oerr := s.templateValue(name, value)
 	if oerr != nil {
@@ -108,7 +126,7 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 	}
 	resp, err := s.httpClient().Do(req)
 	if err != nil {
-		s.audit("token", name, tr.URL, "unreachable")
+		s.auditRepeat("token", name, tr.URL, "unreachable")
 		return nil, tokenErr(http.StatusBadGateway, "token_request_failed", "token endpoint unreachable")
 	}
 	defer resp.Body.Close()
@@ -116,7 +134,7 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 	got := parseTokenResponse(body)
 	if resp.StatusCode/100 != 2 {
 		code, _ := got["error"].(string)
-		s.audit("token", name, tr.URL, fmt.Sprintf("%d %s", resp.StatusCode, code))
+		s.auditRepeat("token", name, tr.URL, fmt.Sprintf("%d %s", resp.StatusCode, sanitizeCode(code)))
 		return nil, tokenErr(http.StatusBadGateway, "token_request_failed", "token endpoint answered %d %s", resp.StatusCode, sanitizeCode(code))
 	}
 
@@ -141,9 +159,14 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 		}
 		e := &credproxy.Entry{Name: dn, Hosts: append([]string(nil), t.Hosts...), Positions: t.Positions, Use: credproxy.UseInject, Value: []byte(v)}
 		if t.ExpiresInField != "" {
-			if secs, ok := got[t.ExpiresInField].(float64); ok && secs > 0 {
+			if secs := expiresIn(got[t.ExpiresInField]); secs > 0 {
 				e.ExpiresAt = now.Add(time.Duration(secs) * time.Second)
 			}
+		}
+		// Never past its source: an expired entry obtains nothing that
+		// outlives it.
+		if def.ExpiresAt > 0 && (e.ExpiresAt.IsZero() || e.ExpiresAt.Unix() > def.ExpiresAt) {
+			e.ExpiresAt = time.Unix(def.ExpiresAt, 0)
 		}
 		if err := e.Validate(); err != nil {
 			return nil, tokenErr(http.StatusBadGateway, "token_request_failed", "template produced an invalid entry: %v", err)
@@ -153,7 +176,7 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 	s.mu.Lock()
 	if s.gen != gen || s.defHashes[name] != srcHash {
 		s.mu.Unlock()
-		s.audit("token", name, tr.URL, "dropped: the entry changed while the request ran")
+		s.auditRepeat("token", name, tr.URL, "dropped: the entry changed while the request ran")
 		return nil, tokenErr(http.StatusConflict, "changed", "credential %q changed while the token request ran; ask again", name)
 	}
 	var out []EntryInfo
@@ -166,13 +189,26 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 		if !e.ExpiresAt.IsZero() {
 			exp = e.ExpiresAt.Unix()
 		}
-		s.derived[e.Name] = derived{from: name, srcHash: srcHash, hosts: e.Hosts, expiresAt: exp}
+		s.derived[e.Name] = derived{from: name, srcHash: srcHash, params: params, hosts: e.Hosts, expiresAt: exp}
 		out = append(out, EntryInfo{Name: e.Name, Source: "derived", From: name, Use: string(credproxy.UseInject), Hosts: e.Hosts,
 			Positions: e.Positions, ExpiresAt: exp, AllowReveal: def.AllowReveal, Placeholder: credproxy.Placeholder(e.Name)})
 	}
 	s.mu.Unlock()
-	s.audit("token", name, tr.URL, "ok")
+	s.auditRepeat("token", name, tr.URL, "ok")
 	return out, nil
+}
+
+// expiresIn reads a lifetime in seconds, as a number or as a string of
+// digits (some endpoints send one).
+func expiresIn(v any) int64 {
+	switch x := v.(type) {
+	case float64:
+		return int64(x)
+	case string:
+		n, _ := strconv.ParseInt(x, 10, 64)
+		return n
+	}
+	return 0
 }
 
 func (s *Store) buildTokenRequest(ctx context.Context, tr *TokenRequest, fields map[string]string) (*http.Request, *credproxy.Error) {
@@ -313,6 +349,18 @@ func contains(list []string, v string) bool {
 }
 
 func (s *Store) audit(op, name, target, result string) {
+	s.addAudit(auditRecord(s.now(), op, name, target, result))
+}
+
+// auditRepeat records what the harness can cause as often as it likes: it is
+// counted by kind (AuditRecord.repeat).
+func (s *Store) auditRepeat(op, name, target, result string) {
+	r := auditRecord(s.now(), op, name, target, result)
+	r.repeat = true
+	s.addAudit(r)
+}
+
+func auditRecord(now time.Time, op, name, target, result string) AuditRecord {
 	host := target
 	if u, err := url.Parse(target); err == nil && u.Host != "" {
 		host = u.Host
@@ -321,7 +369,7 @@ func (s *Store) audit(op, name, target, result string) {
 	if name != "" {
 		names = []string{name}
 	}
-	s.addAudit(AuditRecord{Time: s.now(), Op: op, Names: names, Host: host, Result: result})
+	return AuditRecord{Time: now, Op: op, Names: names, Host: host, Result: result}
 }
 
 // rotate makes value, which sealed obtained for def (a rotated token, a
@@ -335,7 +383,7 @@ func (s *Store) rotate(ctx context.Context, def *Definition, gen uint64, value [
 	cur := s.defs[def.Name]
 	if s.gen != gen || cur == nil || cur.Binding() != def.Binding() {
 		s.mu.Unlock()
-		s.audit("rotate", def.Name, "", "dropped: the entry changed meanwhile")
+		s.auditRepeat("rotate", def.Name, "", "dropped: the entry changed meanwhile")
 		return false, false
 	}
 	had = s.values[def.Name] != nil
@@ -344,7 +392,7 @@ func (s *Store) rotate(ctx context.Context, def *Definition, gen uint64, value [
 	owner, binding, writeback := s.owner, cur.Binding(), cur.Writeback
 	s.mu.Unlock()
 	if !writeback || s.env.Writeback == nil {
-		s.audit("rotate", def.Name, "", "kept until restart: no writeback")
+		s.auditRepeat("rotate", def.Name, "", "kept until restart: no writeback")
 		return true, had
 	}
 	wb, err := s.signWriteback(def.Name, value, binding, owner)
@@ -357,17 +405,35 @@ func (s *Store) rotate(ctx context.Context, def *Definition, gen uint64, value [
 	// already rotated, and the next boot needs the new value.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 	defer cancel()
-	for attempt := 0; attempt < 3; attempt++ {
-		if err = s.env.Writeback(ctx, def.Name, wb); err == nil {
-			s.audit("writeback", def.Name, "", "ok")
-			return true, had
-		}
-		time.Sleep(time.Duration(attempt+1) * time.Second)
+	if s.postWriteback(ctx, def.Name, wb) == nil {
+		s.auditRepeat("writeback", def.Name, "", "ok")
+		return true, had
 	}
-	s.audit("writeback", def.Name, "", "failed")
+	s.auditRepeat("writeback", def.Name, "", "failed")
 	s.events.add(Event{Type: "writeback_failed", Name: def.Name})
 	go s.retryWriteback(def.Name, wb, value)
 	return true, had
+}
+
+// writeBackOnce seals value for owner, signs it for binding and posts it to
+// the attestor (three tries), with no retry after.
+func (s *Store) writeBackOnce(ctx context.Context, name, binding string, owner common.Address, value []byte) error {
+	wb, err := s.signWriteback(name, value, binding, owner)
+	if err != nil {
+		return err
+	}
+	return s.postWriteback(ctx, name, wb)
+}
+
+// postWriteback posts wb, trying three times.
+func (s *Store) postWriteback(ctx context.Context, name string, wb Writeback) (err error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = s.env.Writeback(ctx, name, wb); err == nil {
+			return nil
+		}
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	return err
 }
 
 func (s *Store) retryWriteback(name string, wb Writeback, value []byte) {
@@ -383,7 +449,7 @@ func (s *Store) retryWriteback(name string, wb Writeback, value []byte) {
 		err := s.env.Writeback(ctx, name, wb)
 		cancel()
 		if err == nil {
-			s.audit("writeback", name, "", "ok after retry")
+			s.auditRepeat("writeback", name, "", "ok after retry")
 			return
 		}
 	}

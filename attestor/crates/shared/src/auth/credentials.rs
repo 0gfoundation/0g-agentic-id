@@ -15,8 +15,10 @@
 //!
 //! sealed writes back values it obtained itself (a rotated refresh token, a
 //! login), signed by agentSeal over
-//! `"CredentialWriteback.v1:<seal>:<name>:<set version>:<boot id>:<keccak(ct)>"`
-//! with raw keccak256 and no EIP-191 prefix, like `/status`.
+//! `"CredentialWriteback.v2:<seal>:<name>:<binding>:<boot id>:<keccak(ct)>"`
+//! with raw keccak256 and no EIP-191 prefix, like `/status`. The binding
+//! names what the value stands for; sealed checks it against the definition
+//! at boot.
 //!
 //! The request formats mirror the settings channel (`auth::settings`): the
 //! owner signs `"<tag>:0x<sealId>:<unix seconds>:<base version>[:<sha256 hex>]"`

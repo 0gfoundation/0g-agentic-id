@@ -44,7 +44,7 @@ func (s *Store) WalletSign(ctx context.Context, in SignRequest) (map[string]any,
 	owner := s.owner
 	s.mu.Unlock()
 	if addr, err := WalletAddress(e.Value); err == nil && addr == owner {
-		s.addAudit(AuditRecord{Time: s.now(), Op: "sign", Names: []string{in.Name}, Result: "refused: the wallet is the owner's own key"})
+		s.addAudit(AuditRecord{Time: s.now(), Op: "sign", Names: []string{in.Name}, Result: "refused: the wallet is the owner's own key", repeat: true})
 		return nil, tokenErr(http.StatusForbidden, "not_allowed", "credential %q holds the owner's own key and does not sign", in.Name)
 	}
 	n := 0
@@ -77,7 +77,8 @@ func (s *Store) WalletSign(ctx context.Context, in SignRequest) (map[string]any,
 		if status == http.StatusBadRequest {
 			code = "bad_request"
 		}
-		s.addAudit(AuditRecord{Time: s.now(), Op: op, Names: []string{in.Name}, Result: code + ": " + what})
+		// The harness can fail as often as it likes: counted by kind.
+		s.addAudit(AuditRecord{Time: s.now(), Op: op, Names: []string{in.Name}, Result: code, repeat: true})
 		return nil, tokenErr(status, code, "%s", err.Error())
 	}
 	s.addAudit(AuditRecord{Time: s.now(), Op: op, Names: []string{in.Name}, Result: "signed: " + what})
@@ -122,7 +123,7 @@ func clip(s string, n int) string {
 		s = s[:n]
 	}
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
 			return '?'
 		}
 		return r

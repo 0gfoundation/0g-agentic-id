@@ -69,6 +69,9 @@ type loginAttempt struct {
 	expires                     time.Time
 	def                         *Definition
 	gen                         uint64
+	// secretFromEntry: clientSecret is the owner's client_secret_entry,
+	// read again at each use, so the login does not keep a copy.
+	secretFromEntry bool
 }
 
 const (
@@ -114,12 +117,6 @@ func (s *Store) StartLogin(ctx context.Context, name, redirectURI string) (strin
 	}
 	s.mu.Lock()
 	def, gen := s.defs[name], s.gen
-	var secretDef *Definition
-	var secret string
-	if def != nil && def.MCP != nil && def.MCP.ClientID != "" && def.MCP.ClientSecretEntry != "" {
-		secretDef = s.defs[def.MCP.ClientSecretEntry]
-		secret = string(usableValue(secretDef, s.values[def.MCP.ClientSecretEntry]))
-	}
 	s.mu.Unlock()
 	if def == nil || def.MCP == nil {
 		return "", loginErr("no login entry named %q", name)
@@ -127,25 +124,13 @@ func (s *Store) StartLogin(ctx context.Context, name, redirectURI string) (strin
 	if !strings.HasPrefix(redirectURI, "https://") {
 		return "", loginErr("this agent has no https address for the login to return to")
 	}
-	if def.MCP.ClientID != "" && def.MCP.ClientSecretEntry != "" {
-		se := def.MCP.ClientSecretEntry
-		switch {
-		case secretDef == nil || secret == "":
-			return "", loginErr("the client secret entry %q is not loaded", se)
-		case useOf(secretDef) == credproxy.UseSign:
-			return "", loginErr("the client secret entry %q is a signing key and is never sent", se)
-		case s.expired(se):
-			return "", loginErr("the client secret entry %q has expired", se)
-		}
-	}
 	as, err := s.discover(ctx, def.MCP.URL)
 	if err != nil {
 		return "", err
 	}
-	// The token endpoint comes from the server's metadata: the client secret
-	// goes there only if its entry allows that host.
-	if secretDef != nil && len(secretDef.Hosts) > 0 && !hostListed(as.token, secretDef.Hosts) {
-		return "", loginErr("the client secret entry %q does not allow the token endpoint's host", def.MCP.ClientSecretEntry)
+	secret, fromEntry, err := s.entrySecret(def, as.token)
+	if err != nil {
+		return "", err
 	}
 	clientID := def.MCP.ClientID
 	if clientID == "" {
@@ -172,7 +157,7 @@ func (s *Store) StartLogin(ctx context.Context, name, redirectURI string) (strin
 	}
 	s.logins[state] = &loginAttempt{name: name, verifier: verifier, redirectURI: redirectURI, clientID: clientID,
 		clientSecret: secret, tokenURL: as.token, resource: as.resource, revocationURL: as.revocation, expires: now.Add(loginTTL),
-		def: def, gen: gen}
+		def: def, gen: gen, secretFromEntry: fromEntry}
 	s.mu.Unlock()
 
 	q := url.Values{
@@ -238,11 +223,20 @@ func (s *Store) FinishLogin(ctx context.Context, state, code, oauthError string)
 		return a.name, err
 	}
 	st := &mcpState{V: 1, Type: "mcp_login", AccessToken: tok.access, RefreshToken: tok.refresh, LoggedInAt: s.now().Unix(),
-		ClientID: a.clientID, ClientSecret: a.clientSecret, TokenURL: a.tokenURL, Resource: a.resource, RevocationURL: a.revocationURL}
+		ClientID: a.clientID, TokenURL: a.tokenURL, Resource: a.resource, RevocationURL: a.revocationURL}
+	if !a.secretFromEntry {
+		st.ClientSecret = a.clientSecret // issued at registration: the login's own
+	}
 	if tok.expiresIn > 0 {
 		st.ExpiresAt = s.now().Unix() + tok.expiresIn
 	}
-	if !s.applyLogin(ctx, a.def, a.gen, st) {
+	// Not while a refresh or a disconnect of the entry runs: the newer login
+	// is the one that stands.
+	lock := s.lockFor(a.name)
+	lock.Lock()
+	applied := s.applyLogin(ctx, a.def, a.gen, st)
+	lock.Unlock()
+	if !applied {
 		s.audit("login", a.name, a.tokenURL, "dropped: the entry changed meanwhile")
 		return a.name, loginErr("the entry changed while the login ran; start the login again")
 	}
@@ -319,14 +313,23 @@ func (s *Store) refreshLogin(name, access string, attempt int) {
 	if def == nil || def.MCP == nil || !ok || st.RefreshToken == "" || st.AccessToken != access {
 		return // gone, or refreshed or logged in again meanwhile
 	}
+	secret, fromEntry, serr := s.entrySecret(def, st.TokenURL)
+	if serr != nil {
+		s.auditRepeat("refresh", name, st.TokenURL, "not sent: "+serr.Error())
+		s.askLogin(name, def, gen, serr.Error())
+		return
+	}
+	if !fromEntry {
+		secret = st.ClientSecret
+	}
 	form := url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {st.RefreshToken},
 		"client_id":     {st.ClientID},
 		"resource":      {st.Resource},
 	}
-	if st.ClientSecret != "" {
-		form.Set("client_secret", st.ClientSecret)
+	if secret != "" {
+		form.Set("client_secret", secret)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -334,15 +337,11 @@ func (s *Store) refreshLogin(name, access string, attempt int) {
 	if err != nil {
 		var le *LoginError
 		if errors.As(err, &le) && strings.Contains(le.Reason, "invalid_grant") {
-			s.audit("refresh", name, st.TokenURL, "invalid_grant")
-			s.mu.Lock()
-			if s.gen == gen {
-				_, _ = s.pendingForLocked("login", name, map[string]string{"url": def.MCP.URL}, "", "", map[string]any{"source": "sealed", "why": "the login expired or was revoked"})
-			}
-			s.mu.Unlock()
+			s.auditRepeat("refresh", name, st.TokenURL, "invalid_grant")
+			s.askLogin(name, def, gen, "the login expired or was revoked")
 			return
 		}
-		s.audit("refresh", name, st.TokenURL, "failed")
+		s.auditRepeat("refresh", name, st.TokenURL, "failed")
 		if attempt < 6 {
 			delay := time.Duration(1<<attempt) * 10 * time.Second
 			time.AfterFunc(delay, func() { s.refreshLogin(name, access, attempt+1) })
@@ -358,8 +357,52 @@ func (s *Store) refreshLogin(name, access string, attempt int) {
 	if tok.expiresIn > 0 {
 		next.ExpiresAt = s.now().Unix() + tok.expiresIn
 	}
-	s.audit("refresh", name, st.TokenURL, "ok")
+	s.auditRepeat("refresh", name, st.TokenURL, "ok")
 	s.applyLogin(ctx, def, gen, &next)
+}
+
+// askLogin opens a login request for the owner when the entry's login can
+// no longer be refreshed (why says so), unless everything was cleared since gen.
+func (s *Store) askLogin(name string, def *Definition, gen uint64, why string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.gen == gen {
+		_, _ = s.pendingForLocked("login", name, map[string]string{"url": def.MCP.URL}, "", "", map[string]any{"source": "sealed", "why": why})
+	}
+}
+
+// entrySecret is the client secret a login sends to tokenURL from the owner's
+// client_secret_entry, as the entry stands now: loaded, unexpired, not a
+// signing key, and allowing tokenURL's host when it lists hosts (the
+// endpoint comes from the server's metadata). fromEntry is false when the
+// login has no such entry (no client_id of the owner's).
+func (s *Store) entrySecret(def *Definition, tokenURL string) (secret string, fromEntry bool, err error) {
+	if def.MCP == nil || def.MCP.ClientID == "" || def.MCP.ClientSecretEntry == "" {
+		return "", false, nil
+	}
+	se := def.MCP.ClientSecretEntry
+	s.mu.Lock()
+	sd := s.defs[se]
+	v := usableValue(sd, s.values[se])
+	s.mu.Unlock()
+	switch {
+	case sd == nil || len(v) == 0:
+		return "", true, loginErr("the client secret entry %q is not loaded", se)
+	case useOf(sd) == credproxy.UseSign:
+		return "", true, loginErr("the client secret entry %q is a signing key and is never sent", se)
+	case s.expired(se):
+		return "", true, loginErr("the client secret entry %q has expired", se)
+	case len(sd.Hosts) > 0 && !hostListed(tokenURL, sd.Hosts):
+		return "", true, loginErr("the client secret entry %q does not allow the token endpoint's host", se)
+	}
+	return string(v), true, nil
+}
+
+// sameHost reports whether two URLs name the same host.
+func sameHost(a, b string) bool {
+	ua, err1 := url.Parse(a)
+	ub, err2 := url.Parse(b)
+	return err1 == nil && err2 == nil && ua.Host != "" && credproxy.NormalizeHost(ua.Host) == credproxy.NormalizeHost(ub.Host)
 }
 
 // hostListed reports whether rawURL's host is one of hosts.
@@ -377,17 +420,28 @@ func hostListed(rawURL string, hosts []string) bool {
 	return false
 }
 
+// loggedOut is what a disconnected login entry is written back as, so a
+// restart does not bring the login back.
+var loggedOut = []byte(`{"v":1,"type":"mcp_logout"}`)
+
 // Disconnect ends a login entry's login. When the authorization server
-// offers token revocation (RFC 7009), it is asked to revoke the refresh
-// token and the access token; either way sealed forgets them, so the entry
-// waits for a new login. The owner removes the entry after. revoked says
-// whether the server confirmed; note, when it did not, why.
+// offered token revocation (RFC 7009) at login, on the token endpoint's
+// host, it is asked to revoke the refresh token and the access token;
+// either way sealed forgets them and writes that back, so the entry waits
+// for a new login, across restarts too. The owner removes the entry after.
+// revoked says whether the server confirmed; note, when it did not, why.
 func (s *Store) Disconnect(ctx context.Context, name string) (revoked bool, note string, err error) {
-	lock := s.lockFor(name) // not while a refresh rotates the tokens
+	s.mu.Lock()
+	_, defined := s.defs[name]
+	s.mu.Unlock()
+	if !defined {
+		return false, "", loginErr("no login entry named %q", name)
+	}
+	lock := s.lockFor(name) // not while a refresh or a login applies tokens
 	lock.Lock()
 	defer lock.Unlock()
 	s.mu.Lock()
-	def, raw := s.defs[name], s.values[name]
+	def, raw, owner := s.defs[name], s.values[name], s.owner
 	s.mu.Unlock()
 	if def == nil || def.MCP == nil {
 		return false, "", loginErr("no login entry named %q", name)
@@ -396,16 +450,13 @@ func (s *Store) Disconnect(ctx context.Context, name string) (revoked bool, note
 	if st, ok := parseMCPState(raw); !ok {
 		note = "not connected: there was nothing to revoke"
 	} else {
+		// Only the endpoint the server named at login: tokens and a client
+		// secret never go where the server's metadata points to today.
 		endpoint = st.RevocationURL
-		if endpoint == "" { // connected before sealed kept the endpoint
-			if as, derr := s.discover(ctx, def.MCP.URL); derr == nil {
-				endpoint = as.revocation
-			}
-		}
 		if endpoint == "" {
-			note = "the server offers no token revocation: revoke the app's access at the service"
+			note = "the server offered no token revocation: revoke the app's access at the service"
 		} else {
-			revoked, note = s.revoke(ctx, endpoint, st)
+			revoked, note = s.revoke(ctx, endpoint, def, st)
 		}
 	}
 	s.mu.Lock()
@@ -419,6 +470,14 @@ func (s *Store) Disconnect(ctx context.Context, name string) (revoked bool, note
 	}
 	s.syncRegistryLocked()
 	s.mu.Unlock()
+	if raw != nil && def.Writeback && s.env.Writeback != nil {
+		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		werr := s.writeBackOnce(wctx, name, def.Binding(), owner, loggedOut)
+		cancel()
+		if werr != nil {
+			note = strings.TrimPrefix(note+"; the attestor still holds the login until the entry is removed", "; ")
+		}
+	}
 	result := "revoked at the server"
 	if !revoked {
 		result = "forgotten; " + note
@@ -428,8 +487,17 @@ func (s *Store) Disconnect(ctx context.Context, name string) (revoked bool, note
 }
 
 // revoke asks endpoint to revoke the login's refresh token, then its access
-// token (RFC 7009 §2.1); the answer to the first one decides.
-func (s *Store) revoke(ctx context.Context, endpoint string, st *mcpState) (bool, string) {
+// token (RFC 7009 §2.1); the answer to the first one decides. Only an
+// endpoint on the token endpoint's host is asked, since the tokens and the
+// client secret go there and nowhere else.
+func (s *Store) revoke(ctx context.Context, endpoint string, def *Definition, st *mcpState) (bool, string) {
+	if !sameHost(endpoint, st.TokenURL) {
+		return false, "the revocation endpoint is not on the token endpoint's host: revoke the app's access at the service"
+	}
+	secret, fromEntry, _ := s.entrySecret(def, st.TokenURL)
+	if !fromEntry {
+		secret = st.ClientSecret
+	}
 	tokens := [][2]string{{st.RefreshToken, "refresh_token"}, {st.AccessToken, "access_token"}}
 	confirmed, asked := false, false
 	note := ""
@@ -438,8 +506,8 @@ func (s *Store) revoke(ctx context.Context, endpoint string, st *mcpState) (bool
 			continue
 		}
 		form := url.Values{"token": {t[0]}, "token_type_hint": {t[1]}, "client_id": {st.ClientID}}
-		if st.ClientSecret != "" {
-			form.Set("client_secret", st.ClientSecret)
+		if secret != "" {
+			form.Set("client_secret", secret)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 		if err != nil {
@@ -553,7 +621,7 @@ func (s *Store) discover(ctx context.Context, mcpURL string) (*authServer, error
 		if resp, err := s.httpClient().Do(req); err == nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxMetadata))
 			resp.Body.Close()
-			if m := resourceMetadataParam(resp.Header.Get("WWW-Authenticate")); m != "" {
+			if m := resourceMetadataParam(resp.Header.Get("WWW-Authenticate")); strings.HasPrefix(m, "https://") {
 				prmURLs = append(prmURLs, m)
 			}
 		}
@@ -576,6 +644,11 @@ func (s *Store) discover(ctx context.Context, mcpURL string) (*authServer, error
 		}
 		issuer = strings.TrimSuffix(prm.AuthorizationServers[0], "/")
 		if prm.Resource != "" {
+			// RFC 9728 §3.3: the metadata is about this server, so the
+			// token is asked for this resource and no other.
+			if !resourceCovers(prm.Resource, mcpURL) {
+				return nil, loginErr("the server's resource metadata names another resource")
+			}
 			as.resource = prm.Resource
 		}
 		as.scopes = prm.ScopesSupported
@@ -594,6 +667,7 @@ func (s *Store) discover(ctx context.Context, mcpURL string) (*authServer, error
 		issuer + "/.well-known/openid-configuration",
 	} {
 		var meta struct {
+			Issuer                        string   `json:"issuer"`
 			AuthorizationEndpoint         string   `json:"authorization_endpoint"`
 			TokenEndpoint                 string   `json:"token_endpoint"`
 			RegistrationEndpoint          string   `json:"registration_endpoint"`
@@ -602,6 +676,10 @@ func (s *Store) discover(ctx context.Context, mcpURL string) (*authServer, error
 			ScopesSupported               []string `json:"scopes_supported"`
 		}
 		if s.getJSON(ctx, m, &meta) != nil || meta.AuthorizationEndpoint == "" || meta.TokenEndpoint == "" {
+			continue
+		}
+		// RFC 8414 §3.3: metadata naming another issuer is not this one's.
+		if meta.Issuer != "" && strings.TrimSuffix(meta.Issuer, "/") != issuer {
 			continue
 		}
 		if len(meta.CodeChallengeMethodsSupported) > 0 && !contains(meta.CodeChallengeMethodsSupported, "S256") {
@@ -616,7 +694,9 @@ func (s *Store) discover(ctx context.Context, mcpURL string) (*authServer, error
 			meta.RegistrationEndpoint = ""
 		}
 		as.authorize, as.token, as.register = meta.AuthorizationEndpoint, meta.TokenEndpoint, meta.RegistrationEndpoint
-		if strings.HasPrefix(meta.RevocationEndpoint, "https://") {
+		// Revocation is asked only on the token endpoint's host, where the
+		// tokens and a client secret already go.
+		if strings.HasPrefix(meta.RevocationEndpoint, "https://") && sameHost(meta.RevocationEndpoint, meta.TokenEndpoint) {
 			as.revocation = meta.RevocationEndpoint
 		}
 		if len(as.scopes) == 0 {
@@ -642,6 +722,20 @@ func (s *Store) getJSON(ctx context.Context, u string, v any) error {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, maxMetadata)).Decode(v)
+}
+
+// resourceCovers reports whether resource identifies the MCP server at
+// mcpURL: the same https origin, and its path the server's or a whole-
+// segment prefix of it (the well-known paths name either).
+func resourceCovers(resource, mcpURL string) bool {
+	r, err1 := url.Parse(resource)
+	m, err2 := url.Parse(mcpURL)
+	if err1 != nil || err2 != nil || r.Scheme != "https" || r.RawQuery != "" || r.Fragment != "" ||
+		credproxy.NormalizeHost(r.Host) != credproxy.NormalizeHost(m.Host) {
+		return false
+	}
+	rp, mp := strings.TrimSuffix(r.EscapedPath(), "/"), strings.TrimSuffix(m.EscapedPath(), "/")
+	return rp == "" || rp == mp || strings.HasPrefix(mp, rp+"/")
 }
 
 // resourceMetadataParam reads resource_metadata="…" from a WWW-Authenticate

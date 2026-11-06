@@ -92,9 +92,9 @@ A refusal is an HTTP error with `X-Seal-Credential-Error: <code>` and a JSON bod
 | `DELETE /credentials/{name}` | drop a derived entry (owner entries are the owner's) |
 | `GET /events?after=&wait=` | long-poll: `entry_added`, `entry_removed`, `pending_opened`, `pending_decided`, `cleared`, `writeback_failed` |
 
-Requests waiting for the owner are bounded: at most 32 at once (429 `too_many_requests` after that), a reason of up to 512 characters (longer ones are cut), up to 4 parameters of up to 512 characters each (2048 for `url`).
+Requests waiting for the owner are bounded: at most 32 at once (429 `too_many_requests` after that), a reason of up to 512 characters on one line (longer ones are cut, control characters become spaces), up to 4 parameters of up to 512 characters each (2048 for `url`, which must be https), with no control characters.
 
-**Reveal** (`$SEAL_CRED_REVEAL_SOCKET`): `POST /credentials/reveal {name, reason}`. With `allow_reveal` it answers `{value}`. Otherwise 403 `authorization_pending` with an `auth_req_id`; the owner decides; the agent sends the same request again. 403 `access_denied` is a refusal. An approval is for the value the agent asked about: a token obtained or rotated after it is asked for again. A signing key (`use: sign`) is never revealed (403 `not_allowed`). A login entry reveals its access token, never its stored login state. The socket is separate from the one above so that a harness running its tools as another user could keep it from them; both belong to the agent user, which the tools of the shipped frameworks run as too.
+**Reveal** (`$SEAL_CRED_REVEAL_SOCKET`): `POST /credentials/reveal {name, reason}`. With `allow_reveal` it answers `{value}`. Otherwise 403 `authorization_pending` with an `auth_req_id`; the owner decides; the agent sends the same request again. 403 `access_denied` is a refusal. An approval is for the value the agent asked about: a token obtained or rotated after it is asked for again. For a derived token the owner is shown its own hosts and expiry and the parameters it was obtained with. A signing key (`use: sign`) is never revealed (403 `not_allowed`). A login entry reveals its access token, never its stored login state. The socket is separate from the one above so that a harness running its tools as another user could keep it from them; both belong to the agent user, which the tools of the shipped frameworks run as too.
 
 ## The framework's inference key
 
@@ -111,13 +111,13 @@ A `token_request` is a template sealed follows; the agent never sees the request
 | `url`, `encoding` | the token endpoint; `form` (default) or `json` |
 | `fields` | field → template: `{v}` is this entry's value, `{cred:<name>}` another entry's (a `jwt` entry stands for a freshly minted token; another signing key is refused) |
 | `basic_auth` | `{username_entry, password_entry}` |
-| `params` | parameters the agent may add (e.g. `scope`) |
-| `take` | response fields kept as derived entries: `field`, `name`, `hosts`, `positions`, `expires_in_field`; named `derived:<entry>.<field>` unless named |
+| `params` | parameters the agent may add (e.g. `scope`): a field the template does not set; one it sets is refused (403 `not_allowed`). Up to 512 characters, no control characters |
+| `take` | response fields kept as derived entries: `field`, `name`, `hosts`, `positions`, `expires_in_field` (seconds, a number or a string of digits); named `derived:<entry>.<field>` unless named. A derived entry never outlives its source's `expires_at` |
 | `rotate_field` | e.g. `refresh_token`: a new value in the response replaces the entry's value |
 
 Token requests for one entry run one at a time. A failure answers `token_request_failed` with the OAuth error code only; a request whose entry changed while it ran (see *Ownership epoch*) answers 409 `changed`. A template's fields are filled in one pass: a value that reads like `{cred:<name>}` is sent as it is. A login entry takes no template.
 
-**From the CLI.** `preset=oauth2-refresh` (the value is a refresh token; it rotates and is written back) and `preset=oauth2-client` (the value is a client secret) build the standard OAuth 2.0 template from `token_url=`, `client_id=` and `api_host=`, with optional `scope=` (which the agent may also pass) and, for a refresh token whose client has a secret, `client_secret=<entry>`. The agent runs `POST /credentials/token` on the entry and uses `[[credential:derived:<entry>]]` as a Bearer token on `api_host`. Any other template goes in `token=<json>`.
+**From the CLI.** `preset=oauth2-refresh` (the value is a refresh token; it rotates and is written back) and `preset=oauth2-client` (the value is a client secret) build the standard OAuth 2.0 template from `token_url=`, `client_id=` and `api_host=`, with optional `scope=` (when given it is fixed; without it the agent may pass one) and, for a refresh token whose client has a secret, `client_secret=<entry>`. The agent runs `POST /credentials/token` on the entry and uses `[[credential:derived:<entry>]]` as a Bearer token on `api_host`. Any other template goes in `token=<json>`.
 
 **Writebacks.** A value sealed obtains (a rotated refresh token, a login) is sealed to agentSeal and posted to the attestor, signed by agentSeal over
 
@@ -150,18 +150,23 @@ A login entry has `mcp.url` and no value of the owner's.
 
 The agent configures the MCP server with the header `Authorization: Bearer [[credential:<name>]]`.
 
-A login entry is checked when the set loads as it will be served after the login, and skipped if the proxy could not serve it. Its `client_secret_entry` must be loaded, unexpired and not a signing key, and when that entry lists hosts, the token endpoint's host (which comes from the server's metadata) must be one of them.
+A login entry is checked when the set loads as it will be served after the login, and skipped if the proxy could not serve it.
+
+- **Discovery.** Metadata is read over https only. The protected resource metadata's `resource` must name this server (same origin; its path the server's or a whole-segment prefix of it, RFC 9728 §3.3), and authorization server metadata that names another `issuer` is not used (RFC 8414 §3.3). Revocation is used only when its endpoint is on the token endpoint's host.
+- **Client secret.** A `client_secret_entry` is read again at each use (the code exchange, each refresh, revocation) and never kept with the login: it must be loaded, unexpired and not a signing key, and when that entry lists hosts the token endpoint's host must be one of them. Once it is not, refreshes stop and the owner gets a `login` request.
+- **Order.** A login completes after a refresh of the same entry already running, so the newer login stands. A disconnect asks only the revocation endpoint kept from the login, and writes the disconnect back, so a restart does not bring the login back.
+- **Scopes.** With no `scopes` in the entry, sealed asks for the ones the server's metadata lists; the owner sees them on the consent screen.
 
 ## The owner's side
 
-Owner routes on the agent (`/_seal/*`, through `:8080`) take `X-Auth-Message` / `X-Auth-Signature` (EIP-191 by the live on-chain owner), grammar `<tag>:0x<sealId>:<unix seconds>[:<sha256(body)>]:<audience>`. A signed `POST` is taken once: the same message sent again within its freshness window answers 409.
+Owner routes on the agent (`/_seal/*`, through `:8080`) take `X-Auth-Message` / `X-Auth-Signature` (EIP-191 by the live on-chain owner), grammar `<tag>:0x<sealId>:<unix seconds>[:<sha256(body)>]:<audience>`. A signed `POST` is taken once: the same message sent again within its freshness window answers 409. Each request records its signer as the owner, so a new owner's first request, a read included, clears the previous owner's state before anything of it is served.
 
 | Route | Tag | |
 |---|---|---|
 | `GET` / `POST /_seal/credentials` | `0GSealCredentials` | list loaded entries / load a signed set (409 `stale_version` for an older one) |
 | `GET /_seal/credentials/pending` | `0GSealCredPending` | requests waiting: sealed's `facts` apart from the agent's `reason` |
 | `POST /_seal/credentials/decide` | `0GSealCredDecide` | `{auth_req_id, decision: "once" \| "deny", approval?, signature?}` |
-| `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | what the agent did (fills, token requests, signatures, reveals, logins, writebacks), and which entries a set skipped and why: never values. Oldest first: the last 1000 proxy uses and the last 1000 other records, kept apart so fills never push the rest out; the successful uses of what sealed supplies itself (`sealed:` entries, e.g. the framework's inference key) are one record each with `count`, `first` and the latest `ts`. Kept across stop/start with the owner it belongs to, and restored only for that owner |
+| `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | what the agent did (fills, token requests, signatures, reveals, logins, writebacks), and which entries a set skipped and why: never values. Oldest first: the last 1000 proxy uses and the last 1000 other records, kept apart so fills never push the rest out. What the agent can repeat at will (token requests, refreshes, writebacks, failed signatures, reveals allowed in advance) and the successful uses of what sealed supplies itself (`sealed:` entries, e.g. the framework's inference key) are one record per kind with `count`, `first` and the latest `ts` (64 kinds, then the rest together). Hosts and names are cut to a bounded length, control characters shown as `?`. Kept across stop/start with the owner it belongs to and restored only for that owner; a persisted log a boot cannot read is left as it is and not written over |
 | `POST /_seal/credentials/login` | `0GSealCredLogin` | start an MCP login; `{authorize_url}` |
 | `POST /_seal/credentials/disconnect` | `0GSealCredDisconnect` | end an MCP login: revoke at the server when it offers that, forget the tokens; `{revoked, note}` |
 | `GET /_seal/oauth/callback` | none | the browser's return from a login |
@@ -183,10 +188,11 @@ The SDK is `ag.credentials` (`sdk/typescript/src/Credentials.ts`); the CLI is `0
 
 ## What is outside
 
-- **Responses and committed data.** HTTP responses relayed through `:8080` (registered services, framework routes, event streams, the synthesized `/v1/responses`) are scrubbed of every value sealed holds, before a serve-proof is computed; WebSocket upgrades there are relayed as they are. What sealed commits on chain is scrubbed the same way (leaf roles, manifest files, files inside directory archives); drift is judged on the scrubbed content. A value removed from sealed (a set without it, an owner change) is still scrubbed, never filled, until sealed restarts (the last 1024).
+- **Responses and committed data.** HTTP responses relayed through `:8080` (registered services, framework routes, event streams, the synthesized `/v1/responses` and its stored result, `/hello`'s service list) are scrubbed of every value sealed holds, before a serve-proof is computed; a reply to an upgrade request that is not `101` is scrubbed like any other, and an accepted WebSocket upgrade is relayed as it is. A value a model streams in pieces is scrubbed in the stored result, not in the pieces as they stream. What sealed commits on chain is scrubbed the same way (leaf roles, manifest files, files inside directory archives); drift is judged on the scrubbed content. A value removed from sealed (a set without it, an owner change) is still scrubbed, never filled, until sealed restarts (the last 1024).
 - **Tools that ignore the proxy.** A tool that ignores `HTTPS_PROXY` or pins its certificates reaches its host directly with the placeholder and fails; it can use the explicit form, or a revealed value.
 - **Tokens from ordinary API calls.** A token an ordinary API call returns (not a token request) reaches the agent as returned, unless it has one of the well-known formats the proxy masks: then the agent gets `[[redacted]]` and cannot use it, and the way to obtain it is a token request.
 - **Use is not limited.** Within a key's own permissions the agent may do anything with it, including deriving new keys or signing arbitrary content with a signing entry.
 - **Rollback after a reset.** sealed refuses a lower set version across stop/start, but after a reset or a new sandbox it trusts the attestor to serve the latest set. Revoke a removed key at its provider too.
 - **Other channels.** Non-HTTP protocols and browser sessions need a revealed value; response redaction is best effort.
+- **The previous owner's container after a transfer.** sealed clears every credential within seconds of the transfer, but the container keeps running until the attestor tears it down, and until then the new owner reaches its framework routes. A value the previous owner revealed to the agent can still be in the agent's memory or files then.
 - **The framework's own traffic.** `HTTPS_PROXY` is in the framework's environment too. A host no entry names is tunnelled untouched, but the proxy refuses private-network addresses, so a framework whose HTTP client follows `HTTPS_PROXY` cannot reach a model (or anything else) on a private address.

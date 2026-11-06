@@ -92,9 +92,9 @@ Entry(string name,bytes32 defHash)
 | `DELETE /credentials/{name}` | 删除换出的条目（owner 的条目由 owner 管理） |
 | `GET /events?after=&wait=` | 长轮询：`entry_added`、`entry_removed`、`pending_opened`、`pending_decided`、`cleared`、`writeback_failed` |
 
-等待 owner 的申请有上限：同时最多 32 条（超出返回 429 `too_many_requests`），理由最多 512 个字符（超出部分截掉），参数最多 4 个、每个最多 512 个字符（`url` 为 2048）。
+等待 owner 的申请有上限：同时最多 32 条（超出返回 429 `too_many_requests`），理由最多 512 个字符且只占一行（超出部分截掉，控制字符换成空格），参数最多 4 个、每个最多 512 个字符（`url` 为 2048，且必须是 https），不能含控制字符。
 
-**交出**（`$SEAL_CRED_REVEAL_SOCKET`）：`POST /credentials/reveal {name, reason}`。设置了 `allow_reveal` 时返回 `{value}`。否则返回 403 `authorization_pending` 和 `auth_req_id`；owner 决定后，agent 原样重发请求。403 `access_denied` 表示被拒绝。批准只针对 agent 申请时的那个值：之后换出或轮换得到的 token 需要重新申请。签名密钥（`use: sign`）从不交出（403 `not_allowed`）。登录条目交出的是 access token，不是存储的登录状态。这个 socket 和上面的 socket 分开，是为了让以另一个用户运行工具的 harness 可以不让工具访问它；两个 socket 都属于 agent 用户，现有框架的工具也以这个用户运行。
+**交出**（`$SEAL_CRED_REVEAL_SOCKET`）：`POST /credentials/reveal {name, reason}`。设置了 `allow_reveal` 时返回 `{value}`。否则返回 403 `authorization_pending` 和 `auth_req_id`；owner 决定后，agent 原样重发请求。403 `access_denied` 表示被拒绝。批准只针对 agent 申请时的那个值：之后换出或轮换得到的 token 需要重新申请。对换出的 token，owner 看到的是它自己的域名、过期时间，以及换取时用的参数。签名密钥（`use: sign`）从不交出（403 `not_allowed`）。登录条目交出的是 access token，不是存储的登录状态。这个 socket 和上面的 socket 分开，是为了让以另一个用户运行工具的 harness 可以不让工具访问它；两个 socket 都属于 agent 用户，现有框架的工具也以这个用户运行。
 
 ## 框架的推理 key
 
@@ -111,13 +111,13 @@ Entry(string name,bytes32 defHash)
 | `url`、`encoding` | token 地址；`form`（默认）或 `json` |
 | `fields` | 字段 → 模板：`{v}` 是本条目的值，`{cred:<名字>}` 是其他条目的值（`jwt` 条目代表一个现签的令牌；其他签名密钥被拒绝） |
 | `basic_auth` | `{username_entry, password_entry}` |
-| `params` | agent 可以额外传的参数（如 `scope`） |
-| `take` | 从响应中取出、存成换出条目的字段：`field`、`name`、`hosts`、`positions`、`expires_in_field`；未命名时名为 `derived:<条目>.<字段>` |
+| `params` | agent 可以额外传的参数（如 `scope`）：只能是模板没有设置的字段，模板已设置的字段会被拒绝（403 `not_allowed`）。最多 512 个字符，不能含控制字符 |
+| `take` | 从响应中取出、存成换出条目的字段：`field`、`name`、`hosts`、`positions`、`expires_in_field`（秒数，数字或数字字符串）；未命名时名为 `derived:<条目>.<字段>`。换出的条目不会晚于来源条目的 `expires_at` 过期 |
 | `rotate_field` | 如 `refresh_token`：响应中的新值替换条目的值 |
 
 同一条目的换 token 一次只执行一个。失败时返回 `token_request_failed`，只带 OAuth 错误码；执行期间条目发生变化（见*所有权纪元*）时返回 409 `changed`。模板字段只填写一遍：形如 `{cred:<名字>}` 的值原样发送。登录条目不能带模板。
 
-**在 CLI 里设置。** `preset=oauth2-refresh`（值是 refresh token，会轮换并写回）和 `preset=oauth2-client`（值是 client secret）用 `token_url=`、`client_id=`、`api_host=` 生成标准的 OAuth 2.0 模板，可选 `scope=`（agent 也可以传）；refresh token 所属的 client 有 secret 时，再加 `client_secret=<条目>`。agent 对该条目执行 `POST /credentials/token`，然后在 `api_host` 上用 `[[credential:derived:<条目>]]` 作为 Bearer token。其他模板用 `token=<json>` 设置。
+**在 CLI 里设置。** `preset=oauth2-refresh`（值是 refresh token，会轮换并写回）和 `preset=oauth2-client`（值是 client secret）用 `token_url=`、`client_id=`、`api_host=` 生成标准的 OAuth 2.0 模板，可选 `scope=`（设置了就固定；不设置时 agent 可以传）；refresh token 所属的 client 有 secret 时，再加 `client_secret=<条目>`。agent 对该条目执行 `POST /credentials/token`，然后在 `api_host` 上用 `[[credential:derived:<条目>]]` 作为 Bearer token。其他模板用 `token=<json>` 设置。
 
 **写回。** sealed 自己获得的值（轮换得到的 refresh token、登录结果）加密给 agentSeal 后提交给 attestor，并由 agentSeal 对下面的消息签名：
 
@@ -150,18 +150,23 @@ CredentialWriteback.v2:<seal_id>:<name>:<binding>:<boot_id>:<keccak256(ciphertex
 
 agent 在 MCP 配置中给该服务器加请求头 `Authorization: Bearer [[credential:<名字>]]`。
 
-登录条目在凭据集加载时就按登录后的使用方式检查，代理无法使用时跳过。它的 `client_secret_entry` 必须已加载、未过期且不是签名密钥；该条目列了域名时，token 地址（来自服务器的元数据）的域名必须在其中。
+登录条目在凭据集加载时就按登录后的使用方式检查，代理无法使用时跳过。
+
+- **发现。** 元数据只通过 https 读取。受保护资源元数据里的 `resource` 必须指向这个服务器（同一 origin；路径为服务器本身的路径，或按完整路径段计的前缀，RFC 9728 §3.3）；授权服务器元数据中的 `issuer` 与预期不同时不使用（RFC 8414 §3.3）。只有作废地址与 token 地址在同一域名时才使用作废。
+- **client secret。** `client_secret_entry` 在每次使用时（换 code、每次刷新、作废）重新读取，不随登录状态保存：它必须已加载、未过期且不是签名密钥；该条目列了域名时，token 地址的域名必须在其中。不再满足时停止刷新，并给 owner 一条 `login` 待办。
+- **顺序。** 同一条目正在刷新时，登录等刷新结束后才完成，所以较新的登录生效。断开只使用登录时保存的作废地址，并把断开写回，容器重启后登录不会恢复。
+- **scope。** 条目没有 `scopes` 时，sealed 申请服务器元数据列出的 scope；owner 在授权页面上能看到。
 
 ## owner 一侧
 
-agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` / `X-Auth-Signature`（链上现任 owner 的 EIP-191 签名），格式为 `<tag>:0x<sealId>:<unix 秒>[:<sha256(body)>]:<audience>`。签名的 `POST` 只接受一次：在有效时间窗内再次发送同一条消息返回 409。
+agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` / `X-Auth-Signature`（链上现任 owner 的 EIP-191 签名），格式为 `<tag>:0x<sealId>:<unix 秒>[:<sha256(body)>]:<audience>`。签名的 `POST` 只接受一次：在有效时间窗内再次发送同一条消息返回 409。每个请求都把签名者记为 owner，所以新 owner 的第一个请求（包括读取）会先清掉前任 owner 的状态，再返回任何内容。
 
 | 路由 | Tag | |
 |---|---|---|
 | `GET` / `POST /_seal/credentials` | `0GSealCredentials` | 列出已加载条目 / 加载签名凭据集（更旧的版本返回 409 `stale_version`） |
 | `GET /_seal/credentials/pending` | `0GSealCredPending` | 待办：sealed 记录的 `facts` 与 agent 给出的 `reason` 分开展示 |
 | `POST /_seal/credentials/decide` | `0GSealCredDecide` | `{auth_req_id, decision: "once" \| "deny", approval?, signature?}` |
-| `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | agent 做了什么（代填、换 token、签名、交出、登录、写回），以及凭据集里哪些条目被跳过、原因是什么，不含值。按时间从旧到新：代理使用保留最近 1000 条，其他记录另外保留最近 1000 条，分开存放，代填不会把其他记录挤掉；sealed 自己提供的值（`sealed:` 条目，如框架的推理 key）成功使用时合并为一条记录，带 `count`、`first` 和最近一次的 `ts`。stop/start 后保留，并记下属于哪个 owner，只为同一个 owner 恢复 |
+| `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | agent 做了什么（代填、换 token、签名、交出、登录、写回），以及凭据集里哪些条目被跳过、原因是什么，不含值。按时间从旧到新：代理使用保留最近 1000 条，其他记录另外保留最近 1000 条，分开存放，代填不会把其他记录挤掉。agent 可以随意重复的操作（换 token、刷新、写回、失败的签名、预先允许的交出）以及 sealed 自己提供的值（`sealed:` 条目，如框架的推理 key）的成功使用，每类合并为一条记录，带 `count`、`first` 和最近一次的 `ts`（最多 64 类，其余合在一起）。域名和条目名截到有限长度，控制字符显示为 `?`。stop/start 后保留，并记下属于哪个 owner，只为同一个 owner 恢复；启动时读不了的已保存记录原样保留，不会被覆盖 |
 | `POST /_seal/credentials/login` | `0GSealCredLogin` | 发起 MCP 登录；返回 `{authorize_url}` |
 | `POST /_seal/credentials/disconnect` | `0GSealCredDisconnect` | 结束 MCP 登录：服务器支持时请它作废 token，并丢掉 token；返回 `{revoked, note}` |
 | `GET /_seal/oauth/callback` | 无 | 登录后浏览器的回跳 |
@@ -183,10 +188,11 @@ SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-
 
 ## 范围之外
 
-- **响应与上链数据。** 经 `:8080` 转发的 HTTP 响应（已注册的服务、框架路由、事件流、合成的 `/v1/responses`）在计算 serve-proof 之前去掉 sealed 持有的每个值；那里的 WebSocket 升级原样转发。sealed 上链的内容同样去掉这些值（leaf 角色、manifest 中的文件、目录归档里的文件），漂移判断也基于去掉值之后的内容。从 sealed 删除的值（新凭据集不再包含、owner 变更）仍会被去掉，但不再代填，直到 sealed 重启（最近 1024 个）。
+- **响应与上链数据。** 经 `:8080` 转发的 HTTP 响应（已注册的服务、框架路由、事件流、合成的 `/v1/responses` 及其保存的结果、`/hello` 的服务列表）在计算 serve-proof 之前去掉 sealed 持有的每个值；对升级请求返回的非 `101` 响应和其他响应一样处理，接受了的 WebSocket 升级原样转发。模型分段流式输出的值，在保存的结果中会被去掉，在流式输出的各段中不会。sealed 上链的内容同样去掉这些值（leaf 角色、manifest 中的文件、目录归档里的文件），漂移判断也基于去掉值之后的内容。从 sealed 删除的值（新凭据集不再包含、owner 变更）仍会被去掉，但不再代填，直到 sealed 重启（最近 1024 个）。
 - **不经过代理的工具。** 不认 `HTTPS_PROXY` 或钉死证书的工具会带着占位符直连目标并失败；可以改用显式形式，或使用交出的值。
 - **普通 API 返回的 token。** 普通 API 调用（不是换 token）返回的 token 原样到达 agent；如果它属于代理遮盖的常见格式，agent 拿到的是 `[[redacted]]`，无法使用，要拿这类 token 需用换 token。
 - **不限制用途。** 在密钥本身的权限范围内，agent 可以做任何事，包括派生新密钥、用签名条目签任意内容。
 - **reset 之后的回滚。** sealed 在 stop/start 后拒绝更低的凭据集版本，但 reset 或新建 sandbox 之后，依赖 attestor 提供最新的凭据集。删除密钥时，也要在服务商那边吊销。
 - **其他通道。** 非 HTTP 协议和浏览器登录态需要交出值；响应遮盖是尽力而为。
+- **转让后前任 owner 的容器。** 转让后几秒内 sealed 就清空所有凭据，但容器会一直运行到 attestor 将其拆除，在此之前新 owner 可以访问它的框架路由。前任 owner 交给 agent 的值，这时可能仍在 agent 的内存或文件里。
 - **框架自己的流量。** 框架的环境变量里也有 `HTTPS_PROXY`。没有条目的域名原样转发通道，但代理拒绝连接私网地址，所以 HTTP 客户端遵循 `HTTPS_PROXY` 的框架，连不上私网地址上的模型（或其他服务）。

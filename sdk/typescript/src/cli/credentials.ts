@@ -398,7 +398,8 @@ function oauth2Template(name: string, o: NonNullable<CredPatch['oauth2']>): { us
       url: o.tokenUrl!,
       encoding: 'form',
       fields,
-      params: ['scope'],
+      // A scope the owner sets is fixed; with none, the agent may ask for one.
+      params: o.scope ? [] : ['scope'],
       take: [{ field: 'access_token', name, hosts: o.apiHosts, positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }], expires_in_field: 'expires_in' }],
       ...(refresh ? { rotate_field: 'refresh_token' } : {}),
     },
@@ -532,21 +533,34 @@ export function renderPending(list: PendingCredentialRequest[]): string[] {
   return lines;
 }
 
+/**
+ * Text that came from the agent (or through it), made safe to print: control
+ * characters are shown escaped, so nothing it wrote can move the cursor or
+ * rewrite what the owner reads.
+ */
+export function printable(v: unknown): string {
+  // eslint-disable-next-line no-control-regex
+  return String(v).replace(/[\u0000-\u001f\u007f-\u009f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
 /** What sealed knows about a request, without the empty fields. */
 function factLines(p: PendingCredentialRequest): string[] {
   const f = (p.facts ?? {}) as Record<string, unknown>;
   const out: string[] = [];
-  if (typeof f.source === 'string' && f.source) out.push(`  entry      set by ${f.source}${typeof f.from === 'string' && f.from ? `, from ${f.from}` : ''}`);
-  if (Array.isArray(f.hosts) && f.hosts.length) out.push(`  hosts      ${f.hosts.join(', ')}`);
+  if (typeof f.source === 'string' && f.source) out.push(`  entry      set by ${printable(f.source)}${typeof f.from === 'string' && f.from ? `, from ${printable(f.from)}` : ''}`);
+  if (Array.isArray(f.hosts) && f.hosts.length) out.push(`  hosts      ${f.hosts.map(printable).join(', ')}`);
   if (typeof f.expires_at === 'number' && f.expires_at > 0) out.push(`  entry expires ${dateText(f.expires_at)}`);
-  if (typeof f.why === 'string' && f.why) out.push(`  why        ${f.why}`);
-  for (const [k, v] of Object.entries(p.params ?? {})) out.push(`  ${k.padEnd(10)} ${v}`);
+  if (typeof f.why === 'string' && f.why) out.push(`  why        ${printable(f.why)}`);
+  if (f.params && typeof f.params === 'object') {
+    for (const [k, v] of Object.entries(f.params as Record<string, unknown>)) out.push(`  ${printable(k).padEnd(10)} ${printable(v)}   (asked by the agent)`);
+  }
+  for (const [k, v] of Object.entries(p.params ?? {})) out.push(`  ${printable(k).padEnd(10)} ${printable(v)}`);
   return out;
 }
 
 function answerHint(p: PendingCredentialRequest): string {
-  if (p.op === 'login') return `cred <agent> connect ${p.name} ${p.params?.url ?? '<mcp-url>'}   (or deny)`;
-  if (p.op === 'add') return `cred <agent> set ${p.name}${p.params?.preset ? ` preset=${p.params.preset}` : ' …'}   (or deny)`;
+  if (p.op === 'login') return `cred <agent> connect ${p.name} ${printable(p.params?.url ?? '<mcp-url>')}   (or deny)`;
+  if (p.op === 'add') return `cred <agent> set ${p.name}${p.params?.preset ? ` preset=${printable(p.params.preset)}` : ' …'}   (or deny)`;
   return 'cred <agent> approve | deny';
 }
 
@@ -558,10 +572,10 @@ export function renderAudit(recs: AuditRecord[]): string[] {
   const counted = recs.filter((r) => r.count);
   const listed = recs.filter((r) => !r.count);
   const lines = counted.map((r) =>
-    `${r.op}  ${r.names.join(',')}  ${where(r)}  ${r.result} ×${r.count}  (${r.first ?? '?'} … ${r.ts})`,
+    printable(`${r.op}  ${(r.names ?? []).join(',')}  ${where(r)}  ${r.result} ×${r.count}  (${r.first ?? '?'} … ${r.ts})`),
   );
   if (counted.length && listed.length) lines.push('');
-  for (const r of listed) lines.push([r.ts, r.op, r.names.join(','), where(r), r.result].filter(Boolean).join('  '));
+  for (const r of listed) lines.push(printable([r.ts, r.op, (r.names ?? []).join(','), where(r), r.result].filter(Boolean).join('  ')));
   return lines;
 }
 
@@ -814,7 +828,7 @@ export async function answerPending(
   const tell: string[] = [];
   for (const p of open) {
     io.out('');
-    io.out(`⚑ the agent asks to ${p.op === 'reveal' ? `read the value of ${p.name}` : p.op === 'login' ? `be connected to ${p.params?.url ?? 'an MCP server'} as ${p.name}` : `get a credential named ${p.name}`}`);
+    io.out(`⚑ the agent asks to ${p.op === 'reveal' ? `read the value of ${p.name}` : p.op === 'login' ? `be connected to ${printable(p.params?.url ?? 'an MCP server')} as ${p.name}` : `get a credential named ${p.name}`}`);
     for (const l of factLines(p)) io.out(l);
     if (p.reason) io.out(`  the agent says: ${JSON.stringify(p.reason)}`);
     const later = (): void => {

@@ -283,7 +283,7 @@ test('cli: token requests from the OAuth 2.0 presets and from token=', () => {
   assert.deepEqual(rt.tokenRequest, {
     url: 'https://auth.crm.example/oauth/token', encoding: 'form',
     fields: { grant_type: 'refresh_token', refresh_token: '{v}', client_id: 'agent-app', client_secret: '{cred:crm-secret}', scope: 'read' },
-    params: ['scope'],
+    params: [], // the owner's scope is fixed
     take: [{ field: 'access_token', name: 'crm', hosts: ['api.crm.example'], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }], expires_in_field: 'expires_in' }],
     rotate_field: 'refresh_token',
   });
@@ -291,6 +291,7 @@ test('cli: token requests from the OAuth 2.0 presets and from token=', () => {
   const cc = applyCredPatch('svc', parseCredArgs(['preset=oauth2-client', 'token_url=https://auth.svc.example/token', 'client_id=c1', 'api_host=api.svc.example']));
   assert.deepEqual([cc.use, cc.writeback, cc.tokenRequest.rotate_field], ['token_only', false, undefined]);
   assert.deepEqual(cc.tokenRequest.fields, { grant_type: 'client_credentials', client_id: 'c1', client_secret: '{v}' });
+  assert.deepEqual(cc.tokenRequest.params, ['scope'], 'with no scope of the owner\'s, the agent may ask for one');
   for (const bad of [
     ['preset=oauth2-refresh', 'client_id=a', 'api_host=h.example'],                                  // no token_url
     ['preset=oauth2-refresh', 'token_url=http://auth.example/t', 'client_id=a', 'api_host=h.example'], // not https
@@ -550,4 +551,17 @@ test('cli: disconnect revokes at the server and removes; rm of a connection does
   ag.credentials.disconnect = async () => ({ version: 5, revoked: false, note: 'the server offers no token revocation: revoke the app\'s access at the service' });
   await credOp(ag, SEAL_ID, ['disconnect', 'linear'], io);
   assert.match(lines.at(-1), /not revoked at the server: the server offers no token revocation/);
+});
+
+test('cli: what came from the agent is printed with control characters escaped', async () => {
+  const req = { auth_req_id: '0xee', op: 'login', name: 'linear', params: { url: 'https://mcp.example/\x1b[1A\x1b[2Kx' },
+    facts: { source: 'derived', from: 'gcp', hosts: ['a.example\r'], params: { scope: 'read\x1b[8m' } }, created_at: 1, expires_at: 1794200000, status: 'pending' };
+  const lines = [];
+  await credOp({ credentials: { pending: async () => [req] } }, SEAL_ID, ['pending'], { json: false, out: (l) => lines.push(l), secret: async () => '' });
+  const text = lines.join('\n');
+  assert.ok(!/[\u0000-\u0009\u000b-\u001f]/.test(text), JSON.stringify(text));
+  assert.match(text, /\\u001b\[1A/);
+  assert.match(text, /scope\s+read\\u001b\[8m {3}\(asked by the agent\)/);
+  const audit = renderAudit([{ ts: '2026-11-07T00:00:00Z', op: 'inject', names: ['x'], host: 'h\x1b[2K', result: 'unknown_entry' }]);
+  assert.ok(!audit.join('').includes('\x1b'), audit.join(''));
 });

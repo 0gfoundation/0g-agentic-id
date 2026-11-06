@@ -92,6 +92,9 @@ type synthRecord struct {
 	errMsg    string
 	listeners map[chan synthEvent]struct{}
 	cancel    context.CancelFunc
+	// scrub is applied to the joined output when it is served: a value the
+	// model streams in pieces is whole only there.
+	scrub func([]byte) []byte
 }
 
 type synthHub struct {
@@ -158,11 +161,15 @@ func (r *synthRecord) push(name string, data map[string]any) {
 func (r *synthRecord) snapshot() map[string]any {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	text := r.output.String()
+	if r.scrub != nil {
+		text = string(r.scrub([]byte(text)))
+	}
 	out := map[string]any{
 		"id":          r.id,
 		"object":      "response",
 		"status":      r.status,
-		"output_text": r.output.String(),
+		"output_text": text,
 	}
 	if r.errMsg != "" {
 		out["error"] = map[string]any{"message": r.errMsg}

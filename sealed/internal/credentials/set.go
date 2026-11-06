@@ -334,6 +334,14 @@ func openEntry(doc Document, e SetEntry, c Check) (*Definition, []byte, string) 
 	if err != nil {
 		return nil, nil, err.Error()
 	}
+	if _, ok := parseMCPState(value); def.MCP != nil && !ok {
+		// A login entry holds a login or nothing: a disconnect written back
+		// leaves it waiting for a login.
+		if err := def.Entry([]byte("login-pending")).Validate(); err != nil {
+			return nil, nil, err.Error()
+		}
+		return &def, nil, ""
+	}
 	// An entry the proxy cannot serve is left out here, with its reason,
 	// rather than failing the whole set where the proxy loads it.
 	if err := def.Entry(value).Validate(); err != nil {

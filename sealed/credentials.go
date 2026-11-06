@@ -107,7 +107,11 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 	}, reg)
 	audit.store = store
 	// Restored once the owner is known, and only for the owner who wrote it.
-	store.SeedAudit(loadAudit())
+	if f, ok := loadAudit(); ok {
+		store.SeedAudit(f)
+	} else {
+		logger.Logf("warn: credentials: the persisted audit log could not be read; it is kept as it is, and this boot's records are not persisted")
+	}
 	go audit.flushLoop()
 
 	token := randomHex(32)
@@ -143,7 +147,7 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 			logger.Logf("OK   credentials: set v%d loaded, %d entries, %d skipped", opened.Set.Version, len(opened.Values), len(opened.Skipped))
 		}
 	}
-	go watchOwner(store, liveOwner)
+	go watchOwner(store)
 	report.SetCredentialsPending(store.PendingCount)
 	go reportPendingChanges(cfg, agentSealPriv, store)
 	logger.Logf("OK   credential proxy listening on 127.0.0.1:%d", port)
@@ -212,11 +216,9 @@ func writeCredentialFiles(ca *credproxy.CA) error {
 // keys must not serve the new one). A failed lookup changes nothing; the
 // next one tries again. Reveals, token requests, wallet signatures and
 // logins confirm the owner themselves before they go ahead.
-func watchOwner(store *credentials.Store, liveOwner func(context.Context) (common.Address, error)) {
+func watchOwner(store *credentials.Store) {
 	for {
-		if owner, err := liveOwner(context.Background()); err == nil {
-			store.ObserveOwner(owner)
-		}
+		_ = store.RefreshOwner(context.Background())
 		time.Sleep(ownerWatchInterval)
 	}
 }
@@ -316,19 +318,27 @@ func (a *auditSink) flushLoop() {
 	}
 }
 
-// loadAudit reads what an earlier boot persisted. A file that names no
-// owner (written before the owner was kept) is not restored: whose it is
-// cannot be told.
-func loadAudit() *credentials.AuditFile {
+// loadAudit reads what an earlier boot persisted (nil: nothing). A file
+// written before the owner was kept is not restored: whose it is cannot be
+// told. ok is false when a file is there but cannot be read or understood:
+// it is left as it is, and this boot does not write over it.
+func loadAudit() (f *credentials.AuditFile, ok bool) {
 	b, err := privsep.ReadFile(auditPath(), maxAuditFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, true
+	}
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	var f credentials.AuditFile
-	if json.Unmarshal(b, &f) != nil || f.Owner == (common.Address{}) {
-		return nil
+	var af credentials.AuditFile
+	if json.Unmarshal(b, &af) == nil && af.Owner != (common.Address{}) {
+		return &af, true
 	}
-	return &f
+	var unowned []credentials.AuditRecord
+	if json.Unmarshal(b, &unowned) == nil {
+		return nil, true
+	}
+	return nil, false
 }
 
 // attestorWriteback posts a value sealed obtained (a rotated refresh token,

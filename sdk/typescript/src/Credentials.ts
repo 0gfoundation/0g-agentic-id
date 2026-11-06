@@ -301,16 +301,19 @@ export class CredentialsApi {
   }
 
   /**
-   * Remove one entry. The container gets the new set first, so the entry
-   * stops working at once; then the attestor stores it. Revoke the key at its
+   * Remove one entry. The attestor stores the new set, then the container
+   * gets it, so the entry stops working at once. Revoke the key at its
    * provider as well: removing it here does not.
    */
   async remove(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ version: number }> {
     const current = await this.get(sealId);
     const keep = current.definitions.filter((d) => d.name !== name).map((d) => inputOf(d));
     const doc = await this.buildDocument(sealId, keep, current.version, current);
+    // Stored first, as put does: a container that took a version the
+    // attestor never stored would refuse the attestor's set at its next boot.
+    const version = await this.store(sealId, doc, current.version);
     await this.push(sealId, doc, opts?.agentUrl).catch(() => undefined);
-    return { version: await this.store(sealId, doc, current.version) };
+    return { version };
   }
 
   /** Turn advance permission to reveal one entry on or off. */

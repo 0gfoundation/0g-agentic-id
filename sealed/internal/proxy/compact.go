@@ -104,7 +104,9 @@ func (s *Server) admitSynthTurn() (*synthRecord, bool) {
 	if s.compact.running {
 		return nil, false
 	}
-	return s.synth.create(), true
+	rec := s.synth.create()
+	rec.scrub = s.scrubBytes
+	return rec, true
 }
 
 // SetCompact installs the applier. Late-bound like the settings appliers.

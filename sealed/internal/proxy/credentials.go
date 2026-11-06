@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+
 	"seal-verify/internal/credentials"
 )
 
@@ -29,6 +31,10 @@ type CredentialService interface {
 	StartLogin(ctx context.Context, name, redirectURI string) (string, error)
 	FinishLogin(ctx context.Context, state, code, oauthError string) (string, error)
 	Disconnect(ctx context.Context, name string) (revoked bool, note string, err error)
+	// ObserveOwner records the owner a request was signed by, the live
+	// on-chain owner: a new owner's first request clears the previous
+	// owner's state before anything of it is read or used.
+	ObserveOwner(owner common.Address) bool
 }
 
 // Scrubber replaces the credential values sealed holds with their
@@ -43,6 +49,18 @@ func (s *Server) SetScrubber(sc Scrubber) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.scrubber = sc
+}
+
+// scrubBytes replaces credential values in b; b itself when there is no
+// scrubber.
+func (s *Server) scrubBytes(b []byte) []byte {
+	s.mu.RLock()
+	sc := s.scrubber
+	s.mu.RUnlock()
+	if sc == nil {
+		return b
+	}
+	return sc.Scrub(b)
 }
 
 // scrubResponse replaces credential values in resp's headers and, as it is
@@ -92,6 +110,16 @@ func (s *Server) credentialService(w http.ResponseWriter) (CredentialService, st
 	return c, sealID, owner, true
 }
 
+// verifyCredOwner checks an owner-signed credential request (digest is the
+// body's, or "" for a read) and records its signer as the owner.
+func (s *Server) verifyCredOwner(w http.ResponseWriter, r *http.Request, c CredentialService, tag, sealID, owner, digest string) bool {
+	_, signer, ok := s.verifyOwnerSigAs(w, r, tag, sealID, owner, digest)
+	if ok {
+		c.ObserveOwner(common.HexToAddress(signer))
+	}
+	return ok
+}
+
 func readSignedBody(w http.ResponseWriter, r *http.Request, s *Server, tag, sealID, owner string) ([]byte, bool) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxCredentialBody+1))
 	if err != nil {
@@ -103,7 +131,10 @@ func readSignedBody(w http.ResponseWriter, r *http.Request, s *Server, tag, seal
 		return nil, false
 	}
 	sum := sha256.Sum256(body)
-	if _, ok := s.verifyOwnerSig(w, r, tag, sealID, owner, hex.EncodeToString(sum[:])); !ok {
+	s.mu.RLock()
+	c := s.credentials
+	s.mu.RUnlock()
+	if !s.verifyCredOwner(w, r, c, tag, sealID, owner, hex.EncodeToString(sum[:])) {
 		return nil, false
 	}
 	// A signed request is taken once: replayed within its freshness window
@@ -156,7 +187,7 @@ func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		if _, ok := s.verifyOwnerSig(w, r, "0GSealCredentials", sealID, owner, ""); !ok {
+		if !s.verifyCredOwner(w, r, c, "0GSealCredentials", sealID, owner, "") {
 			return
 		}
 		entries := c.List()
@@ -198,7 +229,7 @@ func (s *Server) handleCredentialPending(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if _, ok := s.verifyOwnerSig(w, r, "0GSealCredPending", sealID, owner, ""); !ok {
+	if !s.verifyCredOwner(w, r, c, "0GSealCredPending", sealID, owner, "") {
 		return
 	}
 	list := c.PendingList()
@@ -251,7 +282,7 @@ func (s *Server) handleCredentialAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if _, ok := s.verifyOwnerSig(w, r, "0GSealCredAudit", sealID, owner, ""); !ok {
+	if !s.verifyCredOwner(w, r, c, "0GSealCredAudit", sealID, owner, "") {
 		return
 	}
 	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)

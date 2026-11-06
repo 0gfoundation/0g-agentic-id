@@ -5,8 +5,8 @@
 //! - `POST /credentials`           owner-signed write, compare-and-swap on
 //!   the version (settings grammar under `AgenticID.Credentials.v1`).
 //! - `POST /credentials/writeback` the container: a value sealed obtained
-//!   (rotated refresh token, login), signed by agentSeal, bound to the
-//!   current boot and set version.
+//!   (rotated refresh token, login), signed by agentSeal, from the current
+//!   boot, for an entry in the set with writebacks allowed.
 //! - `GET  /credentials/pending`   owner-signed: pending-request counts of
 //!   every agent the signer owns.
 //! - `GET|POST /credentials/notify` owner-signed: read or set the address the
