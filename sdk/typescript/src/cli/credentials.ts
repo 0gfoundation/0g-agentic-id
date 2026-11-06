@@ -525,9 +525,9 @@ export function renderPending(list: PendingCredentialRequest[]): string[] {
   if (!open.length) return ['nothing waiting'];
   const lines: string[] = [];
   for (const p of open) {
-    lines.push(`${p.auth_req_id.slice(0, 10)}  ${p.op} ${p.name}   (the request lapses ${dateText(p.expires_at)})`);
+    lines.push(`${printable(p.auth_req_id.slice(0, 10))}  ${printable(p.op)} ${printable(p.name)}   (the request lapses ${dateText(p.expires_at)})`);
     lines.push(...factLines(p));
-    if (p.reason) lines.push(`  the agent says: ${JSON.stringify(p.reason)}`);
+    if (p.reason) lines.push(`  the agent says: ${printable(JSON.stringify(p.reason))}`);
     lines.push(`  answer: ${answerHint(p)}`);
   }
   return lines;
@@ -539,10 +539,11 @@ export function renderPending(list: PendingCredentialRequest[]): string[] {
  * rewrite what the owner reads.
  */
 export function printable(v: unknown): string {
-  // Control characters, and format characters (bidi overrides and the like),
-  // which could make a line read differently from what it holds.
+  // Control characters, format characters (bidi overrides and the like),
+  // spaces other than the plain one, and letters that draw as blanks, which
+  // could make a line read differently from what it holds.
   // eslint-disable-next-line no-control-regex
-  return String(v).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]|\p{Cf}|[^\P{Zs} ]/gu, (c) => `\\u${c.codePointAt(0)!.toString(16).padStart(4, '0')}`);
+  return String(v).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u115f\u1160\u3164\uffa0\u2800]|\p{Cf}|[^\P{Zs} ]/gu, (c) => `\\u${c.codePointAt(0)!.toString(16).padStart(4, '0')}`);
 }
 
 /** What sealed knows about a request, without the empty fields. */

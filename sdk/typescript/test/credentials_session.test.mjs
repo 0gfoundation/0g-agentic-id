@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { keccak256 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { CredentialsApi } from '../dist/index.js';
+import { CredentialsApi, credentialSetTypes, CREDENTIALS_DOMAIN_NAME, CREDENTIALS_DOMAIN_VERSION } from '../dist/index.js';
 import { credOp, answerPending } from '../dist/cli/credentials.js';
 
 const SEAL_PUB = '0x024e3b81af9c2234cad09d679ce6035ed1392347ce64ce405f5dcd36228a25de6e';
@@ -14,21 +14,32 @@ const SEAL_ID = '0x0fb3604de692a0a2ceae1d9e655d0dc28a8a81340534df4ba5c9a66a375f7
 const CHAIN_ID = 16602;
 const CONTRACT = '0x5BB5000000000000000000000000000000000001';
 
+// The stored set as the owner signed it (Credentials.get checks this).
+async function signed(doc) {
+  const owner = privateKeyToAccount('0x' + '11'.repeat(32));
+  doc.signature = await owner.signTypedData({
+    domain: { name: CREDENTIALS_DOMAIN_NAME, version: CREDENTIALS_DOMAIN_VERSION, chainId: CHAIN_ID, verifyingContract: CONTRACT },
+    types: credentialSetTypes, primaryType: 'CredentialSet',
+    message: { sealId: doc.set.seal_id, ownerEpoch: BigInt(doc.set.owner_epoch), version: BigInt(doc.set.version), entries: doc.set.entries.map((e) => ({ name: e.name, defHash: e.def_hash })) },
+  });
+  return doc;
+}
+
 // A stored set holding one connection.
-function storedConnection() {
+async function storedConnection() {
   const def = { v: 1, name: 'linear', hosts: ['mcp.linear.app'], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }],
     use: 'inject', value_hash: '', writeback: true, description: 'MCP server https://mcp.linear.app/mcp', mcp: { url: 'https://mcp.linear.app/mcp' } };
   const defB = Buffer.from(JSON.stringify(def));
-  return { version: 3, owner_epoch: 5, writebacks: {}, document: {
+  return { version: 3, owner_epoch: 5, writebacks: {}, document: await signed({
     set: { seal_id: SEAL_ID, owner_epoch: 5, version: 3, entries: [{ name: 'linear', def_hash: keccak256(defB) }] },
-    signature: '0x', defs: { linear: defB.toString('base64') }, values: {} } };
+    signature: '0x', defs: { linear: defB.toString('base64') }, values: {} }) };
 }
 
 // The running agent answers 503 to every owner route (its owner lookup is
 // failing), as in credentials_push.test.mjs.
-function stub() {
+async function stub() {
   const seen = [];
-  const stored = storedConnection();
+  const stored = await storedConnection();
   const server = createServer((req, res) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));

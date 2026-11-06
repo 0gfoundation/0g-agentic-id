@@ -21,7 +21,7 @@
  * including that the signer is the agent's current on-chain owner.
  */
 import { plainText } from './AgentClient';
-import { getAddress, hexToBytes, keccak256, toBytes, type Address, type Hash } from 'viem';
+import { getAddress, hexToBytes, keccak256, recoverTypedDataAddress, toBytes, type Address, type Hash, type Hex } from 'viem';
 import type { Ctx } from './context';
 import { requireWallet } from './context';
 import { eciesEncrypt } from './secretEnv';
@@ -182,6 +182,18 @@ export interface PendingCredentialRequest {
 /** The largest value sealed holds (credproxy.MaxValueLen). */
 export const MAX_VALUE_BYTES = 16 * 1024;
 
+/**
+ * Thrown when the stored set is not one this wallet signed: the attestor, or
+ * the connection to it, returned something else. Nothing is signed on top
+ * of it.
+ */
+export class CredentialsUnverifiedError extends Error {
+  constructor(readonly why: string) {
+    super(`the stored credential set is not one this wallet signed (${why}); nothing was signed`);
+    this.name = 'CredentialsUnverifiedError';
+  }
+}
+
 /** Thrown when the stored set moved on since it was read. */
 export class CredentialsConflictError extends Error {
   constructor(readonly currentVersion: number, readonly ownerEpoch: number) {
@@ -278,17 +290,62 @@ export class CredentialsApi {
     return url.replace(/\/$/, '');
   }
 
-  /** Owner-signed read of the stored set (no values). */
+  /**
+   * Owner-signed read of the stored set (no values). The set is checked to be
+   * one this wallet signed, down to each definition and stored value, since
+   * every change signs the other entries again from it; one that is not
+   * throws {@link CredentialsUnverifiedError}.
+   */
   async get(sealId: Hash): Promise<{ version: number; ownerEpoch: number; document: CredentialDocument | null; definitions: CredentialDefinition[] }> {
     const seal = sealId.toLowerCase() as Hash;
     const message = `AgenticID.Credentials.v1:${seal}:${Math.floor(Date.now() / 1000)}:0`;
     const r = await fetch(`${this.attestorUrl()}/credentials?seal_id=${seal}`, { headers: await this.ownerHeaders(message), signal: AbortSignal.timeout(10_000) });
-    if (!r.ok) throw new Error(`credentials.get: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`credentials.get: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     const body = (await r.json()) as { version: number; owner_epoch: number; document: CredentialDocument | null };
-    const definitions = body.document
-      ? body.document.set.entries.map((e) => JSON.parse(new TextDecoder().decode(fromB64(body.document!.defs[e.name]))) as CredentialDefinition)
-      : [];
+    const definitions = body.document ? await this.verified(seal, body.version, body.owner_epoch, body.document) : [];
     return { version: body.version, ownerEpoch: body.owner_epoch, document: body.document, definitions };
+  }
+
+  /** The definitions of a stored document this wallet signed for this agent, or throws. */
+  private async verified(seal: Hash, version: number, ownerEpoch: number, doc: CredentialDocument): Promise<CredentialDefinition[]> {
+    const fail = (why: string): never => {
+      throw new CredentialsUnverifiedError(why);
+    };
+    const set = doc.set;
+    if (!set || !Array.isArray(set.entries)) fail('no signed set');
+    if (String(set.seal_id).toLowerCase() !== seal) fail('it is for another agent');
+    if (set.version !== version || set.owner_epoch !== ownerEpoch) fail(`it is signed as version ${set.version}, stored as ${version}`);
+    let signer: Address | undefined;
+    try {
+      signer = await recoverTypedDataAddress({
+        domain: this.domain(),
+        types: credentialSetTypes,
+        primaryType: 'CredentialSet',
+        message: { sealId: seal, ownerEpoch: BigInt(set.owner_epoch), version: BigInt(set.version), entries: set.entries.map((x) => ({ name: x.name, defHash: x.def_hash as Hash })) },
+        signature: doc.signature as Hex,
+      });
+    } catch {
+      signer = undefined;
+    }
+    const { account } = requireWallet(this.ctx);
+    if (!signer || getAddress(signer) !== getAddress(account.address)) fail('its signature is not this wallet\'s');
+    const names = new Set<string>();
+    return set.entries.map((e) => {
+      if (names.has(e.name)) fail(`${e.name} is listed twice`);
+      names.add(e.name);
+      const raw = doc.defs?.[e.name];
+      if (typeof raw !== 'string') fail(`${e.name} has no definition`);
+      const bytes = fromB64(raw);
+      if (keccak256(bytes) !== e.def_hash) fail(`${e.name}'s definition is not the signed one`);
+      const def = JSON.parse(new TextDecoder().decode(bytes)) as CredentialDefinition;
+      if (def.name !== e.name) fail(`${e.name}'s definition names ${def.name}`);
+      // The stored value is the one the definition (so the signature) binds.
+      if (!def.mcp) {
+        const v = doc.values?.[e.name];
+        if (typeof v !== 'string' || keccak256(fromB64(v)) !== def.value_hash) fail(`${e.name}'s stored value is not the signed one`);
+      }
+      return def;
+    });
   }
 
   /**
@@ -414,7 +471,7 @@ export class CredentialsApi {
       const j = (await r.json().catch(() => ({}))) as { details?: { version?: number; owner_epoch?: number } };
       throw new CredentialsConflictError(j.details?.version ?? -1, j.details?.owner_epoch ?? -1);
     }
-    if (!r.ok) throw new Error(`credentials: store failed: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`credentials: store failed: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     return ((await r.json()) as { version: number }).version;
   }
 
@@ -435,7 +492,7 @@ export class CredentialsApi {
   private async push(sealId: Hash, doc: CredentialDocument, agentUrl?: string): Promise<void> {
     const base = agentUrl ?? (await this.agentUrl(sealId));
     const r = await this.sealRequest(sealId, base, '0GSealCredentials', '/_seal/credentials', JSON.stringify(doc));
-    if (!r.ok) throw new Error(`push to the running agent failed: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`push to the running agent failed: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
   }
 
   /**
@@ -447,7 +504,7 @@ export class CredentialsApi {
   async connect(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ authorizeUrl: string }> {
     const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
     const r = await this.sealRequest(sealId, base, '0GSealCredLogin', '/_seal/credentials/login', JSON.stringify({ name }));
-    if (!r.ok) throw new Error(`credentials.connect: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`credentials.connect: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     return { authorizeUrl: ((await r.json()) as { authorize_url: string }).authorize_url };
   }
 
@@ -492,7 +549,7 @@ export class CredentialsApi {
   async loaded(sealId: Hash, opts?: { agentUrl?: string }): Promise<{ version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number; logged_in_at?: number; status?: string }> }> {
     const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
     const r = await this.sealRequest(sealId, base, '0GSealCredentials', '/_seal/credentials');
-    if (!r.ok) throw new Error(`credentials.loaded: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`credentials.loaded: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     return (await r.json()) as { version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number; logged_in_at?: number; status?: string }> };
   }
 
@@ -500,7 +557,7 @@ export class CredentialsApi {
   async pending(sealId: Hash, opts?: { agentUrl?: string }): Promise<PendingCredentialRequest[]> {
     const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
     const r = await this.sealRequest(sealId, base, '0GSealCredPending', '/_seal/credentials/pending');
-    if (!r.ok) throw new Error(`credentials.pending: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`credentials.pending: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     return (await r.json()) as PendingCredentialRequest[];
   }
 
@@ -509,7 +566,7 @@ export class CredentialsApi {
     const { account } = requireWallet(this.ctx);
     const message = `AgenticID.CredentialsPending.v1:${account.address.toLowerCase()}:${Math.floor(Date.now() / 1000)}`;
     const r = await fetch(`${this.attestorUrl()}/credentials/pending`, { headers: await this.ownerHeaders(message), signal: AbortSignal.timeout(10_000) });
-    if (!r.ok) throw new Error(`credentials.pendingCounts: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`credentials.pendingCounts: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     return (await r.json()) as Array<{ seal_id: string; agent_id: string | null; pending: number; updated_at: number }>;
   }
 
@@ -518,7 +575,7 @@ export class CredentialsApi {
     const { account } = requireWallet(this.ctx);
     const message = `AgenticID.CredentialsNotify.v1:${account.address.toLowerCase()}:${Math.floor(Date.now() / 1000)}`;
     const r = await fetch(`${this.attestorUrl()}/credentials/notify`, { headers: await this.ownerHeaders(message), signal: AbortSignal.timeout(10_000) });
-    if (!r.ok) throw new Error(`credentials.notifyAddress: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`credentials.notifyAddress: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     return (await r.json()) as { email: string | null; enabled: boolean };
   }
 
@@ -533,7 +590,7 @@ export class CredentialsApi {
       body,
       signal: AbortSignal.timeout(10_000),
     });
-    if (!r.ok) throw new Error(`credentials.setNotifyAddress: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`credentials.setNotifyAddress: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     return (await r.json()) as { email: string | null; enabled: boolean };
   }
 
@@ -571,7 +628,7 @@ export class CredentialsApi {
 
   private async decide(sealId: Hash, base: string, body: Record<string, unknown>): Promise<void> {
     const r = await this.sealRequest(sealId, base, '0GSealCredDecide', '/_seal/credentials/decide', JSON.stringify(body));
-    if (!r.ok) throw new Error(`credentials: decision refused: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`credentials: decision refused: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
   }
 
   /**
@@ -583,7 +640,7 @@ export class CredentialsApi {
   async audit(sealId: Hash, opts?: { after?: number; agentUrl?: string }): Promise<Array<{ ts: string; op: string; names: string[]; host?: string; method?: string; result: string; count?: number; first?: string }>> {
     const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
     const r = await this.sealRequest(sealId, base, '0GSealCredAudit', `/_seal/credentials/audit?after=${opts?.after ?? 0}`);
-    if (!r.ok) throw new Error(`credentials.audit: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`credentials.audit: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     return (await r.json()) as Array<{ ts: string; op: string; names: string[]; host?: string; method?: string; result: string; count?: number; first?: string }>;
   }
 }

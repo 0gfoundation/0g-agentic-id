@@ -69,6 +69,7 @@ export type { SettingsDoc, ThinkingLevel } from './Settings';
 export {
   CredentialsApi,
   CredentialsConflictError,
+  CredentialsUnverifiedError,
   credentialSetTypes,
   approvalTypes,
   definitionOf,

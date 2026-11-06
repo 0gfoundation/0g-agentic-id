@@ -601,17 +601,26 @@ const og = (wei: bigint | null | undefined): string => (wei == null ? 'n/a' : `$
  *  q is shown (see run). */
 type Ask = ((q: string) => Promise<string>) & { fresh?: (q: string) => Promise<string> };
 
+/** An answer to a signing question this soon after it is shown was typed before it. */
+const READ_MS = 300;
+
 /**
  * The shell's `ask` as a line QUEUE, not rl.question: lines that arrive while
  * no question is pending (piped input racing the ~4s async banner) used to be
  * consumed by readline with no listener and silently dropped — commands
  * vanished with exit 0 (feedback.md F5). Buffer them instead. ask.fresh is
- * for a question whose answer signs something: on a terminal (tty), lines
- * typed before it is shown (during a turn, say) are dropped, not taken as the
- * answer.
+ * for a question whose answer signs something: on a terminal (tty), what was
+ * typed before it is shown (during a turn, say) is not its answer — neither
+ * a whole line, nor keys not yet sent with Enter, nor a line that comes in
+ * too soon after it to have been typed for it. A terminal whose line editing
+ * the shell does not do (its output is redirected) holds such keys itself,
+ * so there it is not asked at all.
  */
 export function lineQueue(
-  rl: { on(ev: 'line', f: (l: string) => void): unknown; on(ev: 'close', f: () => void): unknown; setPrompt(q: string): void; prompt(): void },
+  rl: {
+    on(ev: 'line', f: (l: string) => void): unknown; on(ev: 'close', f: () => void): unknown; setPrompt(q: string): void; prompt(): void;
+    terminal?: boolean;
+  },
   tty: () => boolean,
 ): Ask {
   const pendingLines: string[] = [];
@@ -643,9 +652,25 @@ export function lineQueue(
     rl.prompt();
     return new Promise((res, rej) => waiters.push({ res, rej }));
   };
-  ask.fresh = (q: string): Promise<string> => {
-    if (tty()) pendingLines.length = 0;
-    return ask(q);
+  ask.fresh = async (q: string): Promise<string> => {
+    if (!tty()) return ask(q);
+    if (rl.terminal === false) {
+      throw new Error('a question that signs is asked only when the session\'s output is a terminal: answer with /cred pending, then /cred approve <id> or /cred deny <id>');
+    }
+    for (;;) {
+      pendingLines.length = 0;
+      // readline keeps keys typed so far as the line being edited and would
+      // show them after q, ready for Enter; and its offset from the last
+      // redraw would move q up over the lines printed since.
+      const edit = rl as { line?: unknown; cursor?: unknown; prevRows?: unknown };
+      if (typeof edit.line === 'string') edit.line = '';
+      if (typeof edit.cursor === 'number') edit.cursor = 0;
+      if (typeof edit.prevRows === 'number') edit.prevRows = 0;
+      const shown = Date.now();
+      const a = await ask(q);
+      if (!a.trim() || Date.now() - shown >= READ_MS) return a;
+      out('  (that came in before the question could be read: answer again)\n');
+    }
   };
   return ask;
 }
@@ -2041,6 +2066,13 @@ function credIO(ask: (q: string) => Promise<string>) {
 /** Prompt for a secret with the typed characters not echoed. readline has no
  *  native masking, so suppress stdout echo for the duration of the question. */
 function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise<string> {
+  // A terminal whose line editing the shell does not do (its output is
+  // redirected) shows what is typed as it is typed.
+  if (process.stdin.isTTY && activeRl?.terminal === false) {
+    return Promise.reject(new CliError('BAD_FLAG', 'a value is typed here only when the session\'s output is a terminal: the terminal would show it as you type', {
+      remedy: 'start the session without redirecting its output',
+    }));
+  }
   return new Promise((res, rej) => {
     const stdout = process.stdout as unknown as { write: (s: string) => boolean };
     const orig = stdout.write.bind(stdout);
@@ -2315,7 +2347,10 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   out('\n');
   if (art) {
     for (let i = 0; i < Math.max(art.length, fields.length); i++) {
-      out(`  ${art[i] ?? ' '.repeat(16)}   ${fields[i] ?? ''}\n`);
+      // The avatar's cells are the CLI's own colour codes (svgPixelLines):
+      // written as they are; the fields are cleaned.
+      term(`  ${art[i] ?? ' '.repeat(16)}   `);
+      out(`${fields[i] ?? ''}\n`);
     }
   } else {
     for (const f of fields) out(`  ${f}\n`);

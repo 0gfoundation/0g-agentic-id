@@ -1163,7 +1163,7 @@ export function makeAgentClient(params: {
             // A 4xx is an answer (the route is gone, the handle is refused),
             // and asking again gets the same one.
             if (res.status < 500 && res.status !== 408 && res.status !== 429) {
-              throw new Error(`events: HTTP ${res.status}: ${text}`);
+              throw new Error(`events: HTTP ${res.status}: ${plainText(text)}`);
             }
             res = undefined;
           }

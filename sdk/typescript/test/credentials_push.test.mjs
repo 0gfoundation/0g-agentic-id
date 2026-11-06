@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { keccak256 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { CredentialsApi } from '../dist/index.js';
+import { CredentialsApi, credentialSetTypes, CREDENTIALS_DOMAIN_NAME, CREDENTIALS_DOMAIN_VERSION } from '../dist/index.js';
 import { credOp } from '../dist/cli/credentials.js';
 
 const SEAL_PUB = '0x024e3b81af9c2234cad09d679ce6035ed1392347ce64ce405f5dcd36228a25de6e';
@@ -13,19 +13,30 @@ const SEAL_ID = '0x0fb3604de692a0a2ceae1d9e655d0dc28a8a81340534df4ba5c9a66a375f7
 const CHAIN_ID = 16602;
 const CONTRACT = '0x5BB5000000000000000000000000000000000001';
 
-function storedSet() {
+// The stored set as the owner signed it (Credentials.get checks this).
+async function signed(doc) {
+  const owner = privateKeyToAccount('0x' + '11'.repeat(32));
+  doc.signature = await owner.signTypedData({
+    domain: { name: CREDENTIALS_DOMAIN_NAME, version: CREDENTIALS_DOMAIN_VERSION, chainId: CHAIN_ID, verifyingContract: CONTRACT },
+    types: credentialSetTypes, primaryType: 'CredentialSet',
+    message: { sealId: doc.set.seal_id, ownerEpoch: BigInt(doc.set.owner_epoch), version: BigInt(doc.set.version), entries: doc.set.entries.map((e) => ({ name: e.name, defHash: e.def_hash })) },
+  });
+  return doc;
+}
+
+async function storedSet() {
   const ct = Buffer.from('ciphertext-of-github');
   const def = { v: 1, name: 'github', hosts: ['api.github.com'], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }],
     use: 'inject', value_hash: keccak256(ct), allow_reveal: true };
   const defB = Buffer.from(JSON.stringify(def));
-  return { version: 3, owner_epoch: 5, writebacks: {}, document: {
+  return { version: 3, owner_epoch: 5, writebacks: {}, document: await signed({
     set: { seal_id: SEAL_ID, owner_epoch: 5, version: 3, entries: [{ name: 'github', def_hash: keccak256(defB) }] },
-    signature: '0x', defs: { github: defB.toString('base64') }, values: { github: ct.toString('base64') } } };
+    signature: '0x', defs: { github: defB.toString('base64') }, values: { github: ct.toString('base64') } }) };
 }
 
-function stub() {
+async function stub() {
   const seen = [];
-  const stored = storedSet();
+  const stored = await storedSet();
   const server = createServer((req, res) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
