@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -131,7 +132,8 @@ func (e *Entry) validateSigner() error {
 // access key id (an AWS tool given a placeholder for its secret: the proxy
 // signs the same request again with the real key). A request that does
 // neither leaves untouched. body is the buffered body; streamed means the
-// body is too large to have been buffered.
+// body is too large to have been buffered. The names are the entry signing,
+// also when it refuses, for the audit record.
 func (r *Registry) signRequest(req *http.Request, host string, body []byte, streamed bool) ([]string, *Error) {
 	host = NormalizeHost(host)
 	now := r.now()
@@ -140,7 +142,7 @@ func (r *Registry) signRequest(req *http.Request, host string, body []byte, stre
 	if name != "" {
 		e, err := r.signingEntry(name, host, now)
 		if err != nil {
-			return nil, err
+			return []string{name}, err
 		}
 		switch e.Signer.Method {
 		case SignSigV4:
@@ -148,7 +150,7 @@ func (r *Registry) signRequest(req *http.Request, host string, body []byte, stre
 		case SignHMAC:
 			return []string{name}, signHMAC(req, e, body, streamed, now)
 		}
-		return nil, refuse(http.StatusForbidden, "not_allowed", "credential %q does not sign requests", name)
+		return []string{name}, refuse(http.StatusForbidden, "not_allowed", "credential %q does not sign requests", name)
 	}
 	auth := req.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, "AWS4-HMAC-SHA256 ") {
@@ -163,7 +165,7 @@ func (r *Registry) signRequest(req *http.Request, host string, body []byte, stre
 		return nil, nil // signed with a key sealed does not hold
 	}
 	if !e.ExpiresAt.IsZero() && now.After(e.ExpiresAt) {
-		return nil, refuse(http.StatusGone, "expired", "credential %q has expired", e.Name)
+		return []string{e.Name}, refuse(http.StatusGone, "expired", "credential %q has expired", e.Name)
 	}
 	return []string{e.Name}, r.sigV4(req, e, body, streamed, now, &a)
 }
@@ -232,32 +234,33 @@ func parseAWSAuth(v string) (awsAuth, bool) {
 	return a, a.accessKeyID != "" && len(a.signedHeaders) > 0
 }
 
-// sigV4 signs req with entry e. With resign, the request keeps the date,
-// scope and signed headers the client chose and is signed again; without,
-// the proxy signs it from scratch.
+// sigV4 signs req with entry e, always for the entry's own region and
+// service. With resign, the request keeps the date and signed headers the
+// client chose and is signed again; without, the proxy signs it from scratch
+// over the host, every x-amz-* header and Content-Type and Content-MD5 when
+// present.
 func (r *Registry) sigV4(req *http.Request, e *Entry, body []byte, streamed bool, now time.Time, resign *awsAuth) *Error {
 	s := e.Signer
-	var amzDate, date, region, service string
+	region, service := s.Region, s.Service
+	var amzDate, date string
 	var signed []string
 	if resign != nil {
 		amzDate = req.Header.Get("X-Amz-Date")
 		if len(amzDate) < 8 || amzDate[:8] != resign.date {
 			return refuse(http.StatusBadRequest, "sign_failed", "an AWS-signed request must carry X-Amz-Date for its scope")
 		}
-		date, region, service = resign.date, resign.region, resign.service
+		date = resign.date
 		signed = resign.signedHeaders
 	} else {
 		amzDate = now.UTC().Format("20060102T150405Z")
-		date, region, service = amzDate[:8], s.Region, s.Service
+		date = amzDate[:8]
 		req.Header.Set("X-Amz-Date", amzDate)
-		signed = []string{"host", "x-amz-content-sha256", "x-amz-date"}
 		if s.SessionTokenEntry != "" {
-			tok := r.Get(s.SessionTokenEntry)
-			if tok == nil {
-				return refuse(http.StatusForbidden, "unknown_entry", "no credential named %q", s.SessionTokenEntry)
+			tok, err := r.sessionToken(s.SessionTokenEntry, now)
+			if err != nil {
+				return err
 			}
-			req.Header.Set("X-Amz-Security-Token", string(tok.Value))
-			signed = append(signed, "x-amz-security-token")
+			req.Header.Set("X-Amz-Security-Token", string(tok))
 		}
 		switch {
 		case !streamed:
@@ -267,7 +270,7 @@ func (r *Registry) sigV4(req *http.Request, e *Entry, body []byte, streamed bool
 		default:
 			return refuse(http.StatusRequestEntityTooLarge, "body_too_large", "a body over %d bytes cannot be signed for %s", maxBodyBytes, service)
 		}
-		sort.Strings(signed)
+		signed = freshSignedHeaders(req.Header)
 	}
 	payload := req.Header.Get("X-Amz-Content-Sha256")
 	if payload == "" {
@@ -294,6 +297,38 @@ func (r *Registry) sigV4(req *http.Request, e *Entry, body []byte, streamed bool
 	req.Header.Set("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
 		s.AccessKeyID, scope, strings.Join(signed, ";"), sig))
 	return nil
+}
+
+// freshSignedHeaders lists, sorted, the headers a fresh SigV4 signature
+// covers: host, every x-amz-* header, and content-type and content-md5 when
+// present. A header the request carries unsigned could be changed on the way
+// without the server noticing.
+func freshSignedHeaders(h http.Header) []string {
+	signed := []string{"host"}
+	for k := range h {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "x-amz-") || lk == "content-type" || lk == "content-md5" {
+			signed = append(signed, lk)
+		}
+	}
+	sort.Strings(signed)
+	return slices.Compact(signed)
+}
+
+// sessionToken is the value of the entry a sigv4 signer names for its
+// session token: a loaded entry that is not a signing key and has not
+// expired. Its value goes into the request as X-Amz-Security-Token.
+func (r *Registry) sessionToken(name string, now time.Time) ([]byte, *Error) {
+	e := r.Get(name)
+	switch {
+	case e == nil:
+		return nil, refuse(http.StatusForbidden, "unknown_entry", "no credential named %q", name)
+	case e.Use == UseSign:
+		return nil, refuse(http.StatusForbidden, "not_allowed", "credential %q is a signing key and is never written into a request", name)
+	case !e.ExpiresAt.IsZero() && now.After(e.ExpiresAt):
+		return nil, refuse(http.StatusGone, "expired", "credential %q has expired", name)
+	}
+	return e.Value, nil
 }
 
 // awsEscape is AWS's URI encoding: every byte but A-Z a-z 0-9 - _ . ~ is
@@ -555,6 +590,27 @@ func MintJWT(e *Entry, now time.Time) ([]byte, error) {
 		return nil, err
 	}
 	return []byte(input + "." + enc.EncodeToString(sig)), nil
+}
+
+// jwtExpiry is when a minted token expires: its exp claim, or a day after
+// now when it has none that reads.
+func jwtExpiry(tok []byte, now time.Time) time.Time {
+	fallback := now.Add(24 * time.Hour)
+	parts := strings.Split(string(tok), ".")
+	if len(parts) != 3 {
+		return fallback
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return fallback
+	}
+	var claims struct {
+		Exp *float64 `json:"exp"`
+	}
+	if json.Unmarshal(payload, &claims) != nil || claims.Exp == nil {
+		return fallback
+	}
+	return time.Unix(int64(*claims.Exp), 0)
 }
 
 // ── wallet ───────────────────────────────────────────────────────────────────
