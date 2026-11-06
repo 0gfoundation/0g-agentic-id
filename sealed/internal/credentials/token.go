@@ -67,6 +67,9 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 	if def == nil || value == nil {
 		return nil, tokenErr(http.StatusNotFound, "unknown_entry", "no credential named %q", name)
 	}
+	if s.expired(name) {
+		return nil, tokenErr(http.StatusGone, "expired", "credential %q has expired", name)
+	}
 	tr := def.TokenRequest
 	if tr == nil {
 		return nil, tokenErr(http.StatusForbidden, "not_allowed", "credential %q has no token request template", name)
@@ -212,6 +215,9 @@ func (s *Store) refValue(name string) (string, *credproxy.Error) {
 	s.mu.Unlock()
 	if !ok || v == nil {
 		return "", tokenErr(http.StatusNotFound, "unknown_entry", "the template refers to %q, which is not loaded", name)
+	}
+	if s.expired(name) {
+		return "", tokenErr(http.StatusGone, "expired", "the template refers to %q, which has expired", name)
 	}
 	tv, err := s.templateValue(name, v)
 	return string(tv), err

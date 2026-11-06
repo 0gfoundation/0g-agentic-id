@@ -190,9 +190,37 @@ func TestRevealNeedsApproval(t *testing.T) {
 	if cerr != nil || string(v) != "ghp_x" {
 		t.Fatalf("approved reveal: %v %q", cerr, v)
 	}
+	// The same signed approval sent again, right after its use, is refused:
+	// its request is decided.
+	if err := s.Decide(context.Background(), id, "once", a, f.sign(t, digest, f.owner)); err != ErrUnknownRequest {
+		t.Fatalf("a used approval was accepted again: %v", err)
+	}
 	// The approval is single-use.
 	if _, cerr := s.Reveal("github", ""); cerr == nil || cerr.Code != CodePending {
 		t.Fatalf("approval reused: %+v", cerr)
+	}
+}
+
+// An expired credential is not revealed (not even allowed in advance) and
+// not used in a token request, as the proxy does not fill or sign with it.
+func TestExpiredEntryNotRevealedOrUsed(t *testing.T) {
+	f := newFixture(t)
+	s, _, _ := f.store(t, nil, nil)
+	doc := f.doc(t, 1, map[string]string{"github": "ghp_x"})
+	f.editDefs(t, &doc, func(d *Definition) {
+		d.ExpiresAt = time.Now().Add(-time.Hour).Unix()
+		d.AllowReveal = true
+		d.TokenRequest = &TokenRequest{URL: "https://auth.example/token", Fields: map[string]string{"refresh_token": "{v}"},
+			Take: []TokenTake{{Field: "access_token", Hosts: []string{"api.github.com"}, Positions: []credproxy.Position{{Kind: credproxy.PosHeader, Name: "Authorization", Template: "Bearer {v}"}}}}}
+	})
+	if _, err := s.Load(context.Background(), doc, 0); err != nil {
+		t.Fatal(err)
+	}
+	if v, cerr := s.Reveal("github", ""); cerr == nil || cerr.Code != "expired" || v != nil {
+		t.Fatalf("reveal of an expired entry: %v %+v", v, cerr)
+	}
+	if _, cerr := s.Token(context.Background(), "github", nil); cerr == nil || cerr.Code != "expired" {
+		t.Fatalf("token request with an expired entry: %+v", cerr)
 	}
 }
 

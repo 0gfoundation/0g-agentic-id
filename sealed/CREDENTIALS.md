@@ -29,7 +29,7 @@ An entry's **definition** is JSON, serialized once by the client and hashed as i
 | `mcp` | a login entry: `url`, and `client_id`, `client_secret_entry`, `scopes` when needed (below) |
 | `allow_reveal` | the agent may read the value without asking each time |
 | `writeback` | sealed may store a value it obtained (rotation, login) for the next boot |
-| `expires_at`, `description` | Unix seconds; free text shown to the agent |
+| `expires_at`, `description` | Unix seconds: after it the entry is neither filled, signed with, revealed nor used in a token request; free text shown to the agent |
 
 One entry is one value used in several places: its positions hold on each of its hosts. A GitHub token, for one, serves both the API (`api.github.com`, `Authorization: Bearer`) and git (`github.com`, Basic) when the entry lists both hosts and both positions. A preset (`preset=<name>` in the CLI; `cred presets` lists them with where to create each key) is a shortcut the client expands into hosts, positions and a description; sealed never sees it.
 
@@ -160,7 +160,7 @@ Owner routes on the agent (`/_seal/*`, through `:8080`) take `X-Auth-Message` / 
 | `POST /_seal/credentials/disconnect` | `0GSealCredDisconnect` | end an MCP login: revoke at the server when it offers that, forget the tokens; `{revoked, note}` |
 | `GET /_seal/oauth/callback` | none | the browser's return from a login |
 
-**Approvals.** "Once" is an EIP-712 `Approval(bytes32 sealId,bytes32 bootId,bytes32 authReqId,bytes32 requestDigest,uint64 expiresAt)` signed by the live owner (same domain), bound to this boot, this request and its digest, used once (the SDK gives it 1 hour, never past the request's own expiry). Requests wait 72 hours and do not survive a restart; the agent asks again. A request to add a credential or log in is answered by doing it. Unanswered means no.
+**Approvals.** "Once" is an EIP-712 `Approval(bytes32 sealId,bytes32 bootId,bytes32 authReqId,bytes32 requestDigest,uint64 expiresAt)` signed by the live owner (same domain), bound to this boot, this request and its digest, used once (the SDK gives it 1 hour, never past the request's own expiry). sealed takes a decision only for a request still waiting, so an approval sent again after its use is refused. Requests wait 72 hours and do not survive a restart; the agent asks again. A request to add a credential or log in is answered by doing it. Unanswered means no.
 
 **Attestor routes** (owner messages EIP-191; see `attestor/README.md`):
 

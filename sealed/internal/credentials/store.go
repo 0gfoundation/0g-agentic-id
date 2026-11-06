@@ -522,6 +522,9 @@ func (s *Store) Reveal(name, reason string) ([]byte, *credproxy.Error) {
 	if value == nil {
 		return nil, &credproxy.Error{Status: http.StatusNotFound, Code: "unknown_entry", Message: "no credential named " + name}
 	}
+	if s.expired(name) {
+		return nil, &credproxy.Error{Status: http.StatusGone, Code: "expired", Message: "credential " + name + " has expired"}
+	}
 	if def.AllowReveal {
 		s.addAudit(AuditRecord{Time: s.now(), Op: "reveal", Names: []string{name}, Result: "allowed in advance"})
 		return value, nil
@@ -541,6 +544,14 @@ func (s *Store) Reveal(name, reason string) ([]byte, *credproxy.Error) {
 		return nil, &credproxy.Error{Status: http.StatusForbidden, Code: CodeDenied, Message: "the owner refused this request"}
 	}
 	return nil, &credproxy.Error{Status: http.StatusForbidden, Code: CodePending, Message: p.AuthReqID}
+}
+
+// expired: the entry's expiry (the owner's, or a derived token's) has passed.
+// Filling and signing refuse it in the proxy; revealing it or using it in a
+// token request must too.
+func (s *Store) expired(name string) bool {
+	e := s.reg.Get(name)
+	return e != nil && !e.ExpiresAt.IsZero() && s.now().After(e.ExpiresAt)
 }
 
 func sourceOf(from string) string {
@@ -653,8 +664,11 @@ var ErrUnknownRequest = errors.New("no such pending request")
 func (s *Store) Decide(ctx context.Context, authReqID, decision string, a *Approval, sig string) error {
 	s.mu.Lock()
 	p, ok := s.pending[authReqID]
+	open := ok && p.Status == "pending" && p.ExpiresAt >= s.now().Unix()
 	s.mu.Unlock()
-	if !ok {
+	if !open {
+		// Decided already (a used approval must not be accepted again) or
+		// gone.
 		return ErrUnknownRequest
 	}
 	switch decision {

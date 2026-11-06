@@ -29,7 +29,7 @@ owner 把第三方凭据（API key、token、refresh token、签名密钥、MCP 
 | `mcp` | 登录条目：`url`，需要时还有 `client_id`、`client_secret_entry`、`scopes`（见下文） |
 | `allow_reveal` | agent 无需每次申请即可读取值 |
 | `writeback` | 允许 sealed 把自己获得的值（轮换、登录）存下来供下次启动使用 |
-| `expires_at`、`description` | Unix 秒；给 agent 看的自由文本 |
+| `expires_at`、`description` | Unix 秒：过期后不再代填、代签、交出，也不用于换 token；给 agent 看的自由文本 |
 
 一个条目是一个值，可以用在多个地方：条目的填写位置对它的每个域名都生效。例如一个 GitHub token，条目同时写上两个域名和两种位置，就既能用于 API（`api.github.com`，`Authorization: Bearer`），也能用于 git（`github.com`，Basic）。预设（CLI 里的 `preset=<名字>`；`cred presets` 列出全部预设及各自的密钥创建地址）是快捷方式，由客户端展开成域名、位置和说明；sealed 看不到预设。
 
@@ -160,7 +160,7 @@ agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` /
 | `POST /_seal/credentials/disconnect` | `0GSealCredDisconnect` | 结束 MCP 登录：服务器支持时请它作废 token，并丢掉 token；返回 `{revoked, note}` |
 | `GET /_seal/oauth/callback` | 无 | 登录后浏览器的回跳 |
 
-**授权。** "只允许这一次"是链上现任 owner 签的 EIP-712 `Approval(bytes32 sealId,bytes32 bootId,bytes32 authReqId,bytes32 requestDigest,uint64 expiresAt)`（同一个 domain），绑定本次启动、这条申请及其摘要，只能使用一次（SDK 给 1 小时，不超过申请本身的过期时间）。待办保留 72 小时，容器重启后丢失，agent 重新申请即可。新增凭据和登录的申请，通过实际去新增、去登录来应答。不表态即视为不允许。
+**授权。** "只允许这一次"是链上现任 owner 签的 EIP-712 `Approval(bytes32 sealId,bytes32 bootId,bytes32 authReqId,bytes32 requestDigest,uint64 expiresAt)`（同一个 domain），绑定本次启动、这条申请及其摘要，只能使用一次（SDK 给 1 小时，不超过申请本身的过期时间）。sealed 只对仍在等待的申请接受决定，所以用过之后再次提交的批准会被拒绝。待办保留 72 小时，容器重启后丢失，agent 重新申请即可。新增凭据和登录的申请，通过实际去新增、去登录来应答。不表态即视为不允许。
 
 **attestor 路由**（owner 消息为 EIP-191；见 `attestor/README.zh.md`）：
 
