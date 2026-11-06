@@ -68,17 +68,17 @@ Entry(string name,bytes32 defHash)
 
 **代理。** 对条目中出现的域名发起的 `CONNECT`，代理用该根证书签发的证书终止 TLS（HTTP/1.1 和 HTTP/2）；其他域名原样转发通道。对终止的请求和显式请求，代理：
 
-- 要求每次启动的令牌；要求 CONNECT 目标、TLS SNI（IP 地址没有 SNI）和 `Host` 三者一致；显式形式中含控制字符、空格或格式字符的域名一律拒绝；同时最多服务 512 个连接（之后的连接等待）；连接空闲 2 分钟后关闭，CONNECT 通道或 WebSocket 中继双向 10 分钟没有数据时关闭；
+- 要求每次启动的令牌；要求 CONNECT 目标、TLS SNI（IP 地址没有 SNI）和 `Host` 三者一致；显式形式中含控制字符、空格或格式字符的域名一律拒绝；同时最多服务 512 个连接（之后的连接等待），所有连接合计同时最多处理 128 个请求，其中 32 个留给只代填 `sealed:` 条目的请求（超出时返回 503 `busy` 和 `Retry-After: 1`；CONNECT 通道只算作连接）；终止的连接上最多 16 个并发 HTTP/2 流，请求头最大 64 KiB；连接空闲 2 分钟后关闭，CONNECT 通道或 WebSocket 中继双向 10 分钟没有数据时关闭；
 - 拒绝连接私网、回环、链路本地、组播、未指定、NAT64 和元数据地址；不跟随重定向；
 - 只在允许的域名和位置代填占位符，否则拒绝整个请求；从不往 `Host`、`Content-Length`、`Transfer-Encoding`、`Cookie`、`Proxy-*` 里填写；
-- 只在有条目可以填写请求体字段或需要签名的域名上读取请求体。在这些域名上，代理最多缓冲 64 KiB 用于代填；更大的请求体边转发边扫描到结尾，遇到占位符就停止上传（之前的部分已经发往上游），并以 413 `body_too_large` 应答。其他域名的请求体原样转发，其中的占位符文字也原样发出，因为那里没有可以填写的地方；
+- 只在有条目可以填写请求体字段或需要签名的域名上读取请求体。在这些域名上，代理最多缓冲 64 KiB 用于代填，须在 30 秒内到达（否则返回 408 `bad_request`）；更大的请求体边转发边扫描到结尾，遇到占位符就停止上传（之前的部分已经发往上游），并以 413 `body_too_large` 应答。其他域名的请求体原样转发，其中的占位符文字也原样发出，因为那里没有可以填写的地方；
 - 请求体里出现占位符（原样出现，或解开百分号编码、JSON 转义后出现）时，只有满足以下条件才代填：只有一个 `Content-Type`，是 JSON 或表单；占位符原样书写，单独作为某个顶层字段的值；其他情况一律拒绝。表单请求体在代填后必须整体是 url 编码（占位符本身可以原样书写：`token=[[credential:x]]`）。JSON 请求体发出时，其中的 `&` 和 `;` 写成 `\u0026` 和 `\u003b`：JSON 内容不变，按表单解析它的服务器找不到字段分隔符。解开百分号编码后是占位符的路径段会被代填；
 - 先设置自己添加的请求头再签名，签名覆盖实际发出的请求；只有 `X-Amz-Date` 与当前时间相差 15 分钟以内、且 `host` 在签名头中时，才对 AWS 已签的请求重签；查询参数里有 `X-Amz-Signature`、`X-Amz-Credential` 或 `X-Amz-Algorithm` 的请求拒绝签名（`sign_failed`）；丢弃上游返回的 `X-Seal-Credential-Filled` 和 `X-Seal-Credential-Error`；
-- 要求上游不压缩，响应带任何 `Content-Encoding` 时拒绝；从响应头（名字里含值的响应头整个丢弃）和流式响应体中去掉它持有的每个值，以及本次请求里填进去的每个值和它设置的签名、session token：原文、百分号编码（大小写均可）、JSON 转义（含 `\/` 和 HTML 转义）、带引号字符串的转义、三种对齐的 base64；短于 6 字节的值、跨 WebSocket 分片的值、换行的 base64 或 hex 不做遮盖。并尽力把它不持有、但格式常见的 token（GitHub、GitLab、Slack、Stripe、`sk-` 开头的密钥、Hugging Face、Google API key、npm、Notion）替换成 `[[redacted]]`。WebSocket 逐帧读取（每帧载荷最多 1 MiB）并原位遮盖，长度不变，控制帧也一样（ping、pong 的整个载荷，close 帧状态码之后的原因）；设置了 RSV 位的帧会结束中继；`101` 响应和其他响应一样遮盖。sealed 自己往外发的内容（注册的服务、上链数据，见下文）只去掉它持有的值。
+- 要求上游不压缩，响应带任何 `Content-Encoding` 时拒绝；从响应头（名字里含值的响应头整个丢弃，不分大小写）和流式响应体中去掉它持有的每个值，以及本次请求里填进去的每个值和它设置的签名、session token：原文、百分号编码（大小写均可）、常见编码器写法的 JSON 转义（HTML 转义，`+` `'` `=` 和反引号的转义，大小写两种 `\u` 十六进制，非 ASCII 转义，`/` 写作 `\/`）、带引号字符串的转义、三种对齐的 base64；短于 6 字节的值、跨 WebSocket 分片的值、换行的 base64 或 hex 不做遮盖。并尽力把它不持有、但格式常见的 token（GitHub、GitLab、Slack、Stripe、`sk-` 开头的密钥、Hugging Face、Google API key、npm、Notion）替换成 `[[redacted]]`。WebSocket 逐帧读取（每帧载荷最多 1 MiB）并原位遮盖，长度不变，控制帧也一样（ping、pong 的整个载荷，close 帧状态码之后的原因）；设置了 RSV 位的帧会结束中继；`101` 响应和其他响应一样遮盖。sealed 自己往外发的内容（注册的服务、上链数据，见下文）只去掉它持有的值。
 
 代理填写过值的请求，其响应带 `X-Seal-Credential-Filled: <条目名>`：回显请求的服务会把占位符显示回来（值在返回途中被遮住），agent 靠这个响应头区分"填了"和"没填"。没有条目的域名走通道，那里什么都不填，也不报错，响应里不会有这个头。
 
-拒绝时返回 HTTP 错误，带 `X-Seal-Credential-Error: <代码>` 和 JSON 正文 `{code, message}`，其中不含值。代码：`unknown_entry`、`expired`（410）、`token_only`、`position_not_allowed`、`host_not_allowed`、`forbidden_header`、`body_too_large`、`private_address`、`bad_request`、`bad_target`、`target_mismatch`、`proxy_auth`、`not_allowed`、`sign_failed`、`upstream_error`、`internal`。
+拒绝时返回 HTTP 错误，带 `X-Seal-Credential-Error: <代码>` 和 JSON 正文 `{code, message}`，其中不含值。代码：`unknown_entry`、`expired`（410）、`busy`（503）、`token_only`、`position_not_allowed`、`host_not_allowed`、`forbidden_header`、`body_too_large`、`private_address`、`bad_request`（请求体未按时到达时为 408）、`bad_target`、`target_mismatch`、`proxy_auth`、`not_allowed`、`sign_failed`、`upstream_error`、`internal`。
 
 **凭据 socket**（`$SEAL_CRED_SOCKET`，属于 agent 用户，JSON）：
 
