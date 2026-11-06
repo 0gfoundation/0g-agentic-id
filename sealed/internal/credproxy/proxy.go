@@ -16,10 +16,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Record is one request that carried credentials, for the audit log. It never
@@ -53,9 +56,21 @@ type Config struct {
 	// open); zero means defaultIdleTimeout. There is no read timeout: an
 	// upload takes as long as it takes.
 	IdleTimeout time.Duration
+	// RelayIdleTimeout closes a CONNECT tunnel or a WebSocket relay once no
+	// bytes have moved in either direction for this long; zero means
+	// defaultRelayIdleTimeout. A stream that keeps moving is never cut.
+	RelayIdleTimeout time.Duration
+	// MaxConns caps the client connections the listener serves at once,
+	// tunnels and relays included; the next one waits until one closes.
+	// Zero means defaultMaxConns.
+	MaxConns int
 }
 
-const defaultIdleTimeout = 2 * time.Minute
+const (
+	defaultIdleTimeout      = 2 * time.Minute
+	defaultRelayIdleTimeout = 10 * time.Minute
+	defaultMaxConns         = 512
+)
 
 // Server is the proxy. It is an http.Handler for the loopback listener.
 type Server struct {
@@ -74,6 +89,12 @@ func New(cfg Config) *Server {
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = defaultIdleTimeout
 	}
+	if cfg.RelayIdleTimeout <= 0 {
+		cfg.RelayIdleTimeout = defaultRelayIdleTimeout
+	}
+	if cfg.MaxConns <= 0 {
+		cfg.MaxConns = defaultMaxConns
+	}
 	s := &Server{cfg: cfg}
 	s.transport = &http.Transport{
 		DialContext:         s.dial,
@@ -87,8 +108,10 @@ func New(cfg Config) *Server {
 	return s
 }
 
-// Serve accepts on ln until it is closed.
+// Serve accepts on ln until it is closed, serving at most MaxConns
+// connections at once.
 func (s *Server) Serve(ln net.Listener) error {
+	ln = &limitListener{Listener: ln, sem: make(chan struct{}, s.cfg.MaxConns), done: make(chan struct{})}
 	srv := &http.Server{
 		Handler:           s,
 		ReadHeaderTimeout: 30 * time.Second,
@@ -122,7 +145,7 @@ func (s *Server) explicit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rawHost, uerr := url.PathUnescape(segs[2])
-	if uerr != nil || rawHost == "" || strings.ContainsAny(rawHost, "@/?#") {
+	if uerr != nil || rawHost == "" || strings.ContainsAny(rawHost, "@/?#") || !printableHost(rawHost) {
 		writeErr(w, refuse(http.StatusBadRequest, "bad_target", "invalid host"))
 		return
 	}
@@ -140,6 +163,21 @@ func (s *Server) explicit(w http.ResponseWriter, r *http.Request) {
 	out.URL = &url.URL{Scheme: "https", Host: host, Path: path, RawPath: rest, RawQuery: r.URL.RawQuery}
 	out.Host = host
 	s.forward(w, out, host)
+}
+
+// printableHost reports whether h, a percent-decoded target host, is valid
+// UTF-8 with no control, space or format character, so that a message or the
+// audit record can carry it as it is.
+func printableHost(h string) bool {
+	if !utf8.ValidString(h) {
+		return false
+	}
+	for _, r := range h {
+		if unicode.IsControl(r) || unicode.IsSpace(r) || unicode.Is(unicode.Cf, r) {
+			return false
+		}
+	}
+	return true
 }
 
 // connect handles CONNECT: hosts an entry names are terminated and filled,
@@ -214,11 +252,13 @@ func (s *Server) tunnel(w http.ResponseWriter, hj http.Hijacker, r *http.Request
 	}
 	var once sync.Once
 	closeBoth := func() { conn.Close(); up.Close() }
+	idle := newIdleTimer(s.cfg.RelayIdleTimeout, conn, up)
+	defer idle.stop()
 	go func() {
-		_, _ = io.Copy(up, buf.Reader)
+		_, _ = io.Copy(up, idle.reader(buf.Reader))
 		once.Do(closeBoth)
 	}()
-	_, _ = io.Copy(conn, up)
+	_, _ = io.Copy(conn, idle.reader(up))
 	once.Do(closeBoth)
 }
 
@@ -330,21 +370,26 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 		out.Header.Set("Upgrade", "websocket")
 		out.Header.Del("Sec-WebSocket-Extensions")
 	}
-	signedWith, serr := s.cfg.Registry.signRequest(out, host, body, large != nil)
+	signedWith, signedValues, serr := s.cfg.Registry.signRequest(out, host, body, large != nil)
 	names = append(names, signedWith...)
 	if serr != nil {
 		s.record(names, host, r.Method, serr.Status, serr.Code)
 		writeErr(w, serr)
 		return
 	}
+	// What the proxy signed with (a signature, a session token) is redacted
+	// from the response like a value it filled.
+	for n, v := range signedValues {
+		filled[n] = v
+	}
+	scan, _ := large.(*bodyScan)
 	if ws {
-		s.websocket(w, out, host, names, filled)
+		s.websocket(w, out, host, names, filled, scan)
 		return
 	}
 
-	resp, err := s.transport.RoundTrip(out)
-	if err != nil {
-		e := upstreamErr(err, host)
+	resp, names, e := s.roundTrip(out, host, names, scan)
+	if e != nil {
 		s.record(names, host, r.Method, e.Status, e.Code)
 		writeErr(w, e)
 		return
@@ -365,6 +410,25 @@ func setContentLength(req *http.Request) {
 	default:
 		req.Header.Del("Content-Length")
 	}
+}
+
+// roundTrip sends out. When it fails because scan stopped the body at a
+// placeholder, the request is refused as body_too_large and the names the
+// body gave join the audit record's.
+func (s *Server) roundTrip(out *http.Request, host string, names []string, scan *bodyScan) (*http.Response, []string, *Error) {
+	resp, err := s.transport.RoundTrip(out)
+	if err == nil {
+		return resp, names, nil
+	}
+	if found, more := scan.result(); found {
+		for _, n := range more {
+			if !slices.Contains(names, n) {
+				names = append(names, n)
+			}
+		}
+		return nil, names, refuse(http.StatusRequestEntityTooLarge, "body_too_large", "a placeholder in a body over %d bytes cannot be filled", maxBodyBytes)
+	}
+	return nil, names, upstreamErr(err, host)
 }
 
 // upstreamErr is the refusal for a request that could not reach upstream.
@@ -401,7 +465,7 @@ func checkResponse(resp *http.Response) *Error {
 	for _, v := range resp.Header.Values("Content-Encoding") {
 		for _, ce := range strings.Split(v, ",") {
 			if ce = strings.TrimSpace(ce); ce != "" && !strings.EqualFold(ce, "identity") {
-				return refuse(http.StatusBadGateway, "upstream_error", "upstream sent an encoded body (%s) that cannot be redacted", ce)
+				return refuse(http.StatusBadGateway, "upstream_error", "upstream sent an encoded body, which cannot be redacted")
 			}
 		}
 	}
@@ -473,8 +537,9 @@ func copyFlush(w http.ResponseWriter, src io.Reader) {
 
 // websocket relays an upgraded HTTP/1.1 connection (its request headers set
 // by forward). The 101 response is redacted like any other; then values in
-// server frames are masked byte for byte, frame by frame (relayFrames).
-func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string, names []string, filled map[string][]byte) {
+// server frames are masked byte for byte, frame by frame (relayFrames). The
+// relay ends once no bytes have moved either way for RelayIdleTimeout.
+func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string, names []string, filled map[string][]byte, scan *bodyScan) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		e := refuse(http.StatusBadRequest, "bad_target", "WebSocket needs HTTP/1.1 toward the proxy")
@@ -482,9 +547,8 @@ func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string
 		writeErr(w, e)
 		return
 	}
-	resp, err := s.transport.RoundTrip(out)
-	if err != nil {
-		e := upstreamErr(err, host)
+	resp, names, e := s.roundTrip(out, host, names, scan)
+	if e != nil {
 		s.record(names, host, out.Method, e.Status, e.Code)
 		writeErr(w, e)
 		return
@@ -529,11 +593,13 @@ func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string
 		return
 	}
 	mask := s.cfg.Registry.proxyRedactor(true, filled)
+	idle := newIdleTimer(s.cfg.RelayIdleTimeout, conn, up)
+	defer idle.stop()
 	go func() {
-		_, _ = io.Copy(up, buf.Reader)
+		_, _ = io.Copy(up, idle.reader(buf.Reader))
 		up.Close()
 	}()
-	_ = relayFrames(conn, bufio.NewReader(up), mask)
+	_ = relayFrames(conn, bufio.NewReader(idle.reader(up)), mask)
 }
 
 // maxFramePayload is the largest frame payload held in memory and redacted
@@ -543,13 +609,16 @@ const maxFramePayload = 1 << 20
 var errBadFrame = errors.New("websocket: a frame a server may not send")
 
 // relayFrames copies server-to-client WebSocket frames (RFC 6455) from src to
-// dst. Each data frame's payload is redacted with red, a mask redactor, so it
+// dst. Each frame's payload is redacted with red, a mask redactor, so it
 // keeps its length and the frame header goes out unchanged: up to
 // maxFramePayload as a whole, beyond that in chunks (a value split across
-// chunks is still matched). A value split across the fragments of a message
-// is not matched: each fragment is a frame of its own. Control frames (close,
-// ping, pong) pass as they are. A masked frame, which a server never sends,
-// or a control frame over 125 bytes ends the relay.
+// chunks is still matched). Control frames are masked too: a ping or pong
+// payload whole, a close frame's after its two-byte status code. A value
+// split across the fragments of a message is not matched: each fragment is a
+// frame of its own. A masked frame, which a server never sends, a frame with
+// an RSV bit set (no extension is negotiated, so its payload could be in a
+// form redaction cannot read) or a control frame over 125 bytes ends the
+// relay.
 func relayFrames(dst io.Writer, src *bufio.Reader, red *redactor) error {
 	var hdr [10]byte // a server frame carries no masking key
 	for {
@@ -572,10 +641,11 @@ func relayFrames(dst io.Writer, src *bufio.Reader, red *redactor) error {
 				return errBadFrame
 			}
 		}
-		if hdr[1]&0x80 != 0 {
+		if hdr[1]&0x80 != 0 || hdr[0]&0x70 != 0 {
 			return errBadFrame
 		}
-		control := hdr[0]&0x0f >= 0x8 && hdr[0]&0x0f <= 0xa
+		op := hdr[0] & 0x0f
+		control := op >= 0x8 && op <= 0xa
 		if control && length > 125 {
 			return errBadFrame
 		}
@@ -597,17 +667,94 @@ func relayFrames(dst io.Writer, src *bufio.Reader, red *redactor) error {
 		if _, err := io.ReadFull(src, frame[n:]); err != nil {
 			return err
 		}
-		if !control {
-			p := red.apply(frame[n:])
-			if len(p) != int(length) {
-				return errBadFrame // a mask redactor keeps the length; never reached
-			}
-			copy(frame[n:], p)
+		payload := frame[n:]
+		if op == 0x8 && len(payload) >= 2 {
+			payload = payload[2:] // the status code
 		}
+		p := red.apply(payload)
+		if len(p) != len(payload) {
+			return errBadFrame // a mask redactor keeps the length; never reached
+		}
+		copy(payload, p)
 		if _, err := dst.Write(frame); err != nil {
 			return err
 		}
 	}
+}
+
+// idleTimer closes a relay's connections once no bytes have moved in either
+// direction for d: every read through reader that moves bytes starts the
+// wait again.
+type idleTimer struct {
+	d time.Duration
+	t *time.Timer
+}
+
+func newIdleTimer(d time.Duration, conns ...io.Closer) *idleTimer {
+	return &idleTimer{d: d, t: time.AfterFunc(d, func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	})}
+}
+
+func (it *idleTimer) reader(r io.Reader) io.Reader { return &activeReader{r: r, it: it} }
+
+func (it *idleTimer) stop() { it.t.Stop() }
+
+type activeReader struct {
+	r  io.Reader
+	it *idleTimer
+}
+
+func (a *activeReader) Read(p []byte) (int, error) {
+	n, err := a.r.Read(p)
+	if n > 0 {
+		a.it.t.Reset(a.it.d)
+	}
+	return n, err
+}
+
+// limitListener serves at most cap(sem) connections at once: Accept waits
+// for a free slot, and a connection gives its slot back when it is closed,
+// by the server or by the handler that took it over (a tunnel, a relay).
+type limitListener struct {
+	net.Listener
+	sem       chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	select {
+	case l.sem <- struct{}{}:
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+	c, err := l.Listener.Accept()
+	if err != nil {
+		<-l.sem
+		return nil, err
+	}
+	return &limitConn{Conn: c, release: func() { <-l.sem }}, nil
+}
+
+func (l *limitListener) Close() error {
+	err := l.Listener.Close()
+	l.closeOnce.Do(func() { close(l.done) })
+	return err
+}
+
+type limitConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
 }
 
 func (s *Server) record(names []string, host, method string, status int, code string) {
@@ -620,8 +767,9 @@ func (s *Server) record(names []string, host, method string, status int, code st
 // readBody buffers a body up to maxBodyBytes so placeholders in it can be
 // filled, or it can be signed. A larger body is passed through untouched; if
 // its first bytes already name a placeholder it is refused instead (with the
-// names, for the audit record), so a value is never left unfilled without
-// the harness hearing about it.
+// names, for the audit record), and if a later part does, the upload stops
+// there (bodyScan) and the request is refused all the same, so a value is
+// never left unfilled without the harness hearing about it.
 //
 // Only a host where some entry can fill a body field or must sign the body
 // has its bodies read at all. Anywhere else a body is relayed as it is,
@@ -644,10 +792,71 @@ func readBody(r *http.Request, inspect bool) ([]byte, io.ReadCloser, []string, *
 	if mentionsPlaceholder(head) {
 		return nil, nil, mentionedNames(head), refuse(http.StatusRequestEntityTooLarge, "body_too_large", "a placeholder in a body over %d bytes cannot be filled", maxBodyBytes)
 	}
-	return nil, struct {
-		io.Reader
-		io.Closer
-	}{io.MultiReader(bytes.NewReader(head), r.Body), r.Body}, nil, nil
+	return nil, &bodyScan{r: io.MultiReader(bytes.NewReader(head), r.Body), c: r.Body}, nil, nil
+}
+
+// scanOverlap is how many bytes of a body bodyScan keeps from one read to
+// the next: the longest form of a placeholder's opening, every byte of it
+// \u-escaped, so an opening split across reads is still found.
+const scanOverlap = 6 * len("[[credential:")
+
+// scanNameRead is how far bodyScan reads on past the opening of a
+// placeholder, for its name (the longest name, \u-escaped, is under it).
+const scanNameRead = 1 << 10
+
+var errBodyPlaceholder = errors.New("a placeholder in a body too large to fill")
+
+// bodyScan relays a body too large to fill and stops it at the first
+// placeholder it names, as written or percent- or JSON-escaped: that Read
+// fails, so the request does not go out whole, and result reports the names
+// for the refusal. It keeps only the last scanOverlap bytes between reads.
+type bodyScan struct {
+	r    io.Reader
+	c    io.Closer
+	tail []byte
+
+	mu    sync.Mutex // the transport reads the body on a goroutine of its own
+	found bool
+	names []string
+}
+
+func (b *bodyScan) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if n == 0 {
+		return n, err
+	}
+	win := append(b.tail, p[:n]...)
+	if mentionsPlaceholder(win) {
+		// Read on only until the name is in (it usually is already).
+		names := mentionedNames(win)
+		for extra, buf := 0, make([]byte, 256); len(names) == 0 && extra < scanNameRead; {
+			m, rerr := b.r.Read(buf)
+			win, extra = append(win, buf[:m]...), extra+m
+			names = mentionedNames(win)
+			if m == 0 || rerr != nil {
+				break
+			}
+		}
+		b.mu.Lock()
+		b.found, b.names = true, names
+		b.mu.Unlock()
+		return 0, errBodyPlaceholder
+	}
+	b.tail = append(b.tail[:0], win[max(0, len(win)-scanOverlap):]...)
+	return n, err
+}
+
+func (b *bodyScan) Close() error { return b.c.Close() }
+
+// result reports whether the body was stopped at a placeholder, and the
+// names it gave. A nil bodyScan found none.
+func (b *bodyScan) result() (bool, []string) {
+	if b == nil {
+		return false, nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.found, b.names
 }
 
 func writeErr(w http.ResponseWriter, e *Error) {

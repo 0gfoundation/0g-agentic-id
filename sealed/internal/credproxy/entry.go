@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -123,10 +124,13 @@ func NormalizeHost(hostport string) string {
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]*Entry
-	retired []scrubValue // oldest first, at most maxRetired
-	minted  []scrubValue // oldest first, at most maxMinted
-	gen     uint64       // advances on every change to the values Scrub covers
-	now     func() time.Time
+	// retired holds the values of owner and sealed entries, retiredDerived
+	// those of derived entries; each oldest first (retireLocked).
+	retired        []scrubValue
+	retiredDerived []scrubValue
+	minted         []scrubValue // oldest first, at most maxMinted
+	gen            uint64       // advances on every change to the values Scrub covers
+	now            func() time.Time
 
 	// formsMu guards forms, the redaction forms of every value Scrub covers
 	// as they stood at formsGen.
@@ -145,8 +149,10 @@ type scrubValue struct {
 
 // The scrub-only sets are bounded; the oldest values go first.
 const (
-	maxRetired = 1024
-	maxMinted  = 256
+	maxRetired        = 1024 // values of owner and sealed entries
+	maxRetiredDerived = 1024 // values of derived entries
+	maxRetiredPerName = 32   // in either, the values of any one entry name
+	maxMinted         = 256
 )
 
 // NewRegistry returns an empty registry.
@@ -223,20 +229,38 @@ func (r *Registry) Delete(name string) {
 }
 
 // retireLocked keeps e's value to be scrubbed for the rest of the process.
+// Values of derived entries, which every token request replaces, are kept
+// apart from those of owner and sealed entries, so the one never pushes the
+// other out; and a name keeps at most maxRetiredPerName values, so a value
+// replaced again and again (a rotated refresh token) pushes out only its own
+// earlier ones.
 func (r *Registry) retireLocked(e *Entry) {
 	if len(e.Value) == 0 {
 		return
 	}
-	kept := r.retired[:0]
-	for _, v := range r.retired {
+	list, limit := &r.retired, maxRetired
+	if strings.HasPrefix(e.Name, "derived:") {
+		list, limit = &r.retiredDerived, maxRetiredDerived
+	}
+	kept := (*list)[:0]
+	same := 0
+	for _, v := range *list {
 		if !bytes.Equal(v.value, e.Value) {
 			kept = append(kept, v)
+			if v.name == e.Name {
+				same++
+			}
 		}
 	}
-	r.retired = append(kept, scrubValue{name: e.Name, value: e.Value})
-	if len(r.retired) > maxRetired {
-		r.retired = append([]scrubValue(nil), r.retired[len(r.retired)-maxRetired:]...)
+	if same >= maxRetiredPerName {
+		i := slices.IndexFunc(kept, func(v scrubValue) bool { return v.name == e.Name })
+		kept = slices.Delete(kept, i, i+1)
 	}
+	kept = append(kept, scrubValue{name: e.Name, value: e.Value})
+	if len(kept) > limit {
+		kept = append([]scrubValue(nil), kept[len(kept)-limit:]...)
+	}
+	*list = kept
 }
 
 // holdMinted keeps a token minted for jwt entry name until its exp, so later
@@ -333,7 +357,7 @@ func (r *Registry) BasicFor(host string) (username, name string, ok bool) {
 // then the minted tokens not yet expired and the retired values, newest
 // first. Where one value appears twice the first placeholder wins.
 func (r *Registry) scrubListLocked() []secret {
-	out := make([]secret, 0, len(r.entries)+len(r.minted)+len(r.retired))
+	out := make([]secret, 0, len(r.entries)+len(r.minted)+len(r.retired)+len(r.retiredDerived))
 	for _, n := range sortedNames(r.entries) {
 		out = append(out, secret{name: n, value: r.entries[n].Value})
 	}
@@ -343,8 +367,10 @@ func (r *Registry) scrubListLocked() []secret {
 			out = append(out, secret{name: v.name, value: v.value})
 		}
 	}
-	for i := len(r.retired) - 1; i >= 0; i-- {
-		out = append(out, secret{name: r.retired[i].name, value: r.retired[i].value})
+	for _, list := range [][]scrubValue{r.retired, r.retiredDerived} {
+		for i := len(list) - 1; i >= 0; i-- {
+			out = append(out, secret{name: list[i].name, value: list[i].value})
+		}
 	}
 	return out
 }

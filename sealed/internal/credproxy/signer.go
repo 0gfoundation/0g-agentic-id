@@ -133,41 +133,45 @@ func (e *Entry) validateSigner() error {
 // signs the same request again with the real key). A request that does
 // neither leaves untouched. body is the buffered body; streamed means the
 // body is too large to have been buffered. The names are the entry signing,
-// also when it refuses, for the audit record.
-func (r *Registry) signRequest(req *http.Request, host string, body []byte, streamed bool) ([]string, *Error) {
+// also when it refuses, for the audit record. set holds what the proxy wrote
+// into the request from a credential (the signature, under the signing
+// entry's name; a session token, under its entry's), for the response's
+// redaction.
+func (r *Registry) signRequest(req *http.Request, host string, body []byte, streamed bool) ([]string, map[string][]byte, *Error) {
 	host = NormalizeHost(host)
 	now := r.now()
+	set := map[string][]byte{}
 	name := strings.TrimSpace(req.Header.Get(SignHeader))
 	req.Header.Del(SignHeader)
 	if name != "" {
 		e, err := r.signingEntry(name, host, now)
 		if err != nil {
-			return []string{name}, err
+			return []string{name}, nil, err
 		}
 		switch e.Signer.Method {
 		case SignSigV4:
-			return []string{name}, r.sigV4(req, e, body, streamed, now, nil)
+			return []string{name}, set, r.sigV4(req, e, body, streamed, now, nil, set)
 		case SignHMAC:
-			return []string{name}, signHMAC(req, e, body, streamed, now)
+			return []string{name}, set, signHMAC(req, e, body, streamed, now, set)
 		}
-		return []string{name}, refuse(http.StatusForbidden, "not_allowed", "credential %q does not sign requests", name)
+		return []string{name}, nil, refuse(http.StatusForbidden, "not_allowed", "credential %q does not sign requests", name)
 	}
 	auth := req.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, "AWS4-HMAC-SHA256 ") {
-		return nil, nil
+		return nil, nil, nil
 	}
 	a, ok := parseAWSAuth(auth)
 	if !ok {
-		return nil, nil
+		return nil, nil, nil
 	}
 	e := r.sigV4ByKeyID(a.accessKeyID, host)
 	if e == nil {
-		return nil, nil // signed with a key sealed does not hold
+		return nil, nil, nil // signed with a key sealed does not hold
 	}
 	if !e.ExpiresAt.IsZero() && now.After(e.ExpiresAt) {
-		return []string{e.Name}, refuse(http.StatusGone, "expired", "credential %q has expired", e.Name)
+		return []string{e.Name}, nil, refuse(http.StatusGone, "expired", "credential %q has expired", e.Name)
 	}
-	return []string{e.Name}, r.sigV4(req, e, body, streamed, now, &a)
+	return []string{e.Name}, set, r.sigV4(req, e, body, streamed, now, &a, set)
 }
 
 func (r *Registry) signingEntry(name, host string, now time.Time) (*Entry, *Error) {
@@ -234,20 +238,34 @@ func parseAWSAuth(v string) (awsAuth, bool) {
 	return a, a.accessKeyID != "" && len(a.signedHeaders) > 0
 }
 
+// sigV4MaxSkew is how far from now the X-Amz-Date of a request the proxy
+// re-signs may be: the clock skew AWS itself accepts.
+const sigV4MaxSkew = 15 * time.Minute
+
 // sigV4 signs req with entry e, always for the entry's own region and
-// service. With resign, the request keeps the date and signed headers the
-// client chose and is signed again; without, the proxy signs it from scratch
-// over the host, every x-amz-* header and Content-Type and Content-MD5 when
-// present.
-func (r *Registry) sigV4(req *http.Request, e *Entry, body []byte, streamed bool, now time.Time, resign *awsAuth) *Error {
+// service, in the Authorization header. With resign, the request keeps the
+// date and signed headers the client chose and is signed again: the date
+// must be within sigV4MaxSkew of now and the signed headers must include
+// host. Without, the proxy signs it from scratch over the host, every
+// x-amz-* header and Content-Type and Content-MD5 when present. Either way a
+// request that also carries a query-string signature's parameters is
+// refused. The signature, and a session token it adds, go into set.
+func (r *Registry) sigV4(req *http.Request, e *Entry, body []byte, streamed bool, now time.Time, resign *awsAuth, set map[string][]byte) *Error {
 	s := e.Signer
 	region, service := s.Region, s.Service
+	if hasQuerySignature(req.URL.RawQuery) {
+		return refuse(http.StatusBadRequest, "sign_failed", "a request carrying X-Amz-Signature, X-Amz-Credential or X-Amz-Algorithm in its query is not signed")
+	}
 	var amzDate, date string
 	var signed []string
 	if resign != nil {
 		amzDate = req.Header.Get("X-Amz-Date")
-		if len(amzDate) < 8 || amzDate[:8] != resign.date {
-			return refuse(http.StatusBadRequest, "sign_failed", "an AWS-signed request must carry X-Amz-Date for its scope")
+		at, perr := time.Parse("20060102T150405Z", amzDate)
+		if perr != nil || amzDate[:8] != resign.date || at.Sub(now).Abs() > sigV4MaxSkew {
+			return refuse(http.StatusBadRequest, "sign_failed", "an AWS-signed request must carry an X-Amz-Date for its scope, within 15 minutes of now")
+		}
+		if !slices.Contains(resign.signedHeaders, "host") {
+			return refuse(http.StatusBadRequest, "sign_failed", "an AWS-signed request must sign the host header")
 		}
 		date = resign.date
 		signed = resign.signedHeaders
@@ -261,6 +279,7 @@ func (r *Registry) sigV4(req *http.Request, e *Entry, body []byte, streamed bool
 				return err
 			}
 			req.Header.Set("X-Amz-Security-Token", string(tok))
+			set[s.SessionTokenEntry] = tok
 		}
 		switch {
 		case !streamed:
@@ -296,7 +315,25 @@ func (r *Registry) sigV4(req *http.Request, e *Entry, body []byte, streamed bool
 	sig := hex.EncodeToString(hmacSum(sha256.New, key, []byte(toSign)))
 	req.Header.Set("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
 		s.AccessKeyID, scope, strings.Join(signed, ";"), sig))
+	set[e.Name] = []byte(sig)
 	return nil
+}
+
+// hasQuerySignature reports whether a query holds a parameter of AWS's
+// query-string signing (X-Amz-Signature, X-Amz-Credential, X-Amz-Algorithm),
+// in any case. The proxy signs in the Authorization header only.
+func hasQuerySignature(rawQuery string) bool {
+	for _, part := range strings.Split(rawQuery, "&") {
+		k, _, _ := strings.Cut(part, "=")
+		if dk, err := url.QueryUnescape(k); err == nil {
+			k = dk
+		}
+		switch strings.ToLower(k) {
+		case "x-amz-signature", "x-amz-credential", "x-amz-algorithm":
+			return true
+		}
+	}
+	return false
 }
 
 // freshSignedHeaders lists, sorted, the headers a fresh SigV4 signature
@@ -427,7 +464,8 @@ func hmacHash(alg string) (func() hash.Hash, error) {
 	return nil, fmt.Errorf("unknown hmac algorithm %q", alg)
 }
 
-func signHMAC(req *http.Request, e *Entry, body []byte, streamed bool, now time.Time) *Error {
+// signHMAC signs req with hmac entry e; the encoded signature goes into set.
+func signHMAC(req *http.Request, e *Entry, body []byte, streamed bool, now time.Time, set map[string][]byte) *Error {
 	s := e.Signer
 	if streamed && strings.Contains(s.Message, "{body}") {
 		return refuse(http.StatusRequestEntityTooLarge, "body_too_large", "a body over %d bytes cannot be signed", maxBodyBytes)
@@ -460,6 +498,7 @@ func signHMAC(req *http.Request, e *Entry, body []byte, streamed bool, now time.
 	if s.Encoding == "base64" {
 		sig = base64.StdEncoding.EncodeToString(sum)
 	}
+	set[e.Name] = []byte(sig)
 	sig = s.Prefix + sig
 	if s.Header != "" {
 		req.Header.Set(s.Header, sig)
