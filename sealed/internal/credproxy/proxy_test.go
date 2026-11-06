@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1638,6 +1639,361 @@ func TestRetiredOwnerValuesOutlastChurn(t *testing.T) {
 	for _, v := range []string{fmt.Sprintf("derived-value-%06d", n-2), fmt.Sprintf("rotated-value-%06d", n-2)} {
 		if got := string(reg.Scrub([]byte(v))); got == v {
 			t.Fatalf("%s is no longer scrubbed", v)
+		}
+	}
+}
+
+// waitUntil polls cond until it holds, failing the test after d.
+func waitUntil(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(d); !cond(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+}
+
+// blockingUpstream counts the requests in flight to it and holds every
+// request for /block until release is closed (on cleanup at the latest).
+func blockingUpstream(t *testing.T) (ts *httptest.Server, inflight, peak *atomic.Int64, release func()) {
+	t.Helper()
+	inflight, peak = new(atomic.Int64), new(atomic.Int64)
+	ch := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(ch) }) }
+	ts = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := inflight.Add(1)
+		defer inflight.Add(-1)
+		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+		}
+		if r.URL.Path == "/block" {
+			<-ch
+		}
+	}))
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	t.Cleanup(release) // runs first, so Close does not wait on a held request
+	return ts, inflight, peak, release
+}
+
+// One terminated HTTP/2 connection carries at most MaxStreamsPerConn
+// requests at once, however many the client starts on it.
+func TestHTTP2StreamsPerConnectionCapped(t *testing.T) {
+	ts, _, peak, release := blockingUpstream(t)
+	h := newHarnessWith(t, ts, func(c *Config) { c.MaxConns = 1; c.IdleTimeout = 200 * time.Millisecond })
+	c := h.interceptClient(h.token)
+	const n = defaultMaxStreamsPerConn + 8
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			req, _ := http.NewRequest("GET", "https://example.com/block", nil)
+			req.Header.Set("Authorization", "Bearer [[credential:github]]")
+			resp, err := c.Do(req)
+			if err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusOK || resp.Proto != "HTTP/2.0" {
+					err = fmt.Errorf("%s %d", resp.Proto, resp.StatusCode)
+				}
+			}
+			errs <- err
+		}()
+	}
+	waitUntil(t, 10*time.Second, "requests upstream", func() bool { return peak.Load() >= defaultMaxStreamsPerConn })
+	time.Sleep(300 * time.Millisecond)
+	got := peak.Load()
+	release()
+	if got != defaultMaxStreamsPerConn {
+		t.Fatalf("%d requests in flight upstream over one connection, want %d", got, defaultMaxStreamsPerConn)
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("a request waiting for a stream never completed")
+		}
+	}
+}
+
+// The requests the proxy works on at once are capped across connections: over
+// the cap a request is answered 503 busy at once. The slots reserved for
+// requests that fill sealed: entries alone stay free for them, and a request
+// that fills another entry as well cannot take one.
+func TestRequestCapReservesSealedSlots(t *testing.T) {
+	ts, inflight, _, release := blockingUpstream(t)
+	github := &Entry{Name: "github", Hosts: []string{"example.com"}, Value: []byte(secretValue), Positions: []Position{
+		{Kind: PosHeader, Name: "Authorization", Template: "Bearer {v}"}, {Kind: PosBody, Field: "token"}}}
+	inference := &Entry{Name: "sealed:inference", Hosts: []string{"example.com"}, Value: []byte("sealed-inference-key-0123"),
+		Positions: []Position{{Kind: PosHeader, Name: "x-api-key", Template: "{v}"}}}
+	h := newHarnessWith(t, ts, func(c *Config) { c.MaxRequests = 4; c.ReservedRequests = 2 }, github, inference)
+
+	send := func(method, path, header, value, body string) *http.Response {
+		t.Helper()
+		var rd io.Reader
+		if body != "" {
+			rd = strings.NewReader(body)
+		}
+		req, _ := http.NewRequest(method, h.explicitURL(path), rd)
+		if header != "" {
+			req.Header.Set(header, value)
+		}
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		readAll(t, resp)
+		return resp
+	}
+	held := make(chan int, 4)
+	hold := func(header, value string) {
+		go func() {
+			req, _ := http.NewRequest("GET", h.explicitURL("/block"), nil)
+			req.Header.Set(header, value)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				held <- 0
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			held <- resp.StatusCode
+		}()
+	}
+	busy := func(what string, resp *http.Response) {
+		t.Helper()
+		if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get(ErrorHeader) != "busy" || resp.Header.Get("Retry-After") == "" {
+			t.Fatalf("%s: got %d %q", what, resp.StatusCode, resp.Header.Get(ErrorHeader))
+		}
+	}
+
+	// Two general slots, both taken.
+	hold("Authorization", "Bearer [[credential:github]]")
+	hold("Authorization", "Bearer [[credential:github]]")
+	waitUntil(t, 5*time.Second, "two requests upstream", func() bool { return inflight.Load() == 2 })
+	busy("a third request", send("GET", "/x", "Authorization", "Bearer [[credential:github]]", ""))
+	if rec := h.lastRecord(t); rec.Code != "busy" || rec.Status != http.StatusServiceUnavailable || len(rec.Names) != 1 || rec.Names[0] != "github" {
+		t.Fatalf("audit record %+v", rec)
+	}
+	busy("a request naming no entry", send("GET", "/x", "", "", ""))
+	busy("a request whose body fills another entry", send("POST", "/x", "x-api-key", "[[credential:sealed:inference]]", `{"token":"[[credential:github]]"}`))
+	if resp := send("GET", "/x", "x-api-key", "[[credential:sealed:inference]]", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("a request filling sealed:inference alone: got %d %q", resp.StatusCode, resp.Header.Get(ErrorHeader))
+	}
+
+	// The reserved slots taken too: nothing more goes.
+	hold("x-api-key", "[[credential:sealed:inference]]")
+	hold("x-api-key", "[[credential:sealed:inference]]")
+	waitUntil(t, 5*time.Second, "four requests upstream", func() bool { return inflight.Load() == 4 })
+	busy("a fifth request", send("GET", "/x", "x-api-key", "[[credential:sealed:inference]]", ""))
+
+	// Every slot is given back.
+	release()
+	for i := 0; i < 4; i++ {
+		if code := <-held; code != http.StatusOK {
+			t.Fatalf("a held request: got %d", code)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		if resp := send("GET", "/x", "Authorization", "Bearer [[credential:github]]", ""); resp.StatusCode != http.StatusOK {
+			t.Fatalf("after release: got %d %q", resp.StatusCode, resp.Header.Get(ErrorHeader))
+		}
+	}
+}
+
+// The part of a body the proxy buffers to fill must arrive within
+// BodyReadTimeout: a request whose body stalls is answered 408 and gives its
+// request slot back.
+func TestBufferedBodyReadTimeout(t *testing.T) {
+	ts, _ := upstream(t)
+	h := newHarnessWith(t, ts, func(c *Config) { c.BodyReadTimeout = 300 * time.Millisecond; c.MaxRequests = 1 })
+	conn, err := net.Dial("tcp", h.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, _ = conn.Write([]byte("POST /" + h.token + "/https/example.com/x HTTP/1.1\r\nHost: " + h.addr +
+		"\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"token\":"))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("a stalled body got no answer: %v", err)
+	}
+	readAll(t, resp)
+	if resp.StatusCode != http.StatusRequestTimeout || resp.Header.Get(ErrorHeader) != "bad_request" {
+		t.Fatalf("got %d %q", resp.StatusCode, resp.Header.Get(ErrorHeader))
+	}
+	resp, err = http.Get(h.explicitURL("/x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readAll(t, resp); resp.StatusCode != http.StatusOK {
+		t.Fatalf("the next request: got %d %q", resp.StatusCode, resp.Header.Get(ErrorHeader))
+	}
+}
+
+// A request head over 64 KiB is refused, on the listener and on a
+// terminated connection (HTTP/1.1 and HTTP/2); one well under it goes out.
+func TestRequestHeadSizeCapped(t *testing.T) {
+	ts, _ := upstream(t)
+	h := newHarness(t, ts)
+	clients := map[string]*http.Client{"explicit": http.DefaultClient, "h2": h.interceptClient(h.token), "h1": h.interceptClient(h.token)}
+	clients["h1"].Transport.(*http.Transport).ForceAttemptHTTP2 = false
+	for name, c := range clients {
+		for _, size := range []int{16 << 10, 100 << 10} {
+			target := "https://example.com/x"
+			if name == "explicit" {
+				target = h.explicitURL("/x")
+			}
+			req, _ := http.NewRequest("GET", target, nil)
+			req.Header.Set("X-Pad", strings.Repeat("p", size))
+			resp, err := c.Do(req)
+			status := 0
+			if err == nil {
+				// The server closes the connection after a 431.
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				status = resp.StatusCode
+			}
+			// Over HTTP/2 the client itself refuses a head over the limit the
+			// proxy advertises.
+			if refused := status != http.StatusOK; refused != (size > maxHeaderBytes) {
+				t.Fatalf("%s, %d-byte header: status %d, err %v", name, size, status, err)
+			}
+		}
+	}
+}
+
+// A header whose name holds a value is dropped, whatever the case the name
+// comes back in (Go canonicalizes it, HTTP/2 lower-cases it).
+func TestResponseHeaderNameWithValueDroppedInAnyCase(t *testing.T) {
+	const hexValue, mixedValue = "deadbeefcafebabe0123456789abcdef", "MiXeD-cAsE-vAlUe-0123"
+	for _, h2 := range []bool{false, true} {
+		ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			v := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			w.Header()["X-Echo-"+v] = []string{"1"}
+			w.Header()["X-Upper-"+strings.ToUpper(v)] = []string{"1"}
+			w.Header().Set("X-Kept", "1")
+		}))
+		ts.EnableHTTP2 = h2
+		ts.StartTLS()
+		t.Cleanup(ts.Close)
+		entry := func(name, v string) *Entry {
+			return &Entry{Name: name, Hosts: []string{"example.com"}, Value: []byte(v),
+				Positions: []Position{{Kind: PosHeader, Name: "Authorization", Template: "Bearer {v}"}}}
+		}
+		h := newHarness(t, ts, entry("hex", hexValue), entry("mixed", mixedValue))
+		for name, v := range map[string]string{"hex": hexValue, "mixed": mixedValue} {
+			req, _ := http.NewRequest("GET", h.explicitURL("/"), nil)
+			req.Header.Set("Authorization", "Bearer [[credential:"+name+"]]")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			readAll(t, resp)
+			for k := range resp.Header {
+				if strings.Contains(strings.ToLower(k), strings.ToLower(v)) {
+					t.Fatalf("HTTP/2 upstream %v: a value came back in header name %q", h2, k)
+				}
+			}
+			if resp.Header.Get("X-Kept") != "1" {
+				t.Fatalf("HTTP/2 upstream %v: other headers were dropped too: %v", h2, resp.Header)
+			}
+		}
+	}
+}
+
+// Streamed, a response is redacted as it is whole, wherever reads split it:
+// also where one value lies inside another, is a prefix of it, or overlaps
+// it.
+func TestRedactorStreamMatchesWhole(t *testing.T) {
+	for _, c := range []struct {
+		values map[string][]byte
+		stream string
+	}{
+		{map[string][]byte{"in": []byte("inner-secret-0123"), "out": []byte("OUTERHEAD-inner-secret-0123-OUTERTAIL")},
+			"x OUTERHEAD-inner-secret-0123-OUTERTAIL y inner-secret-0123 z OUTERHEAD-inner-secret-0123-OUTER"},
+		{map[string][]byte{"a": []byte("shared-prefix-0123"), "b": []byte("shared-prefix-0123-tail-SECRET")},
+			"x shared-prefix-0123-tail-SECRET y shared-prefix-0123 z shared-prefix-0123-tail"},
+		{map[string][]byte{"a": []byte("overlap-left-0123"), "b": []byte("left-0123-and-right")},
+			"x overlap-left-0123-and-right y left-0123-and-right z overlap-left-0123"},
+	} {
+		red := newProxyRedactor(c.values)
+		want := red.applyString(c.stream)
+		for _, v := range c.values {
+			if strings.Contains(want, string(v)) {
+				t.Fatalf("whole: %q", want)
+			}
+		}
+		for split := 1; split < len(c.stream); split++ {
+			src := &chunkReader{[]byte(c.stream[:split]), []byte(c.stream[split:])}
+			if out, _ := io.ReadAll(red.reader(src)); string(out) != want {
+				t.Fatalf("split %d: %q, whole %q", split, out, want)
+			}
+		}
+		var bytewise chunkReader
+		for i := range c.stream {
+			bytewise = append(bytewise, []byte{c.stream[i]})
+		}
+		if out, _ := io.ReadAll(red.reader(&bytewise)); string(out) != want {
+			t.Fatalf("byte by byte: %q, whole %q", out, want)
+		}
+	}
+}
+
+// bodyScan finds a placeholder in a large body exactly when the whole body
+// names one, wherever reads split it: also where the tail it keeps between
+// reads would start inside a run of backslashes before an escaped
+// placeholder.
+func TestBodyScanSplitInBackslashRun(t *testing.T) {
+	var opening string
+	for _, c := range "[[credential:" {
+		opening += fmt.Sprintf(`\u%04x`, c)
+	}
+	pad := strings.Repeat("a", 100)
+	for _, run := range []int{0, 1, 2, 3, 4, 100, 101} {
+		body := pad + strings.Repeat(`\`, run) + opening + `github]]"}`
+		want := mentionsPlaceholder([]byte(body))
+		if want != (run%2 == 0) {
+			t.Fatalf("run %d: the whole body names a placeholder: %v", run, want)
+		}
+		for split := 1; split < len(body); split++ {
+			b := &bodyScan{r: &chunkReader{[]byte(body[:split]), []byte(body[split:])}, c: io.NopCloser(nil)}
+			_, _ = io.ReadAll(b)
+			if found, _ := b.result(); found != want {
+				t.Fatalf("run %d, split %d: found %v, want %v", run, split, found, want)
+			}
+		}
+	}
+}
+
+// A value reflected by a JSON encoder other than Go's is redacted: plus
+// sign, apostrophe, equals sign and backtick escaped, \u hex in upper case.
+func TestRedactorJSONEscapesOfOtherEncoders(t *testing.T) {
+	for v, forms := range map[string][]string{
+		"AbCd+EfGh/IjKl<0123": {
+			"AbCd\\u002BEfGh/IjKl\\u003C0123",   // System.Text.Json
+			"AbCd+EfGh/IjKl\\u003C0123",         // upper-case hex HTML escapes
+			"AbCd+EfGh\\/IjKl\\u003C0123",       // the same, '/' escaped (PHP)
+			"AbCd\\u002bEfGh\\/IjKl\\u003c0123", // every escape, lower case
+		},
+		"Ab+Cd='Ef`Gh<0123": {
+			"Ab\\u002BCd=\\u0027Ef\\u0060Gh\\u003C0123",       // System.Text.Json
+			"Ab+Cd\\u003d\\u0027Ef`Gh\\u003c0123",             // Gson
+			"Ab+Cd=\\u0027Ef`Gh\\u003c0123",                   // Json.NET with EscapeHtml
+			"Ab\\u002BCd\\u003D\\u0027Ef\\u0060Gh\\u003C0123", // every escape, upper case
+		},
+	} {
+		red := newProxyRedactor(map[string][]byte{"k": []byte(v)})
+		for _, form := range forms {
+			if got := red.applyString(`{"echo":"` + form + `"}`); got != `{"echo":"[[credential:k]]"}` {
+				t.Errorf("%s: got %s", form, got)
+			}
 		}
 	}
 }
