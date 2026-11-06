@@ -258,6 +258,10 @@ type scrubValues struct{ value string }
 func (v scrubValues) Scrub(b []byte) []byte {
 	return []byte(strings.ReplaceAll(string(b), v.value, "[[credential:github]]"))
 }
+func (v scrubValues) NameHoldsValue(name string) bool {
+	return strings.Contains(strings.ToLower(name), strings.ToLower(v.value))
+}
+
 func (v scrubValues) ScrubReader(src io.Reader) io.Reader {
 	b, _ := io.ReadAll(src)
 	return strings.NewReader(string(v.Scrub(b)))

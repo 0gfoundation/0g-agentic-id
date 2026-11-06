@@ -562,6 +562,12 @@ func (r *Registry) Scrub(b []byte) []byte {
 	return (&redactor{sets: []*formSet{r.scrubForms()}}).apply(b)
 }
 
+// NameHoldsValue reports whether a header name holds a value Scrub covers,
+// in any letter case (HTTP clients and HTTP/2 change the case of names).
+func (r *Registry) NameHoldsValue(name string) bool {
+	return (&redactor{sets: []*formSet{r.scrubForms()}}).inName(name)
+}
+
 // ScrubReader streams src with every value Scrub covers now replaced by its
 // placeholder, holding back only what could begin a value split across
 // reads.

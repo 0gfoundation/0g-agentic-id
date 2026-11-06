@@ -45,7 +45,7 @@ const (
 	systemRootsPath    = "/etc/ssl/certs/ca-certificates.crt"
 	maxSystemRoots     = 4 << 20
 	ownerWatchInterval = 10 * time.Second
-	maxAuditFile       = 8 << 20
+	maxAuditFile       = 16 << 20
 	auditFlushInterval = 10 * time.Second
 )
 

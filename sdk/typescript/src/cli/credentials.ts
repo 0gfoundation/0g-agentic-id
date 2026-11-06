@@ -556,7 +556,9 @@ function factLines(p: PendingCredentialRequest): string[] {
   if (f.params && typeof f.params === 'object') {
     for (const [k, v] of Object.entries(f.params as Record<string, unknown>)) out.push(`  ${printable(k).padEnd(10)} ${printable(v)}   (asked by the agent)`);
   }
-  for (const [k, v] of Object.entries(p.params ?? {})) out.push(`  ${printable(k).padEnd(10)} ${printable(v)}`);
+  // The agent's own parameters, labelled as such: never laid out like what
+  // sealed knows.
+  for (const [k, v] of Object.entries(p.params ?? {})) out.push(`  the agent's ${printable(k)}: ${printable(v)}`);
   return out;
 }
 
@@ -609,7 +611,7 @@ async function disconnectOp(cred: AgenticID['credentials'], sealId: Hash, name: 
   io.out(`disconnected ${name} — version ${out.version}; ${out.revoked ? 'its tokens are revoked at the server' : `not revoked at the server: ${out.note ?? 'unknown'}`}`);
   if (out.pushWarning) {
     io.out(`the running agent did not take it: ${out.pushWarning}`);
-    if (!out.revoked) io.out(`the agent still holds the login until its next boot: revoke the app's access at the service, and restart the agent`);
+    if (!out.forgotten) io.out(`the agent still holds the login until its next boot: revoke the app's access at the service, and restart the agent`);
   }
 }
 
@@ -752,7 +754,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       } catch {
         parsed = undefined;
       }
-      if (!parsed || parsed.protocol !== 'https:') {
+      if (!parsed || parsed.protocol !== 'https:' || parsed.username || parsed.password) {
         throw new CliError('BAD_FLAG', 'connect needs the MCP server\'s https URL', { remedy: 'cred <agent> connect linear https://mcp.linear.app/mcp' });
       }
       const mcp: CredentialMCP = { url: mcpUrl! };
@@ -785,7 +787,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       if (io.json) return emitOk({ sealId, name, authorizeUrl });
       io.out(`Open this link and log in to connect ${host} to the agent (valid 10 minutes):`);
       io.out('');
-      io.out(`  ${authorizeUrl}`);
+      io.out(`  ${printable(authorizeUrl)}`);
       io.out('');
       if (!io.wait) {
         io.out(`When you have finished in the browser, \`cred <agent>\` lists ${name}; the agent uses [[credential:${name}]] as its bearer token for ${host}.`);
@@ -833,18 +835,22 @@ export async function answerPending(
 ): Promise<string[]> {
   const cred = ag.credentials;
   const at = opts.agentUrl ? { agentUrl: opts.agentUrl } : undefined;
-  const open = (await cred.pending(sealId, at)).filter((p) => p.status === 'pending' && !opts.later.has(p.auth_req_id));
+  // An agent that cannot be asked (not running yet, say) has nothing to decide.
+  const open = (await cred.pending(sealId, at).catch(() => [])).filter((p) => p.status === 'pending' && !opts.later.has(p.auth_req_id));
   if (!open.length) return [];
   const tell: string[] = [];
   for (const p of open) {
     // Read again for each request: an answer to the one before may have
     // changed them.
     const defs = (await cred.get(sealId)).definitions;
-    // Whatever the agent printed before is not carried into the prompt.
-    io.out('\x1b[0m');
+    // Whatever the agent printed before is not carried into the prompt: a
+    // soft terminal reset (margins, modes, character sets, attributes).
+    io.out('\x1b[!p\x1b[0m');
+    // The agent's words first, so that what follows them, up to the
+    // prompt, is the CLI's own.
+    if (p.reason) io.out(`the agent says: ${JSON.stringify(p.reason)}`);
     io.out(`⚑ the agent asks to ${p.op === 'reveal' ? `read the value of ${p.name}` : p.op === 'login' ? `be connected to ${printable(p.params?.url ?? 'an MCP server')} as ${p.name}` : `get a credential named ${p.name}`}`);
     for (const l of factLines(p)) io.out(l);
-    if (p.reason) io.out(`  the agent says: ${JSON.stringify(p.reason)}`);
     const later = (): void => {
       opts.later.add(p.auth_req_id);
       io.out(`  left for later — cred <agent> pending lists it`);
@@ -857,7 +863,7 @@ export async function answerPending(
       // "Always" is for the owner's own entries; a derived token is allowed
       // through the entry it came from.
       const owned = defs.some((d) => d.name === p.name);
-      const a = (await io.ask(`  [y] allow once${owned ? '  [a] always allow' : ''}  [n] refuse  [Enter] later: `)).trim().toLowerCase();
+      const a = (await io.ask(`  read ${p.name}? [y] allow once${owned ? '  [a] always allow' : ''}  [n] refuse  [Enter] later: `)).trim().toLowerCase();
       if (a === 'y') {
         await cred.approveOnce(sealId, p.auth_req_id, at);
         tell.push(`[cred] I approved your request to read ${p.name}, this once. Send the same reveal request again.`);
@@ -879,8 +885,13 @@ export async function answerPending(
         else later();
         continue;
       }
-      const a = (await io.ask(`  [s] set it now  [n] refuse  [Enter] later: `)).trim().toLowerCase();
-      if (a === 's') {
+      const a = (await io.ask(`  add ${p.name}? [s] set it now  [n] refuse  [Enter] later: `)).trim().toLowerCase();
+      // Checked again as the answer comes: an entry set meanwhile is not
+      // the agent's request to change.
+      if (a === 's' && (await cred.get(sealId)).definitions.some((d) => d.name === p.name)) {
+        io.out(`  ${p.name} was set meanwhile; to change it, run: cred <agent> set ${p.name} …`);
+        later();
+      } else if (a === 's') {
         let args = p.params?.preset ? [`preset=${p.params.preset}`] : [];
         if (!args.length) {
           const how = (await io.ask(`  how may ${p.name} be used? (preset=<name>, or host=… header='Name: … {v}' …; cred presets lists them): `)).trim();
@@ -903,8 +914,22 @@ export async function answerPending(
         else later();
         continue;
       }
-      const a = url ? (await io.ask(`  [c] connect now  [n] refuse  [Enter] later: `)).trim().toLowerCase() : '';
-      if (a === 'c' && url) {
+      let host = '';
+      try {
+        const u = url ? new URL(url) : undefined;
+        if (u && u.protocol === 'https:' && !u.username && !u.password) host = u.host;
+      } catch {
+        host = '';
+      }
+      const a = host ? (await io.ask(`  connect ${p.name} to ${printable(host)}? [c] connect now  [n] refuse  [Enter] later: `)).trim().toLowerCase() : '';
+      const moved = async (): Promise<boolean> => {
+        const now = (await cred.get(sealId)).definitions.find((d) => d.name === p.name)?.mcp?.url;
+        return !!now && now !== url;
+      };
+      if (a === 'c' && url && (await moved())) {
+        io.out(`  ${p.name} was connected elsewhere meanwhile; to change it, run: cred <agent> connect ${p.name} <url>`);
+        later();
+      } else if (a === 'c' && url) {
         const before = (await cred.loaded(sealId, at)).entries.find((e) => e.name === p.name)?.logged_in_at;
         await credOp(ag, sealId, ['connect', p.name, url], { ...io, wait: false }, opts.agentUrl);
         io.out('  waiting for the connection to complete (Esc stops waiting, not the login)…');

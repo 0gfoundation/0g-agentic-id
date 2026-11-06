@@ -44,6 +44,9 @@ type CredentialService interface {
 type Scrubber interface {
 	Scrub(b []byte) []byte
 	ScrubReader(src io.Reader) io.Reader
+	// NameHoldsValue reports whether a header name holds a value, in any
+	// letter case.
+	NameHoldsValue(name string) bool
 }
 
 // SetScrubber installs what the proxy scrubs agent responses with.
@@ -67,13 +70,12 @@ func (s *Server) scrubBytes(b []byte) []byte {
 
 // nameHoldsValue reports whether a header name holds a credential value, in
 // any letter case: Go's client and HTTP/2 change the case of header names.
-func nameHoldsValue(scrub func([]byte) []byte, name string) bool {
-	for _, n := range []string{name, strings.ToLower(name), strings.ToUpper(name)} {
-		if string(scrub([]byte(n))) != n {
-			return true
-		}
-	}
-	return false
+// False when there is no scrubber.
+func (s *Server) nameHoldsValue(name string) bool {
+	s.mu.RLock()
+	sc := s.scrubber
+	s.mu.RUnlock()
+	return sc != nil && sc.NameHoldsValue(name)
 }
 
 // scrubResponse replaces credential values in resp's headers (dropping a
@@ -86,7 +88,7 @@ func (s *Server) scrubResponse(resp *http.Response) {
 		return
 	}
 	for k, vs := range resp.Header {
-		if nameHoldsValue(sc.Scrub, k) {
+		if sc.NameHoldsValue(k) {
 			delete(resp.Header, k)
 			continue
 		}

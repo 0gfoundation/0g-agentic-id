@@ -178,10 +178,10 @@ export interface PendingCredentialRequest {
   status: 'pending' | 'approved' | 'denied';
 }
 
-/** Thrown when the stored set moved on since it was read. */
 /** The largest value sealed holds (credproxy.MaxValueLen). */
 export const MAX_VALUE_BYTES = 16 * 1024;
 
+/** Thrown when the stored set moved on since it was read. */
 export class CredentialsConflictError extends Error {
   constructor(readonly currentVersion: number, readonly ownerEpoch: number) {
     super(`credentials have moved on: the current version is ${currentVersion}; re-read and retry`);
@@ -457,8 +457,9 @@ export class CredentialsApi {
    * server confirmed; `note` says why not (no revocation endpoint, the agent
    * not running, …), in which case revoke the app's access at the service.
    */
-  async disconnect(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ version: number; revoked: boolean; note?: string; pushWarning?: string }> {
+  async disconnect(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ version: number; revoked: boolean; forgotten: boolean; note?: string; pushWarning?: string }> {
     let revoked = false;
+    let forgotten = false; // the running agent took the disconnect and forgot the tokens
     let note: string | undefined;
     try {
       const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
@@ -466,13 +467,14 @@ export class CredentialsApi {
       if (r.ok) {
         const b = (await r.json()) as { revoked: boolean; note?: string };
         revoked = b.revoked;
+        forgotten = true;
         note = b.note || undefined;
       } else note = `the agent refused: HTTP ${r.status} ${await r.text().catch(() => '')}`.trim();
     } catch (e) {
       note = `the agent could not be reached (${e instanceof Error ? e.message : String(e)}): revoke the app's access at the service`;
     }
     const { version, pushWarning } = await this.remove(sealId, name, opts);
-    return { version, revoked, note, pushWarning };
+    return { version, revoked, forgotten, note, pushWarning };
   }
 
   /**

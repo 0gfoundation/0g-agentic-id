@@ -262,6 +262,10 @@ func (s *Store) FinishLogin(ctx context.Context, state, code, oauthError, iss st
 		s.audit("login", a.name, a.tokenURL, "failed")
 		return a.name, err
 	}
+	if len(tok.access) > credproxy.MaxValueLen {
+		s.audit("login", a.name, a.tokenURL, "refused: the access token is over the size sealed holds")
+		return a.name, loginErr("the server's access token is over %d bytes, more than sealed holds", credproxy.MaxValueLen)
+	}
 	st := &mcpState{V: 1, Type: "mcp_login", AccessToken: tok.access, RefreshToken: tok.refresh, LoggedInAt: s.now().Unix(),
 		ClientID: a.clientID, TokenURL: a.tokenURL, Resource: a.resource, RevocationURL: a.revocationURL}
 	if !a.secretFromEntry {
@@ -388,6 +392,11 @@ func (s *Store) refreshLogin(name, access string, attempt int) {
 			return
 		}
 		s.askLogin(name, def, gen, "the login could not be refreshed")
+		return
+	}
+	if len(tok.access) > credproxy.MaxValueLen {
+		s.auditRepeat("refresh", name, st.TokenURL, "refused: the access token is over the size sealed holds")
+		s.askLogin(name, def, gen, "the server's access token is over the size sealed holds")
 		return
 	}
 	next := *st
@@ -742,18 +751,18 @@ func (s *Store) discover(ctx context.Context, mcpURL string) (*authServer, error
 			return nil, loginErr("the authorization server does not support PKCE with S256")
 		}
 		for _, e := range []string{meta.AuthorizationEndpoint, meta.TokenEndpoint} {
-			if !strings.HasPrefix(e, "https://") {
-				return nil, loginErr("the authorization server's endpoints must be https")
+			if !cleanHTTPS(e) {
+				return nil, loginErr("the authorization server's endpoints must be plain https URLs")
 			}
 		}
-		if meta.RegistrationEndpoint != "" && !strings.HasPrefix(meta.RegistrationEndpoint, "https://") {
+		if meta.RegistrationEndpoint != "" && !cleanHTTPS(meta.RegistrationEndpoint) {
 			meta.RegistrationEndpoint = ""
 		}
 		as.authorize, as.token, as.register = meta.AuthorizationEndpoint, meta.TokenEndpoint, meta.RegistrationEndpoint
 		as.issuer, as.issParam = issuer, meta.IssParameterSupported
 		// Revocation is asked only on the token endpoint's host, where the
 		// tokens and a client secret already go.
-		if strings.HasPrefix(meta.RevocationEndpoint, "https://") && sameHost(meta.RevocationEndpoint, meta.TokenEndpoint) {
+		if cleanHTTPS(meta.RevocationEndpoint) && sameHost(meta.RevocationEndpoint, meta.TokenEndpoint) {
 			as.revocation = meta.RevocationEndpoint
 		}
 		if len(as.scopes) == 0 {
@@ -779,6 +788,14 @@ func (s *Store) getJSON(ctx context.Context, u string, v any) error {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, maxMetadata)).Decode(v)
+}
+
+// cleanHTTPS reports whether u is an https URL with a host, no userinfo,
+// and no control or format characters: what sealed sends the owner to (the
+// authorization link) or posts to.
+func cleanHTTPS(u string) bool {
+	p, err := url.Parse(u)
+	return err == nil && p.Scheme == "https" && p.Host != "" && p.User == nil && !hasControl(u) && !strings.ContainsAny(u, " ")
 }
 
 // resourceCovers reports whether resource identifies the MCP server at

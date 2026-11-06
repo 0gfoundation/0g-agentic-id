@@ -384,6 +384,12 @@ func auditRecord(now time.Time, op, name, target, result string) AuditRecord {
 // meanwhile (its binding changed). had says whether the entry had a value
 // before. A failed write is retried in the background.
 func (s *Store) rotate(ctx context.Context, def *Definition, gen uint64, value []byte) (applied, had bool) {
+	// A value the proxy could not serve (over credproxy.MaxValueLen, say)
+	// is not taken: the entry keeps the value it has.
+	if err := def.Entry(value).Validate(); err != nil {
+		s.auditRepeat("rotate", def.Name, "", "refused: "+err.Error())
+		return false, false
+	}
 	s.mu.Lock()
 	cur := s.defs[def.Name]
 	if s.gen != gen || cur == nil || cur.Binding() != def.Binding() {

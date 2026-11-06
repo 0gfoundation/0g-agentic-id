@@ -189,7 +189,7 @@ export function makeBrake(
     const client = getClient();
     if (!client?.interrupt) { print('\n(this agent image has no interrupt endpoint — /reset is the only stop)\n'); return; }
     client.interrupt().then(
-      (r) => print(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + (r.note ?? 'not supported') + ')\n'),
+      (r) => print(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + cleanCell(r.note ?? 'not supported') + ')\n'),
       // NOT a prompt: the loop's ask() is pending right now — a notice only.
       // The seat argument is deliberately NOT called from here.
       (e) => print(brakeInterruptLine(e)),
@@ -2506,8 +2506,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           agentUrl: s.url, later: credLater, tokenize, signal: ac.signal,
         });
         if (tell.length) queued.push(tell.join('\n'));
-      } catch {
-        // No owner wallet here, or the agent cannot be asked: nothing to decide.
+      } catch (e) {
+        // No owner wallet here: nothing to decide. Anything else the owner
+        // must see (a decision that did not go through).
+        if (!(e instanceof CliError && e.code === 'WALLET_REQUIRED')) {
+          out(`\n(credential requests: ${cleanCell(e instanceof Error ? e.message : String(e))})\n`);
+        }
       } finally {
         irq.streaming = null;
       }
@@ -2644,7 +2648,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         try {
           const r = await s.ag.agent.clearConversation(s.url, BigInt(s.agentId), clientInstanceId);
           messages.length = 0;
-          out(`${r.note ?? 'conversation cleared'}\n`);
+          out(`${cleanCell(r.note ?? 'conversation cleared')}\n`);
         } catch (e) {
           // clear is a seat-gated POST — a displaced 409 is a seat event here too
           if (await routeTaskFailure(out, displacedSeat, e, '', 'retry /clear') !== 'raw') continue;
@@ -2666,7 +2670,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out('compacting the conversation (one or more model calls; can take a few minutes)…\n');
         try {
           const r = await s.ag.agent.compactConversation(s.url, BigInt(s.agentId), clientInstanceId);
-          out(`${r.note ?? 'conversation compacted'}\n`);
+          out(`${cleanCell(r.note ?? 'conversation compacted')}\n`);
         } catch (e) {
           // compact is a seat-gated POST — a displaced 409 is a seat event;
           // every other 409 (e.g. "compact refused") stays a compact error
@@ -2696,7 +2700,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (line === '/agentlog' || line.startsWith('/agentlog ')) {
         if (!s.client?.logs) { out(s.client ? '(logs unavailable — owner key needed)' : `agent is ${s.phase} — /start or /reset first`); out('\n'); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
-        out(`${await s.client.logs({ tail: n })}\n`); continue;
+        out(`${cleanStream(await s.client.logs({ tail: n }))}\n`); continue;
       }
       if (line === '/startuplog' || line.startsWith('/startuplog ')) {
         // The sealed runtime serves /log from early boot — mid-`deploying` is
@@ -2778,7 +2782,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         }));
         if (displacedFromTasks && (await displacedSeat(displacedFromTasks, 'retry /tasks')) !== null) continue;
         for (const t of rows.reverse()) {
-          out(`  ${t.id}  ${t.status.padEnd(12)} ${Math.round((Date.now() - t.at) / 1000)}s ago  ${t.prompt}\n`);
+          out(`  ${cleanCell(t.id)}  ${cleanCell(t.status).padEnd(12)} ${Math.round((Date.now() - t.at) / 1000)}s ago  ${cleanCell(t.prompt)}\n`);
         }
         out('re-attach with /result [id] (default: latest)\n');
         continue;
@@ -2790,8 +2794,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (named && s.client?.taskInfo) {
           const t = await s.client.taskInfo(named).catch(() => null);
           if (t && t.type !== 'turn') {
-            out(`${cleanCell(t.id)} — ${t.status} · by ${t.actor} · ${cleanCell(t.label)}\n`);
-            if (t.output_text) out(`${t.output_text}\n`);
+            out(`${cleanCell(t.id)} — ${cleanCell(t.status)} · by ${cleanCell(t.actor)} · ${cleanCell(t.label)}\n`);
+            if (t.output_text) out(`${cleanStream(t.output_text)}\n`);
             else if (t.type === 'command') out('(a command\'s output goes to the agent, which reports on it when the command finishes — /inbox)\n');
             if (t.error) out(`error: ${cleanCell(t.error)}\n`);
             continue;
@@ -2816,8 +2820,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!snap) continue;
         if (snap.status === 'completed' || snap.status === 'cancelled' || snap.status === 'failed') {
           out(`task ${id} — ${snap.status}\n`);
-          if (snap.output_text) out(`${snap.output_text}\n`);
-          if (snap.error) out(`error: ${snap.error.message}\n`);
+          if (snap.output_text) out(`${cleanStream(snap.output_text)}\n`);
+          if (snap.error) out(`error: ${cleanCell(snap.error.message)}\n`);
           continue;
         }
         // Still running: re-attach live. Text so far arrives via the replay
@@ -2908,7 +2912,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
               for (;;) {
                 try {
                   const t = await s.client.cancelTask(tid);
-                  out(`⏹ cancel ${tid} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
+                  out(`⏹ cancel ${cleanCell(tid)} — ${t.status === 'completed' ? 'already finished' : cleanCell(t.status)}\n`);
                   break;
                 } catch (e) {
                   const d = await routeTaskFailure(out, displacedSeat, e, `(cancel ${tid} failed: ${(e as Error).message})\n`, `retry /cancel ${tid}`);
@@ -2926,7 +2930,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           for (;;) {
             try {
               const t = await s.client.cancelTask(id);
-              out(`⏹ cancel ${id} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
+              out(`⏹ cancel ${cleanCell(id)} — ${t.status === 'completed' ? 'already finished' : cleanCell(t.status)}\n`);
               break;
             } catch (e) {
               const d = await routeTaskFailure(out, displacedSeat, e, `(cancel failed: ${(e as Error).message})\n`, `retry /cancel ${id}`);
@@ -2954,7 +2958,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (await routeTaskFailure(out, displacedSeat, e, `(interrupt failed: ${(e as Error).message})\n`, 'retry the interrupt') !== 'raw') return null;
           return null;
         });
-        if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing to stop, or: ${r.note ?? 'not supported'})\n`);
+        if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing to stop, or: ${cleanCell(r.note ?? 'not supported')})\n`);
         continue;
       }
       if (line === '/inbox' || line === '/inbox all') {
@@ -3037,7 +3041,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             // a failure worth reporting.
             if (/tool|bash|subagent|rlm_child/i.test(label) && label !== 'thinking') sawToolActivity = true;
             if (label.startsWith('turn/end')) { clearActivity(); return; }
-            status = label;
+            status = cleanCell(label);
             paintStatus();
           }
         : undefined;
@@ -3094,7 +3098,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // hard-interrupt + reap — so the disconnect Esc just did IS the stop.
           out(stopped?.aborted || (stopped && /disconnects/.test(stopped.note ?? ''))
             ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
-            : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${stopped.note}` : ''}; /cancel stops it${s.client?.cancelTask ? '' : ' (bare form — this image has no per-id cancel)'})`);
+            : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${cleanCell(stopped.note)}` : ''}; /cancel stops it${s.client?.cancelTask ? '' : ' (bare form — this image has no per-id cancel)'})`);
         } else if (/lost the agent while following/.test((e as Error).message)) {
           // Responses transport: the SDK already auto-resumed through drops
           // and only gives up after repeated reconnect failures — the agent
@@ -3130,7 +3134,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         s.currentTask = null;
       }
       if (failure && !s.framework && !retriedWithPick) {
-        out(`\n(chat failed: ${failure})\nthis framework may need a model selector — pick it:\n`);
+        out(`\n(chat failed: ${cleanCell(failure)})\nthis framework may need a model selector — pick it:\n`);
         s.framework = await pickFramework(s.attestorUrl, ask);
         retriedWithPick = true;
         continue; // retry the same user message once with the selector
@@ -3158,7 +3162,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // while the actual cause (the 400 body) is only in the container log. A
       // turn that fails EVERY time is usually the model or config it was just
       // given, so point at the log the way the connection-drop branches do.
-      if (failure) out(`\n(chat failed: ${failure}) — /agentlog has the agent's full error (a turn that fails every time usually means the model or config just set)`);
+      if (failure) out(`\n(chat failed: ${cleanCell(failure)}) — /agentlog has the agent's full error (a turn that fails every time usually means the model or config just set)`);
       out('\n');
       messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
       break;

@@ -981,7 +981,7 @@ func (s *Server) wsReverseProxy(upstream string) *httputil.ReverseProxy {
 			// no trailers.
 			if resp.StatusCode != http.StatusSwitchingProtocols {
 				dropAgentProof(resp.Trailer)
-				resp.Body = &trailerProofStripper{ReadCloser: resp.Body, resp: resp, scrub: s.scrubBytes}
+				resp.Body = &trailerProofStripper{ReadCloser: resp.Body, resp: resp, scrub: s.scrubBytes, nameHolds: s.nameHoldsValue}
 				// Not an upgrade after all: an ordinary response, scrubbed
 				// like any other (headers set by the caller choose the path,
 				// not what comes back), trailers too. Scrubbing can change
@@ -996,7 +996,7 @@ func (s *Server) wsReverseProxy(upstream string) *httputil.ReverseProxy {
 					// The Trailer announcement is built from these names
 					// after this returns.
 					for k := range resp.Trailer {
-						if nameHoldsValue(s.scrubBytes, k) {
+						if s.nameHoldsValue(k) {
 							delete(resp.Trailer, k)
 						}
 					}
@@ -1020,8 +1020,9 @@ func dropAgentProof(h http.Header) {
 // has been read to EOF (when the transport populates trailers) and on Close.
 type trailerProofStripper struct {
 	io.ReadCloser
-	resp  *http.Response
-	scrub func([]byte) []byte // credential values out of trailer values; nil: none
+	resp      *http.Response
+	scrub     func([]byte) []byte // credential values out of trailer values; nil: none
+	nameHolds func(string) bool   // whether a trailer name holds a value
 }
 
 func (b *trailerProofStripper) Read(p []byte) (int, error) {
@@ -1044,7 +1045,7 @@ func (b *trailerProofStripper) clean() {
 		return
 	}
 	for k, vs := range b.resp.Trailer {
-		if nameHoldsValue(b.scrub, k) {
+		if b.nameHolds != nil && b.nameHolds(k) {
 			delete(b.resp.Trailer, k)
 			continue
 		}

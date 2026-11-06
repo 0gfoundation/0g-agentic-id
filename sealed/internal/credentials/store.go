@@ -54,8 +54,9 @@ const (
 	maxAuditHost    = 255
 	maxAuditNames   = 16
 	maxAuditName    = 80
-	maxCountKeys    = 256 // all kinds together
-	maxOpKeys       = 32  // the kinds of one operation
+	maxCountKeys    = 1024 // all kinds together, a backstop
+	maxOpKeys       = 96   // the named kinds of one operation
+	maxResultKeys   = 32   // the named kinds of one operation with one result
 )
 
 // ErrOwnerLookup is a Load that could not look the owner up: worth trying
@@ -157,7 +158,7 @@ type Store struct {
 
 	auditMu     sync.Mutex
 	auditCounts map[string]*AuditRecord // counted records, by countKey
-	auditOpKeys map[string]int          // counted kinds per operation and result
+	auditOpKeys map[string]int          // counted kinds per operation, and per operation and result
 	// Listed records, in three rings so that what the harness can cause
 	// (proxy uses, signatures) never pushes out the rest: the owner's
 	// decisions, logins, loads and what sealed did itself.
@@ -296,11 +297,14 @@ func countKey(r AuditRecord) string {
 	return strings.Join([]string{r.Op, strings.Join(r.Names, ","), r.Method, r.Host, r.Result}, "\x00")
 }
 
-// countLocked adds n uses ending at r.Time (from r.First when set). Past
-// maxOpKeys kinds of one operation and result, further ones are counted by
-// operation and result alone, so one result's kinds (unknown names, say)
-// never crowd out another's (a host an entry does not allow); past
-// maxCountKeys in all, by operation alone.
+// countLocked adds n uses ending at r.Time (from r.First when set). Each
+// operation has its own budget of maxOpKeys named kinds, and each of its
+// results maxResultKeys of them; past either, further kinds are counted by
+// operation and result alone (a bounded set). So what the harness floods one
+// operation or result with never takes another's budget: refused uses of
+// unknown names leave room for a host an entry does not allow, and proxy
+// uses leave room for reveals. maxCountKeys is a backstop past which kinds
+// are counted by operation.
 func (s *Store) countLocked(r AuditRecord, n int) {
 	first := r.Time
 	if r.First != nil {
@@ -310,7 +314,7 @@ func (s *Store) countLocked(r AuditRecord, n int) {
 		switch {
 		case len(s.auditCounts) >= maxCountKeys:
 			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: "more kinds", Time: r.Time, First: r.First}
-		case s.auditOpKeys[r.Op+"\x00"+r.Result] >= maxOpKeys:
+		case s.auditOpKeys[r.Op] >= maxOpKeys || s.auditOpKeys[r.Op+"\x00"+r.Result] >= maxResultKeys:
 			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: r.Result, Time: r.Time, First: r.First}
 		}
 	}
@@ -318,6 +322,7 @@ func (s *Store) countLocked(r AuditRecord, n int) {
 	if c == nil {
 		c = &AuditRecord{Op: r.Op, Names: r.Names, Method: r.Method, Host: r.Host, Result: r.Result, Time: r.Time, First: &first}
 		s.auditCounts[countKey(r)] = c
+		s.auditOpKeys[r.Op]++
 		s.auditOpKeys[r.Op+"\x00"+r.Result]++
 	} else {
 		if first.Before(*c.First) {
@@ -939,16 +944,14 @@ func (s *Store) Request(op, name string, params map[string]string, reason string
 			return nil, &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "parameter " + k + " holds control characters"}
 		}
 	}
-	if u, ok := params["url"]; ok && !strings.HasPrefix(u, "https://") {
-		return nil, &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "url must be https"}
+	if u, ok := params["url"]; ok && !cleanHTTPS(u) {
+		return nil, &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "url must be a plain https URL"}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	facts := map[string]any{}
-	for k, v := range params {
-		facts[k] = v
-	}
-	p, perr := s.pendingForLocked(op, name, params, "", reason, facts)
+	// The agent's parameters stay its own (Pending.Params): facts are what
+	// sealed knows, and the agent writes none of them.
+	p, perr := s.pendingForLocked(op, name, params, "", reason, map[string]any{})
 	if perr != nil {
 		return nil, perr
 	}
@@ -996,9 +999,9 @@ func (s *Store) pendingForLocked(op, name string, params map[string]string, bind
 	if found != nil {
 		return found, nil
 	}
-	// sealed's own requests (a login to renew) are not the harness's to
-	// crowd out.
-	if open >= maxOpenRequests && facts["source"] != "sealed" {
+	// sealed's own requests (a login to renew, bound "sealed") are not the
+	// harness's to crowd out.
+	if open >= maxOpenRequests && bind != "sealed" {
 		return nil, &credproxy.Error{Status: http.StatusTooManyRequests, Code: "too_many_requests",
 			Message: "too many requests are waiting for the owner; wait for a decision"}
 	}
