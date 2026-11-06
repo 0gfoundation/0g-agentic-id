@@ -256,6 +256,36 @@ func TestClearDropsEverything(t *testing.T) {
 	}
 }
 
+// A used approval closes its request: asking again opens a new one the owner
+// can see and decide, instead of answering with the old id forever.
+func TestRevealAgainAfterApprovalOpensNewRequest(t *testing.T) {
+	f := newFixture(t)
+	s, _, _ := f.store(t, nil, nil)
+	_, _ = s.Load(context.Background(), f.doc(t, 1, map[string]string{"github": "ghp_x"}), 0)
+	_, e1 := s.Reveal("github", "first")
+	s.mu.Lock()
+	p := s.pending[e1.Message]
+	p.Status = "approved"
+	s.approvals[p.RequestDigest] = Approval{ExpiresAt: uint64(s.now().Unix()) + 60}
+	s.mu.Unlock()
+	if v, err := s.Reveal("github", "first"); err != nil || string(v) != "ghp_x" {
+		t.Fatalf("the approval was not honoured: %v", err)
+	}
+	_, e2 := s.Reveal("github", "second")
+	if e2 == nil || e2.Code != CodePending || e2.Message == e1.Message {
+		t.Fatalf("asking again: %+v (first id %s)", e2, e1.Message)
+	}
+	open := 0
+	for _, q := range s.PendingList() {
+		if q.Status == "pending" && q.AuthReqID == e2.Message {
+			open++
+		}
+	}
+	if open != 1 {
+		t.Fatalf("the new request is not waiting for the owner: %+v", s.PendingList())
+	}
+}
+
 // What sealed supplies itself is used on every model call: its successful
 // uses become one counted record, failures stay listed, and the owner's own
 // records are never pushed out by them.

@@ -578,12 +578,19 @@ func (s *Store) Request(op, name string, params map[string]string, reason string
 		facts[k] = v
 	}
 	p := s.pendingForLocked(op, name, params, reason, facts)
+	if p.Status == "denied" {
+		delete(s.pending, p.AuthReqID)
+		return nil, &credproxy.Error{Status: http.StatusForbidden, Code: CodeDenied, Message: "the owner refused this request"}
+	}
 	cp := *p
 	return &cp, nil
 }
 
 // pendingForLocked returns the open request for (op, name, params), opening
-// one if there is none. Expired requests are dropped first.
+// one if there is none. Expired requests are dropped first. A refusal is
+// returned once for the caller to report; an approved request is done (its
+// approval used, or its entry added or logged in), so asking again opens a
+// new one the owner sees.
 func (s *Store) pendingForLocked(op, name string, params map[string]string, reason string, facts map[string]any) *Pending {
 	now := s.now().Unix()
 	digest := RequestDigest(op, name, params)
@@ -592,9 +599,13 @@ func (s *Store) pendingForLocked(op, name string, params map[string]string, reas
 			delete(s.pending, id)
 			continue
 		}
-		if p.RequestDigest == digest {
+		if p.RequestDigest != digest {
+			continue
+		}
+		if p.Status != "approved" {
 			return p
 		}
+		delete(s.pending, id)
 	}
 	p := &Pending{AuthReqID: newID(), Op: op, Name: name, Params: params, Facts: facts, Reason: reason,
 		RequestDigest: digest, BootID: BootIDHash(s.env.BootID), CreatedAt: now, ExpiresAt: now + int64(pendingTTL/time.Second), Status: "pending"}
