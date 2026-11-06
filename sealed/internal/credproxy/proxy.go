@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,7 +48,14 @@ type Config struct {
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	// UpstreamTLS overrides the TLS config used toward upstream (tests).
 	UpstreamTLS *tls.Config
+	// IdleTimeout closes a client connection that stays idle this long
+	// between requests (HTTP/1.1 keep-alive, or HTTP/2 with no stream
+	// open); zero means defaultIdleTimeout. There is no read timeout: an
+	// upload takes as long as it takes.
+	IdleTimeout time.Duration
 }
+
+const defaultIdleTimeout = 2 * time.Minute
 
 // Server is the proxy. It is an http.Handler for the loopback listener.
 type Server struct {
@@ -61,6 +70,9 @@ var ErrPrivateAddress = errors.New("target resolves to a private, loopback, link
 func New(cfg Config) *Server {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = defaultIdleTimeout
 	}
 	s := &Server{cfg: cfg}
 	s.transport = &http.Transport{
@@ -80,6 +92,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           s,
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       s.cfg.IdleTimeout,
 		ErrorLog:          log.New(io.Discard, "", 0),
 	}
 	return srv.Serve(ln)
@@ -218,6 +231,11 @@ func (s *Server) terminate(conn net.Conn, host string) {
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"h2", "http/1.1"},
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			// A client sends no SNI for an IP address (RFC 6066); the Host
+			// header is still checked against the CONNECT target.
+			if hello.ServerName == "" && net.ParseIP(hostname) != nil {
+				return s.cfg.CA.leaf(hostname)
+			}
 			if NormalizeHost(hello.ServerName) != hostname {
 				return nil, fmt.Errorf("SNI %q does not match CONNECT target %q", hello.ServerName, hostname)
 			}
@@ -225,10 +243,12 @@ func (s *Server) terminate(conn net.Conn, host string) {
 		},
 	}
 	ln := newOneConnListener(tls.Server(conn, tlsCfg))
+	// HTTP/2 on this server takes its idle timeout from IdleTimeout.
 	srv := &http.Server{
 		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.intercepted(w, r, host) }),
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       s.cfg.IdleTimeout,
 		ErrorLog:          log.New(io.Discard, "", 0),
 		ConnState: func(_ net.Conn, st http.ConnState) {
 			if st == http.StateClosed || st == http.StateHijacked {
@@ -274,8 +294,9 @@ func isWebSocket(r *http.Request) bool {
 // forward fills r (already pointed at https://host), sends it, and streams
 // the response back redacted.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
-	small, large, berr := readBody(r, s.cfg.Registry.inspectsBody(host))
+	small, large, bodyNames, berr := readBody(r, s.cfg.Registry.inspectsBody(host))
 	if berr != nil {
+		s.record(bodyNames, host, r.Method, berr.Status, berr.Code)
 		writeErr(w, berr)
 		return
 	}
@@ -283,13 +304,32 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 	out := r.Clone(r.Context())
 	out.RequestURI = ""
 	stripHop(out.Header)
-	body, names, minted, ferr := s.cfg.Registry.fillRequest(out, host, small)
+	body, names, filled, ferr := s.cfg.Registry.fillRequest(out, host, small)
 	if ferr != nil {
 		s.record(names, host, r.Method, ferr.Status, ferr.Code)
 		writeErr(w, ferr)
 		return
 	}
-	// Signing comes last, over the request as it will be sent.
+	// Every header the proxy itself sets is in place before signing, so the
+	// signature covers the request as it is sent.
+	if large != nil {
+		out.Body = large
+		out.ContentLength = r.ContentLength
+	} else {
+		out.Body = io.NopCloser(bytes.NewReader(body))
+		out.ContentLength = int64(len(body))
+		if len(body) == 0 {
+			out.Body = http.NoBody
+		}
+	}
+	setContentLength(out)
+	out.Header.Set("Accept-Encoding", "identity")
+	if ws {
+		// The extension header is dropped so frames stay uncompressed.
+		out.Header.Set("Connection", "Upgrade")
+		out.Header.Set("Upgrade", "websocket")
+		out.Header.Del("Sec-WebSocket-Extensions")
+	}
 	signedWith, serr := s.cfg.Registry.signRequest(out, host, body, large != nil)
 	names = append(names, signedWith...)
 	if serr != nil {
@@ -297,52 +337,93 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 		writeErr(w, serr)
 		return
 	}
-	if large != nil {
-		out.Body = large
-		out.ContentLength = r.ContentLength
-	} else {
-		out.Body = io.NopCloser(bytes.NewReader(body))
-		out.ContentLength = int64(len(body))
-		out.Header.Del("Content-Length")
-		if len(body) == 0 {
-			out.Body = http.NoBody
-		}
-	}
-	out.Header.Set("Accept-Encoding", "identity")
 	if ws {
-		s.websocket(w, out, host, names, minted)
+		s.websocket(w, out, host, names, filled)
 		return
 	}
 
 	resp, err := s.transport.RoundTrip(out)
 	if err != nil {
-		e := refuse(http.StatusBadGateway, "upstream_error", "upstream request to %s failed", host)
-		if errors.Is(err, ErrPrivateAddress) {
-			e = refuse(http.StatusForbidden, "private_address", "%s", ErrPrivateAddress.Error())
-		}
+		e := upstreamErr(err, host)
 		s.record(names, host, r.Method, e.Status, e.Code)
 		writeErr(w, e)
 		return
 	}
 	defer resp.Body.Close()
-	if ce := strings.TrimSpace(resp.Header.Get("Content-Encoding")); ce != "" && !strings.EqualFold(ce, "identity") {
-		e := refuse(http.StatusBadGateway, "upstream_error", "upstream sent an encoded body (%s) that cannot be redacted", ce)
-		s.record(names, host, r.Method, e.Status, e.Code)
+	s.relay(w, resp, host, r.Method, names, filled)
+}
+
+// setContentLength makes the Content-Length header say what the transport
+// writes (from req.ContentLength), or removes it when the transport writes
+// none, so a signature over it signs what goes out.
+func setContentLength(req *http.Request) {
+	switch {
+	case req.ContentLength > 0:
+		req.Header.Set("Content-Length", strconv.FormatInt(req.ContentLength, 10))
+	case req.ContentLength == 0 && (req.Method == http.MethodPost || req.Method == http.MethodPut || req.Method == http.MethodPatch):
+		req.Header.Set("Content-Length", "0")
+	default:
+		req.Header.Del("Content-Length")
+	}
+}
+
+// upstreamErr is the refusal for a request that could not reach upstream.
+func upstreamErr(err error, host string) *Error {
+	if errors.Is(err, ErrPrivateAddress) {
+		return refuse(http.StatusForbidden, "private_address", "%s", ErrPrivateAddress.Error())
+	}
+	return refuse(http.StatusBadGateway, "upstream_error", "upstream request to %s failed", host)
+}
+
+// relay writes a final (non-101) upstream response back redacted. The audit
+// record is written before the response is.
+func (s *Server) relay(w http.ResponseWriter, resp *http.Response, host, method string, names []string, filled map[string][]byte) {
+	if e := checkResponse(resp); e != nil {
+		s.record(names, host, method, e.Status, e.Code)
 		writeErr(w, e)
 		return
 	}
-	red := newProxyRedactor(s.cfg.Registry.secrets(), minted)
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			w.Header().Add(k, red.applyString(v))
+	red := s.cfg.Registry.proxyRedactor(false, filled)
+	copyResponseHeader(w.Header(), resp.Header, red)
+	setFilled(w.Header(), names)
+	s.record(names, host, method, resp.StatusCode, "")
+	w.WriteHeader(resp.StatusCode)
+	copyFlush(w, red.reader(resp.Body))
+}
+
+// checkResponse refuses a response the proxy cannot relay redacted: a status
+// that is not a final one (WriteHeader would panic on some), or a body in
+// any content coding but identity, which redaction cannot see into.
+func checkResponse(resp *http.Response) *Error {
+	if resp.StatusCode < 200 || resp.StatusCode > 999 {
+		return refuse(http.StatusBadGateway, "upstream_error", "upstream sent status %d", resp.StatusCode)
+	}
+	for _, v := range resp.Header.Values("Content-Encoding") {
+		for _, ce := range strings.Split(v, ",") {
+			if ce = strings.TrimSpace(ce); ce != "" && !strings.EqualFold(ce, "identity") {
+				return refuse(http.StatusBadGateway, "upstream_error", "upstream sent an encoded body (%s) that cannot be redacted", ce)
+			}
 		}
 	}
-	stripHop(w.Header())
-	w.Header().Del("Content-Length")
-	setFilled(w.Header(), names)
-	w.WriteHeader(resp.StatusCode)
-	s.record(names, host, r.Method, resp.StatusCode, "")
-	copyFlush(w, red.reader(resp.Body))
+	return nil
+}
+
+// copyResponseHeader copies upstream's response headers into dst with every
+// value redacted. Hop-by-hop headers, Content-Length and the headers only the
+// proxy may set are dropped, and so is a header whose name holds a value.
+func copyResponseHeader(dst, src http.Header, red *redactor) {
+	for k, vs := range src {
+		if red.applyString(k) != k {
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, red.applyString(v))
+		}
+	}
+	stripHop(dst)
+	dst.Del("Content-Length")
+	dst.Del(FilledHeader)
+	dst.Del(ErrorHeader)
 }
 
 // FilledHeader names, on a response, the entries whose values went out in
@@ -350,6 +431,9 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 // values are hidden on the way back), so this is how the harness tells a
 // filled request from one that was not.
 const FilledHeader = "X-Seal-Credential-Filled"
+
+// ErrorHeader carries the code of a refusal the proxy answers itself.
+const ErrorHeader = "X-Seal-Credential-Error"
 
 func setFilled(h http.Header, names []string) {
 	h.Del(FilledHeader) // only the proxy says what it filled
@@ -387,62 +471,143 @@ func copyFlush(w http.ResponseWriter, src io.Reader) {
 	}
 }
 
-// websocket relays an upgraded HTTP/1.1 connection. The extension header is
-// dropped so frames stay uncompressed, and values in server frames are masked
-// byte-for-byte, which keeps every frame length intact.
-func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string, names []string, minted map[string][]byte) {
+// websocket relays an upgraded HTTP/1.1 connection (its request headers set
+// by forward). The 101 response is redacted like any other; then values in
+// server frames are masked byte for byte, frame by frame (relayFrames).
+func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string, names []string, filled map[string][]byte) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		writeErr(w, refuse(http.StatusBadRequest, "bad_target", "WebSocket needs HTTP/1.1 toward the proxy"))
+		e := refuse(http.StatusBadRequest, "bad_target", "WebSocket needs HTTP/1.1 toward the proxy")
+		s.record(names, host, out.Method, e.Status, e.Code)
+		writeErr(w, e)
 		return
 	}
-	out.Header.Set("Connection", "Upgrade")
-	out.Header.Set("Upgrade", "websocket")
-	out.Header.Del("Sec-WebSocket-Extensions")
 	resp, err := s.transport.RoundTrip(out)
 	if err != nil {
-		s.record(names, host, out.Method, http.StatusBadGateway, "upstream_error")
-		writeErr(w, refuse(http.StatusBadGateway, "upstream_error", "upstream request to %s failed", host))
+		e := upstreamErr(err, host)
+		s.record(names, host, out.Method, e.Status, e.Code)
+		writeErr(w, e)
 		return
 	}
-	s.record(names, host, out.Method, resp.StatusCode, "")
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		defer resp.Body.Close()
-		red := newProxyRedactor(s.cfg.Registry.secrets(), minted)
-		for k, vs := range resp.Header {
-			for _, v := range vs {
-				w.Header().Add(k, red.applyString(v))
-			}
-		}
-		stripHop(w.Header())
-		w.Header().Del("Content-Length")
-		setFilled(w.Header(), names)
-		w.WriteHeader(resp.StatusCode)
-		copyFlush(w, red.reader(resp.Body))
+		s.relay(w, resp, host, out.Method, names, filled)
 		return
 	}
 	up, ok := resp.Body.(io.ReadWriteCloser)
 	if !ok {
 		resp.Body.Close()
+		e := refuse(http.StatusBadGateway, "upstream_error", "upstream switched protocols without a connection to relay")
+		s.record(names, host, out.Method, e.Status, e.Code)
+		writeErr(w, e)
 		return
 	}
 	defer up.Close()
-	resp.Header.Del("Sec-WebSocket-Extensions")
+	red := s.cfg.Registry.proxyRedactor(false, filled)
+	h := http.Header{}
+	copyResponseHeader(h, resp.Header, red)
+	h.Set("Connection", "Upgrade")
+	h.Set("Upgrade", "websocket")
+	h.Del("Sec-WebSocket-Extensions")
+	setFilled(h, names)
+	reason := strings.TrimSpace(strings.TrimPrefix(resp.Status, "101"))
+	if reason == "" {
+		reason = "Switching Protocols"
+	}
+	var head bytes.Buffer
+	fmt.Fprintf(&head, "HTTP/1.1 101 %s\r\n", red.applyString(reason))
+	_ = h.Write(&head)
+	head.WriteString("\r\n")
+	s.record(names, host, out.Method, resp.StatusCode, "")
+
 	conn, buf, err := hj.Hijack()
 	if err != nil {
 		return
 	}
 	defer conn.Close()
-	resp.Body = nil
-	if err := resp.Write(conn); err != nil {
+	if _, err := conn.Write(head.Bytes()); err != nil {
 		return
 	}
-	mask := newMaskRedactor(s.cfg.Registry.secrets(), minted)
+	mask := s.cfg.Registry.proxyRedactor(true, filled)
 	go func() {
 		_, _ = io.Copy(up, buf.Reader)
 		up.Close()
 	}()
-	_, _ = io.Copy(conn, mask.reader(up))
+	_ = relayFrames(conn, bufio.NewReader(up), mask)
+}
+
+// maxFramePayload is the largest frame payload held in memory and redacted
+// as a whole; a larger one is redacted in chunks as it streams.
+const maxFramePayload = 1 << 20
+
+var errBadFrame = errors.New("websocket: a frame a server may not send")
+
+// relayFrames copies server-to-client WebSocket frames (RFC 6455) from src to
+// dst. Each data frame's payload is redacted with red, a mask redactor, so it
+// keeps its length and the frame header goes out unchanged: up to
+// maxFramePayload as a whole, beyond that in chunks (a value split across
+// chunks is still matched). A value split across the fragments of a message
+// is not matched: each fragment is a frame of its own. Control frames (close,
+// ping, pong) pass as they are. A masked frame, which a server never sends,
+// or a control frame over 125 bytes ends the relay.
+func relayFrames(dst io.Writer, src *bufio.Reader, red *redactor) error {
+	var hdr [10]byte // a server frame carries no masking key
+	for {
+		if _, err := io.ReadFull(src, hdr[:2]); err != nil {
+			return err
+		}
+		n, length := 2, uint64(hdr[1]&0x7f)
+		switch length {
+		case 126:
+			if _, err := io.ReadFull(src, hdr[2:4]); err != nil {
+				return err
+			}
+			n, length = 4, uint64(binary.BigEndian.Uint16(hdr[2:4]))
+		case 127:
+			if _, err := io.ReadFull(src, hdr[2:10]); err != nil {
+				return err
+			}
+			n, length = 10, binary.BigEndian.Uint64(hdr[2:10])
+			if length>>63 != 0 {
+				return errBadFrame
+			}
+		}
+		if hdr[1]&0x80 != 0 {
+			return errBadFrame
+		}
+		control := hdr[0]&0x0f >= 0x8 && hdr[0]&0x0f <= 0xa
+		if control && length > 125 {
+			return errBadFrame
+		}
+		if length > maxFramePayload {
+			if _, err := dst.Write(hdr[:n]); err != nil {
+				return err
+			}
+			got, err := io.Copy(dst, red.reader(io.LimitReader(src, int64(length))))
+			if err != nil {
+				return err
+			}
+			if uint64(got) != length {
+				return io.ErrUnexpectedEOF
+			}
+			continue
+		}
+		frame := make([]byte, n+int(length))
+		copy(frame, hdr[:n])
+		if _, err := io.ReadFull(src, frame[n:]); err != nil {
+			return err
+		}
+		if !control {
+			p := red.apply(frame[n:])
+			if len(p) != int(length) {
+				return errBadFrame // a mask redactor keeps the length; never reached
+			}
+			copy(frame[n:], p)
+		}
+		if _, err := dst.Write(frame); err != nil {
+			return err
+		}
+	}
 }
 
 func (s *Server) record(names []string, host, method string, status int, code string) {
@@ -454,39 +619,40 @@ func (s *Server) record(names []string, host, method string, status int, code st
 
 // readBody buffers a body up to maxBodyBytes so placeholders in it can be
 // filled, or it can be signed. A larger body is passed through untouched; if
-// its first bytes already show a placeholder it is refused instead, so a
-// value is never left unfilled without the harness hearing about it.
+// its first bytes already name a placeholder it is refused instead (with the
+// names, for the audit record), so a value is never left unfilled without
+// the harness hearing about it.
 //
 // Only a host where some entry can fill a body field or must sign the body
 // has its bodies read at all. Anywhere else a body is relayed as it is,
 // whatever its size: bodies carry text (a conversation, an issue, a model
 // prompt) that may quote a placeholder, and nothing could be filled there.
-func readBody(r *http.Request, inspect bool) ([]byte, io.ReadCloser, *Error) {
+func readBody(r *http.Request, inspect bool) ([]byte, io.ReadCloser, []string, *Error) {
 	if r.Body == nil || r.Body == http.NoBody {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	if !inspect {
-		return nil, r.Body, nil
+		return nil, r.Body, nil, nil
 	}
 	head, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
-		return nil, nil, refuse(http.StatusBadRequest, "bad_request", "cannot read request body")
+		return nil, nil, nil, refuse(http.StatusBadRequest, "bad_request", "cannot read request body")
 	}
 	if len(head) <= maxBodyBytes {
-		return head, nil, nil
+		return head, nil, nil, nil
 	}
-	if bytes.Contains(head, []byte("[[credential:")) || bytes.Contains(bytes.ToUpper(head), bytes.ToUpper(encodedPlaceholder)) {
-		return nil, nil, refuse(http.StatusRequestEntityTooLarge, "body_too_large", "a placeholder in a body over %d bytes cannot be filled", maxBodyBytes)
+	if mentionsPlaceholder(head) {
+		return nil, nil, mentionedNames(head), refuse(http.StatusRequestEntityTooLarge, "body_too_large", "a placeholder in a body over %d bytes cannot be filled", maxBodyBytes)
 	}
 	return nil, struct {
 		io.Reader
 		io.Closer
-	}{io.MultiReader(bytes.NewReader(head), r.Body), r.Body}, nil
+	}{io.MultiReader(bytes.NewReader(head), r.Body), r.Body}, nil, nil
 }
 
 func writeErr(w http.ResponseWriter, e *Error) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Seal-Credential-Error", e.Code)
+	w.Header().Set(ErrorHeader, e.Code)
 	w.WriteHeader(e.Status)
 	_ = json.NewEncoder(w).Encode(e)
 }
@@ -540,7 +706,9 @@ func SafeDial(ctx context.Context, network, addr string) (net.Conn, error) {
 var blockedNets = func() []*net.IPNet {
 	var out []*net.IPNet
 	// IANA special-purpose ranges (RFC 6890) on top of what net.IP classifies.
-	for _, c := range []string{"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15", "fc00::/7"} { // privacy-check: allow
+	// NAT64 prefixes (RFC 6052, RFC 8215) reach IPv4 addresses, private
+	// ones included, through a translator.
+	for _, c := range []string{"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15", "fc00::/7", "64:ff9b::/96", "64:ff9b:1::/48"} { // privacy-check: allow
 		_, n, _ := net.ParseCIDR(c)
 		out = append(out, n)
 	}

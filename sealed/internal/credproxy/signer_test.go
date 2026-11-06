@@ -14,11 +14,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
+	"io"
 	"math/big"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -80,7 +86,7 @@ func TestSigV4ResignMatchesAWSSDK(t *testing.T) {
 			for k, val := range v.Headers {
 				req.Header.Set(k, val)
 			}
-			reg := awsRegistry(t, u.Host, "elsewhere", "other", at)
+			reg := awsRegistry(t, u.Host, v.Region, v.Service, at)
 			names, err := reg.signRequest(req, u.Host, []byte(v.Body), false)
 			if err != nil {
 				t.Fatal(err)
@@ -333,5 +339,210 @@ func TestWalletKey(t *testing.T) {
 	}
 	if _, err := WalletKey([]byte("0x1234")); err == nil {
 		t.Fatal("a short key was accepted")
+	}
+}
+
+// Re-signing uses the entry's own region and service, whatever scope the
+// client's signature named: the result is what aws-sdk-go gets for the
+// entry's scope.
+func TestSigV4ResignUsesEntryScope(t *testing.T) {
+	at := time.Date(2015, 8, 30, 12, 36, 0, 0, time.UTC)
+	for _, v := range loadSigV4Vectors(t) {
+		if v.Name != "iam-get" {
+			continue
+		}
+		u, _ := url.Parse(v.URL)
+		req, _ := http.NewRequest(v.Method, v.URL, nil)
+		for k, val := range v.Headers {
+			req.Header.Set(k, val)
+		}
+		req.Header.Set("Authorization", strings.Replace(v.Headers["Authorization"], "/us-east-1/iam/", "/eu-west-1/s3/", 1))
+		reg := awsRegistry(t, u.Host, v.Region, v.Service, at)
+		if _, err := reg.signRequest(req, u.Host, nil, false); err != nil {
+			t.Fatal(err)
+		}
+		if got := req.Header.Get("Authorization"); got != v.WantAuth {
+			t.Fatalf("\ngot  %s\nwant %s", got, v.WantAuth)
+		}
+		return
+	}
+	t.Fatal("vector iam-get missing")
+}
+
+// A fresh signature covers every x-amz-* header and Content-Type and
+// Content-MD5, so none of them can change on the way unnoticed.
+func TestSigV4FreshSignsEveryAmzHeader(t *testing.T) {
+	at := time.Date(2015, 8, 30, 12, 36, 0, 0, time.UTC)
+	reg := awsRegistry(t, "sqs.example", "us-east-1", "sqs", at)
+	body := []byte(`{"QueueUrl":"q"}`)
+	req, _ := http.NewRequest("POST", "https://sqs.example/", bytes.NewReader(body))
+	req.Header.Set(SignHeader, "aws")
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("Content-Md5", "q1w2e3")
+	req.Header.Set("X-Amz-Target", "AmazonSQS.SendMessage")
+	req.Header.Set("X-Amz-Meta-Note", "hi")
+	req.Header.Set("User-Agent", "not-signed")
+	if _, err := reg.signRequest(req, "sqs.example", body, false); err != nil {
+		t.Fatal(err)
+	}
+	auth := req.Header.Get("Authorization")
+	a, ok := parseAWSAuth(auth)
+	want := "content-md5;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-meta-note;x-amz-target"
+	if !ok || strings.Join(a.signedHeaders, ";") != want {
+		t.Fatalf("signed %v, want %s", a.signedHeaders, want)
+	}
+	// The signature is right for that list: re-signing the request as a
+	// client-signed one (checked against aws-sdk-go above) gives the same.
+	if _, err := reg.signRequest(req, "sqs.example", body, false); err != nil || req.Header.Get("Authorization") != auth {
+		t.Fatalf("re-signed differently: %v\n%s\n%s", err, auth, req.Header.Get("Authorization"))
+	}
+}
+
+// session_token_entry names an entry whose value may go into a request: not
+// a signing key, not expired, and loaded.
+func TestSigV4SessionTokenEntry(t *testing.T) {
+	at := time.Date(2015, 8, 30, 12, 36, 0, 0, time.UTC)
+	for _, c := range []struct{ session, code, token string }{
+		{"key", "not_allowed", ""},
+		{"old", "expired", ""},
+		{"nope", "unknown_entry", ""},
+		{"sess", "", "session-token-value"},
+	} {
+		reg := NewRegistry()
+		reg.now = func() time.Time { return at }
+		if err := reg.Replace([]*Entry{
+			{Name: "aws", Hosts: []string{"sts.example"}, Use: UseSign, Value: []byte(awsExampleSecret),
+				Signer: &Signer{Method: SignSigV4, AccessKeyID: "AKIDEXAMPLE", Region: "us-east-1", Service: "sts", SessionTokenEntry: c.session}},
+			{Name: "key", Hosts: []string{"hooks.example"}, Use: UseSign, Value: []byte("whsec_signing_key_value"),
+				Signer: &Signer{Method: SignHMAC, Message: "{body}", Header: "X-Sig"}},
+			{Name: "old", Hosts: []string{"sts.example"}, Value: []byte("expired-session-token"), ExpiresAt: at.Add(-time.Minute)},
+			{Name: "sess", Hosts: []string{"sts.example"}, Value: []byte("session-token-value")},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		req, _ := http.NewRequest("GET", "https://sts.example/", nil)
+		req.Header.Set(SignHeader, "aws")
+		_, err := reg.signRequest(req, "sts.example", nil, false)
+		got := req.Header.Get("X-Amz-Security-Token")
+		if c.code != "" {
+			if err == nil || err.Code != c.code || got != "" {
+				t.Fatalf("%s: got %v, token %q", c.session, err, got)
+			}
+			continue
+		}
+		a, _ := parseAWSAuth(req.Header.Get("Authorization"))
+		if err != nil || got != c.token || !slices.Contains(a.signedHeaders, "x-amz-security-token") {
+			t.Fatalf("%s: got %v, token %q, signed %v", c.session, err, got, a.signedHeaders)
+		}
+	}
+}
+
+// What the proxy itself sets (Accept-Encoding, the final Content-Length, the
+// WebSocket upgrade headers) is in place before signing, so the signature
+// covers the request as it is sent.
+func TestSignatureCoversHeadersAsSent(t *testing.T) {
+	secret := []byte("whsec_0123456789abcdef")
+	mac := func(msg string) string {
+		m := hmac.New(sha256.New, secret)
+		m.Write([]byte(msg))
+		return hex.EncodeToString(m.Sum(nil))
+	}
+	ts, got := upstream(t)
+	h := newHarness(t, ts,
+		&Entry{Name: "github", Hosts: []string{"example.com"}, Positions: []Position{{Kind: PosBody, Field: "token"}}, Value: []byte(secretValue)},
+		&Entry{Name: "hook", Hosts: []string{"example.com"}, Use: UseSign, Value: secret,
+			Signer: &Signer{Method: SignHMAC, Message: "{header:Accept-Encoding}|{header:Content-Length}|{body}", Header: "X-Signature"}})
+	req, _ := http.NewRequest("POST", h.explicitURL("/hook"), strings.NewReader(`{"token":"[[credential:github]]"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set(SignHeader, "hook")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAll(t, resp)
+	g := got.snapshot()
+	want := mac(g.header.Get("Accept-Encoding") + "|" + strconv.Itoa(len(g.body)) + "|" + g.body)
+	if resp.StatusCode != 200 || g.header.Get("Accept-Encoding") != "identity" || g.header.Get("X-Signature") != want {
+		t.Fatalf("status %d, upstream Accept-Encoding %q, signature %q, want %q", resp.StatusCode, g.header.Get("Accept-Encoding"), g.header.Get("X-Signature"), want)
+	}
+
+	ws := wsUpstream(t, switching, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("X-Signature") != mac(r.Header.Get("Upgrade")+"|"+r.Header.Get("Sec-WebSocket-Extensions")) {
+			http.Error(w, "signature does not cover the headers sent", http.StatusUnauthorized)
+			return false
+		}
+		return true
+	}, nil)
+	hw := newHarness(t, ws, &Entry{Name: "hook", Hosts: []string{"example.com"}, Use: UseSign, Value: secret,
+		Signer: &Signer{Method: SignHMAC, Message: "{header:Upgrade}|{header:Sec-WebSocket-Extensions}", Header: "X-Signature"}})
+	_, _, wresp := wsDial(t, hw, SignHeader+": hook\r\n")
+	if wresp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("WebSocket: status %d", wresp.StatusCode)
+	}
+}
+
+// A minted token stays scrubbed after its own request, under the
+// placeholder of the jwt entry, until its exp.
+func TestMintedJWTScrubbedLater(t *testing.T) {
+	var mu sync.Mutex
+	var last string
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path == "/later" {
+			_, _ = io.WriteString(w, last)
+			return
+		}
+		last = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	}))
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	h := newHarness(t, ts, &Entry{Name: "sa", Hosts: []string{"example.com"}, Use: UseSign, Value: []byte("hs256-shared-secret-value"),
+		Positions: []Position{{Kind: PosHeader, Name: "Authorization", Template: "Bearer {v}"}},
+		Signer:    &Signer{Method: SignJWT, Alg: "HS256", TTL: 600}})
+	req, _ := http.NewRequest("GET", h.explicitURL("/me"), nil)
+	req.Header.Set("Authorization", "Bearer [[credential:sa]]")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAll(t, resp)
+	mu.Lock()
+	tok := last
+	mu.Unlock()
+	if !strings.HasPrefix(tok, "ey") {
+		t.Fatalf("upstream got %q", tok)
+	}
+	resp, err = http.Get(h.explicitURL("/later"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readAll(t, resp); body != "[[credential:sa]]" {
+		t.Fatalf("a later response: %q", body)
+	}
+	if got := string(h.reg().Scrub([]byte(tok))); got != "[[credential:sa]]" {
+		t.Fatalf("Scrub: %q", got)
+	}
+
+	// Past its exp a token is dropped when the next one is held.
+	reg := NewRegistry()
+	now := time.Unix(1700000000, 0)
+	reg.now = func() time.Time { return now }
+	reg.holdMinted("sa", []byte("first-minted-token"), now.Add(time.Minute))
+	if got := string(reg.Scrub([]byte("first-minted-token"))); got != "[[credential:sa]]" {
+		t.Fatalf("held: %q", got)
+	}
+	now = now.Add(2 * time.Minute)
+	reg.holdMinted("sa", []byte("second-minted-token"), now.Add(time.Minute))
+	if reg.Len() != 1 || string(reg.Scrub([]byte("first-minted-token"))) != "first-minted-token" {
+		t.Fatalf("an expired token was kept: Len %d", reg.Len())
+	}
+	for i := 0; i < maxMinted+10; i++ {
+		reg.holdMinted("sa", []byte(fmt.Sprintf("minted-token-%06d", i)), now.Add(time.Hour))
+	}
+	if reg.Len() != maxMinted {
+		t.Fatalf("Len %d, want %d", reg.Len(), maxMinted)
 	}
 }

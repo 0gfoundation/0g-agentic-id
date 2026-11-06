@@ -12,6 +12,7 @@
 package credproxy
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"regexp"
@@ -113,55 +114,149 @@ func NormalizeHost(hostport string) string {
 
 // Registry holds the entries sealed currently serves. It is safe for
 // concurrent use; the proxy reads it on every request.
+//
+// Besides the entries it keeps values that are only scrubbed, never filled:
+// every value sealed served earlier in this boot and no longer does (an entry
+// replaced or removed, the previous owner's after a Clear), and the JWTs the
+// proxy minted, until their exp. Redaction, Scrub and ScrubReader cover them
+// under the placeholder of the entry they belonged to.
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]*Entry
-	gen     uint64 // advances on every change to the entries
+	retired []scrubValue // oldest first, at most maxRetired
+	minted  []scrubValue // oldest first, at most maxMinted
+	gen     uint64       // advances on every change to the values Scrub covers
 	now     func() time.Time
+
+	// formsMu guards forms, the redaction forms of every value Scrub covers
+	// as they stood at formsGen.
+	formsMu  sync.Mutex
+	forms    *formSet
+	formsGen uint64
 }
+
+// scrubValue is a value kept only to be scrubbed, and the entry whose
+// placeholder replaces it.
+type scrubValue struct {
+	name  string
+	value []byte
+	until time.Time // minted tokens: the token's exp
+}
+
+// The scrub-only sets are bounded; the oldest values go first.
+const (
+	maxRetired = 1024
+	maxMinted  = 256
+)
 
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{entries: map[string]*Entry{}, now: time.Now}
 }
 
+// validated returns a validated copy of e. The registry never writes to an
+// entry it is handed: callers pass entries they read back from it, which
+// proxy goroutines may be reading at the same time.
+func validated(e *Entry) (*Entry, error) {
+	cp := *e
+	cp.Hosts = append([]string(nil), e.Hosts...)
+	if err := cp.validate(); err != nil {
+		return nil, err
+	}
+	return &cp, nil
+}
+
 // Replace swaps the whole entry set, e.g. after a new credential set loads.
+// A value the new set no longer holds is retired: scrubbed, never filled.
 func (r *Registry) Replace(entries []*Entry) error {
 	next := make(map[string]*Entry, len(entries))
+	held := make(map[string]bool, len(entries))
 	for _, e := range entries {
-		if err := e.validate(); err != nil {
+		v, err := validated(e)
+		if err != nil {
 			return err
 		}
-		if _, dup := next[e.Name]; dup {
-			return fmt.Errorf("credential %q listed twice", e.Name)
+		if _, dup := next[v.Name]; dup {
+			return fmt.Errorf("credential %q listed twice", v.Name)
 		}
-		next[e.Name] = e
+		next[v.Name] = v
+		held[string(v.Value)] = true
 	}
 	r.mu.Lock()
+	for _, n := range sortedNames(r.entries) {
+		if old := r.entries[n]; !held[string(old.Value)] {
+			r.retireLocked(old)
+		}
+	}
 	r.entries = next
 	r.gen++
 	r.mu.Unlock()
 	return nil
 }
 
-// Put adds or replaces one entry (derived entries from a token request).
+// Put adds or replaces one entry (derived entries from a token request). A
+// value it replaces is retired.
 func (r *Registry) Put(e *Entry) error {
-	if err := e.validate(); err != nil {
+	v, err := validated(e)
+	if err != nil {
 		return err
 	}
 	r.mu.Lock()
-	r.entries[e.Name] = e
+	if old, ok := r.entries[v.Name]; ok && !bytes.Equal(old.Value, v.Value) {
+		r.retireLocked(old)
+	}
+	r.entries[v.Name] = v
 	r.gen++
 	r.mu.Unlock()
 	return nil
 }
 
-// Delete removes one entry.
+// Delete removes one entry; its value is retired.
 func (r *Registry) Delete(name string) {
 	r.mu.Lock()
+	if old, ok := r.entries[name]; ok {
+		r.retireLocked(old)
+	}
 	delete(r.entries, name)
 	r.gen++
 	r.mu.Unlock()
+}
+
+// retireLocked keeps e's value to be scrubbed for the rest of the process.
+func (r *Registry) retireLocked(e *Entry) {
+	if len(e.Value) == 0 {
+		return
+	}
+	kept := r.retired[:0]
+	for _, v := range r.retired {
+		if !bytes.Equal(v.value, e.Value) {
+			kept = append(kept, v)
+		}
+	}
+	r.retired = append(kept, scrubValue{name: e.Name, value: e.Value})
+	if len(r.retired) > maxRetired {
+		r.retired = append([]scrubValue(nil), r.retired[len(r.retired)-maxRetired:]...)
+	}
+}
+
+// holdMinted keeps a token minted for jwt entry name until its exp, so later
+// responses and what sealed commits are scrubbed of it as well.
+func (r *Registry) holdMinted(name string, tok []byte, until time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.now()
+	var kept []scrubValue
+	for _, v := range r.minted {
+		if now.Before(v.until) {
+			kept = append(kept, v)
+		}
+	}
+	kept = append(kept, scrubValue{name: name, value: tok, until: until})
+	if len(kept) > maxMinted {
+		kept = kept[len(kept)-maxMinted:]
+	}
+	r.minted = kept
+	r.gen++
 }
 
 // Get returns the entry named name, or nil.
@@ -175,12 +270,7 @@ func (r *Registry) Get(name string) *Entry {
 func (r *Registry) Names() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]string, 0, len(r.entries))
-	for n := range r.entries {
-		out = append(out, n)
-	}
-	sort.Strings(out)
-	return out
+	return sortedNames(r.entries)
 }
 
 // InterceptsHost reports whether any entry names host, i.e. whether a CONNECT
@@ -239,19 +329,54 @@ func (r *Registry) BasicFor(host string) (username, name string, ok bool) {
 	return "", "", false
 }
 
-// secrets snapshots name → value for redaction.
-func (r *Registry) secrets() map[string][]byte {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make(map[string][]byte, len(r.entries))
-	for n, e := range r.entries {
-		out[n] = e.Value
+// scrubListLocked lists every value Scrub covers: the entries (by name),
+// then the minted tokens not yet expired and the retired values, newest
+// first. Where one value appears twice the first placeholder wins.
+func (r *Registry) scrubListLocked() []secret {
+	out := make([]secret, 0, len(r.entries)+len(r.minted)+len(r.retired))
+	for _, n := range sortedNames(r.entries) {
+		out = append(out, secret{name: n, value: r.entries[n].Value})
+	}
+	now := r.now()
+	for i := len(r.minted) - 1; i >= 0; i-- {
+		if v := r.minted[i]; now.Before(v.until) {
+			out = append(out, secret{name: v.name, value: v.value})
+		}
+	}
+	for i := len(r.retired) - 1; i >= 0; i-- {
+		out = append(out, secret{name: r.retired[i].name, value: r.retired[i].value})
 	}
 	return out
 }
 
+// scrubForms returns the redaction forms of every value Scrub covers, built
+// again only when those values changed.
+func (r *Registry) scrubForms() *formSet {
+	r.formsMu.Lock()
+	defer r.formsMu.Unlock()
+	r.mu.RLock()
+	if r.forms != nil && r.formsGen == r.gen {
+		r.mu.RUnlock()
+		return r.forms
+	}
+	gen, list := r.gen, r.scrubListLocked()
+	r.mu.RUnlock()
+	r.forms, r.formsGen = newFormSet(list), gen
+	return r.forms
+}
+
+func sortedNames(m map[string]*Entry) []string {
+	out := make([]string, 0, len(m))
+	for n := range m {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Validate reports whether e can be served (hosts, positions, use, signer);
-// Replace refuses a set holding one that cannot.
+// Replace refuses a set holding one that cannot. It normalizes e's hosts and
+// use in place, so it is for an entry the registry does not hold yet.
 func (e *Entry) Validate() error { return e.validate() }
 
 func (e *Entry) validate() error {
