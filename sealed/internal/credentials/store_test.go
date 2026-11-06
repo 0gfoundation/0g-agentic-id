@@ -18,10 +18,10 @@ import (
 	"seal-verify/internal/credproxy"
 )
 
-type memPersist struct{ v uint64 }
+type memPersist struct{ v Mark }
 
-func (m *memPersist) LoadHighest() (uint64, error) { return m.v, nil }
-func (m *memPersist) SaveHighest(v uint64) error   { m.v = v; return nil }
+func (m *memPersist) LoadHighest() (Mark, error) { return m.v, nil }
+func (m *memPersist) SaveHighest(v Mark) error   { m.v = v; return nil }
 
 func (f *fixture) store(t *testing.T, wb func(context.Context, string, Writeback) error, client *http.Client) (*Store, *credproxy.Registry, *memPersist) {
 	t.Helper()
@@ -58,7 +58,7 @@ func TestLoadListAndAntiRollback(t *testing.T) {
 	if _, err := s.Load(context.Background(), f.doc(t, 2, map[string]string{"github": "ghp_x"}), 0); err != nil {
 		t.Fatal(err)
 	}
-	if p.v != 2 || reg.Get("github") == nil {
+	if p.v != (Mark{Epoch: 7, Version: 2}) || reg.Get("github") == nil {
 		t.Fatalf("persisted %d, registry %v", p.v, reg.Names())
 	}
 	list := s.List()
@@ -119,7 +119,7 @@ func TestTokenRequestRotatesAndWritesBack(t *testing.T) {
 	if e := reg.Get("gcp"); e == nil || string(e.Value) != "rt_new" {
 		t.Fatal("refresh token not rotated")
 	}
-	if len(wrote) != 1 || !strings.EqualFold(wrote[0].DefHash, doc.Set.Entries[0].DefHash) {
+	if len(wrote) != 1 || wrote[0].Binding != s.defs["gcp"].Binding() || !strings.HasPrefix(wrote[0].Binding, "value:0x") {
 		t.Fatalf("writebacks %+v", wrote)
 	}
 	// The written-back value opens at the next boot.
@@ -160,7 +160,7 @@ func TestRevealNeedsApproval(t *testing.T) {
 	if _, err := s.Load(context.Background(), f.doc(t, 1, map[string]string{"github": "ghp_x"}), 0); err != nil {
 		t.Fatal(err)
 	}
-	_, cerr := s.Reveal("github", "gh needs it")
+	_, cerr := s.Reveal(context.Background(), "github", "gh needs it")
 	if cerr == nil || cerr.Code != CodePending {
 		t.Fatalf("got %+v", cerr)
 	}
@@ -170,7 +170,7 @@ func TestRevealNeedsApproval(t *testing.T) {
 		t.Fatalf("pending %+v", pending)
 	}
 	// Asking again reports the same request.
-	if _, again := s.Reveal("github", "again"); again.Message != id {
+	if _, again := s.Reveal(context.Background(), "github", "again"); again.Message != id {
 		t.Fatal("a repeated request opened a second pending item")
 	}
 	p := pending[0]
@@ -186,7 +186,7 @@ func TestRevealNeedsApproval(t *testing.T) {
 	if ev := s.Events(context.Background(), 0, 0); len(ev) == 0 || ev[len(ev)-1].Type != "pending_decided" {
 		t.Fatalf("events %+v", ev)
 	}
-	v, cerr := s.Reveal("github", "")
+	v, cerr := s.Reveal(context.Background(), "github", "")
 	if cerr != nil || string(v) != "ghp_x" {
 		t.Fatalf("approved reveal: %v %q", cerr, v)
 	}
@@ -196,7 +196,7 @@ func TestRevealNeedsApproval(t *testing.T) {
 		t.Fatalf("a used approval was accepted again: %v", err)
 	}
 	// The approval is single-use.
-	if _, cerr := s.Reveal("github", ""); cerr == nil || cerr.Code != CodePending {
+	if _, cerr := s.Reveal(context.Background(), "github", ""); cerr == nil || cerr.Code != CodePending {
 		t.Fatalf("approval reused: %+v", cerr)
 	}
 }
@@ -216,7 +216,7 @@ func TestExpiredEntryNotRevealedOrUsed(t *testing.T) {
 	if _, err := s.Load(context.Background(), doc, 0); err != nil {
 		t.Fatal(err)
 	}
-	if v, cerr := s.Reveal("github", ""); cerr == nil || cerr.Code != "expired" || v != nil {
+	if v, cerr := s.Reveal(context.Background(), "github", ""); cerr == nil || cerr.Code != "expired" || v != nil {
 		t.Fatalf("reveal of an expired entry: %v %+v", v, cerr)
 	}
 	if _, cerr := s.Token(context.Background(), "github", nil); cerr == nil || cerr.Code != "expired" {
@@ -228,11 +228,11 @@ func TestRevealDenied(t *testing.T) {
 	f := newFixture(t)
 	s, _, _ := f.store(t, nil, nil)
 	_, _ = s.Load(context.Background(), f.doc(t, 1, map[string]string{"github": "ghp_x"}), 0)
-	_, cerr := s.Reveal("github", "")
+	_, cerr := s.Reveal(context.Background(), "github", "")
 	if err := s.Decide(context.Background(), cerr.Message, "deny", nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, cerr := s.Reveal("github", ""); cerr == nil || cerr.Code != CodeDenied {
+	if _, cerr := s.Reveal(context.Background(), "github", ""); cerr == nil || cerr.Code != CodeDenied {
 		t.Fatalf("got %+v", cerr)
 	}
 	recs := s.AuditSince(0)
@@ -247,7 +247,7 @@ func TestRevealAllowedInAdvance(t *testing.T) {
 	doc := f.doc(t, 1, map[string]string{"github": "ghp_x"})
 	f.editDefs(t, &doc, func(d *Definition) { d.AllowReveal = true })
 	_, _ = s.Load(context.Background(), doc, 0)
-	if v, cerr := s.Reveal("github", ""); cerr != nil || string(v) != "ghp_x" {
+	if v, cerr := s.Reveal(context.Background(), "github", ""); cerr != nil || string(v) != "ghp_x" {
 		t.Fatalf("got %v %q", cerr, v)
 	}
 	if len(s.AuditSince(0)) != 1 {
@@ -276,7 +276,7 @@ func TestClearDropsEverything(t *testing.T) {
 	f := newFixture(t)
 	s, reg, _ := f.store(t, nil, nil)
 	_, _ = s.Load(context.Background(), f.doc(t, 1, map[string]string{"github": "ghp_x"}), 0)
-	_, _ = s.Reveal("github", "")
+	_, _ = s.Reveal(context.Background(), "github", "")
 	s.Clear()
 	if len(reg.Names()) != 0 || len(s.List()) != 0 || len(s.PendingList()) != 0 {
 		t.Fatal("clear left state behind")
@@ -294,16 +294,16 @@ func TestRevealAgainAfterApprovalOpensNewRequest(t *testing.T) {
 	f := newFixture(t)
 	s, _, _ := f.store(t, nil, nil)
 	_, _ = s.Load(context.Background(), f.doc(t, 1, map[string]string{"github": "ghp_x"}), 0)
-	_, e1 := s.Reveal("github", "first")
+	_, e1 := s.Reveal(context.Background(), "github", "first")
 	s.mu.Lock()
 	p := s.pending[e1.Message]
 	p.Status = "approved"
 	s.approvals[p.RequestDigest] = Approval{ExpiresAt: uint64(s.now().Unix()) + 60}
 	s.mu.Unlock()
-	if v, err := s.Reveal("github", "first"); err != nil || string(v) != "ghp_x" {
+	if v, err := s.Reveal(context.Background(), "github", "first"); err != nil || string(v) != "ghp_x" {
 		t.Fatalf("the approval was not honoured: %v", err)
 	}
-	_, e2 := s.Reveal("github", "second")
+	_, e2 := s.Reveal(context.Background(), "github", "second")
 	if e2 == nil || e2.Code != CodePending || e2.Message == e1.Message {
 		t.Fatalf("asking again: %+v (first id %s)", e2, e1.Message)
 	}
@@ -346,7 +346,8 @@ func TestAuditCountsSealedEntries(t *testing.T) {
 	}
 	// Persisted and loaded again (stop/start), the count carries on.
 	s2, _, _ := f.store(t, nil, nil)
-	s2.SeedAudit(recs)
+	s2.ObserveOwner(crypto.PubkeyToAddress(f.owner.PublicKey))
+	s2.SeedAudit(&AuditFile{Owner: crypto.PubkeyToAddress(f.owner.PublicKey), Records: recs})
 	s2.Record(credproxy.Record{Time: t0.Add(3 * time.Hour), Names: []string{"sealed:inference"}, Host: "router.example", Method: "POST"})
 	again := s2.AuditSince(0)
 	if len(again) != 3 || again[2].Count != auditKeep+51 {

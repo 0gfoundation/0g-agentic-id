@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,13 +16,15 @@ import (
 	"time"
 
 	eciesgo "github.com/ecies/go/v2"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"seal-verify/internal/credproxy"
 )
 
-var credRefRe = regexp.MustCompile(`\{cred:([a-z0-9][a-z0-9._-]{0,62})\}`)
+// templateRe matches what a field template fills in: {v}, or {cred:<name>}.
+var templateRe = regexp.MustCompile(`\{v\}|\{cred:([a-z0-9][a-z0-9._-]{0,62})\}`)
 
 const maxTokenResponse = 1 << 20
 
@@ -57,12 +60,17 @@ func tokenErr(status int, code, format string, args ...any) *credproxy.Error {
 // request per entry runs at a time, so a rotating refresh token is never
 // used twice.
 func (s *Store) Token(ctx context.Context, name string, params map[string]string) ([]EntryInfo, *credproxy.Error) {
+	if err := s.ensureOwner(ctx); err != nil {
+		return nil, err
+	}
 	lock := s.lockFor(name)
 	lock.Lock()
 	defer lock.Unlock()
 
+	// What the request was made under: its result is kept only if that
+	// still holds when it returns.
 	s.mu.Lock()
-	def, value := s.defs[name], s.values[name]
+	def, value, srcHash, gen := s.defs[name], s.values[name], s.defHashes[name], s.gen
 	s.mu.Unlock()
 	if def == nil || value == nil {
 		return nil, tokenErr(http.StatusNotFound, "unknown_entry", "no credential named %q", name)
@@ -114,10 +122,10 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 
 	if tr.RotateField != "" {
 		if nv, _ := got[tr.RotateField].(string); nv != "" && nv != string(value) {
-			s.rotate(ctx, def, []byte(nv))
+			s.rotate(ctx, def, gen, []byte(nv))
 		}
 	}
-	var out []EntryInfo
+	var entries []*credproxy.Entry
 	now := s.now()
 	for _, t := range tr.Take {
 		v, _ := got[t.Field].(string)
@@ -132,22 +140,37 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 			dn = "derived:" + dn
 		}
 		e := &credproxy.Entry{Name: dn, Hosts: append([]string(nil), t.Hosts...), Positions: t.Positions, Use: credproxy.UseInject, Value: []byte(v)}
-		var exp int64
 		if t.ExpiresInField != "" {
 			if secs, ok := got[t.ExpiresInField].(float64); ok && secs > 0 {
 				e.ExpiresAt = now.Add(time.Duration(secs) * time.Second)
-				exp = e.ExpiresAt.Unix()
 			}
 		}
-		if err := s.reg.Put(e); err != nil {
+		if err := e.Validate(); err != nil {
 			return nil, tokenErr(http.StatusBadGateway, "token_request_failed", "template produced an invalid entry: %v", err)
 		}
-		s.mu.Lock()
-		s.derived[dn] = derived{from: name, hosts: e.Hosts, expiresAt: exp}
-		s.mu.Unlock()
-		out = append(out, EntryInfo{Name: dn, Source: "derived", From: name, Use: string(credproxy.UseInject), Hosts: e.Hosts,
-			Positions: e.Positions, ExpiresAt: exp, AllowReveal: def.AllowReveal, Placeholder: credproxy.Placeholder(dn)})
+		entries = append(entries, e)
 	}
+	s.mu.Lock()
+	if s.gen != gen || s.defHashes[name] != srcHash {
+		s.mu.Unlock()
+		s.audit("token", name, tr.URL, "dropped: the entry changed while the request ran")
+		return nil, tokenErr(http.StatusConflict, "changed", "credential %q changed while the token request ran; ask again", name)
+	}
+	var out []EntryInfo
+	for _, e := range entries {
+		if err := s.reg.Put(e); err != nil {
+			s.mu.Unlock()
+			return nil, tokenErr(http.StatusBadGateway, "token_request_failed", "template produced an invalid entry: %v", err)
+		}
+		var exp int64
+		if !e.ExpiresAt.IsZero() {
+			exp = e.ExpiresAt.Unix()
+		}
+		s.derived[e.Name] = derived{from: name, srcHash: srcHash, hosts: e.Hosts, expiresAt: exp}
+		out = append(out, EntryInfo{Name: e.Name, Source: "derived", From: name, Use: string(credproxy.UseInject), Hosts: e.Hosts,
+			Positions: e.Positions, ExpiresAt: exp, AllowReveal: def.AllowReveal, Placeholder: credproxy.Placeholder(e.Name)})
+	}
+	s.mu.Unlock()
 	s.audit("token", name, tr.URL, "ok")
 	return out, nil
 }
@@ -193,12 +216,15 @@ func (s *Store) buildTokenRequest(ctx context.Context, tr *TokenRequest, fields 
 }
 
 // expand fills a field template: {v} is the entry's own value, {cred:<n>}
-// another owner entry's value; everything else is sent as written.
+// another owner entry's value; everything else is sent as written. One
+// pass: a value that itself reads like {cred:<n>} is sent as it is.
 func (s *Store) expand(tmpl string, own []byte) (string, *credproxy.Error) {
-	out := strings.ReplaceAll(tmpl, "{v}", string(own))
 	var ferr *credproxy.Error
-	out = credRefRe.ReplaceAllStringFunc(out, func(m string) string {
-		v, err := s.refValue(credRefRe.FindStringSubmatch(m)[1])
+	out := templateRe.ReplaceAllStringFunc(tmpl, func(m string) string {
+		if m == "{v}" {
+			return string(own)
+		}
+		v, err := s.refValue(templateRe.FindStringSubmatch(m)[1])
 		if err != nil {
 			ferr = err
 			return ""
@@ -225,16 +251,22 @@ func (s *Store) refValue(name string) (string, *credproxy.Error) {
 
 // templateValue is what an entry stands for in a token request: its value,
 // or for a jwt signing entry a token freshly minted from its key. Any other
-// signing key is never sent.
+// signing key is never sent. The owner's definition decides, not what the
+// proxy currently serves.
 func (s *Store) templateValue(name string, value []byte) ([]byte, *credproxy.Error) {
-	e := s.reg.Get(name)
-	if e == nil || e.Use != credproxy.UseSign {
+	s.mu.Lock()
+	d := s.defs[name]
+	s.mu.Unlock()
+	if d == nil {
+		return nil, tokenErr(http.StatusNotFound, "unknown_entry", "no credential named %q", name)
+	}
+	if useOf(d) != credproxy.UseSign {
 		return value, nil
 	}
-	if e.Signer == nil || e.Signer.Method != credproxy.SignJWT {
+	if d.Signer == nil || d.Signer.Method != credproxy.SignJWT {
 		return nil, tokenErr(http.StatusForbidden, "not_allowed", "credential %q is a signing key and is never sent", name)
 	}
-	tok, err := credproxy.MintJWT(e, s.now())
+	tok, err := credproxy.MintJWT(d.Entry(value), s.now())
 	if err != nil {
 		return nil, tokenErr(http.StatusInternalServerError, "sign_failed", "credential %q could not mint a token", name)
 	}
@@ -292,35 +324,50 @@ func (s *Store) audit(op, name, target, result string) {
 	s.addAudit(AuditRecord{Time: s.now(), Op: op, Names: names, Host: host, Result: result})
 }
 
-// rotate replaces an entry's value with the one the token endpoint just
-// issued and writes it back to the attestor, signed by agentSeal, so the
-// next boot starts from it. A failed write is retried in the background.
-func (s *Store) rotate(ctx context.Context, def *Definition, value []byte) {
+// rotate makes value, which sealed obtained for def (a rotated token, a
+// login), the entry's value, and writes it back to the attestor, signed by
+// agentSeal, so the next boot starts from it. It is dropped if everything
+// was cleared since gen, or the owner gave the entry a new value or login
+// meanwhile (its binding changed). had says whether the entry had a value
+// before. A failed write is retried in the background.
+func (s *Store) rotate(ctx context.Context, def *Definition, gen uint64, value []byte) (applied, had bool) {
 	s.mu.Lock()
+	cur := s.defs[def.Name]
+	if s.gen != gen || cur == nil || cur.Binding() != def.Binding() {
+		s.mu.Unlock()
+		s.audit("rotate", def.Name, "", "dropped: the entry changed meanwhile")
+		return false, false
+	}
+	had = s.values[def.Name] != nil
 	s.values[def.Name] = value
 	s.syncRegistryLocked()
-	defHash := s.defHashes[def.Name]
+	owner, binding, writeback := s.owner, cur.Binding(), cur.Writeback
 	s.mu.Unlock()
-	if !def.Writeback || s.env.Writeback == nil {
+	if !writeback || s.env.Writeback == nil {
 		s.audit("rotate", def.Name, "", "kept until restart: no writeback")
-		return
+		return true, had
 	}
-	wb, err := s.signWriteback(ctx, def.Name, value, defHash)
+	wb, err := s.signWriteback(def.Name, value, binding, owner)
 	if err != nil {
 		s.env.Logf("credentials: a rotated value could not be sealed for writeback (the owner's audit log names it)")
 		s.audit("writeback", def.Name, "", "failed: "+err.Error())
-		return
+		return true, had
 	}
+	// The harness hanging up does not stop the writeback: the endpoint has
+	// already rotated, and the next boot needs the new value.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
 	for attempt := 0; attempt < 3; attempt++ {
 		if err = s.env.Writeback(ctx, def.Name, wb); err == nil {
 			s.audit("writeback", def.Name, "", "ok")
-			return
+			return true, had
 		}
 		time.Sleep(time.Duration(attempt+1) * time.Second)
 	}
 	s.audit("writeback", def.Name, "", "failed")
 	s.events.add(Event{Type: "writeback_failed", Name: def.Name})
 	go s.retryWriteback(def.Name, wb, value)
+	return true, had
 }
 
 func (s *Store) retryWriteback(name string, wb Writeback, value []byte) {
@@ -342,10 +389,11 @@ func (s *Store) retryWriteback(name string, wb Writeback, value []byte) {
 	}
 }
 
-func (s *Store) signWriteback(ctx context.Context, name string, value []byte, defHash string) (Writeback, error) {
-	owner, err := s.env.LiveOwner(ctx)
-	if err != nil {
-		return Writeback{}, err
+// signWriteback seals value to agentSeal for owner (the owner the state
+// belongs to) and signs it for binding.
+func (s *Store) signWriteback(name string, value []byte, binding string, owner common.Address) (Writeback, error) {
+	if owner == (common.Address{}) {
+		return Writeback{}, errors.New("the owner is not known yet")
 	}
 	pub := eciesgo.NewPrivateKeyFromBytes(s.env.AgentSealPriv).PublicKey
 	ct, err := SealValue(pub, owner, s.env.SealID, s.env.Domain.ChainID, name, value)
@@ -356,10 +404,10 @@ func (s *Store) signWriteback(ctx context.Context, name string, value []byte, de
 	if err != nil {
 		return Writeback{}, err
 	}
-	sig, err := crypto.Sign(crypto.Keccak256(WritebackMessage(s.env.SealID, name, defHash, s.env.BootID, ct)), key)
+	sig, err := crypto.Sign(crypto.Keccak256(WritebackMessage(s.env.SealID, name, binding, s.env.BootID, ct)), key)
 	if err != nil {
 		return Writeback{}, err
 	}
 	sig[64] += 27
-	return Writeback{Ciphertext: base64.StdEncoding.EncodeToString(ct), DefHash: defHash, BootID: s.env.BootID, Signature: hexutil.Encode(sig)}, nil
+	return Writeback{Ciphertext: base64.StdEncoding.EncodeToString(ct), Binding: binding, BootID: s.env.BootID, Signature: hexutil.Encode(sig)}, nil
 }

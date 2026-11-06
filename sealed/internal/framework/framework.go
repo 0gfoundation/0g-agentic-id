@@ -466,9 +466,16 @@ type RuntimeContext struct {
 	// to the framework (its inference key) instead of handing it over: the
 	// value is filled in only in the given headers (name → template with
 	// one {v}) on baseURL's host. It returns the base URL to use instead
-	// (through the proxy) and the placeholder to give the framework.
+	// (through the proxy) and the placeholder to give the framework. An
+	// error wrapping ErrCredHoldRefused means the framework must not get
+	// the value either; any other, that sealed could not hold it.
 	CredHold func(name, baseURL string, headers map[string]string, value []byte) (proxiedBaseURL, placeholder string, err error)
 }
+
+// ErrCredHoldRefused is CredHold refusing a value the framework may not
+// have at all: the agent's owner changed, and the value came with the
+// previous owner's deployment.
+var ErrCredHoldRefused = fmt.Errorf("framework: sealed refused the value; the agent's owner changed")
 
 // WithCredentials returns rt with every credential field (Cred*) taken from
 // c, the RuntimeContext startCredentials returned. One place copies them, so

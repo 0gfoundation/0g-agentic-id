@@ -85,14 +85,15 @@ pub struct SetWire {
     pub entries: Vec<SetEntry>,
 }
 
-/// A value sealed obtained and wrote back. It is bound to the entry's
-/// definition (its hash in the owner's set): it stays valid while the owner
-/// changes other entries, and ends when the owner changes this one.
+/// A value sealed obtained and wrote back. It is bound to what the value
+/// stands for (`binding`: the owner's value by its hash, or a login by its
+/// server, client and scopes), which sealed checks against the definition at
+/// boot: the owner can edit the rest of the definition and keep it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Writeback {
     pub ciphertext: String,
-    pub def_hash: String,
+    pub binding: String,
     pub boot_id: String,
     pub signature: String,
 }
@@ -255,16 +256,23 @@ pub fn validate_document(
 pub fn writeback_message(
     seal_id: SealId,
     name: &str,
-    def_hash: &str,
+    binding: &str,
     boot_id: &str,
     ciphertext: &[u8],
 ) -> String {
     format!(
-        "CredentialWriteback.v1:0x{}:{name}:{}:{boot_id}:{}",
+        "CredentialWriteback.v2:0x{}:{name}:{binding}:{boot_id}:{}",
         hex::encode(seal_id.as_slice()),
-        def_hash.to_ascii_lowercase(),
         keccak256(ciphertext)
     )
+}
+
+/// A binding as sealed writes it: `value:0x<64 hex>` or `mcp:0x<64 hex>`.
+fn valid_binding(b: &str) -> bool {
+    let hex = b
+        .strip_prefix("value:0x")
+        .or_else(|| b.strip_prefix("mcp:0x"));
+    matches!(hex, Some(h) if h.len() == 64 && h.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 /// Verify a writeback was signed by `agent_seal` for this seal, entry and boot.
@@ -274,8 +282,12 @@ pub fn verify_writeback(
     w: &Writeback,
     agent_seal: Address,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        valid_binding(&w.binding),
+        "the writeback's binding is not one sealed writes"
+    );
     let ct = b64(&w.ciphertext)?;
-    let msg = writeback_message(seal_id, name, &w.def_hash, &w.boot_id, &ct);
+    let msg = writeback_message(seal_id, name, &w.binding, &w.boot_id, &ct);
     let signer = recover_prehash_signer(
         &keccak256(msg.as_bytes()).0,
         &signature_bytes(&w.signature)?,
@@ -522,17 +534,17 @@ mod tests {
         let seal_key = PrivateKeySigner::random();
         let seal_id = B256::from_str(SEAL).unwrap();
         let ct = b"rotated".to_vec();
-        let def_hash = "0xAB00000000000000000000000000000000000000000000000000000000000001";
-        let msg = writeback_message(seal_id, "gcp", def_hash, "0xboot", &ct);
+        let binding = "value:0xab00000000000000000000000000000000000000000000000000000000000001";
+        let msg = writeback_message(seal_id, "gcp", binding, "0xboot", &ct);
         // The same string sealed's WritebackMessage produces.
         assert_eq!(
             msg,
-            "CredentialWriteback.v1:0x0fb3604de692a0a2ceae1d9e655d0dc28a8a81340534df4ba5c9a66a375f7c8f:gcp:0xab00000000000000000000000000000000000000000000000000000000000001:0xboot:0xeacb26800d47aea80d40d70980c9726defc50d7b4f14e3ad1d74ae435ef5948e"
+            "CredentialWriteback.v2:0x0fb3604de692a0a2ceae1d9e655d0dc28a8a81340534df4ba5c9a66a375f7c8f:gcp:value:0xab00000000000000000000000000000000000000000000000000000000000001:0xboot:0xeacb26800d47aea80d40d70980c9726defc50d7b4f14e3ad1d74ae435ef5948e"
         );
         let sig = seal_key.sign_hash_sync(&keccak256(msg.as_bytes())).unwrap();
         let w = Writeback {
             ciphertext: b64e(&ct),
-            def_hash: def_hash.into(),
+            binding: binding.into(),
             boot_id: "0xboot".into(),
             signature: format!("0x{}", hex::encode(sig.as_bytes())),
         };
@@ -541,6 +553,11 @@ mod tests {
             verify_writeback(seal_id, "gcp", &w, PrivateKeySigner::random().address()).is_err()
         );
         assert!(verify_writeback(seal_id, "other", &w, seal_key.address()).is_err());
+        let odd = Writeback {
+            binding: "anything:goes".into(),
+            ..w
+        };
+        assert!(verify_writeback(seal_id, "gcp", &odd, seal_key.address()).is_err());
     }
 
     #[test]

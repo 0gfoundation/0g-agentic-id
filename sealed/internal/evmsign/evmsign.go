@@ -86,13 +86,9 @@ func TypedData(td apitypes.TypedData, k KeyFunc) (map[string]any, error) {
 	if td.PrimaryType == "" {
 		return nil, bad("primaryType missing")
 	}
-	domainHash, err := td.HashStruct("EIP712Domain", td.Domain.Map())
+	domainHash, msgHash, err := hashTypedData(td)
 	if err != nil {
-		return nil, bad("hash domain: " + err.Error())
-	}
-	msgHash, err := td.HashStruct(td.PrimaryType, td.Message)
-	if err != nil {
-		return nil, bad("hash message: " + err.Error())
+		return nil, err
 	}
 	digest := crypto.Keccak256([]byte{0x19, 0x01}, domainHash, msgHash)
 	priv, err := k()
@@ -311,4 +307,22 @@ func decodeHex(s string) ([]byte, error) {
 		return nil, nil
 	}
 	return hex.DecodeString(s)
+}
+
+// hashTypedData hashes the domain and the message. go-ethereum panics on
+// some malformed messages (a null inside an array of uint256): that is the
+// caller's bad request, not a crash.
+func hashTypedData(td apitypes.TypedData) (domainHash, msgHash []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = bad(fmt.Sprintf("typed data is malformed: %v", r))
+		}
+	}()
+	if domainHash, err = td.HashStruct("EIP712Domain", td.Domain.Map()); err != nil {
+		return nil, nil, bad("hash domain: " + err.Error())
+	}
+	if msgHash, err = td.HashStruct(td.PrimaryType, td.Message); err != nil {
+		return nil, nil, bad("hash message: " + err.Error())
+	}
+	return domainHash, msgHash, nil
 }

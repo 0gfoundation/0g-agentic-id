@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -236,12 +237,17 @@ func (be bridgeEnv) environ() []string {
 // returns what the harness gets instead: the placeholder, and the router's
 // base URL through the credential proxy. Otherwise (no proxy, a framework
 // built-in endpoint, no key, or sealed could not hold it) the key and the
-// rendered base URL stand.
+// rendered base URL stand — except after the owner changed, when the
+// harness gets no key at all (the new owner resets the agent).
 func holdInferenceKey(ep *inference.Endpoint, apiKey string, rt framework.RuntimeContext) (key, baseURL string) {
 	if ep == nil || apiKey == "" || rt.CredHold == nil {
 		return apiKey, ""
 	}
 	base, placeholder, err := rt.CredHold("inference", ep.BaseURL, inferenceKeyHeaders, []byte(apiKey))
+	if errors.Is(err, framework.ErrCredHoldRefused) {
+		logger.Logf("warn: harness.Start: %v; the harness starts without the inference key", err)
+		return "", ""
+	}
 	if err != nil {
 		logger.Logf("warn: harness.Start: the inference key could not be held by sealed (%v); the harness gets it itself", err)
 		return apiKey, ""

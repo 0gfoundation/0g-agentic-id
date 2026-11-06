@@ -44,7 +44,8 @@ const (
 	credGitConfigPath  = "/etc/seal/credential-gitconfig"
 	systemRootsPath    = "/etc/ssl/certs/ca-certificates.crt"
 	maxSystemRoots     = 4 << 20
-	ownerWatchInterval = time.Minute
+	ownerWatchInterval = 10 * time.Second
+	maxAuditFile       = 8 << 20
 	auditFlushInterval = 10 * time.Second
 )
 
@@ -105,6 +106,7 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 		Writeback:     attestorWriteback(cfg.AttestorURL, sealID),
 	}, reg)
 	audit.store = store
+	// Restored once the owner is known, and only for the owner who wrote it.
 	store.SeedAudit(loadAudit())
 	go audit.flushLoop()
 
@@ -141,9 +143,7 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 			logger.Logf("OK   credentials: set v%d loaded, %d entries, %d skipped", opened.Set.Version, len(opened.Values), len(opened.Skipped))
 		}
 	}
-	if initial, err := liveOwner(context.Background()); err == nil {
-		go watchOwner(store, liveOwner, initial)
-	}
+	go watchOwner(store, liveOwner)
 	report.SetCredentialsPending(store.PendingCount)
 	go reportPendingChanges(cfg, agentSealPriv, store)
 	logger.Logf("OK   credential proxy listening on 127.0.0.1:%d", port)
@@ -175,7 +175,9 @@ func credHold(store *credentials.Store, explicit string) func(name, baseURL stri
 		for header, template := range headers {
 			e.Positions = append(e.Positions, credproxy.Position{Kind: credproxy.PosHeader, Name: header, Template: template})
 		}
-		if err := store.HoldSystem(e); err != nil {
+		if err := store.HoldSystem(e); errors.Is(err, credentials.ErrOwnerChanged) {
+			return "", "", fmt.Errorf("%w (%v)", framework.ErrCredHoldRefused, err)
+		} else if err != nil {
 			return "", "", err
 		}
 		return explicit + "/https/" + u.Host + strings.TrimSuffix(u.EscapedPath(), "/"), credproxy.Placeholder(e.Name), nil
@@ -205,18 +207,17 @@ func writeCredentialFiles(ca *credproxy.CA) error {
 	return nil
 }
 
-// watchOwner clears every credential when the agent's owner changes: the
-// previous owner's keys must not serve the new one. A failed lookup changes
-// nothing; the next succeeds or fails the same way.
-func watchOwner(store *credentials.Store, liveOwner func(context.Context) (common.Address, error), owner common.Address) {
-	for range time.Tick(ownerWatchInterval) {
-		now, err := liveOwner(context.Background())
-		if err != nil || now == owner {
-			continue
+// watchOwner looks the agent's owner up now and every ownerWatchInterval;
+// the store clears every credential when it changes (the previous owner's
+// keys must not serve the new one). A failed lookup changes nothing; the
+// next one tries again. Reveals, token requests, wallet signatures and
+// logins confirm the owner themselves before they go ahead.
+func watchOwner(store *credentials.Store, liveOwner func(context.Context) (common.Address, error)) {
+	for {
+		if owner, err := liveOwner(context.Background()); err == nil {
+			store.ObserveOwner(owner)
 		}
-		logger.Logf("credentials: owner changed from %s to %s; every credential cleared", owner.Hex(), now.Hex())
-		store.Clear()
-		owner = now
+		time.Sleep(ownerWatchInterval)
 	}
 }
 
@@ -241,28 +242,35 @@ func reportPendingChanges(cfg *config.Bootstrap, agentSealPriv []byte, store *cr
 	}
 }
 
-// statePersist keeps the highest loaded set version in sealed's root-only
-// state directory, which survives stop/start.
+// statePersist keeps the newest loaded set's (owner epoch, version) in
+// sealed's root-only state directory, which survives stop/start.
 type statePersist struct{}
 
 func (statePersist) path() string { return filepath.Join(credStateDir(), "highest-version") }
 
-func (p statePersist) LoadHighest() (uint64, error) {
-	b, err := privsep.ReadFile(p.path(), 64)
+func (p statePersist) LoadHighest() (credentials.Mark, error) {
+	b, err := privsep.ReadFile(p.path(), 256)
 	if errors.Is(err, fs.ErrNotExist) {
-		return 0, nil
+		return credentials.Mark{}, nil
 	}
 	if err != nil {
-		return 0, err
+		return credentials.Mark{}, err
 	}
-	return strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
+	var m credentials.Mark
+	if json.Unmarshal(b, &m) == nil {
+		return m, nil
+	}
+	// Written as a bare version before epochs were kept.
+	v, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
+	return credentials.Mark{Version: v}, err
 }
 
-func (p statePersist) SaveHighest(v uint64) error {
+func (p statePersist) SaveHighest(m credentials.Mark) error {
 	if err := privsep.MkdirAll(credStateDir(), 0o700); err != nil {
 		return err
 	}
-	return privsep.WriteFile(p.path(), []byte(strconv.FormatUint(v, 10)), 0o600)
+	b, _ := json.Marshal(m)
+	return privsep.WriteFile(p.path(), b, 0o600)
 }
 
 // auditSink persists the store's audit records in the state directory,
@@ -290,7 +298,13 @@ func (a *auditSink) flushLoop() {
 		if !dirty || a.store == nil {
 			continue
 		}
-		b, err := json.Marshal(a.store.AuditSince(0))
+		// Not before the records an earlier boot persisted are decided.
+		f, ok := a.store.AuditSnapshot()
+		if !ok {
+			a.add(credentials.AuditRecord{})
+			continue
+		}
+		b, err := json.Marshal(f)
 		if err == nil {
 			if err = privsep.MkdirAll(credStateDir(), 0o700); err == nil {
 				err = privsep.WriteFile(auditPath(), b, 0o600)
@@ -302,16 +316,19 @@ func (a *auditSink) flushLoop() {
 	}
 }
 
-func loadAudit() []credentials.AuditRecord {
-	b, err := privsep.ReadFile(auditPath(), 4<<20)
+// loadAudit reads what an earlier boot persisted. A file that names no
+// owner (written before the owner was kept) is not restored: whose it is
+// cannot be told.
+func loadAudit() *credentials.AuditFile {
+	b, err := privsep.ReadFile(auditPath(), maxAuditFile)
 	if err != nil {
 		return nil
 	}
-	var recs []credentials.AuditRecord
-	if json.Unmarshal(b, &recs) != nil {
+	var f credentials.AuditFile
+	if json.Unmarshal(b, &f) != nil || f.Owner == (common.Address{}) {
 		return nil
 	}
-	return recs
+	return &f
 }
 
 // attestorWriteback posts a value sealed obtained (a rotated refresh token,

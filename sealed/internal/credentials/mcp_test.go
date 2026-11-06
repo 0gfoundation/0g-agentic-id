@@ -144,7 +144,7 @@ func TestMCPLoginRefreshAndRevoke(t *testing.T) {
 	}
 	// The agent asked for this login; the owner adding the entry does not answer it.
 	s.mu.Lock()
-	req := s.pendingForLocked("login", "linear", map[string]string{"url": auth.ts.URL + "/mcp"}, "", nil)
+	req, _ := s.pendingForLocked("login", "linear", map[string]string{"url": auth.ts.URL + "/mcp"}, "", "", nil)
 	s.mu.Unlock()
 	if _, err := s.Load(context.Background(), doc, 0); err != nil {
 		t.Fatal(err)
@@ -195,7 +195,7 @@ func TestMCPLoginRefreshAndRevoke(t *testing.T) {
 	}
 	// Revealing a login entry gives its access token, never the stored
 	// login state with the refresh token in it.
-	if v, cerr := s.Reveal("linear", ""); cerr != nil || string(v) != "at-1" {
+	if v, cerr := s.Reveal(context.Background(), "linear", ""); cerr != nil || string(v) != "at-1" {
 		t.Fatalf("reveal gave %q (%v), not the access token", v, cerr)
 	}
 	mu.Lock()
@@ -205,7 +205,7 @@ func TestMCPLoginRefreshAndRevoke(t *testing.T) {
 	mu.Unlock()
 
 	// Refresh rotates both tokens; the proxy fills the new access token.
-	s.refreshLogin("linear", 0)
+	s.refreshLogin("linear", "at-1", 0)
 	if e := reg.Get("linear"); string(e.Value) != "at-2" {
 		t.Fatalf("after refresh: %q", e.Value)
 	}
@@ -213,7 +213,7 @@ func TestMCPLoginRefreshAndRevoke(t *testing.T) {
 	auth.mu.Lock()
 	auth.revoked = true
 	auth.mu.Unlock()
-	s.refreshLogin("linear", 6)
+	s.refreshLogin("linear", "at-2", 6)
 	var found bool
 	for _, p := range s.PendingList() {
 		if p.Op == "login" && p.Name == "linear" {

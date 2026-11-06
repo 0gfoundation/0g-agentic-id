@@ -82,7 +82,7 @@ func (s *Store) HarnessHandler() http.Handler {
 			writeErr(w, e)
 			return
 		}
-		out, e := s.WalletSign(in)
+		out, e := s.WalletSign(r.Context(), in)
 		if e != nil {
 			writeErr(w, e)
 			return
@@ -143,8 +143,9 @@ func (s *Store) HarnessHandler() http.Handler {
 }
 
 // RevealHandler serves /run/seal-cred-reveal.sock, the only place a value
-// leaves sealed. Its socket can belong to a different system user than the
-// one running tools, so a harness can keep revealed values from them.
+// leaves sealed. It is a socket of its own so that a harness running its
+// tools as another user could keep it from them; today both sockets belong
+// to the agent user, which the tools run as too.
 func (s *Store) RevealHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /credentials/reveal", func(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +157,7 @@ func (s *Store) RevealHandler() http.Handler {
 			writeErr(w, e)
 			return
 		}
-		value, e := s.Reveal(strings.TrimSpace(in.Name), in.Reason)
+		value, e := s.Reveal(r.Context(), strings.TrimSpace(in.Name), in.Reason)
 		if e != nil {
 			writeErr(w, e)
 			return

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -11,8 +12,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
+
 	"seal-verify/internal/credentials"
 	"seal-verify/internal/credproxy"
+	"seal-verify/internal/framework"
 )
 
 // The inference key held by sealed: the framework calls the router through
@@ -29,7 +33,8 @@ func TestCredHoldServesTheInferenceKeyThroughTheProxy(t *testing.T) {
 	defer upstream.Close()
 
 	reg := credproxy.NewRegistry()
-	store := credentials.NewStore(credentials.Env{}, reg)
+	owner := common.HexToAddress("0x00000000000000000000000000000000000000a1")
+	store := credentials.NewStore(credentials.Env{LiveOwner: func(context.Context) (common.Address, error) { return owner, nil }}, reg)
 	pool := x509.NewCertPool()
 	pool.AddCert(upstream.Certificate())
 	srv := credproxy.New(credproxy.Config{
@@ -72,12 +77,17 @@ func TestCredHoldServesTheInferenceKeyThroughTheProxy(t *testing.T) {
 		t.Fatalf("the key came back: %s", out)
 	}
 	// Nothing reveals it, and it goes with the owner.
-	if _, cerr := store.Reveal("sealed:inference", ""); cerr == nil || cerr.Code != "unknown_entry" {
+	if _, cerr := store.Reveal(context.Background(), "sealed:inference", ""); cerr == nil || cerr.Code != "unknown_entry" {
 		t.Fatalf("reveal: %v", cerr)
 	}
-	store.Clear()
+	store.ObserveOwner(common.HexToAddress("0x00000000000000000000000000000000000000b2"))
 	if reg.Get("sealed:inference") != nil {
 		t.Fatal("held key outlived an owner change")
+	}
+	// A framework restart does not take it again: the harness starts
+	// without it, not with the key itself.
+	if _, _, err := hold("inference", "https://example.com/v1", map[string]string{"Authorization": "Bearer {v}"}, []byte("sk-the-real-key")); !errors.Is(err, framework.ErrCredHoldRefused) {
+		t.Fatalf("held again after the owner changed: %v", err)
 	}
 	// Only an https base URL, and only under the sealed: prefix.
 	if _, _, err := hold("x", "http://router.example/v1", nil, []byte("k")); err == nil {

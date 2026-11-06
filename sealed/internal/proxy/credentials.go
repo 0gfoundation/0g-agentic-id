@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"seal-verify/internal/credentials"
 )
@@ -104,7 +106,43 @@ func readSignedBody(w http.ResponseWriter, r *http.Request, s *Server, tag, seal
 	if _, ok := s.verifyOwnerSig(w, r, tag, sealID, owner, hex.EncodeToString(sum[:])); !ok {
 		return nil, false
 	}
+	// A signed request is taken once: replayed within its freshness window
+	// (a login started again, a decision sent again) it is refused. Keyed on
+	// the signed message, as compaction's guard is (compact.go says why).
+	used := sha256.Sum256([]byte(r.Header.Get("X-Auth-Message")))
+	if !s.credUsed.take(hex.EncodeToString(used[:])) {
+		http.Error(w, "this signed request was already used; sign a fresh one", http.StatusConflict)
+		return nil, false
+	}
 	return body, true
+}
+
+// usedMessages remembers accepted signed messages for as long as their
+// timestamp could still pass verifyOwnerSig.
+type usedMessages struct {
+	mu   sync.Mutex
+	used map[string]int64
+}
+
+// take records key and reports whether it was new. A message older than
+// 2×window can no longer pass verifyOwnerSig, so it is forgotten then.
+func (u *usedMessages) take(key string) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	now := time.Now().Unix()
+	if u.used == nil {
+		u.used = map[string]int64{}
+	}
+	for k, at := range u.used {
+		if now-at > 2*authWindowSec {
+			delete(u.used, k)
+		}
+	}
+	if _, seen := u.used[key]; seen {
+		return false
+	}
+	u.used[key] = now
+	return true
 }
 
 // handleCredentials: GET lists the loaded entries (never values); POST loads

@@ -171,21 +171,35 @@ type valuePlaintext struct {
 }
 
 // Writeback is a value sealed itself obtained (a rotated refresh token, or a
-// login) and stored at the attestor, signed by agentSeal. It is bound to the
-// entry's definition (its hash in the owner's set), so it stays valid while
-// the owner changes other entries and ends when the owner changes this one.
+// login) and stored at the attestor, signed by agentSeal. It is bound to what
+// the value stands for (Definition.Binding), so it stays valid while the
+// owner edits the rest of the definition and ends when the owner gives the
+// entry a new value or a different login.
 type Writeback struct {
 	Ciphertext string `json:"ciphertext"`
-	DefHash    string `json:"def_hash"`
+	Binding    string `json:"binding"`
 	BootID     string `json:"boot_id"`
 	Signature  string `json:"signature"`
 }
 
 // WritebackMessage is what agentSeal signs (keccak256, no EIP-191 prefix).
 // The sign socket offers no raw-hash signing, so the harness cannot forge it.
-func WritebackMessage(sealID, name, defHash, bootID string, ciphertext []byte) []byte {
-	return []byte(fmt.Sprintf("CredentialWriteback.v1:%s:%s:%s:%s:%s",
-		strings.ToLower(sealID), name, strings.ToLower(defHash), bootID, crypto.Keccak256Hash(ciphertext).Hex()))
+func WritebackMessage(sealID, name, binding, bootID string, ciphertext []byte) []byte {
+	return []byte(fmt.Sprintf("CredentialWriteback.v2:%s:%s:%s:%s:%s",
+		strings.ToLower(sealID), name, binding, bootID, crypto.Keccak256Hash(ciphertext).Hex()))
+}
+
+// Binding names what a value sealed obtains for this entry stands for: the
+// owner's value (its hash), or for a login entry the login itself (server,
+// client and scopes). A value sealed obtained outlives a new definition with
+// the same binding, so editing a description, hosts or allow_reveal keeps a
+// rotation or a login.
+func (d *Definition) Binding() string {
+	if m := d.MCP; m != nil {
+		return "mcp:" + crypto.Keccak256Hash([]byte(strings.Join([]string{
+			"mcp", m.URL, m.ClientID, m.ClientSecretEntry, strings.Join(m.Scopes, " "), strings.ToLower(d.ValueHash)}, "\n"))).Hex()
+	}
+	return "value:" + strings.ToLower(d.ValueHash)
 }
 
 // Document is a signed set with its definitions, values and writebacks, as
@@ -213,11 +227,27 @@ type Check struct {
 	Owner         common.Address // the live on-chain owner
 	AgentSeal     common.Address
 	AgentSealPriv []byte
-	// MinVersion: documents below it are refused (anti-rollback).
-	MinVersion uint64
+	// Min is the newest set this agent loaded: a document older by
+	// (owner epoch, version) is refused (anti-rollback). A new ownership's
+	// first set is newer than every set of the one before.
+	Min Mark
 	// OwnerEpoch, when non-zero, must equal the set's.
 	OwnerEpoch uint64
 }
+
+// Mark orders credential sets: by owner epoch, then by version.
+type Mark struct {
+	Epoch   uint64 `json:"epoch"`
+	Version uint64 `json:"version"`
+}
+
+// Less reports whether m is older than o.
+func (m Mark) Less(o Mark) bool {
+	return m.Epoch < o.Epoch || m.Epoch == o.Epoch && m.Version < o.Version
+}
+
+// MarkOf is the set's place in that order.
+func MarkOf(s CredentialSet) Mark { return Mark{Epoch: s.OwnerEpoch, Version: s.Version} }
 
 // Errors returned by Open.
 var (
@@ -234,7 +264,7 @@ func Open(doc Document, c Check) (*Opened, error) {
 	if !strings.EqualFold(doc.Set.SealID, c.SealID) {
 		return nil, ErrWrongSeal
 	}
-	if doc.Set.Version < c.MinVersion {
+	if MarkOf(doc.Set).Less(c.Min) {
 		return nil, ErrStale
 	}
 	if c.OwnerEpoch != 0 && doc.Set.OwnerEpoch != c.OwnerEpoch {
@@ -284,11 +314,20 @@ func openEntry(doc Document, e SetEntry, c Check) (*Definition, []byte, string) 
 	if !credproxy.ValidName(def.Name) || strings.HasPrefix(def.Name, "derived:") || strings.HasPrefix(def.Name, "sealed:") {
 		return nil, nil, "name is not valid for an owner entry"
 	}
-	ct, err := chooseCiphertext(doc, e, &def, c)
+	if def.MCP != nil && def.TokenRequest != nil {
+		// A login entry's value is its login state; a template would send it.
+		return nil, nil, "a login entry has no token request template"
+	}
+	ct, err := chooseCiphertext(doc, &def, c)
 	if err != nil {
 		return nil, nil, err.Error()
 	}
 	if ct == nil { // a login entry with no value yet
+		// Checked as it will be served once the login is done, so a login
+		// cannot bring in an entry the proxy refuses.
+		if err := def.Entry([]byte("login-pending")).Validate(); err != nil {
+			return nil, nil, err.Error()
+		}
 		return &def, nil, ""
 	}
 	value, err := openValue(ct, def.Name, c)
@@ -300,16 +339,40 @@ func openEntry(doc Document, e SetEntry, c Check) (*Definition, []byte, string) 
 	if err := def.Entry(value).Validate(); err != nil {
 		return nil, nil, err.Error()
 	}
+	if isWallet(&def) {
+		// The agent signing as its own owner could approve its own requests
+		// and push credential sets.
+		if addr, err := WalletAddress(value); err == nil && addr == c.Owner {
+			return nil, nil, "a wallet entry may not hold the owner's own key"
+		}
+	}
 	return &def, value, ""
 }
 
+func isWallet(d *Definition) bool {
+	return d.Use == credproxy.UseSign && d.Signer != nil && d.Signer.Method == credproxy.SignWallet
+}
+
+// WalletAddress is the address of a wallet entry's key.
+func WalletAddress(value []byte) (common.Address, error) {
+	k, err := credproxy.WalletKey(value)
+	if err != nil {
+		return common.Address{}, err
+	}
+	key, err := crypto.ToECDSA(k)
+	if err != nil {
+		return common.Address{}, err
+	}
+	return crypto.PubkeyToAddress(key.PublicKey), nil
+}
+
 // chooseCiphertext prefers a valid writeback (a rotated or logged-in value
-// sealed stored for this very definition) over the owner's value.
-func chooseCiphertext(doc Document, e SetEntry, def *Definition, c Check) ([]byte, error) {
-	if wb, ok := doc.Writebacks[def.Name]; ok && def.Writeback && strings.EqualFold(wb.DefHash, e.DefHash) {
+// sealed stored for what this definition binds) over the owner's value.
+func chooseCiphertext(doc Document, def *Definition, c Check) ([]byte, error) {
+	if wb, ok := doc.Writebacks[def.Name]; ok && def.Writeback && wb.Binding == def.Binding() {
 		ct, err := base64.StdEncoding.DecodeString(wb.Ciphertext)
 		if err == nil {
-			msg := WritebackMessage(c.SealID, def.Name, wb.DefHash, wb.BootID, ct)
+			msg := WritebackMessage(c.SealID, def.Name, wb.Binding, wb.BootID, ct)
 			if sig, derr := hexSig(wb.Signature); derr == nil {
 				if pub, perr := crypto.SigToPub(crypto.Keccak256(msg), sig); perr == nil && crypto.PubkeyToAddress(*pub) == c.AgentSeal {
 					return ct, nil

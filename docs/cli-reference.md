@@ -100,7 +100,7 @@ The owner's credentials for the agent's sealed credential proxy (`sealed/CREDENT
 | `cred <agent> rm <name>` | remove one (revoke it at its provider too) |
 | `cred <agent> connect <name> <mcp-url> [client_id=… client_secret_entry=… scope=a,b]` | connect an MCP server to the agent: defines the entry (Bearer on the server's host) if new or changed, prints the link where you log in, and waits for the connection to land |
 | `cred <agent> disconnect <name>` | the running agent asks the server to revoke the connection's tokens (RFC 7009) when the server offers that, and forgets them; then the entry is removed. When the server cannot revoke (or the agent is not running), it says so: revoke the app's access at the service. `rm` of a connection does the same |
-| `cred <agent> reveal <name> on\|off` | let the agent read the value itself without asking each time. Refused for an entry holding a login or a rotated token: the change would drop that value |
+| `cred <agent> reveal <name> on\|off` | let the agent read the value itself without asking each time. A login or a rotated token the entry holds is kept. Refused for a signing key, which is never revealed |
 | `cred <agent> pending` | requests waiting: what sealed knows apart from what the agent says |
 | `cred <agent> approve\|deny [<id>]` | decide one (an id prefix is enough; none when only one request waits); `approve` signs a one-time EIP-712 approval. A request to add a credential or log in is answered by `set` / `login` |
 | `cred <agent> log [n]` | what the agent did with its credentials: first the counted uses of the inference key sealed holds (`×count`, first … last), then the last n other records |

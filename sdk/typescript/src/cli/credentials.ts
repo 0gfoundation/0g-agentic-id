@@ -683,8 +683,8 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       if (!name || !onOff) throw new CliError('BAD_FLAG', 'usage: cred <agent> reveal <name> on|off', { remedy: 'cred <agent> reveal <name> on|off' });
       const allow = yesNo('reveal', onOff);
       const out = await cred.setAllowReveal(sealId, name, allow, at).catch((e: unknown) => {
-        if (e instanceof Error && /keeps a value sealed obtained/.test(e.message)) {
-          throw new CliError('BAD_FLAG', e.message.replace(/^credentials: /, ''), { remedy: 'cred <agent> approve <id>' });
+        if (e instanceof Error && /is a signing key/.test(e.message)) {
+          throw new CliError('BAD_FLAG', e.message.replace(/^credentials: /, ''), { remedy: 'cred <agent>' });
         }
         return conflict(e);
       });
@@ -826,14 +826,14 @@ export async function answerPending(
       tell.push(`[cred] I refused your request to ${p.op} ${p.name}.`);
     };
     if (p.op === 'reveal') {
-      // Allowing it for good changes the entry's definition, which would drop
-      // a value sealed obtained for it (a login, a rotated token).
-      const keeps = defs.find((d) => d.name === p.name)?.writeback;
-      const a = (await io.ask(`  [y] allow once${keeps ? '' : '  [a] always allow'}  [n] refuse  [Enter] later: `)).trim().toLowerCase();
+      // "Always" is for the owner's own entries; a derived token is allowed
+      // through the entry it came from.
+      const owned = defs.some((d) => d.name === p.name);
+      const a = (await io.ask(`  [y] allow once${owned ? '  [a] always allow' : ''}  [n] refuse  [Enter] later: `)).trim().toLowerCase();
       if (a === 'y') {
         await cred.approveOnce(sealId, p.auth_req_id, at);
         tell.push(`[cred] I approved your request to read ${p.name}, this once. Send the same reveal request again.`);
-      } else if (a === 'a' && !keeps) {
+      } else if (a === 'a' && owned) {
         await cred.setAllowReveal(sealId, p.name, true, at);
         tell.push(`[cred] You may read ${p.name} without asking from now on. Send the same reveal request again.`);
       } else if (a === 'n') await refuse();

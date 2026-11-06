@@ -161,6 +161,9 @@ func (s *Server) signPriv() ([]byte, string, error) {
 	return priv, crypto.PubkeyToAddress(pk.PublicKey).Hex(), nil
 }
 
+// maxSignBody bounds what the sign socket reads per request.
+const maxSignBody = 1 << 20
+
 // ── /sign/personal_sign ─────────────────────────────────────────────────────
 
 func (s *Server) handleSignPersonalSign(w http.ResponseWriter, r *http.Request) {
@@ -168,6 +171,7 @@ func (s *Server) handleSignPersonalSign(w http.ResponseWriter, r *http.Request) 
 		writeSignError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxSignBody)
 	var req evmsign.PersonalSignRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeSignError(w, http.StatusBadRequest, "decode body: "+err.Error())
@@ -184,6 +188,7 @@ func (s *Server) handleSignTypedData(w http.ResponseWriter, r *http.Request) {
 		writeSignError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxSignBody)
 	var td apitypes.TypedData
 	if err := json.NewDecoder(r.Body).Decode(&td); err != nil {
 		writeSignError(w, http.StatusBadRequest, "decode body: "+err.Error())
@@ -200,6 +205,7 @@ func (s *Server) handleSignTransaction(w http.ResponseWriter, r *http.Request) {
 		writeSignError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxSignBody)
 	var req evmsign.TransactionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeSignError(w, http.StatusBadRequest, "decode body: "+err.Error())

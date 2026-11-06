@@ -22,6 +22,7 @@ type fakeCredentials struct {
 	decided       []string
 	decideErr     error
 	loginRedirect string
+	logins        []string
 }
 
 func (f *fakeCredentials) Load(_ context.Context, doc credentials.Document, _ uint64) (*credentials.Opened, error) {
@@ -48,6 +49,7 @@ func (f *fakeCredentials) Decide(_ context.Context, id, decision string, _ *cred
 func (f *fakeCredentials) AuditSince(int64) []credentials.AuditRecord { return nil }
 func (f *fakeCredentials) StartLogin(_ context.Context, name, redirect string) (string, error) {
 	f.loginRedirect = redirect
+	f.logins = append(f.logins, name)
 	return "https://auth.example/authorize?state=s1", nil
 }
 func (f *fakeCredentials) Disconnect(_ context.Context, name string) (bool, string, error) {
@@ -188,9 +190,30 @@ func TestCredentialRoutes_Decide(t *testing.T) {
 	}
 	f.decideErr = credentials.ErrUnknownRequest
 	w = httptest.NewRecorder()
-	s.handleCredentialDecide(w, credReq(sign, http.MethodPost, "/_seal/credentials/decide", "0GSealCredDecide", body))
+	s.handleCredentialDecide(w, credReq(sign, http.MethodPost, "/_seal/credentials/decide", "0GSealCredDecide", `{"auth_req_id":"0xbb","decision":"deny"}`))
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("HTTP %d, want 404 for a request that is not open", w.Code)
+	}
+}
+
+// A signed credential request is taken once: the same message and signature
+// sent again within its freshness window is refused.
+func TestCredentialRoutes_ReplayRefused(t *testing.T) {
+	sign, owner := mustKey(t)
+	s, f := credServer(t, owner)
+	first := credReq(sign, http.MethodPost, "/_seal/credentials/login", "0GSealCredLogin", `{"name":"linear"}`)
+	again := httptest.NewRequest(http.MethodPost, "/_seal/credentials/login", strings.NewReader(`{"name":"linear"}`))
+	again.Header = first.Header.Clone()
+	s.publicURL = credAudience
+	w := httptest.NewRecorder()
+	s.handleCredentialLogin(w, first)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HTTP %d (%s)", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	s.handleCredentialLogin(w, again)
+	if w.Code != http.StatusConflict || len(f.logins) != 1 {
+		t.Fatalf("a replayed login: HTTP %d, %d logins started", w.Code, len(f.logins))
 	}
 }
 

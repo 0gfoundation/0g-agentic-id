@@ -89,6 +89,7 @@ type Server struct {
 
 	readSettings        SettingsReader
 	credentials         CredentialService
+	credUsed            usedMessages // owner-signed credential requests already taken
 	scrubber            Scrubber
 	readRuntimeSettings func() RuntimeSettings
 	applySettings       SettingsApplier
@@ -735,6 +736,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if u, perr := url.Parse(upstream); perr == nil {
 		upHost = u.Host
 	}
+	s.mu.RLock()
+	scrubbing := s.scrubber != nil
+	s.mu.RUnlock()
 	for k, vs := range r.Header {
 		switch k {
 		case "Connection", "Keep-Alive", "Te", "Trailer", "Transfer-Encoding", "Upgrade", "Proxy-Authorization", "Proxy-Authenticate":
@@ -742,17 +746,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		case "Origin", "X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host", "X-Real-Ip":
 			continue
 		case "Accept-Encoding":
-			// Signed service path only. Forwarding the client's
-			// Accept-Encoding explicitly pins it: Go's Transport then skips
-			// its own negotiation AND does not decompress, so the serve-proof
-			// taskHash would cover the gzip bytes while the client (undici,
-			// browsers) hashes the plain body it transparently decompressed —
-			// every compressing backend would fail per-exchange verification.
-			// Dropping the header lets the Transport negotiate + decompress,
-			// so the hashed bytes equal the delivered bytes. Framework routes
-			// keep the client's header: their responses are never hashed, and
-			// dropping it would cost br/zstd on framework UI assets.
-			if signed {
+			// Forwarding the client's Accept-Encoding explicitly pins it:
+			// Go's Transport then skips its own negotiation AND does not
+			// decompress. On the signed service path the serve-proof taskHash
+			// would cover the gzip bytes while the client (undici, browsers)
+			// hashes the plain body it transparently decompressed — every
+			// compressing backend would fail per-exchange verification. With
+			// credentials on, the scrubber would see compressed bytes and
+			// miss a value in them. Dropping the header lets the Transport
+			// negotiate + decompress, so what is hashed and scrubbed is what
+			// is delivered. Framework routes otherwise keep the client's
+			// header: their responses are never hashed, and dropping it costs
+			// br/zstd on framework UI assets.
+			if signed || scrubbing {
 				continue
 			}
 		}

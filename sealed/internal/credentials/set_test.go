@@ -101,9 +101,19 @@ func TestOpenRefusals(t *testing.T) {
 		t.Fatalf("wrong owner: %v", err)
 	}
 	c = f.check()
-	c.MinVersion = 4
+	c.Min = Mark{Epoch: 7, Version: 4}
 	if _, err := Open(doc, c); !errors.Is(err, ErrStale) {
 		t.Fatalf("stale: %v", err)
+	}
+	// A set of an earlier ownership is older whatever its version; a later
+	// ownership's first set is newer than every set before it.
+	c.Min = Mark{Epoch: 8, Version: 1}
+	if _, err := Open(doc, c); !errors.Is(err, ErrStale) {
+		t.Fatalf("an earlier ownership's set: %v", err)
+	}
+	c.Min = Mark{Epoch: 6, Version: 40}
+	if _, err := Open(doc, c); err != nil {
+		t.Fatalf("a later ownership's set: %v", err)
 	}
 	c = f.check()
 	c.SealID = "0x" + "11" + testSeal[4:]
@@ -150,9 +160,9 @@ func TestWritebackPreferredWhenSignedBySeal(t *testing.T) {
 	doc.Signature = f.sign(t, digest, f.owner)
 
 	ct, _ := SealValue(f.sealECIES.PublicKey, crypto.PubkeyToAddress(f.owner.PublicKey), testSeal, f.domain.ChainID, "rt", []byte("rotated_refresh_token"))
-	defHash := doc.Set.Entries[0].DefHash
-	msg := WritebackMessage(testSeal, "rt", defHash, "boot-1", ct)
-	doc.Writebacks = map[string]Writeback{"rt": {Ciphertext: base64.StdEncoding.EncodeToString(ct), DefHash: defHash, BootID: "boot-1",
+	binding := def.Binding()
+	msg := WritebackMessage(testSeal, "rt", binding, "boot-1", ct)
+	doc.Writebacks = map[string]Writeback{"rt": {Ciphertext: base64.StdEncoding.EncodeToString(ct), Binding: binding, BootID: "boot-1",
 		Signature: f.sign(t, crypto.Keccak256Hash(msg), f.seal)}}
 	o, err := Open(doc, f.check())
 	if err != nil {
@@ -163,18 +173,29 @@ func TestWritebackPreferredWhenSignedBySeal(t *testing.T) {
 	}
 	// A writeback signed by anyone else is ignored.
 	good := doc.Writebacks["rt"]
-	doc.Writebacks["rt"] = Writeback{Ciphertext: good.Ciphertext, DefHash: defHash, BootID: "boot-1", Signature: f.sign(t, crypto.Keccak256Hash(msg), f.owner)}
+	doc.Writebacks["rt"] = Writeback{Ciphertext: good.Ciphertext, Binding: binding, BootID: "boot-1", Signature: f.sign(t, crypto.Keccak256Hash(msg), f.owner)}
 	o, _ = Open(doc, f.check())
 	if string(o.Values["rt"]) != "old_refresh_token" {
 		t.Fatalf("an unsigned writeback won: %q", o.Values["rt"])
 	}
-	// So is one made for another definition of the entry: the owner changed it.
-	other := crypto.Keccak256Hash([]byte("another definition")).Hex()
+	// So is one made for another value of the entry: the owner replaced it.
+	other := "value:" + crypto.Keccak256Hash([]byte("another value")).Hex()
 	omsg := WritebackMessage(testSeal, "rt", other, "boot-1", ct)
-	doc.Writebacks["rt"] = Writeback{Ciphertext: good.Ciphertext, DefHash: other, BootID: "boot-1", Signature: f.sign(t, crypto.Keccak256Hash(omsg), f.seal)}
+	doc.Writebacks["rt"] = Writeback{Ciphertext: good.Ciphertext, Binding: other, BootID: "boot-1", Signature: f.sign(t, crypto.Keccak256Hash(omsg), f.seal)}
 	o, _ = Open(doc, f.check())
 	if string(o.Values["rt"]) != "old_refresh_token" {
-		t.Fatalf("a writeback for another definition won: %q", o.Values["rt"])
+		t.Fatalf("a writeback for another value won: %q", o.Values["rt"])
+	}
+	// One sealed under a previous owner does not open for the new one.
+	doc.Writebacks["rt"] = good
+	c := f.check()
+	newOwner, _ := crypto.GenerateKey()
+	c.Owner = crypto.PubkeyToAddress(newOwner.PublicKey)
+	digest, _ = doc.Set.Digest(f.domain)
+	doc.Signature = f.sign(t, digest, newOwner)
+	o, _ = Open(doc, c)
+	if string(o.Values["rt"]) == "rotated_refresh_token" {
+		t.Fatal("a previous owner's writeback opened for the new owner")
 	}
 }
 
@@ -214,8 +235,8 @@ func TestDigestVectors(t *testing.T) {
 // The writeback message, character for character as the attestor's
 // writeback_message builds it.
 func TestWritebackMessageMatchesAttestor(t *testing.T) {
-	got := string(WritebackMessage(testSeal, "gcp", "0xAB00000000000000000000000000000000000000000000000000000000000001", "0xboot", []byte("rotated")))
-	want := "CredentialWriteback.v1:0x0fb3604de692a0a2ceae1d9e655d0dc28a8a81340534df4ba5c9a66a375f7c8f:gcp:0xab00000000000000000000000000000000000000000000000000000000000001:0xboot:0xeacb26800d47aea80d40d70980c9726defc50d7b4f14e3ad1d74ae435ef5948e"
+	got := string(WritebackMessage(testSeal, "gcp", "value:0xab00000000000000000000000000000000000000000000000000000000000001", "0xboot", []byte("rotated")))
+	want := "CredentialWriteback.v2:0x0fb3604de692a0a2ceae1d9e655d0dc28a8a81340534df4ba5c9a66a375f7c8f:gcp:value:0xab00000000000000000000000000000000000000000000000000000000000001:0xboot:0xeacb26800d47aea80d40d70980c9726defc50d7b4f14e3ad1d74ae435ef5948e"
 	if got != want {
 		t.Fatalf("\ngot  %s\nwant %s", got, want)
 	}

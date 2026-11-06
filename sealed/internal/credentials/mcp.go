@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"seal-verify/internal/credproxy"
 )
 
 // MCPSpec makes an entry a login entry: the owner logs sealed in to the MCP
@@ -57,19 +59,25 @@ func parseMCPState(b []byte) (*mcpState, bool) {
 	return &st, true
 }
 
-// loginAttempt is a login the owner started and has not finished.
+// loginAttempt is a login the owner started and has not finished: under
+// def, while nothing was cleared since gen.
 type loginAttempt struct {
 	name, verifier, redirectURI string
 	clientID, clientSecret      string
 	tokenURL, resource          string
 	revocationURL               string
 	expires                     time.Time
+	def                         *Definition
+	gen                         uint64
 }
 
 const (
 	loginTTL      = 10 * time.Minute
 	refreshBefore = time.Minute
-	maxMetadata   = 1 << 20
+	// minRefreshWait keeps a server that issues very short-lived tokens
+	// from being asked again and again.
+	minRefreshWait = 10 * time.Second
+	maxMetadata    = 1 << 20
 )
 
 // authServer is what discovery finds for an MCP server.
@@ -101,11 +109,16 @@ func loginErr(format string, args ...any) error { return &LoginError{fmt.Sprintf
 // redirects to redirectURI (this agent's /_seal/oauth/callback), where
 // FinishLogin completes it. The PKCE verifier never leaves sealed.
 func (s *Store) StartLogin(ctx context.Context, name, redirectURI string) (string, error) {
+	if cerr := s.ensureOwner(ctx); cerr != nil {
+		return "", loginErr("%s", cerr.Message)
+	}
 	s.mu.Lock()
-	def := s.defs[name]
+	def, gen := s.defs[name], s.gen
+	var secretDef *Definition
 	var secret string
-	if def != nil && def.MCP != nil && def.MCP.ClientSecretEntry != "" {
-		secret = string(s.values[def.MCP.ClientSecretEntry])
+	if def != nil && def.MCP != nil && def.MCP.ClientID != "" && def.MCP.ClientSecretEntry != "" {
+		secretDef = s.defs[def.MCP.ClientSecretEntry]
+		secret = string(usableValue(secretDef, s.values[def.MCP.ClientSecretEntry]))
 	}
 	s.mu.Unlock()
 	if def == nil || def.MCP == nil {
@@ -114,9 +127,25 @@ func (s *Store) StartLogin(ctx context.Context, name, redirectURI string) (strin
 	if !strings.HasPrefix(redirectURI, "https://") {
 		return "", loginErr("this agent has no https address for the login to return to")
 	}
+	if def.MCP.ClientID != "" && def.MCP.ClientSecretEntry != "" {
+		se := def.MCP.ClientSecretEntry
+		switch {
+		case secretDef == nil || secret == "":
+			return "", loginErr("the client secret entry %q is not loaded", se)
+		case useOf(secretDef) == credproxy.UseSign:
+			return "", loginErr("the client secret entry %q is a signing key and is never sent", se)
+		case s.expired(se):
+			return "", loginErr("the client secret entry %q has expired", se)
+		}
+	}
 	as, err := s.discover(ctx, def.MCP.URL)
 	if err != nil {
 		return "", err
+	}
+	// The token endpoint comes from the server's metadata: the client secret
+	// goes there only if its entry allows that host.
+	if secretDef != nil && len(secretDef.Hosts) > 0 && !hostListed(as.token, secretDef.Hosts) {
+		return "", loginErr("the client secret entry %q does not allow the token endpoint's host", def.MCP.ClientSecretEntry)
 	}
 	clientID := def.MCP.ClientID
 	if clientID == "" {
@@ -137,8 +166,13 @@ func (s *Store) StartLogin(ctx context.Context, name, redirectURI string) (strin
 			delete(s.logins, k)
 		}
 	}
+	if s.gen != gen {
+		s.mu.Unlock()
+		return "", loginErr("the agent's owner changed; start the login again")
+	}
 	s.logins[state] = &loginAttempt{name: name, verifier: verifier, redirectURI: redirectURI, clientID: clientID,
-		clientSecret: secret, tokenURL: as.token, resource: as.resource, revocationURL: as.revocation, expires: now.Add(loginTTL)}
+		clientSecret: secret, tokenURL: as.token, resource: as.resource, revocationURL: as.revocation, expires: now.Add(loginTTL),
+		def: def, gen: gen}
 	s.mu.Unlock()
 
 	q := url.Values{
@@ -169,6 +203,10 @@ func (s *Store) StartLogin(ctx context.Context, name, redirectURI string) (strin
 // the state names the attempt (once), the code is exchanged with the PKCE
 // verifier, and the tokens become the entry's value.
 func (s *Store) FinishLogin(ctx context.Context, state, code, oauthError string) (string, error) {
+	// An owner change clears the attempt.
+	if cerr := s.ensureOwner(ctx); cerr != nil {
+		return "", loginErr("%s", cerr.Message)
+	}
 	s.mu.Lock()
 	a := s.logins[state]
 	delete(s.logins, state)
@@ -204,7 +242,10 @@ func (s *Store) FinishLogin(ctx context.Context, state, code, oauthError string)
 	if tok.expiresIn > 0 {
 		st.ExpiresAt = s.now().Unix() + tok.expiresIn
 	}
-	s.applyLogin(ctx, a.name, st)
+	if !s.applyLogin(ctx, a.def, a.gen, st) {
+		s.audit("login", a.name, a.tokenURL, "dropped: the entry changed meanwhile")
+		return a.name, loginErr("the entry changed while the login ran; start the login again")
+	}
 	// A login request is answered by a completed login, not by the owner
 	// adding the entry.
 	s.mu.Lock()
@@ -219,61 +260,65 @@ func (s *Store) FinishLogin(ctx context.Context, state, code, oauthError string)
 	return a.name, nil
 }
 
-// applyLogin makes st the entry's value, writes it back, and schedules the
-// next refresh.
-func (s *Store) applyLogin(ctx context.Context, name string, st *mcpState) {
+// applyLogin makes st the entry's value (unless the entry changed since gen,
+// see rotate), writes it back, and schedules the next refresh.
+func (s *Store) applyLogin(ctx context.Context, def *Definition, gen uint64, st *mcpState) bool {
 	raw, _ := json.Marshal(st)
-	s.mu.Lock()
-	def := s.defs[name]
-	if def == nil {
-		s.mu.Unlock()
-		return // removed meanwhile
+	applied, had := s.rotate(ctx, def, gen, raw)
+	if !applied {
+		return false
 	}
-	had := s.values[name] != nil
-	s.mu.Unlock()
-	s.rotate(ctx, def, raw)
 	if !had {
 		s.mu.Lock()
-		s.events.add(Event{Type: "entry_added", Name: name})
+		s.events.add(Event{Type: "entry_added", Name: def.Name})
 		s.mu.Unlock()
 	}
-	s.scheduleRefresh(name, st)
+	s.scheduleRefresh(def.Name, st)
+	return true
 }
 
 // scheduleRefresh refreshes a login entry's access token shortly before it
-// expires. A newer schedule for the same entry replaces this one.
+// expires (halfway through a lifetime under two minutes, and never sooner
+// than minRefreshWait). A newer schedule for the same entry replaces this
+// one.
 func (s *Store) scheduleRefresh(name string, st *mcpState) {
 	if st.RefreshToken == "" || st.ExpiresAt == 0 {
 		return
 	}
-	wait := time.Until(time.Unix(st.ExpiresAt, 0).Add(-refreshBefore))
-	if wait < 0 {
-		wait = 0
+	lifetime := time.Unix(st.ExpiresAt, 0).Sub(s.now())
+	before := refreshBefore
+	if lifetime < 2*refreshBefore {
+		before = lifetime / 2
+	}
+	wait := lifetime - before
+	if wait < minRefreshWait {
+		wait = minRefreshWait
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if t := s.refreshTimers[name]; t != nil {
 		t.Stop()
 	}
-	s.refreshTimers[name] = time.AfterFunc(wait, func() { s.refreshLogin(name, 0) })
+	access := st.AccessToken
+	s.refreshTimers[name] = time.AfterFunc(wait, func() { s.refreshLogin(name, access, 0) })
 }
 
 // refreshLogin trades the refresh token for a new access token (and the
-// rotated refresh token the server returns). A failure is retried with
+// rotated refresh token the server returns), if the entry still holds the
+// access token this refresh was scheduled for. A failure is retried with
 // backoff; a refused refresh token ends the login, and the owner is told
 // through a login request.
-func (s *Store) refreshLogin(name string, attempt int) {
-	s.mu.Lock()
-	raw := s.values[name]
-	def := s.defs[name]
-	s.mu.Unlock()
-	st, ok := parseMCPState(raw)
-	if def == nil || def.MCP == nil || !ok || st.RefreshToken == "" {
-		return
-	}
+func (s *Store) refreshLogin(name, access string, attempt int) {
 	lock := s.lockFor(name)
 	lock.Lock()
 	defer lock.Unlock()
+	s.mu.Lock()
+	raw, def, gen := s.values[name], s.defs[name], s.gen
+	s.mu.Unlock()
+	st, ok := parseMCPState(raw)
+	if def == nil || def.MCP == nil || !ok || st.RefreshToken == "" || st.AccessToken != access {
+		return // gone, or refreshed or logged in again meanwhile
+	}
 	form := url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {st.RefreshToken},
@@ -291,14 +336,16 @@ func (s *Store) refreshLogin(name string, attempt int) {
 		if errors.As(err, &le) && strings.Contains(le.Reason, "invalid_grant") {
 			s.audit("refresh", name, st.TokenURL, "invalid_grant")
 			s.mu.Lock()
-			s.pendingForLocked("login", name, map[string]string{"url": def.MCP.URL}, "", map[string]any{"source": "sealed", "why": "the login expired or was revoked"})
+			if s.gen == gen {
+				_, _ = s.pendingForLocked("login", name, map[string]string{"url": def.MCP.URL}, "", "", map[string]any{"source": "sealed", "why": "the login expired or was revoked"})
+			}
 			s.mu.Unlock()
 			return
 		}
 		s.audit("refresh", name, st.TokenURL, "failed")
 		if attempt < 6 {
 			delay := time.Duration(1<<attempt) * 10 * time.Second
-			time.AfterFunc(delay, func() { s.refreshLogin(name, attempt+1) })
+			time.AfterFunc(delay, func() { s.refreshLogin(name, access, attempt+1) })
 		}
 		return
 	}
@@ -312,7 +359,22 @@ func (s *Store) refreshLogin(name string, attempt int) {
 		next.ExpiresAt = s.now().Unix() + tok.expiresIn
 	}
 	s.audit("refresh", name, st.TokenURL, "ok")
-	s.applyLogin(ctx, name, &next)
+	s.applyLogin(ctx, def, gen, &next)
+}
+
+// hostListed reports whether rawURL's host is one of hosts.
+func hostListed(rawURL string, hosts []string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	h := credproxy.NormalizeHost(u.Host)
+	for _, x := range hosts {
+		if credproxy.NormalizeHost(x) == h {
+			return true
+		}
+	}
+	return false
 }
 
 // Disconnect ends a login entry's login. When the authorization server

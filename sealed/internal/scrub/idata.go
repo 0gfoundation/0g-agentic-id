@@ -129,12 +129,17 @@ func (a *IData) scrubManifest(ctx context.Context, role string, raw []byte) ([]b
 				return nil, err
 			}
 			got = entryResult{hash: manifest.HashHex(scrubbed), size: len(scrubbed)}
-			if got.hash == manifest.HashHex(content) {
-				got = entryResult{hash: e.ContentHash, size: e.Size}
+			// Kept only for the content the manifest names: a file that
+			// changed between the manifest and this read is read again on
+			// the next pass, never remembered under the other hash.
+			if manifest.HashHex(content) == e.ContentHash {
+				if got.hash == e.ContentHash {
+					got = entryResult{hash: e.ContentHash, size: e.Size}
+				}
+				a.mu.Lock()
+				a.cache[key] = got
+				a.mu.Unlock()
 			}
-			a.mu.Lock()
-			a.cache[key] = got
-			a.mu.Unlock()
 		}
 		if got.hash != e.ContentHash {
 			e.ContentHash, e.Size = got.hash, got.size

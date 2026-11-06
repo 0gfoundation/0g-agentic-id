@@ -197,23 +197,15 @@ pub async fn handle_post(
         // The row belongs to an earlier ownership: start over.
         state.credentials.clear(req.seal_id).await?;
     }
-    // Writebacks for definitions the new set leaves as they were carry over
-    // (a rotated refresh token, a login); the rest end with their definition.
+    // Writebacks (a rotated refresh token, a login) carry over for entries
+    // the new set keeps with writebacks allowed. Whether one still stands
+    // for the new definition (the same value or login) sealed decides at
+    // boot by its binding; the rest end with their entry.
     let mut carried = serde_json::Map::new();
     if let Some(c) = current.as_ref().filter(|_| base > 0) {
         if let Some(wbs) = c.writebacks.as_object() {
             for (name, w) in wbs {
-                let def_hash = w
-                    .get("def_hash")
-                    .and_then(|h| h.as_str())
-                    .unwrap_or_default();
-                if req
-                    .document
-                    .set
-                    .entries
-                    .iter()
-                    .any(|e| &e.name == name && e.def_hash.eq_ignore_ascii_case(def_hash))
-                {
+                if allows_writeback(&req.document, name) {
                     carried.insert(name.clone(), w.clone());
                 }
             }
@@ -275,28 +267,10 @@ pub async fn handle_writeback(
         .ok_or_else(|| ApiError::not_found("no credential set for this agent"))?;
     let doc: Document =
         serde_json::from_value(stored.document).map_err(|e| ApiError::internal(e.to_string()))?;
-    // Bound to the entry's definition: one the owner has since changed is
-    // over.
-    if !doc
-        .set
-        .entries
-        .iter()
-        .any(|e| e.name == req.name && e.def_hash.eq_ignore_ascii_case(&req.writeback.def_hash))
-    {
-        return Err(ApiError::conflict(
-            "stale_definition: the writeback is for a definition the owner has replaced",
-        ));
+    if !doc.set.entries.iter().any(|e| e.name == req.name) {
+        return Err(ApiError::not_found("no such credential in the current set"));
     }
-    let def_b64 = doc
-        .defs
-        .get(&req.name)
-        .ok_or_else(|| ApiError::not_found("no such credential in the current set"))?;
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(def_b64)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    let def: serde_json::Value =
-        serde_json::from_slice(&raw).map_err(|e| ApiError::internal(e.to_string()))?;
-    if def.get("writeback").and_then(|v| v.as_bool()) != Some(true) {
+    if !allows_writeback(&doc, &req.name) {
         return Err(ApiError::forbidden(
             "writeback_not_allowed: the owner did not allow writebacks for this credential",
         ));
@@ -313,6 +287,20 @@ pub async fn handle_writeback(
     }
     tracing::info!(seal_id = ?req.seal_id, name = %req.name, "credential writeback stored");
     Ok(Json(json!({"ok": true})))
+}
+
+/// Whether `doc` defines `name` with writebacks allowed.
+fn allows_writeback(doc: &Document, name: &str) -> bool {
+    let Some(def_b64) = doc.defs.get(name) else {
+        return false;
+    };
+    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(def_b64) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|d| d.get("writeback").and_then(|v| v.as_bool()))
+        == Some(true)
 }
 
 pub async fn handle_pending(
@@ -664,9 +652,21 @@ mod tests {
         epoch: u64,
         writeback: bool,
     ) -> Document {
+        document_described(s, signer, version, epoch, writeback, "")
+    }
+
+    /// `document`, with gcp's definition carrying `description`.
+    fn document_described(
+        s: &Setup,
+        signer: &PrivateKeySigner,
+        version: u64,
+        epoch: u64,
+        writeback: bool,
+        description: &str,
+    ) -> Document {
         let ct = b"ciphertext sealed to the agent".to_vec();
         let def = json!({"v":1,"name":"gcp","hosts":["oauth2.googleapis.com"],"use":"token_only",
-            "value_hash": format!("{}", keccak256(&ct)), "writeback": writeback});
+            "value_hash": format!("{}", keccak256(&ct)), "writeback": writeback, "description": description});
         let raw = serde_json::to_vec(&def).unwrap();
         let set = SetWire {
             seal_id: format!("{:#x}", s.seal_id),
@@ -784,21 +784,18 @@ mod tests {
             .unwrap();
     }
 
-    /// A writeback of gcp, for the definition `document` builds with this
-    /// writeback permission.
-    fn writeback(s: &Setup, key: &PrivateKeySigner, boot: &str, allowed: bool) -> WritebackRequest {
-        let def_hash = document(s, &s.owner, 1, 0, allowed).set.entries[0]
-            .def_hash
-            .clone();
+    /// A writeback of gcp, bound to the value `document` gives it.
+    fn writeback(s: &Setup, key: &PrivateKeySigner, boot: &str) -> WritebackRequest {
+        let binding = format!("value:{}", keccak256(b"ciphertext sealed to the agent"));
         let ct = b"rotated refresh token, sealed".to_vec();
-        let msg = writeback_message(s.seal_id, "gcp", &def_hash, boot, &ct);
+        let msg = writeback_message(s.seal_id, "gcp", &binding, boot, &ct);
         let sig = key.sign_hash_sync(&keccak256(msg.as_bytes())).unwrap();
         WritebackRequest {
             seal_id: s.seal_id,
             name: "gcp".into(),
             writeback: Writeback {
                 ciphertext: b64e(&ct),
-                def_hash,
+                binding,
                 boot_id: boot.into(),
                 signature: format!("0x{}", hex::encode(sig.as_bytes())),
             },
@@ -816,18 +813,24 @@ mod tests {
         let boot_hex = format!("{boot:#x}");
         let _ = handle_writeback(
             State(s.state.clone()),
-            Json(writeback(&s, &s.agent_seal, &boot_hex, true)),
+            Json(writeback(&s, &s.agent_seal, &boot_hex)),
         )
         .await
         .unwrap();
         let stored = s.creds.get(s.seal_id).await.unwrap().unwrap();
         assert_eq!(stored.writebacks["gcp"]["boot_id"], boot_hex);
 
-        // The owner stores a new set that keeps gcp's definition: its
-        // writeback carries over. One that changes it ends the writeback.
-        let _ = write(&s, &s.owner, 1, &document(&s, &s.owner, 2, 0, true))
-            .await
-            .unwrap();
+        // The owner stores a new set that edits gcp (its description): the
+        // writeback carries over, and sealed keeps it while its binding
+        // holds. One that withdraws writebacks ends it.
+        let _ = write(
+            &s,
+            &s.owner,
+            1,
+            &document_described(&s, &s.owner, 2, 0, true, "edited"),
+        )
+        .await
+        .unwrap();
         let stored = s.creds.get(s.seal_id).await.unwrap().unwrap();
         assert_eq!(
             stored.writebacks["gcp"]["boot_id"], boot_hex,
@@ -839,22 +842,21 @@ mod tests {
         let stored = s.creds.get(s.seal_id).await.unwrap().unwrap();
         assert!(
             stored.writebacks.get("gcp").is_none(),
-            "ended with its definition"
+            "ended when writebacks were withdrawn"
         );
-        // A writeback for the replaced definition is refused.
         let err = handle_writeback(
             State(s.state.clone()),
-            Json(writeback(&s, &s.agent_seal, &boot_hex, true)),
+            Json(writeback(&s, &s.agent_seal, &boot_hex)),
         )
         .await
         .unwrap_err();
-        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
 
         let other_boot = format!("{:#x}", B256::repeat_byte(0x43));
         assert!(
             handle_writeback(
                 State(s.state.clone()),
-                Json(writeback(&s, &s.agent_seal, &other_boot, true))
+                Json(writeback(&s, &s.agent_seal, &other_boot))
             )
             .await
             .is_err(),
@@ -863,7 +865,7 @@ mod tests {
         assert!(
             handle_writeback(
                 State(s.state.clone()),
-                Json(writeback(&s, &s.owner, &boot_hex, true))
+                Json(writeback(&s, &s.owner, &boot_hex))
             )
             .await
             .is_err(),
@@ -881,7 +883,7 @@ mod tests {
         s.creds.set_boot_id(s.seal_id, boot);
         let err = handle_writeback(
             State(s.state.clone()),
-            Json(writeback(&s, &s.agent_seal, &format!("{boot:#x}"), false)),
+            Json(writeback(&s, &s.agent_seal, &format!("{boot:#x}"))),
         )
         .await
         .unwrap_err();

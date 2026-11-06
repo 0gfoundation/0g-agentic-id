@@ -318,11 +318,11 @@ export class CredentialsApi {
     const current = await this.get(sealId);
     const def = current.definitions.find((d) => d.name === name);
     if (!def) throw new Error(`credentials: no entry named ${name}`);
-    // The setting is part of the signed definition. A value sealed obtained
-    // for this entry (a login, a rotated refresh token) is bound to the
-    // definition, so changing it would drop that value.
-    if (def.writeback && !!def.allow_reveal !== allow) {
-      throw new Error(`credentials: ${name} keeps a value sealed obtained (a login or a rotated token), and changing its definition would drop it; approve the agent's requests one at a time instead`);
+    // A signing key signs and is never revealed (sealed refuses it). A value
+    // sealed obtained for the entry (a login, a rotated token) is bound to
+    // that value or login, not to this setting, so it is kept.
+    if (allow && def.use === 'sign') {
+      throw new Error(`credentials: ${name} is a signing key: it signs and is never revealed`);
     }
     const next = current.definitions.map((d) => (d.name === name ? { ...inputOf(d), allowReveal: allow } : inputOf(d)));
     return this.put(sealId, next, { baseVersion: current.version, agentUrl: opts?.agentUrl });

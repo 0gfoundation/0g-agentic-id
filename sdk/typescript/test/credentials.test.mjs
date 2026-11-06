@@ -467,9 +467,9 @@ test('cli: approve with no id takes the only request; pending shows no empty fac
   await assert.rejects(credOp(ag, SEAL_ID, ['approve'], io), (e) => e.code === 'BAD_FLAG' && /2 requests are waiting/.test(e.message) && e.remedy === 'cred <agent> pending');
 });
 
-test('cli: reveal on|off refuses an entry whose login or rotated token the change would drop', async () => {
-  const ag = { credentials: { setAllowReveal: async () => { throw new Error('credentials: linear keeps a value sealed obtained (a login or a rotated token), and changing its definition would drop it; approve the agent\'s requests one at a time instead'); } } };
-  await assert.rejects(credOp(ag, SEAL_ID, ['reveal', 'linear', 'on'], { json: false, out: () => {}, secret: async () => '' }), (e) => e.code === 'BAD_FLAG' && /would drop it/.test(e.message));
+test('cli: reveal on refuses a signing key', async () => {
+  const ag = { credentials: { setAllowReveal: async () => { throw new Error('credentials: hmac is a signing key: it signs and is never revealed'); } } };
+  await assert.rejects(credOp(ag, SEAL_ID, ['reveal', 'hmac', 'on'], { json: false, out: () => {}, secret: async () => '' }), (e) => e.code === 'BAD_FLAG' && /never revealed/.test(e.message));
 });
 
 function sessionIO(answers) {
@@ -503,9 +503,12 @@ test('session: a waiting reveal comes up at the prompt; the answer goes to the a
   t = sessionIO(['y']);
   assert.deepEqual(await answerPending(base(plain), SEAL_ID, t.io, { later, tokenize: (l) => l.split(' ') }), []);
   assert.equal(t.asked.length, 0);
-  // An entry holding a login: "always" is not offered (it would drop the login).
+  // An entry holding a login keeps it when allowed for good: "always" is offered.
   t = sessionIO(['a']);
-  assert.deepEqual(await answerPending(base([{ name: 'github', writeback: true }]), SEAL_ID, t.io, { later: new Set(), tokenize: (l) => l.split(' ') }), []);
+  assert.match((await answerPending(base([{ name: 'github', writeback: true }]), SEAL_ID, t.io, { later: new Set(), tokenize: (l) => l.split(' ') }))[0], /without asking/);
+  // A derived token is allowed through the entry it came from: only "once" here.
+  t = sessionIO(['a']);
+  assert.deepEqual(await answerPending(base([]), SEAL_ID, t.io, { later: new Set(), tokenize: (l) => l.split(' ') }), []);
   assert.doesNotMatch(t.asked[0], /always/);
 });
 
