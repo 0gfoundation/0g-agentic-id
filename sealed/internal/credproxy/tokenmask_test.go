@@ -17,6 +17,8 @@ func TestMaskTokensFormatsAndBoundaries(t *testing.T) {
 	pat := fakeToken("github"+"_pat_", 82)
 	slack := "xox" + "b-" + "1234567890-0987654321-" + fakeToken("", 24)
 	sk := fakeToken("sk"+"-proj-", 60)
+	// GitHub's installation tokens: about 520 bytes with two dots.
+	ghs := "ghs" + "_" + "123456_" + fakeToken("", 200) + "." + fakeToken("", 150) + "." + fakeToken("", 160)
 	for in, want := range map[string]string{
 		`{"token":"` + gh + `"}`:        `{"token":"[[redacted]]"}`,
 		"a " + pat + " b":               "a [[redacted]] b",
@@ -26,6 +28,9 @@ func TestMaskTokensFormatsAndBoundaries(t *testing.T) {
 		"x" + gh:                        "x" + gh,                        // not at a word boundary
 		fakeToken("ghp"+"_", 10) + " .": fakeToken("ghp"+"_", 10) + " .", // too short
 		"no tokens here":                "no tokens here",
+		"t=" + ghs + ".":                "t=[[redacted]].", // the full stop stays
+		"see " + gh + ", then":          "see [[redacted]], then",
+		"file." + gh:                    "file.[[redacted]]", // '.' ends a word
 	} {
 		if got := newProxyRedactor().applyString(in); got != want {
 			t.Errorf("%q\n got %q\nwant %q", in, got, want)

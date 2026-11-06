@@ -192,7 +192,7 @@ func (rr *redactReader) Read(p []byte) (int, error) {
 		rr.out = buf[:len(buf)-keep]
 		rr.held = append([]byte(nil), buf[len(buf)-keep:]...)
 		if len(rr.out) > 0 {
-			rr.prevToken = tokenByte(rr.out[len(rr.out)-1])
+			rr.prevToken = wordByte(rr.out[len(rr.out)-1])
 		}
 	}
 	n := copy(p, rr.out)
