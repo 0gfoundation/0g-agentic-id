@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // Two sets the owner signed at one version (one the attestor refused, kept
@@ -55,7 +57,7 @@ func TestMarkWithoutDigestLearnsIt(t *testing.T) {
 }
 
 // A document at the loaded version that the owner did not sign is refused
-// as such, not as a second set: it is never counted as "already loaded".
+// as such, not as a second set.
 func TestUnsignedAtLoadedVersionIsWrongSigner(t *testing.T) {
 	f := newFixture(t)
 	s, _, _ := f.store(t, nil, nil)
@@ -64,8 +66,10 @@ func TestUnsignedAtLoadedVersionIsWrongSigner(t *testing.T) {
 		t.Fatal(err)
 	}
 	junk := f.doc(t, 3, map[string]string{"other": "x"})
-	junk.Signature = "0x00"
-	if _, err := s.Load(ctx, junk, 0); err == nil || errors.Is(err, ErrStale) {
-		t.Fatalf("an unsigned document at the loaded version: %v", err)
+	other, _ := crypto.GenerateKey()
+	d, _ := junk.Set.Digest(f.domain)
+	junk.Signature = f.sign(t, d, other)
+	if _, err := s.Load(ctx, junk, 0); !errors.Is(err, ErrWrongSigner) {
+		t.Fatalf("a document at the loaded version signed by another key: %v", err)
 	}
 }

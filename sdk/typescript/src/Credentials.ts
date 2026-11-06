@@ -279,6 +279,8 @@ async function safely<T>(f: () => T | Promise<T>): Promise<T | undefined> {
 export class CredentialsApi {
   /** The newest set seen per agent (see markKey), within this client's life. */
   private readonly marks = new Map<string, Mark>();
+  /** Per agent, the check against the newest set seen and its raise run one at a time. */
+  private readonly markTurns = new Map<string, Promise<unknown>>();
 
   constructor(
     private readonly ctx: Ctx,
@@ -299,6 +301,13 @@ export class CredentialsApi {
     return kept && newer(kept, mine) ? kept : mine;
   }
 
+  private inTurn<T>(seal: Hash, f: () => Promise<T>): Promise<T> {
+    const key = this.markKey(seal);
+    const run = (this.markTurns.get(key) ?? Promise.resolve()).then(f);
+    this.markTurns.set(key, run.catch(() => undefined));
+    return run;
+  }
+
   private async raiseMark(seal: Hash, m: Mark): Promise<void> {
     const key = this.markKey(seal);
     const cur = await this.markOf(seal);
@@ -316,8 +325,12 @@ export class CredentialsApi {
     if (older(at, seen)) why = `it is older than the newest set this client has seen, version ${seen.version} of ownership ${seen.epoch}`;
     else if (same(at, seen) && seen.digest && at.digest && at.digest.toLowerCase() !== seen.digest.toLowerCase()) why = `it is not the version ${seen.version} this client has seen`;
     if (!why) return undefined;
-    const where = this.ctx.credentialMarks?.where;
-    const clear = where ? `remove this agent's record from ${where}` : 'start a new client';
+    const marks = this.ctx.credentialMarks;
+    const clear = marks?.where
+      ? `remove this agent's record from ${marks.where}`
+      : marks
+        ? "remove this agent's record from the client's credentialMarks store"
+        : 'start a new client';
     return `${why}. If the attestor's data was reset on purpose, ${clear} and read again`;
   }
 
@@ -389,9 +402,12 @@ export class CredentialsApi {
     // An older set the owner did sign, or another at the same version,
     // served again, would bring back what the owner changed or removed since.
     const at: Mark = { epoch: body.owner_epoch, version: body.version, digest: v.digest };
-    const stale = this.staleness(at, await this.markOf(seal));
-    if (stale) throw new CredentialsUnverifiedError(stale);
-    if (body.document) await this.raiseMark(seal, at);
+    // Checked and raised in one turn: two reads in flight take one set at a version.
+    await this.inTurn(seal, async () => {
+      const stale = this.staleness(at, await this.markOf(seal));
+      if (stale) throw new CredentialsUnverifiedError(stale);
+      if (body.document) await this.raiseMark(seal, at);
+    });
     return { version: body.version, ownerEpoch: body.owner_epoch, document: body.document, definitions };
   }
 
@@ -559,7 +575,7 @@ export class CredentialsApi {
     }
     if (!r.ok) throw new Error(`credentials: store failed: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     const version = ((await r.json()) as { version: number }).version;
-    await this.raiseMark(seal, { epoch: doc.set.owner_epoch, version: doc.set.version, digest: this.setDigest(seal, doc.set) });
+    await this.inTurn(seal, () => this.raiseMark(seal, { epoch: doc.set.owner_epoch, version: doc.set.version, digest: this.setDigest(seal, doc.set) }));
     return version;
   }
 

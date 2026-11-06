@@ -317,3 +317,95 @@ test('marks: a digest answered in upper case does not refuse the same set', asyn
     h.server.close();
   }
 });
+
+// Two signed sets at one version, served to reads in flight.
+const A_IN = { name: 'a', value: 'x', hosts: ['a.example'], positions: [{ kind: 'header', name: 'X', template: '{v}' }] };
+const LEAKY_IN = { name: 'leaky', value: 'l', hosts: ['l.example'], positions: [{ kind: 'header', name: 'X', template: '{v}' }] };
+async function pairs({ holdPairs = false } = {}) {
+  const sets = [];
+  const h = { serveQueue: [], epoch: 7, fake: undefined };
+  let waiting = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const u = new URL(req.url, 'http://x');
+      const json = (s, b) => { res.writeHead(s, { 'content-type': 'application/json' }); res.end(typeof b === 'string' ? b : JSON.stringify(b)); };
+      if (req.method === 'GET' && u.pathname === '/credentials') {
+        if (h.fake !== undefined) return json(200, h.fake);
+        const cur = h.serveQueue.length ? h.serveQueue.shift() : sets.at(-1);
+        const send = () => json(200, { version: cur ? cur.set.version : 0, owner_epoch: cur ? cur.set.owner_epoch : h.epoch, document: cur ?? null, writebacks: {} });
+        if (holdPairs && h.hold) { waiting.push(send); if (waiting.length === 2) { const w = waiting; waiting = []; w.forEach((f) => f()); } return; }
+        return send();
+      }
+      if (req.method === 'POST' && u.pathname === '/credentials') {
+        const b = JSON.parse(Buffer.concat(chunks).toString());
+        sets.push(b.document);
+        return json(200, { ok: true, version: b.document.set.version });
+      }
+      if (u.pathname.startsWith('/_seal/')) return json(200, {});
+      json(404, {});
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const client = (marks) => new CredentialsApi({ attestorUrl: url, chain: { id: CHAIN_ID }, addresses: { agenticID: CONTRACT }, account: OWNER, credentialMarks: marks,
+    walletClient: { signMessage: ({ message }) => OWNER.signMessage({ message }), signTypedData: (a) => OWNER.signTypedData(a) } }, { agentSealPubkey: async () => SEAL_PUB });
+  return Object.assign(h, { url, server, sets, client });
+}
+
+// Two signed sets X, Y at v2 (same epoch).
+async function fork(h) {
+  await h.client().put(SEAL_ID, [A_IN], { baseVersion: 0, agentUrl: h.url }); // v1
+  await h.client().put(SEAL_ID, [A_IN, LEAKY_IN], { baseVersion: 1, agentUrl: h.url });
+  const X = h.sets.pop();
+  await h.client().put(SEAL_ID, [A_IN], { baseVersion: 1, agentUrl: h.url });
+  const Y = h.sets.at(-1);
+  return { X, Y };
+}
+
+const both = (a, b) => !(a instanceof Error) && !(b instanceof Error);
+
+test('marks: with an asynchronous store, two reads in flight do not both take two sets at one version', async () => {
+  const h = await pairs();
+  const kept = new Map();
+  const marks = { seen: async (k) => { await new Promise((r) => setTimeout(r, 20)); return kept.get(k); }, record: async (k, m) => { kept.set(k, m); } };
+  try {
+    const { X, Y } = await fork(h);
+    const c = h.client(marks);
+    h.serveQueue = [Y, X];
+    const [a, b] = await Promise.all([c.get(SEAL_ID), c.get(SEAL_ID)].map((p) => p.then((x) => x, (e) => e)));
+    assert.ok(!both(a, b), `both taken: [${a.definitions?.map((d) => d.name)}] / [${b.definitions?.map((d) => d.name)}]`);
+  } finally { h.server.close(); }
+});
+
+// No store, both answers released together.
+test('marks: two reads whose answers arrive together do not both take two sets at one version', async () => {
+  const h = await pairs({ holdPairs: true });
+  try {
+    const { X, Y } = await fork(h);
+    const c = h.client();
+    h.serveQueue = [Y, X];
+    h.hold = true;
+    const [a, b] = await Promise.all([c.get(SEAL_ID), c.get(SEAL_ID)].map((p) => p.then((x) => x, (e) => e)));
+    assert.ok(!both(a, b), `both taken: [${a.definitions?.map((d) => d.name)}] / [${b.definitions?.map((d) => d.name)}]`);
+  } finally { h.server.close(); }
+});
+
+// A store without `where`: the refusal points at the store, not at a new client.
+test('marks: with a store and no where, the refusal points at the store', async () => {
+  const h = await pairs();
+  const kept = new Map();
+  const marks = { seen: (k) => kept.get(k), record: (k, m) => { kept.set(k, m); } };
+  try {
+    const { X } = await fork(h); // Y stored at v2
+    await h.client(marks).get(SEAL_ID); // records Y at (7,2)
+    h.serveQueue = [X];
+    const e1 = await h.client(marks).get(SEAL_ID).then(() => null, (e) => e);
+    assert.ok(e1 instanceof CredentialsUnverifiedError);
+    h.serveQueue = [X];
+    const e2 = await h.client(marks).get(SEAL_ID).then(() => null, (e) => e); // "a new client"
+    assert.ok(!(e2 instanceof Error) || !/start a new client/.test(e1.message), `followed the advice, still refused: ${e2?.message}`);
+  } finally { h.server.close(); }
+});
+
