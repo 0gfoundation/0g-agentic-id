@@ -331,7 +331,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 		writeErr(w, e)
 		return
 	}
-	red := newRedactor(s.cfg.Registry.secrets(), minted)
+	red := newProxyRedactor(s.cfg.Registry.secrets(), minted)
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, red.applyString(v))
@@ -408,7 +408,7 @@ func (s *Server) websocket(w http.ResponseWriter, out *http.Request, host string
 	s.record(names, host, out.Method, resp.StatusCode, "")
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		defer resp.Body.Close()
-		red := newRedactor(s.cfg.Registry.secrets(), minted)
+		red := newProxyRedactor(s.cfg.Registry.secrets(), minted)
 		for k, vs := range resp.Header {
 			for _, v := range vs {
 				w.Header().Add(k, red.applyString(v))

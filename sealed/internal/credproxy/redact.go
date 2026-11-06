@@ -22,18 +22,36 @@ type redactForm struct{ match, repl []byte }
 // the encodings a value is likely to travel in: raw, percent-encoded,
 // JSON-escaped, and standard or URL-safe base64 at each of the three byte
 // alignments a value can take inside a longer base64 run.
-type redactor struct{ forms []redactForm }
+// A proxy redactor also masks tokens of well-known formats (tokenmask.go).
+type redactor struct {
+	forms  []redactForm
+	tokens bool
+	mask   bool
+}
 
-func newRedactor(secrets ...map[string][]byte) *redactor { return buildRedactor(false, secrets...) }
+// newRedactor covers the values sealed holds, for what sealed itself sends
+// on (Scrub).
+func newRedactor(secrets ...map[string][]byte) *redactor {
+	return buildRedactor(false, false, secrets...)
+}
 
-// newMaskRedactor replaces each match with as many '*' as it has bytes, for
-// streams whose framing a change in length would break (WebSocket).
-func newMaskRedactor(secrets ...map[string][]byte) *redactor { return buildRedactor(true, secrets...) }
+// newProxyRedactor also masks well-known tokens, for responses the proxy
+// relays to the harness.
+func newProxyRedactor(secrets ...map[string][]byte) *redactor {
+	return buildRedactor(false, true, secrets...)
+}
+
+// newMaskRedactor is a proxy redactor that replaces each match with as many
+// '*' as it has bytes, for streams whose framing a change in length would
+// break (WebSocket).
+func newMaskRedactor(secrets ...map[string][]byte) *redactor {
+	return buildRedactor(true, true, secrets...)
+}
 
 // buildRedactor covers every value of every set, each replaced by its
 // entry's placeholder (a minted token by the placeholder that stood for it).
-func buildRedactor(mask bool, sets ...map[string][]byte) *redactor {
-	r := &redactor{}
+func buildRedactor(mask, tokens bool, sets ...map[string][]byte) *redactor {
+	r := &redactor{tokens: tokens, mask: mask}
 	seen := map[string]bool{}
 	add := func(match string, min int, repl []byte) {
 		if len(match) < min || seen[match] {
@@ -81,7 +99,16 @@ func addValue(add func(match string, min int, repl []byte), name string, v []byt
 	}
 }
 
+// apply redacts a whole value, such as a header.
 func (r *redactor) apply(b []byte) []byte {
+	b = r.applyValues(b)
+	if r.tokens {
+		b, _ = maskTokens(b, false, true, r.mask)
+	}
+	return b
+}
+
+func (r *redactor) applyValues(b []byte) []byte {
 	for _, f := range r.forms {
 		if bytes.Contains(b, f.match) {
 			b = bytes.ReplaceAll(b, f.match, f.repl)
@@ -116,7 +143,7 @@ func (r *redactor) pendingTail(b []byte) int {
 // could begin a value split across reads, so event streams (SSE) keep their
 // latency.
 func (r *redactor) reader(src io.Reader) io.Reader {
-	if len(r.forms) == 0 {
+	if len(r.forms) == 0 && !r.tokens {
 		return src
 	}
 	return &redactReader{src: src, red: r}
@@ -128,13 +155,19 @@ type redactReader struct {
 	held []byte
 	out  []byte
 	err  error
+	// prevToken: the last byte passed on was a token byte, so what follows
+	// does not start a word.
+	prevToken bool
 }
 
 func (rr *redactReader) Read(p []byte) (int, error) {
 	for len(rr.out) == 0 {
 		if rr.err != nil {
 			if len(rr.held) > 0 {
-				rr.out, rr.held = rr.red.apply(rr.held), nil
+				rr.out, rr.held = rr.red.applyValues(rr.held), nil
+				if rr.red.tokens {
+					rr.out, _ = maskTokens(rr.out, rr.prevToken, true, rr.red.mask)
+				}
 				break
 			}
 			return 0, rr.err
@@ -147,13 +180,20 @@ func (rr *redactReader) Read(p []byte) (int, error) {
 		if n == 0 {
 			continue
 		}
-		buf := rr.red.apply(append(rr.held, chunk[:n]...))
+		final := rr.err != nil
+		buf := rr.red.applyValues(append(rr.held, chunk[:n]...))
 		keep := 0
-		if rr.err == nil {
-			keep = rr.red.pendingTail(buf)
+		if rr.red.tokens {
+			buf, keep = maskTokens(buf, rr.prevToken, final, rr.red.mask)
+		}
+		if !final {
+			keep = max(keep, rr.red.pendingTail(buf))
 		}
 		rr.out = buf[:len(buf)-keep]
 		rr.held = append([]byte(nil), buf[len(buf)-keep:]...)
+		if len(rr.out) > 0 {
+			rr.prevToken = tokenByte(rr.out[len(rr.out)-1])
+		}
 	}
 	n := copy(p, rr.out)
 	rr.out = rr.out[n:]
