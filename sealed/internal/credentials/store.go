@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -53,8 +54,13 @@ const (
 	maxAuditHost    = 255
 	maxAuditNames   = 16
 	maxAuditName    = 80
-	maxCountKeys    = 64
+	maxCountKeys    = 256 // all kinds together
+	maxOpKeys       = 32  // the kinds of one operation
 )
+
+// ErrOwnerLookup is a Load that could not look the owner up: worth trying
+// again, unlike a set that does not check out.
+var ErrOwnerLookup = errors.New("the agent's owner could not be looked up")
 
 // ErrOwnerChanged refuses what sealed would supply the framework after the
 // owner changed: it came with the previous owner's deployment.
@@ -151,7 +157,12 @@ type Store struct {
 
 	auditMu     sync.Mutex
 	auditCounts map[string]*AuditRecord // counted records, by countKey
-	auditInject []AuditRecord           // proxy uses, kept apart so they never push out the rest
+	auditOpKeys map[string]int          // counted kinds per operation
+	// Listed records, in three rings so that what the harness can cause
+	// (proxy uses, signatures) never pushes out the rest: the owner's
+	// decisions, logins, loads and what sealed did itself.
+	auditInject []AuditRecord
+	auditSign   []AuditRecord
 	auditLog    []AuditRecord
 	// auditSeed holds what an earlier boot persisted until the owner is
 	// known: it is restored only for the owner who wrote it.
@@ -188,6 +199,8 @@ type Store struct {
 	refreshTimers map[string]*time.Timer   // login entries, by name
 	events        *eventLog
 	now           func() time.Time
+	// retryUnit paces writeback retries: a second (tests shorten it).
+	retryUnit time.Duration
 }
 
 // auditKeep bounds each of the two lists: proxy uses, and everything else.
@@ -237,16 +250,31 @@ func (s *Store) keepLocked(rec AuditRecord, n int) {
 	case counted(rec) || rec.repeat:
 		s.countLocked(rec, n)
 	case rec.Op == "inject":
-		s.auditInject = appendKeep(s.auditInject, rec)
+		s.auditInject = s.keepRingLocked(s.auditInject, rec)
+	case strings.HasPrefix(rec.Op, "sign"):
+		s.auditSign = s.keepRingLocked(s.auditSign, rec)
 	default:
-		s.auditLog = appendKeep(s.auditLog, rec)
+		s.auditLog = s.keepRingLocked(s.auditLog, rec)
 	}
 }
 
-func appendKeep(list []AuditRecord, rec AuditRecord) []AuditRecord {
+// keepRingLocked appends rec to a ring of auditKeep records; what falls out
+// of it is folded into a count of its kind, so a record leaves the log as a
+// number, never without a trace.
+func (s *Store) keepRingLocked(list []AuditRecord, rec AuditRecord) []AuditRecord {
 	list = append(list, rec)
-	if len(list) > auditKeep {
-		list = list[len(list)-auditKeep:]
+	for len(list) > auditKeep {
+		old := list[0]
+		list = list[1:]
+		result := old.Result
+		if i := strings.IndexByte(result, ':'); i > 0 {
+			result = result[:i] // "signed: chain …" counts as "signed"
+		}
+		at := old.Time
+		s.countLocked(AuditRecord{Op: old.Op, Names: old.Names, Host: old.Host, Result: result, Time: old.Time, First: &at}, 1)
+	}
+	if cap(list) > 2*auditKeep {
+		list = append([]AuditRecord(nil), list...)
 	}
 	return list
 }
@@ -269,19 +297,27 @@ func countKey(r AuditRecord) string {
 }
 
 // countLocked adds n uses ending at r.Time (from r.First when set). Past
-// maxCountKeys distinct kinds, further ones are counted together.
+// maxOpKeys kinds of one operation, further ones are counted by result
+// alone, so one operation's kinds never crowd out another's; past
+// maxCountKeys in all, by operation alone.
 func (s *Store) countLocked(r AuditRecord, n int) {
 	first := r.Time
 	if r.First != nil {
 		first = *r.First
 	}
-	if _, ok := s.auditCounts[countKey(r)]; !ok && len(s.auditCounts) >= maxCountKeys {
-		r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: "more kinds, counted together", Time: r.Time, First: r.First}
+	if _, ok := s.auditCounts[countKey(r)]; !ok {
+		switch {
+		case len(s.auditCounts) >= maxCountKeys:
+			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: "more kinds", Time: r.Time, First: r.First}
+		case s.auditOpKeys[r.Op] >= maxOpKeys:
+			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: r.Result, Time: r.Time, First: r.First}
+		}
 	}
 	c := s.auditCounts[countKey(r)]
 	if c == nil {
 		c = &AuditRecord{Op: r.Op, Names: r.Names, Method: r.Method, Host: r.Host, Result: r.Result, Time: r.Time, First: &first}
 		s.auditCounts[countKey(r)] = c
+		s.auditOpKeys[r.Op]++
 	} else {
 		if first.Before(*c.First) {
 			c.First = &first
@@ -324,12 +360,12 @@ func (s *Store) decideSeedLocked() {
 	if seed.Owner != s.owner {
 		return
 	}
-	inject, rest := s.auditInject, s.auditLog
-	s.auditInject, s.auditLog = nil, nil
+	kept := append(append(append([]AuditRecord(nil), s.auditInject...), s.auditSign...), s.auditLog...)
+	s.auditInject, s.auditSign, s.auditLog = nil, nil, nil
 	for _, r := range seed.Records {
 		s.keepLocked(r, 1)
 	}
-	for _, r := range append(inject, rest...) {
+	for _, r := range kept {
 		s.keepLocked(r, 1)
 	}
 }
@@ -358,7 +394,7 @@ func (s *Store) AuditSince(after int64) []AuditRecord {
 
 func (s *Store) auditSinceLocked(after int64) []AuditRecord {
 	var out []AuditRecord
-	for _, list := range [][]AuditRecord{s.auditLog, s.auditInject} {
+	for _, list := range [][]AuditRecord{s.auditLog, s.auditSign, s.auditInject} {
 		for _, r := range list {
 			if r.Time.Unix() > after {
 				out = append(out, r)
@@ -390,7 +426,8 @@ func NewStore(env Env, reg *credproxy.Registry) *Store {
 		defs: map[string]*Definition{}, defHashes: map[string]string{}, values: map[string][]byte{}, derived: map[string]derived{},
 		pending: map[string]*Pending{}, approvals: map[string]Approval{}, tokenMu: map[string]*sync.Mutex{},
 		logins: map[string]*loginAttempt{}, refreshTimers: map[string]*time.Timer{}, system: map[string]*credproxy.Entry{},
-		events: newEventLog(), now: time.Now, auditCounts: map[string]*AuditRecord{},
+		events: newEventLog(), now: time.Now, auditCounts: map[string]*AuditRecord{}, auditOpKeys: map[string]int{},
+		retryUnit: time.Second,
 	}
 }
 
@@ -406,42 +443,62 @@ func (s *Store) Version() uint64 {
 // everything (the previous owner's keys must not serve the new one) and is
 // reported.
 func (s *Store) ObserveOwner(live common.Address) (changed bool) {
-	s.mu.Lock()
-	s.lookupSeq++
-	seq, at := s.lookupSeq, s.now()
-	s.mu.Unlock()
-	return s.observeOwner(live, seq, at)
+	l := s.BeginOwnerLookup()
+	_, changed = s.observeOwner(live, l.seq, l.at)
+	return changed
 }
 
 // RefreshOwner looks the owner up on chain and records it (the watcher).
 func (s *Store) RefreshOwner(ctx context.Context) error {
-	_, err := s.lookupOwner(ctx)
+	_, _, err := s.lookupOwner(ctx)
 	return err
+}
+
+// OwnerLookup marks when a lookup of the owner made elsewhere (an owner
+// route's signature check) began: its answer is recorded in the order the
+// lookups began, like the store's own.
+type OwnerLookup struct {
+	seq uint64
+	at  time.Time
+}
+
+// BeginOwnerLookup is taken before such a lookup.
+func (s *Store) BeginOwnerLookup() OwnerLookup {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lookupSeq++
+	return OwnerLookup{seq: s.lookupSeq, at: s.now()}
+}
+
+// ObserveOwnerLookup records the owner that lookup l found.
+func (s *Store) ObserveOwnerLookup(l OwnerLookup, owner common.Address) bool {
+	_, changed := s.observeOwner(owner, l.seq, l.at)
+	return changed
 }
 
 // lookupOwner asks the chain for the owner and records the answer, unless
 // a lookup begun later was recorded first: answers can arrive out of order,
-// and an older one must not undo a newer one.
-func (s *Store) lookupOwner(ctx context.Context) (common.Address, error) {
-	s.mu.Lock()
-	s.lookupSeq++
-	seq, started := s.lookupSeq, s.now()
-	s.mu.Unlock()
-	live, err := s.env.LiveOwner(ctx)
+// and an older one must not undo a newer one. recorded says whether this
+// answer was the one recorded.
+func (s *Store) lookupOwner(ctx context.Context) (live common.Address, recorded bool, err error) {
+	l := s.BeginOwnerLookup()
+	live, err = s.env.LiveOwner(ctx)
 	if err != nil {
-		return common.Address{}, err
+		return common.Address{}, false, err
 	}
-	s.observeOwner(live, seq, started)
-	return live, nil
+	recorded, _ = s.observeOwner(live, l.seq, l.at)
+	return live, recorded, nil
 }
 
-// observeOwner records live as the owner at the time lookup seq began.
-func (s *Store) observeOwner(live common.Address, seq uint64, at time.Time) (changed bool) {
+// observeOwner records live as the owner at the time lookup seq began,
+// unless a lookup begun later was recorded already.
+func (s *Store) observeOwner(live common.Address, seq uint64, at time.Time) (recorded, changed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if seq < s.appliedSeq {
-		return false
+		return false, false
 	}
+	recorded = true
 	s.appliedSeq = seq
 	if s.owner != (common.Address{}) && live != s.owner {
 		s.env.Logf("credentials: owner changed from %s to %s; every credential cleared", s.owner.Hex(), live.Hex())
@@ -452,7 +509,7 @@ func (s *Store) observeOwner(live common.Address, seq uint64, at time.Time) (cha
 	s.auditMu.Lock()
 	s.decideSeedLocked()
 	s.auditMu.Unlock()
-	return changed
+	return recorded, changed
 }
 
 // ensureOwner confirms, at most ownerFresh ago, that the owner the state
@@ -465,7 +522,13 @@ func (s *Store) ensureOwner(ctx context.Context) *credproxy.Error {
 	if fresh {
 		return nil
 	}
-	if _, err := s.lookupOwner(ctx); err != nil {
+	live, recorded, err := s.lookupOwner(ctx)
+	s.mu.Lock()
+	current := s.owner
+	s.mu.Unlock()
+	// An answer not recorded (a later lookup was) that disagrees with what
+	// was recorded confirms nothing.
+	if err != nil || !recorded && live != current {
 		return &credproxy.Error{Status: http.StatusServiceUnavailable, Code: "owner_unknown",
 			Message: "the agent's owner could not be confirmed on chain; try again"}
 	}
@@ -478,9 +541,9 @@ func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Ope
 	s.loadMu.Lock()
 	defer s.loadMu.Unlock()
 	// A new owner's set never meets the previous owner's state.
-	owner, err := s.lookupOwner(ctx)
+	owner, _, err := s.lookupOwner(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrOwnerLookup, err)
 	}
 	var highest Mark
 	if s.env.Persist != nil {
@@ -605,7 +668,8 @@ func (s *Store) clearLocked() {
 	s.events.add(Event{Type: "cleared"})
 	// The audit log is the previous owner's too.
 	s.auditMu.Lock()
-	s.auditLog, s.auditInject, s.auditCounts = nil, nil, map[string]*AuditRecord{}
+	s.auditLog, s.auditSign, s.auditInject = nil, nil, nil
+	s.auditCounts, s.auditOpKeys = map[string]*AuditRecord{}, map[string]int{}
 	s.auditMu.Unlock()
 	s.addAudit(AuditRecord{Time: s.now(), Op: "clear", Result: "the owner changed: every credential and earlier record cleared"})
 }
@@ -620,7 +684,7 @@ func (s *Store) syncRegistryLocked() {
 			e := d.Entry(v)
 			if err := e.Validate(); err != nil {
 				s.env.Logf("credentials: an entry the proxy cannot serve was left out (the owner's audit log names it)")
-				s.audit("load", name, "", "left out: "+err.Error())
+				s.auditRepeat("load", name, "", "left out: "+err.Error())
 				continue
 			}
 			entries = append(entries, e)
@@ -638,7 +702,7 @@ func (s *Store) syncRegistryLocked() {
 	}
 	if err := s.reg.Replace(entries); err != nil {
 		s.env.Logf("credentials: the proxy refused the entries (the owner's audit log says why)")
-		s.audit("load", "", "", "refused by the proxy: "+err.Error())
+		s.auditRepeat("load", "", "", "refused by the proxy: "+err.Error())
 	}
 }
 
@@ -923,7 +987,9 @@ func (s *Store) pendingForLocked(op, name string, params map[string]string, bind
 	if found != nil {
 		return found, nil
 	}
-	if open >= maxOpenRequests {
+	// sealed's own requests (a login to renew) are not the harness's to
+	// crowd out.
+	if open >= maxOpenRequests && facts["source"] != "sealed" {
 		return nil, &credproxy.Error{Status: http.StatusTooManyRequests, Code: "too_many_requests",
 			Message: "too many requests are waiting for the owner; wait for a decision"}
 	}
@@ -931,7 +997,7 @@ func (s *Store) pendingForLocked(op, name string, params map[string]string, bind
 		reason = string([]rune(reason)[:maxReason])
 	}
 	reason = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+		if isControl(r) {
 			return ' '
 		}
 		return r
@@ -1024,7 +1090,7 @@ func (s *Store) Decide(ctx context.Context, authReqID, decision string, a *Appro
 		return err
 	}
 	// A new owner never decides on what the previous owner's state holds.
-	owner, err := s.lookupOwner(ctx)
+	owner, _, err := s.lookupOwner(ctx)
 	if err != nil {
 		return err
 	}
@@ -1056,26 +1122,28 @@ func (s *Store) Record(r credproxy.Record) {
 	s.addAudit(AuditRecord{Time: r.Time, Op: "inject", Names: r.Names, Host: r.Host, Method: auditMethod(r.Method), Result: result})
 }
 
-// hasControl reports whether v holds a control character (C0, DEL or C1).
+// hasControl reports whether v holds a control character (C0, DEL or C1)
+// or a format character (bidi overrides and the like), which could make
+// what the owner reads differ from what it is.
 func hasControl(v string) bool {
 	for _, r := range v {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+		if isControl(r) {
 			return true
 		}
 	}
 	return false
 }
 
-// auditMethod keeps an HTTP method as the log's own word: whatever the
-// harness sent that is not one is recorded as OTHER.
+func isControl(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || unicode.Is(unicode.Cf, r)
+}
+
+// auditMethod keeps a standard HTTP method as it is; anything else the
+// harness sent is recorded as OTHER, so it cannot make kinds of its own.
 func auditMethod(m string) string {
-	if len(m) > 10 {
-		return "OTHER"
+	switch m {
+	case "", "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE":
+		return m
 	}
-	for _, r := range m {
-		if r < 'A' || r > 'Z' {
-			return "OTHER"
-		}
-	}
-	return m
+	return "OTHER"
 }

@@ -175,13 +175,13 @@ func TestMCPLoginRefreshAndRevoke(t *testing.T) {
 	auth.mu.Unlock()
 
 	// A forged state does nothing; the real one logs in, once.
-	if _, err := s.FinishLogin(context.Background(), "forged", "the-code", ""); err == nil {
+	if _, err := s.FinishLogin(context.Background(), "forged", "the-code", "", ""); err == nil {
 		t.Fatal("a forged state was accepted")
 	}
-	if name, err := s.FinishLogin(context.Background(), q.Get("state"), "the-code", ""); err != nil || name != "linear" {
+	if name, err := s.FinishLogin(context.Background(), q.Get("state"), "the-code", "", ""); err != nil || name != "linear" {
 		t.Fatalf("finish: %v", err)
 	}
-	if _, err := s.FinishLogin(context.Background(), q.Get("state"), "the-code", ""); err == nil {
+	if _, err := s.FinishLogin(context.Background(), q.Get("state"), "the-code", "", ""); err == nil {
 		t.Fatal("a state was used twice")
 	}
 	e := reg.Get("linear")
@@ -278,7 +278,7 @@ func loginLinear(t *testing.T, f *fixture, auth *fakeAuth) (*Store, *credproxy.R
 	auth.mu.Lock()
 	auth.challenge = u.Query().Get("code_challenge")
 	auth.mu.Unlock()
-	if _, err := s.FinishLogin(context.Background(), u.Query().Get("state"), "the-code", ""); err != nil {
+	if _, err := s.FinishLogin(context.Background(), u.Query().Get("state"), "the-code", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	return s, reg

@@ -92,7 +92,7 @@ Entry(string name,bytes32 defHash)
 | `DELETE /credentials/{name}` | 删除换出的条目（owner 的条目由 owner 管理） |
 | `GET /events?after=&wait=` | 长轮询：`entry_added`、`entry_removed`、`pending_opened`、`pending_decided`、`cleared`、`writeback_failed` |
 
-等待 owner 的申请有上限：同时最多 32 条（超出返回 429 `too_many_requests`），理由最多 512 个字符且只占一行（超出部分截掉，控制字符换成空格），参数最多 4 个、每个最多 512 个字符（`url` 为 2048，且必须是 https），不能含控制字符。
+等待 owner 的申请有上限：同时最多 32 条（超出返回 429 `too_many_requests`），理由最多 512 个字符且只占一行（超出部分截掉，控制字符换成空格），参数最多 4 个、每个最多 512 个字符（`url` 为 2048，且必须是 https），不能含控制字符或格式字符。sealed 自己发起的申请（需要重新登录）不计入 32 条。
 
 **交出**（`$SEAL_CRED_REVEAL_SOCKET`）：`POST /credentials/reveal {name, reason}`。设置了 `allow_reveal` 时返回 `{value}`。否则返回 403 `authorization_pending` 和 `auth_req_id`；owner 决定后，agent 原样重发请求。403 `access_denied` 表示被拒绝。批准只针对 agent 申请时的那个值：之后换出或轮换得到的 token 需要重新申请。对换出的 token，owner 看到的是它自己的域名、过期时间，以及换取时用的参数。签名密钥（`use: sign`）从不交出（403 `not_allowed`）。登录条目交出的是 access token，不是存储的登录状态。这个 socket 和上面的 socket 分开，是为了让以另一个用户运行工具的 harness 可以不让工具访问它；两个 socket 都属于 agent 用户，现有框架的工具也以这个用户运行。
 
@@ -145,7 +145,7 @@ CredentialWriteback.v2:<seal_id>:<name>:<binding>:<boot_id>:<keccak256(ciphertex
 1. owner 发起登录：`POST /_seal/credentials/login {name}`（owner 签名）。
 2. sealed 读取 MCP 服务器的受保护资源元数据（RFC 9728，来自 401 的 `WWW-Authenticate` 或 well-known 路径），再读取授权服务器元数据（RFC 8414 或 OpenID）。条目没有给 `client_id` 时，sealed 以 public client 身份动态注册（RFC 7591），然后返回授权链接，链接带 PKCE（S256）、`resource` 和一次性的 `state`。
 3. owner 打开链接并同意。浏览器回到 agent 的 `<公开地址>/_seal/oauth/callback`；`state`（10 分钟内有效，只能用一次）把 code 绑定到这次登录。sealed 用只有它持有的 verifier 换取 token。
-4. 之后条目在 owner 允许的位置提供 access token（该服务器域名上的 Bearer）。在此之前，`GET /credentials` 列出该条目时带 `status: awaiting_login`；从这时起改为带 `logged_in_at`，agent 的事件里出现 `entry_added`，针对它的 `login` 待办也随之结案。sealed 在过期前一分钟刷新（有效期不到两分钟时在一半处刷新，最早 10 秒后），保存轮换后的 refresh token，并写回登录状态。refresh token 被拒绝时，转为一条给 owner 的 `login` 待办。
+4. 之后条目在 owner 允许的位置提供 access token（该服务器域名上的 Bearer）。在此之前，`GET /credentials` 列出该条目时带 `status: awaiting_login`；从这时起改为带 `logged_in_at`，agent 的事件里出现 `entry_added`，针对它的 `login` 待办也随之结案。sealed 在过期前一分钟刷新（有效期不到两分钟时在一半处刷新，最早 10 秒后），保存轮换后的 refresh token，并写回登录状态。refresh token 被拒绝时（包括以状态码 200 返回的拒绝），或刷新一直失败时，转为一条给 owner 的 `login` 待办。
 5. 断开时，owner 调用 `POST /_seal/credentials/disconnect {name}`：如果授权服务器的元数据给出了 `revocation_endpoint`，sealed 先请它作废 refresh token，再作废 access token（RFC 7009）；无论是否作废成功，sealed 都会丢掉这些 token，条目回到等待登录的状态。之后由客户端删除该条目。CLI 里对应的命令是 `cred <agent> connect` 和 `disconnect`。
 
 agent 在 MCP 配置中给该服务器加请求头 `Authorization: Bearer [[credential:<名字>]]`。
@@ -154,7 +154,8 @@ agent 在 MCP 配置中给该服务器加请求头 `Authorization: Bearer [[cred
 
 - **发现。** 元数据只通过 https 读取。受保护资源元数据里的 `resource` 必须指向这个服务器（同一 origin；路径为服务器本身的路径，或按完整路径段计的前缀，RFC 9728 §3.3）；授权服务器元数据中的 `issuer` 与预期不同时不使用（RFC 8414 §3.3）。只有作废地址与 token 地址在同一域名时才使用作废。
 - **client secret。** `client_secret_entry` 在每次使用时（换 code、每次刷新、作废）重新读取，不随登录状态保存：它必须已加载、未过期且不是签名密钥；该条目列了域名时，token 地址的域名必须在其中。不再满足时停止刷新，并给 owner 一条 `login` 待办。
-- **顺序。** 同一条目正在刷新时，登录等刷新结束后才完成，所以较新的登录生效。断开只使用登录时保存的作废地址，并把断开写回，容器重启后登录不会恢复。
+- **回跳。** 先检查 `state`。授权服务器的回跳带了 issuer（`iss`，RFC 9207）时，必须是 owner 被引导去的那个服务器；服务器元数据声明总会带上时，必须带；否则不换取 code。
+- **顺序。** 同一条目正在刷新时，登录等刷新结束后才完成，所以较新的登录生效。断开只使用登录时保存的作废地址，即使 owner 的客户端中途放弃也会请服务器作废完，并把断开写回，容器重启后登录不会恢复。
 - **scope。** 条目没有 `scopes` 时，sealed 申请服务器元数据列出的 scope；owner 在授权页面上能看到。
 
 ## owner 一侧
@@ -166,7 +167,7 @@ agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` /
 | `GET` / `POST /_seal/credentials` | `0GSealCredentials` | 列出已加载条目 / 加载签名凭据集（更旧的版本返回 409 `stale_version`） |
 | `GET /_seal/credentials/pending` | `0GSealCredPending` | 待办：sealed 记录的 `facts` 与 agent 给出的 `reason` 分开展示 |
 | `POST /_seal/credentials/decide` | `0GSealCredDecide` | `{auth_req_id, decision: "once" \| "deny", approval?, signature?}` |
-| `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | agent 做了什么（代填、换 token、签名、交出、登录、写回），以及凭据集里哪些条目被跳过、原因是什么，不含值。按时间从旧到新：代理使用保留最近 1000 条，其他记录另外保留最近 1000 条，分开存放，代填不会把其他记录挤掉。agent 可以随意重复的操作（换 token、刷新、写回、失败的签名、预先允许的交出）以及 sealed 自己提供的值（`sealed:` 条目，如框架的推理 key）的成功使用，每类合并为一条记录，带 `count`、`first` 和最近一次的 `ts`（最多 64 类，其余合在一起）。域名和条目名截到有限长度，控制字符显示为 `?`。stop/start 后保留，并记下属于哪个 owner，只为同一个 owner 恢复；启动时读不了的已保存记录原样保留，不会被覆盖 |
+| `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | agent 做了什么（代填、换 token、签名、交出、登录、写回），以及凭据集里哪些条目被跳过、原因是什么，不含值。按时间从旧到新，分三份各保留最近 1000 条：代理使用；钱包签名；其余记录（owner 的决定、登录、断开、加载、sealed 自己做的事），所以 agent 能引发的记录不会把 owner 的记录挤掉。从某份里挤出的记录按类（操作、条目、域名、结果）计数，不会不留痕迹地丢掉。agent 可以随意重复的操作（换 token、刷新、写回、失败的签名、预先允许的交出）以及 sealed 自己提供的值（`sealed:` 条目，如框架的推理 key）的成功使用，每类合并为一条记录，带 `count`、`first` 和最近一次的 `ts`；每种操作最多 32 类，再多的按结果合并计数。域名和条目名截到有限长度，控制字符和格式字符显示为 `?`，标准 HTTP 方法以外的方法记为 `OTHER`。stop/start 后保留，并记下属于哪个 owner，只为同一个 owner 恢复；启动时读不了的已保存记录原样保留，不会被覆盖 |
 | `POST /_seal/credentials/login` | `0GSealCredLogin` | 发起 MCP 登录；返回 `{authorize_url}` |
 | `POST /_seal/credentials/disconnect` | `0GSealCredDisconnect` | 结束 MCP 登录：服务器支持时请它作废 token，并丢掉 token；返回 `{revoked, note}` |
 | `GET /_seal/oauth/callback` | 无 | 登录后浏览器的回跳 |
@@ -188,7 +189,7 @@ SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-
 
 ## 范围之外
 
-- **响应与上链数据。** 经 `:8080` 转发的 HTTP 响应（已注册的服务、框架路由、事件流、合成的 `/v1/responses` 及其保存的结果、`/hello` 的服务列表）在计算 serve-proof 之前去掉 sealed 持有的每个值；对升级请求返回的非 `101` 响应和其他响应一样处理，接受了的 WebSocket 升级原样转发。模型分段流式输出的值，在保存的结果中会被去掉，在流式输出的各段中不会。sealed 上链的内容同样去掉这些值（leaf 角色、manifest 中的文件、目录归档里的文件），漂移判断也基于去掉值之后的内容。从 sealed 删除的值（新凭据集不再包含、owner 变更）仍会被去掉，但不再代填，直到 sealed 重启（owner 条目和 sealed 条目的最近 1024 个值，另外换出条目的最近 1024 个值；每个名字最多 32 个）。
+- **响应与上链数据。** 经 `:8080` 转发的 HTTP 响应（已注册的服务、框架路由、事件流、合成的 `/v1/responses` 及其保存的结果、`/hello` 的服务列表）在计算 serve-proof 之前去掉 sealed 持有的每个值；对升级请求返回的非 `101` 响应和其他响应一样处理（trailer 也一样），接受了的 WebSocket 升级原样转发。框架对压缩上下文（`/_seal/compact`）的说明，在 owner 或公开日志看到之前也会去掉这些值。模型分段流式输出的值，在保存的结果中会被去掉，在流式输出的各段中不会。sealed 上链的内容同样去掉这些值（leaf 角色、manifest 中的文件、目录归档里的文件），漂移判断也基于去掉值之后的内容。从 sealed 删除的值（新凭据集不再包含、owner 变更）仍会被去掉，但不再代填，直到 sealed 重启（owner 条目和 sealed 条目的最近 1024 个值，另外换出条目的最近 1024 个值；每个名字最多 32 个）。
 - **不经过代理的工具。** 不认 `HTTPS_PROXY` 或钉死证书的工具会带着占位符直连目标并失败；可以改用显式形式，或使用交出的值。
 - **普通 API 返回的 token。** 普通 API 调用（不是换 token）返回的 token 原样到达 agent；如果它属于代理遮盖的常见格式，agent 拿到的是 `[[redacted]]`，无法使用，要拿这类 token 需用换 token。
 - **不限制用途。** 在密钥本身的权限范围内，agent 可以做任何事，包括派生新密钥、用签名条目签任意内容。

@@ -69,9 +69,15 @@ type loginAttempt struct {
 	expires                     time.Time
 	def                         *Definition
 	gen                         uint64
-	// secretFromEntry: clientSecret is the owner's client_secret_entry,
-	// read again at each use, so the login does not keep a copy.
+	// secretFromEntry: the client secret is the owner's
+	// client_secret_entry, read at each use; clientSecret then stays empty
+	// (it holds only a secret the server issued at registration).
 	secretFromEntry bool
+	// issuer is the authorization server the owner was sent to; its
+	// redirect names it (RFC 9207) when issRequired, and must not name
+	// another when it names one.
+	issuer      string
+	issRequired bool
 }
 
 const (
@@ -85,10 +91,12 @@ const (
 
 // authServer is what discovery finds for an MCP server.
 type authServer struct {
+	issuer                     string
 	authorize, token, register string
 	revocation                 string // RFC 7009; empty when not offered
 	resource                   string
 	scopes                     []string
+	issParam                   bool // RFC 9207: the redirect names the issuer
 }
 
 func randomURLSafe(n int) string {
@@ -155,9 +163,12 @@ func (s *Store) StartLogin(ctx context.Context, name, redirectURI string) (strin
 		s.mu.Unlock()
 		return "", loginErr("the agent's owner changed; start the login again")
 	}
+	if fromEntry {
+		secret = "" // read again at the code exchange
+	}
 	s.logins[state] = &loginAttempt{name: name, verifier: verifier, redirectURI: redirectURI, clientID: clientID,
 		clientSecret: secret, tokenURL: as.token, resource: as.resource, revocationURL: as.revocation, expires: now.Add(loginTTL),
-		def: def, gen: gen, secretFromEntry: fromEntry}
+		def: def, gen: gen, secretFromEntry: fromEntry, issuer: as.issuer, issRequired: as.issParam}
 	s.mu.Unlock()
 
 	q := url.Values{
@@ -185,19 +196,34 @@ func (s *Store) StartLogin(ctx context.Context, name, redirectURI string) (strin
 }
 
 // FinishLogin completes a login from the authorization server's redirect:
-// the state names the attempt (once), the code is exchanged with the PKCE
-// verifier, and the tokens become the entry's value.
-func (s *Store) FinishLogin(ctx context.Context, state, code, oauthError string) (string, error) {
-	// An owner change clears the attempt.
-	if cerr := s.ensureOwner(ctx); cerr != nil {
-		return "", loginErr("%s", cerr.Message)
-	}
+// the state names the attempt (once), iss (RFC 9207) the server that sent
+// it back, the code is exchanged with the PKCE verifier, and the tokens
+// become the entry's value.
+func (s *Store) FinishLogin(ctx context.Context, state, code, oauthError, iss string) (string, error) {
+	// The state first: an unknown one costs nothing, not a chain lookup.
 	s.mu.Lock()
 	a := s.logins[state]
 	delete(s.logins, state)
 	s.mu.Unlock()
 	if a == nil || s.now().After(a.expires) {
 		return "", loginErr("this login link is unknown or has expired; start the login again")
+	}
+	// An owner change clears every attempt; one taken just before is
+	// caught here.
+	if cerr := s.ensureOwner(ctx); cerr != nil {
+		return "", loginErr("%s", cerr.Message)
+	}
+	s.mu.Lock()
+	gen := s.gen
+	s.mu.Unlock()
+	if gen != a.gen {
+		return "", loginErr("the agent's owner changed; start the login again")
+	}
+	// The redirect must come from the server the owner was sent to: a code
+	// from another one is never posted to this login's token endpoint.
+	if (iss != "" || a.issRequired) && strings.TrimSuffix(iss, "/") != a.issuer {
+		s.audit("login", a.name, a.tokenURL, "refused: the redirect names another authorization server")
+		return a.name, loginErr("the login came back from another authorization server; start the login again")
 	}
 	if oauthError != "" {
 		s.audit("login", a.name, a.tokenURL, "refused: "+sanitizeCode(oauthError))
@@ -214,8 +240,22 @@ func (s *Store) FinishLogin(ctx context.Context, state, code, oauthError string)
 		"code_verifier": {a.verifier},
 		"resource":      {a.resource},
 	}
-	if a.clientSecret != "" {
-		form.Set("client_secret", a.clientSecret)
+	secret := a.clientSecret
+	if a.secretFromEntry {
+		s.mu.Lock()
+		cur := s.defs[a.name]
+		s.mu.Unlock()
+		if cur == nil || cur.Binding() != a.def.Binding() {
+			return a.name, loginErr("the entry changed while the login ran; start the login again")
+		}
+		var serr error
+		if secret, _, serr = s.entrySecret(cur, a.tokenURL); serr != nil {
+			s.audit("login", a.name, a.tokenURL, "not sent: "+serr.Error())
+			return a.name, serr
+		}
+	}
+	if secret != "" {
+		form.Set("client_secret", secret)
 	}
 	tok, err := s.tokenCall(ctx, a.tokenURL, form)
 	if err != nil {
@@ -345,7 +385,9 @@ func (s *Store) refreshLogin(name, access string, attempt int) {
 		if attempt < 6 {
 			delay := time.Duration(1<<attempt) * 10 * time.Second
 			time.AfterFunc(delay, func() { s.refreshLogin(name, access, attempt+1) })
+			return
 		}
+		s.askLogin(name, def, gen, "the login could not be refreshed")
 		return
 	}
 	next := *st
@@ -441,7 +483,7 @@ func (s *Store) Disconnect(ctx context.Context, name string) (revoked bool, note
 	lock.Lock()
 	defer lock.Unlock()
 	s.mu.Lock()
-	def, raw, owner := s.defs[name], s.values[name], s.owner
+	def, raw, owner, gen := s.defs[name], s.values[name], s.owner, s.gen
 	s.mu.Unlock()
 	if def == nil || def.MCP == nil {
 		return false, "", loginErr("no login entry named %q", name)
@@ -456,10 +498,20 @@ func (s *Store) Disconnect(ctx context.Context, name string) (revoked bool, note
 		if endpoint == "" {
 			note = "the server offered no token revocation: revoke the app's access at the service"
 		} else {
-			revoked, note = s.revoke(ctx, endpoint, def, st)
+			// Not cut short by the owner's client giving up: the tokens are
+			// forgotten next, so this is the one chance to revoke them.
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			revoked, note = s.revoke(rctx, endpoint, def, st)
+			cancel()
 		}
 	}
 	s.mu.Lock()
+	if cur := s.defs[name]; s.gen != gen || cur == nil || cur.Binding() != def.Binding() {
+		// Cleared, or a new login definition, while the server was asked:
+		// what is there now is not this login's to forget.
+		s.mu.Unlock()
+		return revoked, note, nil
+	}
 	if t := s.refreshTimers[name]; t != nil {
 		t.Stop()
 		delete(s.refreshTimers, name)
@@ -554,8 +606,8 @@ func (s *Store) tokenCall(ctx context.Context, tokenURL string, form url.Values)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxTokenResponse))
 	got := parseTokenResponse(body)
-	if resp.StatusCode/100 != 2 {
-		code, _ := got["error"].(string)
+	// Some endpoints refuse with a 200 that carries an error.
+	if code, _ := got["error"].(string); resp.StatusCode/100 != 2 || code != "" {
 		return nil, loginErr("the token endpoint answered %d %s", resp.StatusCode, sanitizeCode(code))
 	}
 	out := &tokenResult{}
@@ -672,6 +724,7 @@ func (s *Store) discover(ctx context.Context, mcpURL string) (*authServer, error
 			TokenEndpoint                 string   `json:"token_endpoint"`
 			RegistrationEndpoint          string   `json:"registration_endpoint"`
 			RevocationEndpoint            string   `json:"revocation_endpoint"`
+			IssParameterSupported         bool     `json:"authorization_response_iss_parameter_supported"`
 			CodeChallengeMethodsSupported []string `json:"code_challenge_methods_supported"`
 			ScopesSupported               []string `json:"scopes_supported"`
 		}
@@ -694,6 +747,7 @@ func (s *Store) discover(ctx context.Context, mcpURL string) (*authServer, error
 			meta.RegistrationEndpoint = ""
 		}
 		as.authorize, as.token, as.register = meta.AuthorizationEndpoint, meta.TokenEndpoint, meta.RegistrationEndpoint
+		as.issuer, as.issParam = issuer, meta.IssParameterSupported
 		// Revocation is asked only on the token endpoint's host, where the
 		// tokens and a client secret already go.
 		if strings.HasPrefix(meta.RevocationEndpoint, "https://") && sameHost(meta.RevocationEndpoint, meta.TokenEndpoint) {

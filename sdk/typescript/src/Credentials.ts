@@ -302,22 +302,23 @@ export class CredentialsApi {
 
   /**
    * Remove one entry. The attestor stores the new set, then the container
-   * gets it, so the entry stops working at once. Revoke the key at its
-   * provider as well: removing it here does not.
+   * gets it, so the entry stops working at once; pushWarning says why the
+   * running container did not take it (it then applies at the next boot).
+   * Revoke the key at its provider as well: removing it here does not.
    */
-  async remove(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ version: number }> {
+  async remove(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ version: number; pushWarning?: string }> {
     const current = await this.get(sealId);
     const keep = current.definitions.filter((d) => d.name !== name).map((d) => inputOf(d));
     const doc = await this.buildDocument(sealId, keep, current.version, current);
     // Stored first, as put does: a container that took a version the
     // attestor never stored would refuse the attestor's set at its next boot.
     const version = await this.store(sealId, doc, current.version);
-    await this.push(sealId, doc, opts?.agentUrl).catch(() => undefined);
-    return { version };
+    const pushWarning = await this.push(sealId, doc, opts?.agentUrl).then(() => undefined, (e: unknown) => String(e instanceof Error ? e.message : e));
+    return { version, pushWarning };
   }
 
   /** Turn advance permission to reveal one entry on or off. */
-  async setAllowReveal(sealId: Hash, name: string, allow: boolean, opts?: { agentUrl?: string }): Promise<{ version: number }> {
+  async setAllowReveal(sealId: Hash, name: string, allow: boolean, opts?: { agentUrl?: string }): Promise<{ version: number; pushWarning?: string }> {
     const current = await this.get(sealId);
     const def = current.definitions.find((d) => d.name === name);
     if (!def) throw new Error(`credentials: no entry named ${name}`);

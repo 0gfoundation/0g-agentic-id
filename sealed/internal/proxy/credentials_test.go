@@ -28,7 +28,10 @@ type fakeCredentials struct {
 	observed      []common.Address
 }
 
-func (f *fakeCredentials) ObserveOwner(o common.Address) bool {
+func (f *fakeCredentials) BeginOwnerLookup() credentials.OwnerLookup {
+	return credentials.OwnerLookup{}
+}
+func (f *fakeCredentials) ObserveOwnerLookup(_ credentials.OwnerLookup, o common.Address) bool {
 	f.observed = append(f.observed, o)
 	return false
 }
@@ -67,7 +70,7 @@ func (f *fakeCredentials) Disconnect(_ context.Context, name string) (bool, stri
 	return true, "", nil
 }
 
-func (f *fakeCredentials) FinishLogin(_ context.Context, state, code, _ string) (string, error) {
+func (f *fakeCredentials) FinishLogin(_ context.Context, state, code, _, _ string) (string, error) {
 	if state != "s1" || code == "" {
 		return "", &credentials.LoginError{Reason: "this login link is unknown or has expired; start the login again"}
 	}

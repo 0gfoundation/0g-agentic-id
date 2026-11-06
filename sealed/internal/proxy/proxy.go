@@ -981,11 +981,19 @@ func (s *Server) wsReverseProxy(upstream string) *httputil.ReverseProxy {
 			// no trailers.
 			if resp.StatusCode != http.StatusSwitchingProtocols {
 				dropAgentProof(resp.Trailer)
-				resp.Body = &trailerProofStripper{ReadCloser: resp.Body, resp: resp}
+				resp.Body = &trailerProofStripper{ReadCloser: resp.Body, resp: resp, scrub: s.scrubBytes}
 				// Not an upgrade after all: an ordinary response, scrubbed
 				// like any other (headers set by the caller choose the path,
-				// not what comes back).
-				s.scrubResponse(resp)
+				// not what comes back), trailers too. Scrubbing can change
+				// the body's length.
+				s.mu.RLock()
+				scrubbing := s.scrubber != nil
+				s.mu.RUnlock()
+				if scrubbing {
+					s.scrubResponse(resp)
+					resp.Header.Del("Content-Length")
+					resp.ContentLength = -1
+				}
 			}
 			return nil
 		},
@@ -1005,21 +1013,38 @@ func dropAgentProof(h http.Header) {
 // has been read to EOF (when the transport populates trailers) and on Close.
 type trailerProofStripper struct {
 	io.ReadCloser
-	resp *http.Response
+	resp  *http.Response
+	scrub func([]byte) []byte // credential values out of trailer values; nil: none
 }
 
 func (b *trailerProofStripper) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil {
-		dropAgentProof(b.resp.Trailer)
+		b.clean()
 	}
 	return n, err
 }
 
 func (b *trailerProofStripper) Close() error {
 	err := b.ReadCloser.Close()
-	dropAgentProof(b.resp.Trailer)
+	b.clean()
 	return err
+}
+
+func (b *trailerProofStripper) clean() {
+	dropAgentProof(b.resp.Trailer)
+	if b.scrub == nil {
+		return
+	}
+	for k, vs := range b.resp.Trailer {
+		if string(b.scrub([]byte(k))) != k {
+			delete(b.resp.Trailer, k)
+			continue
+		}
+		for i, v := range vs {
+			vs[i] = string(b.scrub([]byte(v)))
+		}
+	}
 }
 
 // ── Serve-proof signing ─────────────────────────────────────────────────────

@@ -128,7 +128,7 @@ func TestNewerLoginWinsOverRefreshInFlight(t *testing.T) {
 			t.Fatal(err)
 		}
 		u, _ := url.Parse(link)
-		if _, err := s.FinishLogin(context.Background(), u.Query().Get("state"), code, ""); err != nil {
+		if _, err := s.FinishLogin(context.Background(), u.Query().Get("state"), code, "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -148,7 +148,7 @@ func TestNewerLoginWinsOverRefreshInFlight(t *testing.T) {
 	u, _ := url.Parse(link)
 	finished := make(chan error, 1)
 	go func() {
-		_, err := s.FinishLogin(context.Background(), u.Query().Get("state"), "code-B", "")
+		_, err := s.FinishLogin(context.Background(), u.Query().Get("state"), "code-B", "", "")
 		finished <- err
 	}()
 	time.Sleep(50 * time.Millisecond)

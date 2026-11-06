@@ -562,6 +562,7 @@ test('cli: what came from the agent is printed with control characters escaped',
   assert.ok(!/[\u0000-\u0009\u000b-\u001f]/.test(text), JSON.stringify(text));
   assert.match(text, /\\u001b\[1A/);
   assert.match(text, /scope\s+read\\u001b\[8m {3}\(asked by the agent\)/);
-  const audit = renderAudit([{ ts: '2026-11-07T00:00:00Z', op: 'inject', names: ['x'], host: 'h\x1b[2K', result: 'unknown_entry' }]);
-  assert.ok(!audit.join('').includes('\x1b'), audit.join(''));
+  const audit = renderAudit([{ ts: '2026-11-07T00:00:00Z', op: 'inject', names: ['x'], host: 'h\x1b[2K\u202e', result: 'unknown_entry' }]);
+  assert.ok(!audit.join('').includes('\x1b') && !audit.join('').includes('\u202e'), audit.join(''));
+  assert.match(audit.join(''), /\\u202e/);
 });

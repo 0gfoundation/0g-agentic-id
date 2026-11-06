@@ -123,7 +123,7 @@ func clip(s string, n int) string {
 		s = s[:n]
 	}
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+		if isControl(r) {
 			return '?'
 		}
 		return r

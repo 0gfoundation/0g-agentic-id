@@ -139,12 +139,18 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 		var boot credentialsBoot
 		if err := json.Unmarshal(prov.Credentials, &boot); err != nil {
 			logger.Logf("warn: credentials: provisioned set is not valid JSON")
-		} else if opened, err := store.Load(context.Background(), boot.Document, boot.OwnerEpoch); err != nil {
-			// The reason may name entries: the owner reads it, the public log does not.
-			logger.Logf("warn: credentials: provisioned set refused (the owner's audit log says why)")
-			store.Note("load", "", "set refused: "+err.Error())
-		} else {
-			logger.Logf("OK   credentials: set v%d loaded, %d entries, %d skipped", opened.Set.Version, len(opened.Values), len(opened.Skipped))
+		} else if !loadProvisioned(store, boot) {
+			// The owner could not be looked up: tried again in the
+			// background, so a passing chain hiccup does not leave the agent
+			// without its credentials until the owner pushes the set again.
+			go func() {
+				for wait := 5 * time.Second; wait <= 10*time.Minute; wait *= 2 {
+					time.Sleep(wait)
+					if loadProvisioned(store, boot) {
+						return
+					}
+				}
+			}()
 		}
 	}
 	go watchOwner(store)
@@ -162,6 +168,25 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 		CredRevealSock: credRevealSockPath,
 		CredGitConfig:  credGitConfigPath,
 	}, reg
+}
+
+// loadProvisioned loads the set /provision handed over. It reports false
+// only when the owner could not be looked up, which is worth trying again;
+// a set that does not check out is refused for good.
+func loadProvisioned(store *credentials.Store, boot credentialsBoot) bool {
+	opened, err := store.Load(context.Background(), boot.Document, boot.OwnerEpoch)
+	switch {
+	case errors.Is(err, credentials.ErrOwnerLookup):
+		logger.Logf("warn: credentials: the owner could not be looked up; loading the provisioned set again shortly")
+		return false
+	case err != nil:
+		// The reason may name entries: the owner reads it, the public log does not.
+		logger.Logf("warn: credentials: provisioned set refused (the owner's audit log says why)")
+		store.Note("load", "", "set refused: "+err.Error())
+	default:
+		logger.Logf("OK   credentials: set v%d loaded, %d entries, %d skipped", opened.Set.Version, len(opened.Values), len(opened.Skipped))
+	}
+	return true
 }
 
 // credHold is RuntimeContext.CredHold: it keeps a value sealed supplies to

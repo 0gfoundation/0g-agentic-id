@@ -75,6 +75,11 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 	lock := s.lockFor(name)
 	lock.Lock()
 	defer lock.Unlock()
+	// Again once it is this request's turn: one ahead of it may have taken
+	// a minute.
+	if err := s.ensureOwner(ctx); err != nil {
+		return nil, err
+	}
 
 	// What the request was made under: its result is kept only if that
 	// still holds when it returns.
@@ -431,28 +436,41 @@ func (s *Store) postWriteback(ctx context.Context, name string, wb Writeback) (e
 		if err = s.env.Writeback(ctx, name, wb); err == nil {
 			return nil
 		}
-		time.Sleep(time.Duration(attempt+1) * time.Second)
+		time.Sleep(time.Duration(attempt+1) * s.retryUnit)
 	}
 	return err
 }
 
+// retryWriteback posts wb again with backoff while value is still the
+// entry's value. Under the entry's lock, like every other writeback, so a
+// later one (a new login, a rotation, a disconnect) is never overwritten.
 func (s *Store) retryWriteback(name string, wb Writeback, value []byte) {
-	for backoff := 30 * time.Second; backoff <= 30*time.Minute; backoff *= 2 {
+	for backoff := 30 * s.retryUnit; backoff <= 1800*s.retryUnit; backoff *= 2 {
 		time.Sleep(backoff)
-		s.mu.Lock()
-		current := s.values[name]
-		s.mu.Unlock()
-		if !bytes.Equal(current, value) {
-			return // superseded by a later rotation
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := s.env.Writeback(ctx, name, wb)
-		cancel()
-		if err == nil {
-			s.auditRepeat("writeback", name, "", "ok after retry")
+		if s.retryOnce(name, wb, value) {
 			return
 		}
 	}
+}
+
+// retryOnce reports whether the retry is over: posted, or superseded.
+func (s *Store) retryOnce(name string, wb Writeback, value []byte) bool {
+	lock := s.lockFor(name)
+	lock.Lock()
+	defer lock.Unlock()
+	s.mu.Lock()
+	current := s.values[name]
+	s.mu.Unlock()
+	if !bytes.Equal(current, value) {
+		return true // superseded
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if s.env.Writeback(ctx, name, wb) != nil {
+		return false
+	}
+	s.auditRepeat("writeback", name, "", "ok after retry")
+	return true
 }
 
 // signWriteback seals value to agentSeal for owner (the owner the state

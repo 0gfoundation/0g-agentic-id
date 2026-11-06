@@ -539,8 +539,10 @@ export function renderPending(list: PendingCredentialRequest[]): string[] {
  * rewrite what the owner reads.
  */
 export function printable(v: unknown): string {
+  // Control characters, and format characters (bidi overrides and the like),
+  // which could make a line read differently from what it holds.
   // eslint-disable-next-line no-control-regex
-  return String(v).replace(/[\u0000-\u001f\u007f-\u009f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  return String(v).replace(/[\u0000-\u001f\u007f-\u009f]|\p{Cf}/gu, (c) => `\\u${c.codePointAt(0)!.toString(16).padStart(4, '0')}`);
 }
 
 /** What sealed knows about a request, without the empty fields. */
@@ -681,8 +683,9 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       // A connection is revoked at its server first, as `disconnect` does.
       if (def.mcp) return disconnectOp(cred, sealId, name, io, at);
       const out = await cred.remove(sealId, name, at).catch(conflict);
-      if (io.json) return emitOk({ sealId, version: out.version, removed: name });
+      if (io.json) return emitOk({ sealId, version: out.version, removed: name, pushWarning: out.pushWarning ?? null });
       io.out(`removed ${name} — version ${out.version}. Revoke it at its provider too: removing it here does not.`);
+      if (out.pushWarning) io.out(`the running agent did not take it: ${out.pushWarning} — the agent can use ${name} until its next boot`);
       return;
     }
     case 'disconnect': {
@@ -702,8 +705,9 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
         }
         return conflict(e);
       });
-      if (io.json) return emitOk({ sealId, version: out.version, name, allowReveal: allow });
+      if (io.json) return emitOk({ sealId, version: out.version, name, allowReveal: allow, pushWarning: out.pushWarning ?? null });
       io.out(`${name}: the agent ${allow ? 'may read the value itself' : 'must ask you to read the value'} — version ${out.version}`);
+      if (out.pushWarning) io.out(`the running agent did not take it: ${out.pushWarning} — it applies on the next boot`);
       return;
     }
     case 'pending': {
@@ -866,6 +870,17 @@ export async function answerPending(
       else later();
     } else if (p.op === 'login') {
       const url = p.params?.url;
+      // An existing connection is the owner's to point elsewhere, with
+      // `connect` itself: the agent's request does not change its server.
+      const existing = defs.find((d) => d.name === p.name)?.mcp?.url;
+      if (url && existing && existing !== url) {
+        io.out(`  ${p.name} is connected to ${printable(existing)}; the agent asks for ${printable(url)}.`);
+        io.out(`  To change it, run: cred <agent> connect ${p.name} <url>`);
+        const a = (await io.ask(`  [n] refuse  [Enter] later: `)).trim().toLowerCase();
+        if (a === 'n') await refuse();
+        else later();
+        continue;
+      }
       const a = url ? (await io.ask(`  [c] connect now  [n] refuse  [Enter] later: `)).trim().toLowerCase() : '';
       if (a === 'c' && url) {
         const before = (await cred.loaded(sealId, at)).entries.find((e) => e.name === p.name)?.logged_in_at;

@@ -97,3 +97,21 @@ func TestCredHoldServesTheInferenceKeyThroughTheProxy(t *testing.T) {
 		t.Fatal("a held value without the sealed: prefix was accepted")
 	}
 }
+
+// A provisioned set whose load failed only because the owner could not be
+// looked up is tried again; one that does not check out is not.
+func TestLoadProvisionedRetriesOnlyOwnerLookups(t *testing.T) {
+	reg := credproxy.NewRegistry()
+	down := credentials.NewStore(credentials.Env{LiveOwner: func(context.Context) (common.Address, error) {
+		return common.Address{}, errors.New("rpc down")
+	}}, reg)
+	if loadProvisioned(down, credentialsBoot{}) {
+		t.Fatal("a failed owner lookup was taken as final")
+	}
+	up := credentials.NewStore(credentials.Env{LiveOwner: func(context.Context) (common.Address, error) {
+		return common.HexToAddress("0x00000000000000000000000000000000000000a1"), nil
+	}}, reg)
+	if !loadProvisioned(up, credentialsBoot{}) {
+		t.Fatal("a set that does not check out was tried again")
+	}
+}

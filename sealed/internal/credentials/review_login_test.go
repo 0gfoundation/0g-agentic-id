@@ -115,7 +115,7 @@ func loginPair(t *testing.T, f *fixture, x *authPair) *Store {
 		t.Fatal(err)
 	}
 	u, _ := url.Parse(link)
-	if _, err := s.FinishLogin(context.Background(), u.Query().Get("state"), "code", ""); err != nil {
+	if _, err := s.FinishLogin(context.Background(), u.Query().Get("state"), "code", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	return s
@@ -423,7 +423,7 @@ func TestDisconnectSurvivesRestart(t *testing.T) {
 	auth.mu.Lock()
 	auth.challenge = u.Query().Get("code_challenge")
 	auth.mu.Unlock()
-	if _, err := s.FinishLogin(context.Background(), u.Query().Get("state"), "the-code", ""); err != nil {
+	if _, err := s.FinishLogin(context.Background(), u.Query().Get("state"), "the-code", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()

@@ -551,9 +551,20 @@ func TestHarnessBounds(t *testing.T) {
 	for i := 0; i < 2*auditKeep; i++ {
 		s.Record(credproxy.Record{Time: time.Now(), Names: []string{"github"}, Host: "api.github.com", Method: "x\nINJECTED"})
 	}
+	// The load note stays; the last proxy uses are listed (the method the
+	// harness sent recorded as OTHER), the earlier ones counted.
 	recs := s.AuditSince(0)
-	if recs[0].Op != "load" || len(recs) != auditKeep+1 || recs[1].Method != "OTHER" {
-		t.Fatalf("%d records; first %+v; method %q", len(recs), recs[0], recs[1].Method)
+	var listed, folded int
+	for _, r := range recs {
+		switch {
+		case r.Op == "inject" && r.Count == 0 && r.Method == "OTHER":
+			listed++
+		case r.Op == "inject" && r.Count > 0:
+			folded += r.Count
+		}
+	}
+	if recs[0].Op != "load" || listed != auditKeep || folded != auditKeep {
+		t.Fatalf("%d records; first %+v; %d listed, %d counted", len(recs), recs[0], listed, folded)
 	}
 }
 

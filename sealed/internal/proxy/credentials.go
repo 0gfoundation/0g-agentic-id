@@ -29,12 +29,14 @@ type CredentialService interface {
 	Decide(ctx context.Context, authReqID, decision string, a *credentials.Approval, sig string) error
 	AuditSince(after int64) []credentials.AuditRecord
 	StartLogin(ctx context.Context, name, redirectURI string) (string, error)
-	FinishLogin(ctx context.Context, state, code, oauthError string) (string, error)
+	FinishLogin(ctx context.Context, state, code, oauthError, iss string) (string, error)
 	Disconnect(ctx context.Context, name string) (revoked bool, note string, err error)
-	// ObserveOwner records the owner a request was signed by, the live
-	// on-chain owner: a new owner's first request clears the previous
-	// owner's state before anything of it is read or used.
-	ObserveOwner(owner common.Address) bool
+	// BeginOwnerLookup and ObserveOwnerLookup record the owner a request
+	// was signed by, the live on-chain owner, in the order the lookups
+	// began: a new owner's first request clears the previous owner's state
+	// before anything of it is read or used.
+	BeginOwnerLookup() credentials.OwnerLookup
+	ObserveOwnerLookup(l credentials.OwnerLookup, owner common.Address) bool
 }
 
 // Scrubber replaces the credential values sealed holds with their
@@ -113,9 +115,10 @@ func (s *Server) credentialService(w http.ResponseWriter) (CredentialService, st
 // verifyCredOwner checks an owner-signed credential request (digest is the
 // body's, or "" for a read) and records its signer as the owner.
 func (s *Server) verifyCredOwner(w http.ResponseWriter, r *http.Request, c CredentialService, tag, sealID, owner, digest string) bool {
+	l := c.BeginOwnerLookup() // before the signature check looks the owner up
 	_, signer, ok := s.verifyOwnerSigAs(w, r, tag, sealID, owner, digest)
 	if ok {
-		c.ObserveOwner(common.HexToAddress(signer))
+		c.ObserveOwnerLookup(l, common.HexToAddress(signer))
 	}
 	return ok
 }
@@ -382,7 +385,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	name, err := c.FinishLogin(r.Context(), q.Get("state"), q.Get("code"), q.Get("error"))
+	name, err := c.FinishLogin(r.Context(), q.Get("state"), q.Get("code"), q.Get("error"), q.Get("iss"))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
