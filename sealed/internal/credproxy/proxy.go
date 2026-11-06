@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -53,9 +54,15 @@ type Config struct {
 	UpstreamTLS *tls.Config
 	// IdleTimeout closes a client connection that stays idle this long
 	// between requests (HTTP/1.1 keep-alive, or HTTP/2 with no stream
-	// open); zero means defaultIdleTimeout. There is no read timeout: an
-	// upload takes as long as it takes.
+	// open); zero means defaultIdleTimeout.
 	IdleTimeout time.Duration
+	// BodyReadTimeout bounds the wait for the part of a request body the
+	// proxy buffers to fill or sign (up to maxBodyBytes); the request is
+	// answered 408 when it has not arrived by then. Zero means
+	// defaultBodyReadTimeout. A body streamed on unread, or the rest of one
+	// too large to fill, has no read timeout: an upload takes as long as it
+	// takes.
+	BodyReadTimeout time.Duration
 	// RelayIdleTimeout closes a CONNECT tunnel or a WebSocket relay once no
 	// bytes have moved in either direction for this long; zero means
 	// defaultRelayIdleTimeout. A stream that keeps moving is never cut.
@@ -64,18 +71,46 @@ type Config struct {
 	// tunnels and relays included; the next one waits until one closes.
 	// Zero means defaultMaxConns.
 	MaxConns int
+	// MaxStreamsPerConn caps the HTTP/2 streams a client may have open at
+	// once on one terminated connection. Zero means defaultMaxStreamsPerConn.
+	MaxStreamsPerConn int
+	// MaxRequests caps the requests the proxy works on at once, over every
+	// connection and stream: a request holds a slot from before its body is
+	// read to the end of its response, a WebSocket for as long as its relay
+	// lasts. A request over the cap is answered 503 busy at once. A CONNECT
+	// tunnel holds no slot: it is one client connection, under MaxConns.
+	// Zero means defaultMaxRequests.
+	MaxRequests int
+	// ReservedRequests of the MaxRequests slots are kept for requests that
+	// fill sealed: entries alone (the framework's inference key), so that
+	// other requests cannot take every slot. Zero means
+	// defaultReservedRequests, a negative value reserves none, and it is at
+	// most half of MaxRequests.
+	ReservedRequests int
 }
 
 const (
-	defaultIdleTimeout      = 2 * time.Minute
-	defaultRelayIdleTimeout = 10 * time.Minute
-	defaultMaxConns         = 512
+	defaultIdleTimeout       = 2 * time.Minute
+	defaultBodyReadTimeout   = 30 * time.Second
+	defaultRelayIdleTimeout  = 10 * time.Minute
+	defaultMaxConns          = 512
+	defaultMaxStreamsPerConn = 16
+	defaultMaxRequests       = 128
+	defaultReservedRequests  = 32
 )
+
+// maxHeaderBytes caps a request's head (request line and headers) on every
+// server the proxy runs, HTTP/1.1 and HTTP/2.
+const maxHeaderBytes = 64 << 10
 
 // Server is the proxy. It is an http.Handler for the loopback listener.
 type Server struct {
 	cfg       Config
 	transport *http.Transport
+	// general and reserved hold the request slots (MaxRequests): any request
+	// may take a general one, only one filling sealed: entries alone a
+	// reserved one.
+	general, reserved chan struct{}
 }
 
 // ErrPrivateAddress is returned by SafeDial for a refused address.
@@ -95,7 +130,27 @@ func New(cfg Config) *Server {
 	if cfg.MaxConns <= 0 {
 		cfg.MaxConns = defaultMaxConns
 	}
-	s := &Server{cfg: cfg}
+	if cfg.BodyReadTimeout <= 0 {
+		cfg.BodyReadTimeout = defaultBodyReadTimeout
+	}
+	if cfg.MaxStreamsPerConn <= 0 {
+		cfg.MaxStreamsPerConn = defaultMaxStreamsPerConn
+	}
+	if cfg.MaxRequests <= 0 {
+		cfg.MaxRequests = defaultMaxRequests
+	}
+	switch {
+	case cfg.ReservedRequests == 0:
+		cfg.ReservedRequests = defaultReservedRequests
+	case cfg.ReservedRequests < 0:
+		cfg.ReservedRequests = 0
+	}
+	cfg.ReservedRequests = min(cfg.ReservedRequests, cfg.MaxRequests/2)
+	s := &Server{
+		cfg:      cfg,
+		general:  make(chan struct{}, cfg.MaxRequests-cfg.ReservedRequests),
+		reserved: make(chan struct{}, cfg.ReservedRequests),
+	}
 	s.transport = &http.Transport{
 		DialContext:         s.dial,
 		TLSClientConfig:     cfg.UpstreamTLS,
@@ -116,6 +171,7 @@ func (s *Server) Serve(ln net.Listener) error {
 		Handler:           s,
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       s.cfg.IdleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
 		ErrorLog:          log.New(io.Discard, "", 0),
 	}
 	return srv.Serve(ln)
@@ -283,12 +339,15 @@ func (s *Server) terminate(conn net.Conn, host string) {
 		},
 	}
 	ln := newOneConnListener(tls.Server(conn, tlsCfg))
-	// HTTP/2 on this server takes its idle timeout from IdleTimeout.
+	// HTTP/2 on this server takes its idle timeout from IdleTimeout and its
+	// header limit from MaxHeaderBytes.
 	srv := &http.Server{
 		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.intercepted(w, r, host) }),
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       s.cfg.IdleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+		HTTP2:             &http.HTTP2Config{MaxConcurrentStreams: s.cfg.MaxStreamsPerConn},
 		ErrorLog:          log.New(io.Discard, "", 0),
 		ConnState: func(_ net.Conn, st http.ConnState) {
 			if st == http.StateClosed || st == http.StateHijacked {
@@ -332,9 +391,18 @@ func isWebSocket(r *http.Request) bool {
 }
 
 // forward fills r (already pointed at https://host), sends it, and streams
-// the response back redacted.
+// the response back redacted. It holds a request slot throughout.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
-	small, large, bodyNames, berr := readBody(r, s.cfg.Registry.inspectsBody(host))
+	headNames := requestHeadNames(r)
+	pool := s.takeSlot(sealedOnly(headNames))
+	if pool == nil {
+		s.record(headNames, host, r.Method, http.StatusServiceUnavailable, "busy")
+		writeBusy(w)
+		return
+	}
+	defer func() { <-pool }()
+
+	small, large, bodyNames, berr := s.readBody(w, r, s.cfg.Registry.inspectsBody(host))
 	if berr != nil {
 		s.record(bodyNames, host, r.Method, berr.Status, berr.Code)
 		writeErr(w, berr)
@@ -377,6 +445,18 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 		writeErr(w, serr)
 		return
 	}
+	// A reserved slot is for a request that fills sealed: entries alone; one
+	// whose body filled another entry, or that is signed, takes a general
+	// slot in its place.
+	if pool == s.reserved && !sealedOnly(names) {
+		if !tryTake(s.general) {
+			s.record(names, host, r.Method, http.StatusServiceUnavailable, "busy")
+			writeBusy(w)
+			return
+		}
+		<-s.reserved
+		pool = s.general
+	}
 	// What the proxy signed with (a signature, a session token) is redacted
 	// from the response like a value it filled.
 	for n, v := range signedValues {
@@ -396,6 +476,71 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, host string) {
 	}
 	defer resp.Body.Close()
 	s.relay(w, resp, host, r.Method, names, filled)
+}
+
+// takeSlot takes a request slot without waiting: a reserved one first for a
+// request that may have one, else a general one. It returns the pool the slot
+// came from, to give it back to, or nil when none is free.
+func (s *Server) takeSlot(sealedOnly bool) chan struct{} {
+	if sealedOnly && tryTake(s.reserved) {
+		return s.reserved
+	}
+	if tryTake(s.general) {
+		return s.general
+	}
+	return nil
+}
+
+func tryTake(pool chan struct{}) bool {
+	select {
+	case pool <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// sealedOnly reports whether names, the entries a request names or fills, are
+// all entries sealed supplies itself (sealed:), and there is one at least.
+func sealedOnly(names []string) bool {
+	for _, n := range names {
+		if !strings.HasPrefix(n, "sealed:") {
+			return false
+		}
+	}
+	return len(names) > 0
+}
+
+// requestHeadNames lists the entries the head of r names (its headers, a
+// Basic password, its path and query), as written or escaped, before its
+// body is read. It decides which pool of request slots r may use, and names
+// the entries in the audit record of a request refused as busy.
+func requestHeadNames(r *http.Request) []string {
+	var b bytes.Buffer
+	for k, vs := range r.Header {
+		b.WriteString(k)
+		b.WriteByte('\n')
+		for _, v := range vs {
+			b.WriteString(v)
+			b.WriteByte('\n')
+			if len(v) > 6 && strings.EqualFold(v[:6], "Basic ") {
+				if dec, err := base64.StdEncoding.DecodeString(strings.TrimSpace(v[6:])); err == nil {
+					b.Write(dec)
+					b.WriteByte('\n')
+				}
+			}
+		}
+	}
+	b.WriteString(r.URL.EscapedPath())
+	b.WriteByte('?')
+	b.WriteString(r.URL.RawQuery)
+	return mentionedNames(b.Bytes())
+}
+
+// writeBusy answers a request the proxy has no slot for.
+func writeBusy(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	writeErr(w, refuse(http.StatusServiceUnavailable, "busy", "the proxy is serving as many requests as it may at once; try again shortly"))
 }
 
 // setContentLength makes the Content-Length header say what the transport
@@ -474,10 +619,12 @@ func checkResponse(resp *http.Response) *Error {
 
 // copyResponseHeader copies upstream's response headers into dst with every
 // value redacted. Hop-by-hop headers, Content-Length and the headers only the
-// proxy may set are dropped, and so is a header whose name holds a value.
+// proxy may set are dropped, and so is a header whose name holds a value or a
+// token, a value in any case: a header name reaches the proxy in canonical
+// case (HTTP/2 writes it in lower case), not as upstream wrote it.
 func copyResponseHeader(dst, src http.Header, red *redactor) {
 	for k, vs := range src {
-		if red.applyString(k) != k {
+		if red.applyString(k) != k || red.inName(k) {
 			continue
 		}
 		for _, v := range vs {
@@ -775,14 +922,24 @@ func (s *Server) record(names []string, host, method string, status int, code st
 // has its bodies read at all. Anywhere else a body is relayed as it is,
 // whatever its size: bodies carry text (a conversation, an issue, a model
 // prompt) that may quote a placeholder, and nothing could be filled there.
-func readBody(r *http.Request, inspect bool) ([]byte, io.ReadCloser, []string, *Error) {
+//
+// What it buffers must arrive within BodyReadTimeout (w's read deadline,
+// cleared again once it has; when it has not, the deadline stays, so the
+// server does not wait on the rest of that body either).
+func (s *Server) readBody(w http.ResponseWriter, r *http.Request, inspect bool) ([]byte, io.ReadCloser, []string, *Error) {
 	if r.Body == nil || r.Body == http.NoBody {
 		return nil, nil, nil, nil
 	}
 	if !inspect {
 		return nil, r.Body, nil, nil
 	}
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(s.cfg.BodyReadTimeout))
 	head, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return nil, nil, nil, refuse(http.StatusRequestTimeout, "bad_request", "request body not received within %s", s.cfg.BodyReadTimeout)
+	}
+	_ = rc.SetReadDeadline(time.Time{})
 	if err != nil {
 		return nil, nil, nil, refuse(http.StatusBadRequest, "bad_request", "cannot read request body")
 	}
@@ -809,7 +966,8 @@ var errBodyPlaceholder = errors.New("a placeholder in a body too large to fill")
 // bodyScan relays a body too large to fill and stops it at the first
 // placeholder it names, as written or percent- or JSON-escaped: that Read
 // fails, so the request does not go out whole, and result reports the names
-// for the refusal. It keeps only the last scanOverlap bytes between reads.
+// for the refusal. It keeps only the last scanOverlap bytes between reads
+// (one more where that cut would split a backslash from the byte it escapes).
 type bodyScan struct {
 	r    io.Reader
 	c    io.Closer
@@ -842,8 +1000,25 @@ func (b *bodyScan) Read(p []byte) (int, error) {
 		b.mu.Unlock()
 		return 0, errBodyPlaceholder
 	}
-	b.tail = append(b.tail[:0], win[max(0, len(win)-scanOverlap):]...)
+	b.tail = append(b.tail[:0], win[escapeStart(win, max(0, len(win)-scanOverlap)):]...)
 	return n, err
+}
+
+// escapeStart is where the tail bodyScan keeps of win begins, given the cut
+// p: one byte earlier when the backslash before p escapes win[p], so that the
+// tail's JSON escapes read as they do in the whole body. It does when the run
+// of backslashes ending at p-1 is odd: a run begins where an escape may (only
+// a backslash escapes a backslash, and none is a \u digit), and so does win
+// (the body's start, or a cut made here).
+func escapeStart(win []byte, p int) int {
+	run := 0
+	for i := p - 1; i >= 0 && win[i] == '\\'; i-- {
+		run++
+	}
+	if run%2 == 1 {
+		return p - 1
+	}
+	return p
 }
 
 func (b *bodyScan) Close() error { return b.c.Close() }

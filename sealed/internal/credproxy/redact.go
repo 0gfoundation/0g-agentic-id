@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
+	"unicode/utf16"
 )
 
 // Values shorter than minRawRedact are not redacted, and encoded forms
@@ -91,24 +93,33 @@ type formSet struct {
 	index  map[uint32][]int32  // first formKeyLen bytes -> forms, longest first
 	heads  map[string]struct{} // every shorter prefix of a form
 	maxLen int
+
+	lowerOnce sync.Once
+	lower     *formSet // the forms in ASCII lower case, for header names
 }
 
 // newFormSet covers every value of list, each replaced by its entry's
 // placeholder (a minted token by the placeholder that stood for it). Where
 // two values share a form, the first in list names it.
 func newFormSet(list []secret) *formSet {
-	s := &formSet{index: map[uint32][]int32{}, heads: map[string]struct{}{}}
+	var forms []redactForm
 	seen := map[string]bool{}
 	add := func(match string, min int, repl []byte) {
 		if len(match) < min || seen[match] {
 			return
 		}
 		seen[match] = true
-		s.forms = append(s.forms, redactForm{match: []byte(match), repl: repl})
+		forms = append(forms, redactForm{match: []byte(match), repl: repl})
 	}
 	for _, v := range list {
 		addValue(add, v.name, v.value)
 	}
+	return indexForms(forms)
+}
+
+// indexForms builds the set of forms, each at least formKeyLen long.
+func indexForms(forms []redactForm) *formSet {
+	s := &formSet{forms: forms, index: map[uint32][]int32{}, heads: map[string]struct{}{}}
 	// Longest first, so where several forms start at one place the longest
 	// is replaced.
 	sort.SliceStable(s.forms, func(i, j int) bool { return len(s.forms[i].match) > len(s.forms[j].match) })
@@ -121,6 +132,46 @@ func newFormSet(list []secret) *formSet {
 		s.maxLen = max(s.maxLen, len(f.match))
 	}
 	return s
+}
+
+// lowerForms is s with every form in ASCII lower case, built on first use.
+func (s *formSet) lowerForms() *formSet {
+	s.lowerOnce.Do(func() {
+		seen := map[string]bool{}
+		var forms []redactForm
+		for _, f := range s.forms {
+			m := asciiLower(f.match)
+			if !seen[string(m)] {
+				seen[string(m)] = true
+				forms = append(forms, redactForm{match: m, repl: f.repl})
+			}
+		}
+		s.lower = indexForms(forms)
+	})
+	return s.lower
+}
+
+func asciiLower(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		out[i] = lowerASCII(c)
+	}
+	return out
+}
+
+// inName reports whether the header name k holds a value's form in any case
+// of its ASCII letters.
+func (r *redactor) inName(k string) bool {
+	lk := asciiLower([]byte(k))
+	for _, s := range r.sets {
+		lower := s.lowerForms()
+		for i := 0; i+formKeyLen <= len(lk); i++ {
+			if lower.matchAt(lk[i:]) != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func formKey(b []byte) uint32 { return binary.LittleEndian.Uint32(b) }
@@ -158,10 +209,11 @@ func (s *formSet) isProperPrefix(b []byte) bool {
 // addValue registers v in each encoding it may travel in: raw; percent-
 // encoded as Go's QueryEscape and PathEscape write it and as Python's
 // quote() does (every byte but the unreserved ones, '/' kept or not), each
-// with upper- or lower-case hex; JSON-escaped with and without HTML escapes,
-// each with '/' written plain or as "\/"; and standard or URL-safe base64 at
-// each of the three byte alignments a value can take inside a longer base64
-// run. Base64 wrapped across lines and hex are not covered.
+// with upper- or lower-case hex; JSON-escaped as common encoders write it
+// (jsonStrings), each with '/' written plain or as "\/"; and standard or
+// URL-safe base64 at each of the three byte alignments a value can take
+// inside a longer base64 run. Base64 wrapped across lines and hex are not
+// covered.
 //
 // Base64 is redacted for every value redacted raw, whatever the length of
 // the encoded run: a 6-byte value leaves only 7 characters that are its
@@ -191,7 +243,8 @@ func addValue(add func(match string, min int, repl []byte), name string, v []byt
 }
 
 // jsonStrings is s inside a JSON string (quotes left out), as Go writes it
-// (<, > and & escaped) and as most other encoders do.
+// with HTML escapes (as Rails does) and without (as JavaScript, Ruby and Rust
+// do), and as the encoders of jsonProfiles write it.
 func jsonStrings(s string) []string {
 	var out []string
 	if q, err := json.Marshal(s); err == nil {
@@ -204,7 +257,81 @@ func jsonStrings(s string) []string {
 		q := bytes.TrimSuffix(b.Bytes(), []byte("\n"))
 		out = append(out, string(q[1:len(q)-1]))
 	}
+	for _, p := range jsonProfiles {
+		out = append(out, p.quote(s))
+	}
 	return out
+}
+
+// jsonProfile is how a family of JSON encoders writes a string: the ASCII
+// characters it writes as \u00XX besides the ones JSON requires, the case of
+// its hex digits, and whether it writes every non-ASCII character as \uXXXX.
+type jsonProfile struct {
+	escape   string
+	upper    bool
+	nonASCII bool
+}
+
+var jsonProfiles = []jsonProfile{
+	{"", false, true},              // Python's default, PHP
+	{"", true, false},              // Jackson (control characters in upper-case hex)
+	{"<>&", true, false},           // HTML escapes in upper-case hex (PHP's JSON_HEX_TAG, JSON_HEX_AMP)
+	{"<>&='", false, false},        // Gson
+	{"<>&'\"", false, false},       // Json.NET with EscapeHtml
+	{"<>&'\"+`\x7f", true, true},   // System.Text.Json
+	{"<>&'\"+=`\x7f", false, true}, // every one of these, in either case
+	{"<>&'\"+=`\x7f", true, true},
+}
+
+// quote writes s as p's encoders do inside a JSON string: '"' and '\'
+// escaped, \b \f \n \r \t short and other control characters as \u00XX, the
+// characters of p.escape as \u00XX, non-ASCII as \uXXXX (UTF-16) when
+// p.nonASCII.
+func (p jsonProfile) quote(s string) string {
+	digits := "0123456789abcdef"
+	if p.upper {
+		digits = "0123456789ABCDEF"
+	}
+	var b strings.Builder
+	u := func(r rune) {
+		b.WriteString(`\u`)
+		for shift := 12; shift >= 0; shift -= 4 {
+			b.WriteByte(digits[r>>shift&0xf])
+		}
+	}
+	for _, r := range s {
+		switch {
+		case r < 0x80 && strings.ContainsRune(p.escape, r):
+			u(r)
+		case r == '"':
+			b.WriteString(`\"`)
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == '\b':
+			b.WriteString(`\b`)
+		case r == '\f':
+			b.WriteString(`\f`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20:
+			u(r)
+		case r >= 0x80 && p.nonASCII:
+			if r > 0xffff {
+				r1, r2 := utf16.EncodeRune(r)
+				u(r1)
+				u(r2)
+			} else {
+				u(r)
+			}
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // lowerHex writes the hex digits of every %XX escape in s in lower case.
@@ -250,17 +377,23 @@ func (r *redactor) empty() bool {
 // applyValues replaces, scanning left to right, the longest form that starts
 // at each place. b comes back as it is when nothing matched.
 //
-// Unless final (more of the stream is to come), a match that could still
-// grow into a longer form (one value a prefix of another, the read ending
-// inside the longer one) is not replaced: it and everything after it are
-// left as they are, and hold is their length, for the caller to hold back
-// until more data arrives.
+// Unless final (more of the stream is to come), the bytes from where a form
+// may begin that b ends inside of (pendingTail, measured on b as it came, so
+// a value inside another or a prefix of another is held whole) are left as
+// they are, and so is everything from the start of a match that would run
+// into them; hold is their length, for the caller to hold back until more
+// data arrives. What is replaced is then what a scan of the whole stream
+// replaces.
 func (r *redactor) applyValues(b []byte, final bool) (out []byte, hold int) {
 	if r.empty() {
 		return b, 0
 	}
+	end := len(b)
+	if !final {
+		end -= r.pendingTail(b)
+	}
 	last := 0
-	for i := 0; i+min(minRawRedact, minEncodedRedact) <= len(b); i++ {
+	for i := 0; i < end && i+min(minRawRedact, minEncodedRedact) <= len(b); i++ {
 		var f *redactForm
 		for _, s := range r.sets {
 			if g := s.matchAt(b[i:]); g != nil && (f == nil || len(g.match) > len(f.match)) {
@@ -270,8 +403,8 @@ func (r *redactor) applyValues(b []byte, final bool) (out []byte, hold int) {
 		if f == nil {
 			continue
 		}
-		if !final && r.isProperPrefix(b[i:]) {
-			hold = len(b) - i
+		if i+len(f.match) > end {
+			end = i
 			break
 		}
 		if out == nil {
@@ -286,6 +419,7 @@ func (r *redactor) applyValues(b []byte, final bool) (out []byte, hold int) {
 		last = i + len(f.match)
 		i = last - 1
 	}
+	hold = len(b) - end
 	if out == nil {
 		return b, hold
 	}
@@ -364,8 +498,8 @@ func (rr *redactReader) Read(p []byte) (int, error) {
 		}
 		final := rr.err != nil
 		buf, hold := rr.red.applyValues(append(rr.held, chunk[:n]...), final)
-		// The held tail is left to the next round whole: token masking
-		// sees only what comes before it.
+		// The held tail, as it came, is left to the next round whole: token
+		// masking sees only what comes before it.
 		head := buf[:len(buf)-hold]
 		keep := 0
 		if rr.red.tokens {
@@ -377,9 +511,6 @@ func (rr *redactReader) Read(p []byte) (int, error) {
 			buf = head
 		}
 		keep += hold
-		if !final {
-			keep = max(keep, rr.red.pendingTail(buf))
-		}
 		rr.out = buf[:len(buf)-keep]
 		rr.held = append([]byte(nil), buf[len(buf)-keep:]...)
 		if len(rr.out) > 0 {
