@@ -53,3 +53,19 @@ func TestMarkWithoutDigestLearnsIt(t *testing.T) {
 		t.Fatalf("a second set at version 3 was taken: %v", err)
 	}
 }
+
+// A document at the loaded version that the owner did not sign is refused
+// as such, not as a second set: it is never counted as "already loaded".
+func TestUnsignedAtLoadedVersionIsWrongSigner(t *testing.T) {
+	f := newFixture(t)
+	s, _, _ := f.store(t, nil, nil)
+	ctx := context.Background()
+	if _, err := s.Load(ctx, f.doc(t, 3, map[string]string{"github": "ghp_y"}), 0); err != nil {
+		t.Fatal(err)
+	}
+	junk := f.doc(t, 3, map[string]string{"other": "x"})
+	junk.Signature = "0x00"
+	if _, err := s.Load(ctx, junk, 0); err == nil || errors.Is(err, ErrStale) {
+		t.Fatalf("an unsigned document at the loaded version: %v", err)
+	}
+}

@@ -130,10 +130,11 @@ export function loadCredentialMarks(env: NodeJS.ProcessEnv = process.env): Recor
 }
 
 /**
- * Record a newer credential set for `key`, keeping whichever of it and the
- * file's is newer (another run may have written meanwhile). Written to a
- * temporary file and renamed, so a reader never sees half of it.
- * Best-effort, as recordSecretEnvPin.
+ * Record a newer credential set for `key`, unless the file already holds a
+ * newer one for it (another run may have written meanwhile). Written to a
+ * temporary file and renamed, so a reader never sees half of it; two runs
+ * writing at the same moment can still lose one's record, which that run
+ * keeps in memory. Best-effort, as recordSecretEnvPin.
  */
 export function recordCredentialMark(key: string, mark: CredentialMark, env: NodeJS.ProcessEnv = process.env): void {
   try {

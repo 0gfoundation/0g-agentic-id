@@ -16,7 +16,6 @@ import {
 import { privateKeyToAccount } from 'viem/accounts';
 import { ZERO_G_TESTNET, RPC_URL, type ContractAddresses } from './constants';
 
-/** Public config for `new AgentDNA(config)` (exported as `AgentDNAConfig`). */
 /** A stored credential set's place in order, and its EIP-712 digest. */
 export interface CredentialMarkRecord {
   epoch: number;
@@ -24,6 +23,7 @@ export interface CredentialMarkRecord {
   digest?: string;
 }
 
+/** Public config for `new AgentDNA(config)` (exported as `AgentDNAConfig`). */
 export interface AgenticIDConfig {
   /** RPC endpoint. Defaults to the 0G Galileo testnet RPC. */
   rpcUrl?: string;

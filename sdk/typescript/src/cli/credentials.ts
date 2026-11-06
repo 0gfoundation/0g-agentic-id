@@ -610,7 +610,7 @@ function conflict(e: unknown): never {
 /** `disconnect` (and `rm` of a connection): revoke at the server when it can be, then remove. */
 async function disconnectOp(cred: AgenticID['credentials'], sealId: Hash, name: string, io: CredIO, at?: { agentUrl: string }): Promise<void> {
   const out = await cred.disconnect(sealId, name, at).catch(conflict);
-  if (io.json) return emitOk({ sealId, version: out.version, disconnected: name, revoked: out.revoked, note: out.note ?? null, pushWarning: out.pushWarning ?? null });
+  if (io.json) return emitOk({ sealId, version: out.version, disconnected: name, revoked: out.revoked, changed: !!out.changed, note: out.note ?? null, pushWarning: out.pushWarning ?? null });
   io.out(`disconnected ${name} — version ${out.version}; ${out.changed ? out.note : out.revoked ? 'its tokens are revoked at the server' : `not revoked at the server: ${out.note ?? 'unknown'}`}`);
   if (out.pushWarning) {
     io.out(`the running agent did not take it: ${out.pushWarning}`);

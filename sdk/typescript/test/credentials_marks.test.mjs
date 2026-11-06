@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -188,6 +188,131 @@ test('cli: an overtaken disconnect does not say "not revoked" and "are revoked" 
     await credOp({ credentials: h.client() }, SEAL_ID, ['disconnect', 'linear'], { json: false, out: (l) => lines.push(l), secret: async () => '' }, h.url);
     const text = lines.join('\n');
     assert.ok(!(/not revoked at the server/.test(text) && /are revoked/.test(text)), text);
+  } finally {
+    h.server.close();
+  }
+});
+
+// An attestor that can re-case what it returns, queue answers, and send an
+// epoch as a raw JSON number.
+async function serving() {
+  const sets = [];
+  const kept = [];
+  const h = { serve: undefined, fakeEpoch: undefined, epoch: 7, rewrite: (d) => d, serveQueue: [] };
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const u = new URL(req.url, 'http://x');
+      const json = (s, b) => { res.writeHead(s, { 'content-type': 'application/json' }); res.end(typeof b === 'string' ? b : JSON.stringify(b)); };
+      if (req.method === 'GET' && u.pathname === '/credentials') {
+        if (h.fakeEpoch !== undefined) return json(200, `{"version":0,"owner_epoch":${h.fakeEpoch},"document":null,"writebacks":{}}`);
+        const cur = h.serveQueue.length ? h.serveQueue.shift() : (h.serve ?? sets.at(-1));
+        const doc = cur ? h.rewrite(JSON.parse(JSON.stringify(cur))) : null;
+        return json(200, { version: cur ? cur.set.version : 0, owner_epoch: cur ? cur.set.owner_epoch : h.epoch, document: doc, writebacks: {} });
+      }
+      if (req.method === 'POST' && u.pathname === '/credentials') {
+        const b = JSON.parse(Buffer.concat(chunks).toString());
+        kept.push(b.document);
+        if (h.fakeEpoch === undefined) sets.push(b.document);
+        return json(200, { ok: true, version: b.document.set.version });
+      }
+      if (u.pathname.startsWith('/_seal/')) return json(200, {});
+      json(404, {});
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const client = (marks) => new CredentialsApi({ attestorUrl: url, chain: { id: CHAIN_ID }, addresses: { agenticID: CONTRACT }, account: OWNER, credentialMarks: marks,
+    walletClient: { signMessage: ({ message }) => OWNER.signMessage({ message }), signTypedData: (a) => OWNER.signTypedData(a) } }, { agentSealPubkey: async () => SEAL_PUB });
+  return Object.assign(h, { url, server, sets, kept, client });
+}
+
+const fileMarks = (env) => ({ seen: (k) => loadCredentialMarks(env)[k], record: (k, m) => recordCredentialMark(k, m, env), where: 'x' });
+
+// Digest parity: a set this SDK stored (upper-case sealId given, attestor
+// re-serializing hex in another case, an empty set) reads back with no
+// false "not the version this client has seen".
+test('marks: stored set reads back as the same version (upper-case sealId, re-cased hex, empty set)', async () => {
+  const h = await serving();
+  const env = { XDG_CONFIG_HOME: mkdtempSync(join(tmpdir(), 'marks-')) };
+  const UP = '0x' + SEAL_ID.slice(2).toUpperCase();
+  h.rewrite = (d) => { d.set.seal_id = '0x' + d.set.seal_id.slice(2).toUpperCase(); d.signature = '0x' + d.signature.slice(2).toUpperCase(); return d; };
+  try {
+    const c = h.client(fileMarks(env));
+    await c.put(UP, [{ name: 'github', value: 'ghp_x', hosts: ['api.github.com'], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }] }], { baseVersion: 0, agentUrl: h.url });
+    const g1 = await h.client(fileMarks(env)).get(UP); // a new process, file marks
+    assert.equal(g1.version, 1);
+    await h.client(fileMarks(env)).remove(UP, 'github', { agentUrl: h.url }); // v2, empty set
+    const g2 = await h.client(fileMarks(env)).get(SEAL_ID);
+    assert.equal(g2.version, 2);
+    assert.equal(g2.definitions.length, 0);
+  } finally {
+    h.server.close();
+  }
+});
+
+// The record must not be erasable by the attestor. A made-up epoch that is
+// an integer but not a safe one (1e20) is signed for and recorded; the
+// commit's stricter loadCredentialMarks then drops that record, so the next
+// run has no mark and takes an older honest set (rollback). Before 471eb62
+// the record was kept (JSON.parse as-is) and the older set was refused.
+test('marks: an epoch past what the client can hold is refused, so the record stays and an older set is not taken', async () => {
+  const h = await serving();
+  const env = { XDG_CONFIG_HOME: mkdtempSync(join(tmpdir(), 'marks-')) };
+  try {
+    await credOp({ credentials: h.client(fileMarks(env)) }, SEAL_ID, ['set', 'github', 'preset=github'], quiet, h.url); // v1
+    await credOp({ credentials: h.client(fileMarks(env)) }, SEAL_ID, ['set', 'leaky', 'host=collect.example', 'header=X-Key: {v}'], quiet, h.url); // v2
+    await credOp({ credentials: h.client(fileMarks(env)) }, SEAL_ID, ['rm', 'leaky'], quiet, h.url); // v3 {github}
+    const v2 = h.sets[1];
+    h.fakeEpoch = '1152921504606846976'; // 2**60: fits uint64, not a safe JS integer
+    await assert.rejects(credOp({ credentials: h.client(fileMarks(env)) }, SEAL_ID, ['set', 'slack', 'preset=slack'], quiet, h.url),
+      (e) => e instanceof CredentialsUnverifiedError && /not a number this client can hold/.test(e.message));
+    h.fakeEpoch = undefined;
+    const file = readFileSync(join(env.XDG_CONFIG_HOME, '0g-agentdna', 'credential-marks.json'), 'utf8');
+    h.serve = v2; // the older set, with `leaky`, served as current
+    const r = await h.client(fileMarks(env)).get(SEAL_ID).then((x) => x, (e) => e);
+    assert.ok(r instanceof CredentialsUnverifiedError, `older v2 taken after the record was erased; file was: ${file.trim()}; loaded marks: ${JSON.stringify(loadCredentialMarks(env))}`);
+  } finally {
+    h.server.close();
+  }
+});
+
+// One client, two reads in flight: the attestor serves two owner-signed
+// sets at one version. The check and the raise are not one step, so both
+// are taken (each caller may sign on top of its own).
+test('marks: two reads in flight in one client do not both take two sets at one version', async () => {
+  const h = await serving();
+  const kept = new Map();
+  const marks = { seen: (k) => kept.get(k), record: (k, m) => { kept.set(k, m); } };
+  try {
+    await h.client().put(SEAL_ID, [{ name: 'a', value: 'x', hosts: ['a.example'], positions: [{ kind: 'header', name: 'X', template: '{v}' }] }], { baseVersion: 0, agentUrl: h.url }); // v1
+    // X and Y: both signed by the owner at v2 (one "refused" by the attestor).
+    await h.client().put(SEAL_ID, [{ name: 'a', value: 'x', hosts: ['a.example'], positions: [{ kind: 'header', name: 'X', template: '{v}' }] }, { name: 'leaky', value: 'l', hosts: ['l.example'], positions: [{ kind: 'header', name: 'X', template: '{v}' }] }], { baseVersion: 1, agentUrl: h.url });
+    const X = h.sets.pop();
+    await h.client().put(SEAL_ID, [], { baseVersion: 1, agentUrl: h.url });
+    const Y = h.sets.at(-1);
+    assert.equal(X.set.version, Y.set.version);
+    const c = h.client(marks);
+    h.serveQueue = [Y, X];
+    const [a, b] = await Promise.all([c.get(SEAL_ID), c.get(SEAL_ID)].map((p) => p.then((x) => x, (e) => e)));
+    assert.ok(a instanceof Error || b instanceof Error, `both taken: ${a.definitions?.map((d) => d.name)} / ${b.definitions?.map((d) => d.name)}`);
+  } finally {
+    h.server.close();
+  }
+});
+
+// A credentialMarks store that answers the digest in another case (say, a
+// store that normalises hex) makes the honest set read as "not the version
+// this client has seen".
+test('marks: a digest answered in upper case does not refuse the same set', async () => {
+  const h = await serving();
+  const kept = new Map();
+  const marks = { seen: (k) => kept.get(k), record: (k, m) => { kept.set(k, { ...m, digest: m.digest?.toUpperCase().replace('0X', '0x') }); } };
+  try {
+    await h.client(marks).put(SEAL_ID, [{ name: 'a', value: 'x', hosts: ['a.example'], positions: [{ kind: 'header', name: 'X', template: '{v}' }] }], { baseVersion: 0, agentUrl: h.url });
+    const r = await h.client(marks).get(SEAL_ID).then((x) => x, (e) => e);
+    assert.ok(!(r instanceof Error), `refused: ${r?.message}`);
   } finally {
     h.server.close();
   }

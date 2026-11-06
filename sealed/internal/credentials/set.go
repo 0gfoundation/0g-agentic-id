@@ -287,17 +287,17 @@ func Open(doc Document, c Check) (*Opened, error) {
 	if err != nil {
 		return nil, err
 	}
-	at := MarkOf(doc.Set)
-	at.Digest = digest.Hex()
-	if at.Same(c.Min) && c.Min.Digest != "" && !strings.EqualFold(at.Digest, c.Min.Digest) {
-		return nil, ErrForked
-	}
 	signer, err := Recover(digest, doc.Signature)
 	if err != nil {
 		return nil, fmt.Errorf("credential set signature: %w", err)
 	}
 	if signer != c.Owner {
 		return nil, ErrWrongSigner
+	}
+	at := MarkOf(doc.Set)
+	at.Digest = digest.Hex()
+	if at.Same(c.Min) && c.Min.Digest != "" && !strings.EqualFold(at.Digest, c.Min.Digest) {
+		return nil, ErrForked
 	}
 	out := &Opened{Set: doc.Set, Mark: at, Defs: map[string]*Definition{}, Values: map[string][]byte{}, Skipped: map[string]string{}}
 	seen := map[string]bool{}

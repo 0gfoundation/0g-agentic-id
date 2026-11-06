@@ -170,7 +170,7 @@ agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` /
 | `POST /_seal/credentials/decide` | `0GSealCredDecide` | `{auth_req_id, decision: "once" \| "deny", approval?, signature?}` |
 | `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | agent 做了什么（代填、换 token、签名、交出、登录、写回），以及凭据集里哪些条目被跳过、原因是什么，不含值。按时间从旧到新，分三份各保留最近 1000 条：代理使用；钱包签名；其余记录（owner 的决定、登录、断开、加载、sealed 自己做的事），所以 agent 能引发的记录不会把 owner 的记录挤掉。从某份里挤出的记录按类（操作、条目、域名、结果）计数，不会不留痕迹地丢掉。agent 可以随意重复的操作（换 token、刷新、写回、失败的签名、预先允许的交出）以及 sealed 自己提供的值（`sealed:` 条目，如框架的推理 key）的成功使用，每类合并为一条记录，带 `count`、`first` 和最近一次的 `ts`；每种操作的每种结果（冒号之前的部分）各有 32 类的额度，再多的只按结果合并计数，所以对一种结果的大量请求只会让这种结果之后的记录变模糊；总数超过 1024 类后，所有操作的新类别都只按结果合并计数。域名和条目名截到有限长度，控制字符和格式字符显示为 `?`，标准 HTTP 方法以外的方法记为 `OTHER`。stop/start 后保留，并记下属于哪个 owner，只为同一个 owner 恢复；启动时读不了的已保存记录原样保留，不会被覆盖 |
 | `POST /_seal/credentials/login` | `0GSealCredLogin` | 发起 MCP 登录；返回 `{authorize_url}` |
-| `POST /_seal/credentials/disconnect` | `0GSealCredDisconnect` | 结束 MCP 登录：服务器支持时请它作废 token，并丢掉 token；返回 `{revoked, note}`，期间条目变了时返回 409 `{code: "changed", revoked}` |
+| `POST /_seal/credentials/disconnect` | `0GSealCredDisconnect` | 结束 MCP 登录：服务器支持时请它作废 token，并丢掉 token；返回 `{revoked, note}`，期间条目变了时返回 409 `{code: "changed", message, revoked, note}` |
 | `GET /_seal/oauth/callback` | 无 | 登录后浏览器的回跳 |
 
 **授权。** "只允许这一次"是链上现任 owner 签的 EIP-712 `Approval(bytes32 sealId,bytes32 bootId,bytes32 authReqId,bytes32 requestDigest,uint64 expiresAt)`（同一个 domain），绑定本次启动、这条申请及其摘要，只能使用一次（SDK 给 1 小时，不超过申请本身的过期时间）。sealed 只对仍在等待的申请接受决定，所以用过之后再次提交的批准会被拒绝。待办保留 72 小时，容器重启后丢失，agent 重新申请即可。新增凭据和登录的申请，通过实际去新增、去登录来应答。不表态即视为不允许。
@@ -195,6 +195,7 @@ SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-
 - **普通 API 返回的 token。** 普通 API 调用（不是换 token）返回的 token 原样到达 agent；如果它属于代理遮盖的常见格式，agent 拿到的是 `[[redacted]]`，无法使用，要拿这类 token 需用换 token。
 - **不限制用途。** 在密钥本身的权限范围内，agent 可以做任何事，包括派生新密钥、用签名条目签任意内容。
 - **reset 之后的回滚。** sealed 在 stop/start 后拒绝更低的凭据集版本，但 reset 或新建 sandbox 之后，依赖 attestor 提供最新的凭据集。删除密钥时，也要在服务商那边吊销。
+- **所有权纪元来自 attestor。** owner 客户端按 attestor 报告的纪元签名凭据集，sealed 接收推送的凭据集时不检查纪元。编造的更晚纪元一旦被签名并加载，真实的凭据集就会显得更旧：在 agent 上直到 reset，在 owner 的机器上直到删除那条记录。
 - **其他通道。** 非 HTTP 协议和浏览器登录态需要交出值；响应遮盖是尽力而为。
 - **转让后前任 owner 的容器。** 转让后几秒内 sealed 就清空所有凭据，但容器会一直运行到 attestor 将其拆除，在此之前新 owner 可以访问它的框架路由。前任 owner 交给 agent 的值，这时可能仍在 agent 的内存或文件里。
 - **框架自己的流量。** 框架的环境变量里也有 `HTTPS_PROXY`。没有条目的域名原样转发通道，但代理拒绝连接私网地址，所以 HTTP 客户端遵循 `HTTPS_PROXY` 的框架，连不上私网地址上的模型（或其他服务）。

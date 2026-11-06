@@ -314,10 +314,11 @@ export class CredentialsApi {
     if (!seen) return undefined;
     let why: string | undefined;
     if (older(at, seen)) why = `it is older than the newest set this client has seen, version ${seen.version} of ownership ${seen.epoch}`;
-    else if (same(at, seen) && seen.digest && at.digest && at.digest !== seen.digest) why = `it is not the version ${seen.version} this client has seen`;
+    else if (same(at, seen) && seen.digest && at.digest && at.digest.toLowerCase() !== seen.digest.toLowerCase()) why = `it is not the version ${seen.version} this client has seen`;
     if (!why) return undefined;
     const where = this.ctx.credentialMarks?.where;
-    return `${why}. If the attestor's data was reset on purpose, remove this agent's record${where ? ` from ${where}` : ''} and read again`;
+    const clear = where ? `remove this agent's record from ${where}` : 'start a new client';
+    return `${why}. If the attestor's data was reset on purpose, ${clear} and read again`;
   }
 
   /** The EIP-712 digest of a set, as the owner signs it. */
@@ -377,6 +378,11 @@ export class CredentialsApi {
     const r = await fetch(`${this.attestorUrl()}/credentials?seal_id=${seal}`, { headers: await this.ownerHeaders(message), signal: AbortSignal.timeout(10_000) });
     if (!r.ok) throw new Error(`credentials.get: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     const body = (await r.json()) as { version: number; owner_epoch: number; document: CredentialDocument | null };
+    // A number this client cannot hold exactly could not be kept as the
+    // newest seen either.
+    if (![body.version, body.owner_epoch].every((n) => Number.isSafeInteger(n) && n >= 0)) {
+      throw new CredentialsUnverifiedError('its version or ownership epoch is not a number this client can hold');
+    }
     if (!body.document && body.version !== 0) throw new CredentialsUnverifiedError(`version ${body.version} comes with no signed set`);
     const v = body.document ? await this.verified(seal, body.version, body.owner_epoch, body.document) : { definitions: [], digest: undefined };
     const definitions = v.definitions;
