@@ -757,6 +757,25 @@ mod tests {
 
         let jobs = Arc::new(InMemoryJobQueue::new());
         let w = test_watcher(deployments.clone(), events.clone(), jobs.clone());
+        // The seller's credentials: a set with a writeback, a pending count
+        // and a reminder already sent.
+        let creds = w.credentials.clone();
+        creds
+            .put(
+                seal_id,
+                seller,
+                0,
+                0,
+                serde_json::json!({"set": {}}),
+                serde_json::json!({"rt": {}}),
+            )
+            .await
+            .unwrap();
+        creds.set_pending(seal_id, 2).await.unwrap();
+        assert!(creds
+            .claim_reminder(seal_id, "rt", 1, 1_900_000_000)
+            .await
+            .unwrap());
         w.on_transfer(
             AgenticID::Transfer {
                 from: seller,
@@ -768,6 +787,26 @@ mod tests {
         .await
         .expect("transfer handled");
 
+        assert!(
+            creds.get(seal_id).await.unwrap().is_none(),
+            "the seller's set and writebacks are deleted"
+        );
+        assert!(
+            creds.pending_counts(&[seal_id]).await.unwrap().is_empty(),
+            "pending count deleted"
+        );
+        assert!(
+            creds
+                .claim_reminder(seal_id, "rt", 1, 1_900_000_000)
+                .await
+                .unwrap(),
+            "reminder records deleted, so the buyer's entries are reminded afresh"
+        );
+        assert_eq!(
+            creds.epoch(seal_id).await.unwrap(),
+            100,
+            "a new ownership epoch"
+        );
         let after = deployments.get(seal_id).await.unwrap().expect("seeded");
         assert_eq!(after.owner, buyer, "owner synced to new on-chain owner");
         assert!(

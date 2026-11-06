@@ -85,7 +85,8 @@ pub trait CredentialRepo: Send + Sync {
         version: i64,
         expires_at: i64,
     ) -> anyhow::Result<bool>;
-    /// Drop the set and its pending count: the agent changed hands.
+    /// Drop the set (with its writebacks), its pending count and the
+    /// reminders sent for it: the agent changed hands.
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()>;
     async fn epoch(&self, seal_id: SealId) -> anyhow::Result<i64>;
     async fn set_epoch(&self, seal_id: SealId, epoch: i64) -> anyhow::Result<()>;
@@ -335,6 +336,10 @@ impl CredentialRepo for PostgresCredentialRepo {
             .bind(seal_id.as_slice())
             .execute(&self.pool)
             .await?;
+        sqlx::query("DELETE FROM credential_reminders WHERE seal_id = $1")
+            .bind(seal_id.as_slice())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -539,6 +544,7 @@ impl CredentialRepo for InMemoryCredentialRepo {
         let mut s = self.inner.lock().unwrap();
         s.sets.remove(&seal_id);
         s.pending.remove(&seal_id);
+        s.reminders.retain(|r| r.0 != seal_id);
         Ok(())
     }
 
