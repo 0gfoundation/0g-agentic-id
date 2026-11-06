@@ -122,12 +122,16 @@ COMMANDS
                    it leaves this machine.
                      cred <agent>                       list (never values)
                      cred <agent> set <name> [k=v …]    add or change one.
-                       Keys: preset=github|openai|anthropic, host=a,b,
+                       Keys: preset=<name> (see cred presets), host=a,b,
                        header='Name: … {v} …', basic=<user>, query=<param>,
                        body=<field>, path=yes, use=inject|token_only|sign,
                        signer=<json> (with use=sign: sigv4, hmac, jwt or
                        wallet; the key is never sent, sealed signs with it),
-                       reveal=yes|no, expires=<YYYY-MM-DD|unix>, desc=…
+                       token=<json>, writeback=yes|no, reveal=yes|no,
+                       expires=<YYYY-MM-DD|unix>, desc=…
+                       preset=oauth2-refresh|oauth2-client token_url=…
+                       client_id=… api_host=… [client_secret=<entry>]
+                       [scope=…]: sealed trades the value for access tokens
                      cred <agent> rm <name>             remove one
                      cred <agent> login <name> <mcp-url>
                                                         log the agent in to an MCP
@@ -140,7 +144,10 @@ COMMANDS
                      cred <agent> log [n]               what the agent did
                      cred pending                       counts, all your agents
                      cred notify [<email>|off]          email when one waits
-                   Owner-signed; needs AGENTIC_PRIVATE_KEY. A write is a
+                     cred presets                       presets, where to
+                                                        create each key
+                   Owner-signed (all but cred presets); needs
+                   AGENTIC_PRIVATE_KEY. A write is a
                    compare-and-swap like settings (CREDENTIALS_CONFLICT, exit 3).
   providers        Read the platform provider registry (--json for export).
   update           Self-update: compare against the npm registry and

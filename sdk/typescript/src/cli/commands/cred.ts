@@ -1,7 +1,7 @@
 /**
  * @file cred.ts
  * @description `0g-agentdna cred <agent> [ls|set|rm|login|reveal|pending|approve|deny|log]`
- * and `0g-agentdna cred pending|notify` — the owner's credentials for an agent's
+ * and `0g-agentdna cred pending|notify|presets` — the owner's credentials for an agent's
  * sealed credential proxy (cli/credentials.ts holds the grammar and the
  * operation the REPL shares).
  *
@@ -20,6 +20,10 @@ export async function run(ctx: CommandContext): Promise<void> {
   const [first, ...rest] = ctx.positionals;
   if (!first) throw new CliError('BAD_AGENT_REF', 'missing <agent> argument', { remedy: CRED_USAGE });
 
+  if (first === 'presets') {
+    await credOwnerOp(undefined, ctx.positionals, { json: ctx.json, out: print, secret: readSecret });
+    return;
+  }
   if (first === 'pending' || first === 'notify') {
     const ag = await buildClient(ctx.env, { withWallet: true });
     await credOwnerOp(ag, ctx.positionals, { json: ctx.json, out: print, secret: readSecret });

@@ -23,20 +23,35 @@ import {
   type CredentialInput,
   type CredentialPosition,
   type PendingCredentialRequest,
+  type TokenRequestTemplate,
 } from '../Credentials';
 import { CliError } from './errors';
 import { emitOk } from './envelope';
 
 /** The keys `cred <agent> set <name>` takes. */
-export const CRED_KEYS = ['preset', 'host', 'header', 'basic', 'query', 'body', 'path', 'use', 'signer', 'reveal', 'expires', 'desc'] as const;
+export const CRED_KEYS = [
+  'preset', 'host', 'header', 'basic', 'query', 'body', 'path', 'use', 'signer', 'token', 'writeback', 'reveal', 'expires', 'desc',
+  'token_url', 'client_id', 'client_secret', 'scope', 'api_host',
+] as const;
 
 const SET_USAGE =
-  "cred <agent> set <name> [preset=github|openai|anthropic] [host=a.example,b.example] [header='Authorization: Bearer {v}'] [basic=<user>] [query=<param>] [body=<field>] [path=yes] [use=inject|token_only|sign] [signer=<json>] [reveal=yes|no] [expires=<YYYY-MM-DD|unix>] [desc=…]";
+  "cred <agent> set <name> [preset=<name>] [host=a.example,b.example] [header='Authorization: Bearer {v}'] [basic=<user>] [query=<param>] [body=<field>] [path=yes] [use=inject|token_only|sign] [signer=<json>] [token=<json>] [writeback=yes|no] [reveal=yes|no] [expires=<YYYY-MM-DD|unix>] [desc=…]";
+
+/** The token-request presets: OAuth 2.0 refresh (RFC 6749 §6) and client credentials (§4.4). */
+const OAUTH2_PRESETS = ['oauth2-refresh', 'oauth2-client'] as const;
+type OAuth2Preset = (typeof OAUTH2_PRESETS)[number];
+
+const OAUTH2_USAGE =
+  'cred <agent> set <name> preset=oauth2-refresh|oauth2-client token_url=https://… client_id=… api_host=api.example [client_secret=<entry>] [scope=…]';
 
 export const CRED_USAGE = `usage:
   cred <agent>                         list the agent's credentials (never values)
   ${SET_USAGE}
                                        add or change one; the value is read from stdin or a prompt that does not echo
+  ${OAUTH2_USAGE}
+                                       a refresh token (oauth2-refresh) or a client secret (oauth2-client) that sealed
+                                       trades for access tokens; the agent uses [[credential:derived:<name>]] on api_host
+  cred presets                         the presets, and where to create each key
   cred <agent> rm <name>               remove one (revoke it at its provider as well)
   cred <agent> login <name> <mcp-url> [client_id=… client_secret_entry=… scope=a,b]
                                        log the agent in to an MCP server (you open a link); sealed keeps the tokens
@@ -48,27 +63,126 @@ export const CRED_USAGE = `usage:
   cred pending                         pending counts across every agent you own
   cred notify [<email>|off]            where you are emailed when an agent waits for you`;
 
+/** One preset: where a provider takes its key, and how to make a narrow one. */
+export interface CredPreset {
+  hosts: string[];
+  positions: CredentialPosition[];
+  description: string;
+  /** Where the owner creates the key. */
+  create: string;
+  /** The provider's advice for the narrowest key, and headers the agent adds itself. */
+  tip: string;
+}
+
+const BEARER: CredentialPosition = { kind: 'header', name: 'Authorization', template: 'Bearer {v}' };
+
 /**
- * Where common providers take their key. Each is the provider's documented
- * header for its HTTP API.
+ * Where common providers take their key: each provider's documented hosts
+ * and headers (checked 2026-11), and for git hosts the Basic username that
+ * goes with a token as the password.
  */
-export const CRED_PRESETS: Record<string, { hosts: string[]; positions: CredentialPosition[]; description: string }> = {
+export const CRED_PRESETS: Record<string, CredPreset> = {
   github: {
-    hosts: ['api.github.com'],
-    positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }],
-    description: 'GitHub REST API token',
+    hosts: ['api.github.com', 'uploads.github.com', 'github.com'],
+    // GitHub does not use the Basic username to authenticate a token, but it must not be empty.
+    positions: [BEARER, { kind: 'basic', username: 'x-access-token' }],
+    description: 'GitHub token (REST API and git over HTTPS)',
+    create: 'https://github.com/settings/personal-access-tokens/new',
+    tip: 'a fine-grained token, limited to the repositories and permissions the agent needs; git uses it with no setup',
+  },
+  gitlab: {
+    hosts: ['gitlab.com'],
+    positions: [{ kind: 'header', name: 'PRIVATE-TOKEN', template: '{v}' }, BEARER, { kind: 'basic', username: 'oauth2' }],
+    description: 'GitLab token (REST API and git over HTTPS)',
+    create: 'https://gitlab.com/-/user_settings/personal_access_tokens',
+    tip: 'a fine-grained token, or the narrowest scopes (read_api, read_repository, write_repository); for one project, a project access token',
+  },
+  huggingface: {
+    hosts: ['huggingface.co', 'router.huggingface.co'],
+    positions: [BEARER],
+    description: 'Hugging Face token',
+    create: 'https://huggingface.co/settings/tokens',
+    tip: 'a fine-grained token; the read role if the agent only reads',
+  },
+  slack: {
+    hosts: ['slack.com'],
+    positions: [BEARER],
+    description: 'Slack bot token',
+    create: 'https://api.slack.com/apps',
+    tip: 'an app with only the bot scopes it needs, installed to the workspace; the bot token (xoxb-) is under OAuth & Permissions',
+  },
+  stripe: {
+    hosts: ['api.stripe.com'],
+    positions: [BEARER],
+    description: 'Stripe API key',
+    create: 'https://dashboard.stripe.com/apikeys',
+    tip: 'a restricted key (rk_) allowing only the resources it needs',
+  },
+  gemini: {
+    hosts: ['generativelanguage.googleapis.com'],
+    positions: [{ kind: 'header', name: 'x-goog-api-key', template: '{v}' }, BEARER],
+    description: 'Google Gemini API key',
+    create: 'https://aistudio.google.com/apikey',
+    tip: 'AI Studio keys are restricted to the Gemini API by default',
   },
   openai: {
     hosts: ['api.openai.com'],
-    positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }],
+    positions: [BEARER],
     description: 'OpenAI API key',
+    create: 'https://platform.openai.com/settings/organization/api-keys',
+    tip: 'a key for a project of its own, with only the permissions it needs',
   },
   anthropic: {
     hosts: ['api.anthropic.com'],
-    positions: [{ kind: 'header', name: 'x-api-key', template: '{v}' }],
+    positions: [BEARER, { kind: 'header', name: 'x-api-key', template: '{v}' }],
     description: 'Anthropic API key',
+    create: 'https://platform.claude.com/settings/keys',
+    tip: 'a key scoped to one workspace, with an expiry; requests also need anthropic-version, which the agent adds',
+  },
+  openrouter: {
+    hosts: ['openrouter.ai'],
+    positions: [BEARER],
+    description: 'OpenRouter API key',
+    create: 'https://openrouter.ai/settings/keys',
+    tip: 'set a credit limit on the key',
+  },
+  deepseek: {
+    hosts: ['api.deepseek.com'],
+    positions: [BEARER, { kind: 'header', name: 'x-api-key', template: '{v}' }],
+    description: 'DeepSeek API key',
+    create: 'https://platform.deepseek.com/api_keys',
+    tip: 'a key for the agent alone, so you can revoke it on its own',
+  },
+  npm: {
+    hosts: ['registry.npmjs.org'],
+    positions: [BEARER],
+    description: 'npm registry token',
+    create: 'npmjs.com → your avatar → Access Tokens',
+    tip: 'a granular token: read-only unless it publishes, limited to its packages, with an expiry',
+  },
+  notion: {
+    hosts: ['api.notion.com'],
+    positions: [BEARER],
+    description: 'Notion integration token',
+    create: 'https://app.notion.com/developers/connections',
+    tip: 'share only the pages it needs (child pages inherit access); requests also need Notion-Version, which the agent adds',
   },
 };
+
+/** `cred presets`: every preset, where to create its key, and the OAuth 2.0 ones. */
+export function renderPresets(): string[] {
+  const lines: string[] = [];
+  for (const [name, p] of Object.entries(CRED_PRESETS)) {
+    lines.push(`${name.padEnd(12)} ${p.description}`);
+    lines.push(`${''.padEnd(12)} ${p.hosts.join(', ')} — ${p.positions.map(positionText).join(' · ')}`);
+    lines.push(`${''.padEnd(12)} create: ${p.create}`);
+    lines.push(`${''.padEnd(12)} ${p.tip}`);
+  }
+  lines.push(`oauth2-refresh  a refresh token sealed trades for access tokens (it rotates and is written back)`);
+  lines.push(`oauth2-client   a client secret sealed trades for access tokens (client credentials)`);
+  lines.push(`                ${OAUTH2_USAGE}`);
+  return lines;
+}
 
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
 const FORBIDDEN_HEADERS = new Set(['host', 'content-length', 'transfer-encoding', 'cookie']);
@@ -105,6 +219,12 @@ export interface CredPatch {
   description?: string | null;
   /** A preset's description, used when the entry has none. */
   presetDescription?: string;
+  /** The preset named, for its creation hint. */
+  preset?: string;
+  tokenRequest?: TokenRequestTemplate;
+  writeback?: boolean;
+  /** An OAuth 2.0 preset and its parameters, turned into a token request by {@link applyCredPatch}. */
+  oauth2?: { preset?: OAuth2Preset; tokenUrl?: string; clientId?: string; clientSecretEntry?: string; scope?: string; apiHosts?: string[] };
 }
 
 /** Parse the assignments of `set <name> k=v …`. Usage errors only; no I/O. */
@@ -119,11 +239,16 @@ export function parseCredArgs(args: string[]): CredPatch {
     const raw = eq > 0 ? arg.slice(eq + 1) : '';
     switch (key) {
       case 'preset': {
+        if ((OAUTH2_PRESETS as readonly string[]).includes(raw)) {
+          out.oauth2 = { ...out.oauth2, preset: raw as OAuth2Preset };
+          break;
+        }
         const p = CRED_PRESETS[raw];
-        if (!p) throw usage(`unknown preset "${raw}" (known: ${Object.keys(CRED_PRESETS).join(', ')})`);
+        if (!p) throw usage(`unknown preset "${raw}" (known: ${[...Object.keys(CRED_PRESETS), ...OAUTH2_PRESETS].join(', ')})`);
         add('hosts', p.hosts);
         add('positions', p.positions);
         out.presetDescription ??= p.description;
+        out.preset ??= raw;
         break;
       }
       case 'host':
@@ -176,6 +301,38 @@ export function parseCredArgs(args: string[]): CredPatch {
         out.signer = v as CredentialSigner;
         break;
       }
+      case 'token': {
+        let v: unknown;
+        try {
+          v = JSON.parse(raw);
+        } catch {
+          throw usage(`token= takes the token request as JSON: {"url","encoding","fields","take",…}`);
+        }
+        out.tokenRequest = checkTokenRequest(v);
+        break;
+      }
+      case 'writeback':
+        out.writeback = yesNo('writeback', raw);
+        break;
+      case 'token_url':
+      case 'client_id':
+      case 'client_secret':
+      case 'scope':
+      case 'api_host': {
+        if (!raw) throw usage(`${key}= takes a value`);
+        const o = (out.oauth2 ??= {});
+        if (key === 'token_url') o.tokenUrl = raw;
+        else if (key === 'client_id') o.clientId = raw;
+        else if (key === 'client_secret') o.clientSecretEntry = checkCredName(raw);
+        else if (key === 'scope') o.scope = raw;
+        else {
+          for (const h of raw.split(',').map((x) => x.trim().toLowerCase()).filter(Boolean)) {
+            if (!/^[a-z0-9.-]+(:\d+)?$/.test(h)) throw usage(`not a host: "${h}"`);
+            o.apiHosts = [...(o.apiHosts ?? []), h];
+          }
+        }
+        break;
+      }
       case 'reveal':
         out.allowReveal = yesNo('reveal', raw);
         break;
@@ -190,6 +347,61 @@ export function parseCredArgs(args: string[]): CredPatch {
     }
   }
   return out;
+}
+
+/** The shape sealed requires of a token request (sealed/internal/credentials), checked before anything is signed. */
+function checkTokenRequest(v: unknown): TokenRequestTemplate {
+  const t = v as Partial<TokenRequestTemplate> | null;
+  let url: URL | undefined;
+  try {
+    url = typeof t?.url === 'string' ? new URL(t.url) : undefined;
+  } catch {
+    url = undefined;
+  }
+  if (!t || !url || url.protocol !== 'https:') throw usage('token= needs "url", an https token endpoint');
+  if (t.encoding !== undefined && t.encoding !== 'form' && t.encoding !== 'json') throw usage('token= "encoding" is form or json');
+  if (!t.fields || typeof t.fields !== 'object' || Object.values(t.fields).some((x) => typeof x !== 'string')) {
+    throw usage('token= needs "fields": an object of field → template ({v} is this value, {cred:<name>} another entry)');
+  }
+  if (!Array.isArray(t.take) || !t.take.length || t.take.some((x) => !x || typeof x.field !== 'string' || !Array.isArray(x.hosts) || !Array.isArray(x.positions))) {
+    throw usage('token= needs "take": [{ "field", "name"?, "hosts", "positions", "expires_in_field"? }, …]');
+  }
+  return t as TokenRequestTemplate;
+}
+
+/** The token request an OAuth 2.0 preset stands for. */
+function oauth2Template(name: string, o: NonNullable<CredPatch['oauth2']>): { use: 'token_only'; writeback: boolean; tokenRequest: TokenRequestTemplate } {
+  if (!o.preset) throw usage(`token_url=, client_id=, client_secret=, scope= and api_host= go with preset=oauth2-refresh or preset=oauth2-client`);
+  let url: URL | undefined;
+  try {
+    url = o.tokenUrl ? new URL(o.tokenUrl) : undefined;
+  } catch {
+    url = undefined;
+  }
+  if (!url || url.protocol !== 'https:') throw new CliError('BAD_FLAG', `${o.preset} needs token_url=, the provider's https token endpoint`, { remedy: OAUTH2_USAGE });
+  if (!o.clientId) throw new CliError('BAD_FLAG', `${o.preset} needs client_id=`, { remedy: OAUTH2_USAGE });
+  if (!o.apiHosts?.length) throw new CliError('BAD_FLAG', `${o.preset} needs api_host=, where the agent uses the access token`, { remedy: OAUTH2_USAGE });
+  const refresh = o.preset === 'oauth2-refresh';
+  if (!refresh && o.clientSecretEntry) throw new CliError('BAD_FLAG', 'with oauth2-client the value you enter is the client secret; drop client_secret=', { remedy: OAUTH2_USAGE });
+  const fields: Record<string, string> = refresh
+    ? { grant_type: 'refresh_token', refresh_token: '{v}', client_id: o.clientId }
+    : { grant_type: 'client_credentials', client_id: o.clientId, client_secret: '{v}' };
+  if (o.clientSecretEntry) fields.client_secret = `{cred:${o.clientSecretEntry}}`;
+  if (o.scope) fields.scope = o.scope;
+  return {
+    use: 'token_only',
+    // A provider that rotates refresh tokens retires the old one at once:
+    // the new one must outlive a restart.
+    writeback: refresh,
+    tokenRequest: {
+      url: o.tokenUrl!,
+      encoding: 'form',
+      fields,
+      params: ['scope'],
+      take: [{ field: 'access_token', name, hosts: o.apiHosts, positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }], expires_in_field: 'expires_in' }],
+      ...(refresh ? { rotate_field: 'refresh_token' } : {}),
+    },
+  };
 }
 
 /** Check a name against the placeholder grammar sealed enforces. */
@@ -211,6 +423,15 @@ export function applyCredPatch(name: string, patch: CredPatch, base?: Credential
   if (patch.positions) out.positions = patch.positions;
   if (patch.use) out.use = patch.use;
   if (patch.signer) out.signer = patch.signer;
+  if (patch.oauth2) {
+    if (patch.tokenRequest) throw usage('give either token= or an oauth2 preset, not both');
+    const t = oauth2Template(name, patch.oauth2);
+    out.use = t.use;
+    out.writeback = t.writeback;
+    out.tokenRequest = t.tokenRequest;
+  }
+  if (patch.tokenRequest) out.tokenRequest = patch.tokenRequest;
+  if (patch.writeback !== undefined) out.writeback = patch.writeback;
   if (patch.allowReveal !== undefined) out.allowReveal = patch.allowReveal;
   if (patch.expiresAt === null) delete out.expiresAt;
   else if (patch.expiresAt !== undefined) out.expiresAt = patch.expiresAt;
@@ -256,12 +477,22 @@ export function renderCredentials(defs: CredentialDefinition[], version: number)
       d.signer ? `signs ${d.signer.method}${d.signer.method === 'sigv4' ? ` (${d.signer.access_key_id}, ${d.signer.region}/${d.signer.service})` : ''}` : '',
       d.allow_reveal ? 'reveal allowed' : '',
       d.writeback ? 'writeback' : '',
-      d.token_request ? `token request → ${d.token_request.url}` : '',
+      d.token_request ? `token request → ${d.token_request.url}${d.token_request.rotate_field ? ' (rotates)' : ''}` : '',
       d.expires_at ? `expires ${dateText(d.expires_at)}` : '',
     ].filter(Boolean);
     if (flags.length) lines.push(`  ${flags.join(' · ')}`);
+    for (const t of d.token_request?.take ?? []) {
+      const derived = derivedName(d.name, t);
+      lines.push(`  gives      [[credential:${derived}]] on ${t.hosts.join(', ') || '—'} (${t.positions.map(positionText).join(' · ') || '—'})`);
+    }
   }
   return lines;
+}
+
+/** The name sealed gives a value a token request keeps (sealed/internal/credentials/token.go). */
+function derivedName(entry: string, t: TokenRequestTemplate['take'][number]): string {
+  const n = t.name || `${entry}.${t.field}`;
+  return n.startsWith('derived:') ? n : `derived:${n}`;
 }
 
 /** Pending requests, the agent's own words kept apart from what sealed knows. */
@@ -333,6 +564,10 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
   const cred = ag.credentials;
   const at = agentUrl ? { agentUrl } : undefined;
   switch (sub) {
+    case 'presets':
+      if (io.json) return emitOk({ presets: CRED_PRESETS });
+      for (const l of renderPresets()) io.out(l);
+      return;
     case 'ls':
     case 'list': {
       const cur = await cred.get(sealId);
@@ -347,13 +582,18 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       const cur = await cred.get(sealId);
       const stored = cur.definitions.find((d) => d.name === name);
       const entry = applyCredPatch(name, patch, stored ? inputOf(stored) : undefined);
+      const preset = patch.preset ? CRED_PRESETS[patch.preset] : undefined;
+      if (preset && !stored && !io.json) io.out(`create it at ${preset.create} — ${preset.tip}`);
       const typed = await io.secret(stored ? `${name} value (Enter keeps the stored one): ` : `${name} value: `);
       if (typed) entry.value = typed;
       else if (!stored) throw new CliError('BAD_FLAG', `${name} needs a value (pipe it in, or type it at the prompt)`, { remedy: SET_USAGE });
       const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
       const out = await cred.put(sealId, [...others, entry], { baseVersion: cur.version, ...at }).catch(conflict);
       if (io.json) return emitOk({ sealId, version: out.version, name, pushWarning: out.pushWarning ?? null });
-      io.out(`${stored ? 'changed' : 'added'} ${name} — version ${out.version}; the agent writes [[credential:${name}]] where the key goes`);
+      const gives = (entry.tokenRequest?.take ?? []).map((t) => `[[credential:${derivedName(name, t)}]]`);
+      io.out(gives.length && entry.use === 'token_only'
+        ? `${stored ? 'changed' : 'added'} ${name} — version ${out.version}; the agent asks for a token request on ${name} and then uses ${gives.join(', ')}`
+        : `${stored ? 'changed' : 'added'} ${name} — version ${out.version}; the agent writes [[credential:${name}]] where the key goes`);
       io.out(out.pushWarning ? `stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot` : 'applied to the running agent');
       return;
     }
@@ -476,10 +716,17 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
 
 /**
  * The `cred` subcommands that take no agent: `pending` (counts across every
- * agent the wallet owns) and `notify`. Returns false for anything else.
+ * agent the wallet owns), `notify`, and `presets` (no wallet needed: `ag`
+ * may be undefined for it). Returns false for anything else.
  */
-export async function credOwnerOp(ag: AgenticID, args: string[], io: CredIO): Promise<boolean> {
+export async function credOwnerOp(ag: AgenticID | undefined, args: string[], io: CredIO): Promise<boolean> {
   const [sub, arg] = args;
+  if (sub === 'presets') {
+    if (io.json) emitOk({ presets: CRED_PRESETS });
+    else for (const l of renderPresets()) io.out(l);
+    return true;
+  }
+  if (!ag) return false;
   if (sub === 'pending') {
     // The attestor keeps each agent's count from its status reports.
     const rows = (await ag.credentials.pendingCounts()).filter((r) => r.pending > 0);

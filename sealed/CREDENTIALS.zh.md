@@ -31,7 +31,7 @@ owner 把第三方凭据（API key、token、refresh token、签名密钥、MCP 
 | `writeback` | 允许 sealed 把自己获得的值（轮换、登录）存下来供下次启动使用 |
 | `expires_at`、`description` | Unix 秒；给 agent 看的自由文本 |
 
-一个条目是一个值，可以用在多个地方：条目的填写位置对它的每个域名都生效。例如一个 GitHub token，条目同时写上两个域名和两种位置，就既能用于 API（`api.github.com`，`Authorization: Bearer`），也能用于 git（`github.com`，Basic）。预设（CLI 里的 `preset=github|openai|anthropic`）是快捷方式，由客户端展开成域名、位置和说明；sealed 看不到预设。
+一个条目是一个值，可以用在多个地方：条目的填写位置对它的每个域名都生效。例如一个 GitHub token，条目同时写上两个域名和两种位置，就既能用于 API（`api.github.com`，`Authorization: Bearer`），也能用于 git（`github.com`，Basic）。预设（CLI 里的 `preset=<名字>`；`cred presets` 列出全部预设及各自的密钥创建地址）是快捷方式，由客户端展开成域名、位置和说明；sealed 看不到预设。
 
 **值**在客户端用 ECIES 加密给 agent 的 agentSeal 公钥。明文绑定了归属：`{"v":1,"type":"credential","owner","seal_id","chain_id","name","value"}`；绑定到其他 owner、agent、链或名字的值，sealed 一律拒绝。
 
@@ -72,7 +72,7 @@ Entry(string name,bytes32 defHash)
 - 拒绝连接私网、回环、链路本地、组播、未指定和元数据地址；不跟随重定向；
 - 只在允许的域名和位置代填占位符，否则拒绝整个请求；从不往 `Host`、`Content-Length`、`Transfer-Encoding`、`Cookie`、`Proxy-*` 里填写；
 - 只在有条目可以填写请求体字段或需要签名的域名上读取请求体，而且只读 64 KiB 以内（更大的请求体里有占位符时拒绝）；其他域名的请求体原样转发，其中的占位符文字也原样发出，因为那里没有可以填写的地方；
-- 要求上游不压缩，从响应头和流式响应体中去掉它持有的每个值（原文、百分号编码、JSON 转义、三种对齐的 base64；短于 6 字节的值不做遮盖）；WebSocket 帧原位遮盖。
+- 要求上游不压缩，从响应头和流式响应体中去掉它持有的每个值（原文、百分号编码、JSON 转义、三种对齐的 base64；短于 6 字节的值不做遮盖），并尽力把它不持有、但格式常见的 token（GitHub、GitLab、Slack、Stripe、`sk-` 开头的密钥、Hugging Face、Google API key、npm、Notion）替换成 `[[redacted]]`；WebSocket 帧原位遮盖，长度不变。sealed 自己往外发的内容（注册的服务、上链数据，见下文）只去掉它持有的值。
 
 代理填写过值的请求，其响应带 `X-Seal-Credential-Filled: <条目名>`：回显请求的服务会把占位符显示回来（值在返回途中被遮住），agent 靠这个响应头区分"填了"和"没填"。没有条目的域名走通道，那里什么都不填，也不报错，响应里不会有这个头。
 
@@ -112,6 +112,8 @@ Entry(string name,bytes32 defHash)
 | `rotate_field` | 如 `refresh_token`：响应中的新值替换条目的值 |
 
 同一条目的换 token 一次只执行一个。失败时返回 `token_request_failed`，只带 OAuth 错误码。
+
+**在 CLI 里设置。** `preset=oauth2-refresh`（值是 refresh token，会轮换并写回）和 `preset=oauth2-client`（值是 client secret）用 `token_url=`、`client_id=`、`api_host=` 生成标准的 OAuth 2.0 模板，可选 `scope=`（agent 也可以传）；refresh token 所属的 client 有 secret 时，再加 `client_secret=<条目>`。agent 对该条目执行 `POST /credentials/token`，然后在 `api_host` 上用 `[[credential:derived:<条目>]]` 作为 Bearer token。其他模板用 `token=<json>` 设置。
 
 **写回。** sealed 自己获得的值（轮换得到的 refresh token、登录结果）加密给 agentSeal 后提交给 attestor，并由 agentSeal 对下面的消息签名：
 
@@ -175,7 +177,7 @@ SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-
 
 - **响应与上链数据。** 经 `:8080` 转发的 HTTP 响应（已注册的服务、框架路由、事件流、合成的 `/v1/responses`）在计算 serve-proof 之前去掉 sealed 持有的每个值；那里的 WebSocket 升级原样转发。sealed 上链的内容同样去掉这些值（leaf 角色、manifest 中的文件、目录归档里的文件），漂移判断也基于去掉值之后的内容。从 sealed 删除的值不再被识别，也就不再被去掉。
 - **不经过代理的工具。** 不认 `HTTPS_PROXY` 或钉死证书的工具会带着占位符直连目标并失败；可以改用显式形式，或使用交出的值。
-- **普通 API 返回的 token。** 普通 API 调用（不是换 token）返回的 token 原样到达 agent。
+- **普通 API 返回的 token。** 普通 API 调用（不是换 token）返回的 token 原样到达 agent；如果它属于代理遮盖的常见格式，agent 拿到的是 `[[redacted]]`，无法使用，要拿这类 token 需用换 token。
 - **不限制用途。** 在密钥本身的权限范围内，agent 可以做任何事，包括派生新密钥、用签名条目签任意内容。
 - **reset 之后的回滚。** sealed 在 stop/start 后拒绝更低的凭据集版本，但 reset 或新建 sandbox 之后，依赖 attestor 提供最新的凭据集。删除密钥时，也要在服务商那边吊销。
 - **其他通道。** 非 HTTP 协议和浏览器登录态需要交出值；响应遮盖是尽力而为。

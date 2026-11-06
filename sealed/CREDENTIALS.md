@@ -31,7 +31,7 @@ An entry's **definition** is JSON, serialized once by the client and hashed as i
 | `writeback` | sealed may store a value it obtained (rotation, login) for the next boot |
 | `expires_at`, `description` | Unix seconds; free text shown to the agent |
 
-One entry is one value used in several places: its positions hold on each of its hosts. A GitHub token, for one, serves both the API (`api.github.com`, `Authorization: Bearer`) and git (`github.com`, Basic) when the entry lists both hosts and both positions. A preset (`preset=github|openai|anthropic` in the CLI) is a shortcut the client expands into hosts, positions and a description; sealed never sees it.
+One entry is one value used in several places: its positions hold on each of its hosts. A GitHub token, for one, serves both the API (`api.github.com`, `Authorization: Bearer`) and git (`github.com`, Basic) when the entry lists both hosts and both positions. A preset (`preset=<name>` in the CLI; `cred presets` lists them with where to create each key) is a shortcut the client expands into hosts, positions and a description; sealed never sees it.
 
 The **value** is ECIES-encrypted to the agent's agentSeal key in the client. Its plaintext binds it: `{"v":1,"type":"credential","owner","seal_id","chain_id","name","value"}`; sealed refuses one bound to another owner, agent, chain or name.
 
@@ -72,7 +72,7 @@ The CA is generated at each boot; its key stays in sealed's memory. The system t
 - refuses to dial private, loopback, link-local, multicast, unspecified and metadata addresses; never follows a redirect;
 - fills each placeholder only for an allowed host and position, and refuses the whole request otherwise; never fills `Host`, `Content-Length`, `Transfer-Encoding`, `Cookie` or `Proxy-*`;
 - reads a body only on a host where some entry may fill a body field or signs requests, and there only up to 64 KiB (a placeholder in a larger body is refused); anywhere else a body is relayed as it is, placeholder text and all, since nothing could be filled in it;
-- asks upstream for an unencoded body, and redacts every value it holds from response headers and the streamed body (raw, percent-encoded, JSON-escaped, base64 at each alignment; values under 6 bytes are not redacted); WebSocket frames are masked in place.
+- asks upstream for an unencoded body, and redacts every value it holds from response headers and the streamed body (raw, percent-encoded, JSON-escaped, base64 at each alignment; values under 6 bytes are not redacted), and masks, best effort, tokens of well-known formats it does not hold (GitHub, GitLab, Slack, Stripe, `sk-` keys, Hugging Face, Google API keys, npm, Notion) as `[[redacted]]`; WebSocket frames are masked in place, length kept. What sealed itself sends on (registered services, committed data, below) is scrubbed of the values it holds only.
 
 A response to a request in which the proxy filled a value carries `X-Seal-Credential-Filled: <entry names>`: a service that echoes the request shows the placeholder again, since the value is hidden on the way back, and this header is how the agent tells a filled request from one that was not. A host no entry names is tunnelled, so nothing is filled there and there is no error either; its responses never carry the header.
 
@@ -112,6 +112,8 @@ A `token_request` is a template sealed follows; the agent never sees the request
 | `rotate_field` | e.g. `refresh_token`: a new value in the response replaces the entry's value |
 
 Token requests for one entry run one at a time. A failure answers `token_request_failed` with the OAuth error code only.
+
+**From the CLI.** `preset=oauth2-refresh` (the value is a refresh token; it rotates and is written back) and `preset=oauth2-client` (the value is a client secret) build the standard OAuth 2.0 template from `token_url=`, `client_id=` and `api_host=`, with optional `scope=` (which the agent may also pass) and, for a refresh token whose client has a secret, `client_secret=<entry>`. The agent runs `POST /credentials/token` on the entry and uses `[[credential:derived:<entry>]]` as a Bearer token on `api_host`. Any other template goes in `token=<json>`.
 
 **Writebacks.** A value sealed obtains (a rotated refresh token, a login) is sealed to agentSeal and posted to the attestor, signed by agentSeal over
 
@@ -175,7 +177,7 @@ The SDK is `ag.credentials` (`sdk/typescript/src/Credentials.ts`); the CLI is `0
 
 - **Responses and committed data.** HTTP responses relayed through `:8080` (registered services, framework routes, event streams, the synthesized `/v1/responses`) are scrubbed of every value sealed holds, before a serve-proof is computed; WebSocket upgrades there are relayed as they are. What sealed commits on chain is scrubbed the same way (leaf roles, manifest files, files inside directory archives); drift is judged on the scrubbed content. A value removed from sealed is no longer known and is no longer scrubbed.
 - **Tools that ignore the proxy.** A tool that ignores `HTTPS_PROXY` or pins its certificates reaches its host directly with the placeholder and fails; it can use the explicit form, or a revealed value.
-- **Tokens from ordinary API calls.** A token an ordinary API call returns (not a token request) reaches the agent as returned.
+- **Tokens from ordinary API calls.** A token an ordinary API call returns (not a token request) reaches the agent as returned, unless it has one of the well-known formats the proxy masks: then the agent gets `[[redacted]]` and cannot use it, and the way to obtain it is a token request.
 - **Use is not limited.** Within a key's own permissions the agent may do anything with it, including deriving new keys or signing arbitrary content with a signing entry.
 - **Rollback after a reset.** sealed refuses a lower set version across stop/start, but after a reset or a new sandbox it trusts the attestor to serve the latest set. Revoke a removed key at its provider too.
 - **Other channels.** Non-HTTP protocols and browser sessions need a revealed value; response redaction is best effort.

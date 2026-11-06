@@ -212,13 +212,38 @@ test('notify address: owner-signed read, and a write bound to its body', async (
 
 // ── CLI: the `cred <agent> set` grammar and the shared operation ────────────
 
-import { parseCredArgs, applyCredPatch, checkCredName, credOp } from '../dist/cli/credentials.js';
+import { parseCredArgs, applyCredPatch, checkCredName, credOp, credOwnerOp, CRED_PRESETS } from '../dist/cli/credentials.js';
 
 test('cli: a preset fills hosts, positions and a description', () => {
   const e = applyCredPatch('github', parseCredArgs(['preset=github']));
-  assert.deepEqual(e.hosts, ['api.github.com']);
-  assert.deepEqual(e.positions, [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }]);
-  assert.equal(e.description, 'GitHub REST API token');
+  // One GitHub token serves the API and git over HTTPS.
+  assert.deepEqual(e.hosts, ['api.github.com', 'uploads.github.com', 'github.com']);
+  assert.deepEqual(e.positions, [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }, { kind: 'basic', username: 'x-access-token' }]);
+  assert.equal(e.description, 'GitHub token (REST API and git over HTTPS)');
+  // Every preset names its hosts, a position, and where to create the key.
+  for (const [name, p] of Object.entries(CRED_PRESETS)) {
+    assert.ok(p.hosts.length && p.positions.length && p.create && p.tip && p.description, name);
+    assert.doesNotThrow(() => applyCredPatch('x', parseCredArgs([`preset=${name}`])), name);
+  }
+});
+
+test('cli: set with a preset says where to create the key; cred presets lists them without a wallet', async () => {
+  const puts = [];
+  const ag = {
+    credentials: {
+      get: async () => ({ version: 0, ownerEpoch: 0, document: null, definitions: [] }),
+      put: async (_s, entries) => { puts.push(entries); return { version: 1 }; },
+    },
+  };
+  const lines = [];
+  await credOp(ag, SEAL_ID, ['set', 'stripe', 'preset=stripe'], { json: false, out: (l) => lines.push(l), secret: async () => 'value' });
+  assert.ok(lines[0].startsWith('create it at https://dashboard.stripe.com/apikeys'), lines[0]);
+  assert.equal(puts[0][0].value, 'value');
+  const listed = [];
+  assert.equal(await credOwnerOp(undefined, ['presets'], { json: false, out: (l) => listed.push(l), secret: async () => '' }), true);
+  for (const name of [...Object.keys(CRED_PRESETS), 'oauth2-refresh', 'oauth2-client']) {
+    assert.ok(listed.some((l) => l.startsWith(name + ' ')), name);
+  }
 });
 
 test('cli: assignments change a stored entry and keep the rest', () => {
@@ -249,6 +274,38 @@ test('cli: signing entries', () => {
   assert.throws(() => parseCredArgs(['signer=not json']), (e) => e.code === 'BAD_FLAG');
   // A signer on an entry that does not sign is dropped, not sent.
   assert.equal(applyCredPatch('p', parseCredArgs(['preset=openai', 'signer={"method":"wallet"}'])).signer, undefined);
+});
+
+test('cli: token requests from the OAuth 2.0 presets and from token=', () => {
+  const rt = applyCredPatch('crm', parseCredArgs(['preset=oauth2-refresh', 'token_url=https://auth.crm.example/oauth/token',
+    'client_id=agent-app', 'client_secret=crm-secret', 'api_host=api.crm.example', 'scope=read']));
+  assert.deepEqual([rt.use, rt.writeback, rt.hosts, rt.positions], ['token_only', true, [], []]);
+  assert.deepEqual(rt.tokenRequest, {
+    url: 'https://auth.crm.example/oauth/token', encoding: 'form',
+    fields: { grant_type: 'refresh_token', refresh_token: '{v}', client_id: 'agent-app', client_secret: '{cred:crm-secret}', scope: 'read' },
+    params: ['scope'],
+    take: [{ field: 'access_token', name: 'crm', hosts: ['api.crm.example'], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }], expires_in_field: 'expires_in' }],
+    rotate_field: 'refresh_token',
+  });
+  // Client credentials: the value is the secret, nothing rotates, nothing is written back.
+  const cc = applyCredPatch('svc', parseCredArgs(['preset=oauth2-client', 'token_url=https://auth.svc.example/token', 'client_id=c1', 'api_host=api.svc.example']));
+  assert.deepEqual([cc.use, cc.writeback, cc.tokenRequest.rotate_field], ['token_only', false, undefined]);
+  assert.deepEqual(cc.tokenRequest.fields, { grant_type: 'client_credentials', client_id: 'c1', client_secret: '{v}' });
+  for (const bad of [
+    ['preset=oauth2-refresh', 'client_id=a', 'api_host=h.example'],                                  // no token_url
+    ['preset=oauth2-refresh', 'token_url=http://auth.example/t', 'client_id=a', 'api_host=h.example'], // not https
+    ['preset=oauth2-refresh', 'token_url=https://auth.example/t', 'api_host=h.example'],               // no client_id
+    ['preset=oauth2-refresh', 'token_url=https://auth.example/t', 'client_id=a'],                      // no api_host
+    ['token_url=https://auth.example/t', 'client_id=a', 'api_host=h.example'],                         // no preset
+    ['preset=oauth2-client', 'token_url=https://auth.example/t', 'client_id=a', 'api_host=h.example', 'client_secret=s'],
+  ]) assert.throws(() => applyCredPatch('x', parseCredArgs(bad)), (e) => e.code === 'BAD_FLAG', bad.join(' '));
+  // token= takes a whole template; writeback= stands on its own.
+  const raw = applyCredPatch('t', parseCredArgs(['use=token_only', 'writeback=yes',
+    'token={"url":"https://auth.example/t","fields":{"grant_type":"refresh_token","refresh_token":"{v}"},"take":[{"field":"access_token","hosts":["api.example"],"positions":[{"kind":"header","name":"Authorization","template":"Bearer {v}"}]}]}']));
+  assert.equal(raw.tokenRequest.url, 'https://auth.example/t');
+  assert.equal(raw.writeback, true);
+  assert.throws(() => parseCredArgs(['token={"url":"https://a.example/t","fields":{}}']), /take/);
+  assert.throws(() => parseCredArgs(['token={"url":"http://a.example/t","fields":{},"take":[]}']), /https/);
 });
 
 test('cli: usage errors are raised before any I/O', () => {
@@ -294,7 +351,8 @@ test('cli: set merges onto the stored set and takes the value from the prompt', 
   assert.equal(put.opts.agentUrl, 'http://agent.example');
   assert.deepEqual(put.entries.map((e) => [e.name, e.value]), [['openai', undefined], ['github', 'tok']]);
   assert.match(prompts[0], /^github value: $/);
-  assert.match(lines[0], /^added github — version 5/);
+  assert.match(lines[0], /^create it at https:\/\/github\.com\//);
+  assert.match(lines[1], /^added github — version 5/);
 });
 
 test('cli: set on a stored name keeps its value when the prompt is left empty', async () => {

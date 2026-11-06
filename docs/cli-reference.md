@@ -88,14 +88,15 @@ Reads/writes the agent's configuration document (which model it thinks with, and
 - a write is a **compare-and-swap** against the version just read: if another client changed the document meanwhile, it is refused (exit 3, `SETTINGS_CONFLICT`) — **never silently overwritten**
 - a merged document with no `model` is refused before signing (the one state the container hard-fails on); the model is checked against the selected provider's catalog first — an absence is a stderr warning only, never a refusal
 
-### `cred <agent> [sub …]` and `cred pending|notify`
+### `cred <agent> [sub …]` and `cred pending|notify|presets`
 
-The owner's credentials for the agent's sealed credential proxy (`sealed/CREDENTIALS.md`): the agent writes `[[credential:<name>]]` where a key goes, and sealed fills it in on the way out, only for the hosts and positions allowed, and hides it in responses. Every subcommand is owner-signed (`AGENTIC_PRIVATE_KEY`).
+The owner's credentials for the agent's sealed credential proxy (`sealed/CREDENTIALS.md`): the agent writes `[[credential:<name>]]` where a key goes, and sealed fills it in on the way out, only for the hosts and positions allowed, and hides it in responses. Every subcommand but `cred presets` is owner-signed (`AGENTIC_PRIVATE_KEY`).
 
 | Subcommand | |
 |---|---|
 | `cred <agent>` / `ls` | list the stored entries (never values) |
-| `cred <agent> set <name> [k=v …]` | add or change one. The value is read from stdin when piped, else from a prompt that does not echo; never from an argument. Enter at the prompt keeps a stored value. Keys: `preset=github\|openai\|anthropic`, `host=a,b`, `header='Name: … {v} …'`, `basic=<user>`, `query=<param>`, `body=<field>`, `path=yes`, `use=inject\|token_only\|sign`, `signer=<json>` (with `use=sign`: `sigv4`, `hmac`, `jwt`, `wallet`), `reveal=yes\|no`, `expires=<YYYY-MM-DD\|unix>`, `desc=…`. `host=` replaces the hosts, any position key replaces the positions, the rest is kept |
+| `cred <agent> set <name> [k=v …]` | add or change one. The value is read from stdin when piped, else from a prompt that does not echo; never from an argument. Enter at the prompt keeps a stored value. Keys: `preset=<name>` (`cred presets`), `host=a,b`, `header='Name: … {v} …'`, `basic=<user>`, `query=<param>`, `body=<field>`, `path=yes`, `use=inject\|token_only\|sign`, `signer=<json>` (with `use=sign`: `sigv4`, `hmac`, `jwt`, `wallet`), `token=<json>` (a token request template), `writeback=yes\|no`, `reveal=yes\|no`, `expires=<YYYY-MM-DD\|unix>`, `desc=…`. `host=` replaces the hosts, any position key replaces the positions, the rest is kept. A new entry from a preset first prints where to create the key |
+| `cred <agent> set <name> preset=oauth2-refresh\|oauth2-client token_url=… client_id=… api_host=… [client_secret=<entry>] [scope=…]` | a refresh token (it rotates and is written back) or a client secret that sealed trades for access tokens; the agent runs a token request on `<name>` and uses `[[credential:derived:<name>]]` as a Bearer token on `api_host` |
 | `cred <agent> rm <name>` | remove one (revoke it at its provider too) |
 | `cred <agent> login <name> <mcp-url> [client_id=… client_secret_entry=… scope=a,b]` | log the agent in to an MCP server: defines the entry (Bearer on the server's host) if new or changed, prints the link to open, and waits for the login to land |
 | `cred <agent> reveal <name> on\|off` | let the agent read the value itself without asking each time |
@@ -104,6 +105,7 @@ The owner's credentials for the agent's sealed credential proxy (`sealed/CREDENT
 | `cred <agent> log [n]` | what the agent did with its credentials |
 | `cred pending` | pending counts on every agent you own |
 | `cred notify [<email>\|off]` | where you are emailed when an agent waits for you or a credential is about to expire |
+| `cred presets` | the presets: hosts, positions, where to create each key and how to keep it narrow (no wallet needed) |
 
 Writes are a compare-and-swap like `settings` (exit 3, `CREDENTIALS_CONFLICT`). A write is stored at the attestor and pushed to the running agent; when the agent is not running it applies at the next boot.
 
