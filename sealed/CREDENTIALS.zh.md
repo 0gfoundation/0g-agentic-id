@@ -45,10 +45,10 @@ Entry(string name,bytes32 defHash)
 
 同一个 digest 在 sealed（`TestDigestVectors`）、attestor 和 SDK 中用同一组向量固定。
 
-- **版本号**：每次写入为 `version + 1`，在 attestor 处做比较并交换。sealed 按（所有权纪元，版本号）记住加载过的最新凭据集（存在状态目录，stop/start 后保留），拒绝更旧的；新 owner 的第一个凭据集比前任 owner 的所有凭据集都新。
+- **版本号**：每次写入为 `version + 1`，在 attestor 处做比较并交换。sealed 按（所有权纪元，版本号）连同凭据集的 digest 记住加载过的最新凭据集（存在状态目录，stop/start 后保留），拒绝更旧的，也拒绝同一（所有权纪元，版本号）下的另一个凭据集；新 owner 的第一个凭据集比前任 owner 的所有凭据集都新。
 - **所有权纪元**：agent 最近一次转让所在的区块号。为更早纪元签名的凭据集在各处都被拒绝，前任 owner 的凭据集无法被恢复。转让时 attestor 删除凭据集，sealed 清空所有条目、待办、授权和使用记录，以及它保管的框架推理 key。sealed 每 10 秒查一次链上 owner；交出、换 token、钱包签名、登录之前，如果距上次确认 owner 已超过 10 秒，会先再查一次（查询失败则拒绝）；新 owner 的凭据集或决定，先清掉前任 owner 的状态再处理。状态被清空时，或 owner 给条目设了新值时，仍在进行的换 token、刷新、登录的结果一概不保留。
 - **逐条检查**：定义与签名 hash 不符、值与 `value_hash` 不符、或者代理无法使用的条目会被跳过并给出原因，其余条目照常加载。
-- **owner 客户端**：每次修改都会重新签名整个凭据集，所以 SDK 只在存储的凭据集由当前钱包为这个 agent 按存储的版本号签名、每个定义和存储的值都与签名一致、并且不比这个客户端见过的最新凭据集旧（先比所有权纪元，再比版本号；CLI 把它记在配置目录的 `credential-marks.json` 里，所以同一台机器上跨次运行也会拒绝重新送来的旧凭据集）时才使用它；否则什么都不签（`CredentialsUnverifiedError`）。
+- **owner 客户端**：每次修改都会重新签名整个凭据集，所以 SDK 只在存储的凭据集由当前钱包为这个 agent 按存储的版本号签名、每个定义和存储的值都与签名一致、并且不比这个客户端见过的最新凭据集旧、也不是同一版本下的另一个凭据集（先比所有权纪元，再比版本号，并比对凭据集的 digest；CLI 把它记在配置目录的 `credential-marks.json` 里，所以同一台机器上跨次运行也成立）时才使用它；否则什么都不签（`CredentialsUnverifiedError`）。所有权纪元由 attestor 提供：编造一个更晚的纪元会让真实的凭据集显得更旧，这时报错会指出要删除的记录。
 
 ## agent 如何使用凭据
 
@@ -147,7 +147,7 @@ CredentialWriteback.v2:<seal_id>:<name>:<binding>:<boot_id>:<keccak256(ciphertex
 2. sealed 读取 MCP 服务器的受保护资源元数据（RFC 9728，来自 401 的 `WWW-Authenticate` 或 well-known 路径），再读取授权服务器元数据（RFC 8414 或 OpenID）。条目没有给 `client_id` 时，sealed 以 public client 身份动态注册（RFC 7591），然后返回授权链接，链接带 PKCE（S256）、`resource` 和一次性的 `state`。
 3. owner 打开链接并同意。浏览器回到 agent 的 `<公开地址>/_seal/oauth/callback`；`state`（10 分钟内有效，只能用一次）把 code 绑定到这次登录。sealed 用只有它持有的 verifier 换取 token。
 4. 之后条目在 owner 允许的位置提供 access token（该服务器域名上的 Bearer）。在此之前，`GET /credentials` 列出该条目时带 `status: awaiting_login`；从这时起改为带 `logged_in_at`，agent 的事件里出现 `entry_added`，针对它的 `login` 待办也随之结案。sealed 在过期前一分钟刷新（有效期不到两分钟时在一半处刷新，最早 10 秒后），保存轮换后的 refresh token，并写回登录状态。refresh token 被拒绝时（包括以状态码 200 返回的拒绝），或刷新一直失败时，转为一条给 owner 的 `login` 待办。
-5. 断开时，owner 调用 `POST /_seal/credentials/disconnect {name}`：如果授权服务器的元数据给出了 `revocation_endpoint`，sealed 先请它作废 refresh token，再作废 access token（RFC 7009）；无论是否作废成功，sealed 都会丢掉这些 token，条目回到等待登录的状态。如果这期间条目变了（新的凭据集或新的登录），sealed 什么都不丢，返回 409 `changed`，并说明服务器是否作废了之前持有的 token。之后由客户端删除该条目。CLI 里对应的命令是 `cred <agent> connect` 和 `disconnect`。
+5. 断开时，owner 调用 `POST /_seal/credentials/disconnect {name}`：如果授权服务器的元数据给出了 `revocation_endpoint`，sealed 先请它作废 refresh token，再作废 access token（RFC 7009）；无论是否作废成功，sealed 都会丢掉这些 token，条目回到等待登录的状态。如果这期间新的凭据集重新定义或删除了该条目，或者 owner 变了，sealed 什么都不丢，返回 409 `changed`，并说明服务器是否作废了断开开始时持有的 token。之后由客户端删除该条目。CLI 里对应的命令是 `cred <agent> connect` 和 `disconnect`。
 
 agent 在 MCP 配置中给该服务器加请求头 `Authorization: Bearer [[credential:<名字>]]`。
 

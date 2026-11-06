@@ -123,7 +123,8 @@ test('disconnect: an overtaken disconnect says what was and was not revoked', as
     // What the server revoked is not what the entry holds now.
     assert.equal(r.revoked, false);
     assert.equal(r.forgotten, false);
-    assert.match(r.note, /changed while the agent disconnected it: the tokens it held before are revoked, a login made meanwhile is not; revoke the app's access/);
+    assert.equal(r.changed, true);
+    assert.match(r.note, /changed while the agent disconnected it: the tokens it held when the disconnect began are revoked; to be sure no other is left, revoke the app's access at the service/);
   } finally {
     s.server.close();
   }

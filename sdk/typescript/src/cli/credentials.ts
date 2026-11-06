@@ -611,7 +611,7 @@ function conflict(e: unknown): never {
 async function disconnectOp(cred: AgenticID['credentials'], sealId: Hash, name: string, io: CredIO, at?: { agentUrl: string }): Promise<void> {
   const out = await cred.disconnect(sealId, name, at).catch(conflict);
   if (io.json) return emitOk({ sealId, version: out.version, disconnected: name, revoked: out.revoked, note: out.note ?? null, pushWarning: out.pushWarning ?? null });
-  io.out(`disconnected ${name} — version ${out.version}; ${out.revoked ? 'its tokens are revoked at the server' : `not revoked at the server: ${out.note ?? 'unknown'}`}`);
+  io.out(`disconnected ${name} — version ${out.version}; ${out.changed ? out.note : out.revoked ? 'its tokens are revoked at the server' : `not revoked at the server: ${out.note ?? 'unknown'}`}`);
   if (out.pushWarning) {
     io.out(`the running agent did not take it: ${out.pushWarning}`);
     if (!out.forgotten) io.out(`the agent still holds the login until its next boot: revoke the app's access at the service, and restart the agent`);

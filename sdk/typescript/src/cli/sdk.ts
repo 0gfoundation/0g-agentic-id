@@ -9,7 +9,7 @@
 
 import { AgenticID } from '../AgenticID';
 import { CliError } from './errors';
-import { loadCredentialMarks, loadSecretEnvPins, recordCredentialMark, recordSecretEnvPin } from './config';
+import { credentialMarksPath, loadCredentialMarks, loadSecretEnvPins, recordCredentialMark, recordSecretEnvPin } from './config';
 import { requireAttestorUrl, requirePrivateKey, type CliEnv } from './env';
 
 /**
@@ -57,6 +57,7 @@ export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = 
       credentialMarks: {
         seen: (key) => loadCredentialMarks()[key],
         record: (key, mark) => recordCredentialMark(key, mark),
+        where: credentialMarksPath(),
       },
     });
   } catch (e) {

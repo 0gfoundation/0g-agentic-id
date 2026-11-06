@@ -272,14 +272,14 @@ func reportPendingChanges(cfg *config.Bootstrap, agentSealPriv []byte, store *cr
 	}
 }
 
-// statePersist keeps the newest loaded set's (owner epoch, version) in
+// statePersist keeps the newest loaded set's (owner epoch, version, digest) in
 // sealed's root-only state directory, which survives stop/start.
 type statePersist struct{}
 
 func (statePersist) path() string { return filepath.Join(credStateDir(), "highest-version") }
 
 func (p statePersist) LoadHighest() (credentials.Mark, error) {
-	b, err := privsep.ReadFile(p.path(), 256)
+	b, err := privsep.ReadFile(p.path(), 512)
 	if errors.Is(err, fs.ErrNotExist) {
 		return credentials.Mark{}, nil
 	}

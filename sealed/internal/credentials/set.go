@@ -215,6 +215,7 @@ type Document struct {
 // Opened is a verified document.
 type Opened struct {
 	Set     CredentialSet
+	Mark    Mark // the set's place in order, with its digest
 	Defs    map[string]*Definition
 	Values  map[string][]byte
 	Skipped map[string]string // name → why the entry was left out
@@ -239,12 +240,23 @@ type Check struct {
 type Mark struct {
 	Epoch   uint64 `json:"epoch"`
 	Version uint64 `json:"version"`
+	// Digest is the set's EIP-712 digest (hex): of two sets the owner signed
+	// at one place in the order (one the attestor refused, say), only the
+	// one loaded first is taken.
+	Digest string `json:"digest,omitempty"`
 }
 
 // Less reports whether m is older than o.
 func (m Mark) Less(o Mark) bool {
 	return m.Epoch < o.Epoch || m.Epoch == o.Epoch && m.Version < o.Version
 }
+
+// Same reports whether m and o are at one place in the order.
+func (m Mark) Same(o Mark) bool { return m.Epoch == o.Epoch && m.Version == o.Version }
+
+// Newer reports whether m should replace o as the newest loaded: it is
+// later, or it is at o's place and o's digest is not known.
+func (m Mark) Newer(o Mark) bool { return o.Less(m) || o.Same(m) && o.Digest == "" && m.Digest != "" }
 
 // MarkOf is the set's place in that order.
 func MarkOf(s CredentialSet) Mark { return Mark{Epoch: s.OwnerEpoch, Version: s.Version} }
@@ -254,6 +266,7 @@ var (
 	ErrWrongSigner = errors.New("the credential set is not signed by the agent's current owner")
 	ErrWrongSeal   = errors.New("the credential set is for another agent")
 	ErrStale       = errors.New("the credential set is older than one this agent already loaded")
+	ErrForked      = fmt.Errorf("%w: another set of the same version was loaded", ErrStale)
 	ErrWrongEpoch  = errors.New("the credential set was signed for an earlier ownership of this agent")
 )
 
@@ -274,6 +287,11 @@ func Open(doc Document, c Check) (*Opened, error) {
 	if err != nil {
 		return nil, err
 	}
+	at := MarkOf(doc.Set)
+	at.Digest = digest.Hex()
+	if at.Same(c.Min) && c.Min.Digest != "" && !strings.EqualFold(at.Digest, c.Min.Digest) {
+		return nil, ErrForked
+	}
 	signer, err := Recover(digest, doc.Signature)
 	if err != nil {
 		return nil, fmt.Errorf("credential set signature: %w", err)
@@ -281,7 +299,7 @@ func Open(doc Document, c Check) (*Opened, error) {
 	if signer != c.Owner {
 		return nil, ErrWrongSigner
 	}
-	out := &Opened{Set: doc.Set, Defs: map[string]*Definition{}, Values: map[string][]byte{}, Skipped: map[string]string{}}
+	out := &Opened{Set: doc.Set, Mark: at, Defs: map[string]*Definition{}, Values: map[string][]byte{}, Skipped: map[string]string{}}
 	seen := map[string]bool{}
 	for _, e := range doc.Set.Entries {
 		if seen[e.Name] {

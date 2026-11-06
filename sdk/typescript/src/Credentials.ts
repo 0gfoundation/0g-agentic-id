@@ -21,7 +21,7 @@
  * including that the signer is the agent's current on-chain owner.
  */
 import { plainText } from './AgentClient';
-import { getAddress, hexToBytes, keccak256, recoverTypedDataAddress, toBytes, type Address, type Hash, type Hex } from 'viem';
+import { getAddress, hashTypedData, hexToBytes, keccak256, recoverAddress, toBytes, type Address, type Hash, type Hex } from 'viem';
 import type { Ctx } from './context';
 import { requireWallet } from './context';
 import { eciesEncrypt } from './secretEnv';
@@ -250,12 +250,31 @@ export function inputOf(d: CredentialDefinition): CredentialInput {
 
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
 
-/** A stored set's place in order: ownership epoch, then version. */
+/**
+ * A stored set's place in order (ownership epoch, then version) and its
+ * EIP-712 digest: of two sets the owner signed at one place (one the
+ * attestor refused, say), only the one seen first is taken.
+ */
 interface Mark {
   epoch: number;
   version: number;
+  digest?: string;
 }
 const older = (a: Mark, b: Mark): boolean => a.epoch < b.epoch || (a.epoch === b.epoch && a.version < b.version);
+const same = (a: Mark, b: Mark): boolean => a.epoch === b.epoch && a.version === b.version;
+/** m replaces o: it is later, or at o's place with a digest o lacks. */
+const newer = (m: Mark, o: Mark): boolean => older(o, m) || (same(o, m) && !o.digest && !!m.digest);
+const isMark = (m: unknown): m is Mark =>
+  !!m && typeof m === 'object' && Number.isSafeInteger((m as Mark).epoch) && Number.isSafeInteger((m as Mark).version)
+  && ((m as Mark).digest === undefined || typeof (m as Mark).digest === 'string');
+/** A hook's answer, or undefined when it throws or rejects. */
+async function safely<T>(f: () => T | Promise<T>): Promise<T | undefined> {
+  try {
+    return await f();
+  } catch {
+    return undefined;
+  }
+}
 
 export class CredentialsApi {
   /** The newest set seen per agent (see markKey), within this client's life. */
@@ -273,18 +292,42 @@ export class CredentialsApi {
   /** The newest set this client (or, through credentialMarks, this machine) has seen. */
   private async markOf(seal: Hash): Promise<Mark | undefined> {
     const key = this.markKey(seal);
+    const answer = await safely(() => this.ctx.credentialMarks?.seen(key));
+    const kept = isMark(answer) ? answer : undefined;
     const mine = this.marks.get(key);
-    const kept = await Promise.resolve(this.ctx.credentialMarks?.seen(key)).catch(() => undefined);
     if (!mine) return kept;
-    return kept && older(mine, kept) ? kept : mine;
+    return kept && newer(kept, mine) ? kept : mine;
   }
 
   private async raiseMark(seal: Hash, m: Mark): Promise<void> {
-    const cur = await this.markOf(seal);
-    if (cur && !older(cur, m)) return;
     const key = this.markKey(seal);
+    const cur = await this.markOf(seal);
+    // Read again after the wait: another raise may have run meanwhile.
+    const mine = this.marks.get(key);
+    if ((cur && !newer(m, cur)) || (mine && !newer(m, mine))) return;
     this.marks.set(key, m);
-    await Promise.resolve(this.ctx.credentialMarks?.record(key, m)).catch(() => undefined);
+    await safely(() => this.ctx.credentialMarks?.record(key, m));
+  }
+
+  /** Why a stored set at `at` is not taken, given the newest seen, or undefined. */
+  private staleness(at: Mark, seen: Mark | undefined): string | undefined {
+    if (!seen) return undefined;
+    let why: string | undefined;
+    if (older(at, seen)) why = `it is older than the newest set this client has seen, version ${seen.version} of ownership ${seen.epoch}`;
+    else if (same(at, seen) && seen.digest && at.digest && at.digest !== seen.digest) why = `it is not the version ${seen.version} this client has seen`;
+    if (!why) return undefined;
+    const where = this.ctx.credentialMarks?.where;
+    return `${why}. If the attestor's data was reset on purpose, remove this agent's record${where ? ` from ${where}` : ''} and read again`;
+  }
+
+  /** The EIP-712 digest of a set, as the owner signs it. */
+  private setDigest(seal: Hash, set: CredentialDocument['set']): Hash {
+    return hashTypedData({
+      domain: this.domain(),
+      types: credentialSetTypes,
+      primaryType: 'CredentialSet',
+      message: { sealId: seal, ownerEpoch: BigInt(set.owner_epoch), version: BigInt(set.version), entries: set.entries.map((x) => ({ name: x.name, defHash: x.def_hash as Hash })) },
+    });
   }
 
   private attestorUrl(): string {
@@ -335,20 +378,19 @@ export class CredentialsApi {
     if (!r.ok) throw new Error(`credentials.get: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     const body = (await r.json()) as { version: number; owner_epoch: number; document: CredentialDocument | null };
     if (!body.document && body.version !== 0) throw new CredentialsUnverifiedError(`version ${body.version} comes with no signed set`);
-    const definitions = body.document ? await this.verified(seal, body.version, body.owner_epoch, body.document) : [];
-    // An older set the owner did sign, served again, would bring back what
-    // the owner changed or removed since.
-    const at = { epoch: body.owner_epoch, version: body.version };
-    const seen = await this.markOf(seal);
-    if (seen && older(at, seen)) {
-      throw new CredentialsUnverifiedError(`it is older than the newest set this client has seen: ownership ${seen.epoch}, version ${seen.version}`);
-    }
+    const v = body.document ? await this.verified(seal, body.version, body.owner_epoch, body.document) : { definitions: [], digest: undefined };
+    const definitions = v.definitions;
+    // An older set the owner did sign, or another at the same version,
+    // served again, would bring back what the owner changed or removed since.
+    const at: Mark = { epoch: body.owner_epoch, version: body.version, digest: v.digest };
+    const stale = this.staleness(at, await this.markOf(seal));
+    if (stale) throw new CredentialsUnverifiedError(stale);
     if (body.document) await this.raiseMark(seal, at);
     return { version: body.version, ownerEpoch: body.owner_epoch, document: body.document, definitions };
   }
 
   /** The definitions of a stored document this wallet signed for this agent, or throws. */
-  private async verified(seal: Hash, version: number, ownerEpoch: number, doc: CredentialDocument): Promise<CredentialDefinition[]> {
+  private async verified(seal: Hash, version: number, ownerEpoch: number, doc: CredentialDocument): Promise<{ definitions: CredentialDefinition[]; digest: Hash }> {
     const fail = (why: string): never => {
       throw new CredentialsUnverifiedError(why);
     };
@@ -356,22 +398,18 @@ export class CredentialsApi {
     if (!set || !Array.isArray(set.entries)) fail('no signed set');
     if (String(set.seal_id).toLowerCase() !== seal) fail('it is for another agent');
     if (set.version !== version || set.owner_epoch !== ownerEpoch) fail(`it is signed as version ${set.version}, stored as ${version}`);
+    let digest: Hash | undefined;
     let signer: Address | undefined;
     try {
-      signer = await recoverTypedDataAddress({
-        domain: this.domain(),
-        types: credentialSetTypes,
-        primaryType: 'CredentialSet',
-        message: { sealId: seal, ownerEpoch: BigInt(set.owner_epoch), version: BigInt(set.version), entries: set.entries.map((x) => ({ name: x.name, defHash: x.def_hash as Hash })) },
-        signature: doc.signature as Hex,
-      });
+      digest = this.setDigest(seal, set);
+      signer = await recoverAddress({ hash: digest, signature: doc.signature as Hex });
     } catch {
       signer = undefined;
     }
     const { account } = requireWallet(this.ctx);
     if (!signer || getAddress(signer) !== getAddress(account.address)) fail('its signature is not this wallet\'s');
     const names = new Set<string>();
-    return set.entries.map((e) => {
+    const definitions = set.entries.map((e) => {
       if (names.has(e.name)) fail(`${e.name} is listed twice`);
       names.add(e.name);
       const raw = doc.defs?.[e.name];
@@ -387,6 +425,7 @@ export class CredentialsApi {
       }
       return def;
     });
+    return { definitions, digest: digest! };
   }
 
   /**
@@ -514,7 +553,7 @@ export class CredentialsApi {
     }
     if (!r.ok) throw new Error(`credentials: store failed: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     const version = ((await r.json()) as { version: number }).version;
-    await this.raiseMark(seal, { epoch: doc.set.owner_epoch, version: doc.set.version });
+    await this.raiseMark(seal, { epoch: doc.set.owner_epoch, version: doc.set.version, digest: this.setDigest(seal, doc.set) });
     return version;
   }
 
@@ -558,8 +597,9 @@ export class CredentialsApi {
    * server confirmed; `note` says why not (no revocation endpoint, the agent
    * not running, …), in which case revoke the app's access at the service.
    */
-  async disconnect(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ version: number; revoked: boolean; forgotten: boolean; note?: string; pushWarning?: string }> {
+  async disconnect(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ version: number; revoked: boolean; forgotten: boolean; changed?: boolean; note?: string; pushWarning?: string }> {
     let revoked = false;
+    let changed = false; // the entry changed while the agent disconnected it
     let forgotten = false; // the running agent took the disconnect and forgot the tokens
     let note: string | undefined;
     try {
@@ -571,19 +611,21 @@ export class CredentialsApi {
         forgotten = true;
         note = b.note || undefined;
       } else if (r.status === 409) {
-        // The entry changed while the agent disconnected it (a new login,
-        // say): what the server revoked is not what the entry holds now.
-        // The removal below makes the agent forget it.
-        const b = (await r.json().catch(() => ({}))) as { revoked?: boolean };
+        // A new set redefined or removed the entry, or the owner changed,
+        // while the agent disconnected it: it forgot nothing, and what the
+        // server revoked may not be all the entry held. The removal below
+        // makes the agent forget it.
+        const b = (await r.json().catch(() => ({}))) as { revoked?: boolean; note?: string };
+        changed = true;
         note = b.revoked
-          ? "the entry changed while the agent disconnected it: the tokens it held before are revoked, a login made meanwhile is not; revoke the app's access at the service"
-          : "the entry changed while the agent disconnected it and nothing was revoked: revoke the app's access at the service";
+          ? "the entry changed while the agent disconnected it: the tokens it held when the disconnect began are revoked; to be sure no other is left, revoke the app's access at the service"
+          : `the entry changed while the agent disconnected it and nothing was revoked${b.note ? ` (${plainText(b.note)})` : ''}: revoke the app's access at the service`;
       } else note = `the agent refused: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`.trim();
     } catch (e) {
       note = `the agent could not be reached (${e instanceof Error ? e.message : String(e)}): revoke the app's access at the service`;
     }
     const { version, pushWarning } = await this.remove(sealId, name, opts);
-    return { version, revoked, forgotten, note, pushWarning };
+    return { version, revoked, forgotten, ...(changed ? { changed } : {}), note, pushWarning };
   }
 
   /**

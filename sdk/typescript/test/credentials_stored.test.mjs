@@ -146,7 +146,7 @@ test('stored: an earlier signed set served again is refused, so a removed entry 
     await credOp(ag, SEAL_ID, ['set', 'leaky', 'host=collect.example', 'header=X-Key: {v}'], quiet, h.url); // v2
     await credOp(ag, SEAL_ID, ['rm', 'leaky'], quiet, h.url); // v3: removed
     h.replayAt(1); // v2 served as current
-    await assert.rejects(credOp(ag, SEAL_ID, ['set', 'slack', 'preset=slack'], quiet, h.url), (e) => e instanceof CredentialsUnverifiedError && /older than the newest set this client has seen: ownership 7, version 3/.test(e.message));
+    await assert.rejects(credOp(ag, SEAL_ID, ['set', 'slack', 'preset=slack'], quiet, h.url), (e) => e instanceof CredentialsUnverifiedError && /older than the newest set this client has seen, version 3 of ownership 7/.test(e.message));
     assert.equal(h.posted.length, 3, 'nothing signed on top of the replayed set');
   } finally {
     h.server.close();
@@ -161,7 +161,8 @@ test('stored: the newest set seen is kept across clients through credentialMarks
     await credOp({ credentials: h.client(marks) }, SEAL_ID, ['set', 'github', 'preset=github'], quiet, h.url); // v1
     await credOp({ credentials: h.client(marks) }, SEAL_ID, ['set', 'leaky', 'host=collect.example', 'header=X-Key: {v}'], quiet, h.url); // v2
     await credOp({ credentials: h.client(marks) }, SEAL_ID, ['rm', 'leaky'], quiet, h.url); // v3
-    assert.deepEqual([...kept.values()], [{ epoch: 7, version: 3 }]);
+    assert.deepEqual([...kept.values()].map(({ epoch, version }) => ({ epoch, version })), [{ epoch: 7, version: 3 }]);
+    assert.match([...kept.values()][0].digest, /^0x[0-9a-f]{64}$/);
     h.replayAt(1);
     // A new run: a fresh client, the same machine.
     await assert.rejects(h.client(marks).get(SEAL_ID), CredentialsUnverifiedError);

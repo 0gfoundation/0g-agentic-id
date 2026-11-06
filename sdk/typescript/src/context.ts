@@ -17,6 +17,13 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { ZERO_G_TESTNET, RPC_URL, type ContractAddresses } from './constants';
 
 /** Public config for `new AgentDNA(config)` (exported as `AgentDNAConfig`). */
+/** A stored credential set's place in order, and its EIP-712 digest. */
+export interface CredentialMarkRecord {
+  epoch: number;
+  version: number;
+  digest?: string;
+}
+
 export interface AgenticIDConfig {
   /** RPC endpoint. Defaults to the 0G Galileo testnet RPC. */
   rpcUrl?: string;
@@ -60,11 +67,15 @@ export interface AgenticIDConfig {
    * client has seen for each agent, so an older one the attestor serves
    * again is refused instead of signed anew. Every client remembers within
    * its own lifetime; supply this store to remember across processes (the
-   * CLI backs it with a file). Keys are opaque strings.
+   * CLI backs it with a file). Keys are opaque strings; `record` is called
+   * with a newer mark than `seen` answered, and should keep the newer of it
+   * and what it holds. `where` names the store in the error that refuses an
+   * older set, for an owner whose attestor's data was reset on purpose.
    */
   credentialMarks?: {
-    seen(key: string): { epoch: number; version: number } | undefined | Promise<{ epoch: number; version: number } | undefined>;
-    record(key: string, mark: { epoch: number; version: number }): void | Promise<void>;
+    seen(key: string): CredentialMarkRecord | undefined | Promise<CredentialMarkRecord | undefined>;
+    record(key: string, mark: CredentialMarkRecord): void | Promise<void>;
+    where?: string;
   };
 }
 

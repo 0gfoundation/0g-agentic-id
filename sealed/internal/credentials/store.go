@@ -580,7 +580,7 @@ func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Ope
 		}
 	}
 	s.mu.Lock()
-	if highest.Less(s.mark) {
+	if s.mark.Newer(highest) {
 		highest = s.mark
 	}
 	gen := s.gen
@@ -590,8 +590,8 @@ func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Ope
 	if err != nil {
 		return nil, err
 	}
-	if s.env.Persist != nil && highest.Less(MarkOf(o.Set)) {
-		if err := s.env.Persist.SaveHighest(MarkOf(o.Set)); err != nil {
+	if s.env.Persist != nil && o.Mark.Newer(highest) {
+		if err := s.env.Persist.SaveHighest(o.Mark); err != nil {
 			return nil, err
 		}
 	}
@@ -621,7 +621,7 @@ func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Ope
 			o.Values[name] = beforeValues[name]
 		}
 	}
-	s.version, s.mark, s.defs, s.defHashes, s.values = o.Set.Version, MarkOf(o.Set), o.Defs, hashes, o.Values
+	s.version, s.mark, s.defs, s.defHashes, s.values = o.Set.Version, o.Mark, o.Defs, hashes, o.Values
 	// Login entries refresh their access token themselves.
 	for name, t := range s.refreshTimers {
 		t.Stop()

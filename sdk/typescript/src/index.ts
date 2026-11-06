@@ -37,7 +37,7 @@ export { mcpServices } from './AgentClient';
 export { defaultIData, DEFAULT_PERSONA_INFERENCE, deploymentFactsOf, needsDefaultSettings, storeDefaultSettings } from './AttestorClient';
 export type { DeploymentFacts } from './AttestorClient';
 export type { DefaultIDataParams } from './AttestorClient';
-export type { AgenticIDConfig as AgentDNAConfig, AgenticIDConfig } from './context';
+export type { AgenticIDConfig as AgentDNAConfig, AgenticIDConfig, CredentialMarkRecord } from './context';
 
 // ── Namespace implementation classes (advanced / typing) ──
 export { SandboxClient } from './SandboxClient';

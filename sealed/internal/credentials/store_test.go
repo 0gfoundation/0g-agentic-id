@@ -58,8 +58,8 @@ func TestLoadListAndAntiRollback(t *testing.T) {
 	if _, err := s.Load(context.Background(), f.doc(t, 2, map[string]string{"github": "ghp_x"}), 0); err != nil {
 		t.Fatal(err)
 	}
-	if p.v != (Mark{Epoch: 7, Version: 2}) || reg.Get("github") == nil {
-		t.Fatalf("persisted %d, registry %v", p.v, reg.Names())
+	if !p.v.Same(Mark{Epoch: 7, Version: 2}) || p.v.Digest == "" || reg.Get("github") == nil {
+		t.Fatalf("persisted %+v, registry %v", p.v, reg.Names())
 	}
 	list := s.List()
 	if len(list) != 1 || list[0].Placeholder != "[[credential:github]]" {

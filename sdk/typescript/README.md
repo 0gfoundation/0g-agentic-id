@@ -242,7 +242,7 @@ await ag.reputation.revokeFeedback(agentId, idx);          // → "0x…"
 The agent writes `[[credential:<name>]]` where a key goes; sealed fills the value in on the way out, only for the hosts and request positions the owner allowed, and removes it from responses. Each value is sealed to the agent's agentSeal key here, in the client; the whole set is signed once (EIP-712 `CredentialSet`), stored at the attestor (compare-and-swap) and pushed to the running agent. The full model is in [`sealed/CREDENTIALS.md`](../../sealed/CREDENTIALS.md).
 
 ```ts
-const { version } = await ag.credentials.get(sealId);   // definitions, never values; CredentialsUnverifiedError unless this wallet signed the stored set and it is no older than one seen before (`credentialMarks` keeps that across processes)
+const { version } = await ag.credentials.get(sealId);   // definitions, never values; CredentialsUnverifiedError unless this wallet signed the stored set and it is no older than, nor another set at the version of, one seen before (`credentialMarks` keeps that across processes)
 await ag.credentials.put(sealId, [
   { name: 'github', value: process.env.GITHUB_TOKEN, hosts: ['api.github.com'],
     positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }] },
