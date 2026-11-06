@@ -26,6 +26,7 @@ type CredentialService interface {
 	AuditSince(after int64) []credentials.AuditRecord
 	StartLogin(ctx context.Context, name, redirectURI string) (string, error)
 	FinishLogin(ctx context.Context, state, code, oauthError string) (string, error)
+	Disconnect(ctx context.Context, name string) (revoked bool, note string, err error)
 }
 
 // Scrubber replaces the credential values sealed holds with their
@@ -221,6 +222,36 @@ func (s *Server) handleCredentialAudit(w http.ResponseWriter, r *http.Request) {
 		recs = []credentials.AuditRecord{}
 	}
 	writeJSON(w, http.StatusOK, recs)
+}
+
+// handleCredentialDisconnect ends a login entry's login: the server is asked
+// to revoke the tokens when it can be, and sealed forgets them. Owner-signed.
+func (s *Server) handleCredentialDisconnect(w http.ResponseWriter, r *http.Request) {
+	c, sealID, owner, ok := s.credentialService(w)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, ok := readSignedBody(w, r, s, "0GSealCredDisconnect", sealID, owner)
+	if !ok {
+		return
+	}
+	var in struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(body, &in); err != nil || in.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "bad_request", "message": "give the entry name"})
+		return
+	}
+	revoked, note, err := c.Disconnect(r.Context(), in.Name)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"code": "not_found", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"revoked": revoked, "note": note})
 }
 
 // oauthCallbackPath is where an authorization server returns the owner

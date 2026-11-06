@@ -53,8 +53,9 @@ export const CRED_USAGE = `usage:
                                        trades for access tokens; the agent uses [[credential:derived:<name>]] on api_host
   cred presets                         the presets, and where to create each key
   cred <agent> rm <name>               remove one (revoke it at its provider as well)
-  cred <agent> login <name> <mcp-url> [client_id=… client_secret_entry=… scope=a,b]
-                                       log the agent in to an MCP server (you open a link); sealed keeps the tokens
+  cred <agent> connect <name> <mcp-url> [client_id=… client_secret_entry=… scope=a,b]
+                                       connect an MCP server to the agent (you log in through a link); sealed keeps the tokens
+  cred <agent> disconnect <name>       revoke that connection at the server (when it offers that) and remove it
   cred <agent> reveal <name> on|off    let the agent read the value itself without asking each time
   cred <agent> pending                 requests waiting for you
   cred <agent> approve [<id>]          approve one request once (an id prefix; none when only one waits)
@@ -497,10 +498,10 @@ export function renderCredentials(defs: CredentialDefinition[], version: number,
     if (flags.length) lines.push(`  ${flags.join(' · ')}`);
     if (d.mcp && logins !== undefined) {
       const st = logins?.[d.name];
-      lines.push(`  login      ${
+      lines.push(`  connected  ${
         logins === null ? 'unknown — the agent is not running'
-          : st?.loggedInAt ? `logged in ${dateText(st.loggedInAt)}`
-            : `not done yet — cred <agent> login ${d.name} ${d.mcp.url}`
+          : st?.loggedInAt ? dateText(st.loggedInAt)
+            : `not yet — cred <agent> connect ${d.name} ${d.mcp.url}`
       }`);
     }
     for (const t of d.token_request?.take ?? []) {
@@ -544,7 +545,7 @@ function factLines(p: PendingCredentialRequest): string[] {
 }
 
 function answerHint(p: PendingCredentialRequest): string {
-  if (p.op === 'login') return `cred <agent> login ${p.name} ${p.params?.url ?? '<mcp-url>'}   (or deny)`;
+  if (p.op === 'login') return `cred <agent> connect ${p.name} ${p.params?.url ?? '<mcp-url>'}   (or deny)`;
   if (p.op === 'add') return `cred <agent> set ${p.name}${p.params?.preset ? ` preset=${p.params.preset}` : ' …'}   (or deny)`;
   return 'cred <agent> approve | deny';
 }
@@ -568,7 +569,7 @@ export function renderAudit(recs: AuditRecord[]): string[] {
 export interface CredIO {
   /** `--json`: emit one envelope instead of lines. */
   json: boolean;
-  /** Wait for a login to complete before returning (the one-shot command does; the REPL does not block). */
+  /** Wait for a connection to complete before returning (the one-shot command does; the REPL does not block). */
   wait?: boolean;
   out(line: string): void;
   /** Read a value without echoing it. */
@@ -583,6 +584,13 @@ function conflict(e: unknown): never {
     });
   }
   throw e;
+}
+
+/** `disconnect` (and `rm` of a connection): revoke at the server when it can be, then remove. */
+async function disconnectOp(cred: AgenticID['credentials'], sealId: Hash, name: string, io: CredIO, at?: { agentUrl: string }): Promise<void> {
+  const out = await cred.disconnect(sealId, name, at).catch(conflict);
+  if (io.json) return emitOk({ sealId, version: out.version, disconnected: name, revoked: out.revoked, note: out.note ?? null });
+  io.out(`disconnected ${name} — version ${out.version}; ${out.revoked ? 'its tokens are revoked at the server' : `not revoked at the server: ${out.note ?? 'unknown'}`}`);
 }
 
 /** Match an id prefix against the pending list; with no id, the only request waiting. */
@@ -654,11 +662,21 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       const [name] = rest;
       if (!name) throw new CliError('BAD_FLAG', 'missing <name>', { remedy: 'cred <agent> rm <name>' });
       const cur = await cred.get(sealId);
-      if (!cur.definitions.some((d) => d.name === name)) throw new CliError('BAD_FLAG', `no credential named ${name}`, { remedy: 'cred <agent>' });
+      const def = cur.definitions.find((d) => d.name === name);
+      if (!def) throw new CliError('BAD_FLAG', `no credential named ${name}`, { remedy: 'cred <agent>' });
+      // A connection is revoked at its server first, as `disconnect` does.
+      if (def.mcp) return disconnectOp(cred, sealId, name, io, at);
       const out = await cred.remove(sealId, name, at).catch(conflict);
       if (io.json) return emitOk({ sealId, version: out.version, removed: name });
       io.out(`removed ${name} — version ${out.version}. Revoke it at its provider too: removing it here does not.`);
       return;
+    }
+    case 'disconnect': {
+      const [name] = rest;
+      if (!name) throw new CliError('BAD_FLAG', 'missing <name>', { remedy: 'cred <agent> disconnect <name>' });
+      const def = (await cred.get(sealId)).definitions.find((d) => d.name === name);
+      if (!def?.mcp) throw new CliError('BAD_FLAG', def ? `${name} is not a connection; remove it with rm` : `no connection named ${name}`, { remedy: def ? `cred <agent> rm ${name}` : 'cred <agent>' });
+      return disconnectOp(cred, sealId, name, io, at);
     }
     case 'reveal': {
       const [name, onOff] = rest;
@@ -685,9 +703,9 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       const base = agentUrl ?? (await cred.agentUrl(sealId));
       const item = pickPending(await cred.pending(sealId, { agentUrl: base }), rest[0]);
       if (sub === 'approve' && item.op !== 'reveal') {
-        // Adding a credential or logging in is done, not approved.
+        // Adding a credential or connecting is done, not approved.
         throw new CliError('BAD_FLAG', `a request to ${item.op} ${item.name} is answered by doing it`, {
-          remedy: item.op === 'login' ? `cred <agent> login ${item.name} ${item.params?.url ?? '<mcp-url>'}` : `cred <agent> set ${item.name} …`,
+          remedy: item.op === 'login' ? `cred <agent> connect ${item.name} ${item.params?.url ?? '<mcp-url>'}` : `cred <agent> set ${item.name} …`,
         });
       }
       if (sub === 'approve') await cred.approveOnce(sealId, item.auth_req_id, { agentUrl: base });
@@ -698,7 +716,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
         : `denied: ${item.op} ${item.name}`);
       return;
     }
-    case 'login': {
+    case 'connect': {
       const name = checkCredName(rest[0]);
       const mcpUrl = rest[1];
       let parsed: URL | undefined;
@@ -708,7 +726,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
         parsed = undefined;
       }
       if (!parsed || parsed.protocol !== 'https:') {
-        throw new CliError('BAD_FLAG', 'login needs the MCP server\'s https URL', { remedy: 'cred <agent> login linear https://mcp.linear.app/mcp' });
+        throw new CliError('BAD_FLAG', 'connect needs the MCP server\'s https URL', { remedy: 'cred <agent> connect linear https://mcp.linear.app/mcp' });
       }
       const mcp: CredentialMCP = { url: mcpUrl! };
       for (const arg of rest.slice(2)) {
@@ -716,7 +734,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
         if (k === 'client_id' && v) mcp.client_id = v;
         else if (k === 'client_secret_entry' && v) mcp.client_secret_entry = checkCredName(v);
         else if (k === 'scope' && v) mcp.scopes = v.split(',').map((x) => x.trim()).filter(Boolean);
-        else throw new CliError('BAD_FLAG', `unknown login option "${arg}"`, { remedy: 'client_id=… client_secret_entry=<entry> scope=a,b' });
+        else throw new CliError('BAD_FLAG', `unknown connect option "${arg}"`, { remedy: 'client_id=… client_secret_entry=<entry> scope=a,b' });
       }
       const host = parsed.host.toLowerCase();
       const want: CredentialInput = {
@@ -725,22 +743,22 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       };
       const cur = await cred.get(sealId);
       const stored = cur.definitions.find((d) => d.name === name);
-      if (stored && !stored.mcp) throw new CliError('BAD_FLAG', `${name} is already a credential that is not a login`, { remedy: 'pick another name, or cred <agent> rm ' + name });
+      if (stored && !stored.mcp) throw new CliError('BAD_FLAG', `${name} is already a credential that is not a connection`, { remedy: 'pick another name, or cred <agent> rm ' + name });
       const base = agentUrl ?? (await cred.agentUrl(sealId));
       const same = stored && JSON.stringify(definitionOf(inputOf(stored), '' as `0x${string}`)) === JSON.stringify(definitionOf({ ...want, description: stored.description }, '' as `0x${string}`));
       if (!same) {
         const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
         const out = await cred.put(sealId, [...others, want], { baseVersion: cur.version, agentUrl: base }).catch(conflict);
         if (out.pushWarning) {
-          throw new CliError('UNKNOWN', `the login entry is stored, but the running agent did not take it: ${out.pushWarning}`, {
-            remedy: 'start the agent, then run the same login command again',
+          throw new CliError('UNKNOWN', `the connection is stored, but the running agent did not take it: ${out.pushWarning}`, {
+            remedy: 'start the agent, then run the same connect command again',
           });
         }
       }
       const before = (await cred.loaded(sealId, { agentUrl: base }).catch(() => undefined))?.entries.find((e) => e.name === name);
-      const { authorizeUrl } = await cred.login(sealId, name, { agentUrl: base });
+      const { authorizeUrl } = await cred.connect(sealId, name, { agentUrl: base });
       if (io.json) return emitOk({ sealId, name, authorizeUrl });
-      io.out(`Open this link to log the agent in to ${host} (valid 10 minutes):`);
+      io.out(`Open this link and log in to connect ${host} to the agent (valid 10 minutes):`);
       io.out('');
       io.out(`  ${authorizeUrl}`);
       io.out('');
@@ -748,12 +766,12 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
         io.out(`When you have finished in the browser, \`cred <agent>\` lists ${name}; the agent uses [[credential:${name}]] as its bearer token for ${host}.`);
         return;
       }
-      io.out('waiting for the login to complete (Ctrl-C stops waiting, not the login)…');
+      io.out('waiting for the connection to complete (Ctrl-C stops waiting, not the login)…');
       for (const deadline = Date.now() + 10 * 60_000; Date.now() < deadline; ) {
         await new Promise((r) => setTimeout(r, 3000));
         const now = (await cred.loaded(sealId, { agentUrl: base }).catch(() => undefined))?.entries.find((e) => e.name === name);
         if (now?.logged_in_at && now.logged_in_at !== before?.logged_in_at) {
-          io.out(`logged in: the agent uses [[credential:${name}]] as its bearer token for ${host}`);
+          io.out(`connected: the agent uses [[credential:${name}]] as its bearer token for ${host}`);
           return;
         }
       }
@@ -796,7 +814,7 @@ export async function answerPending(
   const tell: string[] = [];
   for (const p of open) {
     io.out('');
-    io.out(`⚑ the agent asks to ${p.op === 'reveal' ? `read the value of ${p.name}` : p.op === 'login' ? `be logged in as ${p.name}` : `get a credential named ${p.name}`}`);
+    io.out(`⚑ the agent asks to ${p.op === 'reveal' ? `read the value of ${p.name}` : p.op === 'login' ? `be connected to ${p.params?.url ?? 'an MCP server'} as ${p.name}` : `get a credential named ${p.name}`}`);
     for (const l of factLines(p)) io.out(l);
     if (p.reason) io.out(`  the agent says: ${JSON.stringify(p.reason)}`);
     const later = (): void => {
@@ -834,11 +852,11 @@ export async function answerPending(
       else later();
     } else if (p.op === 'login') {
       const url = p.params?.url;
-      const a = url ? (await io.ask(`  [l] log in now  [n] refuse  [Enter] later: `)).trim().toLowerCase() : '';
-      if (a === 'l' && url) {
+      const a = url ? (await io.ask(`  [c] connect now  [n] refuse  [Enter] later: `)).trim().toLowerCase() : '';
+      if (a === 'c' && url) {
         const before = (await cred.loaded(sealId, at)).entries.find((e) => e.name === p.name)?.logged_in_at;
-        await credOp(ag, sealId, ['login', p.name, url], { ...io, wait: false }, opts.agentUrl);
-        io.out('  waiting for the login to complete (Esc stops waiting, not the login)…');
+        await credOp(ag, sealId, ['connect', p.name, url], { ...io, wait: false }, opts.agentUrl);
+        io.out('  waiting for the connection to complete (Esc stops waiting, not the login)…');
         const deadline = Date.now() + (opts.loginWaitMs ?? 10 * 60_000);
         let done = false;
         while (!done && Date.now() < deadline && !opts.signal?.aborted) {
@@ -847,8 +865,8 @@ export async function answerPending(
           done = !!now && now !== before;
         }
         if (done) {
-          io.out(`  logged in: the agent uses [[credential:${p.name}]]`);
-          tell.push(`[cred] I logged you in: ${p.name} is in GET /credentials now.`);
+          io.out(`  connected: the agent uses [[credential:${p.name}]]`);
+          tell.push(`[cred] I connected you: ${p.name} is in GET /credentials now.`);
         } else later();
       } else if (a === 'n') await refuse();
       else later();

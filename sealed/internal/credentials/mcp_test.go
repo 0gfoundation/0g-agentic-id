@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"seal-verify/internal/credproxy"
 )
 
 // fakeAuth is an MCP server with its own authorization server: 401 with
@@ -24,6 +26,9 @@ type fakeAuth struct {
 	issued     int
 	revoked    bool
 	registered []string
+	// RFC 7009: offered unless noRevocation; what was revoked, in order.
+	noRevocation bool
+	revokedSeen  []string
 }
 
 func newFakeAuth(t *testing.T) *fakeAuth {
@@ -44,8 +49,27 @@ func newFakeAuth(t *testing.T) *fakeAuth {
 		json200(w, map[string]any{"resource": base + "/mcp", "authorization_servers": []string{base + "/auth"}, "scopes_supported": []string{"read"}})
 	})
 	mux.HandleFunc("/.well-known/oauth-authorization-server/auth", func(w http.ResponseWriter, r *http.Request) {
-		json200(w, map[string]any{"authorization_endpoint": base + "/auth/authorize", "token_endpoint": base + "/auth/token",
-			"registration_endpoint": base + "/auth/register", "code_challenge_methods_supported": []string{"S256"}})
+		meta := map[string]any{"authorization_endpoint": base + "/auth/authorize", "token_endpoint": base + "/auth/token",
+			"registration_endpoint": base + "/auth/register", "code_challenge_methods_supported": []string{"S256"}}
+		f.mu.Lock()
+		if !f.noRevocation {
+			meta["revocation_endpoint"] = base + "/auth/revoke"
+		}
+		f.mu.Unlock()
+		json200(w, meta)
+	})
+	mux.HandleFunc("/auth/revoke", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if r.PostForm.Get("client_id") != "client-1" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		f.revokedSeen = append(f.revokedSeen, r.PostForm.Get("token_type_hint")+":"+r.PostForm.Get("token"))
+		if r.PostForm.Get("token") == f.refresh {
+			f.revoked = true
+		}
 	})
 	mux.HandleFunc("/auth/register", func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
@@ -231,4 +255,76 @@ func status(s *Store, id string) string {
 		return p.Status
 	}
 	return ""
+}
+
+// loginLinear runs the owner's login to auth for an entry named linear.
+func loginLinear(t *testing.T, f *fixture, auth *fakeAuth) (*Store, *credproxy.Registry) {
+	t.Helper()
+	s, reg, _ := f.store(t, nil, auth.ts.Client())
+	doc := f.doc(t, 1, map[string]string{"linear": "unused"})
+	f.editDefs(t, &doc, func(d *Definition) {
+		d.MCP = &MCPSpec{URL: auth.ts.URL + "/mcp"}
+		d.ValueHash, d.Writeback, d.Hosts = "", true, []string{strings.TrimPrefix(auth.ts.URL, "https://")}
+	})
+	delete(doc.Values, "linear")
+	if _, err := s.Load(context.Background(), doc, 0); err != nil {
+		t.Fatal(err)
+	}
+	link, err := s.StartLogin(context.Background(), "linear", "https://8080-sandbox.preview.example/_seal/oauth/callback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(link)
+	auth.mu.Lock()
+	auth.challenge = u.Query().Get("code_challenge")
+	auth.mu.Unlock()
+	if _, err := s.FinishLogin(context.Background(), u.Query().Get("state"), "the-code", ""); err != nil {
+		t.Fatal(err)
+	}
+	return s, reg
+}
+
+// Disconnect revokes at the server (refresh token first), and sealed
+// forgets the login: the entry waits for a new one and fills nothing.
+func TestMCPDisconnectRevokesAndForgets(t *testing.T) {
+	auth := newFakeAuth(t)
+	s, reg := loginLinear(t, newFixture(t), auth)
+	revoked, note, err := s.Disconnect(context.Background(), "linear")
+	if err != nil || !revoked || note != "" {
+		t.Fatalf("disconnect: revoked=%v note=%q err=%v", revoked, note, err)
+	}
+	auth.mu.Lock()
+	seen := auth.revokedSeen
+	auth.mu.Unlock()
+	if len(seen) != 2 || seen[0] != "refresh_token:rt-1" || seen[1] != "access_token:at-1" {
+		t.Fatalf("revoked at the server: %v", seen)
+	}
+	if reg.Get("linear") != nil {
+		t.Fatal("the proxy still fills the login")
+	}
+	if e := listed(s, "linear"); e == nil || e.Status != "awaiting_login" {
+		t.Fatalf("after disconnect: %+v", e)
+	}
+	recs := s.AuditSince(0)
+	if last := recs[len(recs)-1]; last.Op != "disconnect" || last.Result != "revoked at the server" {
+		t.Fatalf("audit: %+v", last)
+	}
+	if _, _, err := s.Disconnect(context.Background(), "nope"); err == nil {
+		t.Fatal("disconnect of an unknown entry succeeded")
+	}
+}
+
+// A server with no revocation endpoint: sealed still forgets the login and
+// says the owner must revoke at the service.
+func TestMCPDisconnectWithoutRevocation(t *testing.T) {
+	auth := newFakeAuth(t)
+	auth.noRevocation = true
+	s, reg := loginLinear(t, newFixture(t), auth)
+	revoked, note, err := s.Disconnect(context.Background(), "linear")
+	if err != nil || revoked || !strings.Contains(note, "revoke the app's access at the service") {
+		t.Fatalf("disconnect: revoked=%v note=%q err=%v", revoked, note, err)
+	}
+	if reg.Get("linear") != nil || len(auth.revokedSeen) != 0 {
+		t.Fatal("not forgotten, or something was sent to revoke")
+	}
 }

@@ -420,7 +420,7 @@ function prefetchModelIds(ag: AgenticID): void {
     }
   }).catch(() => { /* only completions; explicit operations refresh strictly */ });
 }
-const CRED_SUBS = ['ls', 'set ', 'rm ', 'login ', 'reveal ', 'pending', 'approve ', 'deny ', 'log', 'presets'];
+const CRED_SUBS = ['ls', 'set ', 'rm ', 'connect ', 'disconnect ', 'reveal ', 'pending', 'approve ', 'deny ', 'log', 'presets'];
 const L1_ARGS: Record<string, string[] | (() => string[])> = {
   use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT,
   retry: AGENT, clone: AGENT, transfer: AGENT, call: AGENT, rate: AGENT,
@@ -1007,8 +1007,8 @@ const L1_HELP_FULL = `manager commands
                           host=, header='Name: … {v}', basic=, query=, body=,
                           path=yes, use=sign signer=<json>, reveal=yes|no,
                           expires=, desc=; the value
-                          is asked for, not echoed); rm <name>; login <name>
-                          <mcp-url> (prints a link to open); reveal <name>
+                          is asked for, not echoed); rm <name>; connect <name>
+                          <mcp-url> (prints a link to open); disconnect <name>; reveal <name>
                           on|off; pending; approve|deny [<id>]; log [n].
                           cred pending: counts on all your agents; cred
                           notify [email|off]: where you are emailed;
@@ -1424,7 +1424,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'cred') {
         // The owner's credentials for an agent (cli/credentials.ts); every
         // subcommand is owner-signed.
-        if (!args[0]) { out('usage: cred <agentId|sealId> [ls|set|rm|login|reveal|pending|approve|deny|log] · cred pending · cred notify [email|off] · cred presets — `help` has the keys\n'); continue; }
+        if (!args[0]) { out('usage: cred <agentId|sealId> [ls|set|rm|connect|disconnect|reveal|pending|approve|deny|log] · cred pending · cred notify [email|off] · cred presets — `help` has the keys\n'); continue; }
         const ag = await withWallet(ctx);
         if (await credOwnerOp(ag, args, credIO(ask))) continue;
         const row = await findAgentRow(ag, args[0]);
@@ -2342,12 +2342,13 @@ const L2_HELP_FULL = `session commands
                           (owner-signed). Applies at the next boot — /reset
                           applies it now
   /cred [sub …]           this agent's credentials — same as \`cred <id>\` in the
-                          manager: bare lists, set <name> [k=v …], rm,
+                          manager: bare lists, set <name> [k=v …], rm, connect,
+                          disconnect,
                           reveal <name> on|off, pending, approve|deny [<id>],
                           log [n], presets. The agent writes [[credential:<name>]]
                           where a key goes; sealed fills it in on the way out.
                           A request the agent waits on (to read a value, to get
-                          a credential, to be logged in) comes up here at the
+                          a credential, to be connected) comes up here at the
                           prompt; your answer goes back to the agent
   /think [low|high|max]   reasoning depth for thinking models (glm etc.) —
                           shorthand for /settings thinking=…, so it is written

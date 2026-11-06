@@ -427,15 +427,41 @@ export class CredentialsApi {
   }
 
   /**
-   * Start the owner's login to a login entry's MCP server. Returns the link
-   * the owner opens to consent (valid 10 minutes); the authorization server
-   * returns the browser to the agent, which completes the login itself.
+   * Connect a login entry's MCP server: start the owner's OAuth login and
+   * return the link the owner opens to consent (valid 10 minutes); the
+   * authorization server returns the browser to the agent, which completes
+   * the login itself and keeps the tokens.
    */
-  async login(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ authorizeUrl: string }> {
+  async connect(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ authorizeUrl: string }> {
     const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
     const r = await this.sealRequest(sealId, base, '0GSealCredLogin', '/_seal/credentials/login', JSON.stringify({ name }));
-    if (!r.ok) throw new Error(`credentials.login: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw new Error(`credentials.connect: HTTP ${r.status} ${await r.text().catch(() => '')}`);
     return { authorizeUrl: ((await r.json()) as { authorize_url: string }).authorize_url };
+  }
+
+  /**
+   * Disconnect a login entry: the running agent asks the authorization
+   * server to revoke its tokens (RFC 7009) when the server offers that, and
+   * forgets them; then the entry is removed. `revoked` says whether the
+   * server confirmed; `note` says why not (no revocation endpoint, the agent
+   * not running, …), in which case revoke the app's access at the service.
+   */
+  async disconnect(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ version: number; revoked: boolean; note?: string }> {
+    let revoked = false;
+    let note: string | undefined;
+    try {
+      const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
+      const r = await this.sealRequest(sealId, base, '0GSealCredDisconnect', '/_seal/credentials/disconnect', JSON.stringify({ name }));
+      if (r.ok) {
+        const b = (await r.json()) as { revoked: boolean; note?: string };
+        revoked = b.revoked;
+        note = b.note || undefined;
+      } else note = `the agent refused: HTTP ${r.status} ${await r.text().catch(() => '')}`.trim();
+    } catch (e) {
+      note = `the agent could not be reached (${e instanceof Error ? e.message : String(e)}): revoke the app's access at the service`;
+    }
+    const { version } = await this.remove(sealId, name, opts);
+    return { version, revoked, note };
   }
 
   /**

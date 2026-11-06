@@ -289,6 +289,7 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/credentials/decide", s.handleCredentialDecide)
 	mux.HandleFunc("/_seal/credentials/audit", s.handleCredentialAudit)
 	mux.HandleFunc("/_seal/credentials/login", s.handleCredentialLogin)
+	mux.HandleFunc("/_seal/credentials/disconnect", s.handleCredentialDisconnect)
 	mux.HandleFunc("/_seal/oauth/callback", s.handleOAuthCallback)
 	mux.HandleFunc("/", s.handleProxy)
 

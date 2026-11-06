@@ -249,7 +249,8 @@ await ag.credentials.put(sealId, [
 ], { baseVersion: version });                            // CredentialsConflictError when someone wrote meanwhile
 
 // an MCP server: define a login entry, then open the link the agent returns
-await ag.credentials.login(sealId, 'linear');           // → { authorizeUrl }
+await ag.credentials.connect(sealId, 'linear');         // → { authorizeUrl }
+await ag.credentials.disconnect(sealId, 'linear');      // revoke at the server (RFC 7009) when it can, then remove
 
 // requests from the agent
 const waiting = await ag.credentials.pending(sealId);   // sealed's facts, and the agent's reason apart

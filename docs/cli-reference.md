@@ -98,7 +98,8 @@ The owner's credentials for the agent's sealed credential proxy (`sealed/CREDENT
 | `cred <agent> set <name> [k=v …]` | add or change one. The value is read from stdin when piped, else from a prompt that does not echo; never from an argument. Enter at the prompt keeps a stored value. Keys: `preset=<name>` (`cred presets`), `host=a,b`, `header='Name: … {v} …'`, `basic=<user>`, `query=<param>`, `body=<field>`, `path=yes`, `use=inject\|token_only\|sign`, `signer=<json>` (with `use=sign`: `sigv4`, `hmac`, `jwt`, `wallet`), `token=<json>` (a token request template), `writeback=yes\|no`, `reveal=yes\|no`, `expires=<YYYY-MM-DD\|unix>`, `desc=…`. `host=` replaces the hosts, any position key replaces the positions, the rest is kept. A new entry from a preset first prints where to create the key |
 | `cred <agent> set <name> preset=oauth2-refresh\|oauth2-client token_url=… client_id=… api_host=… [client_secret=<entry>] [scope=…]` | a refresh token (it rotates and is written back) or a client secret that sealed trades for access tokens; the agent runs a token request on `<name>` and uses `[[credential:derived:<name>]]` as a Bearer token on `api_host` |
 | `cred <agent> rm <name>` | remove one (revoke it at its provider too) |
-| `cred <agent> login <name> <mcp-url> [client_id=… client_secret_entry=… scope=a,b]` | log the agent in to an MCP server: defines the entry (Bearer on the server's host) if new or changed, prints the link to open, and waits for the login to land |
+| `cred <agent> connect <name> <mcp-url> [client_id=… client_secret_entry=… scope=a,b]` | connect an MCP server to the agent: defines the entry (Bearer on the server's host) if new or changed, prints the link where you log in, and waits for the connection to land |
+| `cred <agent> disconnect <name>` | the running agent asks the server to revoke the connection's tokens (RFC 7009) when the server offers that, and forgets them; then the entry is removed. When the server cannot revoke (or the agent is not running), it says so: revoke the app's access at the service. `rm` of a connection does the same |
 | `cred <agent> reveal <name> on\|off` | let the agent read the value itself without asking each time. Refused for an entry holding a login or a rotated token: the change would drop that value |
 | `cred <agent> pending` | requests waiting: what sealed knows apart from what the agent says |
 | `cred <agent> approve\|deny [<id>]` | decide one (an id prefix is enough; none when only one request waits); `approve` signs a one-time EIP-712 approval. A request to add a credential or log in is answered by `set` / `login` |
@@ -107,7 +108,7 @@ The owner's credentials for the agent's sealed credential proxy (`sealed/CREDENT
 | `cred notify [<email>\|off]` | where you are emailed when an agent waits for you or a credential is about to expire |
 | `cred presets` | the presets: hosts, positions, where to create each key and how to keep it narrow (no wallet needed) |
 
-In an agent's session (`0g-agentdna <agent>`), a request the agent waits on comes up at the prompt: reveal `[y]` once / `[a]` always / `[n]` refuse; add `[s]` set it now; login `[l]` log in now (the link is printed and the session waits for the login); `[Enter]` leaves it for later. The answer goes to the agent as your next message, so it carries on.
+In an agent's session (`0g-agentdna <agent>`), a request the agent waits on comes up at the prompt: reveal `[y]` once / `[a]` always / `[n]` refuse; add `[s]` set it now; connect `[c]` connect now (the link is printed and the session waits for the connection); `[Enter]` leaves it for later. The answer goes to the agent as your next message, so it carries on.
 
 Writes are a compare-and-swap like `settings` (exit 3, `CREDENTIALS_CONFLICT`). A write is stored at the attestor and pushed to the running agent; when the agent is not running it applies at the next boot.
 
@@ -180,6 +181,6 @@ npx @0gfoundation/0g-agentdna status 33                          # one agent's f
 npx @0gfoundation/0g-agentdna settings 286                       # show config
 npx @0gfoundation/0g-agentdna settings 286 model=glm-5.3 thinking=high   # change model + effort
 echo "$GITHUB_TOKEN" | npx @0gfoundation/0g-agentdna cred 286 set github preset=github   # give the agent a GitHub token
-npx @0gfoundation/0g-agentdna cred 286 login linear https://mcp.linear.app/mcp     # log the agent in to an MCP server
+npx @0gfoundation/0g-agentdna cred 286 connect linear https://mcp.linear.app/mcp   # connect an MCP server to the agent
 npx @0gfoundation/0g-agentdna list --mine --phase failed --json | jq -r '.data[].sealId'   # scripted
 ```

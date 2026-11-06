@@ -142,6 +142,7 @@ A login entry has `mcp.url` and no value of the owner's.
 2. sealed reads the server's protected resource metadata (RFC 9728, from the 401's `WWW-Authenticate` or the well-known path), then the authorization server's metadata (RFC 8414 or OpenID). It registers itself as a public client (RFC 7591) unless the entry gives a `client_id`, and answers with an authorization link carrying PKCE (S256), the `resource` indicator and a one-time `state`.
 3. The owner opens the link and consents. The browser returns to this agent's `<public URL>/_seal/oauth/callback`; the `state` (valid 10 minutes, used once) binds the code to that login. sealed exchanges the code with the verifier only it holds.
 4. The entry then serves the access token where the owner allowed it (Bearer on the server's host). Until then `GET /credentials` lists it with `status: awaiting_login`; from then on with `logged_in_at`, the agent's events show `entry_added`, and a `login` request for it is answered. sealed refreshes it a minute before it expires, keeps the rotated refresh token, and writes the login back. A refused refresh token becomes a `login` request for the owner.
+5. To disconnect, the owner calls `POST /_seal/credentials/disconnect {name}`: when the authorization server's metadata names a `revocation_endpoint`, sealed asks it to revoke the refresh token, then the access token (RFC 7009); either way it forgets them and the entry waits for a login again. The client then removes the entry. The CLI calls these `cred <agent> connect` and `disconnect`.
 
 The agent configures the MCP server with the header `Authorization: Bearer [[credential:<name>]]`.
 
@@ -156,6 +157,7 @@ Owner routes on the agent (`/_seal/*`, through `:8080`) take `X-Auth-Message` / 
 | `POST /_seal/credentials/decide` | `0GSealCredDecide` | `{auth_req_id, decision: "once" \| "deny", approval?, signature?}` |
 | `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | what the agent did (fills, token requests, signatures, reveals, logins, writebacks), and which entries a set skipped and why: never values. The last 1000 records, oldest first; the successful uses of what sealed supplies itself (`sealed:` entries, e.g. the framework's inference key) are one record each with `count`, `first` and the latest `ts` |
 | `POST /_seal/credentials/login` | `0GSealCredLogin` | start an MCP login; `{authorize_url}` |
+| `POST /_seal/credentials/disconnect` | `0GSealCredDisconnect` | end an MCP login: revoke at the server when it offers that, forget the tokens; `{revoked, note}` |
 | `GET /_seal/oauth/callback` | none | the browser's return from a login |
 
 **Approvals.** "Once" is an EIP-712 `Approval(bytes32 sealId,bytes32 bootId,bytes32 authReqId,bytes32 requestDigest,uint64 expiresAt)` signed by the live owner (same domain), bound to this boot, this request and its digest, used once (the SDK gives it 1 hour, never past the request's own expiry). Requests wait 72 hours and do not survive a restart; the agent asks again. A request to add a credential or log in is answered by doing it. Unanswered means no.

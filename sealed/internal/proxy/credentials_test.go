@@ -50,6 +50,13 @@ func (f *fakeCredentials) StartLogin(_ context.Context, name, redirect string) (
 	f.loginRedirect = redirect
 	return "https://auth.example/authorize?state=s1", nil
 }
+func (f *fakeCredentials) Disconnect(_ context.Context, name string) (bool, string, error) {
+	if name != "linear" {
+		return false, "", &credentials.LoginError{Reason: "no login entry named " + name}
+	}
+	return true, "", nil
+}
+
 func (f *fakeCredentials) FinishLogin(_ context.Context, state, code, _ string) (string, error) {
 	if state != "s1" || code == "" {
 		return "", &credentials.LoginError{Reason: "this login link is unknown or has expired; start the login again"}

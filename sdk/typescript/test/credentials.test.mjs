@@ -370,7 +370,7 @@ test('cli: set on a stored name keeps its value when the prompt is left empty', 
   assert.equal(ag2.calls.length, 0);
 });
 
-test('cli: login defines the entry from the URL once, then prints the link', async () => {
+test('cli: connect defines the entry from the URL once, then prints the link', async () => {
   const defs = [];
   const calls = [];
   const ag = {
@@ -383,12 +383,12 @@ test('cli: login defines the entry from the URL once, then prints the link', asy
       },
       agentUrl: async () => 'https://agent.example',
       loaded: async () => ({ version: 1, entries: [] }),
-      login: async (_seal, name) => { calls.push({ op: 'login', name }); return { authorizeUrl: 'https://auth.example/authorize?state=s' }; },
+      connect: async (_seal, name) => { calls.push({ op: 'connect', name }); return { authorizeUrl: 'https://auth.example/authorize?state=s' }; },
     },
   };
   const lines = [];
   const io = { json: false, out: (l) => lines.push(l), secret: async () => '' };
-  await credOp(ag, SEAL_ID, ['login', 'linear', 'https://mcp.linear.app/mcp', 'scope=read,write'], io);
+  await credOp(ag, SEAL_ID, ['connect', 'linear', 'https://mcp.linear.app/mcp', 'scope=read,write'], io);
   const put = calls.find((c) => c.op === 'put');
   const e = put.entries.find((x) => x.name === 'linear');
   assert.deepEqual(e.hosts, ['mcp.linear.app']);
@@ -397,12 +397,14 @@ test('cli: login defines the entry from the URL once, then prints the link', asy
   assert.ok(lines.some((l) => l.includes('https://auth.example/authorize?state=s')));
   // Again, unchanged: no new set, just a new link.
   calls.length = 0;
-  await credOp(ag, SEAL_ID, ['login', 'linear', 'https://mcp.linear.app/mcp', 'scope=read,write'], io);
-  assert.deepEqual(calls.map((c) => c.op), ['login']);
-  await assert.rejects(credOp(ag, SEAL_ID, ['login', 'linear', 'http://insecure.example/mcp'], io), (err) => err.code === 'BAD_FLAG');
+  await credOp(ag, SEAL_ID, ['connect', 'linear', 'https://mcp.linear.app/mcp', 'scope=read,write'], io);
+  assert.deepEqual(calls.map((c) => c.op), ['connect']);
+  await assert.rejects(credOp(ag, SEAL_ID, ['connect', 'linear', 'http://insecure.example/mcp'], io), (err) => err.code === 'BAD_FLAG');
+  // The old name is gone: login is the CLI's own setup command.
+  await assert.rejects(credOp(ag, SEAL_ID, ['login', 'linear', 'https://mcp.linear.app/mcp'], io), (err) => err.code === 'BAD_FLAG');
 });
 
-test('cli: login waits until the agent reports a new login', async () => {
+test('cli: connect waits until the agent reports a new login', async () => {
   // A second login to the same server: the entry is listed throughout and
   // only its logged_in_at says the new login is done.
   let polls = 0;
@@ -413,12 +415,12 @@ test('cli: login waits until the agent reports a new login', async () => {
       put: async () => { throw new Error('the definition is unchanged; nothing to store'); },
       agentUrl: async () => 'https://agent.example',
       loaded: async () => ({ version: 1, entries: [{ name: 'linear', source: 'owner', use: 'inject', hosts: ['mcp.linear.app'], logged_in_at: polls++ < 1 ? 100 : 200 }] }),
-      login: async () => ({ authorizeUrl: 'https://auth.example/authorize?state=s' }),
+      connect: async () => ({ authorizeUrl: 'https://auth.example/authorize?state=s' }),
     },
   };
   const lines = [];
-  await credOp(ag, SEAL_ID, ['login', 'linear', 'https://mcp.linear.app/mcp'], { json: false, wait: true, out: (l) => lines.push(l), secret: async () => '' });
-  assert.ok(lines.some((l) => l.startsWith('logged in:')), lines.join('\n'));
+  await credOp(ag, SEAL_ID, ['connect', 'linear', 'https://mcp.linear.app/mcp'], { json: false, wait: true, out: (l) => lines.push(l), secret: async () => '' });
+  assert.ok(lines.some((l) => l.startsWith('connected:')), lines.join('\n'));
 });
 
 test('cli: log puts the counted uses of sealed\'s own key first, then the last n records', async () => {
@@ -436,16 +438,16 @@ test('cli: log puts the counted uses of sealed\'s own key first, then the last n
   assert.deepEqual(renderAudit([]), ['no credential use recorded']);
 });
 
-test('cli: the list says whether a login entry is logged in, as the running agent has it', async () => {
+test('cli: the list says whether a connection is connected, as the running agent has it', async () => {
   const login = { v: 1, name: 'linear', hosts: ['mcp.linear.app'], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }], use: 'inject', value_hash: '', writeback: true, mcp: { url: 'https://mcp.linear.app/mcp' } };
   const run = async (loaded) => {
     const ag = { credentials: { get: async () => ({ version: 13, ownerEpoch: 0, document: null, definitions: [login] }), loaded } };
     const lines = [];
     await credOp(ag, SEAL_ID, ['ls'], { json: false, out: (l) => lines.push(l), secret: async () => '' });
-    return lines.find((l) => l.startsWith('  login')) ?? '';
+    return lines.find((l) => l.startsWith('  connected')) ?? '';
   };
-  assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', logged_in_at: 1793880023 }] })), /^  login      logged in 2026-/);
-  assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', status: 'awaiting_login' }] })), /not done yet — cred <agent> login linear https:\/\/mcp\.linear\.app\/mcp/);
+  assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', logged_in_at: 1793880023 }] })), /^  connected  2026-/);
+  assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', status: 'awaiting_login' }] })), /not yet — cred <agent> connect linear https:\/\/mcp\.linear\.app\/mcp/);
   assert.match(await run(async () => { throw new Error('agent down'); }), /unknown — the agent is not running/);
 });
 
@@ -507,7 +509,7 @@ test('session: a waiting reveal comes up at the prompt; the answer goes to the a
   assert.doesNotMatch(t.asked[0], /always/);
 });
 
-test('session: a login request is answered by logging in, and the agent is told once it is done', async () => {
+test('session: a login request is answered by connecting, and the agent is told once it is done', async () => {
   const req = { auth_req_id: '0xbb', op: 'login', name: 'linear', params: { url: 'https://mcp.linear.app/mcp' }, facts: {}, status: 'pending' };
   let polls = 0;
   const defs = [];
@@ -515,11 +517,34 @@ test('session: a login request is answered by logging in, and the agent is told 
     pending: async () => [req], get: async () => ({ version: 1, ownerEpoch: 0, document: null, definitions: defs }),
     put: async (_s, entries) => { defs.splice(0, defs.length, ...entries.map((e) => ({ ...e, v: 1, use: 'inject', value_hash: '' }))); return { version: 2 }; },
     agentUrl: async () => 'https://agent.example',
-    login: async () => ({ authorizeUrl: 'https://auth.example/authorize?state=s' }),
+    connect: async () => ({ authorizeUrl: 'https://auth.example/authorize?state=s' }),
     loaded: async () => ({ version: 2, entries: polls++ < 2 ? [{ name: 'linear', status: 'awaiting_login' }] : [{ name: 'linear', logged_in_at: 1793880023 }] }),
   } };
-  const t = sessionIO(['l']);
+  const t = sessionIO(['c']);
   const tell = await answerPending(ag, SEAL_ID, t.io, { later: new Set(), tokenize: (l) => l.split(' '), pollMs: 1 });
-  assert.deepEqual(tell, ['[cred] I logged you in: linear is in GET /credentials now.']);
+  assert.deepEqual(tell, ['[cred] I connected you: linear is in GET /credentials now.']);
   assert.ok(t.lines.some((l) => l.includes('https://auth.example/authorize?state=s')));
+});
+
+test('cli: disconnect revokes at the server and removes; rm of a connection does the same', async () => {
+  const login = { v: 1, name: 'linear', hosts: ['mcp.linear.app'], positions: [], use: 'inject', value_hash: '', writeback: true, mcp: { url: 'https://mcp.linear.app/mcp' } };
+  const plain = { v: 1, name: 'github', hosts: ['api.github.com'], positions: [], use: 'inject', value_hash: '0x01' };
+  const calls = [];
+  const ag = { credentials: {
+    get: async () => ({ version: 3, ownerEpoch: 0, document: null, definitions: [login, plain] }),
+    disconnect: async (_s, name) => { calls.push(['disconnect', name]); return name === 'linear' ? { version: 4, revoked: true } : { version: 4, revoked: false, note: 'x' }; },
+    remove: async (_s, name) => { calls.push(['remove', name]); return { version: 4 }; },
+  } };
+  const lines = [];
+  const io = { json: false, out: (l) => lines.push(l), secret: async () => '' };
+  await credOp(ag, SEAL_ID, ['disconnect', 'linear'], io);
+  assert.match(lines.at(-1), /^disconnected linear — version 4; its tokens are revoked at the server$/);
+  await credOp(ag, SEAL_ID, ['rm', 'linear'], io);
+  await credOp(ag, SEAL_ID, ['rm', 'github'], io);
+  assert.deepEqual(calls, [['disconnect', 'linear'], ['disconnect', 'linear'], ['remove', 'github']]);
+  await assert.rejects(credOp(ag, SEAL_ID, ['disconnect', 'github'], io), (e) => e.code === 'BAD_FLAG' && /not a connection/.test(e.message));
+  // Not revoked: say so, with the reason.
+  ag.credentials.disconnect = async () => ({ version: 5, revoked: false, note: 'the server offers no token revocation: revoke the app\'s access at the service' });
+  await credOp(ag, SEAL_ID, ['disconnect', 'linear'], io);
+  assert.match(lines.at(-1), /not revoked at the server: the server offers no token revocation/);
 });

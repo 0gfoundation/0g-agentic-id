@@ -40,10 +40,13 @@ type mcpState struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 	ExpiresAt    int64  `json:"expires_at,omitempty"`
 	LoggedInAt   int64  `json:"logged_in_at,omitempty"`
-	ClientID     string `json:"client_id"`
-	ClientSecret string `json:"client_secret,omitempty"`
-	TokenURL     string `json:"token_url"`
-	Resource     string `json:"resource"`
+	// RevocationURL is the authorization server's RFC 7009 endpoint, when
+	// its metadata names one: a disconnect asks it to revoke the tokens.
+	RevocationURL string `json:"revocation_url,omitempty"`
+	ClientID      string `json:"client_id"`
+	ClientSecret  string `json:"client_secret,omitempty"`
+	TokenURL      string `json:"token_url"`
+	Resource      string `json:"resource"`
 }
 
 func parseMCPState(b []byte) (*mcpState, bool) {
@@ -59,6 +62,7 @@ type loginAttempt struct {
 	name, verifier, redirectURI string
 	clientID, clientSecret      string
 	tokenURL, resource          string
+	revocationURL               string
 	expires                     time.Time
 }
 
@@ -71,6 +75,7 @@ const (
 // authServer is what discovery finds for an MCP server.
 type authServer struct {
 	authorize, token, register string
+	revocation                 string // RFC 7009; empty when not offered
 	resource                   string
 	scopes                     []string
 }
@@ -133,7 +138,7 @@ func (s *Store) StartLogin(ctx context.Context, name, redirectURI string) (strin
 		}
 	}
 	s.logins[state] = &loginAttempt{name: name, verifier: verifier, redirectURI: redirectURI, clientID: clientID,
-		clientSecret: secret, tokenURL: as.token, resource: as.resource, expires: now.Add(loginTTL)}
+		clientSecret: secret, tokenURL: as.token, resource: as.resource, revocationURL: as.revocation, expires: now.Add(loginTTL)}
 	s.mu.Unlock()
 
 	q := url.Values{
@@ -195,7 +200,7 @@ func (s *Store) FinishLogin(ctx context.Context, state, code, oauthError string)
 		return a.name, err
 	}
 	st := &mcpState{V: 1, Type: "mcp_login", AccessToken: tok.access, RefreshToken: tok.refresh, LoggedInAt: s.now().Unix(),
-		ClientID: a.clientID, ClientSecret: a.clientSecret, TokenURL: a.tokenURL, Resource: a.resource}
+		ClientID: a.clientID, ClientSecret: a.clientSecret, TokenURL: a.tokenURL, Resource: a.resource, RevocationURL: a.revocationURL}
 	if tok.expiresIn > 0 {
 		st.ExpiresAt = s.now().Unix() + tok.expiresIn
 	}
@@ -308,6 +313,94 @@ func (s *Store) refreshLogin(name string, attempt int) {
 	}
 	s.audit("refresh", name, st.TokenURL, "ok")
 	s.applyLogin(ctx, name, &next)
+}
+
+// Disconnect ends a login entry's login. When the authorization server
+// offers token revocation (RFC 7009), it is asked to revoke the refresh
+// token and the access token; either way sealed forgets them, so the entry
+// waits for a new login. The owner removes the entry after. revoked says
+// whether the server confirmed; note, when it did not, why.
+func (s *Store) Disconnect(ctx context.Context, name string) (revoked bool, note string, err error) {
+	lock := s.lockFor(name) // not while a refresh rotates the tokens
+	lock.Lock()
+	defer lock.Unlock()
+	s.mu.Lock()
+	def, raw := s.defs[name], s.values[name]
+	s.mu.Unlock()
+	if def == nil || def.MCP == nil {
+		return false, "", loginErr("no login entry named %q", name)
+	}
+	endpoint := ""
+	if st, ok := parseMCPState(raw); !ok {
+		note = "not connected: there was nothing to revoke"
+	} else {
+		endpoint = st.RevocationURL
+		if endpoint == "" { // connected before sealed kept the endpoint
+			if as, derr := s.discover(ctx, def.MCP.URL); derr == nil {
+				endpoint = as.revocation
+			}
+		}
+		if endpoint == "" {
+			note = "the server offers no token revocation: revoke the app's access at the service"
+		} else {
+			revoked, note = s.revoke(ctx, endpoint, st)
+		}
+	}
+	s.mu.Lock()
+	if t := s.refreshTimers[name]; t != nil {
+		t.Stop()
+		delete(s.refreshTimers, name)
+	}
+	if raw != nil {
+		s.values[name] = nil
+		s.events.add(Event{Type: "entry_removed", Name: name})
+	}
+	s.syncRegistryLocked()
+	s.mu.Unlock()
+	result := "revoked at the server"
+	if !revoked {
+		result = "forgotten; " + note
+	}
+	s.audit("disconnect", name, endpoint, result)
+	return revoked, note, nil
+}
+
+// revoke asks endpoint to revoke the login's refresh token, then its access
+// token (RFC 7009 §2.1); the answer to the first one decides.
+func (s *Store) revoke(ctx context.Context, endpoint string, st *mcpState) (bool, string) {
+	tokens := [][2]string{{st.RefreshToken, "refresh_token"}, {st.AccessToken, "access_token"}}
+	confirmed, asked := false, false
+	note := ""
+	for _, t := range tokens {
+		if t[0] == "" {
+			continue
+		}
+		form := url.Values{"token": {t[0]}, "token_type_hint": {t[1]}, "client_id": {st.ClientID}}
+		if st.ClientSecret != "" {
+			form.Set("client_secret", st.ClientSecret)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+		if err != nil {
+			return false, "the revocation endpoint is not valid"
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := s.httpClient().Do(req)
+		ok := err == nil && resp.StatusCode/100 == 2
+		if err == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxTokenResponse))
+			resp.Body.Close()
+		}
+		if !asked {
+			asked, confirmed = true, ok
+			switch {
+			case err != nil:
+				note = "the revocation endpoint is unreachable: revoke the app's access at the service"
+			case !ok:
+				note = fmt.Sprintf("the revocation endpoint answered %d: revoke the app's access at the service", resp.StatusCode)
+			}
+		}
+	}
+	return confirmed, note
 }
 
 type tokenResult struct {
@@ -442,6 +535,7 @@ func (s *Store) discover(ctx context.Context, mcpURL string) (*authServer, error
 			AuthorizationEndpoint         string   `json:"authorization_endpoint"`
 			TokenEndpoint                 string   `json:"token_endpoint"`
 			RegistrationEndpoint          string   `json:"registration_endpoint"`
+			RevocationEndpoint            string   `json:"revocation_endpoint"`
 			CodeChallengeMethodsSupported []string `json:"code_challenge_methods_supported"`
 			ScopesSupported               []string `json:"scopes_supported"`
 		}
@@ -460,6 +554,9 @@ func (s *Store) discover(ctx context.Context, mcpURL string) (*authServer, error
 			meta.RegistrationEndpoint = ""
 		}
 		as.authorize, as.token, as.register = meta.AuthorizationEndpoint, meta.TokenEndpoint, meta.RegistrationEndpoint
+		if strings.HasPrefix(meta.RevocationEndpoint, "https://") {
+			as.revocation = meta.RevocationEndpoint
+		}
 		if len(as.scopes) == 0 {
 			as.scopes = meta.ScopesSupported
 		}
