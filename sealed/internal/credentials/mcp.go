@@ -522,7 +522,7 @@ func (s *Store) Disconnect(ctx context.Context, name string) (revoked bool, note
 		// what is there now is not this login's to forget.
 		s.mu.Unlock()
 		s.audit("disconnect", name, endpoint, "the entry changed meanwhile; nothing forgotten")
-		return revoked, note, nil
+		return revoked, note, loginErr("the entry changed while the disconnect ran; nothing was forgotten, disconnect again")
 	}
 	if t := s.refreshTimers[name]; t != nil {
 		t.Stop()
@@ -795,7 +795,7 @@ func (s *Store) getJSON(ctx context.Context, u string, v any) error {
 // authorization link) or posts to.
 func cleanHTTPS(u string) bool {
 	p, err := url.Parse(u)
-	return err == nil && p.Scheme == "https" && p.Host != "" && p.User == nil && !hasControl(u) && !strings.ContainsAny(u, " ")
+	return err == nil && p.Scheme == "https" && p.Hostname() != "" && p.User == nil && !hasControl(u) && !strings.ContainsAny(u, " ")
 }
 
 // resourceCovers reports whether resource identifies the MCP server at

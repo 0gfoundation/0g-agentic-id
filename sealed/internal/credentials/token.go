@@ -386,8 +386,8 @@ func auditRecord(now time.Time, op, name, target, result string) AuditRecord {
 func (s *Store) rotate(ctx context.Context, def *Definition, gen uint64, value []byte) (applied, had bool) {
 	// A value the proxy could not serve (over credproxy.MaxValueLen, say)
 	// is not taken: the entry keeps the value it has.
-	if err := def.Entry(value).Validate(); err != nil {
-		s.auditRepeat("rotate", def.Name, "", "refused: "+err.Error())
+	if def.Entry(value).Validate() != nil {
+		s.auditRepeat("rotate", def.Name, "", "refused: a value the proxy cannot serve")
 		return false, false
 	}
 	s.mu.Lock()

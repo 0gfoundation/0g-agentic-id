@@ -207,7 +207,7 @@ export function brakeInterruptLine(e: unknown): string {
     // reclaims and resends.
     return '\n⚠ this agent is now driven by another client — send a message to take the seat back\n';
   }
-  return `\n(interrupt failed: ${msg})\n`;
+  return `\n(interrupt failed: ${cleanCell(msg)})\n`;
 }
 
 /**
@@ -227,7 +227,7 @@ export async function routeTaskFailure(
 ): Promise<'reclaimed' | 'left' | 'raw'> {
   const d = await seat((e as Error)?.message ?? '', seatHint, 'leaves the seat with the other client');
   if (d !== null) return d;
-  if (rawLine) print(rawLine);
+  if (rawLine) print(cleanStream(rawLine));
   return 'raw';
 }
 
@@ -597,7 +597,69 @@ function containerUrl(sandboxId: string, proxy: string): string {
     : `https://8080-${sandboxId}.${proxy}`;
 }
 const og = (wei: bigint | null | undefined): string => (wei == null ? 'n/a' : `${(Number(wei) / 1e18).toFixed(6)} OG`);
-const out = (s: string): void => void process.stdout.write(s);
+/** The shell's question: the answer to q. fresh asks for a line typed after
+ *  q is shown (see run). */
+type Ask = ((q: string) => Promise<string>) & { fresh?: (q: string) => Promise<string> };
+
+/**
+ * The shell's `ask` as a line QUEUE, not rl.question: lines that arrive while
+ * no question is pending (piped input racing the ~4s async banner) used to be
+ * consumed by readline with no listener and silently dropped — commands
+ * vanished with exit 0 (feedback.md F5). Buffer them instead. ask.fresh is
+ * for a question whose answer signs something: on a terminal (tty), lines
+ * typed before it is shown (during a turn, say) are dropped, not taken as the
+ * answer.
+ */
+export function lineQueue(
+  rl: { on(ev: 'line', f: (l: string) => void): unknown; on(ev: 'close', f: () => void): unknown; setPrompt(q: string): void; prompt(): void },
+  tty: () => boolean,
+): Ask {
+  const pendingLines: string[] = [];
+  const waiters: Array<{ res: (s: string) => void; rej: (e: Error) => void }> = [];
+  rl.on('line', (l) => {
+    const w = waiters.shift();
+    if (w) w.res(l);
+    else pendingLines.push(l);
+  });
+  let stdinClosed = false;
+  rl.on('close', () => {
+    // EOF while a question is pending — surface the same code rl.question
+    // would, which run() already treats as a normal way to leave.
+    stdinClosed = true;
+    for (const w of waiters.splice(0)) {
+      w.rej(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
+    }
+  });
+  const ask: Ask = (q: string): Promise<string> => {
+    const buffered = pendingLines.shift();
+    if (buffered !== undefined) {
+      out(`${q}${buffered}\n`); // keep the transcript readable in pipes/logs
+      return Promise.resolve(buffered);
+    }
+    if (stdinClosed) {
+      return Promise.reject(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
+    }
+    rl.setPrompt(q);
+    rl.prompt();
+    return new Promise((res, rej) => waiters.push({ res, rej }));
+  };
+  ask.fresh = (q: string): Promise<string> => {
+    if (tty()) pendingLines.length = 0;
+    return ask(q);
+  };
+  return ask;
+}
+
+/** Writes to the terminal as is: only for the shell's own control sequences. */
+const term = (s: string): void => void process.stdout.write(s);
+/**
+ * Writes text to the terminal with escape sequences, control characters
+ * (newlines and tabs kept) and bidi controls removed. Everything the shell
+ * prints goes through here unless it is the shell's own control sequence
+ * (term): much of what it prints comes from the agent or its server, and
+ * nothing of that may restyle, hide or rewrite what the owner reads.
+ */
+const out = (s: string): void => term(cleanStream(s));
 
 interface Session {
   ag: AgenticID;
@@ -762,12 +824,12 @@ export async function pollRunning(
   const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
   let spin = 0;
   let spinnerShown = false;
-  const clearSpinner = (): void => { if (spinnerShown) { out('\r\x1b[2K'); spinnerShown = false; } };
+  const clearSpinner = (): void => { if (spinnerShown) { term('\r\x1b[2K'); spinnerShown = false; } };
   const ticker = process.stdout.isTTY
     ? setInterval(() => {
         if (signal?.aborted) return;
         spin = (spin + 1) % SPIN.length;
-        out(`\r\x1b[2K  ${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · esc stops waiting, not the deploy)`);
+        term(`\r\x1b[2K  ${cleanCell(`${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · esc stops waiting, not the deploy)`)}`);
         spinnerShown = true;
       }, 1000)
     : null;
@@ -875,40 +937,8 @@ export async function run(ctx: CommandContext): Promise<void> {
     completer: (line: string): [string[], string] =>
       completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds }),
   });
-  // `ask` is a line QUEUE, not rl.question: lines that arrive while no
-  // question is pending (piped input racing the ~4s async banner) used to be
-  // consumed by readline with no listener and silently dropped — commands
-  // vanished with exit 0 (feedback.md F5). Buffer them instead.
-  const pendingLines: string[] = [];
-  const waiters: Array<{ res: (s: string) => void; rej: (e: Error) => void }> = [];
-  rl.on('line', (l) => {
-    const w = waiters.shift();
-    if (w) w.res(l);
-    else pendingLines.push(l);
-  });
   activeRl = rl;
-  let stdinClosed = false;
-  rl.on('close', () => {
-    // EOF while a question is pending — surface the same code rl.question
-    // would, which run() already treats as a normal way to leave.
-    stdinClosed = true;
-    for (const w of waiters.splice(0)) {
-      w.rej(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
-    }
-  });
-  const ask = (q: string): Promise<string> => {
-    const buffered = pendingLines.shift();
-    if (buffered !== undefined) {
-      out(`${q}${buffered}\n`); // keep the transcript readable in pipes/logs
-      return Promise.resolve(buffered);
-    }
-    if (stdinClosed) {
-      return Promise.reject(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
-    }
-    rl.setPrompt(q);
-    rl.prompt();
-    return new Promise((res, rej) => waiters.push({ res, rej }));
-  };
+  const ask = lineQueue(rl, () => !!process.stdin.isTTY);
   const irq: Interrupt = { streaming: null, brake: null };
 
   let lastSigint = 0;
@@ -1054,7 +1084,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     const art = pandaLines();
     const caption = ['', '', '', '   \x1b[1m0G AgentDNA\x1b[0m', '   interactive shell', '', '', ''];
     out('\n');
-    art.forEach((l, i) => out(`  ${l}${caption[i] ?? ''}\n`));
+    art.forEach((l, i) => term(`  ${l}${caption[i] ?? ''}\n`));
     out('\n');
   } else {
     out('\n╭──────────────────────────────────────╮\n');
@@ -2001,7 +2031,11 @@ async function withWallet(ctx: CommandContext): Promise<AgenticID> {
 
 /** How credOp talks inside the REPL: lines out, values through askSecret. */
 function credIO(ask: (q: string) => Promise<string>) {
-  return { json: false, out: (l: string) => out(`${l}\n`), secret: (p: string) => askSecret(ask, p) };
+  return {
+    json: false, out: (l: string) => out(`${l}\n`), secret: (p: string) => askSecret(ask, p),
+    // The credential prompts' terminal reset: on a terminal only.
+    raw: (s: string) => { if (process.stdout.isTTY) term(s); },
+  };
 }
 
 /** Prompt for a secret with the typed characters not echoed. readline has no
@@ -2502,7 +2536,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       const ac = new AbortController();
       irq.streaming = ac; // Esc stops waiting for a login
       try {
-        const tell = await answerPending(await withWallet(ctx), s.sealId, { ...credIO(ask), ask }, {
+        const tell = await answerPending(await withWallet(ctx), s.sealId, { ...credIO(ask), ask: (ask as Ask).fresh ?? ask }, {
           agentUrl: s.url, later: credLater, tokenize, signal: ac.signal,
         });
         if (tell.length) queued.push(tell.join('\n'));
@@ -3020,7 +3054,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       let statusShown = false;
       let sawToolActivity = false;
       const clearActivity = (): void => {
-        if (statusShown) { out('\r\x1b[2K'); statusShown = false; }
+        if (statusShown) { term('\r\x1b[2K'); statusShown = false; }
       };
       const paintStatus = (): void => {
         if (!process.stdout.isTTY || ac.signal.aborted) return;
@@ -3029,7 +3063,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!statusShown && reply && !reply.endsWith('\n')) out('\n');
         const secs = Math.floor((Date.now() - turnT0) / 1000);
         spin = (spin + 1) % SPIN.length;
-        out(`\r\x1b[2K  ${SPIN[spin]} ${status}… (${secs}s · esc to interrupt)`);
+        term(`\r\x1b[2K  ${cleanCell(`${SPIN[spin]} ${status}… (${secs}s · esc to interrupt)`)}`);
         statusShown = true;
       };
       const onActivity = process.stdout.isTTY

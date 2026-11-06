@@ -542,7 +542,7 @@ export function printable(v: unknown): string {
   // Control characters, and format characters (bidi overrides and the like),
   // which could make a line read differently from what it holds.
   // eslint-disable-next-line no-control-regex
-  return String(v).replace(/[\u0000-\u001f\u007f-\u009f]|\p{Cf}/gu, (c) => `\\u${c.codePointAt(0)!.toString(16).padStart(4, '0')}`);
+  return String(v).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]|\p{Cf}|[^\P{Zs} ]/gu, (c) => `\\u${c.codePointAt(0)!.toString(16).padStart(4, '0')}`);
 }
 
 /** What sealed knows about a request, without the empty fields. */
@@ -592,6 +592,8 @@ export interface CredIO {
   out(line: string): void;
   /** Read a value without echoing it. */
   secret(prompt: string): Promise<string>;
+  /** Write the CLI's own control sequence (a terminal reset), unfiltered; absent off a terminal. */
+  raw?(s: string): void;
 }
 
 function conflict(e: unknown): never {
@@ -840,112 +842,121 @@ export async function answerPending(
   if (!open.length) return [];
   const tell: string[] = [];
   for (const p of open) {
-    // Read again for each request: an answer to the one before may have
-    // changed them.
-    const defs = (await cred.get(sealId)).definitions;
-    // Whatever the agent printed before is not carried into the prompt: a
-    // soft terminal reset (margins, modes, character sets, attributes).
-    io.out('\x1b[!p\x1b[0m');
-    // The agent's words first, so that what follows them, up to the
-    // prompt, is the CLI's own.
-    if (p.reason) io.out(`the agent says: ${JSON.stringify(p.reason)}`);
-    io.out(`⚑ the agent asks to ${p.op === 'reveal' ? `read the value of ${p.name}` : p.op === 'login' ? `be connected to ${printable(p.params?.url ?? 'an MCP server')} as ${p.name}` : `get a credential named ${p.name}`}`);
-    for (const l of factLines(p)) io.out(l);
-    const later = (): void => {
-      opts.later.add(p.auth_req_id);
-      io.out(`  left for later — cred <agent> pending lists it`);
-    };
-    const refuse = async (): Promise<void> => {
-      await cred.deny(sealId, p.auth_req_id, at);
-      tell.push(`[cred] I refused your request to ${p.op} ${p.name}.`);
-    };
-    if (p.op === 'reveal') {
-      // "Always" is for the owner's own entries; a derived token is allowed
-      // through the entry it came from.
-      const owned = defs.some((d) => d.name === p.name);
-      const a = (await io.ask(`  read ${p.name}? [y] allow once${owned ? '  [a] always allow' : ''}  [n] refuse  [Enter] later: `)).trim().toLowerCase();
-      if (a === 'y') {
-        await cred.approveOnce(sealId, p.auth_req_id, at);
-        tell.push(`[cred] I approved your request to read ${p.name}, this once. Send the same reveal request again.`);
-      } else if (a === 'a' && owned) {
-        const out = await cred.setAllowReveal(sealId, p.name, true, at);
-        if (out.pushWarning) {
-          io.out(`  stored, but the running agent did not take it: ${out.pushWarning} — it applies on the next boot`);
-          tell.push(`[cred] I allowed you to read ${p.name} without asking; it applies once you are restarted.`);
-        } else tell.push(`[cred] You may read ${p.name} without asking from now on. Send the same reveal request again.`);
-      } else if (a === 'n') await refuse();
-      else later();
-    } else if (p.op === 'add') {
-      // An existing entry is the owner's to change, with `set` itself: the
-      // agent's request does not move it.
-      if (defs.some((d) => d.name === p.name)) {
-        io.out(`  ${p.name} is already set; to change it, run: cred <agent> set ${p.name} …`);
-        const a = (await io.ask(`  [n] refuse  [Enter] later: `)).trim().toLowerCase();
-        if (a === 'n') await refuse();
-        else later();
-        continue;
-      }
-      const a = (await io.ask(`  add ${p.name}? [s] set it now  [n] refuse  [Enter] later: `)).trim().toLowerCase();
-      // Checked again as the answer comes: an entry set meanwhile is not
-      // the agent's request to change.
-      if (a === 's' && (await cred.get(sealId)).definitions.some((d) => d.name === p.name)) {
-        io.out(`  ${p.name} was set meanwhile; to change it, run: cred <agent> set ${p.name} …`);
-        later();
-      } else if (a === 's') {
-        let args = p.params?.preset ? [`preset=${p.params.preset}`] : [];
-        if (!args.length) {
-          const how = (await io.ask(`  how may ${p.name} be used? (preset=<name>, or host=… header='Name: … {v}' …; cred presets lists them): `)).trim();
-          args = opts.tokenize(how);
-        }
-        await credOp(ag, sealId, ['set', p.name, ...args], io, opts.agentUrl);
-        tell.push(`[cred] I added the credential ${p.name}; it is in GET /credentials now.`);
-      } else if (a === 'n') await refuse();
-      else later();
-    } else if (p.op === 'login') {
-      const url = p.params?.url;
-      // An existing connection is the owner's to point elsewhere, with
-      // `connect` itself: the agent's request does not change its server.
-      const existing = defs.find((d) => d.name === p.name)?.mcp?.url;
-      if (url && existing && existing !== url) {
-        io.out(`  ${p.name} is connected to ${printable(existing)}; the agent asks for ${printable(url)}.`);
-        io.out(`  To change it, run: cred <agent> connect ${p.name} <url>`);
-        const a = (await io.ask(`  [n] refuse  [Enter] later: `)).trim().toLowerCase();
-        if (a === 'n') await refuse();
-        else later();
-        continue;
-      }
-      let host = '';
-      try {
-        const u = url ? new URL(url) : undefined;
-        if (u && u.protocol === 'https:' && !u.username && !u.password) host = u.host;
-      } catch {
-        host = '';
-      }
-      const a = host ? (await io.ask(`  connect ${p.name} to ${printable(host)}? [c] connect now  [n] refuse  [Enter] later: `)).trim().toLowerCase() : '';
-      const moved = async (): Promise<boolean> => {
-        const now = (await cred.get(sealId)).definitions.find((d) => d.name === p.name)?.mcp?.url;
-        return !!now && now !== url;
+    try {
+      // Read again for each request: an answer to the one before may have
+      // changed them.
+      const defs = (await cred.get(sealId)).definitions;
+      // Whatever the agent printed before is not carried into the prompt: a
+      // soft terminal reset (margins, modes, character sets, attributes) and
+      // the default colours and palette back (OSC 104, 110-112).
+      io.raw?.('\x1b[!p\x1b[0m\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\');
+      io.out('');
+      // The agent's words first, so that what follows them, up to the
+      // prompt, is the CLI's own.
+      if (p.reason) io.out(`the agent says: ${printable(JSON.stringify(p.reason))}`);
+      io.out(`⚑ the agent asks to ${p.op === 'reveal' ? `read the value of ${p.name}` : p.op === 'login' ? `be connected to ${printable(p.params?.url ?? 'an MCP server')} as ${p.name}` : `get a credential named ${p.name}`}`);
+      for (const l of factLines(p)) io.out(l);
+      const later = (): void => {
+        opts.later.add(p.auth_req_id);
+        io.out(`  left for later — cred <agent> pending lists it`);
       };
-      if (a === 'c' && url && (await moved())) {
-        io.out(`  ${p.name} was connected elsewhere meanwhile; to change it, run: cred <agent> connect ${p.name} <url>`);
-        later();
-      } else if (a === 'c' && url) {
-        const before = (await cred.loaded(sealId, at)).entries.find((e) => e.name === p.name)?.logged_in_at;
-        await credOp(ag, sealId, ['connect', p.name, url], { ...io, wait: false }, opts.agentUrl);
-        io.out('  waiting for the connection to complete (Esc stops waiting, not the login)…');
-        const deadline = Date.now() + (opts.loginWaitMs ?? 10 * 60_000);
-        let done = false;
-        while (!done && Date.now() < deadline && !opts.signal?.aborted) {
-          await new Promise((r) => setTimeout(r, opts.pollMs ?? 3000));
-          const now = (await cred.loaded(sealId, at).catch(() => undefined))?.entries.find((e) => e.name === p.name)?.logged_in_at;
-          done = !!now && now !== before;
+      const refuse = async (): Promise<void> => {
+        await cred.deny(sealId, p.auth_req_id, at);
+        tell.push(`[cred] I refused your request to ${p.op} ${p.name}.`);
+      };
+      if (p.op === 'reveal') {
+        // "Always" is for the owner's own entries; a derived token is allowed
+        // through the entry it came from.
+        const owned = defs.some((d) => d.name === p.name);
+        const a = (await io.ask(`  read ${p.name}? [y] allow once${owned ? '  [a] always allow' : ''}  [n] refuse  [Enter] later: `)).trim().toLowerCase();
+        if (a === 'y') {
+          await cred.approveOnce(sealId, p.auth_req_id, at);
+          tell.push(`[cred] I approved your request to read ${p.name}, this once. Send the same reveal request again.`);
+        } else if (a === 'a' && owned) {
+          const out = await cred.setAllowReveal(sealId, p.name, true, at);
+          if (out.pushWarning) {
+            io.out(`  stored, but the running agent did not take it: ${out.pushWarning} — it applies on the next boot`);
+            tell.push(`[cred] I allowed you to read ${p.name} without asking; it applies once you are restarted.`);
+          } else tell.push(`[cred] You may read ${p.name} without asking from now on. Send the same reveal request again.`);
+        } else if (a === 'n') await refuse();
+        else later();
+      } else if (p.op === 'add') {
+        // An existing entry is the owner's to change, with `set` itself: the
+        // agent's request does not move it.
+        if (defs.some((d) => d.name === p.name)) {
+          io.out(`  ${p.name} is already set; to change it, run: cred <agent> set ${p.name} …`);
+          const a = (await io.ask(`  [n] refuse  [Enter] later: `)).trim().toLowerCase();
+          if (a === 'n') await refuse();
+          else later();
+          continue;
         }
-        if (done) {
-          io.out(`  connected: the agent uses [[credential:${p.name}]]`);
-          tell.push(`[cred] I connected you: ${p.name} is in GET /credentials now.`);
-        } else later();
-      } else if (a === 'n') await refuse();
-      else later();
+        const a = (await io.ask(`  add ${p.name}? [s] set it now  [n] refuse  [Enter] later: `)).trim().toLowerCase();
+        // Checked again as the answer comes: an entry set meanwhile is not
+        // the agent's request to change.
+        if (a === 's' && (await cred.get(sealId)).definitions.some((d) => d.name === p.name)) {
+          io.out(`  ${p.name} was set meanwhile; to change it, run: cred <agent> set ${p.name} …`);
+          later();
+        } else if (a === 's') {
+          let args = p.params?.preset ? [`preset=${p.params.preset}`] : [];
+          if (!args.length) {
+            const how = (await io.ask(`  how may ${p.name} be used? (preset=<name>, or host=… header='Name: … {v}' …; cred presets lists them): `)).trim();
+            args = opts.tokenize(how);
+          }
+          await credOp(ag, sealId, ['set', p.name, ...args], io, opts.agentUrl);
+          tell.push(`[cred] I added the credential ${p.name}; it is in GET /credentials now.`);
+        } else if (a === 'n') await refuse();
+        else later();
+      } else if (p.op === 'login') {
+        const url = p.params?.url;
+        // An existing connection is the owner's to point elsewhere, with
+        // `connect` itself: the agent's request does not change its server.
+        const existing = defs.find((d) => d.name === p.name)?.mcp?.url;
+        if (url && existing && existing !== url) {
+          io.out(`  ${p.name} is connected to ${printable(existing)}; the agent asks for ${printable(url)}.`);
+          io.out(`  To change it, run: cred <agent> connect ${p.name} <url>`);
+          const a = (await io.ask(`  [n] refuse  [Enter] later: `)).trim().toLowerCase();
+          if (a === 'n') await refuse();
+          else later();
+          continue;
+        }
+        let host = '';
+        try {
+          const u = url ? new URL(url) : undefined;
+          if (u && u.protocol === 'https:' && !u.username && !u.password) host = u.host;
+        } catch {
+          host = '';
+        }
+        const a = host ? (await io.ask(`  connect ${p.name} to ${printable(host)}? [c] connect now  [n] refuse  [Enter] later: `)).trim().toLowerCase() : '';
+        const moved = async (): Promise<boolean> => {
+          const now = (await cred.get(sealId)).definitions.find((d) => d.name === p.name)?.mcp?.url;
+          return !!now && now !== url;
+        };
+        if (a === 'c' && url && (await moved())) {
+          io.out(`  ${p.name} was connected elsewhere meanwhile; to change it, run: cred <agent> connect ${p.name} <url>`);
+          later();
+        } else if (a === 'c' && url) {
+          const before = (await cred.loaded(sealId, at)).entries.find((e) => e.name === p.name)?.logged_in_at;
+          await credOp(ag, sealId, ['connect', p.name, url], { ...io, wait: false }, opts.agentUrl);
+          io.out('  waiting for the connection to complete (Esc stops waiting, not the login)…');
+          const deadline = Date.now() + (opts.loginWaitMs ?? 10 * 60_000);
+          let done = false;
+          while (!done && Date.now() < deadline && !opts.signal?.aborted) {
+            await new Promise((r) => setTimeout(r, opts.pollMs ?? 3000));
+            const now = (await cred.loaded(sealId, at).catch(() => undefined))?.entries.find((e) => e.name === p.name)?.logged_in_at;
+            done = !!now && now !== before;
+          }
+          if (done) {
+            io.out(`  connected: the agent uses [[credential:${p.name}]]`);
+            tell.push(`[cred] I connected you: ${p.name} is in GET /credentials now.`);
+          } else later();
+        } else if (a === 'n') await refuse();
+        else later();
+      }
+    } catch (e) {
+      // One request that could not be answered does not lose the answers
+      // to the others: it is left for later and the owner is told why.
+      io.out(`  could not answer: ${printable(e instanceof Error ? e.message : String(e))}`);
+      opts.later.add(p.auth_req_id);
     }
   }
   return tell;

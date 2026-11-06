@@ -178,7 +178,7 @@ func TestFoldedRefusalKeepsEntryAndHost(t *testing.T) {
 	rec := func(name, host, code string) {
 		s.Record(credproxy.Record{Time: time.Now(), Names: []string{name}, Host: host, Method: "GET", Code: code})
 	}
-	for i := 0; i < maxOpKeys; i++ {
+	for i := 0; i < maxResultKeys+1; i++ {
 		rec(fmt.Sprintf("junk%d", i), "api.example", "unknown_entry")
 	}
 	rec("github", "elsewhere.example", "host_not_allowed")

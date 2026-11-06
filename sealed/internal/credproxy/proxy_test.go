@@ -1461,7 +1461,7 @@ func TestPathPlaceholderPercentEncodedFilled(t *testing.T) {
 // first 64 KiB too: the upload stops there and the request is answered 413.
 // A large body naming none goes through whole.
 func TestBigBodyPlaceholderPastFirstChunkRefused(t *testing.T) {
-	ts, got := upstream(t)
+	ts, _ := upstream(t)
 	h := newHarness(t, ts)
 	pad := strings.Repeat("a", maxBodyBytes+10)
 	for _, ph := range []string{"[[credential:github]]", "%5B%5Bcredential%3Agithub%5D%5D", `[[credential:github]]`} {
@@ -1486,8 +1486,13 @@ func TestBigBodyPlaceholderPastFirstChunkRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	readAll(t, resp)
-	if resp.StatusCode != 200 || got.snapshot().body != body {
+	// The echo of this very request: an upload refused above may still be
+	// recorded by the upstream after it, so the shared snapshot is not used.
+	var echo struct {
+		Body string `json:"body"`
+	}
+	_ = json.Unmarshal([]byte(readAll(t, resp)), &echo)
+	if resp.StatusCode != 200 || echo.Body != body {
 		t.Fatalf("a large body naming no placeholder: status %d", resp.StatusCode)
 	}
 }

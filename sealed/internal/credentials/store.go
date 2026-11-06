@@ -55,7 +55,6 @@ const (
 	maxAuditNames   = 16
 	maxAuditName    = 80
 	maxCountKeys    = 1024 // all kinds together, a backstop
-	maxOpKeys       = 96   // the named kinds of one operation
 	maxResultKeys   = 32   // the named kinds of one operation with one result
 )
 
@@ -158,7 +157,7 @@ type Store struct {
 
 	auditMu     sync.Mutex
 	auditCounts map[string]*AuditRecord // counted records, by countKey
-	auditOpKeys map[string]int          // counted kinds per operation, and per operation and result
+	auditOpKeys map[string]int          // counted kinds per operation and result class
 	// Listed records, in three rings so that what the harness can cause
 	// (proxy uses, signatures) never pushes out the rest: the owner's
 	// decisions, logins, loads and what sealed did itself.
@@ -293,18 +292,28 @@ func counted(r AuditRecord) bool {
 	return true
 }
 
+// resultClass is a result's kind: the text before a colon ("refused: …"
+// counts as "refused"), so the results a budget is kept for are a bounded
+// set.
+func resultClass(r string) string {
+	if i := strings.IndexByte(r, ':'); i > 0 {
+		return r[:i]
+	}
+	return r
+}
+
 func countKey(r AuditRecord) string {
 	return strings.Join([]string{r.Op, strings.Join(r.Names, ","), r.Method, r.Host, r.Result}, "\x00")
 }
 
 // countLocked adds n uses ending at r.Time (from r.First when set). Each
-// operation has its own budget of maxOpKeys named kinds, and each of its
-// results maxResultKeys of them; past either, further kinds are counted by
-// operation and result alone (a bounded set). So what the harness floods one
-// operation or result with never takes another's budget: refused uses of
-// unknown names leave room for a host an entry does not allow, and proxy
-// uses leave room for reveals. maxCountKeys is a backstop past which kinds
-// are counted by operation.
+// operation and result (the result's class: the text before a colon) has its
+// own budget of maxResultKeys named kinds; past it, further kinds are
+// counted by operation and result class alone, a bounded set. So what the
+// harness floods one result with blurs only that result's later kinds:
+// refused uses of unknown names leave a host an entry does not allow, the
+// owner's own uses and every other operation named. maxCountKeys is a
+// backstop past which kinds are counted by operation.
 func (s *Store) countLocked(r AuditRecord, n int) {
 	first := r.Time
 	if r.First != nil {
@@ -314,16 +323,15 @@ func (s *Store) countLocked(r AuditRecord, n int) {
 		switch {
 		case len(s.auditCounts) >= maxCountKeys:
 			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: "more kinds", Time: r.Time, First: r.First}
-		case s.auditOpKeys[r.Op] >= maxOpKeys || s.auditOpKeys[r.Op+"\x00"+r.Result] >= maxResultKeys:
-			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: r.Result, Time: r.Time, First: r.First}
+		case s.auditOpKeys[r.Op+"\x00"+resultClass(r.Result)] >= maxResultKeys:
+			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: resultClass(r.Result), Time: r.Time, First: r.First}
 		}
 	}
 	c := s.auditCounts[countKey(r)]
 	if c == nil {
 		c = &AuditRecord{Op: r.Op, Names: r.Names, Method: r.Method, Host: r.Host, Result: r.Result, Time: r.Time, First: &first}
 		s.auditCounts[countKey(r)] = c
-		s.auditOpKeys[r.Op]++
-		s.auditOpKeys[r.Op+"\x00"+r.Result]++
+		s.auditOpKeys[r.Op+"\x00"+resultClass(r.Result)]++
 	} else {
 		if first.Before(*c.First) {
 			c.First = &first
@@ -940,7 +948,7 @@ func (s *Store) Request(op, name string, params map[string]string, reason string
 			return nil, &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "parameter " + k + " is too long"}
 		}
 		// What the owner is shown stays text: no control characters.
-		if hasControl(v) {
+		if hasControl(k) || hasControl(v) {
 			return nil, &credproxy.Error{Status: http.StatusBadRequest, Code: "bad_request", Message: "parameter " + k + " holds control characters"}
 		}
 	}
@@ -1149,7 +1157,8 @@ func hasControl(v string) bool {
 }
 
 func isControl(r rune) bool {
-	return r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp)
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) ||
+		(r != ' ' && unicode.Is(unicode.Zs, r)) // spaces other than the plain one lay text out unseen
 }
 
 // auditMethod keeps a standard HTTP method as it is; anything else the

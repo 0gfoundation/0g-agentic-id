@@ -24,6 +24,7 @@ import { modelsForProvider, type InferenceProvider } from './Providers';
  * ```
  */
 
+import { plainText } from './AgentClient';
 import type { Address, Hash, TransactionReceipt, WriteContractReturnType } from 'viem';
 import { encodeFunctionData } from 'viem';
 import { RECEIPT_WAIT, ZERO_G_TESTNET, ZERO_G_MAINNET } from './constants';
@@ -579,7 +580,7 @@ export class AgentApi {
       },
       body,
     });
-    if (!r.ok) throw new Error(`pushSettingsToContainer: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`pushSettingsToContainer: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json().catch(() => ({}))) as { note?: string };
   }
 
@@ -605,7 +606,7 @@ export class AgentApi {
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature, 'content-type': 'application/json' },
       body,
     });
-    if (!r.ok) throw new Error(`claimAgent: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`claimAgent: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json().catch(() => ({}))) as { displaced?: boolean };
   }
 
@@ -637,7 +638,7 @@ export class AgentApi {
       },
       body,
     });
-    if (!r.ok) throw new Error(`clearConversation: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`clearConversation: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json().catch(() => ({}))) as { note?: string };
   }
 
@@ -679,7 +680,7 @@ export class AgentApi {
       },
       body,
     });
-    if (!r.ok) throw new Error(`compactConversation: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`compactConversation: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json().catch(() => ({}))) as { note?: string };
   }
 
@@ -690,7 +691,7 @@ export class AgentApi {
       method: 'POST',
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
-    if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${plainText(await r.text())}`);
     return ((await r.json()) as { token: string }).token;
   }
 
