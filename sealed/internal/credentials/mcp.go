@@ -203,21 +203,21 @@ func (s *Store) FinishLogin(ctx context.Context, state, code, oauthError, iss st
 	// The state first: an unknown one costs nothing, not a chain lookup.
 	s.mu.Lock()
 	a := s.logins[state]
-	delete(s.logins, state)
 	s.mu.Unlock()
 	if a == nil || s.now().After(a.expires) {
 		return "", loginErr("this login link is unknown or has expired; start the login again")
 	}
-	// An owner change clears every attempt; one taken just before is
-	// caught here.
+	// The attempt is kept while the owner cannot be confirmed, so the
+	// browser can come back; an owner change clears it.
 	if cerr := s.ensureOwner(ctx); cerr != nil {
 		return "", loginErr("%s", cerr.Message)
 	}
 	s.mu.Lock()
-	gen := s.gen
+	taken := s.logins[state] == a && s.gen == a.gen
+	delete(s.logins, state)
 	s.mu.Unlock()
-	if gen != a.gen {
-		return "", loginErr("the agent's owner changed; start the login again")
+	if !taken {
+		return "", loginErr("this login link is unknown or has expired; start the login again")
 	}
 	// The redirect must come from the server the owner was sent to: a code
 	// from another one is never posted to this login's token endpoint.
@@ -409,7 +409,9 @@ func (s *Store) askLogin(name string, def *Definition, gen uint64, why string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.gen == gen {
-		_, _ = s.pendingForLocked("login", name, map[string]string{"url": def.MCP.URL}, "", "", map[string]any{"source": "sealed", "why": why})
+		// Bound apart from the agent's own requests, so one of those (denied,
+		// say) never stands in for it.
+		_, _ = s.pendingForLocked("login", name, map[string]string{"url": def.MCP.URL}, "sealed", "", map[string]any{"source": "sealed", "why": why})
 	}
 }
 
@@ -510,6 +512,7 @@ func (s *Store) Disconnect(ctx context.Context, name string) (revoked bool, note
 		// Cleared, or a new login definition, while the server was asked:
 		// what is there now is not this login's to forget.
 		s.mu.Unlock()
+		s.audit("disconnect", name, endpoint, "the entry changed meanwhile; nothing forgotten")
 		return revoked, note, nil
 	}
 	if t := s.refreshTimers[name]; t != nil {

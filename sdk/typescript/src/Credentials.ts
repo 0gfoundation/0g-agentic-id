@@ -179,6 +179,9 @@ export interface PendingCredentialRequest {
 }
 
 /** Thrown when the stored set moved on since it was read. */
+/** The largest value sealed holds (credproxy.MaxValueLen). */
+export const MAX_VALUE_BYTES = 16 * 1024;
+
 export class CredentialsConflictError extends Error {
   constructor(readonly currentVersion: number, readonly ownerEpoch: number) {
     super(`credentials have moved on: the current version is ${currentVersion}; re-read and retry`);
@@ -365,6 +368,10 @@ export class CredentialsApi {
         continue;
       }
       let ciphertext: Uint8Array;
+      // sealed holds values of up to 16 KiB; a longer one would be skipped.
+      if (e.value !== undefined && toBytes(e.value).length > MAX_VALUE_BYTES) {
+        throw new Error(`credentials: ${e.name}'s value is over ${MAX_VALUE_BYTES} bytes, the most sealed holds`);
+      }
       if (e.value !== undefined) {
         ciphertext = eciesEncrypt(pubkey!, toBytes(credentialPlaintext({ owner: account.address, sealId: seal, chainId: this.ctx.chain.id, name: e.name, value: e.value })));
       } else {
@@ -450,7 +457,7 @@ export class CredentialsApi {
    * server confirmed; `note` says why not (no revocation endpoint, the agent
    * not running, …), in which case revoke the app's access at the service.
    */
-  async disconnect(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ version: number; revoked: boolean; note?: string }> {
+  async disconnect(sealId: Hash, name: string, opts?: { agentUrl?: string }): Promise<{ version: number; revoked: boolean; note?: string; pushWarning?: string }> {
     let revoked = false;
     let note: string | undefined;
     try {
@@ -464,8 +471,8 @@ export class CredentialsApi {
     } catch (e) {
       note = `the agent could not be reached (${e instanceof Error ? e.message : String(e)}): revoke the app's access at the service`;
     }
-    const { version } = await this.remove(sealId, name, opts);
-    return { version, revoked, note };
+    const { version, pushWarning } = await this.remove(sealId, name, opts);
+    return { version, revoked, note, pushWarning };
   }
 
   /**

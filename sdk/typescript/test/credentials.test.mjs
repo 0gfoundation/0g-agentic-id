@@ -448,7 +448,7 @@ test('cli: the list says whether a connection is connected, as the running agent
     return lines.find((l) => l.startsWith('  connected')) ?? '';
   };
   assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', logged_in_at: 1793880023 }] })), /^  connected  2026-/);
-  assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', status: 'awaiting_login' }] })), /not yet — cred <agent> connect linear https:\/\/mcp\.linear\.app\/mcp/);
+  assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', status: 'awaiting_login' }] })), /not yet — cred <agent> connect linear$/);
   assert.match(await run(async () => { throw new Error('agent down'); }), /unknown — the agent is not running/);
 });
 
@@ -565,4 +565,16 @@ test('cli: what came from the agent is printed with control characters escaped',
   const audit = renderAudit([{ ts: '2026-11-07T00:00:00Z', op: 'inject', names: ['x'], host: 'h\x1b[2K\u202e', result: 'unknown_entry' }]);
   assert.ok(!audit.join('').includes('\x1b') && !audit.join('').includes('\u202e'), audit.join(''));
   assert.match(audit.join(''), /\\u202e/);
+});
+
+test('a value over 16 KiB is refused before it is sealed', async () => {
+  const owner = privateKeyToAccount('0x' + '44'.repeat(32));
+  const s = await stub();
+  try {
+    await assert.rejects(api(s.port, owner).put(SEAL_ID, [{ name: 'big', hosts: ['a.example'], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }], value: 'a'.repeat(16 * 1024 + 1) }], { baseVersion: 0 }),
+      /over 16384 bytes/);
+    assert.ok(!s.seen.some((x) => x.method === 'POST'), 'nothing was stored');
+  } finally {
+    s.server.close();
+  }
 });

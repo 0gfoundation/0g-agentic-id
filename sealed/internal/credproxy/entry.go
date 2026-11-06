@@ -400,12 +400,19 @@ func sortedNames(m map[string]*Entry) []string {
 	return out
 }
 
+// MaxValueLen bounds a value sealed holds: a key, a token or a login's
+// access token. Each value is also kept in many encoded forms for redaction.
+const MaxValueLen = 16 << 10
+
 // Validate reports whether e can be served (hosts, positions, use, signer);
 // Replace refuses a set holding one that cannot. It normalizes e's hosts and
 // use in place, so it is for an entry the registry does not hold yet.
 func (e *Entry) Validate() error { return e.validate() }
 
 func (e *Entry) validate() error {
+	if len(e.Value) > MaxValueLen {
+		return fmt.Errorf("credential %q: a value of %d bytes is over the %d sealed holds", e.Name, len(e.Value), MaxValueLen)
+	}
 	if !ValidName(e.Name) {
 		return fmt.Errorf("credential name %q is not valid", e.Name)
 	}

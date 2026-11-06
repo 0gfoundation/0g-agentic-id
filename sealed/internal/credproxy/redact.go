@@ -246,6 +246,12 @@ func addValue(add func(match string, min int, repl []byte), name string, v []byt
 // with HTML escapes (as Rails does) and without (as JavaScript, Ruby and Rust
 // do), and as the encoders of jsonProfiles write it.
 func jsonStrings(s string) []string {
+	// Most tokens hold only bytes no encoder escapes: every form is the
+	// value itself, so the encoders need not be run (a rebuild after each
+	// minted token stays cheap).
+	if plainJSON(s) {
+		return []string{s}
+	}
 	var out []string
 	if q, err := json.Marshal(s); err == nil {
 		out = append(out, string(q[1:len(q)-1]))
@@ -261,6 +267,17 @@ func jsonStrings(s string) []string {
 		out = append(out, p.quote(s))
 	}
 	return out
+}
+
+// plainJSON reports whether every byte of s is one no JSON encoder escapes.
+func plainJSON(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '-' || c == '.' || c == '_' || c == '~') {
+			return false
+		}
+	}
+	return true
 }
 
 // jsonProfile is how a family of JSON encoders writes a string: the ASCII

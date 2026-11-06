@@ -139,17 +139,18 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 		var boot credentialsBoot
 		if err := json.Unmarshal(prov.Credentials, &boot); err != nil {
 			logger.Logf("warn: credentials: provisioned set is not valid JSON")
-		} else if !loadProvisioned(store, boot) {
+		} else if !loadProvisioned(store, boot, false) {
 			// The owner could not be looked up: tried again in the
 			// background, so a passing chain hiccup does not leave the agent
 			// without its credentials until the owner pushes the set again.
 			go func() {
 				for wait := 5 * time.Second; wait <= 10*time.Minute; wait *= 2 {
 					time.Sleep(wait)
-					if loadProvisioned(store, boot) {
+					if loadProvisioned(store, boot, true) {
 						return
 					}
 				}
+				logger.Logf("warn: credentials: the provisioned set could not be loaded; the owner can push it again")
 			}()
 		}
 	}
@@ -173,12 +174,14 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 // loadProvisioned loads the set /provision handed over. It reports false
 // only when the owner could not be looked up, which is worth trying again;
 // a set that does not check out is refused for good.
-func loadProvisioned(store *credentials.Store, boot credentialsBoot) bool {
+func loadProvisioned(store *credentials.Store, boot credentialsBoot, retry bool) bool {
 	opened, err := store.Load(context.Background(), boot.Document, boot.OwnerEpoch)
 	switch {
 	case errors.Is(err, credentials.ErrOwnerLookup):
 		logger.Logf("warn: credentials: the owner could not be looked up; loading the provisioned set again shortly")
 		return false
+	case retry && errors.Is(err, credentials.ErrStale):
+		// The owner pushed a newer set meanwhile: nothing left to load.
 	case err != nil:
 		// The reason may name entries: the owner reads it, the public log does not.
 		logger.Logf("warn: credentials: provisioned set refused (the owner's audit log says why)")

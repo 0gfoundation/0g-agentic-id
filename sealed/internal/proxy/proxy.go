@@ -993,6 +993,13 @@ func (s *Server) wsReverseProxy(upstream string) *httputil.ReverseProxy {
 					s.scrubResponse(resp)
 					resp.Header.Del("Content-Length")
 					resp.ContentLength = -1
+					// The Trailer announcement is built from these names
+					// after this returns.
+					for k := range resp.Trailer {
+						if nameHoldsValue(s.scrubBytes, k) {
+							delete(resp.Trailer, k)
+						}
+					}
 				}
 			}
 			return nil
@@ -1037,7 +1044,7 @@ func (b *trailerProofStripper) clean() {
 		return
 	}
 	for k, vs := range b.resp.Trailer {
-		if string(b.scrub([]byte(k))) != k {
+		if nameHoldsValue(b.scrub, k) {
 			delete(b.resp.Trailer, k)
 			continue
 		}

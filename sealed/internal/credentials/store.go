@@ -157,7 +157,7 @@ type Store struct {
 
 	auditMu     sync.Mutex
 	auditCounts map[string]*AuditRecord // counted records, by countKey
-	auditOpKeys map[string]int          // counted kinds per operation
+	auditOpKeys map[string]int          // counted kinds per operation and result
 	// Listed records, in three rings so that what the harness can cause
 	// (proxy uses, signatures) never pushes out the rest: the owner's
 	// decisions, logins, loads and what sealed did itself.
@@ -297,8 +297,9 @@ func countKey(r AuditRecord) string {
 }
 
 // countLocked adds n uses ending at r.Time (from r.First when set). Past
-// maxOpKeys kinds of one operation, further ones are counted by result
-// alone, so one operation's kinds never crowd out another's; past
+// maxOpKeys kinds of one operation and result, further ones are counted by
+// operation and result alone, so one result's kinds (unknown names, say)
+// never crowd out another's (a host an entry does not allow); past
 // maxCountKeys in all, by operation alone.
 func (s *Store) countLocked(r AuditRecord, n int) {
 	first := r.Time
@@ -309,7 +310,7 @@ func (s *Store) countLocked(r AuditRecord, n int) {
 		switch {
 		case len(s.auditCounts) >= maxCountKeys:
 			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: "more kinds", Time: r.Time, First: r.First}
-		case s.auditOpKeys[r.Op] >= maxOpKeys:
+		case s.auditOpKeys[r.Op+"\x00"+r.Result] >= maxOpKeys:
 			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: r.Result, Time: r.Time, First: r.First}
 		}
 	}
@@ -317,7 +318,7 @@ func (s *Store) countLocked(r AuditRecord, n int) {
 	if c == nil {
 		c = &AuditRecord{Op: r.Op, Names: r.Names, Method: r.Method, Host: r.Host, Result: r.Result, Time: r.Time, First: &first}
 		s.auditCounts[countKey(r)] = c
-		s.auditOpKeys[r.Op]++
+		s.auditOpKeys[r.Op+"\x00"+r.Result]++
 	} else {
 		if first.Before(*c.First) {
 			c.First = &first
@@ -470,10 +471,18 @@ func (s *Store) BeginOwnerLookup() OwnerLookup {
 	return OwnerLookup{seq: s.lookupSeq, at: s.now()}
 }
 
-// ObserveOwnerLookup records the owner that lookup l found.
+// ObserveOwnerLookup records the owner that lookup l found, and reports
+// whether that is the owner as recorded: false when a lookup begun later
+// was recorded already and found someone else, so the answer confirms
+// nothing and the request it came with must not be served.
 func (s *Store) ObserveOwnerLookup(l OwnerLookup, owner common.Address) bool {
-	_, changed := s.observeOwner(owner, l.seq, l.at)
-	return changed
+	recorded, _ := s.observeOwner(owner, l.seq, l.at)
+	if recorded {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.owner == owner
 }
 
 // lookupOwner asks the chain for the owner and records the answer, unless
@@ -1099,7 +1108,9 @@ func (s *Store) Decide(ctx context.Context, authReqID, decision string, a *Appro
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !still() {
+	// The signer must be the owner as recorded, not only the answer of a
+	// lookup another one overtook.
+	if !still() || s.owner != signer {
 		return ErrUnknownRequest
 	}
 	s.approvals[p.RequestDigest] = *a
@@ -1135,7 +1146,7 @@ func hasControl(v string) bool {
 }
 
 func isControl(r rune) bool {
-	return r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || unicode.Is(unicode.Cf, r)
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp)
 }
 
 // auditMethod keeps a standard HTTP method as it is; anything else the

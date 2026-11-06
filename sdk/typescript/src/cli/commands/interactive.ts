@@ -289,7 +289,7 @@ export function renderInboxMessage(m: AgentInboxMessage): string {
     : m.trigger === 'schedule' ? `reminder · ${label}`
     : label || cleanCell(m.trigger);
   const lines = [`◆ agent · ${why}`];
-  if (m.text?.trim()) lines.push(m.text.replace(/\s+$/, ''));
+  if (m.text?.trim()) lines.push(cleanStream(m.text).replace(/\s+$/, ''));
   if (m.status === 'failed') lines.push(`(that turn failed: ${cleanCell(m.error ?? 'no reason given')})`);
   else if (m.status === 'cancelled') lines.push('(that turn was cancelled)');
   return `${lines.join('\n')}\n`;
@@ -544,7 +544,7 @@ export function printAbovePrompt(
   rl.prompt(true);
 }
 import type { CommandContext } from '../types';
-import { cellText, cleanCell, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
+import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
 
 /** Column widths of the REPL listing; its header and every row share them. */
 const LIST_COLS = { id: 6, phase: 11, framework: 12, seal: 13, agentSeal: 13, owner: 24 } as const;
@@ -2828,7 +2828,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const ac = new AbortController();
         irq.streaming = ac;
         try {
-          for await (const delta of s.client.followTask(id, { signal: ac.signal })) out(delta);
+          for await (const delta of s.client.followTask(id, { signal: ac.signal })) out(cleanStream(delta));
           out('\n');
         } catch (e) {
           out(ac.signal.aborted
@@ -3067,7 +3067,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         };
         for await (const delta of s.client.chatStream(messages, opts)) {
           clearActivity();
-          out(delta); reply += delta;
+          out(cleanStream(delta)); reply += delta;
           lastOutputAt = Date.now();
           status = 'writing';
         }

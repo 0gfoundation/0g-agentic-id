@@ -1997,3 +1997,30 @@ func TestRedactorJSONEscapesOfOtherEncoders(t *testing.T) {
 		}
 	}
 }
+
+// A value over MaxValueLen is not held: each value is kept in many encoded
+// forms for redaction.
+func TestValueSizeCapped(t *testing.T) {
+	big := &Entry{Name: "big", Hosts: []string{"api.example"}, Use: UseInject, Value: bytes.Repeat([]byte("a"), MaxValueLen+1),
+		Positions: []Position{{Kind: PosHeader, Name: "Authorization", Template: "Bearer {v}"}}}
+	if err := NewRegistry().Put(big); err == nil {
+		t.Fatal("a value over the cap was held")
+	}
+}
+
+// A value of bytes no encoder escapes is its own JSON form in every
+// encoder's style, which is why jsonStrings skips running them for it.
+func TestPlainValueIsItsOwnJSONForm(t *testing.T) {
+	const v = "ghp_AbC123-def.GHI~xyz"
+	if !plainJSON(v) {
+		t.Fatal("not plain")
+	}
+	if q, _ := json.Marshal(v); string(q[1:len(q)-1]) != v {
+		t.Fatalf("encoding/json: %s", q)
+	}
+	for _, p := range jsonProfiles {
+		if got := p.quote(v); got != v {
+			t.Fatalf("%+v: %q", p, got)
+		}
+	}
+}

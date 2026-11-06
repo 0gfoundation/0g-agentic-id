@@ -105,13 +105,13 @@ func TestLoadProvisionedRetriesOnlyOwnerLookups(t *testing.T) {
 	down := credentials.NewStore(credentials.Env{LiveOwner: func(context.Context) (common.Address, error) {
 		return common.Address{}, errors.New("rpc down")
 	}}, reg)
-	if loadProvisioned(down, credentialsBoot{}) {
+	if loadProvisioned(down, credentialsBoot{}, false) {
 		t.Fatal("a failed owner lookup was taken as final")
 	}
 	up := credentials.NewStore(credentials.Env{LiveOwner: func(context.Context) (common.Address, error) {
 		return common.HexToAddress("0x00000000000000000000000000000000000000a1"), nil
 	}}, reg)
-	if !loadProvisioned(up, credentialsBoot{}) {
+	if !loadProvisioned(up, credentialsBoot{}, false) {
 		t.Fatal("a set that does not check out was tried again")
 	}
 }

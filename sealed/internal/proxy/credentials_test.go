@@ -33,7 +33,7 @@ func (f *fakeCredentials) BeginOwnerLookup() credentials.OwnerLookup {
 }
 func (f *fakeCredentials) ObserveOwnerLookup(_ credentials.OwnerLookup, o common.Address) bool {
 	f.observed = append(f.observed, o)
-	return false
+	return true
 }
 
 func (f *fakeCredentials) Load(_ context.Context, doc credentials.Document, _ uint64) (*credentials.Opened, error) {

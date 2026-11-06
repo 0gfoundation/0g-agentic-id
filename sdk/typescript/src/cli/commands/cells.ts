@@ -48,6 +48,25 @@ export function cleanCell(v: unknown): string {
 }
 
 /**
+ * The agent's text as printed in the conversation: escape sequences, control
+ * characters (newlines and tabs kept) and bidi controls are removed, so nothing the agent writes can restyle, hide or rewrite what the
+ * terminal shows next — the owner's own prompts included. Works on a chunk of
+ * a stream: a sequence cut between chunks loses its ESC and prints as text.
+ */
+export function cleanStream(v: unknown): string {
+  return String(v ?? '')
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u009b[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007\u001b\u009c]*(?:\u0007|\u001b\\|\u009c)?/g, '')
+    .replace(/\u001b[PX^_][^\u001b\u009c]*(?:\u001b\\|\u009c)?/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '')
+    .replace(/[\u2028\u2029]/g, '\n')
+    // bidi controls, which reorder what follows; joiners in emoji stay
+    .replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');
+}
+
+/**
  * A cell of width `w`: null/undefined renders the em-dash placeholder;
  * over-long text truncates by CODE POINTS with an ellipsis so a long name
  * cannot run into the next column.

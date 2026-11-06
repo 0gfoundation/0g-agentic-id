@@ -65,8 +65,19 @@ func (s *Server) scrubBytes(b []byte) []byte {
 	return sc.Scrub(b)
 }
 
-// scrubResponse replaces credential values in resp's headers and, as it is
-// read, its body.
+// nameHoldsValue reports whether a header name holds a credential value, in
+// any letter case: Go's client and HTTP/2 change the case of header names.
+func nameHoldsValue(scrub func([]byte) []byte, name string) bool {
+	for _, n := range []string{name, strings.ToLower(name), strings.ToUpper(name)} {
+		if string(scrub([]byte(n))) != n {
+			return true
+		}
+	}
+	return false
+}
+
+// scrubResponse replaces credential values in resp's headers (dropping a
+// header whose name holds one) and, as it is read, its body.
 func (s *Server) scrubResponse(resp *http.Response) {
 	s.mu.RLock()
 	sc := s.scrubber
@@ -74,7 +85,11 @@ func (s *Server) scrubResponse(resp *http.Response) {
 	if sc == nil {
 		return
 	}
-	for _, vs := range resp.Header {
+	for k, vs := range resp.Header {
+		if nameHoldsValue(sc.Scrub, k) {
+			delete(resp.Header, k)
+			continue
+		}
 		for i, v := range vs {
 			vs[i] = string(sc.Scrub([]byte(v)))
 		}
@@ -117,10 +132,16 @@ func (s *Server) credentialService(w http.ResponseWriter) (CredentialService, st
 func (s *Server) verifyCredOwner(w http.ResponseWriter, r *http.Request, c CredentialService, tag, sealID, owner, digest string) bool {
 	l := c.BeginOwnerLookup() // before the signature check looks the owner up
 	_, signer, ok := s.verifyOwnerSigAs(w, r, tag, sealID, owner, digest)
-	if ok {
-		c.ObserveOwnerLookup(l, common.HexToAddress(signer))
+	if !ok {
+		return false
 	}
-	return ok
+	// An answer a later lookup overtook, naming someone else, confirms
+	// nothing: the request is not served on it.
+	if !c.ObserveOwnerLookup(l, common.HexToAddress(signer)) {
+		http.Error(w, "owner lookup unavailable, retry", http.StatusServiceUnavailable)
+		return false
+	}
+	return true
 }
 
 func readSignedBody(w http.ResponseWriter, r *http.Request, s *Server, tag, sealID, owner string) ([]byte, bool) {
@@ -212,6 +233,9 @@ func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, credentials.ErrStale):
 			writeJSON(w, http.StatusConflict, map[string]any{"code": "stale_version", "message": err.Error(), "version": c.Version()})
+			return
+		case errors.Is(err, credentials.ErrOwnerLookup):
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "owner_unknown", "message": "the agent's owner could not be looked up; retry"})
 			return
 		case err != nil:
 			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_set", "message": err.Error()})

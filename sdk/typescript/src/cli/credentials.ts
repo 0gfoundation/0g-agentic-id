@@ -53,7 +53,7 @@ export const CRED_USAGE = `usage:
                                        trades for access tokens; the agent uses [[credential:derived:<name>]] on api_host
   cred presets                         the presets, and where to create each key
   cred <agent> rm <name>               remove one (revoke it at its provider as well)
-  cred <agent> connect <name> <mcp-url> [client_id=… client_secret_entry=… scope=a,b]
+  cred <agent> connect <name> [<mcp-url>] [client_id=… client_secret_entry=… scope=a,b]
                                        connect an MCP server to the agent (you log in through a link); sealed keeps the tokens
   cred <agent> disconnect <name>       revoke that connection at the server (when it offers that) and remove it
   cred <agent> reveal <name> on|off    let the agent read the value itself without asking each time
@@ -502,7 +502,7 @@ export function renderCredentials(defs: CredentialDefinition[], version: number,
       lines.push(`  connected  ${
         logins === null ? 'unknown — the agent is not running'
           : st?.loggedInAt ? dateText(st.loggedInAt)
-            : `not yet — cred <agent> connect ${d.name} ${d.mcp.url}`
+            : `not yet — cred <agent> connect ${d.name}`
       }`);
     }
     for (const t of d.token_request?.take ?? []) {
@@ -605,8 +605,12 @@ function conflict(e: unknown): never {
 /** `disconnect` (and `rm` of a connection): revoke at the server when it can be, then remove. */
 async function disconnectOp(cred: AgenticID['credentials'], sealId: Hash, name: string, io: CredIO, at?: { agentUrl: string }): Promise<void> {
   const out = await cred.disconnect(sealId, name, at).catch(conflict);
-  if (io.json) return emitOk({ sealId, version: out.version, disconnected: name, revoked: out.revoked, note: out.note ?? null });
+  if (io.json) return emitOk({ sealId, version: out.version, disconnected: name, revoked: out.revoked, note: out.note ?? null, pushWarning: out.pushWarning ?? null });
   io.out(`disconnected ${name} — version ${out.version}; ${out.revoked ? 'its tokens are revoked at the server' : `not revoked at the server: ${out.note ?? 'unknown'}`}`);
+  if (out.pushWarning) {
+    io.out(`the running agent did not take it: ${out.pushWarning}`);
+    if (!out.revoked) io.out(`the agent still holds the login until its next boot: revoke the app's access at the service, and restart the agent`);
+  }
 }
 
 /** Match an id prefix against the pending list; with no id, the only request waiting. */
@@ -723,7 +727,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       if (sub === 'approve' && item.op !== 'reveal') {
         // Adding a credential or connecting is done, not approved.
         throw new CliError('BAD_FLAG', `a request to ${item.op} ${item.name} is answered by doing it`, {
-          remedy: item.op === 'login' ? `cred <agent> connect ${item.name} ${item.params?.url ?? '<mcp-url>'}` : `cred <agent> set ${item.name} …`,
+          remedy: item.op === 'login' ? `cred <agent> connect ${item.name} ${printable(item.params?.url ?? '<mcp-url>')}` : `cred <agent> set ${item.name} …`,
         });
       }
       if (sub === 'approve') await cred.approveOnce(sealId, item.auth_req_id, { agentUrl: base });
@@ -736,7 +740,12 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     }
     case 'connect': {
       const name = checkCredName(rest[0]);
-      const mcpUrl = rest[1];
+      const cur = await cred.get(sealId);
+      const stored = cur.definitions.find((d) => d.name === name);
+      // An existing connection is connected again as it is defined: with no
+      // url, or its own url and no options, its client and scopes are kept.
+      const mcpUrl = rest[1] ?? stored?.mcp?.url;
+      const reconnect = !!stored?.mcp && stored.mcp.url === mcpUrl && rest.length <= 2;
       let parsed: URL | undefined;
       try {
         parsed = mcpUrl ? new URL(mcpUrl) : undefined;
@@ -759,11 +768,9 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
         name, hosts: [host], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }],
         description: `MCP server ${mcpUrl}`, mcp,
       };
-      const cur = await cred.get(sealId);
-      const stored = cur.definitions.find((d) => d.name === name);
       if (stored && !stored.mcp) throw new CliError('BAD_FLAG', `${name} is already a credential that is not a connection`, { remedy: 'pick another name, or cred <agent> rm ' + name });
       const base = agentUrl ?? (await cred.agentUrl(sealId));
-      const same = stored && JSON.stringify(definitionOf(inputOf(stored), '' as `0x${string}`)) === JSON.stringify(definitionOf({ ...want, description: stored.description }, '' as `0x${string}`));
+      const same = reconnect || (stored && JSON.stringify(definitionOf(inputOf(stored), '' as `0x${string}`)) === JSON.stringify(definitionOf({ ...want, description: stored.description }, '' as `0x${string}`)));
       if (!same) {
         const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
         const out = await cred.put(sealId, [...others, want], { baseVersion: cur.version, agentUrl: base }).catch(conflict);
@@ -828,10 +835,13 @@ export async function answerPending(
   const at = opts.agentUrl ? { agentUrl: opts.agentUrl } : undefined;
   const open = (await cred.pending(sealId, at)).filter((p) => p.status === 'pending' && !opts.later.has(p.auth_req_id));
   if (!open.length) return [];
-  const defs = (await cred.get(sealId)).definitions;
   const tell: string[] = [];
   for (const p of open) {
-    io.out('');
+    // Read again for each request: an answer to the one before may have
+    // changed them.
+    const defs = (await cred.get(sealId)).definitions;
+    // Whatever the agent printed before is not carried into the prompt.
+    io.out('\x1b[0m');
     io.out(`⚑ the agent asks to ${p.op === 'reveal' ? `read the value of ${p.name}` : p.op === 'login' ? `be connected to ${printable(p.params?.url ?? 'an MCP server')} as ${p.name}` : `get a credential named ${p.name}`}`);
     for (const l of factLines(p)) io.out(l);
     if (p.reason) io.out(`  the agent says: ${JSON.stringify(p.reason)}`);
@@ -852,11 +862,23 @@ export async function answerPending(
         await cred.approveOnce(sealId, p.auth_req_id, at);
         tell.push(`[cred] I approved your request to read ${p.name}, this once. Send the same reveal request again.`);
       } else if (a === 'a' && owned) {
-        await cred.setAllowReveal(sealId, p.name, true, at);
-        tell.push(`[cred] You may read ${p.name} without asking from now on. Send the same reveal request again.`);
+        const out = await cred.setAllowReveal(sealId, p.name, true, at);
+        if (out.pushWarning) {
+          io.out(`  stored, but the running agent did not take it: ${out.pushWarning} — it applies on the next boot`);
+          tell.push(`[cred] I allowed you to read ${p.name} without asking; it applies once you are restarted.`);
+        } else tell.push(`[cred] You may read ${p.name} without asking from now on. Send the same reveal request again.`);
       } else if (a === 'n') await refuse();
       else later();
     } else if (p.op === 'add') {
+      // An existing entry is the owner's to change, with `set` itself: the
+      // agent's request does not move it.
+      if (defs.some((d) => d.name === p.name)) {
+        io.out(`  ${p.name} is already set; to change it, run: cred <agent> set ${p.name} …`);
+        const a = (await io.ask(`  [n] refuse  [Enter] later: `)).trim().toLowerCase();
+        if (a === 'n') await refuse();
+        else later();
+        continue;
+      }
       const a = (await io.ask(`  [s] set it now  [n] refuse  [Enter] later: `)).trim().toLowerCase();
       if (a === 's') {
         let args = p.params?.preset ? [`preset=${p.params.preset}`] : [];

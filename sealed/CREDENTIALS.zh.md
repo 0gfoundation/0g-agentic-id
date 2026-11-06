@@ -33,7 +33,7 @@ owner 把第三方凭据（API key、token、refresh token、签名密钥、MCP 
 
 一个条目是一个值，可以用在多个地方：条目的填写位置对它的每个域名都生效。例如一个 GitHub token，条目同时写上两个域名和两种位置，就既能用于 API（`api.github.com`，`Authorization: Bearer`），也能用于 git（`github.com`，Basic）。预设（CLI 里的 `preset=<名字>`；`cred presets` 列出全部预设及各自的密钥创建地址）是快捷方式，由客户端展开成域名、位置和说明；sealed 看不到预设。
 
-**值**在客户端用 ECIES 加密给 agent 的 agentSeal 公钥。明文绑定了归属：`{"v":1,"type":"credential","owner","seal_id","chain_id","name","value"}`；绑定到其他 owner、agent、链或名字的值，sealed 一律拒绝。
+**值**（最大 16 KiB，sealed 获得的值也一样）在客户端用 ECIES 加密给 agent 的 agentSeal 公钥。明文绑定了归属：`{"v":1,"type":"credential","owner","seal_id","chain_id","name","value"}`；绑定到其他 owner、agent、链或名字的值，sealed 一律拒绝。
 
 owner 对整个凭据集签一次名，EIP-712：
 
@@ -68,7 +68,7 @@ Entry(string name,bytes32 defHash)
 
 **代理。** 对条目中出现的域名发起的 `CONNECT`，代理用该根证书签发的证书终止 TLS（HTTP/1.1 和 HTTP/2）；其他域名原样转发通道。对终止的请求和显式请求，代理：
 
-- 要求每次启动的令牌；要求 CONNECT 目标、TLS SNI（IP 地址没有 SNI）和 `Host` 三者一致；显式形式中含控制字符、空格或格式字符的域名一律拒绝；同时最多服务 512 个连接（之后的连接等待），所有连接合计同时最多处理 128 个请求，其中 32 个留给只代填 `sealed:` 条目的请求（超出时返回 503 `busy` 和 `Retry-After: 1`；CONNECT 通道只算作连接）；终止的连接上最多 16 个并发 HTTP/2 流，请求头最大 64 KiB；连接空闲 2 分钟后关闭，CONNECT 通道或 WebSocket 中继双向 10 分钟没有数据时关闭；
+- 要求每次启动的令牌；要求 CONNECT 目标、TLS SNI（IP 地址没有 SNI）和 `Host` 三者一致；显式形式中含控制字符、空格或格式字符的域名一律拒绝；同时最多服务 512 个连接（之后的连接等待），所有连接合计同时最多处理 128 个请求，其中 32 个留给只代填 `sealed:` 条目的请求，框架的工具也可以发这类请求（超出时返回 503 `busy` 和 `Retry-After: 1`；CONNECT 通道只算作连接）；终止的连接上最多 16 个并发 HTTP/2 流，请求头最大 64 KiB；连接空闲 2 分钟后关闭，CONNECT 通道或 WebSocket 中继双向 10 分钟没有数据时关闭；
 - 拒绝连接私网、回环、链路本地、组播、未指定、NAT64 和元数据地址；不跟随重定向；
 - 只在允许的域名和位置代填占位符，否则拒绝整个请求；从不往 `Host`、`Content-Length`、`Transfer-Encoding`、`Cookie`、`Proxy-*` 里填写；
 - 只在有条目可以填写请求体字段或需要签名的域名上读取请求体。在这些域名上，代理最多缓冲 64 KiB 用于代填，须在 30 秒内到达（否则返回 408 `bad_request`）；更大的请求体边转发边扫描到结尾，遇到占位符就停止上传（之前的部分已经发往上游），并以 413 `body_too_large` 应答。其他域名的请求体原样转发，其中的占位符文字也原样发出，因为那里没有可以填写的地方；
@@ -92,7 +92,7 @@ Entry(string name,bytes32 defHash)
 | `DELETE /credentials/{name}` | 删除换出的条目（owner 的条目由 owner 管理） |
 | `GET /events?after=&wait=` | 长轮询：`entry_added`、`entry_removed`、`pending_opened`、`pending_decided`、`cleared`、`writeback_failed` |
 
-等待 owner 的申请有上限：同时最多 32 条（超出返回 429 `too_many_requests`），理由最多 512 个字符且只占一行（超出部分截掉，控制字符换成空格），参数最多 4 个、每个最多 512 个字符（`url` 为 2048，且必须是 https），不能含控制字符或格式字符。sealed 自己发起的申请（需要重新登录）不计入 32 条。
+等待 owner 的申请有上限：同时最多 32 条（超出返回 429 `too_many_requests`），理由最多 512 个字符且只占一行（超出部分截掉，控制字符和行分隔符换成空格），参数最多 4 个、每个最多 512 个字符（`url` 为 2048，且必须是 https），不能含控制字符、格式字符或行分隔符。sealed 自己发起的申请（需要重新登录）不计入 32 条。
 
 **交出**（`$SEAL_CRED_REVEAL_SOCKET`）：`POST /credentials/reveal {name, reason}`。设置了 `allow_reveal` 时返回 `{value}`。否则返回 403 `authorization_pending` 和 `auth_req_id`；owner 决定后，agent 原样重发请求。403 `access_denied` 表示被拒绝。批准只针对 agent 申请时的那个值：之后换出或轮换得到的 token 需要重新申请。对换出的 token，owner 看到的是它自己的域名、过期时间，以及换取时用的参数。签名密钥（`use: sign`）从不交出（403 `not_allowed`）。登录条目交出的是 access token，不是存储的登录状态。这个 socket 和上面的 socket 分开，是为了让以另一个用户运行工具的 harness 可以不让工具访问它；两个 socket 都属于 agent 用户，现有框架的工具也以这个用户运行。
 
@@ -160,7 +160,7 @@ agent 在 MCP 配置中给该服务器加请求头 `Authorization: Bearer [[cred
 
 ## owner 一侧
 
-agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` / `X-Auth-Signature`（链上现任 owner 的 EIP-191 签名），格式为 `<tag>:0x<sealId>:<unix 秒>[:<sha256(body)>]:<audience>`。签名的 `POST` 只接受一次：在有效时间窗内再次发送同一条消息返回 409。每个请求都把签名者记为 owner，所以新 owner 的第一个请求（包括读取）会先清掉前任 owner 的状态，再返回任何内容。
+agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` / `X-Auth-Signature`（链上现任 owner 的 EIP-191 签名），格式为 `<tag>:0x<sealId>:<unix 秒>[:<sha256(body)>]:<audience>`。签名的 `POST` 只接受一次：在有效时间窗内再次发送同一条消息返回 409。每个请求都把签名者记为 owner，所以新 owner 的第一个请求（包括读取）会先清掉前任 owner 的状态，再返回任何内容；owner 查询被更晚开始的查询超越、且结果是另一个人时，请求返回 503。
 
 | 路由 | Tag | |
 |---|---|---|
@@ -189,7 +189,7 @@ SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-
 
 ## 范围之外
 
-- **响应与上链数据。** 经 `:8080` 转发的 HTTP 响应（已注册的服务、框架路由、事件流、合成的 `/v1/responses` 及其保存的结果、`/hello` 的服务列表）在计算 serve-proof 之前去掉 sealed 持有的每个值；对升级请求返回的非 `101` 响应和其他响应一样处理（trailer 也一样），接受了的 WebSocket 升级原样转发。框架对压缩上下文（`/_seal/compact`）的说明，在 owner 或公开日志看到之前也会去掉这些值。模型分段流式输出的值，在保存的结果中会被去掉，在流式输出的各段中不会。sealed 上链的内容同样去掉这些值（leaf 角色、manifest 中的文件、目录归档里的文件），漂移判断也基于去掉值之后的内容。从 sealed 删除的值（新凭据集不再包含、owner 变更）仍会被去掉，但不再代填，直到 sealed 重启（owner 条目和 sealed 条目的最近 1024 个值，另外换出条目的最近 1024 个值；每个名字最多 32 个）。
+- **响应与上链数据。** 经 `:8080` 转发的 HTTP 响应（已注册的服务、框架路由、事件流、合成的 `/v1/responses` 及其保存的结果、`/hello` 的服务列表）在计算 serve-proof 之前去掉 sealed 持有的每个值（名字里含值的响应头整个丢弃，不分大小写）；对升级请求返回的非 `101` 响应和其他响应一样处理（trailer 也一样），接受了的 WebSocket 升级原样转发。框架对压缩上下文（`/_seal/compact`）的说明，在 owner 或公开日志看到之前也会去掉这些值。模型分段流式输出的值，在保存的结果中会被去掉，在流式输出的各段中不会。sealed 上链的内容同样去掉这些值（leaf 角色、manifest 中的文件、目录归档里的文件），漂移判断也基于去掉值之后的内容。从 sealed 删除的值（新凭据集不再包含、owner 变更）仍会被去掉，但不再代填，直到 sealed 重启（owner 条目和 sealed 条目的最近 1024 个值，另外换出条目的最近 1024 个值；每个名字最多 32 个）。
 - **不经过代理的工具。** 不认 `HTTPS_PROXY` 或钉死证书的工具会带着占位符直连目标并失败；可以改用显式形式，或使用交出的值。
 - **普通 API 返回的 token。** 普通 API 调用（不是换 token）返回的 token 原样到达 agent；如果它属于代理遮盖的常见格式，agent 拿到的是 `[[redacted]]`，无法使用，要拿这类 token 需用换 token。
 - **不限制用途。** 在密钥本身的权限范围内，agent 可以做任何事，包括派生新密钥、用签名条目签任意内容。
