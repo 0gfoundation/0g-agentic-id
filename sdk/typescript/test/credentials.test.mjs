@@ -179,7 +179,11 @@ test('an entry stored again unchanged keeps its definition bytes (and so its wri
 
 test('a stale base version is refused before anything is signed', async () => {
   const owner = privateKeyToAccount('0x' + '22'.repeat(32));
-  const s = await stub({ version: 2, owner_epoch: 0, document: null, writebacks: {} });
+  // Version 2 as the attestor stores it: an (empty) set the owner signed.
+  const set = { seal_id: SEAL_ID, owner_epoch: 0, version: 2, entries: [] };
+  const signature = await owner.signTypedData({ domain, types: credentialSetTypes, primaryType: 'CredentialSet',
+    message: { sealId: SEAL_ID, ownerEpoch: 0n, version: 2n, entries: [] } });
+  const s = await stub({ version: 2, owner_epoch: 0, document: { set, signature, defs: {}, values: {} }, writebacks: {} });
   try {
     await assert.rejects(
       api(s.port, owner).put(SEAL_ID, [{ name: 'x', value: 'v', hosts: ['a.example'], positions: [] }], { baseVersion: 1 }),

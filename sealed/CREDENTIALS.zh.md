@@ -48,7 +48,7 @@ Entry(string name,bytes32 defHash)
 - **版本号**：每次写入为 `version + 1`，在 attestor 处做比较并交换。sealed 按（所有权纪元，版本号）记住加载过的最新凭据集（存在状态目录，stop/start 后保留），拒绝更旧的；新 owner 的第一个凭据集比前任 owner 的所有凭据集都新。
 - **所有权纪元**：agent 最近一次转让所在的区块号。为更早纪元签名的凭据集在各处都被拒绝，前任 owner 的凭据集无法被恢复。转让时 attestor 删除凭据集，sealed 清空所有条目、待办、授权和使用记录，以及它保管的框架推理 key。sealed 每 10 秒查一次链上 owner；交出、换 token、钱包签名、登录之前，如果距上次确认 owner 已超过 10 秒，会先再查一次（查询失败则拒绝）；新 owner 的凭据集或决定，先清掉前任 owner 的状态再处理。状态被清空时，或 owner 给条目设了新值时，仍在进行的换 token、刷新、登录的结果一概不保留。
 - **逐条检查**：定义与签名 hash 不符、值与 `value_hash` 不符、或者代理无法使用的条目会被跳过并给出原因，其余条目照常加载。
-- **owner 客户端**：每次修改都会重新签名整个凭据集，所以 SDK 只在存储的凭据集由当前钱包为这个 agent 按存储的版本号签名、且每个定义和存储的值都与签名一致时才使用它；否则什么都不签（`CredentialsUnverifiedError`）。
+- **owner 客户端**：每次修改都会重新签名整个凭据集，所以 SDK 只在存储的凭据集由当前钱包为这个 agent 按存储的版本号签名、每个定义和存储的值都与签名一致、并且不比这个客户端见过的最新凭据集旧（先比所有权纪元，再比版本号；CLI 把它记在配置目录的 `credential-marks.json` 里，所以同一台机器上跨次运行也会拒绝重新送来的旧凭据集）时才使用它；否则什么都不签（`CredentialsUnverifiedError`）。
 
 ## agent 如何使用凭据
 
@@ -147,7 +147,7 @@ CredentialWriteback.v2:<seal_id>:<name>:<binding>:<boot_id>:<keccak256(ciphertex
 2. sealed 读取 MCP 服务器的受保护资源元数据（RFC 9728，来自 401 的 `WWW-Authenticate` 或 well-known 路径），再读取授权服务器元数据（RFC 8414 或 OpenID）。条目没有给 `client_id` 时，sealed 以 public client 身份动态注册（RFC 7591），然后返回授权链接，链接带 PKCE（S256）、`resource` 和一次性的 `state`。
 3. owner 打开链接并同意。浏览器回到 agent 的 `<公开地址>/_seal/oauth/callback`；`state`（10 分钟内有效，只能用一次）把 code 绑定到这次登录。sealed 用只有它持有的 verifier 换取 token。
 4. 之后条目在 owner 允许的位置提供 access token（该服务器域名上的 Bearer）。在此之前，`GET /credentials` 列出该条目时带 `status: awaiting_login`；从这时起改为带 `logged_in_at`，agent 的事件里出现 `entry_added`，针对它的 `login` 待办也随之结案。sealed 在过期前一分钟刷新（有效期不到两分钟时在一半处刷新，最早 10 秒后），保存轮换后的 refresh token，并写回登录状态。refresh token 被拒绝时（包括以状态码 200 返回的拒绝），或刷新一直失败时，转为一条给 owner 的 `login` 待办。
-5. 断开时，owner 调用 `POST /_seal/credentials/disconnect {name}`：如果授权服务器的元数据给出了 `revocation_endpoint`，sealed 先请它作废 refresh token，再作废 access token（RFC 7009）；无论是否作废成功，sealed 都会丢掉这些 token，条目回到等待登录的状态。之后由客户端删除该条目。CLI 里对应的命令是 `cred <agent> connect` 和 `disconnect`。
+5. 断开时，owner 调用 `POST /_seal/credentials/disconnect {name}`：如果授权服务器的元数据给出了 `revocation_endpoint`，sealed 先请它作废 refresh token，再作废 access token（RFC 7009）；无论是否作废成功，sealed 都会丢掉这些 token，条目回到等待登录的状态。如果这期间条目变了（新的凭据集或新的登录），sealed 什么都不丢，返回 409 `changed`，并说明服务器是否作废了之前持有的 token。之后由客户端删除该条目。CLI 里对应的命令是 `cred <agent> connect` 和 `disconnect`。
 
 agent 在 MCP 配置中给该服务器加请求头 `Authorization: Bearer [[credential:<名字>]]`。
 
@@ -170,7 +170,7 @@ agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` /
 | `POST /_seal/credentials/decide` | `0GSealCredDecide` | `{auth_req_id, decision: "once" \| "deny", approval?, signature?}` |
 | `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | agent 做了什么（代填、换 token、签名、交出、登录、写回），以及凭据集里哪些条目被跳过、原因是什么，不含值。按时间从旧到新，分三份各保留最近 1000 条：代理使用；钱包签名；其余记录（owner 的决定、登录、断开、加载、sealed 自己做的事），所以 agent 能引发的记录不会把 owner 的记录挤掉。从某份里挤出的记录按类（操作、条目、域名、结果）计数，不会不留痕迹地丢掉。agent 可以随意重复的操作（换 token、刷新、写回、失败的签名、预先允许的交出）以及 sealed 自己提供的值（`sealed:` 条目，如框架的推理 key）的成功使用，每类合并为一条记录，带 `count`、`first` 和最近一次的 `ts`；每种操作的每种结果（冒号之前的部分）各有 32 类的额度，再多的只按结果合并计数，所以对一种结果的大量请求只会让这种结果之后的记录变模糊；总数超过 1024 类后，所有操作的新类别都只按结果合并计数。域名和条目名截到有限长度，控制字符和格式字符显示为 `?`，标准 HTTP 方法以外的方法记为 `OTHER`。stop/start 后保留，并记下属于哪个 owner，只为同一个 owner 恢复；启动时读不了的已保存记录原样保留，不会被覆盖 |
 | `POST /_seal/credentials/login` | `0GSealCredLogin` | 发起 MCP 登录；返回 `{authorize_url}` |
-| `POST /_seal/credentials/disconnect` | `0GSealCredDisconnect` | 结束 MCP 登录：服务器支持时请它作废 token，并丢掉 token；返回 `{revoked, note}` |
+| `POST /_seal/credentials/disconnect` | `0GSealCredDisconnect` | 结束 MCP 登录：服务器支持时请它作废 token，并丢掉 token；返回 `{revoked, note}`，期间条目变了时返回 409 `{code: "changed", revoked}` |
 | `GET /_seal/oauth/callback` | 无 | 登录后浏览器的回跳 |
 
 **授权。** "只允许这一次"是链上现任 owner 签的 EIP-712 `Approval(bytes32 sealId,bytes32 bootId,bytes32 authReqId,bytes32 requestDigest,uint64 expiresAt)`（同一个 domain），绑定本次启动、这条申请及其摘要，只能使用一次（SDK 给 1 小时，不超过申请本身的过期时间）。sealed 只对仍在等待的申请接受决定，所以用过之后再次提交的批准会被拒绝。待办保留 72 小时，容器重启后丢失，agent 重新申请即可。新增凭据和登录的申请，通过实际去新增、去登录来应答。不表态即视为不允许。

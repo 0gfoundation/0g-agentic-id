@@ -101,3 +101,78 @@ test('stored: a value other than the signed one is refused', async () => {
 test('stored: an older signed set served as the current version is refused', async () => {
   await refusedSet(await sign(github().doc), /signed as version 3, stored as 7/, 7);
 });
+
+// An earlier set the owner did sign, served again as the current one, would
+// bring back what the owner removed since: refused, within one client and,
+// through credentialMarks (the CLI's file), across runs.
+async function history() {
+  const sets = [];
+  let replay;
+  const posted = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const u = new URL(req.url, 'http://x');
+      const json = (s, b) => { res.writeHead(s, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
+      if (req.method === 'GET' && u.pathname === '/credentials') {
+        const cur = replay !== undefined ? sets[replay] : sets.at(-1);
+        return json(200, { version: cur ? cur.set.version : 0, owner_epoch: 7, document: cur ?? null, writebacks: {} });
+      }
+      if (req.method === 'POST' && u.pathname === '/credentials') {
+        const b = JSON.parse(Buffer.concat(chunks).toString());
+        posted.push(b);
+        sets.push(b.document);
+        return json(200, { ok: true, version: b.document.set.version });
+      }
+      if (u.pathname.startsWith('/_seal/')) return json(200, {});
+      json(404, {});
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const client = (marks) => new CredentialsApi({ attestorUrl: url, chain: { id: CHAIN_ID }, addresses: { agenticID: CONTRACT }, account: OWNER, credentialMarks: marks,
+    walletClient: { signMessage: ({ message }) => OWNER.signMessage({ message }), signTypedData: (a) => OWNER.signTypedData(a) } }, { agentSealPubkey: async () => SEAL_PUB });
+  return { url, server, posted, client, replayAt: (i) => { replay = i; } };
+}
+
+const quiet = { json: false, out: () => {}, secret: async () => 'v' };
+
+test('stored: an earlier signed set served again is refused, so a removed entry is not signed back', async () => {
+  const h = await history();
+  const ag = { credentials: h.client() };
+  try {
+    await credOp(ag, SEAL_ID, ['set', 'github', 'preset=github'], quiet, h.url); // v1
+    await credOp(ag, SEAL_ID, ['set', 'leaky', 'host=collect.example', 'header=X-Key: {v}'], quiet, h.url); // v2
+    await credOp(ag, SEAL_ID, ['rm', 'leaky'], quiet, h.url); // v3: removed
+    h.replayAt(1); // v2 served as current
+    await assert.rejects(credOp(ag, SEAL_ID, ['set', 'slack', 'preset=slack'], quiet, h.url), (e) => e instanceof CredentialsUnverifiedError && /older than the newest set this client has seen: ownership 7, version 3/.test(e.message));
+    assert.equal(h.posted.length, 3, 'nothing signed on top of the replayed set');
+  } finally {
+    h.server.close();
+  }
+});
+
+test('stored: the newest set seen is kept across clients through credentialMarks', async () => {
+  const h = await history();
+  const kept = new Map();
+  const marks = { seen: (k) => kept.get(k), record: (k, m) => { kept.set(k, m); } };
+  try {
+    await credOp({ credentials: h.client(marks) }, SEAL_ID, ['set', 'github', 'preset=github'], quiet, h.url); // v1
+    await credOp({ credentials: h.client(marks) }, SEAL_ID, ['set', 'leaky', 'host=collect.example', 'header=X-Key: {v}'], quiet, h.url); // v2
+    await credOp({ credentials: h.client(marks) }, SEAL_ID, ['rm', 'leaky'], quiet, h.url); // v3
+    assert.deepEqual([...kept.values()], [{ epoch: 7, version: 3 }]);
+    h.replayAt(1);
+    // A new run: a fresh client, the same machine.
+    await assert.rejects(h.client(marks).get(SEAL_ID), CredentialsUnverifiedError);
+    // A set the attestor really has moved past is taken.
+    h.replayAt(undefined);
+    assert.equal((await h.client(marks).get(SEAL_ID)).version, 3);
+  } finally {
+    h.server.close();
+  }
+});
+
+test('stored: a version with no signed set is refused', async () => {
+  await refusedSet(null, /version 3 comes with no signed set/);
+});

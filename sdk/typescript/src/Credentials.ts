@@ -189,7 +189,7 @@ export const MAX_VALUE_BYTES = 16 * 1024;
  */
 export class CredentialsUnverifiedError extends Error {
   constructor(readonly why: string) {
-    super(`the stored credential set is not one this wallet signed (${why}); nothing was signed`);
+    super(`the stored credential set cannot be used (${why}); nothing was signed`);
     this.name = 'CredentialsUnverifiedError';
   }
 }
@@ -250,11 +250,42 @@ export function inputOf(d: CredentialDefinition): CredentialInput {
 
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
 
+/** A stored set's place in order: ownership epoch, then version. */
+interface Mark {
+  epoch: number;
+  version: number;
+}
+const older = (a: Mark, b: Mark): boolean => a.epoch < b.epoch || (a.epoch === b.epoch && a.version < b.version);
+
 export class CredentialsApi {
+  /** The newest set seen per agent (see markKey), within this client's life. */
+  private readonly marks = new Map<string, Mark>();
+
   constructor(
     private readonly ctx: Ctx,
     private readonly attestor: AttestorClient,
   ) {}
+
+  private markKey(seal: Hash): string {
+    return `${this.ctx.chain.id}:${this.ctx.addresses.agenticID.toLowerCase()}:${seal}`;
+  }
+
+  /** The newest set this client (or, through credentialMarks, this machine) has seen. */
+  private async markOf(seal: Hash): Promise<Mark | undefined> {
+    const key = this.markKey(seal);
+    const mine = this.marks.get(key);
+    const kept = await Promise.resolve(this.ctx.credentialMarks?.seen(key)).catch(() => undefined);
+    if (!mine) return kept;
+    return kept && older(mine, kept) ? kept : mine;
+  }
+
+  private async raiseMark(seal: Hash, m: Mark): Promise<void> {
+    const cur = await this.markOf(seal);
+    if (cur && !older(cur, m)) return;
+    const key = this.markKey(seal);
+    this.marks.set(key, m);
+    await Promise.resolve(this.ctx.credentialMarks?.record(key, m)).catch(() => undefined);
+  }
 
   private attestorUrl(): string {
     if (!this.ctx.attestorUrl) throw new Error('credentials: attestorUrl is required');
@@ -292,9 +323,10 @@ export class CredentialsApi {
 
   /**
    * Owner-signed read of the stored set (no values). The set is checked to be
-   * one this wallet signed, down to each definition and stored value, since
-   * every change signs the other entries again from it; one that is not
-   * throws {@link CredentialsUnverifiedError}.
+   * one this wallet signed, down to each definition and stored value, and no
+   * older than the newest this client has seen, since every change signs the
+   * other entries again from it; one that is not throws
+   * {@link CredentialsUnverifiedError}.
    */
   async get(sealId: Hash): Promise<{ version: number; ownerEpoch: number; document: CredentialDocument | null; definitions: CredentialDefinition[] }> {
     const seal = sealId.toLowerCase() as Hash;
@@ -302,7 +334,16 @@ export class CredentialsApi {
     const r = await fetch(`${this.attestorUrl()}/credentials?seal_id=${seal}`, { headers: await this.ownerHeaders(message), signal: AbortSignal.timeout(10_000) });
     if (!r.ok) throw new Error(`credentials.get: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
     const body = (await r.json()) as { version: number; owner_epoch: number; document: CredentialDocument | null };
+    if (!body.document && body.version !== 0) throw new CredentialsUnverifiedError(`version ${body.version} comes with no signed set`);
     const definitions = body.document ? await this.verified(seal, body.version, body.owner_epoch, body.document) : [];
+    // An older set the owner did sign, served again, would bring back what
+    // the owner changed or removed since.
+    const at = { epoch: body.owner_epoch, version: body.version };
+    const seen = await this.markOf(seal);
+    if (seen && older(at, seen)) {
+      throw new CredentialsUnverifiedError(`it is older than the newest set this client has seen: ownership ${seen.epoch}, version ${seen.version}`);
+    }
+    if (body.document) await this.raiseMark(seal, at);
     return { version: body.version, ownerEpoch: body.owner_epoch, document: body.document, definitions };
   }
 
@@ -472,7 +513,9 @@ export class CredentialsApi {
       throw new CredentialsConflictError(j.details?.version ?? -1, j.details?.owner_epoch ?? -1);
     }
     if (!r.ok) throw new Error(`credentials: store failed: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
-    return ((await r.json()) as { version: number }).version;
+    const version = ((await r.json()) as { version: number }).version;
+    await this.raiseMark(seal, { epoch: doc.set.owner_epoch, version: doc.set.version });
+    return version;
   }
 
   /** Owner-signed request to the running container (`/_seal/...`). */
@@ -528,11 +571,13 @@ export class CredentialsApi {
         forgotten = true;
         note = b.note || undefined;
       } else if (r.status === 409) {
-        // The entry changed while the agent disconnected it: whether the
-        // server revoked still holds, but nothing was forgotten.
-        const b = (await r.json().catch(() => ({}))) as { revoked?: boolean; message?: string };
-        revoked = !!b.revoked;
-        note = 'the entry changed meanwhile and nothing was forgotten: disconnect again';
+        // The entry changed while the agent disconnected it (a new login,
+        // say): what the server revoked is not what the entry holds now.
+        // The removal below makes the agent forget it.
+        const b = (await r.json().catch(() => ({}))) as { revoked?: boolean };
+        note = b.revoked
+          ? "the entry changed while the agent disconnected it: the tokens it held before are revoked, a login made meanwhile is not; revoke the app's access at the service"
+          : "the entry changed while the agent disconnected it and nothing was revoked: revoke the app's access at the service";
       } else note = `the agent refused: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`.trim();
     } catch (e) {
       note = `the agent could not be reached (${e instanceof Error ? e.message : String(e)}): revoke the app's access at the service`;

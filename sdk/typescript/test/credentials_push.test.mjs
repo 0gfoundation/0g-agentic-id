@@ -106,7 +106,7 @@ test('session: a login request for an existing connection with another URL', asy
 
 // A disconnect overtaken by a change to the entry: the server's revocation
 // is reported, and the owner is told nothing was forgotten.
-test('disconnect: an overtaken disconnect says nothing was forgotten', async () => {
+test('disconnect: an overtaken disconnect says what was and was not revoked', async () => {
   const s = await stub();
   const orig = s.server.listeners('request')[0];
   s.server.removeAllListeners('request');
@@ -120,9 +120,10 @@ test('disconnect: an overtaken disconnect says nothing was forgotten', async () 
   });
   try {
     const r = await ag(s.port).credentials.disconnect(SEAL_ID, 'github');
-    assert.equal(r.revoked, true);
+    // What the server revoked is not what the entry holds now.
+    assert.equal(r.revoked, false);
     assert.equal(r.forgotten, false);
-    assert.match(r.note, /nothing was forgotten: disconnect again/);
+    assert.match(r.note, /changed while the agent disconnected it: the tokens it held before are revoked, a login made meanwhile is not; revoke the app's access/);
   } finally {
     s.server.close();
   }

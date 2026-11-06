@@ -177,3 +177,31 @@ test('session: agent inbox text reaches the terminal with control sequences esca
     text: '⚑ the agent asks to read the value of docs-key\n  [y] allow once  [n] refuse  [Enter] later: \x1b[8m' });
   assert.ok(!text.includes('\x1b'), JSON.stringify(text));
 });
+
+// The CLI says the disconnect was overtaken, and never asks to disconnect
+// an entry it has just removed.
+test('cli: an overtaken disconnect is reported as such', async () => {
+  for (const revoked of [true, false]) {
+    const s = await stub();
+    const orig = s.server.listeners('request')[0];
+    s.server.removeAllListeners('request');
+    s.server.on('request', (req, res) => {
+      if (req.method === 'POST' && req.url === '/_seal/credentials/disconnect') {
+        req.resume();
+        res.writeHead(409, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ code: 'changed', message: 'x', revoked, note: revoked ? '' : "the server offered no token revocation: revoke the app's access at the service" }));
+      }
+      orig(req, res);
+    });
+    const lines = [];
+    try {
+      await credOp(ag(s.port), SEAL_ID, ['disconnect', 'linear'], { json: false, out: (l) => lines.push(l), secret: async () => '' });
+    } finally {
+      s.server.close();
+    }
+    const text = lines.join('\n');
+    assert.match(text, /changed while the agent disconnected it/, text);
+    assert.match(text, /revoke the app's access at the service/, text);
+    assert.doesNotMatch(text, /its tokens are revoked at the server|disconnect again/, text);
+  }
+});

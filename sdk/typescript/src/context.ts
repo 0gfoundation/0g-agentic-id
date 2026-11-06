@@ -55,6 +55,17 @@ export interface AgenticIDConfig {
     seen(attestorUrl: string): boolean | Promise<boolean>;
     record(attestorUrl: string): void | Promise<void>;
   };
+  /**
+   * Memory of the newest credential set (ownership epoch, version) this
+   * client has seen for each agent, so an older one the attestor serves
+   * again is refused instead of signed anew. Every client remembers within
+   * its own lifetime; supply this store to remember across processes (the
+   * CLI backs it with a file). Keys are opaque strings.
+   */
+  credentialMarks?: {
+    seen(key: string): { epoch: number; version: number } | undefined | Promise<{ epoch: number; version: number } | undefined>;
+    record(key: string, mark: { epoch: number; version: number }): void | Promise<void>;
+  };
 }
 
 /** The slice of the attestor's GET /config the SDK auto-configures from. */
@@ -103,6 +114,8 @@ export interface Ctx {
     seen(attestorUrl: string): boolean | Promise<boolean>;
     record(attestorUrl: string): void | Promise<void>;
   };
+  /** See {@link AgenticIDConfig.credentialMarks}. */
+  credentialMarks?: AgenticIDConfig['credentialMarks'];
 }
 
 const DEFAULT_COMPONENT_APP_IDS = ['0g-attestor', '0g-kms', '0g-sandbox-provider'];
@@ -148,6 +161,7 @@ export function buildCtx(config: AgenticIDConfig): Ctx {
     componentAppIdsExplicit: config.componentAppIds !== undefined,
     attestorConfig,
     secretEnvPin: config.secretEnvPin,
+    credentialMarks: config.credentialMarks,
     publicClient: createPublicClient({ chain, transport: http(rpcUrl) }),
   };
 }

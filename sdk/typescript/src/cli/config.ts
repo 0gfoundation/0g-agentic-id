@@ -96,6 +96,33 @@ export function recordSecretEnvPin(attestorUrl: string, env: NodeJS.ProcessEnv =
   }
 }
 
+/**
+ * The newest credential set (ownership epoch, version) this machine has seen
+ * per agent, so an older one an attestor serves again is refused rather
+ * than signed anew (Credentials.get). Not secret: one small file, 0644.
+ */
+export function loadCredentialMarks(env: NodeJS.ProcessEnv = process.env): Record<string, { epoch: number; version: number }> {
+  const file = join(configPaths(env).dir, 'credential-marks.json');
+  if (!existsSync(file)) return {};
+  try {
+    return JSON.parse(readFileSync(file, 'utf8')) as Record<string, { epoch: number; version: number }>;
+  } catch {
+    return {};
+  }
+}
+
+/** Record a newer credential set for `key`. Best-effort, as recordSecretEnvPin. */
+export function recordCredentialMark(key: string, mark: { epoch: number; version: number }, env: NodeJS.ProcessEnv = process.env): void {
+  try {
+    const { dir } = configPaths(env);
+    mkdirSync(dir, { recursive: true });
+    const marks = { ...loadCredentialMarks(env), [key]: { epoch: mark.epoch, version: mark.version } };
+    writeFileSync(join(dir, 'credential-marks.json'), `${JSON.stringify(marks, null, 2)}\n`, { mode: 0o644 });
+  } catch {
+    /* best-effort */
+  }
+}
+
 /** Merge a patch into config.json (creating the dir), 0644. */
 export function saveConfig(patch: FileConfig, env: NodeJS.ProcessEnv = process.env): void {
   const { dir, config } = configPaths(env);

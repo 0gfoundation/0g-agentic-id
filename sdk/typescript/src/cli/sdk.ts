@@ -9,7 +9,7 @@
 
 import { AgenticID } from '../AgenticID';
 import { CliError } from './errors';
-import { loadSecretEnvPins, recordSecretEnvPin } from './config';
+import { loadCredentialMarks, loadSecretEnvPins, recordCredentialMark, recordSecretEnvPin } from './config';
 import { requireAttestorUrl, requirePrivateKey, type CliEnv } from './env';
 
 /**
@@ -52,6 +52,11 @@ export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = 
       secretEnvPin: {
         seen: (url) => !!loadSecretEnvPins()[url],
         record: (url) => recordSecretEnvPin(url),
+      },
+      // An older credential set served again is refused, across runs too.
+      credentialMarks: {
+        seen: (key) => loadCredentialMarks()[key],
+        record: (key, mark) => recordCredentialMark(key, mark),
       },
     });
   } catch (e) {
