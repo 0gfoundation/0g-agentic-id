@@ -115,8 +115,8 @@ func TestMCPLoginRefreshAndRevoke(t *testing.T) {
 	if reg.Get("linear") != nil {
 		t.Fatal("a login entry was served before the login")
 	}
-	if loggedIn(s, "linear") != -1 {
-		t.Fatal("a login entry was listed before the login")
+	if e := listed(s, "linear"); e == nil || e.Status != "awaiting_login" || e.LoggedInAt != 0 {
+		t.Fatalf("before the login the entry is listed as awaiting it: %+v", e)
 	}
 	// The agent asked for this login; the owner adding the entry does not answer it.
 	s.mu.Lock()
@@ -164,8 +164,9 @@ func TestMCPLoginRefreshAndRevoke(t *testing.T) {
 	if e == nil || string(e.Value) != "at-1" || e.ExpiresAt.IsZero() {
 		t.Fatalf("entry after login: %+v", e)
 	}
-	first := loggedIn(s, "linear")
-	if first <= 0 || !added(s, "linear") || status(s, req.AuthReqID) != "approved" {
+	e2 := listed(s, "linear")
+	first := e2.LoggedInAt
+	if e2.Status != "" || first <= 0 || !added(s, "linear") || status(s, req.AuthReqID) != "approved" {
 		t.Fatalf("after login: listed at %d, entry_added %v, request %s", first, added(s, "linear"), status(s, req.AuthReqID))
 	}
 	// Revealing a login entry gives its access token, never the stored
@@ -198,19 +199,19 @@ func TestMCPLoginRefreshAndRevoke(t *testing.T) {
 	if !found {
 		t.Fatal("a revoked login did not ask the owner")
 	}
-	if loggedIn(s, "linear") != first {
+	if listed(s, "linear").LoggedInAt != first {
 		t.Fatal("a refresh changed when the login was done")
 	}
 }
 
-// loggedIn is when List says the entry's login was done; -1 if not listed.
-func loggedIn(s *Store, name string) int64 {
+// listed is what List says of an entry; nil if it is not listed.
+func listed(s *Store, name string) *EntryInfo {
 	for _, e := range s.List() {
 		if e.Name == name {
-			return e.LoggedInAt
+			return &e
 		}
 	}
-	return -1
+	return nil
 }
 
 func added(s *Store, name string) bool {

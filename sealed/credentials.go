@@ -134,7 +134,9 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 		if err := json.Unmarshal(prov.Credentials, &boot); err != nil {
 			logger.Logf("warn: credentials: provisioned set is not valid JSON")
 		} else if opened, err := store.Load(context.Background(), boot.Document, boot.OwnerEpoch); err != nil {
-			logger.Logf("warn: credentials: provisioned set refused: %v", err)
+			// The reason may name entries: the owner reads it, the public log does not.
+			logger.Logf("warn: credentials: provisioned set refused (the owner's audit log says why)")
+			store.Note("load", "", "set refused: "+err.Error())
 		} else {
 			logger.Logf("OK   credentials: set v%d loaded, %d entries, %d skipped", opened.Set.Version, len(opened.Values), len(opened.Skipped))
 		}

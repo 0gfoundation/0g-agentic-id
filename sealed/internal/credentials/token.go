@@ -279,7 +279,11 @@ func (s *Store) audit(op, name, target, result string) {
 	if u, err := url.Parse(target); err == nil && u.Host != "" {
 		host = u.Host
 	}
-	s.addAudit(AuditRecord{Time: s.now(), Op: op, Names: []string{name}, Host: host, Result: result})
+	var names []string
+	if name != "" {
+		names = []string{name}
+	}
+	s.addAudit(AuditRecord{Time: s.now(), Op: op, Names: names, Host: host, Result: result})
 }
 
 // rotate replaces an entry's value with the one the token endpoint just
@@ -292,12 +296,13 @@ func (s *Store) rotate(ctx context.Context, def *Definition, value []byte) {
 	defHash := s.defHashes[def.Name]
 	s.mu.Unlock()
 	if !def.Writeback || s.env.Writeback == nil {
-		s.env.Logf("credentials: %q rotated; no writeback configured, the new value lives until restart", def.Name)
+		s.audit("rotate", def.Name, "", "kept until restart: no writeback")
 		return
 	}
 	wb, err := s.signWriteback(ctx, def.Name, value, defHash)
 	if err != nil {
-		s.env.Logf("credentials: %q rotated but could not be sealed for writeback: %v", def.Name, err)
+		s.env.Logf("credentials: a rotated value could not be sealed for writeback (the owner's audit log names it)")
+		s.audit("writeback", def.Name, "", "failed: "+err.Error())
 		return
 	}
 	for attempt := 0; attempt < 3; attempt++ {

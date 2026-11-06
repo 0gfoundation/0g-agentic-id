@@ -45,6 +45,12 @@ type AuditRecord struct {
 	Host   string    `json:"host,omitempty"`
 	Method string    `json:"method,omitempty"`
 	Result string    `json:"result"`
+	// Count, with First, makes one record stand for many uses: a value
+	// sealed supplies itself (a "sealed:" entry, the framework's inference
+	// key) is used on every model call, so its successful uses are counted,
+	// not listed. Time is then the latest use.
+	Count int        `json:"count,omitempty"`
+	First *time.Time `json:"first,omitempty"`
 }
 
 // Env is what the store needs from the running sealed.
@@ -94,7 +100,10 @@ type EntryInfo struct {
 	Signer    *credproxy.Signer `json:"signer,omitempty"`
 	ExpiresAt int64             `json:"expires_at,omitempty"`
 	// LoggedInAt is when the owner last completed a login entry's login.
-	LoggedInAt  int64  `json:"logged_in_at,omitempty"`
+	LoggedInAt int64 `json:"logged_in_at,omitempty"`
+	// Status "awaiting_login": the owner has not finished this login entry's
+	// login, so it cannot be used yet.
+	Status      string `json:"status,omitempty"`
 	AllowReveal bool   `json:"allow_reveal"`
 	Placeholder string `json:"placeholder"`
 }
@@ -110,7 +119,8 @@ type Store struct {
 	env Env
 	reg *credproxy.Registry
 
-	auditMu sync.Mutex
+	auditMu     sync.Mutex
+	auditCounts map[string]*AuditRecord // counted records, by countKey
 
 	mu            sync.Mutex
 	version       uint64
@@ -132,28 +142,87 @@ type Store struct {
 const auditKeep = 1000
 
 // addAudit keeps rec for the owner's audit route and hands it to Env.Audit,
-// which persists it.
+// which persists it. The successful uses of what sealed supplies itself are
+// counted, so they never push the owner's own records out of the log.
 func (s *Store) addAudit(rec AuditRecord) {
 	s.auditMu.Lock()
-	s.auditLog = append(s.auditLog, rec)
-	if len(s.auditLog) > auditKeep {
-		s.auditLog = s.auditLog[len(s.auditLog)-auditKeep:]
+	if counted(rec) {
+		s.countLocked(rec, 1)
+	} else {
+		s.auditLog = append(s.auditLog, rec)
+		if len(s.auditLog) > auditKeep {
+			s.auditLog = s.auditLog[len(s.auditLog)-auditKeep:]
+		}
 	}
 	s.auditMu.Unlock()
 	s.env.Audit(rec)
 }
 
+// counted: a successful use of entries that are all sealed's own.
+func counted(r AuditRecord) bool {
+	if r.Result != "sent" || len(r.Names) == 0 {
+		return false
+	}
+	for _, n := range r.Names {
+		if !strings.HasPrefix(n, "sealed:") {
+			return false
+		}
+	}
+	return true
+}
+
+func countKey(r AuditRecord) string {
+	return strings.Join([]string{r.Op, strings.Join(r.Names, ","), r.Method, r.Host, r.Result}, "\x00")
+}
+
+// countLocked adds n uses ending at r.Time (from r.First when set).
+func (s *Store) countLocked(r AuditRecord, n int) {
+	first := r.Time
+	if r.First != nil {
+		first = *r.First
+	}
+	c := s.auditCounts[countKey(r)]
+	if c == nil {
+		c = &AuditRecord{Op: r.Op, Names: r.Names, Method: r.Method, Host: r.Host, Result: r.Result, Time: r.Time, First: &first}
+		s.auditCounts[countKey(r)] = c
+	} else {
+		if first.Before(*c.First) {
+			c.First = &first
+		}
+		if r.Time.After(c.Time) {
+			c.Time = r.Time
+		}
+	}
+	c.Count += n
+}
+
+// Note records an event for the owner's audit log only: what sealed's public
+// log must not name (an entry skipped, a set refused) goes here.
+func (s *Store) Note(op, name, result string) { s.audit(op, name, "", result) }
+
 // SeedAudit restores records persisted by an earlier boot.
 func (s *Store) SeedAudit(recs []AuditRecord) {
 	s.auditMu.Lock()
 	defer s.auditMu.Unlock()
-	s.auditLog = append(append([]AuditRecord{}, recs...), s.auditLog...)
+	var listed []AuditRecord
+	for _, r := range recs {
+		switch {
+		case r.Count > 0:
+			s.countLocked(r, r.Count)
+		case counted(r): // written before uses were counted
+			s.countLocked(r, 1)
+		default:
+			listed = append(listed, r)
+		}
+	}
+	s.auditLog = append(listed, s.auditLog...)
 	if len(s.auditLog) > auditKeep {
 		s.auditLog = s.auditLog[len(s.auditLog)-auditKeep:]
 	}
 }
 
-// AuditSince returns the records newer than after (Unix seconds).
+// AuditSince returns the records newer than after (Unix seconds), oldest
+// first; a counted record is there when its latest use is.
 func (s *Store) AuditSince(after int64) []AuditRecord {
 	s.auditMu.Lock()
 	defer s.auditMu.Unlock()
@@ -163,6 +232,12 @@ func (s *Store) AuditSince(after int64) []AuditRecord {
 			out = append(out, r)
 		}
 	}
+	for _, c := range s.auditCounts {
+		if c.Time.Unix() > after {
+			out = append(out, *c)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
 	return out
 }
 
@@ -179,7 +254,7 @@ func NewStore(env Env, reg *credproxy.Registry) *Store {
 		defs: map[string]*Definition{}, defHashes: map[string]string{}, values: map[string][]byte{}, derived: map[string]derived{},
 		pending: map[string]*Pending{}, approvals: map[string]Approval{}, tokenMu: map[string]*sync.Mutex{},
 		logins: map[string]*loginAttempt{}, refreshTimers: map[string]*time.Timer{}, system: map[string]*credproxy.Entry{},
-		events: newEventLog(), now: time.Now,
+		events: newEventLog(), now: time.Now, auditCounts: map[string]*AuditRecord{},
 	}
 }
 
@@ -280,8 +355,10 @@ func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Ope
 			}
 		}
 	}
+	// The public log counts them (the caller); which ones and why is the
+	// owner's to read.
 	for name, why := range o.Skipped {
-		s.env.Logf("credentials: entry %q skipped: %s", name, why)
+		s.audit("load", name, "", "skipped: "+why)
 	}
 	return o, nil
 }
@@ -302,6 +379,11 @@ func (s *Store) Clear() {
 	}
 	_ = s.reg.Replace(nil)
 	s.events.add(Event{Type: "cleared"})
+	// The audit log is the previous owner's too.
+	s.auditMu.Lock()
+	s.auditLog, s.auditCounts = nil, map[string]*AuditRecord{}
+	s.auditMu.Unlock()
+	s.addAudit(AuditRecord{Time: s.now(), Op: "clear", Result: "the owner changed: every credential and earlier record cleared"})
 }
 
 // syncRegistryLocked rebuilds the proxy's entries from defs, values and
@@ -324,7 +406,8 @@ func (s *Store) syncRegistryLocked() {
 		entries = append(entries, e)
 	}
 	if err := s.reg.Replace(entries); err != nil {
-		s.env.Logf("credentials: registry: %v", err)
+		s.env.Logf("credentials: the proxy refused the entries (the owner's audit log says why)")
+		s.audit("load", "", "", "refused by the proxy: "+err.Error())
 	}
 }
 
@@ -352,14 +435,16 @@ func (s *Store) List() []EntryInfo {
 	defer s.mu.Unlock()
 	var out []EntryInfo
 	for name, d := range s.defs {
-		v := s.values[name]
-		if v == nil {
-			continue // a login not done yet
+		v, ok := s.values[name]
+		if !ok {
+			continue
 		}
 		info := EntryInfo{Name: name, Description: d.Description, Source: "owner", Use: string(useOf(d)),
 			Hosts: d.Hosts, Positions: d.Positions, Signer: d.Signer, ExpiresAt: d.ExpiresAt, AllowReveal: d.AllowReveal,
 			Placeholder: credproxy.Placeholder(name)}
-		if st, ok := parseMCPState(v); ok && d.MCP != nil {
+		if v == nil {
+			info.Status = "awaiting_login" // only a login entry is loaded without a value
+		} else if st, ok := parseMCPState(v); ok && d.MCP != nil {
 			info.LoggedInAt = st.LoggedInAt
 		}
 		out = append(out, info)

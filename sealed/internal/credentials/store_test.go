@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -247,6 +248,82 @@ func TestClearDropsEverything(t *testing.T) {
 	s.Clear()
 	if len(reg.Names()) != 0 || len(s.List()) != 0 || len(s.PendingList()) != 0 {
 		t.Fatal("clear left state behind")
+	}
+	// The new owner's audit log starts with the clear, nothing of the old one.
+	recs := s.AuditSince(0)
+	if len(recs) != 1 || recs[0].Op != "clear" || len(recs[0].Names) != 0 {
+		t.Fatalf("audit after clear: %+v", recs)
+	}
+}
+
+// What sealed supplies itself is used on every model call: its successful
+// uses become one counted record, failures stay listed, and the owner's own
+// records are never pushed out by them.
+func TestAuditCountsSealedEntries(t *testing.T) {
+	f := newFixture(t)
+	s, _, _ := f.store(t, nil, nil)
+	t0 := time.Unix(1_800_000_000, 0)
+	s.Record(credproxy.Record{Time: t0.Add(-time.Second), Names: []string{"github"}, Host: "api.github.com", Method: "GET"})
+	for i := 0; i < auditKeep+50; i++ {
+		s.Record(credproxy.Record{Time: t0.Add(time.Duration(i) * time.Second), Names: []string{"sealed:inference"}, Host: "router.example", Method: "POST"})
+	}
+	s.Record(credproxy.Record{Time: t0.Add(2 * time.Hour), Names: []string{"sealed:inference"}, Host: "router.example", Method: "POST", Code: "upstream_error"})
+	recs := s.AuditSince(0)
+	if len(recs) != 3 {
+		t.Fatalf("records: %+v", recs)
+	}
+	if recs[0].Names[0] != "github" {
+		t.Fatalf("the owner's record was pushed out: %+v", recs[0])
+	}
+	c := recs[1]
+	if c.Count != auditKeep+50 || !c.First.Equal(t0) || !c.Time.Equal(t0.Add(time.Duration(auditKeep+49)*time.Second)) {
+		t.Fatalf("counted record: %+v", c)
+	}
+	if recs[2].Result != "upstream_error" || recs[2].Count != 0 {
+		t.Fatalf("a failure is listed on its own: %+v", recs[2])
+	}
+	// Persisted and loaded again (stop/start), the count carries on.
+	s2, _, _ := f.store(t, nil, nil)
+	s2.SeedAudit(recs)
+	s2.Record(credproxy.Record{Time: t0.Add(3 * time.Hour), Names: []string{"sealed:inference"}, Host: "router.example", Method: "POST"})
+	again := s2.AuditSince(0)
+	if len(again) != 3 || again[2].Count != auditKeep+51 {
+		t.Fatalf("after reload: %+v", again)
+	}
+}
+
+// Which entries were skipped and why is the owner's to read, never the
+// public log's.
+func TestSkippedEntryNamedInAuditOnly(t *testing.T) {
+	f := newFixture(t)
+	reg := credproxy.NewRegistry()
+	var logged []string
+	owner := crypto.PubkeyToAddress(f.owner.PublicKey)
+	s := NewStore(Env{
+		Domain: f.domain, SealID: testSeal, AgentSeal: crypto.PubkeyToAddress(f.seal.PublicKey), AgentSealPriv: crypto.FromECDSA(f.seal),
+		BootID: "boot-1", LiveOwner: func(context.Context) (common.Address, error) { return owner, nil }, Persist: &memPersist{},
+		Logf: func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}, reg)
+	doc := f.doc(t, 1, map[string]string{"secretname": "v-123456"})
+	f.editDefs(t, &doc, func(d *Definition) { // a credential in the Host header: skipped
+		d.Positions = []credproxy.Position{{Kind: credproxy.PosHeader, Name: "Host", Template: "{v}"}}
+	})
+	if _, err := s.Load(context.Background(), doc, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range logged {
+		if strings.Contains(l, "secretname") {
+			t.Fatalf("the public log names an entry: %q", l)
+		}
+	}
+	var found bool
+	for _, r := range s.AuditSince(0) {
+		if r.Op == "load" && len(r.Names) == 1 && r.Names[0] == "secretname" && strings.HasPrefix(r.Result, "skipped: ") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the skipped entry is not in the audit log: %+v", s.AuditSince(0))
 	}
 }
 
