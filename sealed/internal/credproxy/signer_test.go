@@ -87,7 +87,7 @@ func TestSigV4ResignMatchesAWSSDK(t *testing.T) {
 				req.Header.Set(k, val)
 			}
 			reg := awsRegistry(t, u.Host, v.Region, v.Service, at)
-			names, err := reg.signRequest(req, u.Host, []byte(v.Body), false)
+			names, _, err := reg.signRequest(req, u.Host, []byte(v.Body), false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -111,7 +111,7 @@ func TestSigV4SignMatchesAWSSDK(t *testing.T) {
 			req, _ := http.NewRequest(v.Method, v.URL, strings.NewReader(v.Body))
 			req.Header.Set(SignHeader, "aws")
 			reg := awsRegistry(t, u.Host, v.Region, v.Service, at)
-			if _, err := reg.signRequest(req, u.Host, []byte(v.Body), false); err != nil {
+			if _, _, err := reg.signRequest(req, u.Host, []byte(v.Body), false); err != nil {
 				t.Fatal(err)
 			}
 			if got := req.Header.Get("Authorization"); got != v.WantAuth {
@@ -129,13 +129,13 @@ func TestSigV4LeavesOtherKeysAlone(t *testing.T) {
 	req, _ := http.NewRequest("GET", "https://sts.amazonaws.com/", nil)
 	orig := "AWS4-HMAC-SHA256 Credential=AKIAOTHER/20150830/us-east-1/sts/aws4_request, SignedHeaders=host;x-amz-date, Signature=00"
 	req.Header.Set("Authorization", orig)
-	names, err := reg.signRequest(req, "sts.amazonaws.com", nil, false)
+	names, _, err := reg.signRequest(req, "sts.amazonaws.com", nil, false)
 	if err != nil || names != nil || req.Header.Get("Authorization") != orig {
 		t.Fatalf("a request signed with someone else's key was touched: %v %v", names, err)
 	}
 	// Our key, another host: not ours to sign there either.
 	req.Header.Set("Authorization", strings.Replace(orig, "AKIAOTHER", "AKIDEXAMPLE", 1))
-	if names, _ := reg.signRequest(req, "evil.example", nil, false); names != nil {
+	if names, _, _ := reg.signRequest(req, "evil.example", nil, false); names != nil {
 		t.Fatal("re-signed for a host the entry does not name")
 	}
 }
@@ -155,7 +155,7 @@ func TestSignRefusals(t *testing.T) {
 	} {
 		req, _ := http.NewRequest("GET", "https://"+c.host+"/", nil)
 		req.Header.Set(SignHeader, c.name)
-		if _, err := reg.signRequest(req, c.host, nil, false); err == nil || err.Code != c.code {
+		if _, _, err := reg.signRequest(req, c.host, nil, false); err == nil || err.Code != c.code {
 			t.Fatalf("%s: got %v, want %s", c.name, err, c.code)
 		}
 	}
@@ -168,7 +168,7 @@ func TestSignRefusals(t *testing.T) {
 	// A big body cannot be signed for a service that needs its hash.
 	req, _ = http.NewRequest("PUT", "https://s3.example/", nil)
 	req.Header.Set(SignHeader, "aws")
-	if _, err := reg.signRequest(req, "s3.example", nil, true); err != nil || req.Header.Get("X-Amz-Content-Sha256") != "UNSIGNED-PAYLOAD" {
+	if _, _, err := reg.signRequest(req, "s3.example", nil, true); err != nil || req.Header.Get("X-Amz-Content-Sha256") != "UNSIGNED-PAYLOAD" {
 		t.Fatalf("s3 streams unsigned: %v %v", err, req.Header)
 	}
 }
@@ -191,7 +191,7 @@ func TestHMACHeaderAndParam(t *testing.T) {
 	body := `{"event":"push"}`
 	req, _ := http.NewRequest("POST", "https://hooks.example/hook", strings.NewReader(body))
 	req.Header.Set(SignHeader, "hook")
-	if _, err := reg.signRequest(req, "hooks.example", []byte(body), false); err != nil {
+	if _, _, err := reg.signRequest(req, "hooks.example", []byte(body), false); err != nil {
 		t.Fatal(err)
 	}
 	if got := req.Header.Get("X-Hub-Signature-256"); got != "sha256="+hex.EncodeToString(mac(body)) {
@@ -201,7 +201,7 @@ func TestHMACHeaderAndParam(t *testing.T) {
 	req, _ = http.NewRequest("GET", "https://api.example/v1/order?a=1", nil)
 	req.Header.Set(SignHeader, "ex")
 	req.Header.Set("X-Nonce", "{header:X-Nonce}")
-	if _, err := reg.signRequest(req, "api.example", nil, false); err != nil {
+	if _, _, err := reg.signRequest(req, "api.example", nil, false); err != nil {
 		t.Fatal(err)
 	}
 	want := base64.StdEncoding.EncodeToString(mac("1700000000GET/v1/ordera=1{header:X-Nonce}"))
@@ -358,7 +358,7 @@ func TestSigV4ResignUsesEntryScope(t *testing.T) {
 		}
 		req.Header.Set("Authorization", strings.Replace(v.Headers["Authorization"], "/us-east-1/iam/", "/eu-west-1/s3/", 1))
 		reg := awsRegistry(t, u.Host, v.Region, v.Service, at)
-		if _, err := reg.signRequest(req, u.Host, nil, false); err != nil {
+		if _, _, err := reg.signRequest(req, u.Host, nil, false); err != nil {
 			t.Fatal(err)
 		}
 		if got := req.Header.Get("Authorization"); got != v.WantAuth {
@@ -382,7 +382,7 @@ func TestSigV4FreshSignsEveryAmzHeader(t *testing.T) {
 	req.Header.Set("X-Amz-Target", "AmazonSQS.SendMessage")
 	req.Header.Set("X-Amz-Meta-Note", "hi")
 	req.Header.Set("User-Agent", "not-signed")
-	if _, err := reg.signRequest(req, "sqs.example", body, false); err != nil {
+	if _, _, err := reg.signRequest(req, "sqs.example", body, false); err != nil {
 		t.Fatal(err)
 	}
 	auth := req.Header.Get("Authorization")
@@ -393,7 +393,7 @@ func TestSigV4FreshSignsEveryAmzHeader(t *testing.T) {
 	}
 	// The signature is right for that list: re-signing the request as a
 	// client-signed one (checked against aws-sdk-go above) gives the same.
-	if _, err := reg.signRequest(req, "sqs.example", body, false); err != nil || req.Header.Get("Authorization") != auth {
+	if _, _, err := reg.signRequest(req, "sqs.example", body, false); err != nil || req.Header.Get("Authorization") != auth {
 		t.Fatalf("re-signed differently: %v\n%s\n%s", err, auth, req.Header.Get("Authorization"))
 	}
 }
@@ -422,7 +422,7 @@ func TestSigV4SessionTokenEntry(t *testing.T) {
 		}
 		req, _ := http.NewRequest("GET", "https://sts.example/", nil)
 		req.Header.Set(SignHeader, "aws")
-		_, err := reg.signRequest(req, "sts.example", nil, false)
+		_, set, err := reg.signRequest(req, "sts.example", nil, false)
 		got := req.Header.Get("X-Amz-Security-Token")
 		if c.code != "" {
 			if err == nil || err.Code != c.code || got != "" {
@@ -433,6 +433,10 @@ func TestSigV4SessionTokenEntry(t *testing.T) {
 		a, _ := parseAWSAuth(req.Header.Get("Authorization"))
 		if err != nil || got != c.token || !slices.Contains(a.signedHeaders, "x-amz-security-token") {
 			t.Fatalf("%s: got %v, token %q, signed %v", c.session, err, got, a.signedHeaders)
+		}
+		// The token and the signature are redacted from the response.
+		if _, sig, _ := strings.Cut(req.Header.Get("Authorization"), "Signature="); string(set["sess"]) != c.token || string(set["aws"]) != sig {
+			t.Fatalf("%s: set %q", c.session, set)
 		}
 	}
 }
@@ -544,5 +548,116 @@ func TestMintedJWTScrubbedLater(t *testing.T) {
 	}
 	if reg.Len() != maxMinted {
 		t.Fatalf("Len %d, want %d", reg.Len(), maxMinted)
+	}
+}
+
+// Re-signing a client's AWS signature needs an X-Amz-Date within 15 minutes
+// of now and host among the signed headers. Neither mode signs a request
+// carrying a query-string signature's parameters.
+func TestSigV4SignRefusesUnboundRequests(t *testing.T) {
+	at := time.Date(2015, 8, 30, 12, 36, 0, 0, time.UTC)
+	reg := awsRegistry(t, "s3.example", "us-east-1", "s3", at)
+	for _, c := range []struct {
+		name, date, signed, query string
+		fresh                     bool
+		ok                        bool
+	}{
+		{"within the window", "20150830T124900Z", "host;x-amz-date", "", false, true},
+		{"16 minutes ahead", "20150830T125200Z", "host;x-amz-date", "", false, false},
+		{"17 minutes behind", "20150830T121900Z", "host;x-amz-date", "", false, false},
+		{"another year", "20301231T000000Z", "host;x-amz-date", "", false, false},
+		{"not a date", "20150830T1236", "host;x-amz-date", "", false, false},
+		{"host not signed", "20150830T123600Z", "x-amz-date", "", false, false},
+		{"query X-Amz-Algorithm", "20150830T123600Z", "host;x-amz-date", "X-Amz-Algorithm=AWS4-HMAC-SHA256", false, false},
+		{"query X-Amz-Credential", "20150830T123600Z", "host;x-amz-date", "a=1&x-amz-credential=AKIDEXAMPLE%2F20150830", false, false},
+		{"query X-Amz-Signature", "20150830T123600Z", "host;x-amz-date", "X-Amz-Signature=00", false, false},
+		{"query X-Amz-Expires alone", "20150830T123600Z", "host;x-amz-date", "X-Amz-Expires=60", false, true},
+		{"fresh, query X-Amz-Credential", "", "", "X-Amz-Credential=AKIDEXAMPLE%2F20150830", true, false},
+		{"fresh", "", "", "a=1", true, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", "https://s3.example/b/k?"+c.query, nil)
+			if c.fresh {
+				req.Header.Set(SignHeader, "aws")
+			} else {
+				req.Header.Set("X-Amz-Date", c.date)
+				req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"+c.date[:min(8, len(c.date))]+"/us-east-1/s3/aws4_request, SignedHeaders="+c.signed+", Signature=00")
+			}
+			_, _, err := reg.signRequest(req, "s3.example", nil, false)
+			if c.ok != (err == nil) || err != nil && err.Code != "sign_failed" {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+}
+
+// A signature the proxy makes is redacted from the response like a value it
+// filled: SigV4 (fresh and re-signed) and HMAC, in a header or a query
+// parameter.
+func TestSignaturesRedacted(t *testing.T) {
+	var mu sync.Mutex
+	var sent string
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s := r.Header.Get("Authorization") + "|" + r.Header.Get("X-Signature") + "|" + r.URL.RawQuery + "|" + r.URL.Query().Get("sig")
+		mu.Lock()
+		sent = s
+		mu.Unlock()
+		w.Header().Set("X-Echo", s)
+		_, _ = io.WriteString(w, s)
+	}))
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	secret := []byte("whsec_0123456789abcdef")
+	h := newHarness(t, ts,
+		&Entry{Name: "aws", Hosts: []string{"example.com"}, Use: UseSign, Value: []byte(awsExampleSecret),
+			Signer: &Signer{Method: SignSigV4, AccessKeyID: "AKIDEXAMPLE", Region: "us-east-1", Service: "s3"}},
+		&Entry{Name: "hook", Hosts: []string{"example.com"}, Use: UseSign, Value: secret,
+			Signer: &Signer{Method: SignHMAC, Message: "{method}{path}", Header: "X-Signature"}},
+		&Entry{Name: "hookq", Hosts: []string{"example.com"}, Use: UseSign, Value: secret,
+			Signer: &Signer{Method: SignHMAC, Message: "{path}{query}", Param: "sig", Encoding: "base64"}})
+	sigOf := map[string]func(string) string{
+		"aws":   func(s string) string { _, sig, _ := strings.Cut(strings.Split(s, "|")[0], "Signature="); return sig },
+		"hook":  func(s string) string { return strings.Split(s, "|")[1] },
+		"hookq": func(s string) string { return strings.Split(s, "|")[3] },
+	}
+	now := time.Now().UTC()
+	for _, c := range []struct {
+		name, entry string
+		set         func(*http.Request)
+	}{
+		{"sigv4 fresh", "aws", func(r *http.Request) { r.Header.Set(SignHeader, "aws") }},
+		{"sigv4 re-signed", "aws", func(r *http.Request) {
+			r.Header.Set("X-Amz-Date", now.Format("20060102T150405Z"))
+			r.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+			r.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"+now.Format("20060102")+"/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=00")
+		}},
+		{"hmac header", "hook", func(r *http.Request) { r.Header.Set(SignHeader, "hook") }},
+		{"hmac query parameter", "hookq", func(r *http.Request) { r.Header.Set(SignHeader, "hookq") }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", h.explicitURL("/b/k?a=1"), nil)
+			c.set(req)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := readAll(t, resp)
+			mu.Lock()
+			sig := sigOf[c.entry](sent)
+			mu.Unlock()
+			if resp.StatusCode != 200 || len(sig) < 20 {
+				t.Fatalf("status %d, signature %q", resp.StatusCode, sig)
+			}
+			echo := resp.Header.Get("X-Echo")
+			for _, form := range []string{sig, url.QueryEscape(sig)} {
+				if strings.Contains(body, form) || strings.Contains(echo, form) {
+					t.Fatalf("signature came back: %s / %s", body, echo)
+				}
+			}
+			if !strings.Contains(body, Placeholder(c.entry)) {
+				t.Fatalf("body %s", body)
+			}
+		})
 	}
 }

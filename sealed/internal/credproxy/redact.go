@@ -11,8 +11,10 @@ import (
 	"strings"
 )
 
-// Values shorter than these are not redacted: a short string would match
-// ordinary response bytes. Credentials are far longer in practice.
+// Values shorter than minRawRedact are not redacted, and encoded forms
+// shorter than minEncodedRedact neither (base64 aside, see addValue): a short
+// string would match ordinary response bytes. Credentials are far longer in
+// practice.
 const (
 	minRawRedact     = 6
 	minEncodedRedact = 8
@@ -138,6 +140,9 @@ func (s *formSet) matchAt(b []byte) *redactForm {
 
 // isProperPrefix reports whether b is a proper prefix of some form.
 func (s *formSet) isProperPrefix(b []byte) bool {
+	if len(b) >= s.maxLen {
+		return false
+	}
 	if len(b) < formKeyLen {
 		_, ok := s.heads[string(b)]
 		return ok
@@ -157,6 +162,10 @@ func (s *formSet) isProperPrefix(b []byte) bool {
 // each with '/' written plain or as "\/"; and standard or URL-safe base64 at
 // each of the three byte alignments a value can take inside a longer base64
 // run. Base64 wrapped across lines and hex are not covered.
+//
+// Base64 is redacted for every value redacted raw, whatever the length of
+// the encoded run: a 6-byte value leaves only 7 characters that are its
+// alone at two of the three alignments.
 func addValue(add func(match string, min int, repl []byte), name string, v []byte) {
 	repl := []byte(Placeholder(name))
 	s := string(v)
@@ -169,13 +178,14 @@ func addValue(add func(match string, min int, repl []byte), name string, v []byt
 		add(j, minEncodedRedact, repl)
 		add(strings.ReplaceAll(j, "/", `\/`), minEncodedRedact, repl)
 	}
+	if len(v) < minRawRedact {
+		return
+	}
 	for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
 		for k := 0; k < 3; k++ {
 			full := enc.EncodeToString(append(make([]byte, k), v...))
 			start, end := (8*k+5)/6, (8*(k+len(v)))/6
-			if end > start {
-				add(full[start:end], minEncodedRedact, repl)
-			}
+			add(full[start:end], 0, repl)
 		}
 	}
 }
@@ -221,7 +231,7 @@ func lowerASCII(c byte) byte {
 
 // apply redacts a whole value, such as a header.
 func (r *redactor) apply(b []byte) []byte {
-	b = r.applyValues(b)
+	b, _ = r.applyValues(b, true)
 	if r.tokens {
 		b, _ = maskTokens(b, false, true, r.mask)
 	}
@@ -239,11 +249,16 @@ func (r *redactor) empty() bool {
 
 // applyValues replaces, scanning left to right, the longest form that starts
 // at each place. b comes back as it is when nothing matched.
-func (r *redactor) applyValues(b []byte) []byte {
+//
+// Unless final (more of the stream is to come), a match that could still
+// grow into a longer form (one value a prefix of another, the read ending
+// inside the longer one) is not replaced: it and everything after it are
+// left as they are, and hold is their length, for the caller to hold back
+// until more data arrives.
+func (r *redactor) applyValues(b []byte, final bool) (out []byte, hold int) {
 	if r.empty() {
-		return b
+		return b, 0
 	}
-	var out []byte
 	last := 0
 	for i := 0; i+min(minRawRedact, minEncodedRedact) <= len(b); i++ {
 		var f *redactForm
@@ -254,6 +269,10 @@ func (r *redactor) applyValues(b []byte) []byte {
 		}
 		if f == nil {
 			continue
+		}
+		if !final && r.isProperPrefix(b[i:]) {
+			hold = len(b) - i
+			break
 		}
 		if out == nil {
 			out = make([]byte, 0, len(b))
@@ -268,9 +287,19 @@ func (r *redactor) applyValues(b []byte) []byte {
 		i = last - 1
 	}
 	if out == nil {
-		return b
+		return b, hold
 	}
-	return append(out, b[last:]...)
+	return append(out, b[last:]...), hold
+}
+
+// isProperPrefix reports whether b is a proper prefix of a form of any set.
+func (r *redactor) isProperPrefix(b []byte) bool {
+	for _, s := range r.sets {
+		if s.isProperPrefix(b) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *redactor) applyString(s string) string { return string(r.apply([]byte(s))) }
@@ -316,7 +345,8 @@ func (rr *redactReader) Read(p []byte) (int, error) {
 	for len(rr.out) == 0 {
 		if rr.err != nil {
 			if len(rr.held) > 0 {
-				rr.out, rr.held = rr.red.applyValues(rr.held), nil
+				rr.out, _ = rr.red.applyValues(rr.held, true)
+				rr.held = nil
 				if rr.red.tokens {
 					rr.out, _ = maskTokens(rr.out, rr.prevToken, true, rr.red.mask)
 				}
@@ -333,11 +363,20 @@ func (rr *redactReader) Read(p []byte) (int, error) {
 			continue
 		}
 		final := rr.err != nil
-		buf := rr.red.applyValues(append(rr.held, chunk[:n]...))
+		buf, hold := rr.red.applyValues(append(rr.held, chunk[:n]...), final)
+		// The held tail is left to the next round whole: token masking
+		// sees only what comes before it.
+		head := buf[:len(buf)-hold]
 		keep := 0
 		if rr.red.tokens {
-			buf, keep = maskTokens(buf, rr.prevToken, final, rr.red.mask)
+			head, keep = maskTokens(head, rr.prevToken, final, rr.red.mask)
 		}
+		if hold > 0 {
+			buf = append(append(make([]byte, 0, len(head)+hold), head...), buf[len(buf)-hold:]...)
+		} else {
+			buf = head
+		}
+		keep += hold
 		if !final {
 			keep = max(keep, rr.red.pendingTail(buf))
 		}
@@ -365,7 +404,7 @@ func (r *Registry) Generation() uint64 {
 func (r *Registry) Len() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.entries) + len(r.retired) + len(r.minted)
+	return len(r.entries) + len(r.retired) + len(r.retiredDerived) + len(r.minted)
 }
 
 // Scrub returns b with every value sealed holds or held during this boot

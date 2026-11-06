@@ -238,8 +238,10 @@ func (f *filler) fillBasic(decoded string) (string, *Error) {
 	return "", refuse(http.StatusForbidden, "position_not_allowed", "credential %q is not allowed in Basic auth for user %q", n, user)
 }
 
+// fillPath fills a path segment that is a placeholder as written or once
+// percent-decoded, whichever of its bytes are escaped.
 func (f *filler) fillPath(escaped string) (string, *Error) {
-	if !strings.Contains(escaped, "credential") {
+	if !strings.Contains(escaped, "credential") && !strings.Contains(escaped, "%") {
 		return escaped, nil
 	}
 	segs := strings.Split(escaped, "/")
@@ -367,7 +369,9 @@ func mentionedNames(b []byte) []string {
 // fillBody fills a JSON or form body. A body that names a placeholder in any
 // form must have it filled, or the request is refused: it is never sent on
 // with a placeholder the harness believes was filled, and never filled in a
-// way the server could read differently from how the proxy read it.
+// way the server could read differently from how the proxy read it. A form
+// body must be url-encoded throughout once filled; a JSON body goes out with
+// its own '&' and ';' escaped (fillJSON).
 func (f *filler) fillBody(contentTypes []string, body []byte) ([]byte, *Error) {
 	if len(body) == 0 || !mentionsPlaceholder(body) {
 		return body, nil
@@ -379,15 +383,18 @@ func (f *filler) fillBody(contentTypes []string, body []byte) ([]byte, *Error) {
 	mt, _, _ := mime.ParseMediaType(contentTypes[0])
 	switch mt {
 	case "application/x-www-form-urlencoded":
-		if !wellFormedForm(body) {
-			return nil, refuse(http.StatusForbidden, "position_not_allowed", "a form body holding a placeholder must be url-encoded throughout")
-		}
 		out, n, err := f.fillPairs(string(body), "form field", bodyField)
 		if err != nil {
 			return nil, err
 		}
 		if n == 0 {
 			return nil, refuse(http.StatusForbidden, "position_not_allowed", "a placeholder in a form body must be the whole value of a field")
+		}
+		// What is sent must be url-encoded throughout; a placeholder written
+		// raw as a whole value is gone once filled (fillPairs refuses one
+		// anywhere else, and a placeholder name holds no '&', '=', ';' or '+').
+		if !wellFormedForm([]byte(out)) {
+			return nil, refuse(http.StatusForbidden, "position_not_allowed", "a form body holding a placeholder must be url-encoded throughout")
 		}
 		return []byte(out), nil
 	case "application/json":
@@ -417,24 +424,17 @@ func wellFormedForm(b []byte) bool {
 	return true
 }
 
-// formFieldInJSON reports whether a server that parses body as a form would
-// find a field of the agent's naming in it: an '&', then a name, then '='.
-// The whole body counts, keys and the bytes between strings included, since
-// a form parser sees none of JSON's structure; what follows the '=' up to
-// the next '&' is that field's value, a value filled there included.
-func formFieldInJSON(body []byte) bool {
-	i := bytes.IndexByte(body, '&')
-	return i >= 0 && bytes.IndexByte(body[i:], '=') >= 0
-}
-
 // fillJSON fills placeholders that stand alone as top-level string values,
 // written as they are (no escapes). Every placeholder the decoded body names
 // must be one of those, so one nested deeper, inside a key or escaped is
 // refused.
+//
+// The body's own '&' and ';' go out as \u0026 and \u003b. In valid JSON
+// those bytes stand only inside strings, where the escapes read the same to
+// a JSON parser, and a server that parses the body as a form finds no field
+// separator of the agent's writing in it. A filled value is written as
+// encoding/json writes it ('&' escaped too).
 func (f *filler) fillJSON(body []byte) ([]byte, *Error) {
-	if formFieldInJSON(body) {
-		return nil, refuse(http.StatusForbidden, "position_not_allowed", "a JSON body holding a placeholder may not hold '&' followed by '=' (it would read as a form field)")
-	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, refuse(http.StatusForbidden, "position_not_allowed", "a placeholder in a JSON body needs a top-level object")
@@ -470,7 +470,7 @@ func (f *filler) fillJSON(body []byte) ([]byte, *Error) {
 	if len(fills) == 0 || jsonPlaceholderCount(body) != len(fills) {
 		return nil, refuse(http.StatusForbidden, "position_not_allowed", "a placeholder in a JSON body must be a whole top-level string value")
 	}
-	out := body
+	out := bytes.ReplaceAll(bytes.ReplaceAll(body, []byte("&"), []byte(`\u0026`)), []byte(";"), []byte(`\u003b`))
 	for _, fl := range fills {
 		if !bytes.Contains(out, fl.quoted) {
 			return nil, refuse(http.StatusForbidden, "position_not_allowed", "a placeholder in a JSON body could not be filled")

@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -686,8 +687,8 @@ func TestWebSocket101IsRedacted(t *testing.T) {
 
 // Server frames are parsed and each payload redacted as a whole: nothing is
 // held back waiting for the next frame, a frame header is never rewritten,
-// a large frame is masked as it streams, and control frames pass as they
-// are.
+// a large frame is masked as it streams, and a close frame's reason is
+// masked after its status code.
 func TestWebSocketFrames(t *testing.T) {
 	const value = "frame-value-0123456789"
 	value2 := []byte(value)
@@ -701,6 +702,7 @@ func TestWebSocketFrames(t *testing.T) {
 	// length byte on.
 	lengthByte := "k-" + strings.Repeat("a", 0x73-2)
 	closeFrame := append([]byte{0x03, 0xe8}, "bye "+value...)
+	closeWant := append([]byte{0x03, 0xe8}, "bye "+strings.Repeat("*", len(value))...)
 
 	ts := wsUpstream(t, switching, nil, func(conn net.Conn, buf *bufio.ReadWriter) {
 		one := make([]byte, 1)
@@ -741,7 +743,7 @@ func TestWebSocketFrames(t *testing.T) {
 	if b0, p := readFrame(t, br); b0 != 0x82 || !bytes.Equal(p, bigWant) {
 		t.Fatalf("large frame: %x, %d bytes, masked as expected %v", b0, len(p), bytes.Equal(p, bigWant))
 	}
-	if b0, p := readFrame(t, br); b0 != 0x88 || !bytes.Equal(p, closeFrame) {
+	if b0, p := readFrame(t, br); b0 != 0x88 || !bytes.Equal(p, closeWant) {
 		t.Fatalf("close frame: %x %q", b0, p)
 	}
 	_, _ = conn.Write([]byte("x"))
@@ -836,8 +838,10 @@ func TestRedactsValueRemovedMidRequest(t *testing.T) {
 			c.mutate(h.reg())
 			// Push the value out of the retired values as well: only the
 			// request's own record of what it filled is left.
-			for i := 0; i <= maxRetired; i++ {
-				_ = h.reg().Put(&Entry{Name: "churn", Hosts: []string{"churn.example"}, Value: []byte(fmt.Sprintf("churn-value-%06d", i))})
+			for i := 0; i <= maxRetiredDerived; i++ {
+				churn := fmt.Sprintf("derived:churn%d", i)
+				_ = h.reg().Put(&Entry{Name: churn, Hosts: []string{"churn.example"}, Value: []byte(fmt.Sprintf("churn-value-%06d", i))})
+				h.reg().Delete(churn)
 			}
 			if string(h.reg().Scrub([]byte(value))) != value {
 				t.Fatal("setup: the registry still scrubs the value")
@@ -900,10 +904,10 @@ func TestBodyFillRefusals(t *testing.T) {
 	}{
 		// Filled as a form, read as JSON: the value lands in "x".
 		{"form body that is JSON", []string{form}, `{"x":"&token=%5B%5Bcredential%3Agithub%5D%5D&y=","z":1}`},
-		{"form body not url-encoded", []string{form}, `token=[[credential:github]]`},
 		{"form body with whitespace", []string{form}, "a=1 &token=%5B%5Bcredential%3Agithub%5D%5D"},
-		// Filled as JSON, read as a form: the value lands in "comment".
-		{"JSON body with a form field", []string{js}, `{"a":"&comment=","token":"[[credential:github]]"}`},
+		{"form body not url-encoded once filled", []string{form}, `a=[x]&token=[[credential:github]]`},
+		{"form placeholder not a whole value", []string{form}, `token=x[[credential:github]]`},
+		{"form placeholder JSON-escaped", []string{form}, `token=%5B%5Bcredential%3Agithub%5D%5D&b=\u005b\u005bcredential:github]]`},
 		{"two content types", []string{js, form}, `{"token":"[[credential:github]]"}`},
 		{"JSON-escaped placeholder", []string{js}, `{"token":"[[credential:git\u0068ub]]"}`},
 		{"JSON-escaped brackets", []string{js}, `{"token":"\u005b\u005bcredential:github]]"}`},
@@ -1217,9 +1221,423 @@ func TestRetiredValuesStillScrubbed(t *testing.T) {
 	}
 	// Bounded: the oldest go first.
 	for i := 0; i < maxRetired+10; i++ {
-		_ = reg.Put(&Entry{Name: "churn", Hosts: []string{"churn.example"}, Value: []byte(fmt.Sprintf("churn-value-%06d", i))})
+		churn := fmt.Sprintf("churn%d", i)
+		_ = reg.Put(&Entry{Name: churn, Hosts: []string{"churn.example"}, Value: []byte(fmt.Sprintf("churn-value-%06d", i))})
+		reg.Delete(churn)
 	}
 	if reg.Len() > maxRetired+1 || string(reg.Scrub([]byte(v1))) != v1 {
 		t.Fatalf("Len %d", reg.Len())
+	}
+}
+
+// A value in a server control frame (a ping or pong payload, a close frame's
+// reason) is masked like one in a data frame, length kept; the close code is
+// kept as it is.
+func TestWebSocketControlFramesMasked(t *testing.T) {
+	ts := wsUpstream(t, switching, nil, func(conn net.Conn, buf *bufio.ReadWriter) {
+		_, _ = conn.Write(wsFrame(0x9, []byte("p:"+secretValue)))
+		_, _ = conn.Write(wsFrame(0xa, []byte(secretValue)))
+		_, _ = conn.Write(wsFrame(0x8, append([]byte{0x0f, 0xa1}, "bad token "+secretValue...)))
+		one := make([]byte, 1)
+		_, _ = buf.Read(one)
+	})
+	h := newHarness(t, ts)
+	conn, br, resp := wsDial(t, h, "Authorization: Bearer [[credential:github]]\r\n")
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	stars := strings.Repeat("*", len(secretValue))
+	for _, want := range []struct {
+		b0      byte
+		payload string
+	}{
+		{0x89, "p:" + stars},
+		{0x8a, stars},
+		{0x88, "\x0f\xa1bad token " + stars},
+	} {
+		if b0, p := readFrame(t, br); b0 != want.b0 || string(p) != want.payload {
+			t.Fatalf("got %x %q, want %x %q", b0, p, want.b0, want.payload)
+		}
+	}
+	_, _ = conn.Write([]byte("x"))
+}
+
+// A frame with an RSV bit set ends the relay: no extension is negotiated, so
+// its payload may be in a form the proxy cannot read.
+func TestWebSocketRSVEndsRelay(t *testing.T) {
+	ts := wsUpstream(t, switching, nil, func(conn net.Conn, buf *bufio.ReadWriter) {
+		_, _ = conn.Write(wsFrame(0x1, []byte("first")))
+		f := wsFrame(0x1, []byte("rsv1 frame"))
+		f[0] |= 0x40
+		_, _ = conn.Write(f)
+		_, _ = conn.Write(wsFrame(0x1, []byte("after")))
+		one := make([]byte, 1)
+		_, _ = buf.Read(one)
+	})
+	h := newHarness(t, ts)
+	_, br, resp := wsDial(t, h, "")
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if b0, p := readFrame(t, br); b0 != 0x81 || string(p) != "first" {
+		t.Fatalf("first frame %x %q", b0, p)
+	}
+	if rest, err := io.ReadAll(br); err != nil || len(rest) != 0 {
+		t.Fatalf("after an RSV frame: %q, %v", rest, err)
+	}
+}
+
+// A JSON body is filled with every '&' and ';' of its own written as a \u
+// escape: the same JSON to a JSON parser, and no field separator to a server
+// that reads it as a form.
+func TestJSONBodyFillHasNoFormSeparator(t *testing.T) {
+	ts, got := upstream(t)
+	h := newHarness(t, ts)
+	for _, body := range []string{
+		`{"x":";note=","token":"[[credential:github]]"}`,
+		`{"cb":"https://x/y?a=1&b=2;c","token":"[[credential:github]]"}`,
+	} {
+		req, _ := http.NewRequest("POST", h.explicitURL("/x"), strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := readAll(t, resp)
+		sent := got.snapshot().body
+		if resp.StatusCode != 200 || strings.ContainsAny(sent, "&;") {
+			t.Fatalf("%s: status %d (%s), upstream got %s", body, resp.StatusCode, out, sent)
+		}
+		var want, have map[string]any
+		_ = json.Unmarshal([]byte(body), &want)
+		want["token"] = secretValue
+		if err := json.Unmarshal([]byte(sent), &have); err != nil || fmt.Sprint(have) != fmt.Sprint(want) {
+			t.Fatalf("%s: upstream read %v, want %v", body, have, want)
+		}
+	}
+}
+
+// A form body is checked for url-encoding once filled, so a placeholder
+// written raw as the whole value of a field is filled.
+func TestFormBodyRawPlaceholderFilled(t *testing.T) {
+	ts, got := upstream(t)
+	h := newHarness(t, ts)
+	req, _ := http.NewRequest("POST", h.explicitURL("/x"), strings.NewReader(`a=1&token=[[credential:github]]`))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := readAll(t, resp)
+	if g := got.snapshot(); resp.StatusCode != 200 || g.body != "a=1&token="+url.QueryEscape(secretValue) {
+		t.Fatalf("status %d (%s), upstream got %q", resp.StatusCode, out, g.body)
+	}
+}
+
+// A 6-byte value is redacted in base64 at each of the three alignments,
+// e.g. inside an echoed Basic header.
+func TestSixByteValueBase64(t *testing.T) {
+	const v = "Xy7#q2"
+	red := newRedactor(map[string][]byte{"pw": []byte(v)})
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.URLEncoding} {
+		for k := 0; k < 3; k++ {
+			full := enc.EncodeToString(append(append(make([]byte, k), v...), "tail"...))
+			inner := full[(8*k+5)/6 : 8*(k+len(v))/6]
+			if out := red.applyString(full); strings.Contains(out, inner) {
+				t.Errorf("alignment %d: %s came back as %s", k, full, out)
+			}
+		}
+	}
+
+	ts, _ := upstream(t)
+	h := newHarness(t, ts, &Entry{Name: "pw", Hosts: []string{"example.com"},
+		Positions: []Position{{Kind: PosBasic, Username: "a"}}, Value: []byte(v)})
+	req, _ := http.NewRequest("GET", h.explicitURL("/"), nil)
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("a:[[credential:pw]]")))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAll(t, resp)
+	echo := strings.TrimPrefix(resp.Header.Get("X-Echo"), "Basic ")
+	if dec, _ := base64.StdEncoding.DecodeString(echo); resp.StatusCode != 200 || strings.Contains(string(dec), v) {
+		t.Fatalf("status %d, echoed Basic header %q decodes to %q", resp.StatusCode, echo, dec)
+	}
+}
+
+// The refusal of an encoded response does not quote upstream's
+// Content-Encoding.
+func TestEncodedResponseRefusalQuotesNothing(t *testing.T) {
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte("x"))
+	}))
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	h := newHarness(t, ts)
+	req, _ := http.NewRequest("GET", h.explicitURL("/"), nil)
+	req.Header.Set("Authorization", "Bearer [[credential:github]]")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readAll(t, resp); resp.StatusCode != http.StatusBadGateway || strings.Contains(body, "Bearer") {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+}
+
+// chunkReader returns its chunks one per Read.
+type chunkReader [][]byte
+
+func (c *chunkReader) Read(p []byte) (int, error) {
+	if len(*c) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, (*c)[0])
+	if n < len((*c)[0]) {
+		(*c)[0] = (*c)[0][n:]
+	} else {
+		*c = (*c)[1:]
+	}
+	return n, nil
+}
+
+// Where one value is a prefix of another, a stream split anywhere in the
+// longer one, just after the shorter one included, redacts the longer one
+// whole.
+func TestRedactorValueThatIsAPrefixOfAnother(t *testing.T) {
+	const a, b = "shared-prefix-0123", "shared-prefix-0123-tail-SECRET"
+	red := newProxyRedactor(map[string][]byte{"a": []byte(a), "b": []byte(b)})
+	stream := "x " + b + " y " + a + " z"
+	want := "x [[credential:b]] y [[credential:a]] z"
+	for split := 1; split < len(stream); split++ {
+		src := &chunkReader{[]byte(stream[:split]), []byte(stream[split:])}
+		if out, _ := io.ReadAll(red.reader(src)); string(out) != want {
+			t.Fatalf("split %d: %q", split, out)
+		}
+	}
+	if out := red.applyString(stream); out != want {
+		t.Fatalf("whole: %q", out)
+	}
+}
+
+// The explicit form refuses a target host holding a control character or a
+// space once percent-decoded, before it reaches a message or the audit log.
+func TestExplicitHostWithControlCharactersRefused(t *testing.T) {
+	ts, _ := upstream(t)
+	h := newHarness(t, ts)
+	for _, host := range []string{"exa%20mple.com", "example.com%0d%0aX-Injected:%201", "%09example.com", "example.com%7f", "example.com%c2%85", "example.com%e2%80%ae"} {
+		before := len(h.records())
+		req, _ := http.NewRequest("GET", "http://"+h.addr+"/"+h.token+"/https/"+host+"/x", nil)
+		req.Header.Set("Authorization", "Bearer [[credential:github]]")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		readAll(t, resp)
+		if resp.StatusCode != http.StatusBadRequest || resp.Header.Get(ErrorHeader) != "bad_target" || len(h.records()) != before {
+			t.Fatalf("%s: got %d %q, records %+v", host, resp.StatusCode, resp.Header.Get(ErrorHeader), h.records()[before:])
+		}
+	}
+}
+
+// A path segment that is a placeholder once percent-decoded is filled, like
+// a query parameter or a form field, whichever bytes of it are escaped.
+func TestPathPlaceholderPercentEncodedFilled(t *testing.T) {
+	ts, got := upstream(t)
+	h := newHarness(t, ts)
+	resp, err := http.Get(h.explicitURL("/%5B%5B%63redential%3Agithub%5D%5D/x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAll(t, resp)
+	if g := got.snapshot(); resp.StatusCode != 200 || g.path != "/"+secretValue+"/x" {
+		t.Fatalf("status %d, upstream path %q", resp.StatusCode, g.path)
+	}
+}
+
+// A placeholder anywhere in a body too large to fill is refused, past the
+// first 64 KiB too: the upload stops there and the request is answered 413.
+// A large body naming none goes through whole.
+func TestBigBodyPlaceholderPastFirstChunkRefused(t *testing.T) {
+	ts, got := upstream(t)
+	h := newHarness(t, ts)
+	pad := strings.Repeat("a", maxBodyBytes+10)
+	for _, ph := range []string{"[[credential:github]]", "%5B%5Bcredential%3Agithub%5D%5D", `[[credential:github]]`} {
+		req, _ := http.NewRequest("POST", h.explicitURL("/x"), strings.NewReader(`{"pad":"`+pad+`","token":"`+ph+`"}`))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		readAll(t, resp)
+		if resp.StatusCode != http.StatusRequestEntityTooLarge || resp.Header.Get(ErrorHeader) != "body_too_large" {
+			t.Fatalf("%s: got %d %q", ph, resp.StatusCode, resp.Header.Get(ErrorHeader))
+		}
+		if rec := h.lastRecord(t); rec.Code != "body_too_large" || len(rec.Names) != 1 || rec.Names[0] != "github" {
+			t.Fatalf("%s: audit record %+v", ph, rec)
+		}
+	}
+	body := `{"pad":"` + pad + `","note":"[[credential"}`
+	req, _ := http.NewRequest("POST", h.explicitURL("/x"), strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAll(t, resp)
+	if resp.StatusCode != 200 || got.snapshot().body != body {
+		t.Fatalf("a large body naming no placeholder: status %d", resp.StatusCode)
+	}
+}
+
+// The listener serves at most MaxConns connections at once; the next one
+// waits until one of them closes.
+func TestConnectionCap(t *testing.T) {
+	ts, _ := upstream(t)
+	h := newHarnessWith(t, ts, func(c *Config) { c.MaxConns = 2 })
+	get := "GET /" + h.token + "/https/example.com/x HTTP/1.1\r\nHost: " + h.addr + "\r\n\r\n"
+	var open []net.Conn
+	for i := 0; i < 2; i++ {
+		c, err := net.Dial("tcp", h.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		_, _ = c.Write([]byte(get))
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		readAll(t, resp)
+		open = append(open, c)
+	}
+	third, err := net.Dial("tcp", h.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { third.Close() })
+	_, _ = third.Write([]byte(get))
+	_ = third.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	var ne net.Error
+	if n, err := third.Read(make([]byte, 1)); n != 0 || !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("a connection over the cap was served: %d %v", n, err)
+	}
+	open[0].Close()
+	_ = third.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(third), nil)
+	if err != nil {
+		t.Fatalf("not served once a connection closed: %v", err)
+	}
+	readAll(t, resp)
+}
+
+// A CONNECT tunnel or a WebSocket relay is closed once no bytes have moved
+// either way for RelayIdleTimeout; one with bytes moving stays open past it.
+func TestRelayIdleTimeout(t *testing.T) {
+	const idle = 500 * time.Millisecond
+	waitClosed := func(t *testing.T, r io.Reader) {
+		t.Helper()
+		start := time.Now()
+		_, err := io.Copy(io.Discard, r)
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			t.Fatalf("not closed after %v", time.Since(start))
+		}
+	}
+	t.Run("tunnel", func(t *testing.T) {
+		ts, _ := upstream(t)
+		h := newHarnessWith(t, ts, func(c *Config) { c.RelayIdleTimeout = idle })
+		conn, err := net.Dial("tcp", h.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		auth := base64.StdEncoding.EncodeToString([]byte("agent:" + h.token))
+		_, _ = conn.Write([]byte("CONNECT not-listed.example:443 HTTP/1.1\r\nHost: not-listed.example:443\r\nProxy-Authorization: Basic " + auth + "\r\n\r\n"))
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
+		if err != nil || resp.StatusCode != 200 {
+			t.Fatalf("CONNECT: %v %v", resp, err)
+		}
+		pool := x509.NewCertPool()
+		pool.AddCert(ts.Certificate())
+		tc := tls.Client(conn, &tls.Config{RootCAs: pool, ServerName: "example.com", NextProtos: []string{"http/1.1"}})
+		tr := bufio.NewReader(tc)
+		for i := 0; i < 8; i++ {
+			time.Sleep(idle / 5)
+			_, _ = tc.Write([]byte("GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n"))
+			resp, err := http.ReadResponse(tr, nil)
+			if err != nil {
+				t.Fatalf("request %d through an active tunnel: %v", i, err)
+			}
+			readAll(t, resp)
+		}
+		waitClosed(t, tr)
+	})
+	t.Run("websocket", func(t *testing.T) {
+		ts := wsUpstream(t, switching, nil, func(conn net.Conn, buf *bufio.ReadWriter) {
+			for i := 0; i < 8; i++ {
+				time.Sleep(idle / 5)
+				_, _ = conn.Write(wsFrame(0x1, []byte("tick")))
+			}
+			one := make([]byte, 1)
+			_, _ = buf.Read(one)
+		})
+		h := newHarnessWith(t, ts, func(c *Config) { c.RelayIdleTimeout = idle })
+		_, br, resp := wsDial(t, h, "")
+		if resp.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		for i := 0; i < 8; i++ {
+			if _, p := readFrame(t, br); string(p) != "tick" {
+				t.Fatalf("frame %d: %q", i, p)
+			}
+		}
+		waitClosed(t, br)
+	})
+}
+
+// Values retired from owner entries (an entry removed, the owner changed)
+// stay scrubbed however often derived entries are replaced or deleted, and
+// however often one value is rotated: that churn pushes out only values of
+// derived entries, or the rotated entry's own earlier ones.
+func TestRetiredOwnerValuesOutlastChurn(t *testing.T) {
+	const removed, cleared = "removed-owner-value-0123", "cleared-owner-value-0123"
+	entry := func(name, v string) *Entry {
+		return &Entry{Name: name, Hosts: []string{"example.com"},
+			Positions: []Position{{Kind: PosHeader, Name: "Authorization", Template: "Bearer {v}"}}, Value: []byte(v)}
+	}
+	reg := NewRegistry()
+	for _, set := range [][]*Entry{{entry("api", removed), entry("other", cleared)}, {entry("other", cleared)}, nil} {
+		if err := reg.Replace(set); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n := 2 * (maxRetired + maxRetiredDerived)
+	for i := 0; i < n; i++ {
+		// A token request replacing a derived entry, and a derived entry
+		// obtained and deleted.
+		_ = reg.Put(entry("derived:gh.access_token", fmt.Sprintf("derived-value-%06d", i)))
+		_ = reg.Put(entry(fmt.Sprintf("derived:x%d", i), fmt.Sprintf("deleted-value-%06d", i)))
+		reg.Delete(fmt.Sprintf("derived:x%d", i))
+		// A refresh token rotated by a token request.
+		_ = reg.Replace([]*Entry{entry("rt", fmt.Sprintf("rotated-value-%06d", i))})
+	}
+	for _, v := range []string{removed, cleared} {
+		if got := string(reg.Scrub([]byte(v))); got == v {
+			t.Fatalf("%s is no longer scrubbed", v)
+		}
+	}
+	if l := reg.Len(); l > 1+maxRetired+maxRetiredDerived {
+		t.Fatalf("Len %d", l)
+	}
+	// The newest values of the churned names are still scrubbed.
+	for _, v := range []string{fmt.Sprintf("derived-value-%06d", n-2), fmt.Sprintf("rotated-value-%06d", n-2)} {
+		if got := string(reg.Scrub([]byte(v))); got == v {
+			t.Fatalf("%s is no longer scrubbed", v)
+		}
 	}
 }
