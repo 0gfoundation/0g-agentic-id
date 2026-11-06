@@ -537,6 +537,7 @@ func (s *Store) Reveal(name, reason string) ([]byte, *credproxy.Error) {
 	p := s.pendingForLocked("reveal", name, nil, reason, map[string]any{"source": sourceOf(from), "from": from, "hosts": def.Hosts, "expires_at": def.ExpiresAt})
 	if p.Status == "denied" {
 		delete(s.pending, p.AuthReqID)
+		s.addAudit(AuditRecord{Time: s.now(), Op: "reveal", Names: []string{name}, Result: "refused by the owner"})
 		return nil, &credproxy.Error{Status: http.StatusForbidden, Code: CodeDenied, Message: "the owner refused this request"}
 	}
 	return nil, &credproxy.Error{Status: http.StatusForbidden, Code: CodePending, Message: p.AuthReqID}
@@ -580,6 +581,7 @@ func (s *Store) Request(op, name string, params map[string]string, reason string
 	p := s.pendingForLocked(op, name, params, reason, facts)
 	if p.Status == "denied" {
 		delete(s.pending, p.AuthReqID)
+		s.addAudit(AuditRecord{Time: s.now(), Op: op, Names: []string{name}, Result: "refused by the owner"})
 		return nil, &credproxy.Error{Status: http.StatusForbidden, Code: CodeDenied, Message: "the owner refused this request"}
 	}
 	cp := *p

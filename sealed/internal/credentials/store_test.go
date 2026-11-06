@@ -207,6 +207,10 @@ func TestRevealDenied(t *testing.T) {
 	if _, cerr := s.Reveal("github", ""); cerr == nil || cerr.Code != CodeDenied {
 		t.Fatalf("got %+v", cerr)
 	}
+	recs := s.AuditSince(0)
+	if last := recs[len(recs)-1]; last.Op != "reveal" || last.Result != "refused by the owner" {
+		t.Fatalf("the refusal is not in the owner's audit log: %+v", recs)
+	}
 }
 
 func TestRevealAllowedInAdvance(t *testing.T) {
