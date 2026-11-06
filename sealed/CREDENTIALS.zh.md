@@ -68,11 +68,13 @@ Entry(string name,bytes32 defHash)
 
 **代理。** 对条目中出现的域名发起的 `CONNECT`，代理用该根证书签发的证书终止 TLS（HTTP/1.1 和 HTTP/2）；其他域名原样转发通道。对终止的请求和显式请求，代理：
 
-- 要求每次启动的令牌；要求 CONNECT 目标、TLS SNI 和 `Host` 三者一致；
-- 拒绝连接私网、回环、链路本地、组播、未指定和元数据地址；不跟随重定向；
+- 要求每次启动的令牌；要求 CONNECT 目标、TLS SNI（IP 地址没有 SNI）和 `Host` 三者一致；连接空闲 2 分钟后关闭；
+- 拒绝连接私网、回环、链路本地、组播、未指定、NAT64 和元数据地址；不跟随重定向；
 - 只在允许的域名和位置代填占位符，否则拒绝整个请求；从不往 `Host`、`Content-Length`、`Transfer-Encoding`、`Cookie`、`Proxy-*` 里填写；
 - 只在有条目可以填写请求体字段或需要签名的域名上读取请求体，而且只读 64 KiB 以内（更大的请求体里有占位符时拒绝）；其他域名的请求体原样转发，其中的占位符文字也原样发出，因为那里没有可以填写的地方；
-- 要求上游不压缩，从响应头和流式响应体中去掉它持有的每个值（原文、百分号编码、JSON 转义、三种对齐的 base64；短于 6 字节的值不做遮盖），并尽力把它不持有、但格式常见的 token（GitHub、GitLab、Slack、Stripe、`sk-` 开头的密钥、Hugging Face、Google API key、npm、Notion）替换成 `[[redacted]]`；WebSocket 帧原位遮盖，长度不变。sealed 自己往外发的内容（注册的服务、上链数据，见下文）只去掉它持有的值。
+- 请求体里出现占位符（原样出现，或解开百分号编码、JSON 转义后出现）时，只有满足以下条件才代填：只有一个 `Content-Type`，是 JSON 或表单；占位符原样书写，单独作为某个顶层字段的值。表单请求体必须整体 url 编码（占位符也要编码：`curl --data-urlencode`）；JSON 请求体中任何位置出现 `&` 后跟 `=` 时拒绝，因为按表单解析它的服务器会从中读出字段；其他情况一律拒绝；
+- 先设置自己添加的请求头再签名，签名覆盖实际发出的请求；丢弃上游返回的 `X-Seal-Credential-Filled` 和 `X-Seal-Credential-Error`；
+- 要求上游不压缩，响应带任何 `Content-Encoding` 时拒绝；从响应头（名字里含值的响应头整个丢弃）和流式响应体中去掉它持有的每个值，以及本次请求里填进去的每个值：原文、百分号编码（大小写均可）、JSON 转义（含 `\/` 和 HTML 转义）、带引号字符串的转义、三种对齐的 base64；短于 6 字节的值、跨 WebSocket 分片的值、换行的 base64 或 hex 不做遮盖。并尽力把它不持有、但格式常见的 token（GitHub、GitLab、Slack、Stripe、`sk-` 开头的密钥、Hugging Face、Google API key、npm、Notion）替换成 `[[redacted]]`。WebSocket 逐帧读取（每帧载荷最多 1 MiB）并原位遮盖，长度不变；`101` 响应和其他响应一样遮盖。sealed 自己往外发的内容（注册的服务、上链数据，见下文）只去掉它持有的值。
 
 代理填写过值的请求，其响应带 `X-Seal-Credential-Filled: <条目名>`：回显请求的服务会把占位符显示回来（值在返回途中被遮住），agent 靠这个响应头区分"填了"和"没填"。没有条目的域名走通道，那里什么都不填，也不报错，响应里不会有这个头。
 
@@ -133,7 +135,7 @@ CredentialWriteback.v2:<seal_id>:<name>:<binding>:<boot_id>:<keccak256(ciphertex
 |---|---|---|
 | `sigv4` | `access_key_id`、`region`、`service`、`session_token_entry?` | 请求带 `X-Seal-Sign: <名字>` 时由代理签名；AWS 工具用这个 `access_key_id` 和占位符作为 secret 签过的请求，代理用真值重签（只对条目的域名）。用 aws-sdk-go 签名器的输出做了对照。 |
 | `hmac` | `message`（可用 `{method}` `{path}` `{query}` `{body}` `{timestamp}` `{header:<名字>}`）、`header` 或 `param`、`algorithm`（`sha256`、`sha512`、`sha1`）、`encoding`（`hex`、`base64`）、`prefix`、`timestamp_header` | 请求带 `X-Seal-Sign: <名字>` 时由代理签名。 |
-| `jwt` | `alg`（`RS256`、`ES256`、`HS256`）、`kid`、`claims`、`ttl`（≤ 86400） | 占位符代表用密钥现签的令牌，可用于请求和换 token 模板（如服务账号的 `jwt-bearer` assertion）。现签的令牌和值一样会被遮盖。 |
+| `jwt` | `alg`（`RS256`、`ES256`、`HS256`）、`kid`、`claims`、`ttl`（≤ 86400） | 占位符代表用密钥现签的令牌，可用于请求和换 token 模板（如服务账号的 `jwt-bearer` assertion）。填进请求的现签令牌和值一样会被遮盖，并在过期前一直从上链数据和响应中去掉（最近 256 个）。 |
 | `wallet` | — | `POST /credentials/sign`，形状与 sign socket 相同（personal message、EIP-712、交易）；只返回签名。使用记录写明签了什么：交易的链、接收方、金额和函数选择器；typed data 的主类型、domain 名称、链和合约；消息的长度。持有 owner 自己私钥的钱包条目会被跳过：否则 agent 可以以 owner 的身份签名。 |
 
 ## MCP 登录
@@ -181,7 +183,7 @@ SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-
 
 ## 范围之外
 
-- **响应与上链数据。** 经 `:8080` 转发的 HTTP 响应（已注册的服务、框架路由、事件流、合成的 `/v1/responses`）在计算 serve-proof 之前去掉 sealed 持有的每个值；那里的 WebSocket 升级原样转发。sealed 上链的内容同样去掉这些值（leaf 角色、manifest 中的文件、目录归档里的文件），漂移判断也基于去掉值之后的内容。从 sealed 删除的值不再被识别，也就不再被去掉。
+- **响应与上链数据。** 经 `:8080` 转发的 HTTP 响应（已注册的服务、框架路由、事件流、合成的 `/v1/responses`）在计算 serve-proof 之前去掉 sealed 持有的每个值；那里的 WebSocket 升级原样转发。sealed 上链的内容同样去掉这些值（leaf 角色、manifest 中的文件、目录归档里的文件），漂移判断也基于去掉值之后的内容。从 sealed 删除的值（新凭据集不再包含、owner 变更）仍会被去掉，但不再代填，直到 sealed 重启（最近 1024 个）。
 - **不经过代理的工具。** 不认 `HTTPS_PROXY` 或钉死证书的工具会带着占位符直连目标并失败；可以改用显式形式，或使用交出的值。
 - **普通 API 返回的 token。** 普通 API 调用（不是换 token）返回的 token 原样到达 agent；如果它属于代理遮盖的常见格式，agent 拿到的是 `[[redacted]]`，无法使用，要拿这类 token 需用换 token。
 - **不限制用途。** 在密钥本身的权限范围内，agent 可以做任何事，包括派生新密钥、用签名条目签任意内容。
