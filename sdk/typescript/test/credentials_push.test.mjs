@@ -92,3 +92,27 @@ test('session: a login request for an existing connection with another URL', asy
   assert.equal(linear, undefined, 'the stored connection was redefined to the agent\'s URL');
   assert.ok(lines.some((l) => l.includes('https://mcp.linear.app/mcp')) && !asked.some((q) => q.includes('[c]')), lines.join('\n'));
 });
+
+// A disconnect overtaken by a change to the entry: the server's revocation
+// is reported, and the owner is told nothing was forgotten.
+test('disconnect: an overtaken disconnect says nothing was forgotten', async () => {
+  const s = await stub();
+  const orig = s.server.listeners('request')[0];
+  s.server.removeAllListeners('request');
+  s.server.on('request', (req, res) => {
+    if (req.method === 'POST' && req.url === '/_seal/credentials/disconnect') {
+      req.resume();
+      res.writeHead(409, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ code: 'changed', message: 'the entry changed', revoked: true, note: '' }));
+    }
+    orig(req, res);
+  });
+  try {
+    const r = await ag(s.port).credentials.disconnect(SEAL_ID, 'github');
+    assert.equal(r.revoked, true);
+    assert.equal(r.forgotten, false);
+    assert.match(r.note, /nothing was forgotten: disconnect again/);
+  } finally {
+    s.server.close();
+  }
+});

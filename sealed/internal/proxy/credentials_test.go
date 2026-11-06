@@ -64,6 +64,9 @@ func (f *fakeCredentials) StartLogin(_ context.Context, name, redirect string) (
 	return "https://auth.example/authorize?state=s1", nil
 }
 func (f *fakeCredentials) Disconnect(_ context.Context, name string) (bool, string, error) {
+	if name == "moving" {
+		return true, "", credentials.ErrEntryChanged
+	}
 	if name != "linear" {
 		return false, "", &credentials.LoginError{Reason: "no login entry named " + name}
 	}

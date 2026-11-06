@@ -58,6 +58,10 @@ const (
 	maxResultKeys   = 32   // the named kinds of one operation with one result
 )
 
+// ErrEntryChanged is a disconnect that found its entry cleared or redefined
+// while it ran: nothing was forgotten.
+var ErrEntryChanged = errors.New("the entry changed while the disconnect ran; nothing was forgotten, disconnect again")
+
 // ErrOwnerLookup is a Load that could not look the owner up: worth trying
 // again, unlike a set that does not check out.
 var ErrOwnerLookup = errors.New("the agent's owner could not be looked up")
@@ -313,7 +317,8 @@ func countKey(r AuditRecord) string {
 // harness floods one result with blurs only that result's later kinds:
 // refused uses of unknown names leave a host an entry does not allow, the
 // owner's own uses and every other operation named. maxCountKeys is a
-// backstop past which kinds are counted by operation.
+// backstop past which every operation's new kinds are counted by result
+// class alone.
 func (s *Store) countLocked(r AuditRecord, n int) {
 	first := r.Time
 	if r.First != nil {
@@ -322,7 +327,8 @@ func (s *Store) countLocked(r AuditRecord, n int) {
 	if _, ok := s.auditCounts[countKey(r)]; !ok {
 		switch {
 		case len(s.auditCounts) >= maxCountKeys:
-			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: "more kinds", Time: r.Time, First: r.First}
+			// Still by result class (a bounded set), so no result is lost.
+			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: resultClass(r.Result), Time: r.Time, First: r.First}
 		case s.auditOpKeys[r.Op+"\x00"+resultClass(r.Result)] >= maxResultKeys:
 			r = AuditRecord{Op: r.Op, Names: []string{"*"}, Result: resultClass(r.Result), Time: r.Time, First: r.First}
 		}

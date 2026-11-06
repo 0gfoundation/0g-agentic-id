@@ -345,6 +345,10 @@ func (s *Server) handleCredentialDisconnect(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	revoked, note, err := c.Disconnect(r.Context(), in.Name)
+	if errors.Is(err, credentials.ErrEntryChanged) {
+		writeJSON(w, http.StatusConflict, map[string]any{"code": "changed", "message": err.Error(), "revoked": revoked, "note": note})
+		return
+	}
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"code": "not_found", "message": err.Error()})
 		return

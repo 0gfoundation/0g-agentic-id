@@ -20,6 +20,7 @@
  * The attestor never sees a value. The container checks everything again,
  * including that the signer is the agent's current on-chain owner.
  */
+import { plainText } from './AgentClient';
 import { getAddress, hexToBytes, keccak256, toBytes, type Address, type Hash } from 'viem';
 import type { Ctx } from './context';
 import { requireWallet } from './context';
@@ -469,7 +470,13 @@ export class CredentialsApi {
         revoked = b.revoked;
         forgotten = true;
         note = b.note || undefined;
-      } else note = `the agent refused: HTTP ${r.status} ${await r.text().catch(() => '')}`.trim();
+      } else if (r.status === 409) {
+        // The entry changed while the agent disconnected it: whether the
+        // server revoked still holds, but nothing was forgotten.
+        const b = (await r.json().catch(() => ({}))) as { revoked?: boolean; message?: string };
+        revoked = !!b.revoked;
+        note = 'the entry changed meanwhile and nothing was forgotten: disconnect again';
+      } else note = `the agent refused: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`.trim();
     } catch (e) {
       note = `the agent could not be reached (${e instanceof Error ? e.message : String(e)}): revoke the app's access at the service`;
     }

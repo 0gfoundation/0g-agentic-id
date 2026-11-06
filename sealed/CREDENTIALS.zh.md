@@ -111,7 +111,7 @@ Entry(string name,bytes32 defHash)
 | `url`、`encoding` | token 地址；`form`（默认）或 `json` |
 | `fields` | 字段 → 模板：`{v}` 是本条目的值，`{cred:<名字>}` 是其他条目的值（`jwt` 条目代表一个现签的令牌；其他签名密钥被拒绝） |
 | `basic_auth` | `{username_entry, password_entry}` |
-| `params` | agent 可以额外传的参数（如 `scope`）：只能是模板没有设置的字段，模板已设置的字段会被拒绝（403 `not_allowed`）。最多 512 个字符，不能含控制字符 |
+| `params` | agent 可以额外传的参数（如 `scope`）：只能是模板没有设置的字段，模板已设置的字段会被拒绝（403 `not_allowed`）。最多 512 个字符，不能含控制字符、格式字符、行分隔符或普通空格以外的空白字符 |
 | `take` | 从响应中取出、存成换出条目的字段：`field`、`name`、`hosts`、`positions`、`expires_in_field`（秒数，数字或数字字符串）；未命名时名为 `derived:<条目>.<字段>`。换出的条目不会晚于来源条目的 `expires_at` 过期 |
 | `rotate_field` | 如 `refresh_token`：响应中的新值替换条目的值 |
 
@@ -167,7 +167,7 @@ agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` /
 | `GET` / `POST /_seal/credentials` | `0GSealCredentials` | 列出已加载条目 / 加载签名凭据集（更旧的版本返回 409 `stale_version`） |
 | `GET /_seal/credentials/pending` | `0GSealCredPending` | 待办：sealed 记录的 `facts` 与 agent 给出的 `reason` 分开展示 |
 | `POST /_seal/credentials/decide` | `0GSealCredDecide` | `{auth_req_id, decision: "once" \| "deny", approval?, signature?}` |
-| `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | agent 做了什么（代填、换 token、签名、交出、登录、写回），以及凭据集里哪些条目被跳过、原因是什么，不含值。按时间从旧到新，分三份各保留最近 1000 条：代理使用；钱包签名；其余记录（owner 的决定、登录、断开、加载、sealed 自己做的事），所以 agent 能引发的记录不会把 owner 的记录挤掉。从某份里挤出的记录按类（操作、条目、域名、结果）计数，不会不留痕迹地丢掉。agent 可以随意重复的操作（换 token、刷新、写回、失败的签名、预先允许的交出）以及 sealed 自己提供的值（`sealed:` 条目，如框架的推理 key）的成功使用，每类合并为一条记录，带 `count`、`first` 和最近一次的 `ts`；每种操作的每种结果（冒号之前的部分）各有 32 类的额度，再多的只按结果合并计数，所以对一种结果的大量请求只会让这种结果之后的记录变模糊。域名和条目名截到有限长度，控制字符和格式字符显示为 `?`，标准 HTTP 方法以外的方法记为 `OTHER`。stop/start 后保留，并记下属于哪个 owner，只为同一个 owner 恢复；启动时读不了的已保存记录原样保留，不会被覆盖 |
+| `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | agent 做了什么（代填、换 token、签名、交出、登录、写回），以及凭据集里哪些条目被跳过、原因是什么，不含值。按时间从旧到新，分三份各保留最近 1000 条：代理使用；钱包签名；其余记录（owner 的决定、登录、断开、加载、sealed 自己做的事），所以 agent 能引发的记录不会把 owner 的记录挤掉。从某份里挤出的记录按类（操作、条目、域名、结果）计数，不会不留痕迹地丢掉。agent 可以随意重复的操作（换 token、刷新、写回、失败的签名、预先允许的交出）以及 sealed 自己提供的值（`sealed:` 条目，如框架的推理 key）的成功使用，每类合并为一条记录，带 `count`、`first` 和最近一次的 `ts`；每种操作的每种结果（冒号之前的部分）各有 32 类的额度，再多的只按结果合并计数，所以对一种结果的大量请求只会让这种结果之后的记录变模糊；总数超过 1024 类后，所有操作的新类别都只按结果合并计数。域名和条目名截到有限长度，控制字符和格式字符显示为 `?`，标准 HTTP 方法以外的方法记为 `OTHER`。stop/start 后保留，并记下属于哪个 owner，只为同一个 owner 恢复；启动时读不了的已保存记录原样保留，不会被覆盖 |
 | `POST /_seal/credentials/login` | `0GSealCredLogin` | 发起 MCP 登录；返回 `{authorize_url}` |
 | `POST /_seal/credentials/disconnect` | `0GSealCredDisconnect` | 结束 MCP 登录：服务器支持时请它作废 token，并丢掉 token；返回 `{revoked, note}` |
 | `GET /_seal/oauth/callback` | 无 | 登录后浏览器的回跳 |

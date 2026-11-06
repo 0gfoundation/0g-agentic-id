@@ -522,7 +522,7 @@ func (s *Store) Disconnect(ctx context.Context, name string) (revoked bool, note
 		// what is there now is not this login's to forget.
 		s.mu.Unlock()
 		s.audit("disconnect", name, endpoint, "the entry changed meanwhile; nothing forgotten")
-		return revoked, note, loginErr("the entry changed while the disconnect ran; nothing was forgotten, disconnect again")
+		return revoked, note, ErrEntryChanged
 	}
 	if t := s.refreshTimers[name]; t != nil {
 		t.Stop()

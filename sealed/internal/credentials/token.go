@@ -139,7 +139,9 @@ func (s *Store) Token(ctx context.Context, name string, params map[string]string
 	got := parseTokenResponse(body)
 	// Some endpoints refuse with a 200 that carries an error.
 	if code, _ := got["error"].(string); resp.StatusCode/100 != 2 || code != "" {
-		s.auditRepeat("token", name, tr.URL, fmt.Sprintf("%d %s", resp.StatusCode, sanitizeCode(code)))
+		// "refused" is the class the audit budget counts by; the endpoint's
+		// status and code follow it.
+		s.auditRepeat("token", name, tr.URL, fmt.Sprintf("refused: %d %s", resp.StatusCode, sanitizeCode(code)))
 		return nil, tokenErr(http.StatusBadGateway, "token_request_failed", "token endpoint answered %d %s", resp.StatusCode, sanitizeCode(code))
 	}
 
