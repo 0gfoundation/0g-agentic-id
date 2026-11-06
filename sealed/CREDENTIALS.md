@@ -121,7 +121,7 @@ Token requests for one entry run one at a time. A failure answers `token_request
 CredentialWriteback.v1:<seal_id>:<name>:<def_hash>:<boot_id>:<keccak256(ciphertext)>
 ```
 
-(keccak256, no EIP-191 prefix; the sign socket cannot produce it). It is bound to the entry's definition: valid while the owner's definition of that entry is unchanged, through the owner's edits to other entries, and over when the owner changes this one. The attestor stores it only from the current boot, for a definition with `writeback: true` that is still in the set. At boot sealed prefers a valid writeback to the owner's value. A failed writeback is retried in the background; if the container restarts first, that value is lost.
+(keccak256, no EIP-191 prefix; the sign socket cannot produce it). It is bound to the entry's definition: valid while the owner's definition of that entry is unchanged, through the owner's edits to other entries, and over when the owner changes this one. The attestor stores it only from the current boot, for a definition with `writeback: true` that is still in the set. At boot sealed prefers a valid writeback to the owner's value. Any change to that entry's definition, `allow_reveal` included, drops the written-back value, so the client refuses to toggle `allow_reveal` on an entry with `writeback`. A failed writeback is retried in the background; if the container restarts first, that value is lost.
 
 ## Signing keys
 

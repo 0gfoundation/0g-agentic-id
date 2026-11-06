@@ -57,8 +57,8 @@ export const CRED_USAGE = `usage:
                                        log the agent in to an MCP server (you open a link); sealed keeps the tokens
   cred <agent> reveal <name> on|off    let the agent read the value itself without asking each time
   cred <agent> pending                 requests waiting for you
-  cred <agent> approve <id>            approve one request once (an id prefix from pending is enough)
-  cred <agent> deny <id>               refuse one request
+  cred <agent> approve [<id>]          approve one request once (an id prefix; none when only one waits)
+  cred <agent> deny [<id>]             refuse one request
   cred <agent> log [n]                 what the agent did with its credentials (last n, default 50)
   cred pending                         pending counts across every agent you own
   cred notify [<email>|off]            where you are emailed when an agent waits for you`;
@@ -463,8 +463,22 @@ function dateText(unix: number): string {
   return new Date(unix * 1000).toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
 }
 
+/** A login entry's state as the running agent has it; null when the agent cannot be asked. */
+export type LoginStates = Record<string, { loggedInAt?: number; awaiting?: boolean }> | null;
+
+async function loginStates(cred: AgenticID['credentials'], sealId: Hash, at?: { agentUrl: string }): Promise<LoginStates> {
+  const loaded = await cred.loaded(sealId, at).catch(() => undefined);
+  if (!loaded) return null;
+  const out: Record<string, { loggedInAt?: number; awaiting?: boolean }> = {};
+  for (const e of loaded.entries) {
+    if (e.status === 'awaiting_login') out[e.name] = { awaiting: true };
+    else if (e.logged_in_at) out[e.name] = { loggedInAt: e.logged_in_at };
+  }
+  return out;
+}
+
 /** One block per credential: what it is for, where it may go, how it may be used. */
-export function renderCredentials(defs: CredentialDefinition[], version: number): string[] {
+export function renderCredentials(defs: CredentialDefinition[], version: number, logins?: LoginStates): string[] {
   if (!defs.length) return [`no credentials (version ${version})`];
   const lines = [`version ${version}`];
   for (const d of defs) {
@@ -481,6 +495,14 @@ export function renderCredentials(defs: CredentialDefinition[], version: number)
       d.expires_at ? `expires ${dateText(d.expires_at)}` : '',
     ].filter(Boolean);
     if (flags.length) lines.push(`  ${flags.join(' · ')}`);
+    if (d.mcp && logins !== undefined) {
+      const st = logins?.[d.name];
+      lines.push(`  login      ${
+        logins === null ? 'unknown — the agent is not running'
+          : st?.loggedInAt ? `logged in ${dateText(st.loggedInAt)}`
+            : `not done yet — cred <agent> login ${d.name} ${d.mcp.url}`
+      }`);
+    }
     for (const t of d.token_request?.take ?? []) {
       const derived = derivedName(d.name, t);
       lines.push(`  gives      [[credential:${derived}]] on ${t.hosts.join(', ') || '—'} (${t.positions.map(positionText).join(' · ') || '—'})`);
@@ -501,23 +523,45 @@ export function renderPending(list: PendingCredentialRequest[]): string[] {
   if (!open.length) return ['nothing waiting'];
   const lines: string[] = [];
   for (const p of open) {
-    lines.push(`${p.auth_req_id.slice(0, 10)}  ${p.op} ${p.name}   expires ${dateText(p.expires_at)}`);
-    for (const [k, v] of Object.entries(p.facts ?? {})) lines.push(`  ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`);
-    if (p.params && Object.keys(p.params).length) lines.push(`  params: ${JSON.stringify(p.params)}`);
+    lines.push(`${p.auth_req_id.slice(0, 10)}  ${p.op} ${p.name}   (the request lapses ${dateText(p.expires_at)})`);
+    lines.push(...factLines(p));
     if (p.reason) lines.push(`  the agent says: ${JSON.stringify(p.reason)}`);
-    if (p.op === 'login') lines.push(`  answer: cred <agent> login ${p.name} ${p.params?.url ?? '<mcp-url>'}   (or deny)`);
-    if (p.op === 'add') lines.push(`  answer: cred <agent> set ${p.name} …   (or deny)`);
+    lines.push(`  answer: ${answerHint(p)}`);
   }
   return lines;
+}
+
+/** What sealed knows about a request, without the empty fields. */
+function factLines(p: PendingCredentialRequest): string[] {
+  const f = (p.facts ?? {}) as Record<string, unknown>;
+  const out: string[] = [];
+  if (typeof f.source === 'string' && f.source) out.push(`  entry      set by ${f.source}${typeof f.from === 'string' && f.from ? `, from ${f.from}` : ''}`);
+  if (Array.isArray(f.hosts) && f.hosts.length) out.push(`  hosts      ${f.hosts.join(', ')}`);
+  if (typeof f.expires_at === 'number' && f.expires_at > 0) out.push(`  entry expires ${dateText(f.expires_at)}`);
+  if (typeof f.why === 'string' && f.why) out.push(`  why        ${f.why}`);
+  for (const [k, v] of Object.entries(p.params ?? {})) out.push(`  ${k.padEnd(10)} ${v}`);
+  return out;
+}
+
+function answerHint(p: PendingCredentialRequest): string {
+  if (p.op === 'login') return `cred <agent> login ${p.name} ${p.params?.url ?? '<mcp-url>'}   (or deny)`;
+  if (p.op === 'add') return `cred <agent> set ${p.name}${p.params?.preset ? ` preset=${p.params.preset}` : ' …'}   (or deny)`;
+  return 'cred <agent> approve | deny';
 }
 
 type AuditRecord = Awaited<ReturnType<AgenticID['credentials']['audit']>>[number];
 
 export function renderAudit(recs: AuditRecord[]): string[] {
   if (!recs.length) return ['no credential use recorded'];
-  return recs.map((r) =>
-    [r.ts, r.op, r.names.join(','), r.method && r.host ? `${r.method} ${r.host}` : r.host ?? '', r.result].filter(Boolean).join('  '),
+  const where = (r: AuditRecord): string => (r.method && r.host ? `${r.method} ${r.host}` : r.host ?? '');
+  const counted = recs.filter((r) => r.count);
+  const listed = recs.filter((r) => !r.count);
+  const lines = counted.map((r) =>
+    `${r.op}  ${r.names.join(',')}  ${where(r)}  ${r.result} ×${r.count}  (${r.first ?? '?'} … ${r.ts})`,
   );
+  if (counted.length && listed.length) lines.push('');
+  for (const r of listed) lines.push([r.ts, r.op, r.names.join(','), where(r), r.result].filter(Boolean).join('  '));
+  return lines;
 }
 
 /** How the operation talks to whoever runs it. */
@@ -541,10 +585,17 @@ function conflict(e: unknown): never {
   throw e;
 }
 
-/** Match an id prefix (≥ 6 hex chars) against the pending list. */
+/** Match an id prefix against the pending list; with no id, the only request waiting. */
 function pickPending(list: PendingCredentialRequest[], raw: string | undefined): PendingCredentialRequest {
-  const want = (raw ?? '').toLowerCase();
-  if (!/^0x[0-9a-f]{4,64}$/.test(want)) throw new CliError('BAD_FLAG', 'give the request id from `cred <agent> pending` (a prefix is enough)', { remedy: CRED_USAGE });
+  const open = list.filter((p) => p.status === 'pending');
+  if (!raw) {
+    if (open.length === 1) return open[0];
+    throw new CliError('BAD_FLAG', open.length ? `${open.length} requests are waiting — give one's id: ${open.map((p) => `${p.auth_req_id.slice(0, 10)} (${p.op} ${p.name})`).join(', ')}` : 'nothing is waiting', {
+      remedy: 'cred <agent> pending',
+    });
+  }
+  const want = raw.toLowerCase();
+  if (!/^0x[0-9a-f]{4,64}$/.test(want)) throw new CliError('BAD_FLAG', `not a request id: "${raw}"`, { remedy: 'cred <agent> approve|deny [<id>]   (ids: cred <agent> pending)' });
   const hits = list.filter((p) => p.status === 'pending' && p.auth_req_id.toLowerCase().startsWith(want));
   if (hits.length !== 1) {
     throw new CliError('BAD_FLAG', hits.length ? `${raw} matches ${hits.length} requests — add more hex` : `no pending request ${raw}`, {
@@ -571,8 +622,10 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     case 'ls':
     case 'list': {
       const cur = await cred.get(sealId);
-      if (io.json) return emitOk({ sealId, version: cur.version, ownerEpoch: cur.ownerEpoch, credentials: cur.definitions });
-      for (const l of renderCredentials(cur.definitions, cur.version)) io.out(l);
+      // Whether a login entry's login is done is the running agent's to say.
+      const logins = cur.definitions.some((d) => d.mcp) ? await loginStates(cred, sealId, at) : undefined;
+      if (io.json) return emitOk({ sealId, version: cur.version, ownerEpoch: cur.ownerEpoch, credentials: cur.definitions, ...(logins !== undefined ? { logins } : {}) });
+      for (const l of renderCredentials(cur.definitions, cur.version, logins)) io.out(l);
       return;
     }
     case 'set': {
@@ -599,7 +652,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     }
     case 'rm': {
       const [name] = rest;
-      if (!name) throw new CliError('BAD_FLAG', 'missing <name>', { remedy: CRED_USAGE });
+      if (!name) throw new CliError('BAD_FLAG', 'missing <name>', { remedy: 'cred <agent> rm <name>' });
       const cur = await cred.get(sealId);
       if (!cur.definitions.some((d) => d.name === name)) throw new CliError('BAD_FLAG', `no credential named ${name}`, { remedy: 'cred <agent>' });
       const out = await cred.remove(sealId, name, at).catch(conflict);
@@ -609,9 +662,14 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     }
     case 'reveal': {
       const [name, onOff] = rest;
-      if (!name || !onOff) throw new CliError('BAD_FLAG', 'usage: cred <agent> reveal <name> on|off', { remedy: CRED_USAGE });
+      if (!name || !onOff) throw new CliError('BAD_FLAG', 'usage: cred <agent> reveal <name> on|off', { remedy: 'cred <agent> reveal <name> on|off' });
       const allow = yesNo('reveal', onOff);
-      const out = await cred.setAllowReveal(sealId, name, allow, at).catch(conflict);
+      const out = await cred.setAllowReveal(sealId, name, allow, at).catch((e: unknown) => {
+        if (e instanceof Error && /keeps a value sealed obtained/.test(e.message)) {
+          throw new CliError('BAD_FLAG', e.message.replace(/^credentials: /, ''), { remedy: 'cred <agent> approve <id>' });
+        }
+        return conflict(e);
+      });
       if (io.json) return emitOk({ sealId, version: out.version, name, allowReveal: allow });
       io.out(`${name}: the agent ${allow ? 'may read the value itself' : 'must ask you to read the value'} — version ${out.version}`);
       return;
@@ -704,7 +762,10 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     }
     case 'log': {
       const n = Number(rest[0]) || 50;
-      const recs = (await cred.audit(sealId, at)).slice(-n);
+      const all = await cred.audit(sealId, at);
+      // Counted records (sealed's own inference key) head the log; the last
+      // n of the rest follow.
+      const recs = [...all.filter((r) => r.count), ...all.filter((r) => !r.count).slice(-n)];
       if (io.json) return emitOk({ sealId, audit: recs });
       for (const l of renderAudit(recs)) io.out(l);
       return;
@@ -712,6 +773,88 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     default:
       throw new CliError('BAD_FLAG', `unknown cred subcommand "${sub}"`, { remedy: CRED_USAGE });
   }
+}
+
+/**
+ * In an agent's session: put each request the agent is waiting on in front of
+ * the owner as it comes up, take the answer, and return what to tell the
+ * agent so it carries on — sent as the owner's next message. A request the
+ * owner leaves for later goes into `later` and is not offered again in this
+ * session (`/cred pending` still lists it).
+ */
+export async function answerPending(
+  ag: AgenticID,
+  sealId: Hash,
+  io: CredIO & { ask(q: string): Promise<string> },
+  opts: { agentUrl?: string; later: Set<string>; tokenize(line: string): string[]; signal?: AbortSignal; pollMs?: number; loginWaitMs?: number },
+): Promise<string[]> {
+  const cred = ag.credentials;
+  const at = opts.agentUrl ? { agentUrl: opts.agentUrl } : undefined;
+  const open = (await cred.pending(sealId, at)).filter((p) => p.status === 'pending' && !opts.later.has(p.auth_req_id));
+  if (!open.length) return [];
+  const defs = (await cred.get(sealId)).definitions;
+  const tell: string[] = [];
+  for (const p of open) {
+    io.out('');
+    io.out(`⚑ the agent asks to ${p.op === 'reveal' ? `read the value of ${p.name}` : p.op === 'login' ? `be logged in as ${p.name}` : `get a credential named ${p.name}`}`);
+    for (const l of factLines(p)) io.out(l);
+    if (p.reason) io.out(`  the agent says: ${JSON.stringify(p.reason)}`);
+    const later = (): void => {
+      opts.later.add(p.auth_req_id);
+      io.out(`  left for later — cred <agent> pending lists it`);
+    };
+    const refuse = async (): Promise<void> => {
+      await cred.deny(sealId, p.auth_req_id, at);
+      tell.push(`[cred] I refused your request to ${p.op} ${p.name}.`);
+    };
+    if (p.op === 'reveal') {
+      // Allowing it for good changes the entry's definition, which would drop
+      // a value sealed obtained for it (a login, a rotated token).
+      const keeps = defs.find((d) => d.name === p.name)?.writeback;
+      const a = (await io.ask(`  [y] allow once${keeps ? '' : '  [a] always allow'}  [n] refuse  [Enter] later: `)).trim().toLowerCase();
+      if (a === 'y') {
+        await cred.approveOnce(sealId, p.auth_req_id, at);
+        tell.push(`[cred] I approved your request to read ${p.name}, this once. Send the same reveal request again.`);
+      } else if (a === 'a' && !keeps) {
+        await cred.setAllowReveal(sealId, p.name, true, at);
+        tell.push(`[cred] You may read ${p.name} without asking from now on. Send the same reveal request again.`);
+      } else if (a === 'n') await refuse();
+      else later();
+    } else if (p.op === 'add') {
+      const a = (await io.ask(`  [s] set it now  [n] refuse  [Enter] later: `)).trim().toLowerCase();
+      if (a === 's') {
+        let args = p.params?.preset ? [`preset=${p.params.preset}`] : [];
+        if (!args.length) {
+          const how = (await io.ask(`  how may ${p.name} be used? (preset=<name>, or host=… header='Name: … {v}' …; cred presets lists them): `)).trim();
+          args = opts.tokenize(how);
+        }
+        await credOp(ag, sealId, ['set', p.name, ...args], io, opts.agentUrl);
+        tell.push(`[cred] I added the credential ${p.name}; it is in GET /credentials now.`);
+      } else if (a === 'n') await refuse();
+      else later();
+    } else if (p.op === 'login') {
+      const url = p.params?.url;
+      const a = url ? (await io.ask(`  [l] log in now  [n] refuse  [Enter] later: `)).trim().toLowerCase() : '';
+      if (a === 'l' && url) {
+        const before = (await cred.loaded(sealId, at)).entries.find((e) => e.name === p.name)?.logged_in_at;
+        await credOp(ag, sealId, ['login', p.name, url], { ...io, wait: false }, opts.agentUrl);
+        io.out('  waiting for the login to complete (Esc stops waiting, not the login)…');
+        const deadline = Date.now() + (opts.loginWaitMs ?? 10 * 60_000);
+        let done = false;
+        while (!done && Date.now() < deadline && !opts.signal?.aborted) {
+          await new Promise((r) => setTimeout(r, opts.pollMs ?? 3000));
+          const now = (await cred.loaded(sealId, at).catch(() => undefined))?.entries.find((e) => e.name === p.name)?.logged_in_at;
+          done = !!now && now !== before;
+        }
+        if (done) {
+          io.out(`  logged in: the agent uses [[credential:${p.name}]]`);
+          tell.push(`[cred] I logged you in: ${p.name} is in GET /credentials now.`);
+        } else later();
+      } else if (a === 'n') await refuse();
+      else later();
+    }
+  }
+  return tell;
 }
 
 /**

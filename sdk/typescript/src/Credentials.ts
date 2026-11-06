@@ -316,7 +316,14 @@ export class CredentialsApi {
   /** Turn advance permission to reveal one entry on or off. */
   async setAllowReveal(sealId: Hash, name: string, allow: boolean, opts?: { agentUrl?: string }): Promise<{ version: number }> {
     const current = await this.get(sealId);
-    if (!current.definitions.some((d) => d.name === name)) throw new Error(`credentials: no entry named ${name}`);
+    const def = current.definitions.find((d) => d.name === name);
+    if (!def) throw new Error(`credentials: no entry named ${name}`);
+    // The setting is part of the signed definition. A value sealed obtained
+    // for this entry (a login, a rotated refresh token) is bound to the
+    // definition, so changing it would drop that value.
+    if (def.writeback && !!def.allow_reveal !== allow) {
+      throw new Error(`credentials: ${name} keeps a value sealed obtained (a login or a rotated token), and changing its definition would drop it; approve the agent's requests one at a time instead`);
+    }
     const next = current.definitions.map((d) => (d.name === name ? { ...inputOf(d), allowReveal: allow } : inputOf(d)));
     return this.put(sealId, next, { baseVersion: current.version, agentUrl: opts?.agentUrl });
   }
@@ -433,14 +440,14 @@ export class CredentialsApi {
 
   /**
    * The entries the running agent has loaded (names and where they may go,
-   * never values). A login entry is listed once its login is done, with
-   * `logged_in_at`.
+   * never values). A login entry is listed with `status: 'awaiting_login'`
+   * until its login is done, then with `logged_in_at`.
    */
-  async loaded(sealId: Hash, opts?: { agentUrl?: string }): Promise<{ version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number; logged_in_at?: number }> }> {
+  async loaded(sealId: Hash, opts?: { agentUrl?: string }): Promise<{ version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number; logged_in_at?: number; status?: string }> }> {
     const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
     const r = await this.sealRequest(sealId, base, '0GSealCredentials', '/_seal/credentials');
     if (!r.ok) throw new Error(`credentials.loaded: HTTP ${r.status} ${await r.text().catch(() => '')}`);
-    return (await r.json()) as { version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number; logged_in_at?: number }> };
+    return (await r.json()) as { version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number; logged_in_at?: number; status?: string }> };
   }
 
   /** Requests waiting for the owner on this agent, with sealed's facts and the agent's reason. */
@@ -521,11 +528,16 @@ export class CredentialsApi {
     if (!r.ok) throw new Error(`credentials: decision refused: HTTP ${r.status} ${await r.text().catch(() => '')}`);
   }
 
-  /** What the agent did with its credentials (never values). `after` is Unix seconds. */
-  async audit(sealId: Hash, opts?: { after?: number; agentUrl?: string }): Promise<Array<{ ts: string; op: string; names: string[]; host?: string; method?: string; result: string }>> {
+  /**
+   * What the agent did with its credentials (never values), oldest first.
+   * `after` is Unix seconds. A record with `count` stands for that many
+   * successful uses of a value sealed supplies itself (its inference key),
+   * from `first` to `ts`.
+   */
+  async audit(sealId: Hash, opts?: { after?: number; agentUrl?: string }): Promise<Array<{ ts: string; op: string; names: string[]; host?: string; method?: string; result: string; count?: number; first?: string }>> {
     const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
     const r = await this.sealRequest(sealId, base, '0GSealCredAudit', `/_seal/credentials/audit?after=${opts?.after ?? 0}`);
     if (!r.ok) throw new Error(`credentials.audit: HTTP ${r.status} ${await r.text().catch(() => '')}`);
-    return (await r.json()) as Array<{ ts: string; op: string; names: string[]; host?: string; method?: string; result: string }>;
+    return (await r.json()) as Array<{ ts: string; op: string; names: string[]; host?: string; method?: string; result: string; count?: number; first?: string }>;
   }
 }

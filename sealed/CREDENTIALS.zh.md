@@ -121,7 +121,7 @@ Entry(string name,bytes32 defHash)
 CredentialWriteback.v1:<seal_id>:<name>:<def_hash>:<boot_id>:<keccak256(ciphertext)>
 ```
 
-（keccak256，不加 EIP-191 前缀；sign socket 签不出这种签名。）写回绑定条目的定义：只要 owner 对这个条目的定义不变就一直有效，owner 修改其他条目不受影响，owner 修改这个条目后失效。attestor 只接受来自当前启动的容器、定义中 `writeback: true` 且该定义仍在凭据集中的写回。开机时 sealed 优先使用有效的写回值。写回失败会在后台重试；重试成功前容器重启，该值丢失。
+（keccak256，不加 EIP-191 前缀；sign socket 签不出这种签名。）写回绑定条目的定义：只要 owner 对这个条目的定义不变就一直有效，owner 修改其他条目不受影响，owner 修改这个条目后失效。attestor 只接受来自当前启动的容器、定义中 `writeback: true` 且该定义仍在凭据集中的写回。开机时 sealed 优先使用有效的写回值。修改该条目的定义（包括 `allow_reveal`）会让写回值失效，所以客户端拒绝修改带 `writeback` 的条目的 `allow_reveal`。写回失败会在后台重试；重试成功前容器重启，该值丢失。
 
 ## 签名密钥
 

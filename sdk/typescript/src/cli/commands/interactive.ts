@@ -29,7 +29,7 @@ import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
 import { applyAssignments, assertModelPresent, assertOthersFitFramework, isHarnessFramework, parseAssignments, renderSettings } from '../settings';
-import { credOp, credOwnerOp } from '../credentials';
+import { answerPending, credOp, credOwnerOp } from '../credentials';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
@@ -420,10 +420,12 @@ function prefetchModelIds(ag: AgenticID): void {
     }
   }).catch(() => { /* only completions; explicit operations refresh strictly */ });
 }
+const CRED_SUBS = ['ls', 'set ', 'rm ', 'login ', 'reveal ', 'pending', 'approve ', 'deny ', 'log', 'presets'];
 const L1_ARGS: Record<string, string[] | (() => string[])> = {
   use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT,
   retry: AGENT, clone: AGENT, transfer: AGENT, call: AGENT, rate: AGENT,
-  grant: AGENT, revoke: AGENT, authorizer: AGENT, settings: AGENT, cred: AGENT,
+  grant: AGENT, revoke: AGENT, authorizer: AGENT, settings: AGENT,
+  cred: () => [...AGENT(), 'pending', 'notify ', 'presets'],
   list: ['--mine'],
 };
 const L2_ARGS: Record<string, string[] | (() => string[])> = {
@@ -432,9 +434,12 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/cancel': ['all'],
   '/inbox': ['all'],
   '/settings': ['provider=', 'model=', 'thinking=', 'others='],
-  '/cred': ['ls', 'set ', 'rm ', 'login ', 'reveal ', 'pending', 'approve ', 'deny ', 'log'],
+  '/cred': CRED_SUBS,
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
+
+// L1 commands whose second word is a subcommand once the agent is named.
+const SUB_AFTER_AGENT: Record<string, string[]> = { cred: CRED_SUBS };
 
 // Commands whose LATER arguments also complete (the generic rule is "first
 // argument only; the rest is free-form" — right for prompts and amounts,
@@ -493,6 +498,13 @@ export function completeLine(
     const models = state.providerModels?.[provider] ?? (provider === (state.provider ?? '0g-compute') ? state.models : []);
     const hits = completeTail(cmd, word, models, state.providers);
     return hits.length ? [hits, word] : [[], line];
+  }
+  // `cred <agent> <sub>`: the second word is the subcommand, not another agent.
+  if (SUB_AFTER_AGENT[cmd] && rest.includes(' ')) {
+    if (rest.split(' ').length !== 2) return [[], line];
+    const subs = SUB_AFTER_AGENT[cmd];
+    const hits = subs.filter((c) => c.startsWith(word));
+    return [hits.length ? hits : subs, word];
   }
   const cand = state.args[cmd];
   const list = typeof cand === 'function' ? cand() : (cand ?? []);
@@ -991,15 +1003,16 @@ const L1_HELP_FULL = `manager commands
                           others=<json> — merge and write it (owner-signed)
   cred <id> [sub …]       the agent's credentials (API keys, tokens): bare
                           lists them (never values); set <name> [k=v …] adds
-                          or changes one (preset=github|openai|anthropic,
+                          or changes one (preset=<name> — cred presets lists them,
                           host=, header='Name: … {v}', basic=, query=, body=,
                           path=yes, use=sign signer=<json>, reveal=yes|no,
                           expires=, desc=; the value
                           is asked for, not echoed); rm <name>; login <name>
                           <mcp-url> (prints a link to open); reveal <name>
-                          on|off; pending; approve|deny <id>; log [n].
+                          on|off; pending; approve|deny [<id>]; log [n].
                           cred pending: counts on all your agents; cred
-                          notify [email|off]: where you are emailed
+                          notify [email|off]: where you are emailed;
+                          cred presets: the presets
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
                           Someone else's: goes through its fork policy — works
                           iff the seller granted YOUR wallet. Lands offline
@@ -1411,7 +1424,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'cred') {
         // The owner's credentials for an agent (cli/credentials.ts); every
         // subcommand is owner-signed.
-        if (!args[0]) { out('usage: cred <agentId|sealId> [ls|set|rm|login|reveal|pending|approve|deny|log] · cred pending · cred notify [email|off] — `help` has the keys\n'); continue; }
+        if (!args[0]) { out('usage: cred <agentId|sealId> [ls|set|rm|login|reveal|pending|approve|deny|log] · cred pending · cred notify [email|off] · cred presets — `help` has the keys\n'); continue; }
         const ag = await withWallet(ctx);
         if (await credOwnerOp(ag, args, credIO(ask))) continue;
         const row = await findAgentRow(ag, args[0]);
@@ -2330,9 +2343,12 @@ const L2_HELP_FULL = `session commands
                           applies it now
   /cred [sub …]           this agent's credentials — same as \`cred <id>\` in the
                           manager: bare lists, set <name> [k=v …], rm,
-                          reveal <name> on|off, pending, approve|deny <id>,
-                          log [n]. The agent writes [[credential:<name>]]
-                          where a key goes; sealed fills it in on the way out
+                          reveal <name> on|off, pending, approve|deny [<id>],
+                          log [n], presets. The agent writes [[credential:<name>]]
+                          where a key goes; sealed fills it in on the way out.
+                          A request the agent waits on (to read a value, to get
+                          a credential, to be logged in) comes up here at the
+                          prompt; your answer goes back to the agent
   /think [low|high|max]   reasoning depth for thinking models (glm etc.) —
                           shorthand for /settings thinking=…, so it is written
                           to the owner's document (owner-signed) and applies at
@@ -2463,6 +2479,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     return ` [${transport}${code ? ` · ${code}` : ''}${msg && msg !== code ? ` · ${msg.slice(0, 80)}` : ''}]`;
   };
   const messages: ChatMessage[] = [];
+  // Requests the agent waits on are put in front of the owner here, at the
+  // prompt; what the owner decided goes to the agent as the next message.
+  const credLater = new Set<string>();
+  const queued: string[] = [];
   try {
   for (;;) {
     activeCompletions = L2_WORDS;
@@ -2477,12 +2497,31 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       out(h.text);
       h.shown();
     }
-    atPrompt = true;
+    if (s.client && s.url && !queued.length) {
+      const ac = new AbortController();
+      irq.streaming = ac; // Esc stops waiting for a login
+      try {
+        const tell = await answerPending(await withWallet(ctx), s.sealId, { ...credIO(ask), ask }, {
+          agentUrl: s.url, later: credLater, tokenize, signal: ac.signal,
+        });
+        if (tell.length) queued.push(tell.join('\n'));
+      } catch {
+        // No owner wallet here, or the agent cannot be asked: nothing to decide.
+      } finally {
+        irq.streaming = null;
+      }
+    }
     let line: string;
-    try {
-      line = (await ask(`\nagent ${s.agentId} › `)).trim();
-    } finally {
-      atPrompt = false;
+    if (queued.length) {
+      line = queued.shift()!;
+      out(`\nagent ${s.agentId} › ${line}\n`);
+    } else {
+      atPrompt = true;
+      try {
+        line = (await ask(`\nagent ${s.agentId} › `)).trim();
+      } finally {
+        atPrompt = false;
+      }
     }
     if (!line) {
       // Bare Enter = live status refresh (phase moves on its own during

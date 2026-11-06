@@ -212,7 +212,7 @@ test('notify address: owner-signed read, and a write bound to its body', async (
 
 // ── CLI: the `cred <agent> set` grammar and the shared operation ────────────
 
-import { parseCredArgs, applyCredPatch, checkCredName, credOp, credOwnerOp, CRED_PRESETS } from '../dist/cli/credentials.js';
+import { parseCredArgs, applyCredPatch, checkCredName, credOp, credOwnerOp, answerPending, renderAudit, CRED_PRESETS } from '../dist/cli/credentials.js';
 
 test('cli: a preset fills hosts, positions and a description', () => {
   const e = applyCredPatch('github', parseCredArgs(['preset=github']));
@@ -419,4 +419,107 @@ test('cli: login waits until the agent reports a new login', async () => {
   const lines = [];
   await credOp(ag, SEAL_ID, ['login', 'linear', 'https://mcp.linear.app/mcp'], { json: false, wait: true, out: (l) => lines.push(l), secret: async () => '' });
   assert.ok(lines.some((l) => l.startsWith('logged in:')), lines.join('\n'));
+});
+
+test('cli: log puts the counted uses of sealed\'s own key first, then the last n records', async () => {
+  const recs = [
+    { ts: '2026-11-06T07:00:00Z', op: 'inject', names: ['github'], method: 'GET', host: 'api.github.com', result: 'sent' },
+    { ts: '2026-11-06T08:35:59Z', op: 'inject', names: ['sealed:inference'], method: 'POST', host: 'router.example', result: 'sent', count: 1234, first: '2026-11-06T07:37:44Z' },
+    { ts: '2026-11-06T08:36:00Z', op: 'token', names: ['crm'], host: 'httpbin.org', result: 'ok' },
+  ];
+  const ag = { credentials: { audit: async () => recs } };
+  const lines = [];
+  await credOp(ag, SEAL_ID, ['log', '1'], { json: false, out: (l) => lines.push(l), secret: async () => '' });
+  assert.match(lines[0], /^inject  sealed:inference  POST router\.example  sent ×1234  \(2026-11-06T07:37:44Z … 2026-11-06T08:35:59Z\)$/);
+  assert.equal(lines[1], '');
+  assert.deepEqual(lines.slice(2), ['2026-11-06T08:36:00Z  token  crm  httpbin.org  ok']);
+  assert.deepEqual(renderAudit([]), ['no credential use recorded']);
+});
+
+test('cli: the list says whether a login entry is logged in, as the running agent has it', async () => {
+  const login = { v: 1, name: 'linear', hosts: ['mcp.linear.app'], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }], use: 'inject', value_hash: '', writeback: true, mcp: { url: 'https://mcp.linear.app/mcp' } };
+  const run = async (loaded) => {
+    const ag = { credentials: { get: async () => ({ version: 13, ownerEpoch: 0, document: null, definitions: [login] }), loaded } };
+    const lines = [];
+    await credOp(ag, SEAL_ID, ['ls'], { json: false, out: (l) => lines.push(l), secret: async () => '' });
+    return lines.find((l) => l.startsWith('  login')) ?? '';
+  };
+  assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', logged_in_at: 1793880023 }] })), /^  login      logged in 2026-/);
+  assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', status: 'awaiting_login' }] })), /not done yet — cred <agent> login linear https:\/\/mcp\.linear\.app\/mcp/);
+  assert.match(await run(async () => { throw new Error('agent down'); }), /unknown — the agent is not running/);
+});
+
+test('cli: approve with no id takes the only request; pending shows no empty facts', async () => {
+  const req = { auth_req_id: '0xdc98fc3158d013dd', op: 'reveal', name: 'github', facts: { source: 'owner', from: '', hosts: ['api.github.com'], expires_at: 0 }, reason: 'a tool needs it', request_digest: '0x', boot_id: '0x', created_at: 1, expires_at: 1794200000, status: 'pending' };
+  const approved = [];
+  const ag = { credentials: { agentUrl: async () => 'https://agent.example', pending: async () => [req], approveOnce: async (_s, id) => approved.push(id) } };
+  const lines = [];
+  const io = { json: false, out: (l) => lines.push(l), secret: async () => '' };
+  await credOp(ag, SEAL_ID, ['pending'], io);
+  assert.ok(!lines.some((l) => /from:|expires_at: 0/.test(l)), lines.join('\n'));
+  assert.ok(lines.some((l) => l === '  entry      set by owner'));
+  await credOp(ag, SEAL_ID, ['approve'], io);
+  assert.deepEqual(approved, [req.auth_req_id]);
+  // Two waiting: the id is needed, and the error names them instead of the whole usage.
+  ag.credentials.pending = async () => [req, { ...req, auth_req_id: '0x7f341cad0a2b2e06', op: 'login', name: 'linear' }];
+  await assert.rejects(credOp(ag, SEAL_ID, ['approve'], io), (e) => e.code === 'BAD_FLAG' && /2 requests are waiting/.test(e.message) && e.remedy === 'cred <agent> pending');
+});
+
+test('cli: reveal on|off refuses an entry whose login or rotated token the change would drop', async () => {
+  const ag = { credentials: { setAllowReveal: async () => { throw new Error('credentials: linear keeps a value sealed obtained (a login or a rotated token), and changing its definition would drop it; approve the agent\'s requests one at a time instead'); } } };
+  await assert.rejects(credOp(ag, SEAL_ID, ['reveal', 'linear', 'on'], { json: false, out: () => {}, secret: async () => '' }), (e) => e.code === 'BAD_FLAG' && /would drop it/.test(e.message));
+});
+
+function sessionIO(answers) {
+  const lines = [];
+  const asked = [];
+  return { lines, asked, io: { json: false, out: (l) => lines.push(l), secret: async () => answers.shift() ?? '', ask: async (q) => { asked.push(q); return answers.shift() ?? ''; } } };
+}
+
+test('session: a waiting reveal comes up at the prompt; the answer goes to the agent', async () => {
+  const req = { auth_req_id: '0xaa', op: 'reveal', name: 'github', facts: { source: 'owner', hosts: ['api.github.com'] }, reason: 'a tool needs it', status: 'pending' };
+  const decided = [];
+  const base = (defs) => ({ credentials: {
+    pending: async () => [req], get: async () => ({ version: 1, ownerEpoch: 0, document: null, definitions: defs }),
+    approveOnce: async (_s, id) => decided.push(['once', id]), deny: async (_s, id) => decided.push(['deny', id]),
+    setAllowReveal: async (_s, name, allow) => decided.push(['always', name, allow]),
+  } });
+  const plain = [{ name: 'github', writeback: false }];
+  let t = sessionIO(['y']);
+  assert.deepEqual(await answerPending(base(plain), SEAL_ID, t.io, { later: new Set(), tokenize: (l) => l.split(' ') }), ['[cred] I approved your request to read github, this once. Send the same reveal request again.']);
+  assert.ok(t.lines.some((l) => l.includes('read the value of github')) && t.lines.some((l) => l.includes('a tool needs it')));
+  assert.match(t.asked[0], /\[a\] always allow/);
+  t = sessionIO(['a']);
+  assert.match((await answerPending(base(plain), SEAL_ID, t.io, { later: new Set(), tokenize: (l) => l.split(' ') }))[0], /without asking/);
+  t = sessionIO(['n']);
+  assert.deepEqual(await answerPending(base(plain), SEAL_ID, t.io, { later: new Set(), tokenize: (l) => l.split(' ') }), ['[cred] I refused your request to reveal github.']);
+  assert.deepEqual(decided, [['once', '0xaa'], ['always', 'github', true], ['deny', '0xaa']]);
+  // Later: not offered again in this session.
+  const later = new Set();
+  t = sessionIO(['']);
+  assert.deepEqual(await answerPending(base(plain), SEAL_ID, t.io, { later, tokenize: (l) => l.split(' ') }), []);
+  t = sessionIO(['y']);
+  assert.deepEqual(await answerPending(base(plain), SEAL_ID, t.io, { later, tokenize: (l) => l.split(' ') }), []);
+  assert.equal(t.asked.length, 0);
+  // An entry holding a login: "always" is not offered (it would drop the login).
+  t = sessionIO(['a']);
+  assert.deepEqual(await answerPending(base([{ name: 'github', writeback: true }]), SEAL_ID, t.io, { later: new Set(), tokenize: (l) => l.split(' ') }), []);
+  assert.doesNotMatch(t.asked[0], /always/);
+});
+
+test('session: a login request is answered by logging in, and the agent is told once it is done', async () => {
+  const req = { auth_req_id: '0xbb', op: 'login', name: 'linear', params: { url: 'https://mcp.linear.app/mcp' }, facts: {}, status: 'pending' };
+  let polls = 0;
+  const defs = [];
+  const ag = { credentials: {
+    pending: async () => [req], get: async () => ({ version: 1, ownerEpoch: 0, document: null, definitions: defs }),
+    put: async (_s, entries) => { defs.splice(0, defs.length, ...entries.map((e) => ({ ...e, v: 1, use: 'inject', value_hash: '' }))); return { version: 2 }; },
+    agentUrl: async () => 'https://agent.example',
+    login: async () => ({ authorizeUrl: 'https://auth.example/authorize?state=s' }),
+    loaded: async () => ({ version: 2, entries: polls++ < 2 ? [{ name: 'linear', status: 'awaiting_login' }] : [{ name: 'linear', logged_in_at: 1793880023 }] }),
+  } };
+  const t = sessionIO(['l']);
+  const tell = await answerPending(ag, SEAL_ID, t.io, { later: new Set(), tokenize: (l) => l.split(' '), pollMs: 1 });
+  assert.deepEqual(tell, ['[cred] I logged you in: linear is in GET /credentials now.']);
+  assert.ok(t.lines.some((l) => l.includes('https://auth.example/authorize?state=s')));
 });
