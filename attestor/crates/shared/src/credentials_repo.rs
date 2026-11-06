@@ -582,3 +582,140 @@ fn chrono_now() -> i64 {
 pub fn in_memory() -> Arc<dyn CredentialRepo> {
     Arc::new(InMemoryCredentialRepo::default())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repo::connect;
+    use serde_json::json;
+
+    fn test_database_url() -> String {
+        let url = std::env::var("AGENTDNA_TEST_DATABASE_URL").expect("isolated test DB URL");
+        format!(
+            "{}{}application_name=agentdna_{}",
+            url,
+            if url.contains('?') { '&' } else { '?' },
+            hex::encode(rand::random::<[u8; 8]>())
+        )
+    }
+
+    // Every statement of the Postgres repository against a real database:
+    // the set's compare-and-swap, writebacks on the current version only,
+    // pending counts and notification claims, reminders, epochs, the
+    // owner's address, and what a transfer deletes.
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_credential_sets_writebacks_and_transfer_clear() {
+        let repo = PostgresCredentialRepo::new(connect(&test_database_url()).await.unwrap());
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        let owner = Address::from(rand::random::<[u8; 20]>());
+
+        assert_eq!(
+            repo.put(seal, owner, 0, 0, json!({"v": 1}), json!({}))
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            repo.put(seal, owner, 0, 0, json!({"v": 2}), json!({}))
+                .await
+                .unwrap(),
+            None,
+            "a second first set"
+        );
+        assert_eq!(
+            repo.put(seal, owner, 0, 7, json!({"v": 2}), json!({}))
+                .await
+                .unwrap(),
+            None,
+            "a stale base"
+        );
+        assert_eq!(
+            repo.put(
+                seal,
+                owner,
+                0,
+                1,
+                json!({"v": 2}),
+                json!({"rt": {"c": "kept"}})
+            )
+            .await
+            .unwrap(),
+            Some(2)
+        );
+
+        assert!(repo
+            .put_writeback(seal, "rt", 2, json!({"c": "x"}))
+            .await
+            .unwrap());
+        assert!(
+            !repo
+                .put_writeback(seal, "rt", 1, json!({"c": "y"}))
+                .await
+                .unwrap(),
+            "a writeback for an old version"
+        );
+        let got = repo.get(seal).await.unwrap().expect("stored");
+        assert_eq!((got.version, got.owner), (2, owner));
+        assert_eq!(got.writebacks["rt"]["c"], "x");
+        assert!(repo
+            .all_sets()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(s, _)| *s == seal));
+
+        repo.set_pending(seal, 2).await.unwrap();
+        assert_eq!(repo.pending_counts(&[seal]).await.unwrap()[0].pending, 2);
+        assert_eq!(repo.claim_notification(seal, 0).await.unwrap(), Some(2));
+        assert_eq!(
+            repo.claim_notification(seal, 0).await.unwrap(),
+            None,
+            "not risen since"
+        );
+        repo.set_pending(seal, 3).await.unwrap();
+        assert_eq!(
+            repo.claim_notification(seal, 3600).await.unwrap(),
+            None,
+            "within the cooldown"
+        );
+
+        assert!(repo
+            .claim_reminder(seal, "rt", 2, 1_900_000_000)
+            .await
+            .unwrap());
+        assert!(!repo
+            .claim_reminder(seal, "rt", 2, 1_900_000_000)
+            .await
+            .unwrap());
+
+        repo.set_epoch(seal, 100).await.unwrap();
+        repo.set_epoch(seal, 50).await.unwrap();
+        assert_eq!(
+            repo.epoch(seal).await.unwrap(),
+            100,
+            "an epoch only moves forward"
+        );
+
+        repo.set_notify_address(owner, Some("owner@example.org"))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.notify_address(owner).await.unwrap().as_deref(),
+            Some("owner@example.org")
+        );
+        repo.set_notify_address(owner, None).await.unwrap();
+        assert_eq!(repo.notify_address(owner).await.unwrap(), None);
+
+        // A transfer: the set with its writebacks, the count and the
+        // reminders go; the epoch stays.
+        repo.clear(seal).await.unwrap();
+        assert!(repo.get(seal).await.unwrap().is_none());
+        assert!(repo.pending_counts(&[seal]).await.unwrap().is_empty());
+        assert!(repo
+            .claim_reminder(seal, "rt", 2, 1_900_000_000)
+            .await
+            .unwrap());
+        assert_eq!(repo.epoch(seal).await.unwrap(), 100);
+    }
+}
