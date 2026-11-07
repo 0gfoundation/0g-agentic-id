@@ -355,7 +355,7 @@ test('cli: set merges onto the stored set and takes the value from the prompt', 
   assert.equal(put.opts.baseVersion, 4);
   assert.equal(put.opts.agentUrl, 'http://agent.example');
   assert.deepEqual(put.entries.map((e) => [e.name, e.value]), [['openai', undefined], ['github', 'tok']]);
-  assert.match(prompts[0], /^github value: $/);
+  assert.match(prompts[0], /^github value \(Ctrl-C cancels\): $/);
   assert.match(lines[0], /^create it at https:\/\/github\.com\//);
   assert.match(lines[1], /^added github — version 5/);
 });

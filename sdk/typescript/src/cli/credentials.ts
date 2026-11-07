@@ -25,7 +25,7 @@ import {
   type PendingCredentialRequest,
   type TokenRequestTemplate,
 } from '../Credentials';
-import { CliError } from './errors';
+import { CliError, isCancelled } from './errors';
 import { emitOk } from './envelope';
 
 /** The keys `cred <agent> set <name>` takes. */
@@ -670,7 +670,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       const entry = applyCredPatch(name, patch, stored ? inputOf(stored) : undefined);
       const preset = patch.preset ? CRED_PRESETS[patch.preset] : undefined;
       if (preset && !stored && !io.json) io.out(`create it at ${preset.create} — ${preset.tip}`);
-      const typed = await io.secret(stored ? `${name} value (Enter keeps the stored one): ` : `${name} value: `);
+      const typed = await io.secret(stored ? `${name} value (Enter keeps the stored one, Ctrl-C cancels): ` : `${name} value (Ctrl-C cancels): `);
       if (typed) entry.value = typed;
       else if (!stored) throw new CliError('BAD_FLAG', `${name} needs a value (pipe it in, or type it at the prompt)`, { remedy: SET_USAGE });
       const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
@@ -954,6 +954,13 @@ export async function answerPending(
         else later();
       }
     } catch (e) {
+      // Cancelled (Ctrl-C or Esc at a question): this request and the ones
+      // after it wait; the answers already given still go to the agent.
+      if (isCancelled(e)) {
+        for (const q of open.slice(open.indexOf(p))) opts.later.add(q.auth_req_id);
+        io.out('  left for later — cred <agent> pending lists them');
+        return tell;
+      }
       // One request that could not be answered does not lose the answers
       // to the others: it is left for later and the owner is told why.
       io.out(`  could not answer: ${printable(e instanceof Error ? e.message : String(e))}`);

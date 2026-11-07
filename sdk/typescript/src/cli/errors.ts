@@ -115,3 +115,12 @@ export function toCliError(e: unknown): CliError {
   }
   return new CliError('UNKNOWN', e instanceof Error ? e.message : String(e));
 }
+
+/** What a question the owner cancelled (Ctrl-C or Esc in the shell) rejects with. */
+export function cancelled(): Error {
+  return Object.assign(new Error('cancelled'), { code: 'CANCELLED' });
+}
+
+export function isCancelled(e: unknown): boolean {
+  return !!e && typeof e === 'object' && (e as { code?: unknown }).code === 'CANCELLED';
+}

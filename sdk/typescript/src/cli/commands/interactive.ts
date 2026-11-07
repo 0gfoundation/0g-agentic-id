@@ -24,7 +24,7 @@ import type { ServeProof, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
-import { CliError } from '../errors';
+import { CliError, cancelled, isCancelled } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
@@ -598,8 +598,13 @@ function containerUrl(sandboxId: string, proxy: string): string {
 }
 const og = (wei: bigint | null | undefined): string => (wei == null ? 'n/a' : `${(Number(wei) / 1e18).toFixed(6)} OG`);
 /** The shell's question: the answer to q. fresh asks for a line typed after
- *  q is shown (see run). */
-type Ask = ((q: string) => Promise<string>) & { fresh?: (q: string) => Promise<string> };
+ *  q is shown (see run); main is the shell's own prompt; cancel rejects the
+ *  question waiting, if any other than the prompt, and says whether it did. */
+type Ask = ((q: string) => Promise<string>) & {
+  fresh?: (q: string) => Promise<string>;
+  main?: (q: string) => Promise<string>;
+  cancel?: () => boolean;
+};
 
 /** An answer to a signing question this soon after it is shown was typed before it. */
 const READ_MS = 300;
@@ -624,7 +629,17 @@ export function lineQueue(
   tty: () => boolean,
 ): Ask {
   const pendingLines: string[] = [];
-  const waiters: Array<{ res: (s: string) => void; rej: (e: Error) => void }> = [];
+  const waiters: Array<{ res: (s: string) => void; rej: (e: Error) => void; main: boolean }> = [];
+  // readline keeps keys typed so far as the line being edited (and would
+  // show them after the next question, ready for Enter), and its offset from
+  // the last redraw (which would move that question up over lines printed
+  // since).
+  const clearEdit = (): void => {
+    const edit = rl as { line?: unknown; cursor?: unknown; prevRows?: unknown };
+    if (typeof edit.line === 'string') edit.line = '';
+    if (typeof edit.cursor === 'number') edit.cursor = 0;
+    if (typeof edit.prevRows === 'number') edit.prevRows = 0;
+  };
   rl.on('line', (l) => {
     const w = waiters.shift();
     if (w) w.res(l);
@@ -639,7 +654,7 @@ export function lineQueue(
       w.rej(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
     }
   });
-  const ask: Ask = (q: string): Promise<string> => {
+  const wait = (q: string, main: boolean): Promise<string> => {
     const buffered = pendingLines.shift();
     if (buffered !== undefined) {
       out(`${q}${buffered}\n`); // keep the transcript readable in pipes/logs
@@ -650,7 +665,17 @@ export function lineQueue(
     }
     rl.setPrompt(q);
     rl.prompt();
-    return new Promise((res, rej) => waiters.push({ res, rej }));
+    return new Promise((res, rej) => waiters.push({ res, rej, main }));
+  };
+  const ask: Ask = (q: string): Promise<string> => wait(q, false);
+  ask.main = (q: string): Promise<string> => wait(q, true);
+  ask.cancel = (): boolean => {
+    const i = waiters.findIndex((w) => !w.main);
+    if (i < 0) return false;
+    const [w] = waiters.splice(i, 1);
+    clearEdit();
+    w.rej(cancelled());
+    return true;
   };
   ask.fresh = async (q: string): Promise<string> => {
     if (!tty()) return ask(q);
@@ -659,13 +684,7 @@ export function lineQueue(
     }
     for (;;) {
       pendingLines.length = 0;
-      // readline keeps keys typed so far as the line being edited and would
-      // show them after q, ready for Enter; and its offset from the last
-      // redraw would move q up over the lines printed since.
-      const edit = rl as { line?: unknown; cursor?: unknown; prevRows?: unknown };
-      if (typeof edit.line === 'string') edit.line = '';
-      if (typeof edit.cursor === 'number') edit.cursor = 0;
-      if (typeof edit.prevRows === 'number') edit.prevRows = 0;
+      clearEdit();
       const shown = Date.now();
       const a = await ask(q);
       if (!a.trim() || Date.now() - shown >= READ_MS) return a;
@@ -968,6 +987,9 @@ export async function run(ctx: CommandContext): Promise<void> {
 
   let lastSigint = 0;
   rl.on('SIGINT', () => {
+    // A question (not the shell's prompt) is waiting: cancel it, and the
+    // command that asked.
+    if (ask.cancel?.()) { out('\n'); return; }
     if (irq.streaming) { irq.streaming.abort(); return; } // interrupt the turn, stay in the REPL
     const now = Date.now();
     if (now - lastSigint < 2000) { rl.close(); process.exit(0); }
@@ -978,6 +1000,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   readline.emitKeypressEvents(process.stdin, rl);
   process.stdin.on('keypress', (_s, key) => {
     if (key?.name !== 'escape') return;
+    if (ask.cancel?.()) { out('\n'); return; }
     if (irq.streaming) { irq.streaming.abort(); return; }
     irq.brake?.(); // idle Esc in a session: stop a background/orphaned task
   });
@@ -990,8 +1013,13 @@ export async function run(ctx: CommandContext): Promise<void> {
       // masquerade as a missing-wallet error. (feedback.md F1)
       parseAgentRef(ctx.positionals[0]);
       const ag = await withWallet(ctx);
-      const s = await attach(ag, requireAttestorUrl(ctx.env), ctx.positionals[0], ask);
-      await sessionRepl(s, ask, irq, ctx);
+      try {
+        const s = await attach(ag, requireAttestorUrl(ctx.env), ctx.positionals[0], ask);
+        await sessionRepl(s, ask, irq, ctx);
+      } catch (e) {
+        if (!isCancelled(e)) throw e;
+        out('cancelled\n');
+      }
     }
     await managerRepl(ctx, ask, irq);
   } catch (e) {
@@ -1090,7 +1118,9 @@ const L1_HELP_FULL = `manager commands
                           (Enter keeps the current value; secrets echo *)
   whoami                  show attestor / wallet / api-key / ack status
   help                    this text
-  quit                    exit (Ctrl-C twice also works)`;
+  quit                    exit (Ctrl-C twice also works)
+At a question a command asks (a value, an amount, a confirmation), Ctrl-C or
+Esc cancels it and the command.`;
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   // The environment marker in every prompt: cross-environment mistakes (a
@@ -1164,7 +1194,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   for (;;) {
     activeCompletions = L1_WORDS;
     activeArgs = L1_ARGS;
-    const line = (await ask(`\n0g-agentdna [${hostOf(ctx.env.attestorUrl)}]> `)).trim();
+    const line = (await ((ask as Ask).main ?? ask)(`\n0g-agentdna [${hostOf(ctx.env.attestorUrl)}]> `)).trim();
     // Bare Enter refreshes the account status — the L1 analog of L2's
     // bare-Enter agent refresh.
     // Quote-aware, so a value with a space in it (`settings 286
@@ -1753,7 +1783,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     } catch (e) {
       // Keep the REPL alive on operational errors; show the remedy if present.
       const ce = e as CliError;
-      out(`error: ${friendlyChainError(e) ?? ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`);
+      if (isCancelled(e)) out('cancelled\n');
+      else out(`error: ${friendlyChainError(e) ?? ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`);
     }
   }
 }
@@ -2394,7 +2425,8 @@ const L2_HELP =
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
-                          turn in flight (the runtime cancels server-side)
+                          turn in flight (the runtime cancels server-side);
+                          at a question a command asks, they cancel it
   (bare Enter)            refresh this agent's phase/url from the attestor
   /hello                  identity, routes/services, serve-proof verification
   /balance                this agent's agentSeal gas + the account prepaid
@@ -2508,7 +2540,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       seatPromptPending = true;
       try {
         out(`\n⚠ this agent is now driven by another client\n`);
-        const takeBack = (await ask(`press Enter to take the seat back (anything else ${leavesWhat}): `)).trim();
+        // Cancelling the question leaves the seat, as any answer but Enter does.
+        const takeBack = (await ask(`press Enter to take the seat back (anything else ${leavesWhat}): `).catch((e: unknown) => {
+          if (isCancelled(e)) return 'cancelled';
+          throw e;
+        })).trim();
         if (takeBack === '') {
           try {
             if (s.url) { await s.ag.agent.claimAgent(s.url, BigInt(s.agentId), clientInstanceId); out(`seat reclaimed — ${reclaimedHint}\n`); return 'reclaimed'; }
@@ -2592,7 +2628,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     } else {
       atPrompt = true;
       try {
-        line = (await ask(`\nagent ${s.agentId} › `)).trim();
+        line = (await ((ask as Ask).main ?? ask)(`\nagent ${s.agentId} › `)).trim();
       } finally {
         atPrompt = false;
       }
@@ -3056,6 +3092,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // Show the remedy too: an error whose whole point is "do this instead"
       // (a refused settings write, a missing wallet) is useless without it.
       const ce = e as CliError;
+      if (isCancelled(e)) { out('cancelled\n'); continue; }
       out(`error: ${ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`); continue;
     }
 
