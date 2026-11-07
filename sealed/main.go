@@ -35,6 +35,7 @@ import (
 	"seal-verify/internal/attestorhttp"
 	"seal-verify/internal/chain"
 	"seal-verify/internal/config"
+	"seal-verify/internal/credproxy"
 	"seal-verify/internal/dataplane"
 	"seal-verify/internal/framework"
 	"seal-verify/internal/framework/harness"
@@ -49,6 +50,7 @@ import (
 	"seal-verify/internal/provision"
 	"seal-verify/internal/proxy"
 	"seal-verify/internal/report"
+	"seal-verify/internal/scrub"
 	"seal-verify/internal/secretenv"
 	"seal-verify/internal/settings"
 	"seal-verify/internal/state"
@@ -295,6 +297,10 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		})
 	}
 
+	// The credential proxy and store come up before the framework, so the
+	// framework's first environment already points its tools at them.
+	credRT, credValues := startCredentials(cfg, res, agentSealPriv, prov, sealedProxy)
+
 	logger.Logf("")
 	logger.Logf("--- Starting agent ---")
 	// onFailed is invoked by the manager exactly once if the supervisor
@@ -305,7 +311,7 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		currentStatus.SupervisorFailed("supervisor exhausted retries: " + err.Error())
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "supervisor exhausted retries: "+err.Error(), cfg.StatusBinding)
 	}
-	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, sealedProxy, onFailed); err != nil {
+	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, credRT, credValues, sealedProxy, onFailed); err != nil {
 		logger.Logf("FAIL agent: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", err.Error(), cfg.StatusBinding)
 		return
@@ -629,6 +635,8 @@ func startAgent(
 	res *chainBootstrapResult,
 	agentSealPriv []byte,
 	settingsBlob []byte,
+	credRT framework.RuntimeContext,
+	credValues *credproxy.Registry,
 	sealedProxy *proxy.Server,
 	onFailed func(err error),
 ) error {
@@ -808,7 +816,14 @@ func startAgent(
 
 	// Build the uploader. The watcher tick handler reuses this single
 	// instance to call upload.Apply each cycle.
-	upload, err := uploader.New(adapter, agent, res.client, res.agentID,
+	// What the watcher hashes and the uploader commits is scrubbed of the
+	// credential values sealed holds (internal/scrub). The drift handler
+	// keeps the adapter itself: it asks it for optional interfaces.
+	var idata framework.Framework = adapter
+	if credValues != nil {
+		idata = scrub.Wrap(adapter, credValues)
+	}
+	upload, err := uploader.New(idata, agent, res.client, res.agentID,
 		agentSealPriv, cfg.ChainRPC, cfg.FallbackIndexer)
 	if err != nil {
 		return fmt.Errorf("init uploader: %w", err)
@@ -819,7 +834,7 @@ func startAgent(
 	// immediately after mgr.Start arms phase=Running. chainSnapshot is
 	// untouched here — Phase A/B already seeded it with chain truth.
 	logger.Logf("--- iData seed phase 1: post-Restore (pre-Start) ---")
-	if err := seedCurrentSnapshots(ctx, adapter, agent); err != nil {
+	if err := seedCurrentSnapshots(ctx, idata, agent); err != nil {
 		return err
 	}
 
@@ -863,7 +878,7 @@ func startAgent(
 			// AgenticID Framework code hash = the sealed image measurement
 			// the provider certified (image_hash), as the contract's bytes32.
 			FrameworkHash: cfg.Attestation.FrameworkHash(),
-		},
+		}.WithCredentials(credRT), // credential proxy, sockets, CredHold (startCredentials); empty when off
 		AgentSealPriv: agentSealPriv,
 		SealID:        sealID,
 		Owner:         res.owner,
@@ -1030,7 +1045,7 @@ func startAgent(
 	logger.Logf("--- iData seed phase 2: waiting %s for %s to settle ---", settle, adapter.Name())
 	time.Sleep(settle)
 	logger.Logf("--- iData seed phase 2: post-settle baseline capture ---")
-	if err := seedCurrentSnapshots(ctx, adapter, agent); err != nil {
+	if err := seedCurrentSnapshots(ctx, idata, agent); err != nil {
 		return fmt.Errorf("re-seed after settle: %w", err)
 	}
 	logger.Logf("OK   baseline captured: %d roles total", len(roles))
@@ -1041,7 +1056,7 @@ func startAgent(
 	// then asks the uploader to push the entire post-reconcile state in
 	// one wholesale chain.Update via upload.Apply.
 	watchCtx := context.Background()
-	go watcher.New(adapter, agent, watcher.Config{
+	go watcher.New(idata, agent, watcher.Config{
 		OnDrift: func(plaintexts map[string][]byte, drifted []string) {
 			handleDrift(watchCtx, plaintexts, drifted, adapter, agent, mgr, upload,
 				cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, cfg.StatusBinding)

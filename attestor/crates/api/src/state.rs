@@ -20,6 +20,10 @@ pub struct AppState {
     pub sandbox: Arc<dyn SandboxClient>,
 
     pub deployments: Arc<dyn DeploymentRepo>,
+    pub credentials: Arc<dyn attestor_shared::credentials_repo::CredentialRepo>,
+    /// How owners hear about pending credential requests; None when no
+    /// channel is configured.
+    pub notify: Option<Arc<attestor_shared::notify::OwnerNotify>>,
     pub idempotency: Arc<dyn IdempotencyStore>,
     pub jobs: Arc<dyn JobQueue>,
     pub events: Arc<dyn EventBus>,

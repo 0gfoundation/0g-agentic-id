@@ -19,6 +19,25 @@
 import { proofFromResponse, requestBytesOf, normalizedMethod, type TaskExchange } from './ServeSession';
 import type { ServeProof } from './types';
 
+/** What a task id the agent returns must look like to be handed out. */
+const TASK_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+/**
+ * Text from the agent (an activity label, an error it sent) made one plain
+ * line for display: escape sequences, control characters and bidi controls
+ * removed, so a program that prints it cannot have its terminal restyled.
+ */
+export function plainText(s: string): string {
+  return s
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u009b[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007\u001b\u009c]*(?:\u0007|\u001b\\|\u009c)?/g, '')
+    .replace(/\u001b[PX^_][^\u001b\u009c]*(?:\u001b\\|\u009c)?/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')
+    .replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');
+}
+
 /**
  * One agent-registered service, as listed in `/hello`'s `services` array.
  * These are exact `/api/*` paths the agent's own code serves; they are not
@@ -683,7 +702,7 @@ export function makeAgentClient(params: {
           return { aborted: !!j.aborted, note: j.note };
         }
         if (r.status === 404) return { aborted: false, note: 'no bridge endpoint — this framework stops its turn when the stream disconnects' };
-        throw new Error(`interrupt: HTTP ${r.status}: ${await r.text()}`);
+        throw new Error(`interrupt: HTTP ${r.status}: ${plainText(await r.text())}`);
       } catch (e) {
         if ((e as Error).message.startsWith('interrupt:')) throw e;
         return { aborted: false, note: 'interrupt transport failed — this framework stops its turn when the stream disconnects' };
@@ -697,7 +716,7 @@ export function makeAgentClient(params: {
         body: chatBody(messages, opts),
         signal: opts?.signal,
       });
-      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const ct = r.headers.get('content-type') ?? '';
       if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
         return (await r.json()) as ChatCompletion; // server didn't stream → plain JSON
@@ -712,7 +731,7 @@ export function makeAgentClient(params: {
         body: chatBody(messages, opts),
         signal: opts?.signal,
       });
-      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const ct = r.headers.get('content-type') ?? '';
       if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
         // Server didn't stream — yield the whole reply as one delta. An EMPTY
@@ -732,7 +751,7 @@ export function makeAgentClient(params: {
       let sawContent = false;
       let streamErr: string | null = null;
       const onComment = opts?.onActivity
-        ? (c: string): void => { if (c.startsWith('activity ')) opts.onActivity!(c.slice(9)); }
+        ? (c: string): void => { if (c.startsWith('activity ')) opts.onActivity!(plainText(c.slice(9))); }
         : undefined;
       let lastThinkingAt = 0;
       const thinking = (): void => {
@@ -749,8 +768,8 @@ export function makeAgentClient(params: {
           if (opts?.onActivity) {
             const tool = (chunk as { tool_name?: string }).tool_name ?? '';
             if (tool === '_thinking') thinking();
-            else if (ev === 'hermes.tool.progress') { if (tool) opts.onActivity(`tool/call ${tool}`); }
-            else opts.onActivity(tool ? `${ev.replace(/^hermes\./, '')} ${tool}` : ev.replace(/^hermes\./, ''));
+            else if (ev === 'hermes.tool.progress') { if (tool) opts.onActivity(plainText(`tool/call ${tool}`)); }
+            else opts.onActivity(plainText(tool ? `${ev.replace(/^hermes\./, '')} ${tool}` : ev.replace(/^hermes\./, '')));
           }
           continue;
         }
@@ -763,7 +782,7 @@ export function makeAgentClient(params: {
           const delta = choice?.delta as { tool_calls?: Array<{ function?: { name?: string } }> } | undefined;
           for (const tc of delta?.tool_calls ?? []) {
             const fn = tc?.function?.name;
-            if (fn) opts.onActivity(`tool/call ${fn}`);
+            if (fn) opts.onActivity(plainText(`tool/call ${fn}`));
           }
         }
         const d = chunkDelta(chunk);
@@ -772,7 +791,7 @@ export function makeAgentClient(params: {
       if (!sawContent) {
         throw new Error(
           streamErr
-            ? `chat: upstream error: ${streamErr}`
+            ? `chat: upstream error: ${plainText(String(streamErr))}`
             : 'chat: the stream ended without any output — the agent-side model call likely failed (see /agentlog)',
         );
       }
@@ -795,7 +814,7 @@ export function makeAgentClient(params: {
 
     const taskSnapshot = async (id: string): Promise<AgentTask> => {
       const r = await doFetch(`${rPrefix}/${id}`);
-      if (!r.ok) throw new Error(`task: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`task: HTTP ${r.status}: ${plainText(await r.text())}`);
       return (await r.json()) as AgentTask;
     };
 
@@ -846,8 +865,8 @@ export function makeAgentClient(params: {
 
     const lostAgent = (id: string | undefined, why: string): Error =>
       new Error(
-        `task ${id}: lost the agent while following (${why}) — ` +
-        `the task may still be running; re-attach with followTask("${id}")`,
+        `task ${plainText(String(id))}: lost the agent while following (${plainText(why)}) — ` +
+        `the task may still be running; re-attach with followTask("${plainText(String(id))}")`,
       );
 
     async function* followResponse(args: {
@@ -894,7 +913,7 @@ export function makeAgentClient(params: {
           let res: Response;
           try {
             const r = await doFetch(`${rPrefix}/${id}?stream=true&starting_after=${seq}`, { signal: attempt.signal });
-            if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+            if (!r.ok) throw new Error(`HTTP ${r.status}: ${plainText(await r.text())}`);
             res = r;
             lastByteAt = Date.now();
           } catch (e) {
@@ -935,7 +954,7 @@ export function makeAgentClient(params: {
                 }
                 case 'response.activity': {
                   const label = (chunk as { label?: string }).label;
-                  if (args.onActivity && typeof label === 'string') args.onActivity(label);
+                  if (args.onActivity && typeof label === 'string') args.onActivity(plainText(label));
                   break;
                 }
                 case 'response.completed':
@@ -977,7 +996,7 @@ export function makeAgentClient(params: {
       }
 
       if (terminal.status === 'failed') {
-        throw new Error(`chat: ${terminal.error?.message ?? 'task failed'}`);
+        throw new Error(`chat: ${plainText(terminal.error?.message ?? 'task failed')}`);
       }
       if (terminal.status === 'cancelled') return; // owner stopped it — partial text already yielded
       if (!sawText) {
@@ -1005,10 +1024,12 @@ export function makeAgentClient(params: {
         body: JSON.stringify(payload),
         signal: opts?.signal,
       });
-      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const submitted = (await r.json()) as AgentTask;
       if (!submitted?.id) throw new Error('chat: the agent accepted the task but returned no id');
-      opts?.onTask?.(submitted.id);
+      // A task id is a name to re-attach with: one that is not a plain
+      // identifier is not handed out to be printed.
+      if (TASK_ID.test(submitted.id)) opts?.onTask?.(submitted.id);
       yield* followResponse({
         id: submitted.id,
         startingAfter: 0,
@@ -1032,7 +1053,7 @@ export function makeAgentClient(params: {
     });
     client.cancelTask = async (id) => {
       const r = await doFetch(`${rPrefix}/${id}/cancel`, { method: 'POST' });
-      if (!r.ok) throw new Error(`cancelTask: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`cancelTask: HTTP ${r.status}: ${plainText(await r.text())}`);
       return (await r.json()) as AgentTask;
     };
   }
@@ -1056,7 +1077,7 @@ export function makeAgentClient(params: {
   };
   const getJSON = async <T>(what: string, path: string): Promise<T> => {
     const r = await doFetch(path);
-    if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json()) as T;
   };
   const postJSON = async <T>(what: string, path: string, body?: unknown): Promise<T> => {
@@ -1064,7 +1085,7 @@ export function makeAgentClient(params: {
       method: 'POST',
       ...(body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
     });
-    if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json()) as T;
   };
 
@@ -1142,7 +1163,7 @@ export function makeAgentClient(params: {
             // A 4xx is an answer (the route is gone, the handle is refused),
             // and asking again gets the same one.
             if (res.status < 500 && res.status !== 408 && res.status !== 429) {
-              throw new Error(`events: HTTP ${res.status}: ${text}`);
+              throw new Error(`events: HTTP ${res.status}: ${plainText(text)}`);
             }
             res = undefined;
           }
@@ -1201,7 +1222,7 @@ export function makeAgentClient(params: {
         headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
         signal: AbortSignal.timeout(30_000),
       });
-      if (!r.ok) throw new Error(`logs: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`logs: HTTP ${r.status}: ${plainText(await r.text())}`);
       const text = await r.text();
       if (opts?.tail && opts.tail > 0) {
         return text.split('\n').slice(-opts.tail).join('\n');

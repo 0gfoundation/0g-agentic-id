@@ -33,7 +33,7 @@ import { requireConfiguredInferenceKey, requiresProviderReset } from '../inferen
 const ZERO_HASH = `0x${'0'.repeat(64)}` as Hash;
 
 /** agentId | sealId | unique sealId prefix → the sealId the attestor keys on. */
-async function resolveSealId(ag: AgenticID, ref: AgentRef, raw: string): Promise<Hash> {
+export async function resolveSealId(ag: AgenticID, ref: AgentRef, raw: string): Promise<Hash> {
   if (ref.kind === 'sealId') return ref.sealId;
   if (ref.kind === 'sealPrefix') {
     const hits = (await ag.agent.listDeployments()).filter((r) =>

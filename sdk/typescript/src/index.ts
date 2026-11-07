@@ -37,7 +37,7 @@ export { mcpServices } from './AgentClient';
 export { defaultIData, DEFAULT_PERSONA_INFERENCE, deploymentFactsOf, needsDefaultSettings, storeDefaultSettings } from './AttestorClient';
 export type { DeploymentFacts } from './AttestorClient';
 export type { DefaultIDataParams } from './AttestorClient';
-export type { AgenticIDConfig as AgentDNAConfig, AgenticIDConfig } from './context';
+export type { AgenticIDConfig as AgentDNAConfig, AgenticIDConfig, CredentialMarkRecord } from './context';
 
 // ── Namespace implementation classes (advanced / typing) ──
 export { SandboxClient } from './SandboxClient';
@@ -66,6 +66,28 @@ export {
   fetchRouterModelIds,
 } from './Settings';
 export type { SettingsDoc, ThinkingLevel } from './Settings';
+export {
+  CredentialsApi,
+  CredentialsConflictError,
+  CredentialsUnverifiedError,
+  credentialSetTypes,
+  approvalTypes,
+  definitionOf,
+  inputOf,
+  credentialPlaintext,
+  CREDENTIALS_DOMAIN_NAME,
+  CREDENTIALS_DOMAIN_VERSION,
+} from './Credentials';
+export type {
+  CredentialSigner,
+  CredentialMCP,
+  CredentialInput,
+  CredentialDefinition,
+  CredentialDocument,
+  CredentialPosition,
+  TokenRequestTemplate,
+  PendingCredentialRequest,
+} from './Credentials';
 
 // ── Reputation: serve-proof transport + verification ──
 export {

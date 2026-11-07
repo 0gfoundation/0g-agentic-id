@@ -33,6 +33,7 @@ export type ErrorCode =
   | 'PREFLIGHT_ACK'
   | 'PREFLIGHT_BALANCE'
   | 'SETTINGS_CONFLICT'
+  | 'CREDENTIALS_CONFLICT'
   | 'INFERENCE_KEY_REQUIRED'
   | 'INFERENCE_PROVIDER_UNSUPPORTED'
   // exit 4 — timeout
@@ -69,6 +70,8 @@ const EXIT_BY_CODE: Record<ErrorCode, number> = {
   // caller has looked at `details.current`, which is why this is an error and
   // not a silent retry.
   SETTINGS_CONFLICT: EXIT.REMEDIABLE,
+  // The same for the agent's credential set.
+  CREDENTIALS_CONFLICT: EXIT.REMEDIABLE,
   INFERENCE_KEY_REQUIRED: EXIT.REMEDIABLE,
   INFERENCE_PROVIDER_UNSUPPORTED: EXIT.REMEDIABLE,
   TIMEOUT: EXIT.TIMEOUT,
@@ -111,4 +114,13 @@ export function toCliError(e: unknown): CliError {
     });
   }
   return new CliError('UNKNOWN', e instanceof Error ? e.message : String(e));
+}
+
+/** What a question the owner cancelled (Ctrl-C or Esc in the shell) rejects with. */
+export function cancelled(): Error {
+  return Object.assign(new Error('cancelled'), { code: 'CANCELLED' });
+}
+
+export function isCancelled(e: unknown): boolean {
+  return !!e && typeof e === 'object' && (e as { code?: unknown }).code === 'CANCELLED';
 }

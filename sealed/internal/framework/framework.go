@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -452,6 +453,97 @@ type RuntimeContext struct {
 	// Sealed runtime metadata.
 	SealedVersion string // git short hash of sealed binary; empty if unavailable
 	FrameworkHash string // "0x"+sha256 sealed image hash; signed into serve-proofs as the AgenticID Framework code hash
+
+	// Credential proxy (internal/credproxy). All empty when it is off.
+	CredProxy      string // explicit form prefix: http://127.0.0.1:<port>/<token>
+	CredHTTPSProxy string // HTTPS_PROXY value: http://agent:<token>@127.0.0.1:<port>
+	CredCAFile     string // the proxy's per-boot root alone
+	CredCABundle   string // system roots followed by the proxy's root
+	CredSock       string // harness credential socket
+	CredRevealSock string // socket that hands out revealed values
+	CredGitConfig  string // git config file naming sealed's credential helper (GitConfig)
+	// CredHold, when the proxy is on, has sealed hold a value it supplies
+	// to the framework (its inference key) instead of handing it over: the
+	// value is filled in only in the given headers (name → template with
+	// one {v}) on baseURL's host. It returns the base URL to use instead
+	// (through the proxy) and the placeholder to give the framework. An
+	// error wrapping ErrCredHoldRefused means the framework must not get
+	// the value either; any other, that sealed could not hold it.
+	CredHold func(name, baseURL string, headers map[string]string, value []byte) (proxiedBaseURL, placeholder string, err error)
+}
+
+// ErrCredHoldRefused is CredHold refusing a value the framework may not
+// have at all: the agent's owner changed, and the value came with the
+// previous owner's deployment.
+var ErrCredHoldRefused = fmt.Errorf("framework: sealed refused the value; the agent's owner changed")
+
+// WithCredentials returns rt with every credential field (Cred*) taken from
+// c, the RuntimeContext startCredentials returned. One place copies them, so
+// a field added there reaches the adapters.
+func (rt RuntimeContext) WithCredentials(c RuntimeContext) RuntimeContext {
+	rt.CredProxy, rt.CredHTTPSProxy = c.CredProxy, c.CredHTTPSProxy
+	rt.CredCAFile, rt.CredCABundle = c.CredCAFile, c.CredCABundle
+	rt.CredSock, rt.CredRevealSock = c.CredSock, c.CredRevealSock
+	rt.CredGitConfig, rt.CredHold = c.CredGitConfig, c.CredHold
+	return rt
+}
+
+// credentialCAVars name the CA-location variables, read by the tools a
+// harness runs, that replace a tool's trust store. They get the bundle
+// (system roots + the proxy root) so ordinary hosts still verify.
+var credentialCAVars = []string{
+	"SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+	"GIT_SSL_CAINFO", "AWS_CA_BUNDLE", "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+}
+
+// CredentialEnv is the environment that sends a framework's tools through
+// sealed's credential proxy: HTTPS_PROXY for the intercepting form, the CA
+// variables pointing at the proxy's root, and the explicit prefix and
+// sockets for tools that call them directly. Every adapter appends it to
+// the framework's environment; it is empty when the proxy is off.
+// gitCredentialHelper answers git's "get" with the credential socket's
+// username and placeholder for the host git names.
+const gitCredentialHelper = `!f() { test "$1" = get || exit 0; h=$(sed -n 's/^host=//p'); test -n "$h" && curl -sf --unix-socket "$SEAL_CRED_SOCKET" "http://localhost/credentials/git?host=$h" || true; }; f`
+
+// GitConfig is the file sealed writes at CredGitConfig: the image's system
+// config, then the credential helper. git reads it as GIT_CONFIG_SYSTEM, a
+// name harnesses pass to their tools; GIT_CONFIG_KEY_<n> is not, where a
+// harness drops credential-shaped names (KEY, TOKEN, …) from its tools'
+// environment, and git then refuses every command.
+func GitConfig() []byte {
+	quoted := `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(gitCredentialHelper) + `"`
+	return []byte("[include]\n\tpath = /etc/gitconfig\n[credential]\n\thelper = " + quoted + "\n")
+}
+
+func (rt RuntimeContext) CredentialEnv() []string {
+	if rt.CredHTTPSProxy == "" {
+		return nil
+	}
+	env := []string{
+		"SEAL_CRED_PROXY=" + rt.CredProxy,
+		"HTTPS_PROXY=" + rt.CredHTTPSProxy,
+		"https_proxy=" + rt.CredHTTPSProxy,
+		"NO_PROXY=localhost,127.0.0.1,::1",
+		"no_proxy=localhost,127.0.0.1,::1",
+		"NODE_EXTRA_CA_CERTS=" + rt.CredCAFile,
+	}
+	for _, name := range credentialCAVars {
+		env = append(env, name+"="+rt.CredCABundle)
+	}
+	if rt.CredSock != "" {
+		env = append(env, "SEAL_CRED_SOCKET="+rt.CredSock)
+	}
+	if rt.CredGitConfig != "" {
+		// git over HTTPS asks the credential socket for the placeholder of
+		// an entry that allows Basic auth on that host; the proxy fills the
+		// real value in. Nothing comes back for other hosts, and git moves
+		// on to whatever helper it has.
+		env = append(env, "GIT_CONFIG_SYSTEM="+rt.CredGitConfig)
+	}
+	if rt.CredRevealSock != "" {
+		env = append(env, "SEAL_CRED_REVEAL_SOCKET="+rt.CredRevealSock)
+	}
+	return env
 }
 
 // StartResult is what an adapter returns when its agent process is up and

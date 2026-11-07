@@ -549,3 +549,43 @@ func TestRenderSettings_CatalogBudgetIsCappedForTheBridge(t *testing.T) {
 		t.Errorf("SEAL_MODEL_MAX_TOKENS = %q, want %q (catalog 131072, capped)", got, want)
 	}
 }
+
+// With the credential proxy on, a platform-routed model's key stays in
+// sealed: the harness (and every tool it runs) gets the placeholder and the
+// router through the proxy, never the key.
+func TestBridgeEnv_InferenceKeyHeldBySealed(t *testing.T) {
+	catalogServer(t, reasoningModel("glm-5.3"))
+	a := New()
+	resolved := settings.Resolve(context.Background(),
+		settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3"}, "sk-the-real-key")
+	if err := a.RenderSettings(context.Background(), resolved); err != nil {
+		t.Fatalf("RenderSettings: %v", err)
+	}
+	var held struct {
+		name, base string
+		headers    map[string]string
+		value      []byte
+	}
+	rt := framework.RuntimeContext{CredHold: func(name, base string, headers map[string]string, value []byte) (string, string, error) {
+		held.name, held.base, held.headers, held.value = name, base, headers, value
+		return "http://127.0.0.1:9/tok/https/router.example/v1", "[[credential:sealed:inference]]", nil
+	}}
+	key, base := holdInferenceKey(a.rendered.resolved.Endpoint, a.rendered.resolved.APIKey, rt)
+	env := strings.Join(bridgeEnv{token: "tok", apiKey: key, modelBaseURL: base, settingsEnv: a.rendered.env, rt: rt}.environ(), "\n")
+	if strings.Contains(env, "sk-the-real-key") {
+		t.Fatalf("the harness got the key:\n%s", env)
+	}
+	if !strings.Contains(env, "SEAL_MODEL_API_KEY=[[credential:sealed:inference]]") ||
+		!strings.Contains(env, "SEAL_MODEL_BASE_URL=http://127.0.0.1:9/tok/https/router.example/v1") ||
+		strings.Count(env, "SEAL_MODEL_BASE_URL=") != 1 {
+		t.Fatalf("env:\n%s", env)
+	}
+	if held.name != "inference" || held.base != a.rendered.resolved.Endpoint.BaseURL || string(held.value) != "sk-the-real-key" ||
+		held.headers["Authorization"] != "Bearer {v}" || held.headers["x-api-key"] != "{v}" {
+		t.Fatalf("held %+v", held)
+	}
+	// Without the proxy the key goes to the harness as before.
+	if key, base := holdInferenceKey(a.rendered.resolved.Endpoint, "sk-the-real-key", framework.RuntimeContext{}); key != "sk-the-real-key" || base != "" {
+		t.Fatalf("got %q %q", key, base)
+	}
+}

@@ -9,8 +9,9 @@
 //!
 //! Canonical format:
 //!   "StatusReport.v2:0x<seal>:<status>:<detail>:<status token SHA-256>:<applied settings SHA-256>"
+//!   "StatusReport.v3:…same fields…:<credential requests pending>"
 //!
-//! The `"StatusReport.v2:"` prefix is the domain tag — signatures for this
+//! The `"StatusReport.v2:"` / `"StatusReport.v3:"` prefix is the domain tag — signatures for this
 //! action cannot be replayed as a `/provision` boot claim
 //! (`"ProvisionBoot.v1:"`) or any future action with a distinct prefix.
 
@@ -175,8 +176,18 @@ pub fn binding_hash(token: &str) -> [u8; 32] {
 /// Reconstruct the exact bytes the container signed. The container side
 /// MUST produce the same format when signing.
 pub fn canonical_message(report: &StatusReport) -> String {
+    // v3 appends the pending credential-request count; a container that
+    // reports none still signs v2.
+    let tag = match report.credentials_pending {
+        Some(_) => "StatusReport.v3",
+        None => "StatusReport.v2",
+    };
+    let pending = report
+        .credentials_pending
+        .map(|n| format!(":{n}"))
+        .unwrap_or_default();
     format!(
-        "StatusReport.v2:0x{}:{}:{}:{}:{}",
+        "{tag}:0x{}:{}:{}:{}:{}{pending}",
         hex::encode(report.seal_id),
         status_slug(report.status),
         report.error_detail.as_deref().unwrap_or(""),
@@ -244,6 +255,7 @@ mod tests {
             error_detail,
             status_binding: "11".repeat(32),
             settings_digest: None,
+            credentials_pending: None,
             agent_seal_signature: Bytes::new(),
         };
         let canonical = canonical_message(&report);
@@ -262,6 +274,7 @@ mod tests {
             error_detail: None,
             status_binding: "token".into(),
             settings_digest: Some(B256::repeat_byte(0x12)),
+            credentials_pending: None,
             agent_seal_signature: Bytes::new(),
         };
         assert_eq!(
@@ -283,6 +296,7 @@ mod tests {
             error_detail: Some("oom".to_string()),
             status_binding: "token".into(),
             settings_digest: None,
+            credentials_pending: None,
             agent_seal_signature: Bytes::new(),
         };
         let msg = canonical_message(&report);

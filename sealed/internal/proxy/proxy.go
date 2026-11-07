@@ -88,6 +88,9 @@ type Server struct {
 	synth *synthHub
 
 	readSettings        SettingsReader
+	credentials         CredentialService
+	credUsed            usedMessages // owner-signed credential requests already taken
+	scrubber            Scrubber
 	readRuntimeSettings func() RuntimeSettings
 	applySettings       SettingsApplier
 	applyClear          ClearApplier
@@ -282,6 +285,13 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/claim", s.handleClaim)
 	mux.HandleFunc("/_seal/clear", s.handleClear)
 	mux.HandleFunc("/_seal/compact", s.handleCompact)
+	mux.HandleFunc("/_seal/credentials", s.handleCredentials)
+	mux.HandleFunc("/_seal/credentials/pending", s.handleCredentialPending)
+	mux.HandleFunc("/_seal/credentials/decide", s.handleCredentialDecide)
+	mux.HandleFunc("/_seal/credentials/audit", s.handleCredentialAudit)
+	mux.HandleFunc("/_seal/credentials/login", s.handleCredentialLogin)
+	mux.HandleFunc("/_seal/credentials/disconnect", s.handleCredentialDisconnect)
+	mux.HandleFunc("/_seal/oauth/callback", s.handleOAuthCallback)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {
@@ -408,6 +418,9 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "marshal: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// The services' descriptions and examples are the agent's text: scrubbed
+	// like a service's own response, before the proof covers them.
+	body = s.scrubBytes(body)
 	w.Header().Set("Content-Type", "application/json")
 	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -446,11 +459,18 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 // On success returns the server's current unix time; on any failure it writes
 // the HTTP error response and returns ok=false, so callers just `return`.
 func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sealID, cachedOwner, wantDigest string) (int64, bool) {
+	ts, _, ok := s.verifyOwnerSigAs(w, r, tag, sealID, cachedOwner, wantDigest)
+	return ts, ok
+}
+
+// verifyOwnerSigAs is verifyOwnerSig, also returning the owner the
+// signature was checked against.
+func (s *Server) verifyOwnerSigAs(w http.ResponseWriter, r *http.Request, tag, sealID, cachedOwner, wantDigest string) (int64, string, bool) {
 	msg := r.Header.Get("X-Auth-Message")
 	sigHex := r.Header.Get("X-Auth-Signature")
 	if msg == "" || sigHex == "" {
 		http.Error(w, "missing X-Auth-Message or X-Auth-Signature", http.StatusBadRequest)
-		return 0, false
+		return 0, "", false
 	}
 
 	// Grammar:
@@ -482,12 +502,12 @@ func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sea
 			grammar = fmt.Sprintf("%q:0x<sealID>:<ts>:<sha256(body)>:<audience>", tag)
 		}
 		http.Error(w, "X-Auth-Message must be "+grammar, http.StatusBadRequest)
-		return 0, false
+		return 0, "", false
 	}
 	if wantDigest != "" {
 		if !strings.EqualFold(strings.TrimPrefix(parts[3], "0x"), wantDigest) {
 			http.Error(w, "signed body digest does not match the request body", http.StatusUnauthorized)
-			return 0, false
+			return 0, "", false
 		}
 		// Shift so the audience check below stays one expression for both
 		// grammars: audience is the last field either way.
@@ -495,31 +515,31 @@ func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sea
 	}
 	if !strings.EqualFold(parts[1], "0x"+sealID) {
 		http.Error(w, "seal_id mismatch", http.StatusUnauthorized)
-		return 0, false
+		return 0, "", false
 	}
 	ts, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil {
 		http.Error(w, "bad timestamp in X-Auth-Message", http.StatusBadRequest)
-		return 0, false
+		return 0, "", false
 	}
 	now := time.Now().Unix()
 	if ts > now+authWindowSec || ts < now-authWindowSec {
 		http.Error(w, "stale or future X-Auth-Message timestamp", http.StatusUnauthorized)
-		return 0, false
+		return 0, "", false
 	}
 	if s.publicURL != "" {
 		want := strings.TrimRight(s.publicURL, "/")
 		got := strings.TrimRight(parts[3], "/")
 		if !strings.EqualFold(got, want) {
 			http.Error(w, "audience mismatch: signature not bound to this agent's URL", http.StatusUnauthorized)
-			return 0, false
+			return 0, "", false
 		}
 	}
 
 	sigBytes, err := hex.DecodeString(strings.TrimPrefix(sigHex, "0x"))
 	if err != nil || len(sigBytes) != 65 {
 		http.Error(w, "X-Auth-Signature must be 65-byte hex", http.StatusBadRequest)
-		return 0, false
+		return 0, "", false
 	}
 	if sigBytes[64] >= 27 {
 		sigBytes[64] -= 27
@@ -529,20 +549,20 @@ func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sea
 	pub, err := crypto.SigToPub(hash, sigBytes)
 	if err != nil {
 		http.Error(w, "signature recover: "+err.Error(), http.StatusBadRequest)
-		return 0, false
+		return 0, "", false
 	}
 	owner, ok := s.resolveOwner(r.Context(), cachedOwner)
 	if !ok {
 		http.Error(w, "owner lookup unavailable, retry", http.StatusServiceUnavailable)
-		return 0, false
+		return 0, "", false
 	}
 
 	recovered := crypto.PubkeyToAddress(*pub).Hex()
 	if !strings.EqualFold(recovered, owner) {
 		http.Error(w, "signer is not the agent owner", http.StatusUnauthorized)
-		return 0, false
+		return 0, "", false
 	}
-	return now, true
+	return now, owner, true
 }
 
 // resolveOwner returns the owner to check a signature against. With a
@@ -705,7 +725,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// WS upgrades cannot be buffered + signed; hand off to httputil.
 	if isWebSocketUpgrade(r) {
-		wsReverseProxy(upstream).ServeHTTP(w, r)
+		s.wsReverseProxy(upstream).ServeHTTP(w, r)
 		return
 	}
 
@@ -726,6 +746,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if u, perr := url.Parse(upstream); perr == nil {
 		upHost = u.Host
 	}
+	s.mu.RLock()
+	scrubbing := s.scrubber != nil
+	s.mu.RUnlock()
 	for k, vs := range r.Header {
 		switch k {
 		case "Connection", "Keep-Alive", "Te", "Trailer", "Transfer-Encoding", "Upgrade", "Proxy-Authorization", "Proxy-Authenticate":
@@ -733,17 +756,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		case "Origin", "X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host", "X-Real-Ip":
 			continue
 		case "Accept-Encoding":
-			// Signed service path only. Forwarding the client's
-			// Accept-Encoding explicitly pins it: Go's Transport then skips
-			// its own negotiation AND does not decompress, so the serve-proof
-			// taskHash would cover the gzip bytes while the client (undici,
-			// browsers) hashes the plain body it transparently decompressed —
-			// every compressing backend would fail per-exchange verification.
-			// Dropping the header lets the Transport negotiate + decompress,
-			// so the hashed bytes equal the delivered bytes. Framework routes
-			// keep the client's header: their responses are never hashed, and
-			// dropping it would cost br/zstd on framework UI assets.
-			if signed {
+			// Forwarding the client's Accept-Encoding explicitly pins it:
+			// Go's Transport then skips its own negotiation AND does not
+			// decompress. On the signed service path the serve-proof taskHash
+			// would cover the gzip bytes while the client (undici, browsers)
+			// hashes the plain body it transparently decompressed — every
+			// compressing backend would fail per-exchange verification. With
+			// credentials on, the scrubber would see compressed bytes and
+			// miss a value in them. Dropping the header lets the Transport
+			// negotiate + decompress, so what is hashed and scrubbed is what
+			// is delivered. Framework routes otherwise keep the client's
+			// header: their responses are never hashed, and dropping it costs
+			// br/zstd on framework UI assets.
+			if signed || scrubbing {
 				continue
 			}
 		}
@@ -761,6 +786,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	// No credential value leaves through here, whatever the backend put in
+	// its response: headers and body are scrubbed before they are relayed,
+	// and before a serve-proof is computed, so the proof covers the bytes
+	// the caller receives.
+	s.scrubResponse(resp)
 
 	// An SSE stream can't be buffered + signed: the serve-proof signs a complete
 	// body, which a stream doesn't have until it ends. Relay it verbatim with
@@ -914,7 +944,7 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return false
 }
 
-func wsReverseProxy(upstream string) *httputil.ReverseProxy {
+func (s *Server) wsReverseProxy(upstream string) *httputil.ReverseProxy {
 	target, err := url.Parse(upstream)
 	if err != nil {
 		return &httputil.ReverseProxy{
@@ -951,7 +981,26 @@ func wsReverseProxy(upstream string) *httputil.ReverseProxy {
 			// no trailers.
 			if resp.StatusCode != http.StatusSwitchingProtocols {
 				dropAgentProof(resp.Trailer)
-				resp.Body = &trailerProofStripper{ReadCloser: resp.Body, resp: resp}
+				resp.Body = &trailerProofStripper{ReadCloser: resp.Body, resp: resp, scrub: s.scrubBytes, nameHolds: s.nameHoldsValue}
+				// Not an upgrade after all: an ordinary response, scrubbed
+				// like any other (headers set by the caller choose the path,
+				// not what comes back), trailers too. Scrubbing can change
+				// the body's length.
+				s.mu.RLock()
+				scrubbing := s.scrubber != nil
+				s.mu.RUnlock()
+				if scrubbing {
+					s.scrubResponse(resp)
+					resp.Header.Del("Content-Length")
+					resp.ContentLength = -1
+					// The Trailer announcement is built from these names
+					// after this returns.
+					for k := range resp.Trailer {
+						if s.nameHoldsValue(k) {
+							delete(resp.Trailer, k)
+						}
+					}
+				}
 			}
 			return nil
 		},
@@ -971,21 +1020,39 @@ func dropAgentProof(h http.Header) {
 // has been read to EOF (when the transport populates trailers) and on Close.
 type trailerProofStripper struct {
 	io.ReadCloser
-	resp *http.Response
+	resp      *http.Response
+	scrub     func([]byte) []byte // credential values out of trailer values; nil: none
+	nameHolds func(string) bool   // whether a trailer name holds a value
 }
 
 func (b *trailerProofStripper) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil {
-		dropAgentProof(b.resp.Trailer)
+		b.clean()
 	}
 	return n, err
 }
 
 func (b *trailerProofStripper) Close() error {
 	err := b.ReadCloser.Close()
-	dropAgentProof(b.resp.Trailer)
+	b.clean()
 	return err
+}
+
+func (b *trailerProofStripper) clean() {
+	dropAgentProof(b.resp.Trailer)
+	if b.scrub == nil {
+		return
+	}
+	for k, vs := range b.resp.Trailer {
+		if b.nameHolds != nil && b.nameHolds(k) {
+			delete(b.resp.Trailer, k)
+			continue
+		}
+		for i, v := range vs {
+			vs[i] = string(b.scrub([]byte(v)))
+		}
+	}
 }
 
 // ── Serve-proof signing ─────────────────────────────────────────────────────

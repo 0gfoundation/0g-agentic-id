@@ -84,6 +84,14 @@ type Result struct {
 	// StatusToken is this boot's status receipt: 64 lowercase hex, signed
 	// into every /status report (report.Binding).
 	StatusToken string
+	// BootID is this boot's random claim id ("0x"+64 hex), the one the
+	// attestor bound the status receipt to. Credential approvals and
+	// writebacks name it, so neither outlives the boot it was made for.
+	BootID string
+	// Credentials is the owner's credential set for this agent (a JSON
+	// credentials.Document plus the owner epoch the attestor vouches for),
+	// or nil when there is none.
+	Credentials []byte
 }
 
 // authorization is the GET /provision answer.
@@ -107,6 +115,7 @@ type provisionResponse struct {
 	EncryptedAgentSealPriv string `json:"encrypted_agent_seal_priv"`
 	EncryptedSettings      string `json:"encrypted_settings"`
 	EncryptedStatusBinding string `json:"encrypted_status_binding"`
+	EncryptedCredentials   string `json:"encrypted_credentials,omitempty"`
 }
 
 // action is what the retry loop does after an attestor answer.
@@ -384,6 +393,15 @@ func (c *claim) open(body []byte) (Result, action) {
 			logger.Logf("OK   provisioned owner settings (%d bytes)", len(pt))
 		}
 	}
+	var credentialsBlob []byte
+	if out.EncryptedCredentials != "" {
+		if pt, err := decrypt(priv, out.EncryptedCredentials); err != nil {
+			logger.Logf("warn: provision: credentials do not decrypt (booting without owner credentials)")
+		} else {
+			credentialsBlob = pt
+			logger.Logf("OK   provisioned owner credentials (%d bytes)", len(pt))
+		}
+	}
 	// Confirm size + derived address only — never log the priv bytes.
 	if pk, err := crypto.ToECDSA(agentKey); err == nil {
 		logger.Logf("OK   provisioned agent_seal_priv (%d bytes), addr=%s",
@@ -391,7 +409,8 @@ func (c *claim) open(body []byte) (Result, action) {
 	} else {
 		logger.Logf("OK   provisioned agent_seal_priv (%d bytes)", len(agentKey))
 	}
-	return Result{AgentSealPriv: agentKey, Settings: settingsBlob, StatusToken: binding.Token}, proceed
+	return Result{AgentSealPriv: agentKey, Settings: settingsBlob, StatusToken: binding.Token,
+		BootID: "0x" + hex.EncodeToString(c.bootID[:]), Credentials: credentialsBlob}, proceed
 }
 
 // decrypt opens a "0x"-prefixed hex ECIES ciphertext.

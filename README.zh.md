@@ -408,6 +408,13 @@ TEEDataVerifier（AccessProof + OwnershipProof 双签名校验）、NonceRegistr
 `attestFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 290
 个 Foundry 测试（28 个测试套件）与部署 / 升级 / Etherscan verify 全套脚本。
 
+**[`sealed/CREDENTIALS.zh.md`](sealed/CREDENTIALS.zh.md) — owner 凭据**
+
+owner 如何把 API key、token、签名密钥和 MCP 登录交给 agent，同时让它们留在
+sealed 里：agent 写占位符，sealed 在出网时只对 owner 允许的域名和位置代填，
+并把值挡在响应和上链数据之外。涵盖 owner 签名的凭据集、代理、换 token 与
+写回、签名密钥、MCP 登录、授权与通知。
+
 **[`sealed/ARCHITECTURE.zh.md`](sealed/ARCHITECTURE.zh.md) — agent 运行时**
 
 sealed 容器的内部架构。涵盖 5-phase 启动（attest → provision → chain

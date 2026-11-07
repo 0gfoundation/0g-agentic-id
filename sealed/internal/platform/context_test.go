@@ -83,3 +83,18 @@ func TestBuildRuntime_ServeProofValidatorRow(t *testing.T) {
 		t.Errorf("no-validator row missing:\n%s", unsigned)
 	}
 }
+
+// The credentials section is there exactly when the runtime started the
+// credential proxy, and names the placeholder grammar sealed matches.
+func TestCapabilities_CredentialsSectionFollowsTheSocket(t *testing.T) {
+	off := Build(RuntimeSnapshot{SealSignSock: "/s", AgentSeal: "0x01"}).Capabilities
+	if strings.Contains(off, "[[credential:") {
+		t.Fatal("credentials described while they are off")
+	}
+	on := Build(RuntimeSnapshot{SealSignSock: "/s", AgentSeal: "0x01", CredSock: "/c", CredRevealSock: "/r"}).Capabilities
+	for _, want := range []string{"[[credential:<name>]]", "[[credential:derived:<name>]]", "$SEAL_CRED_SOCKET", "$SEAL_CRED_REVEAL_SOCKET", "$SEAL_CRED_PROXY", "authorization_pending", "X-Seal-Sign", "/credentials/sign", "X-Seal-Credential-Filled"} {
+		if !strings.Contains(on, want) {
+			t.Fatalf("credentials section lacks %q", want)
+		}
+	}
+}

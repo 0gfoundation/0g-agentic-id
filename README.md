@@ -491,6 +491,15 @@ points and dependencies. Walks through the three main flows (`register`,
 validation, plus 290 Foundry tests across 28 suites and full deploy, upgrade,
 and Etherscan-verify scripts.
 
+**[`sealed/CREDENTIALS.md`](sealed/CREDENTIALS.md) — owner credentials**
+
+How an owner gives an agent API keys, tokens, signing keys and MCP logins
+that stay in sealed: the agent writes a placeholder, sealed fills the value
+in on the way out for the hosts and positions the owner allowed and keeps it
+out of responses and on-chain data. Covers the owner-signed set, the proxy,
+token requests and writebacks, signing keys, MCP login, approvals and
+notifications.
+
 **[`sealed/ARCHITECTURE.md`](sealed/ARCHITECTURE.md) — the agent runtime**
 
 The internal architecture of the sealed container. Covers the 5-phase boot

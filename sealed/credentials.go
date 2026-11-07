@@ -1,0 +1,408 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"net/http"
+	"net/url"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
+
+	"seal-verify/internal/attestorhttp"
+	"seal-verify/internal/config"
+	"seal-verify/internal/credentials"
+	"seal-verify/internal/credproxy"
+	"seal-verify/internal/framework"
+	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
+	"seal-verify/internal/provision"
+	"seal-verify/internal/proxy"
+	"seal-verify/internal/report"
+)
+
+// Where the credential proxy's pieces live in the container. The CA files
+// hold certificates only; the sockets belong to the agent user.
+const (
+	credSockPath       = "/run/seal-cred.sock"
+	credRevealSockPath = "/run/seal-cred-reveal.sock"
+	credCAPath         = "/etc/seal/credential-ca.pem"
+	credCABundlePath   = "/etc/seal/credential-ca-bundle.pem"
+	credGitConfigPath  = "/etc/seal/credential-gitconfig"
+	systemRootsPath    = "/etc/ssl/certs/ca-certificates.crt"
+	maxSystemRoots     = 4 << 20
+	ownerWatchInterval = 10 * time.Second
+	maxAuditFile       = 16 << 20
+	auditFlushInterval = 10 * time.Second
+)
+
+func credStateDir() string { return framework.StatePath("credentials") }
+
+// credentialsBoot is what /provision hands over: the signed set and the
+// owner epoch the attestor vouches for.
+type credentialsBoot struct {
+	Document   credentials.Document `json:"document"`
+	OwnerEpoch uint64               `json:"owner_epoch"`
+}
+
+// startCredentials brings up the credential store, the proxy, its CA files
+// and the two harness sockets, loads the provisioned set, and returns the
+// runtime fields that point the framework at them, and the registry whose
+// values sealed keeps out of what leaves it. Any failure leaves the agent
+// running without credentials rather than not running.
+func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSealPriv []byte, prov provision.Result, sealedProxy *proxy.Server) (framework.RuntimeContext, *credproxy.Registry) {
+	var none framework.RuntimeContext
+	if res.client == nil || res.agentID == nil || res.client.ChainID() == nil {
+		logger.Logf("credentials: off (no chain client)")
+		return none, nil
+	}
+	key, err := crypto.ToECDSA(agentSealPriv)
+	if err != nil {
+		logger.Logf("FAIL credentials: agentSeal key: %v", err)
+		return none, nil
+	}
+	client, agentID := res.client, res.agentID
+	liveOwner := func(ctx context.Context) (common.Address, error) {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return client.OwnerOf(ctx, agentID)
+	}
+	sealID := "0x" + strings.ToLower(strings.TrimPrefix(cfg.Attestation.SealID, "0x"))
+
+	reg := credproxy.NewRegistry()
+	ca, err := credproxy.NewCA()
+	if err != nil {
+		logger.Logf("FAIL credentials: CA: %v", err)
+		return none, nil
+	}
+	if err := writeCredentialFiles(ca); err != nil {
+		logger.Logf("FAIL credentials: %v", err)
+		return none, nil
+	}
+	audit := &auditSink{}
+	store := credentials.NewStore(credentials.Env{
+		Domain:        credentials.Domain{ChainID: client.ChainID().Uint64(), Contract: client.ContractAddr()},
+		SealID:        sealID,
+		AgentSeal:     crypto.PubkeyToAddress(key.PublicKey),
+		AgentSealPriv: agentSealPriv,
+		BootID:        prov.BootID,
+		LiveOwner:     liveOwner,
+		Persist:       statePersist{},
+		Audit:         audit.add,
+		Logf:          logger.Logf,
+		Writeback:     attestorWriteback(cfg.AttestorURL, sealID),
+	}, reg)
+	audit.store = store
+	// Restored once the owner is known, and only for the owner who wrote it.
+	if f, ok := loadAudit(); ok {
+		store.SeedAudit(f)
+	} else {
+		logger.Logf("warn: credentials: the persisted audit log could not be read; it is kept as it is, and this boot's records are not persisted")
+	}
+	go audit.flushLoop()
+
+	token := randomHex(32)
+	srv := credproxy.New(credproxy.Config{Registry: reg, CA: ca, Token: token, Logf: logger.Logf, OnUse: store.Record})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		logger.Logf("FAIL credentials: proxy listen: %v", err)
+		return none, nil
+	}
+	go func() { _ = srv.Serve(ln) }()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	if err := proxy.ServeAgentSocket(credSockPath, "credential", store.HarnessHandler()); err != nil {
+		logger.Logf("FAIL credentials: %v", err)
+		return none, nil
+	}
+	if err := proxy.ServeAgentSocket(credRevealSockPath, "credential reveal", store.RevealHandler()); err != nil {
+		logger.Logf("FAIL credentials: %v", err)
+		return none, nil
+	}
+	sealedProxy.SetCredentials(store)
+	sealedProxy.SetScrubber(reg)
+
+	if len(prov.Credentials) > 0 {
+		var boot credentialsBoot
+		if err := json.Unmarshal(prov.Credentials, &boot); err != nil {
+			logger.Logf("warn: credentials: provisioned set is not valid JSON")
+		} else if !loadProvisioned(store, boot, false) {
+			// The owner could not be looked up: tried again in the
+			// background, so a passing chain hiccup does not leave the agent
+			// without its credentials until the owner pushes the set again.
+			go func() {
+				for wait := 5 * time.Second; wait <= 10*time.Minute; wait *= 2 {
+					time.Sleep(wait)
+					if loadProvisioned(store, boot, true) {
+						return
+					}
+				}
+				logger.Logf("warn: credentials: the provisioned set could not be loaded; the owner can push it again")
+			}()
+		}
+	}
+	go watchOwner(store)
+	report.SetCredentialsPending(store.PendingCount)
+	go reportPendingChanges(cfg, agentSealPriv, store)
+	logger.Logf("OK   credential proxy listening on 127.0.0.1:%d", port)
+	explicit := fmt.Sprintf("http://127.0.0.1:%d/%s", port, token)
+	return framework.RuntimeContext{
+		CredHold:       credHold(store, explicit),
+		CredProxy:      explicit,
+		CredHTTPSProxy: fmt.Sprintf("http://agent:%s@127.0.0.1:%d", token, port),
+		CredCAFile:     credCAPath,
+		CredCABundle:   credCABundlePath,
+		CredSock:       credSockPath,
+		CredRevealSock: credRevealSockPath,
+		CredGitConfig:  credGitConfigPath,
+	}, reg
+}
+
+// loadProvisioned loads the set /provision handed over. It reports false
+// only when the owner could not be looked up, which is worth trying again;
+// a set that does not check out is refused for good.
+func loadProvisioned(store *credentials.Store, boot credentialsBoot, retry bool) bool {
+	opened, err := store.Load(context.Background(), boot.Document, boot.OwnerEpoch)
+	switch {
+	case errors.Is(err, credentials.ErrOwnerLookup):
+		logger.Logf("warn: credentials: the owner could not be looked up; loading the provisioned set again shortly")
+		return false
+	case retry && errors.Is(err, credentials.ErrStale):
+		// The owner pushed a newer set meanwhile: nothing left to load.
+	case err != nil:
+		// The reason may name entries: the owner reads it, the public log does not.
+		logger.Logf("warn: credentials: provisioned set refused (the owner's audit log says why)")
+		store.Note("load", "", "set refused: "+err.Error())
+	default:
+		logger.Logf("OK   credentials: set v%d loaded, %d entries, %d skipped", opened.Set.Version, len(opened.Values), len(opened.Skipped))
+	}
+	return true
+}
+
+// credHold is RuntimeContext.CredHold: it keeps a value sealed supplies to
+// the framework (its inference key) as the entry "sealed:<name>", filled in
+// only in the given headers on baseURL's host, and returns baseURL reached
+// through the proxy's explicit form, with the placeholder that stands for
+// the value.
+func credHold(store *credentials.Store, explicit string) func(name, baseURL string, headers map[string]string, value []byte) (string, string, error) {
+	return func(name, baseURL string, headers map[string]string, value []byte) (string, string, error) {
+		u, err := url.Parse(baseURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.RawQuery != "" {
+			return "", "", fmt.Errorf("credentials: %q is not an https base URL", baseURL)
+		}
+		e := &credproxy.Entry{Name: "sealed:" + name, Hosts: []string{u.Host}, Use: credproxy.UseInject, Value: value}
+		for header, template := range headers {
+			e.Positions = append(e.Positions, credproxy.Position{Kind: credproxy.PosHeader, Name: header, Template: template})
+		}
+		if err := store.HoldSystem(e); errors.Is(err, credentials.ErrOwnerChanged) {
+			return "", "", fmt.Errorf("%w (%v)", framework.ErrCredHoldRefused, err)
+		} else if err != nil {
+			return "", "", err
+		}
+		return explicit + "/https/" + u.Host + strings.TrimSuffix(u.EscapedPath(), "/"), credproxy.Placeholder(e.Name), nil
+	}
+}
+
+// writeCredentialFiles writes the proxy root alone and after the image's
+// system roots (certificates; the key never leaves memory), and git's config
+// naming the credential helper.
+func writeCredentialFiles(ca *credproxy.CA) error {
+	system, err := privsep.ReadFile(systemRootsPath, maxSystemRoots)
+	if err != nil {
+		return fmt.Errorf("read system roots: %w", err)
+	}
+	if err := privsep.MkdirAll(filepath.Dir(credCAPath), 0o755); err != nil {
+		return fmt.Errorf("CA directory: %w", err)
+	}
+	if err := privsep.WriteFile(credCAPath, ca.CertPEM(), 0o644); err != nil {
+		return fmt.Errorf("write CA: %w", err)
+	}
+	if err := privsep.WriteFile(credCABundlePath, ca.Bundle(system), 0o644); err != nil {
+		return fmt.Errorf("write CA bundle: %w", err)
+	}
+	if err := privsep.WriteFile(credGitConfigPath, framework.GitConfig(), 0o644); err != nil {
+		return fmt.Errorf("write git config: %w", err)
+	}
+	return nil
+}
+
+// watchOwner looks the agent's owner up now and every ownerWatchInterval;
+// the store clears every credential when it changes (the previous owner's
+// keys must not serve the new one). A failed lookup changes nothing; the
+// next one tries again. Reveals, token requests, wallet signatures and
+// logins confirm the owner themselves before they go ahead.
+func watchOwner(store *credentials.Store) {
+	for {
+		_ = store.RefreshOwner(context.Background())
+		time.Sleep(ownerWatchInterval)
+	}
+}
+
+// reportPendingChanges sends a status report as soon as a request starts
+// waiting for the owner (or is decided), instead of at the next heartbeat,
+// so the owner's cross-agent view is current within seconds.
+func reportPendingChanges(cfg *config.Bootstrap, agentSealPriv []byte, store *credentials.Store) {
+	var after uint64
+	for {
+		events := store.Events(context.Background(), after, time.Minute)
+		changed := false
+		for _, e := range events {
+			after = e.Seq
+			if e.Type == "pending_opened" || e.Type == "pending_decided" || e.Type == "cleared" {
+				changed = true
+			}
+		}
+		if changed {
+			level, msg := currentStatus.Get()
+			report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, msg, cfg.StatusBinding)
+		}
+	}
+}
+
+// statePersist keeps the newest loaded set's (owner epoch, version, digest) in
+// sealed's root-only state directory, which survives stop/start.
+type statePersist struct{}
+
+func (statePersist) path() string { return filepath.Join(credStateDir(), "highest-version") }
+
+func (p statePersist) LoadHighest() (credentials.Mark, error) {
+	b, err := privsep.ReadFile(p.path(), 512)
+	if errors.Is(err, fs.ErrNotExist) {
+		return credentials.Mark{}, nil
+	}
+	if err != nil {
+		return credentials.Mark{}, err
+	}
+	var m credentials.Mark
+	if json.Unmarshal(b, &m) == nil {
+		return m, nil
+	}
+	// Written as a bare version before epochs were kept.
+	v, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
+	return credentials.Mark{Version: v}, err
+}
+
+func (p statePersist) SaveHighest(m credentials.Mark) error {
+	if err := privsep.MkdirAll(credStateDir(), 0o700); err != nil {
+		return err
+	}
+	b, _ := json.Marshal(m)
+	return privsep.WriteFile(p.path(), b, 0o600)
+}
+
+// auditSink persists the store's audit records in the state directory,
+// batched so a busy proxy does not rewrite the file per request.
+type auditSink struct {
+	mu    sync.Mutex
+	dirty bool
+	store *credentials.Store
+}
+
+func auditPath() string { return filepath.Join(credStateDir(), "audit.json") }
+
+func (a *auditSink) add(credentials.AuditRecord) {
+	a.mu.Lock()
+	a.dirty = true
+	a.mu.Unlock()
+}
+
+func (a *auditSink) flushLoop() {
+	for range time.Tick(auditFlushInterval) {
+		a.mu.Lock()
+		dirty := a.dirty
+		a.dirty = false
+		a.mu.Unlock()
+		if !dirty || a.store == nil {
+			continue
+		}
+		// Not before the records an earlier boot persisted are decided.
+		f, ok := a.store.AuditSnapshot()
+		if !ok {
+			a.add(credentials.AuditRecord{})
+			continue
+		}
+		b, err := json.Marshal(f)
+		if err == nil {
+			if err = privsep.MkdirAll(credStateDir(), 0o700); err == nil {
+				err = privsep.WriteFile(auditPath(), b, 0o600)
+			}
+		}
+		if err != nil {
+			logger.Logf("warn: credentials: audit flush: %v", err)
+		}
+	}
+}
+
+// loadAudit reads what an earlier boot persisted (nil: nothing). A file
+// written before the owner was kept is not restored: whose it is cannot be
+// told. ok is false when a file is there but cannot be read or understood:
+// it is left as it is, and this boot does not write over it.
+func loadAudit() (f *credentials.AuditFile, ok bool) {
+	b, err := privsep.ReadFile(auditPath(), maxAuditFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, true
+	}
+	if err != nil {
+		return nil, false
+	}
+	var af credentials.AuditFile
+	if json.Unmarshal(b, &af) == nil && af.Owner != (common.Address{}) {
+		return &af, true
+	}
+	var unowned []credentials.AuditRecord
+	if json.Unmarshal(b, &unowned) == nil {
+		return nil, true
+	}
+	return nil, false
+}
+
+// attestorWriteback posts a value sealed obtained (a rotated refresh token,
+// a login) to the attestor, which keeps it for the next boot.
+func attestorWriteback(attestorURL, sealID string) func(context.Context, string, credentials.Writeback) error {
+	if attestorURL == "" {
+		return nil
+	}
+	return func(ctx context.Context, name string, wb credentials.Writeback) error {
+		client, err := attestorhttp.Client(attestorURL)
+		if err != nil {
+			return err
+		}
+		body, _ := json.Marshal(map[string]any{"seal_id": sealID, "name": name, "writeback": wb})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, attestorURL+"/credentials/writeback", bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("attestor writeback: HTTP %d: %s", resp.StatusCode, attestorhttp.Excerpt(out))
+		}
+		return nil
+	}
+}
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b)
+}

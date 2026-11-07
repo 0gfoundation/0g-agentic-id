@@ -12,6 +12,7 @@ mod attestor_tls;
 mod avatar;
 mod clone;
 mod config;
+pub(crate) mod credentials;
 mod deploy;
 mod deployment;
 mod deployments;
@@ -103,6 +104,22 @@ pub fn router(state: AppState) -> Router {
             get(settings::handle_get).post(settings::handle),
         )
         .route("/settings/seed", post(settings::handle_seed))
+        // Owner credential sets for sealed's credential proxy: owner-signed
+        // reads and writes, container writebacks signed by agentSeal, and
+        // the owner's cross-agent pending counts.
+        .route(
+            "/credentials",
+            get(credentials::handle_get).post(credentials::handle_post),
+        )
+        .route(
+            "/credentials/writeback",
+            post(credentials::handle_writeback),
+        )
+        .route("/credentials/pending", get(credentials::handle_pending))
+        .route(
+            "/credentials/notify",
+            get(credentials::handle_notify_get).post(credentials::handle_notify_post),
+        )
         .route("/start", post(start::handle))
         .route("/stop", post(stop::handle))
         .route("/retry", post(retry::handle))

@@ -96,6 +96,64 @@ export function recordSecretEnvPin(attestorUrl: string, env: NodeJS.ProcessEnv =
   }
 }
 
+type CredentialMark = { epoch: number; version: number; digest?: string };
+
+/** Where the newest credential set seen per agent is kept. */
+export function credentialMarksPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(configPaths(env).dir, 'credential-marks.json');
+}
+
+/**
+ * The newest credential set (ownership epoch, version, digest) this machine
+ * has seen per agent, so an older one, or another at the same version, that
+ * an attestor serves again is refused rather than signed anew
+ * (Credentials.get). Not secret: one small file, 0644. A file that does not
+ * parse reads as empty.
+ */
+export function loadCredentialMarks(env: NodeJS.ProcessEnv = process.env): Record<string, CredentialMark> {
+  const file = credentialMarksPath(env);
+  if (!existsSync(file)) return {};
+  try {
+    const all = JSON.parse(readFileSync(file, 'utf8')) as unknown;
+    if (!all || typeof all !== 'object' || Array.isArray(all)) return {};
+    const out: Record<string, CredentialMark> = {};
+    for (const [k, m] of Object.entries(all as Record<string, unknown>)) {
+      const c = m as CredentialMark;
+      if (c && Number.isSafeInteger(c.epoch) && Number.isSafeInteger(c.version)) {
+        out[k] = { epoch: c.epoch, version: c.version, ...(typeof c.digest === 'string' ? { digest: c.digest } : {}) };
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Record a newer credential set for `key`, unless the file already holds a
+ * newer one for it (another run may have written meanwhile). Written to a
+ * temporary file and renamed, so a reader never sees half of it; two runs
+ * writing at the same moment can still lose one's record, which that run
+ * keeps in memory. Best-effort, as recordSecretEnvPin.
+ */
+export function recordCredentialMark(key: string, mark: CredentialMark, env: NodeJS.ProcessEnv = process.env): void {
+  try {
+    const { dir } = configPaths(env);
+    mkdirSync(dir, { recursive: true });
+    const marks = loadCredentialMarks(env);
+    const had = marks[key];
+    const later = !had || had.epoch < mark.epoch || (had.epoch === mark.epoch && (had.version < mark.version || (had.version === mark.version && !had.digest)));
+    if (!later) return;
+    marks[key] = { epoch: mark.epoch, version: mark.version, ...(mark.digest ? { digest: mark.digest } : {}) };
+    const file = credentialMarksPath(env);
+    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(marks, null, 2)}\n`, { mode: 0o644 });
+    renameSync(tmp, file);
+  } catch {
+    /* best-effort */
+  }
+}
+
 /** Merge a patch into config.json (creating the dir), 0644. */
 export function saveConfig(patch: FileConfig, env: NodeJS.ProcessEnv = process.env): void {
   const { dir, config } = configPaths(env);
