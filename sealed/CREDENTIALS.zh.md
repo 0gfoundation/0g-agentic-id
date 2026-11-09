@@ -47,6 +47,7 @@ Entry(string name,bytes32 defHash)
 
 - **版本号**：每次写入为 `version + 1`，在 attestor 处做比较并交换。sealed 按（所有权纪元，版本号）连同凭据集的 digest 记住加载过的最新凭据集（存在状态目录，stop/start 后保留），拒绝更旧的，也拒绝同一（所有权纪元，版本号）下的另一个凭据集；新 owner 的第一个凭据集比前任 owner 的所有凭据集都新。
 - **所有权纪元**：agent 最近一次转让所在的区块号。为更早纪元签名的凭据集在各处都被拒绝，前任 owner 的凭据集无法被恢复。转让时 attestor 删除凭据集，sealed 清空所有条目、待办、授权和使用记录，以及它保管的框架推理 key。sealed 每 10 秒查一次链上 owner；交出、换 token、钱包签名、登录之前，如果距上次确认 owner 已超过 10 秒，会先再查一次（查询失败则拒绝）；新 owner 的凭据集或决定，先清掉前任 owner 的状态再处理。状态被清空时，或 owner 给条目设了新值时，仍在进行的换 token、刷新、登录的结果一概不保留。
+- **容器只为启动时的 owner 服务**：一旦链上显示 owner 变了（sealed 每 10 秒查一次，每个 owner 签名的请求也会查），除 `/hello`、`/healthz` 和公开的 `/log` 之外的路由都返回 423 `owner_changed`，agent 的签名 socket 拒绝签名，agent 的状态也不再写回链上。前任 owner 和新 owner 都不能再操作这个容器；新 owner 通过 reset 运行这个 agent。如果 agent 回到容器启动时的 owner，锁会解开。
 - **逐条检查**：定义与签名 hash 不符、值与 `value_hash` 不符、或者代理无法使用的条目会被跳过并给出原因，其余条目照常加载。
 - **owner 客户端**：每次修改都会重新签名整个凭据集，所以 SDK 只在存储的凭据集由当前钱包为这个 agent 按存储的版本号签名、每个定义和存储的值都与签名一致、并且不比这个客户端见过的最新凭据集旧、也不是同一版本下的另一个凭据集（先比所有权纪元，再比版本号，并比对凭据集的 digest；CLI 把它记在配置目录的 `credential-marks.json` 里，所以同一台机器上跨次运行也成立）时才使用它；否则什么都不签（`CredentialsUnverifiedError`）。所有权纪元由 attestor 提供：编造一个更晚的纪元会让真实的凭据集显得更旧，这时报错会说明要删除哪条记录（CLI 会给出文件路径）。
 
@@ -197,5 +198,5 @@ SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-
 - **reset 之后的回滚。** sealed 在 stop/start 后拒绝更低的凭据集版本，但 reset 或新建 sandbox 之后，依赖 attestor 提供最新的凭据集。删除密钥时，也要在服务商那边吊销。
 - **所有权纪元来自 attestor。** owner 客户端按 attestor 报告的纪元签名凭据集，sealed 接收推送的凭据集时不检查纪元。编造的更晚纪元一旦被签名并加载，真实的凭据集就会显得更旧：在 agent 上直到 reset，在 owner 的机器上直到删除那条记录。
 - **其他通道。** 非 HTTP 协议和浏览器登录态需要交出值；响应遮盖是尽力而为。
-- **转让后前任 owner 的容器。** 转让后几秒内 sealed 就清空所有凭据，但容器会一直运行到 attestor 将其拆除，在此之前新 owner 可以访问它的框架路由。前任 owner 交给 agent 的值，这时可能仍在 agent 的内存或文件里。
+- **交给 agent 的东西会随 agent 转让。** 前任 owner 交给 agent 的值，以及 agent 写进记忆或文件的内容，可能已在提交上链的 agent 状态里，转让时随 agent 一起交给新 owner。
 - **框架自己的流量。** 框架的环境变量里也有 `HTTPS_PROXY`。没有条目的域名原样转发通道，但代理拒绝连接私网地址，所以 HTTP 客户端遵循 `HTTPS_PROXY` 的框架，连不上私网地址上的模型（或其他服务）。

@@ -115,6 +115,10 @@ type Server struct {
 	// seat is the single active owner client (see occupancy.go).
 	seat occupantSeat
 
+	// lock closes the container once the agent belongs to another owner
+	// (ownerlock.go).
+	lock ownerLock
+
 	// liveOwner reads the CURRENT on-chain owner. Late-bound like adapter:
 	// the chain client only exists after Phase 2. See verifyOwnerSig for why
 	// the cached owner is not good enough.
@@ -296,7 +300,7 @@ func (s *Server) Listen() {
 
 	go func() {
 		fmt.Println("Listening on :8080  GET /healthz | /log | /log/agent (owner-only) | /hello (signed) | /_seal/auth (owner-only) | /* (agent proxy)")
-		_ = http.ListenAndServe(":8080", corsMiddleware(mux))
+		_ = http.ListenAndServe(":8080", corsMiddleware(s.ownerGate(mux)))
 	}()
 }
 
@@ -554,6 +558,14 @@ func (s *Server) verifyOwnerSigAs(w http.ResponseWriter, r *http.Request, tag, s
 	owner, ok := s.resolveOwner(r.Context(), cachedOwner)
 	if !ok {
 		http.Error(w, "owner lookup unavailable, retry", http.StatusServiceUnavailable)
+		return 0, "", false
+	}
+	// The agent belongs to someone else now: this container serves neither
+	// owner (ownerlock.go). The owner cached at bootstrap is the one it was
+	// started for.
+	s.SetBootOwner(cachedOwner)
+	if locked, _ := s.ObserveOwner(owner); locked {
+		writeOwnerLocked(w)
 		return 0, "", false
 	}
 

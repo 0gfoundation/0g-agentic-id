@@ -1116,11 +1116,14 @@ work.**
   achieved by clearing the container binding on transfer + Layer-2 teardown (a
   resumed old container can't skip the `/provision` freshness re-check); no explicit
   `ownerOf` check in `/provision` was needed.
-- **#5** [sealed] fail-safe ownership heartbeat (self-kill) — **done (goal), by a
-  different mechanism:** the attestor's indexer detects the transfer and enqueues
-  `SandboxTeardown` (`watcher.rs:on_transfer` → worker `admin_delete`). The
-  sealed-side self-kill heartbeat is redundant defense-in-depth, deferred to a TEE
-  full node.
+- **#5** [sealed] fail-safe ownership heartbeat (self-kill) — **done:** the
+  attestor's indexer detects the transfer and enqueues `SandboxTeardown`
+  (`watcher.rs:on_transfer` → worker `admin_delete`), and sealed closes the
+  container itself once the chain names another owner (it asks every 10 seconds):
+  every route but `/hello`, `/healthz` and the public `/log` answers 423, the
+  agent's signing socket refuses, and no state is written back
+  (`sealed/internal/proxy/ownerlock.go`). The owner sealed reads comes from its
+  RPC; a TEE full node would remove that trust.
 - **#7** [security/kms] KMS threshold derivation (removes the single-point
   universal-decryptor) — **done:** 0g-kms#1 (threshold-BLS DPRF; the master
   exists only as cluster shares) + agentic-id#38 (attestor derives each

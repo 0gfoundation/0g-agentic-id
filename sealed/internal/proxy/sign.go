@@ -110,7 +110,9 @@ func (s *Server) ListenInternal(sockPath string) {
 
 	go func() {
 		logger.Logf("OK   sign socket listening at unix://%s (%s)", sockPath, strings.Join(paths, " | "))
-		_ = http.Serve(l, mux)
+		// The agent signs as itself only while it belongs to the owner the
+		// container was started for (ownerlock.go).
+		_ = http.Serve(l, s.ownerGate(mux))
 	}()
 }
 

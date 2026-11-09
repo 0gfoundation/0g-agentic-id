@@ -48,12 +48,18 @@ type runtimeStatus struct {
 	// It shows like pinned, after it, until a settings push applies.
 	settingsIssue     string
 	supervisorFailure string
+	// ownerChanged is set while the agent belongs to an owner other than the
+	// one this container was started for: the container no longer serves it.
+	ownerChanged string
 }
 
 var currentStatus = &runtimeStatus{level: "running"}
 
 // effective is what a /status report should declare. Caller holds mu.
 func (s *runtimeStatus) effective() (string, string) {
+	if s.ownerChanged != "" {
+		return "error", s.ownerChanged
+	}
 	if s.supervisorFailure != "" {
 		return "error", s.supervisorFailure
 	}
@@ -92,6 +98,16 @@ func (s *runtimeStatus) Pin(message string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pinned = message
+}
+
+// OwnerChanged sets (or, with "", clears) the owner-change error described
+// on runtimeStatus and returns the previous effective level.
+func (s *runtimeStatus) OwnerChanged(message string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, _ := s.effective()
+	s.ownerChanged = message
+	return prev
 }
 
 // SettingsIssue sets (or, with "", clears) the settings warning described

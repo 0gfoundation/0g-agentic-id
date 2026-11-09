@@ -295,6 +295,20 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 			}
 			return owner.Hex(), nil
 		})
+		// The container serves the owner it was started for; once the agent
+		// belongs to someone else it stops (proxy/ownerlock.go), and the
+		// attestor is told.
+		sealedProxy.SetBootOwner(res.owner)
+		go sealedProxy.WatchOwner(context.Background(), ownerWatchInterval, func(locked bool) {
+			msg := ""
+			if locked {
+				msg = "the agent now belongs to another owner: this container no longer serves it; reset the agent to run it"
+			}
+			if prev := currentStatus.OwnerChanged(msg); locked || prev != "running" {
+				level, m := currentStatus.Get()
+				report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, m, cfg.StatusBinding)
+			}
+		})
 	}
 
 	// The credential proxy and store come up before the framework, so the
@@ -1058,6 +1072,11 @@ func startAgent(
 	watchCtx := context.Background()
 	go watcher.New(idata, agent, watcher.Config{
 		OnDrift: func(plaintexts map[string][]byte, drifted []string) {
+			// An agent that belongs to another owner now is not written to
+			// from this container.
+			if sealedProxy.OwnerLocked() {
+				return
+			}
 			handleDrift(watchCtx, plaintexts, drifted, adapter, agent, mgr, upload,
 				cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, cfg.StatusBinding)
 		},
