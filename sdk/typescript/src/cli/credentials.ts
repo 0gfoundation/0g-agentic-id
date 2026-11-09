@@ -590,8 +590,10 @@ export function renderAudit(recs: AuditRecord[]): string[] {
 export interface CredIO {
   /** `--json`: emit one envelope instead of lines. */
   json: boolean;
-  /** Wait for a connection to complete before returning (the one-shot command does; the REPL does not block). */
+  /** Wait for a connection to complete before returning, and say so. */
   wait?: boolean;
+  /** Stops that wait, not the login (the session's Ctrl-C or Esc). */
+  signal?: AbortSignal;
   out(line: string): void;
   /** Read a value without echoing it. */
   secret(prompt: string): Promise<string>;
@@ -798,9 +800,17 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
         io.out(`When you have finished in the browser, \`cred <agent>\` lists ${name}; the agent uses [[credential:${name}]] as its bearer token for ${host}.`);
         return;
       }
-      io.out('waiting for the connection to complete (Ctrl-C stops waiting, not the login)…');
+      io.out(`waiting for the connection to complete (${io.signal ? 'Ctrl-C or Esc' : 'Ctrl-C'} stops waiting, not the login)…`);
       for (const deadline = Date.now() + 10 * 60_000; Date.now() < deadline; ) {
-        await new Promise((r) => setTimeout(r, 3000));
+        await new Promise<void>((r) => {
+          if (io.signal?.aborted) return r();
+          const t = setTimeout(r, 3000);
+          io.signal?.addEventListener('abort', () => { clearTimeout(t); r(); }, { once: true });
+        });
+        if (io.signal?.aborted) {
+          io.out(`stopped waiting; the login goes on in the browser, and cred <agent> shows ${name} connected once it is done`);
+          return;
+        }
         const now = (await cred.loaded(sealId, { agentUrl: base }).catch(() => undefined))?.entries.find((e) => e.name === name);
         if (now?.logged_in_at && now.logged_in_at !== before?.logged_in_at) {
           io.out(`connected: the agent uses [[credential:${name}]] as its bearer token for ${host}`);

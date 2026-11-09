@@ -1514,7 +1514,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (await credOwnerOp(ag, args, credIO(ask))) continue;
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
-        await credOp(ag, row.sealId, args.slice(1), credIO(ask), row.phase === 'running' && row.url ? row.url : undefined);
+        await credInShell(irq, args[1] === 'connect', (io) => credOp(ag, row.sealId, args.slice(1), { ...credIO(ask), ...io }, row.phase === 'running' && row.url ? row.url : undefined));
         continue;
       }
 
@@ -2083,6 +2083,22 @@ async function withWallet(ctx: CommandContext): Promise<AgenticID> {
     });
   }
   return clientFor(ctx, true);
+}
+
+/**
+ * Runs a `cred` operation in the shell. A connect waits for the login to
+ * complete and says so, as the one-shot command does; Ctrl-C or Esc stops
+ * the wait (the login goes on in the browser).
+ */
+async function credInShell(irq: Interrupt, connect: boolean, run: (io: { wait?: boolean; signal?: AbortSignal }) => Promise<void>): Promise<void> {
+  if (!connect) return run({});
+  const ac = new AbortController();
+  irq.streaming = ac;
+  try {
+    await run({ wait: true, signal: ac.signal });
+  } finally {
+    irq.streaming = null;
+  }
 }
 
 /** How credOp talks inside the REPL: lines out, values through askSecret. */
@@ -2828,7 +2844,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/cred' || line.startsWith('/cred ')) {
-        await credOp(await withWallet(ctx), s.sealId, tokenize(line).slice(1), credIO(ask), s.client && s.url ? s.url : undefined);
+        const args = tokenize(line).slice(1);
+        const ag = await withWallet(ctx);
+        await credInShell(irq, args[0] === 'connect', (io) => credOp(ag, s.sealId, args, { ...credIO(ask), ...io }, s.client && s.url ? s.url : undefined));
         continue;
       }
       if (line === '/think' || line.startsWith('/think ')) {

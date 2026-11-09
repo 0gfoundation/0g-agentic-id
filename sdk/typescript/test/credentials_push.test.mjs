@@ -135,3 +135,34 @@ test('cli: connect without a name shows the connect usage', async () => {
   await assert.rejects(credOp({ credentials: {} }, SEAL_ID, ['connect'], { json: false, out: () => {}, secret: async () => '' }),
     (e) => e.code === 'BAD_FLAG' && /missing <name>/.test(e.message) && /^cred <agent> connect <name>/.test(e.remedy) && !/ set /.test(e.remedy));
 });
+
+// In the shell, connect waits for the login and says when it is done, as the
+// one-shot command does; Ctrl-C or Esc (the signal) stops the wait at once.
+function connectAgent(loggedInAfter) {
+  const linear = { v: 1, name: 'linear', hosts: ['mcp.linear.app'], positions: [{ kind: 'header', name: 'Authorization', template: 'Bearer {v}' }],
+    use: 'inject', value_hash: '', writeback: true, description: 'MCP server https://mcp.linear.app/mcp', mcp: { url: 'https://mcp.linear.app/mcp' } };
+  let calls = 0;
+  return { credentials: {
+    get: async () => ({ version: 19, ownerEpoch: 0, document: null, definitions: [linear] }),
+    agentUrl: async () => 'https://agent.example',
+    connect: async () => ({ authorizeUrl: 'https://mcp.linear.app/authorize?state=s' }),
+    loaded: async () => ({ version: 19, entries: [{ name: 'linear', ...(++calls > loggedInAfter ? { logged_in_at: 1794220000 } : {}) }] }),
+  } };
+}
+
+test('shell: connect waits for the login and says it is connected', async () => {
+  const lines = [];
+  await credOp(connectAgent(1), SEAL_ID, ['connect', 'linear'], { json: false, wait: true, signal: new AbortController().signal, out: (l) => lines.push(l), secret: async () => '' }, 'https://agent.example');
+  assert.match(lines.at(-1), /^connected: the agent uses \[\[credential:linear\]\] as its bearer token for mcp\.linear\.app$/);
+  assert.ok(lines.some((l) => /Ctrl-C or Esc stops waiting, not the login/.test(l)), lines.join('\n'));
+});
+
+test('shell: Ctrl-C or Esc stops waiting for the login at once', async () => {
+  const lines = [];
+  const ac = new AbortController();
+  const t0 = Date.now();
+  const done = credOp(connectAgent(Infinity), SEAL_ID, ['connect', 'linear'], { json: false, wait: true, signal: ac.signal, out: (l) => { lines.push(l); if (/waiting for the connection/.test(l)) ac.abort(); }, secret: async () => '' }, 'https://agent.example');
+  await done;
+  assert.ok(Date.now() - t0 < 2000, 'returned at once');
+  assert.match(lines.at(-1), /^stopped waiting; the login goes on in the browser/);
+});
