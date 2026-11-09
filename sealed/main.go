@@ -296,18 +296,14 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 			return owner.Hex(), nil
 		})
 		// The container serves the owner it was started for; once the agent
-		// belongs to someone else it stops (proxy/ownerlock.go), and the
-		// attestor is told.
+		// belongs to someone else it closes for good (proxy/ownerlock.go).
+		// Its status says so; after a transfer the attestor no longer takes
+		// this container's reports, so this is for the container's own log.
 		sealedProxy.SetBootOwner(res.owner)
-		go sealedProxy.WatchOwner(context.Background(), ownerWatchInterval, func(locked bool) {
-			msg := ""
-			if locked {
-				msg = "the agent now belongs to another owner: this container no longer serves it; reset the agent to run it"
-			}
-			if prev := currentStatus.OwnerChanged(msg); locked || prev != "running" {
-				level, m := currentStatus.Get()
-				report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, m, cfg.StatusBinding)
-			}
+		go sealedProxy.WatchOwner(context.Background(), ownerWatchInterval, func() {
+			currentStatus.OwnerChanged("the agent now belongs to another owner: this container no longer serves it; reset the agent to run it")
+			level, m := currentStatus.Get()
+			report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, m, cfg.StatusBinding)
 		})
 	}
 
@@ -842,6 +838,13 @@ func startAgent(
 	if err != nil {
 		return fmt.Errorf("init uploader: %w", err)
 	}
+	// An upload under way when the agent changes owner is not committed.
+	upload.SetCommitGate(func() error {
+		if sealedProxy.OwnerLocked() {
+			return errors.New("the agent now belongs to another owner; not committed")
+		}
+		return nil
+	})
 
 	// Phase 1 seed: capture post-Restore + post-HandleLegacy disk state
 	// into currentSnapshot so /hello can report non-empty dataHashes

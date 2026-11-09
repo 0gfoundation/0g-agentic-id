@@ -62,11 +62,12 @@ func TestTransferLocksTheContainer(t *testing.T) {
 		}
 	}
 
-	// Back with the owner the container was started for.
-	if locked, changed := s.ObserveOwner(owner); locked || !changed {
+	// The agent coming back does not open it: another container may be
+	// writing its state by then.
+	if locked, changed := s.ObserveOwner(owner); !locked || changed {
 		t.Fatalf("after a transfer back: locked %v, changed %v", locked, changed)
 	}
-	if code := gated(s, "/v1/chat/completions"); code != http.StatusOK {
+	if code := gated(s, "/v1/chat/completions"); code != http.StatusLocked {
 		t.Fatalf("after a transfer back: HTTP %d", code)
 	}
 }
@@ -86,31 +87,36 @@ func TestBootOwnerFromFirstAnswer(t *testing.T) {
 	}
 }
 
-// The watcher reports each change once, also one an owner route found first.
-func TestWatchOwnerReportsChanges(t *testing.T) {
+// The watcher reports the closing once, also when an owner route found it
+// first, and stops.
+func TestWatchOwnerReportsTheClosing(t *testing.T) {
 	_, owner := mustKey(t)
 	_, buyer := mustKey(t)
-	s, _ := credServer(t, owner)
+	s, f := credServer(t, owner)
 	chain := &chainOwner{owner: owner}
 	s.SetLiveOwner(chain.get)
 	s.SetBootOwner(owner)
-	changes := make(chan bool, 8)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.WatchOwner(ctx, 5*time.Millisecond, func(locked bool) { changes <- locked })
+	closed := make(chan struct{}, 4)
+	done := make(chan struct{})
+	go func() {
+		s.WatchOwner(context.Background(), 5*time.Millisecond, func() { closed <- struct{}{} })
+		close(done)
+	}()
 
 	chain.set(buyer)
 	s.ObserveOwner(buyer) // an owner route saw it first
-	if got := <-changes; !got {
-		t.Fatal("the lock was not reported")
-	}
-	chain.set(owner)
-	if got := <-changes; got {
-		t.Fatal("the opening was not reported")
-	}
+	<-closed
 	select {
-	case extra := <-changes:
-		t.Fatalf("reported again: %v", extra)
-	case <-time.After(50 * time.Millisecond):
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("the watcher kept running after the container closed")
+	}
+	if len(closed) != 0 {
+		t.Fatal("the closing was reported twice")
+	}
+	// The credential store was told the new owner, so it clears the
+	// previous owner's state at once.
+	if len(f.observed) == 0 || !strings.EqualFold(f.observed[len(f.observed)-1].Hex(), buyer) {
+		t.Fatalf("the store was told %v", f.observed)
 	}
 }

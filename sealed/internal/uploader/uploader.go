@@ -113,7 +113,15 @@ type Uploader struct {
 	// are belt-and-braces).
 	locksMu   sync.Mutex
 	roleLocks map[string]*sync.Mutex
+
+	// commitGate, when set, is asked right before the update transaction:
+	// an error stops the commit (the agent no longer belongs to the owner
+	// this container was started for, say). Set before the watcher starts.
+	commitGate func() error
 }
+
+// SetCommitGate installs commitGate. Call it before the first Apply.
+func (u *Uploader) SetCommitGate(f func() error) { u.commitGate = f }
 
 // New constructs a production Uploader wired to a concrete chain.Client
 // and the dataplane storage backend. Returns an error if

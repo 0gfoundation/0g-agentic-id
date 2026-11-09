@@ -595,8 +595,10 @@ func (s *Server) resolveOwner(ctx context.Context, cached string) (string, bool)
 		logger.Logf("proxy: live owner lookup failed: %v", err)
 		return "", false
 	}
-	if owner == "" {
-		logger.Logf("proxy: live owner lookup returned empty")
+	// No owner (or the zero address, which no minted agent has) is a lookup
+	// that failed, not an answer.
+	if owner == "" || common.HexToAddress(owner) == (common.Address{}) {
+		logger.Logf("proxy: live owner lookup returned no owner")
 		return "", false
 	}
 	return owner, true

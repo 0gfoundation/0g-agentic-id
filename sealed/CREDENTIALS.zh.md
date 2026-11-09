@@ -46,8 +46,8 @@ Entry(string name,bytes32 defHash)
 同一个 digest 在 sealed（`TestDigestVectors`）、attestor 和 SDK 中用同一组向量固定。
 
 - **版本号**：每次写入为 `version + 1`，在 attestor 处做比较并交换。sealed 按（所有权纪元，版本号）连同凭据集的 digest 记住加载过的最新凭据集（存在状态目录，stop/start 后保留），拒绝更旧的，也拒绝同一（所有权纪元，版本号）下的另一个凭据集；新 owner 的第一个凭据集比前任 owner 的所有凭据集都新。
-- **所有权纪元**：agent 最近一次转让所在的区块号。为更早纪元签名的凭据集在各处都被拒绝，前任 owner 的凭据集无法被恢复。转让时 attestor 删除凭据集，sealed 清空所有条目、待办、授权和使用记录，以及它保管的框架推理 key。sealed 每 10 秒查一次链上 owner；交出、换 token、钱包签名、登录之前，如果距上次确认 owner 已超过 10 秒，会先再查一次（查询失败则拒绝）；新 owner 的凭据集或决定，先清掉前任 owner 的状态再处理。状态被清空时，或 owner 给条目设了新值时，仍在进行的换 token、刷新、登录的结果一概不保留。
-- **容器只为启动时的 owner 服务**：一旦链上显示 owner 变了（sealed 每 10 秒查一次，每个 owner 签名的请求也会查），除 `/hello`、`/healthz` 和公开的 `/log` 之外的路由都返回 423 `owner_changed`，agent 的签名 socket 拒绝签名，agent 的状态也不再写回链上。前任 owner 和新 owner 都不能再操作这个容器；新 owner 通过 reset 运行这个 agent。如果 agent 回到容器启动时的 owner，锁会解开。
+- **所有权纪元**：agent 最近一次转让所在的区块号。为更早纪元签名的凭据集在各处都被拒绝，前任 owner 的凭据集无法被恢复。转让时 attestor 删除凭据集，sealed 清空所有条目、待办、授权和使用记录，以及它保管的框架推理 key。sealed 每 10 秒查一次链上 owner；交出、换 token、钱包签名、登录之前，如果距上次确认 owner 已超过 10 秒，会先再查一次（查询失败则拒绝）；一旦发现 owner 变了，sealed 就清掉前任 owner 的状态，容器随之关闭（见下一条）。状态被清空时，或 owner 给条目设了新值时，仍在进行的换 token、刷新、登录的结果一概不保留。
+- **容器只为启动时的 owner 服务**：一旦链上显示 owner 变了（sealed 每 10 秒查一次，每个 owner 签名的请求也会查；查不到结果或返回零地址都不算 owner），容器就永久关闭。进行中的请求被终止，包括流式输出和已升级的连接；除 `/hello`、`/healthz` 和公开的 `/log`、`/log.html` 之外的路由都返回 423 `owner_changed`；agent 的签名 socket 拒绝签名；状态不再写回链上，正在进行的上传也不提交。框架进程继续运行，但没有凭据，也没有推理 key。前任 owner 和新 owner 都不能再操作这个容器，即使 agent 转回原 owner 也不会重新打开；owner 通过 reset 运行这个 agent。
 - **逐条检查**：定义与签名 hash 不符、值与 `value_hash` 不符、或者代理无法使用的条目会被跳过并给出原因，其余条目照常加载。
 - **owner 客户端**：每次修改都会重新签名整个凭据集，所以 SDK 只在存储的凭据集由当前钱包为这个 agent 按存储的版本号签名、每个定义和存储的值都与签名一致、并且不比这个客户端见过的最新凭据集旧、也不是同一版本下的另一个凭据集（先比所有权纪元，再比版本号，并比对凭据集的 digest；CLI 把它记在配置目录的 `credential-marks.json` 里，所以同一台机器上跨次运行也成立）时才使用它；否则什么都不签（`CredentialsUnverifiedError`）。所有权纪元由 attestor 提供：编造一个更晚的纪元会让真实的凭据集显得更旧，这时报错会说明要删除哪条记录（CLI 会给出文件路径）。
 

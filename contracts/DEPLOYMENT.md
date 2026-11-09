@@ -1119,11 +1119,11 @@ work.**
 - **#5** [sealed] fail-safe ownership heartbeat (self-kill) — **done:** the
   attestor's indexer detects the transfer and enqueues `SandboxTeardown`
   (`watcher.rs:on_transfer` → worker `admin_delete`), and sealed closes the
-  container itself once the chain names another owner (it asks every 10 seconds):
-  every route but `/hello`, `/healthz` and the public `/log` answers 423, the
-  agent's signing socket refuses, and no state is written back
-  (`sealed/internal/proxy/ownerlock.go`). The owner sealed reads comes from its
-  RPC; a TEE full node would remove that trust.
+  container itself, for good, once the chain names another owner (it asks every
+  10 seconds): requests in flight end, every route but `/hello`, `/healthz`,
+  `/log` and `/log.html` answers 423, the agent's signing socket refuses, and no
+  state is written back (`sealed/internal/proxy/ownerlock.go`). The owner sealed
+  reads comes from its RPC; a TEE full node would remove that trust.
 - **#7** [security/kms] KMS threshold derivation (removes the single-point
   universal-decryptor) — **done:** 0g-kms#1 (threshold-BLS DPRF; the master
   exists only as cluster shares) + agentic-id#38 (attestor derives each

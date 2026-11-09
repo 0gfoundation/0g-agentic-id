@@ -175,6 +175,11 @@ func (u *Uploader) Apply(ctx context.Context, plaintexts map[string][]byte) erro
 		return nil
 	}
 
+	if u.commitGate != nil {
+		if err := u.commitGate(); err != nil {
+			return fmt.Errorf("uploader.Apply: %w", err)
+		}
+	}
 	logger.Logf("uploader.Apply: submitting wholesale update tx (%d entries, %d state changes)",
 		len(newEntries), len(outcomes))
 	if _, err = u.chain.Update(ctx, u.tokenID, newEntries, newSealedKeys, u.agentSealPriv); err != nil {
