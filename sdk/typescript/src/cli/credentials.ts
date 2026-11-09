@@ -188,9 +188,11 @@ export function renderPresets(): string[] {
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
 const FORBIDDEN_HEADERS = new Set(['host', 'content-length', 'transfer-encoding', 'cookie']);
 
-function usage(message: string): CliError {
-  return new CliError('BAD_FLAG', message, { remedy: SET_USAGE });
+function usage(message: string, remedy = SET_USAGE): CliError {
+  return new CliError('BAD_FLAG', message, { remedy });
 }
+
+const CONNECT_USAGE = 'cred <agent> connect <name> [<mcp-url>] [client_id=… client_secret_entry=… scope=a,b]   (a connection already defined: just its name)';
 
 function yesNo(key: string, raw: string): boolean {
   if (/^(yes|on|true|1)$/i.test(raw)) return true;
@@ -406,10 +408,10 @@ function oauth2Template(name: string, o: NonNullable<CredPatch['oauth2']>): { us
   };
 }
 
-/** Check a name against the placeholder grammar sealed enforces. */
-export function checkCredName(name: string | undefined): string {
+/** Check a name against the placeholder grammar sealed enforces; remedy is the usage shown when it fails. */
+export function checkCredName(name: string | undefined, remedy = SET_USAGE): string {
   if (!name || !NAME_RE.test(name)) {
-    throw usage(name ? `not a credential name: "${name}" (lowercase letters, digits, . _ -; up to 63)` : 'missing <name>');
+    throw usage(name ? `not a credential name: "${name}" (lowercase letters, digits, . _ -; up to 63)` : 'missing <name>', remedy);
   }
   return name;
 }
@@ -744,7 +746,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       return;
     }
     case 'connect': {
-      const name = checkCredName(rest[0]);
+      const name = checkCredName(rest[0], CONNECT_USAGE);
       const cur = await cred.get(sealId);
       const stored = cur.definitions.find((d) => d.name === name);
       // An existing connection is connected again as it is defined: with no
@@ -764,7 +766,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       for (const arg of rest.slice(2)) {
         const [k, v = ''] = arg.split(/=(.*)/s);
         if (k === 'client_id' && v) mcp.client_id = v;
-        else if (k === 'client_secret_entry' && v) mcp.client_secret_entry = checkCredName(v);
+        else if (k === 'client_secret_entry' && v) mcp.client_secret_entry = checkCredName(v, CONNECT_USAGE);
         else if (k === 'scope' && v) mcp.scopes = v.split(',').map((x) => x.trim()).filter(Boolean);
         else throw new CliError('BAD_FLAG', `unknown connect option "${arg}"`, { remedy: 'client_id=… client_secret_entry=<entry> scope=a,b' });
       }

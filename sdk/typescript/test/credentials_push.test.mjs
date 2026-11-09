@@ -129,3 +129,9 @@ test('disconnect: an overtaken disconnect says what was and was not revoked', as
     s.server.close();
   }
 });
+
+// `connect` without a name shows how to connect, not how to set.
+test('cli: connect without a name shows the connect usage', async () => {
+  await assert.rejects(credOp({ credentials: {} }, SEAL_ID, ['connect'], { json: false, out: () => {}, secret: async () => '' }),
+    (e) => e.code === 'BAD_FLAG' && /missing <name>/.test(e.message) && /^cred <agent> connect <name>/.test(e.remedy) && !/ set /.test(e.remedy));
+});
