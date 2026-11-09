@@ -2086,6 +2086,18 @@ async function withWallet(ctx: CommandContext): Promise<AgenticID> {
 }
 
 /**
+ * Where the session sends the agent's owner routes (credentials, settings):
+ * the URL the attestor has for the agent now. The agent may be on a new
+ * sandbox since this session connected (a reset from elsewhere), and the URL
+ * the session holds then reaches nothing. The held one is used when the
+ * attestor cannot say; none when the agent is not running here.
+ */
+export async function ownerRouteUrl(ag: AgenticID, s: Session): Promise<string | undefined> {
+  if (!s.client || !s.url) return undefined;
+  return ag.credentials.agentUrl(s.sealId).catch(() => s.url);
+}
+
+/**
  * Runs a `cred` operation in the shell. A connect waits for the login to
  * complete and says so, as the one-shot command does; Ctrl-C or Esc stops
  * the wait (the login goes on in the browser).
@@ -2623,8 +2635,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       const ac = new AbortController();
       irq.streaming = ac; // Esc stops waiting for a login
       try {
-        const tell = await answerPending(await withWallet(ctx), s.sealId, { ...credIO(ask), ask: (ask as Ask).fresh ?? ask }, {
-          agentUrl: s.url, later: credLater, tokenize, signal: ac.signal,
+        const ag = await withWallet(ctx);
+        const tell = await answerPending(ag, s.sealId, { ...credIO(ask), ask: (ask as Ask).fresh ?? ask }, {
+          agentUrl: await ownerRouteUrl(ag, s), later: credLater, tokenize, signal: ac.signal,
         });
         if (tell.length) queued.push(tell.join('\n'));
       } catch (e) {
@@ -2840,13 +2853,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // with, and how hard. Bare shows it; key=value writes it (merged).
         // Owner-signed in both directions, so it needs the wallet client and
         // not the session's (possibly keyless) one.
-        await settingsOp(await withWallet(ctx), s.sealId, tokenize(line).slice(1), s.client && s.url ? s.url : undefined, s.framework);
+        const ag = await withWallet(ctx);
+        await settingsOp(ag, s.sealId, tokenize(line).slice(1), await ownerRouteUrl(ag, s), s.framework);
         continue;
       }
       if (line === '/cred' || line.startsWith('/cred ')) {
         const args = tokenize(line).slice(1);
         const ag = await withWallet(ctx);
-        await credInShell(irq, args[0] === 'connect', (io) => credOp(ag, s.sealId, args, { ...credIO(ask), ...io }, s.client && s.url ? s.url : undefined));
+        const url = await ownerRouteUrl(ag, s);
+        await credInShell(irq, args[0] === 'connect', (io) => credOp(ag, s.sealId, args, { ...credIO(ask), ...io }, url));
         continue;
       }
       if (line === '/think' || line.startsWith('/think ')) {
@@ -2864,7 +2879,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         }
         if (!(THINKING_LEVELS as readonly string[]).includes(arg)) { out(`usage: /think ${THINKING_LEVELS.join('|')}\n`); continue; }
         if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
-        const written = await settingsOp(ag, s.sealId, [`thinking=${arg}`], s.client && s.url ? s.url : undefined);
+        const written = await settingsOp(ag, s.sealId, [`thinking=${arg}`], await ownerRouteUrl(ag, s));
         // Only mirror it into this session once the write actually landed —
         // a refused or conflicted write must not leave the per-message
         // override claiming a level the agent was never given.

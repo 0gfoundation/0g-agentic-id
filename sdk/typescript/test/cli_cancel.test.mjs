@@ -65,3 +65,16 @@ test('cancel: a cancelled credential question leaves it and the rest for later',
   assert.equal(lines.filter((l) => /read github\?|left for later/.test(l)).length, 1, lines.join('\n'));
   assert.match(lines.at(-1), /left for later/);
 });
+
+// The session sends owner routes to the agent's current URL: after a reset
+// from elsewhere the URL it connected to reaches a sandbox that is gone.
+import { ownerRouteUrl } from '../dist/cli/commands/interactive.js';
+
+test('session: owner routes go to the URL the attestor has now', async () => {
+  const s = { sealId: '0x' + '0f'.repeat(32), client: {}, url: 'https://8080-old.sandbox.example' };
+  const moved = { credentials: { agentUrl: async () => 'https://8080-new.sandbox.example' } };
+  assert.equal(await ownerRouteUrl(moved, s), 'https://8080-new.sandbox.example');
+  const silent = { credentials: { agentUrl: async () => { throw new Error('attestor down'); } } };
+  assert.equal(await ownerRouteUrl(silent, s), 'https://8080-old.sandbox.example');
+  assert.equal(await ownerRouteUrl(moved, { ...s, client: undefined }), undefined);
+});
