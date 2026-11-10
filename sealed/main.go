@@ -5,7 +5,7 @@
 //	                         provider signer (the anchor of the attestor TLS
 //	                         statement, internal/attestorhttp)
 //	Phase 1  provision       GET + POST /provision, retried with backoff up to
-//	                         10 minutes after PID-1 start -> ECIES-decrypt
+//	                         10 minutes after sealed starts -> ECIES-decrypt
 //	                         agent_seal_priv
 //	Phase 2  chain bootstrap getAgentIdBySealId + intelligentDatasOf +
 //	                         loadSealedKeys + per-entry download + AES-GCM decrypt
@@ -15,6 +15,10 @@
 // Long-running:
 //   - HTTP server on :8080 (proxy package)
 //   - manager monitors agent process exit and clears shared state
+//
+// sealed is PID 1, except in the 0g-harness image, where the loader
+// (cmd/loader) checks it and runs it as its child; only there does sealed
+// handle a stop signal (shutdown.go).
 package main
 
 import (
@@ -25,8 +29,11 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -138,7 +145,15 @@ func main() {
 	// connection and before its first log line, which is what first reads
 	// the time zone: nothing may log before this call.
 	privsep.Harden()
-	// Provisioning gives up a fixed time after this PID-1 start.
+	// Under the loader (cmd/loader) sealed is not PID 1, and a stop signal
+	// gets a graceful stop: the agent is stopped and pending iData committed
+	// before sealed exits (shutdown.go). As PID 1 nothing changes.
+	if os.Getpid() != 1 {
+		stopSigs := make(chan os.Signal, 2)
+		signal.Notify(stopSigs, syscall.SIGTERM, syscall.SIGINT)
+		go handleStopSignals(stopSigs, &sealedStop, stopBudget, logger.Flush, os.Exit)
+	}
+	// Provisioning gives up a fixed time after this start.
 	started := time.Now()
 
 	// Shared agent state -- read by proxy, written by main + manager.
@@ -1073,7 +1088,7 @@ func startAgent(
 	// then asks the uploader to push the entire post-reconcile state in
 	// one wholesale chain.Update via upload.Apply.
 	watchCtx := context.Background()
-	go watcher.New(idata, agent, watcher.Config{
+	w := watcher.New(idata, agent, watcher.Config{
 		OnDrift: func(plaintexts map[string][]byte, drifted []string) {
 			// An agent that belongs to another owner now is not written to
 			// from this container.
@@ -1083,7 +1098,13 @@ func startAgent(
 			handleDrift(watchCtx, plaintexts, drifted, adapter, agent, mgr, upload,
 				cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, cfg.StatusBinding)
 		},
-	}).Run(watchCtx)
+	})
+	go w.Run(watchCtx)
+	// A stop (shutdown.go) commits what the agent changed since the last
+	// tick before sealed exits.
+	sealedStop.add(func(ctx context.Context) {
+		stopAgentAndCommit(ctx, w, mgr, upload, sealedProxy.OwnerLocked)
+	})
 
 	// Heartbeat: report.Status("running") on a slow ticker so the attestor
 	// can tell a healthy sandbox from one whose process is alive but stuck.

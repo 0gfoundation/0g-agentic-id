@@ -3,7 +3,7 @@
 // receive back an ECIES-encrypted agent_seal_priv that only this container
 // can unlock.
 //
-// One PID-1 boot is one claim, under one random boot_id:
+// One sealed boot is one claim, under one random boot_id:
 //
 //	GET  /provision?seal_id=0x<seal>  → {"generation", "certificate_required"}
 //	POST /provision                   → the claim, signed with the container key
@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	// retryWindow is how long after PID-1 start provisioning keeps trying.
+	// retryWindow is how long after sealed starts provisioning keeps trying.
 	retryWindow = 10 * time.Minute
 	// firstBackoff doubles after every retry, up to maxBackoff.
 	firstBackoff = time.Second
@@ -51,7 +51,7 @@ var clock = struct {
 	sleep func(time.Duration)
 }{time.Now, time.Sleep}
 
-// Boot is what one PID-1 boot hands Phase 1.
+// Boot is what one sealed boot hands Phase 1.
 type Boot struct {
 	AttestorURL string
 	// SealKey is SANDBOX_SEAL_KEY, the container private key.
@@ -63,7 +63,7 @@ type Boot struct {
 	CertificateJSON json.RawMessage
 	// Ticket is SEAL_BOOT_TICKET.
 	Ticket string
-	// Started is PID-1 start; provisioning gives up retryWindow after it.
+	// Started is when sealed started; provisioning gives up retryWindow after it.
 	Started time.Time
 }
 
@@ -157,7 +157,7 @@ type claim struct {
 }
 
 // FromAttestor runs Phase 1 and returns the decrypted payload. Transient
-// failures are retried with backoff until retryWindow after PID-1 start; an
+// failures are retried with backoff until retryWindow after sealed started; an
 // answer that needs a reset (400, 401, 403 without a newer generation) or a
 // response that does not decrypt ends it. On failure AgentSealPriv is nil and
 // the reason is in /log. A settings blob that fails to decrypt is logged and

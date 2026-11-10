@@ -95,6 +95,8 @@ var allowedDirectCalls = map[string]struct {
 	"internal/logger/logger.go Flush os.OpenFile":             {1, "LogPath in the root-only state directory, opened O_NOFOLLOW"},
 	"internal/proxy/sign.go Server.ListenInternal net.Listen": {1, "the sign socket is created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link"},
 	"internal/proxy/agentsock.go ServeAgentSocket net.Listen": {1, "the credential sockets are created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link (as for the sign socket)"},
+	"cmd/loader/supervise.go verifyFile os.Open":              {1, "hashes /bootstrap, a root-only image file, before sealed or any agent process exists; the loader links only the standard library and x/sys (its TestLinkedPackages), so not privsep"},
+	"cmd/loader/supervise.go supervisor.run exec.Command":     {1, "starts /bootstrap, the root-only image file verifyFile just matched against the hash built into the loader, before any agent process exists"},
 }
 
 // rootCommands is everything root executes: the functions that may call

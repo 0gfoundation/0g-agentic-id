@@ -80,7 +80,7 @@ gate     privsep          privsep.Required: framework will run as the `agent` us
 Phase 1  provision        GET /provision (generation, certificate_required) →
                           POST /provision: the boot claim signed with the container key,
                           plus the certificate only when required; retried with backoff
-                          (1 s doubling to 30 s) until 10 min after PID-1 start →
+                          (1 s doubling to 30 s) until 10 min after sealed starts →
                           ECIES-decrypt, with the one container key, the payloads the
                           response carries:
                             · agent_seal_priv                (fatal if absent)
@@ -145,6 +145,29 @@ version promotion share one database transaction (`routes/status.rs`,
 sealed never sends one. This sealed requires the matching provider and
 attestor (v3 certificate, attestor TLS statement, the `/provision` shape
 above); every agent is recreated onto it.
+
+### The loader (0g-harness image) and graceful stop
+
+In the 0g-harness image PID 1 is not sealed but the loader (`cmd/loader`).
+It checks `/bootstrap` against the sha256 compiled into it when the image is
+built (`-X main.expectedSealedHash`, `images/harness/Dockerfile`) and runs
+nothing else. It starts sealed as its child with the environment unchanged,
+forwards SIGTERM, SIGINT, SIGQUIT and SIGHUP, kills sealed if it has not
+exited 2 min after a stop signal, reaps every orphan, and exits with sealed's
+status, so a sealed exit still ends the container. Like sealed it is root,
+non-dumpable and sets `no_new_privs`, and it links only the standard library
+and `golang.org/x/sys` (`TestLinkedPackages`). The other images keep sealed as
+PID 1.
+
+A sealed that is not PID 1 handles SIGTERM and SIGINT (`shutdown.go`): it
+stops the watcher and waits for its tick in progress, stops the framework,
+runs one last tick and commits any drift (`watcher.Final`, `uploader.Apply`),
+then exits 0, all within 90 s. Without that, a stop loses the agent's edits,
+made after the last commit, to what is already on chain (the persona, a skill
+already committed): the next boot writes the chain version back over them. A
+file the agent added survives on disk and is committed after the restart. A
+platform stop timeout shorter than 90 s still cuts the commit short. As PID 1 sealed installs no handler, and the kernel ignores the signal,
+as before.
 
 ### Why the settings document comes down `/provision`
 

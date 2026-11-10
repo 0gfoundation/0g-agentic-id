@@ -1227,8 +1227,13 @@ func handoverProtected() []string {
 	if exe, err := os.Executable(); err == nil {
 		out = addPath(out, exe)
 	}
-	return out
+	return addPath(out, loaderPath)
 }
+
+// loaderPath is the loader that runs sealed in the layered 0g-harness image
+// (cmd/loader): PID 1 there, and root like sealed. Images without a loader
+// have no such file, and the entry then matches nothing that exists.
+const loaderPath = "/loader"
 
 // protectedTools are the commands sealed runs by name, as root
 // (RootCommand) or as the agent (AgentCommand, Sweep).

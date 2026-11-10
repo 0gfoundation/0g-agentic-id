@@ -7,8 +7,8 @@
 #
 # Contents beyond debian-slim: node, ca-certificates (chain RPC + 0G storage +
 # router TLS), git and procps (the adapter's orphan sweep), 0g-harness with its
-# locked DSH dependency tree, the sealed bootstrap binary, and
-# 0g-storage-client.
+# locked DSH dependency tree, the sealed bootstrap binary, the loader that runs
+# it (cmd/loader), and 0g-storage-client.
 #
 # The composition is authored in the harness's code, installed here at build
 # time — NOT in a cordis.yml / profile / bundle the agent can reach — so it
@@ -41,14 +41,20 @@ RUN V=$(go list -m -f '{{.Version}}' github.com/0gfoundation/0g-storage-client) 
  && test -z "$(go list -m -f '{{if .Replace}}replaced{{end}}' github.com/0gfoundation/0g-storage-client)" \
  && CGO_ENABLED=0 GOBIN=/out go install -ldflags="-s -w" "github.com/0gfoundation/0g-storage-client@$V"
 
-# Stage 2 — sealed bootstrap binary.
+# Stage 2 — sealed bootstrap binary, and the loader that verifies and runs it.
+# The loader is built with the sealed binary's sha256 compiled in, so it runs
+# exactly this bootstrap and nothing else (sealed/LAYERS.md, base layer).
 FROM golang:1.24-alpine AS bootstrap-builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
 COPY internal/ ./internal/
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap .
+COPY cmd/ ./cmd/
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap . \
+ && H="$(sha256sum bootstrap | cut -d' ' -f1)" \
+ && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.expectedSealedHash=$H" -o loader ./cmd/loader \
+ && echo "loader pinned to bootstrap sha256 $H"
 
 # Stage 3 — runtime.
 FROM debian:13-slim
@@ -129,6 +135,7 @@ RUN apt-get update \
 
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
 COPY --from=bootstrap-builder /app/bootstrap /bootstrap
+COPY --from=bootstrap-builder /app/loader /loader
 
 # sealed resolves every command it runs by name — as root (RootCommand) and
 # as the agent (AgentCommand, Sweep) alike — only through PATH directories
@@ -149,9 +156,11 @@ RUN for c in npm node pkill 0g-storage-client; do \
       done; \
     done
 
-# Bootstrap runs as PID 1 and spawns the harness once it has restored the
+# The loader runs as PID 1: it checks /bootstrap against the hash built into
+# it, runs sealed as its child, forwards stop signals, reaps orphans, and exits
+# with sealed's status. sealed spawns the harness once it has restored the
 # agent's iData. ENTRYPOINT is REQUIRED on a standalone (non-0g-sandbox-base)
 # image — without it the container boots a shell, never runs sealed, and fails
 # as a provision timeout.
-ENTRYPOINT ["/bootstrap"]
+ENTRYPOINT ["/loader"]
 EXPOSE 8080

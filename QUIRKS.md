@@ -228,7 +228,8 @@ deliberate:
   when the receipt wait failed before that (a reverted submission, a failed receipt
   query), the function has already filled that slot and returned, so the goroutine
   blocks for good (`contract/contract.go:276` at the pinned version), keeping some
-  tens of kilobytes. The CLI exited after every upload; sealed is PID 1, retries a
+  tens of kilobytes. The CLI exited after every upload; sealed runs for the
+  container's life (as PID 1, or under the loader in the 0g-harness image), retries a
   failed upload on every drift tick, and the SDK makes up to three submissions per
   upload. `dataplane.Upload` therefore caps the SDK's live submit goroutines at 64:
   it refuses an upload over 2 MiB that could take them past that (`admitUpload`),
@@ -246,8 +247,9 @@ deliberate:
   (`runBounded`; a fatal log there is turned into a panic first), and the SDK
   recovers none in the goroutines it starts (its non-test sources at the pinned
   version contain no `recover()`). A panic in one of those goroutines (a fatal log
-  there included), or memory exhausted during an upload, therefore ends sealed
-  (PID 1), and with it the container and the agent. This is the trade accepted to
+  there included), or memory exhausted during an upload, therefore ends sealed,
+  and with it the container and the agent (in the 0g-harness image the loader exits
+  with sealed). This is the trade accepted to
   keep the key in one process.
 
 ### 0g-sandbox billing rejects random keys

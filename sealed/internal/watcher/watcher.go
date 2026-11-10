@@ -68,6 +68,9 @@ type Watcher struct {
 
 	stopCh chan struct{}
 	once   sync.Once
+	// doneCh closes when Run returns, after any tick in progress has
+	// finished, OnDrift included.
+	doneCh chan struct{}
 
 	// lastErr is the EvolutionFor error last logged per role. A role can
 	// fail the same way on every tick for as long as its cause lasts (a
@@ -85,13 +88,15 @@ func New(adapter framework.Framework, agent *state.Agent, cfg Config) *Watcher {
 		agent:   agent,
 		cfg:     cfg,
 		stopCh:  make(chan struct{}),
+		doneCh:  make(chan struct{}),
 		lastErr: map[string]string{},
 	}
 }
 
 // Run blocks until ctx is cancelled or Stop is called. Spawn it in a
-// goroutine; main.go does this once after the agent is up.
+// goroutine; main.go does this once after the agent is up. Call it once.
 func (w *Watcher) Run(ctx context.Context) {
+	defer close(w.doneCh)
 	logger.Logf("watcher: started (interval=%s, dims=%v)", w.cfg.Interval, w.dimsToPoll())
 	ticker := time.NewTicker(w.cfg.Interval)
 	defer ticker.Stop()
@@ -106,13 +111,28 @@ func (w *Watcher) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-		w.tick(ctx)
+		w.tick(ctx, w.cfg.OnDrift)
 	}
 }
 
-// Stop signals Run to exit. Idempotent.
+// Stop signals Run to exit. Idempotent. A tick already in progress runs to
+// its end; Done reports when Run has returned.
 func (w *Watcher) Stop() {
 	w.once.Do(func() { close(w.stopCh) })
+}
+
+// Done is closed once Run has returned.
+func (w *Watcher) Done() <-chan struct{} {
+	return w.doneCh
+}
+
+// Final runs one more tick now, after Run has stopped, and hands any drift
+// to onDrift instead of the configured OnDrift. sealed's shutdown uses it to
+// commit what changed since the last tick, without the framework reconcile
+// the regular handler may do (that would restart the framework it has just
+// stopped).
+func (w *Watcher) Final(ctx context.Context, onDrift func(plaintexts map[string][]byte, drifted []string)) {
+	w.tick(ctx, onDrift)
 }
 
 // dimsToPoll returns the role names this watcher should poll on every
@@ -135,7 +155,7 @@ func (w *Watcher) dimsToPoll() []string {
 // chainSnapshot.
 //
 // One summary log line per tick — drift roles marked with `!`.
-func (w *Watcher) tick(ctx context.Context) {
+func (w *Watcher) tick(ctx context.Context, onDrift func(plaintexts map[string][]byte, drifted []string)) {
 	type dimResult struct {
 		dim     string
 		hash    string
@@ -186,8 +206,8 @@ func (w *Watcher) tick(ctx context.Context) {
 
 	// Single dispatch after logging so the summary always lands even if
 	// the callback panics.
-	if w.cfg.OnDrift != nil && len(driftedRoles) > 0 {
-		w.cfg.OnDrift(plaintexts, driftedRoles)
+	if onDrift != nil && len(driftedRoles) > 0 {
+		onDrift(plaintexts, driftedRoles)
 	}
 }
 

@@ -68,7 +68,7 @@ gate     privsep          privsep.Required：框架将以 `agent` 用户运行�
                           ↓
 Phase 1  provision        GET /provision（generation、certificate_required）→
                           POST /provision：用容器密钥签名的 boot claim，仅在需要时
-                          附带证书；以退避（1 秒起翻倍到 30 秒）重试，直到 PID 1
+                          附带证书；以退避（1 秒起翻倍到 30 秒）重试，直到 sealed
                           启动后 10 分钟 → 用同一把容器密钥 ECIES 解出响应里的载荷：
                             · agent_seal_priv            （缺了是致命的）
                             · 本次启动的 status 凭据      （缺了是致命的）
@@ -122,6 +122,23 @@ ECIES 加密给容器，状态、心跳和版本确认在同一数据库事务�
 `repo.rs::apply_status_report`）。不带凭据的报告会被拒绝，sealed 也从不发送。本版
 sealed 要求配套的 provider 和 attestor（v3 证书、attestor TLS 声明、上面的
 `/provision` 形状）；所有 agent 都要重建到它上面。
+
+### 加载器（0g-harness 镜像）和优雅退出
+
+0g-harness 镜像里的 PID 1 不是 sealed，而是加载器（`cmd/loader`）。它用编镜像时编进去的
+sha256（`-X main.expectedSealedHash`，`images/harness/Dockerfile`）核对 `/bootstrap`，
+别的什么都不运行。它把 sealed 作为子进程启动，环境变量原样传下去；转发 SIGTERM、SIGINT、
+SIGQUIT 和 SIGHUP；收到停止信号后 sealed 2 分钟内没退出就杀掉；回收所有孤儿进程；sealed
+退出时用同样的状态退出，所以 sealed 退出照旧会结束容器。它和 sealed 一样是 root、不可
+dump、设置 `no_new_privs`，只链接标准库和 `golang.org/x/sys`（`TestLinkedPackages`）。
+其他镜像里 sealed 仍是 PID 1。
+
+不是 PID 1 的 sealed 会处理 SIGTERM 和 SIGINT（`shutdown.go`）：停下监视器并等它正在
+跑的一轮结束，停掉框架，再跑最后一轮并提交改动（`watcher.Final`、`uploader.Apply`），
+然后以 0 退出，总共不超过 90 秒。没有这一步，停容器会丢掉最后一次提交之后 agent 对链上
+已有内容（人设、已提交的技能）的修改：下次启动会用链上版本把它们覆盖回去。agent 新加的文件
+留在磁盘上，重启后照样提交。平台的停止超时短于 90 秒时，提交仍会被打断。
+作为 PID 1 时 sealed 不装处理函数，内核照旧忽略这些信号。
 
 ### settings document 为什么走 `/provision`
 

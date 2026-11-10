@@ -603,7 +603,7 @@ fences the old generation before resetting settings attempts, so delayed
 requests cannot consume the new boot's retry. Before the new sandbox ID is
 persisted, provisioning returns 409; sealed re-reads the authorization and
 retries, signing each attempt afresh under one boot ID, with backoff from 1 s
-doubling to 30 s, until 10 minutes after its PID-1 start. Creation/ID
+doubling to 30 s, until 10 minutes after sealed starts. Creation/ID
 persistence failures revoke the ticket and clean up the new container. Transfer
 cleanup targets the captured old sandbox ID and preserves a newer owner's
 authorized container.
