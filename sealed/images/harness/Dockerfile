@@ -112,7 +112,7 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
 # binary: the installed 0g-harness version is the version whitelist.go records
 # in every 0g-harness agent's chain-tracked framework role (its last entry,
 # whitelistMax). A mismatch fails the build, not a boot.
-ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/2a5ffb38ccac7e5590463cf98fa3e6fb52a526bd
+ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/087affcac42a3bcad2d05fe5ab1ba089167f4b61
 COPY internal/framework/harness/whitelist.go /tmp/harness-whitelist.go
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ \
