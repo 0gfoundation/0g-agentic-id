@@ -24,6 +24,7 @@ import { modelsForProvider, type InferenceProvider } from './Providers';
  * ```
  */
 
+import { plainText } from './AgentClient';
 import type { Address, Hash, TransactionReceipt, WriteContractReturnType } from 'viem';
 import { encodeFunctionData } from 'viem';
 import { RECEIPT_WAIT, ZERO_G_TESTNET, ZERO_G_MAINNET } from './constants';
@@ -31,6 +32,7 @@ import { AgenticIDClient, type IntelligentDataResult } from './AgenticIDClient';
 import { ReputationClient } from './ReputationClient';
 import { SandboxClient } from './SandboxClient';
 import { AttestorClient, type CloneParams, type DeployParams, type DeployCloneResponse } from './AttestorClient';
+import { CredentialsApi } from './Credentials';
 import { sha256Hex, type SettingsDoc } from './Settings';
 import type { SecretEnvMode } from './secretEnv';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader, type TaskExchange } from './ServeSession';
@@ -578,7 +580,7 @@ export class AgentApi {
       },
       body,
     });
-    if (!r.ok) throw new Error(`pushSettingsToContainer: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`pushSettingsToContainer: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json().catch(() => ({}))) as { note?: string };
   }
 
@@ -604,7 +606,7 @@ export class AgentApi {
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature, 'content-type': 'application/json' },
       body,
     });
-    if (!r.ok) throw new Error(`claimAgent: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`claimAgent: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json().catch(() => ({}))) as { displaced?: boolean };
   }
 
@@ -636,7 +638,7 @@ export class AgentApi {
       },
       body,
     });
-    if (!r.ok) throw new Error(`clearConversation: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`clearConversation: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json().catch(() => ({}))) as { note?: string };
   }
 
@@ -678,7 +680,7 @@ export class AgentApi {
       },
       body,
     });
-    if (!r.ok) throw new Error(`compactConversation: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`compactConversation: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json().catch(() => ({}))) as { note?: string };
   }
 
@@ -689,7 +691,7 @@ export class AgentApi {
       method: 'POST',
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
-    if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${plainText(await r.text())}`);
     return ((await r.json()) as { token: string }).token;
   }
 
@@ -1298,6 +1300,8 @@ export class AgenticID {
   readonly agent: AgentApi;
   readonly admin: AdminApi;
   readonly reputation: ReputationApi;
+  /** Owner credentials served by the agent's sealed credential proxy. */
+  readonly credentials: CredentialsApi;
   private readonly infra: SandboxClient;
   /** Long-lived so its instance caches (/config: provider address, sandbox
    *  endpoint) are paid once per session, not per call. */
@@ -1312,6 +1316,7 @@ export class AgenticID {
     this.infra = new SandboxClient(ctx);
     this.attestor = new AttestorClient(ctx, initialConfig);
     this.admin = new AdminApi(this.attestor);
+    this.credentials = new CredentialsApi(ctx, this.attestor);
   }
 
   /**

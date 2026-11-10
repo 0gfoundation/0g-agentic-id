@@ -1083,7 +1083,10 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let expires_at = chrono::Utc::now().timestamp() + 1;
+        // At least a second ahead, so the create is sent before the lease
+        // ends even with other tests running alongside; the server answers
+        // only after it.
+        let expires_at = chrono::Utc::now().timestamp() + 2;
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = vec![0u8; 4096];

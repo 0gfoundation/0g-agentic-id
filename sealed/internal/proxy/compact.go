@@ -104,7 +104,9 @@ func (s *Server) admitSynthTurn() (*synthRecord, bool) {
 	if s.compact.running {
 		return nil, false
 	}
-	return s.synth.create(), true
+	rec := s.synth.create()
+	rec.scrub = s.scrubBytes
+	return rec, true
 }
 
 // SetCompact installs the applier. Late-bound like the settings appliers.
@@ -200,19 +202,26 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), compactTimeout)
 	defer cancel()
 	note, err := apply(ctx)
+	// The framework's words, relayed to the owner and to the public log:
+	// scrubbed like anything else that leaves through :8080.
+	note = string(s.scrubBytes([]byte(note)))
+	msg := ""
+	if err != nil {
+		msg = string(s.scrubBytes([]byte(err.Error())))
+	}
 	if errors.Is(err, framework.ErrCompactUnsupported) {
-		logger.Logf("compact: unsupported: %v", err)
-		http.Error(w, "this framework does not support on-demand compaction ("+err.Error()+")", http.StatusNotImplemented)
+		logger.Logf("compact: unsupported: %s", msg)
+		http.Error(w, "this framework does not support on-demand compaction ("+msg+")", http.StatusNotImplemented)
 		return
 	}
 	if errors.Is(err, framework.ErrCompactRefused) {
-		logger.Logf("compact: refused: %v", err)
-		http.Error(w, "the framework did not compact and nothing changed; try again shortly ("+err.Error()+")", http.StatusConflict)
+		logger.Logf("compact: refused: %s", msg)
+		http.Error(w, "the framework did not compact and nothing changed; try again shortly ("+msg+")", http.StatusConflict)
 		return
 	}
 	if err != nil {
-		logger.Logf("compact: failed: %v", err)
-		http.Error(w, "compact failed: "+err.Error(), http.StatusInternalServerError)
+		logger.Logf("compact: failed: %s", msg)
+		http.Error(w, "compact failed: "+msg, http.StatusInternalServerError)
 		return
 	}
 	logger.Logf("compact: %s", note)

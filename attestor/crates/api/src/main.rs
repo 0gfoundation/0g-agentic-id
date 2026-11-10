@@ -129,10 +129,26 @@ async fn main() -> anyhow::Result<()> {
         chain,
         sandbox,
         deployments,
+        credentials: attestor_shared::credentials_repo::PostgresCredentialRepo::new(pool.clone()),
+        notify: attestor_shared::notify::OwnerNotify::from_env(),
         idempotency,
         jobs,
         events,
     };
+
+    if state.notify.is_some() {
+        // Hourly: remind owners of credentials that expire within a week.
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                if let Err(e) = routes::credentials::remind_expiring(&st).await {
+                    tracing::warn!(error = %e, "credential expiry sweep failed");
+                }
+            }
+        });
+    }
 
     let app = routes::router(state);
 

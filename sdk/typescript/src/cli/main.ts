@@ -25,11 +25,12 @@ import { run as list } from './commands/list';
 import { run as update } from './commands/update';
 import { run as settings } from './commands/settings';
 import { run as providers } from './commands/providers';
+import { run as cred } from './commands/cred';
 import { run as interactive } from './commands/interactive';
 
 /** Diagnostics subcommands. Anything else (bare, or a leading agent ref)
  *  routes to the default interactive shell. */
-const COMMANDS: Record<string, CommandRun> = { doctor, status, list, update, settings, providers };
+const COMMANDS: Record<string, CommandRun> = { doctor, status, list, update, settings, cred, providers };
 
 // Help is written for LLM consumption as much as for humans: exact syntax,
 // env contract, exit-code semantics, runnable examples — it is the ground
@@ -111,6 +112,46 @@ COMMANDS
                    3, SETTINGS_CONFLICT) rather than overwriting them. The
                    model advisory uses its provider catalog. Provider changes
                    need a matching key and image support, then require reset.
+  cred <agent> [ls|set|rm|connect|disconnect|reveal|pending|approve|deny|log]
+                   The owner's credentials for the agent (API keys, tokens).
+                   The agent writes [[credential:<name>]] where a key goes;
+                   sealed fills it in on the way out, only for the hosts and
+                   positions you allowed, and hides it in responses. The
+                   value is read from stdin or a prompt that does not echo,
+                   never from an argument, and is sealed to the agent before
+                   it leaves this machine.
+                     cred <agent>                       list (never values)
+                     cred <agent> set <name> [k=v …]    add or change one.
+                       Keys: preset=<name> (see cred presets), host=a,b,
+                       header='Name: … {v} …', basic=<user>, query=<param>,
+                       body=<field>, path=yes, use=inject|token_only|sign,
+                       signer=<json> (with use=sign: sigv4, hmac, jwt or
+                       wallet; the key is never sent, sealed signs with it),
+                       token=<json>, writeback=yes|no, reveal=yes|no,
+                       expires=<YYYY-MM-DD|unix>, desc=…
+                       preset=oauth2-refresh|oauth2-client token_url=…
+                       client_id=… api_host=… [client_secret=<entry>]
+                       [scope=…]: sealed trades the value for access tokens
+                     cred <agent> rm <name>             remove one
+                     cred <agent> connect <name> <mcp-url>
+                                                        connect an MCP server: log
+                                                        in through the link it
+                                                        prints; sealed keeps the
+                                                        tokens and refreshes them
+                     cred <agent> disconnect <name>     revoke it at the server
+                                                        (when it offers that) and
+                                                        remove it
+                     cred <agent> reveal <name> on|off  the agent may read it
+                     cred <agent> pending               requests waiting
+                     cred <agent> approve|deny <id>     decide one (id prefix)
+                     cred <agent> log [n]               what the agent did
+                     cred pending                       counts, all your agents
+                     cred notify [<email>|off]          email when one waits
+                     cred presets                       presets, where to
+                                                        create each key
+                   Owner-signed (all but cred presets); needs
+                   AGENTIC_PRIVATE_KEY. A write is a
+                   compare-and-swap like settings (CREDENTIALS_CONFLICT, exit 3).
   providers        Read the platform provider registry (--json for export).
   update           Self-update: compare against the npm registry and
                    npm install -g the latest (a git-checkout/npm-link copy
@@ -159,6 +200,7 @@ EXAMPLES
   0g-agentdna status 33
   0g-agentdna settings 286
   0g-agentdna settings 286 model=0gm-1.0-35b-a3b thinking=high
+  echo "$GITHUB_TOKEN" | 0g-agentdna cred 286 set github preset=github
   0g-agentdna list --mine --phase failed --json | jq -r '.data[].sealId'`;
 
 /** Package version, read at runtime from the SDK's own package.json

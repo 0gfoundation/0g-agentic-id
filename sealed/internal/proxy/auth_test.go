@@ -176,7 +176,8 @@ func TestVerifyOwnerSig_ResolverErrorIsTransient(t *testing.T) {
 // After a transfer the chain says someone else owns this agent. The seller
 // must stop being able to drive /_seal/* immediately, not whenever the
 // container next restarts — attestor already gates on the live owner for
-// exactly this reason.
+// exactly this reason. Nor does the buyer drive the seller's container: it
+// is closed (ownerlock.go), and the buyer runs the agent in one of their own.
 func TestVerifyOwnerSig_TransferTakesEffectWithoutRestart(t *testing.T) {
 	sellerSign, seller := mustKey(t)
 	buyerSign, buyer := mustKey(t)
@@ -191,12 +192,12 @@ func TestVerifyOwnerSig_TransferTakesEffectWithoutRestart(t *testing.T) {
 	if _, ok := s.verifyOwnerSig(w, authReq(msg, sellerSign(msg)), "0GSealLog", sealID, seller, ""); ok {
 		t.Fatal("the previous owner must lose access the moment the chain says so")
 	}
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("HTTP %d, want 401 — this one IS a denial", w.Code)
+	if w.Code != http.StatusLocked {
+		t.Fatalf("HTTP %d, want 423: the container no longer serves the agent", w.Code)
 	}
 
 	w = httptest.NewRecorder()
-	if _, ok := s.verifyOwnerSig(w, authReq(msg, buyerSign(msg)), "0GSealLog", sealID, seller, ""); !ok {
-		t.Fatalf("the new owner must be accepted against the stale cache, got HTTP %d: %s", w.Code, w.Body.String())
+	if _, ok := s.verifyOwnerSig(w, authReq(msg, buyerSign(msg)), "0GSealLog", sealID, seller, ""); ok || w.Code != http.StatusLocked {
+		t.Fatalf("the new owner drove the previous owner's container: HTTP %d: %s", w.Code, w.Body.String())
 	}
 }

@@ -290,3 +290,20 @@ func TestRuntimeStatus_SettingsIssueShowsUntilCleared(t *testing.T) {
 		t.Fatalf("cleared: (%q, %q)", level, msg)
 	}
 }
+
+// While the agent belongs to another owner, the container reports so, over
+// any other state, until it is back with its owner.
+func TestOwnerChangedStatus(t *testing.T) {
+	s := &runtimeStatus{level: "running"}
+	s.Pin("pinned warning")
+	if prev := s.OwnerChanged("transferred"); prev != "warning" {
+		t.Fatalf("previous level %q", prev)
+	}
+	if level, msg := s.Get(); level != "error" || msg != "transferred" {
+		t.Fatalf("%s %q", level, msg)
+	}
+	s.OwnerChanged("")
+	if level, msg := s.Get(); level != "warning" || msg != "pinned warning" {
+		t.Fatalf("after the owner is back: %s %q", level, msg)
+	}
+}

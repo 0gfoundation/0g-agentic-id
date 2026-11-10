@@ -86,3 +86,13 @@ test('hostOf: hostname out of a URL, graceful on garbage', () => {
   assert.equal(hostOf(undefined), 'unset');
   assert.equal(hostOf('not a url'), 'not a url'.slice(0, 24));
 });
+
+test('L1: after `cred <agent>` the second word completes the subcommand, not another agent', () => {
+  const L1c = { completions: ['cred '], args: { cred: () => ['532', '531', 'pending', 'notify ', 'presets'] }, models: MODELS };
+  assert.deepEqual(completeLine('cred 5', L1c)[0], ['532', '531']);
+  const [hits, word] = completeLine('cred 532 app', L1c);
+  assert.deepEqual([hits, word], [['approve '], 'app']);
+  assert.ok(completeLine('cred 532 ', L1c)[0].includes('presets'));
+  // Past the subcommand nothing is offered (names, ids, k=v are free-form).
+  assert.deepEqual(completeLine('cred 532 approve 0x', L1c)[0], []);
+});

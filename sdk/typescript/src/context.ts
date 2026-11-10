@@ -16,6 +16,13 @@ import {
 import { privateKeyToAccount } from 'viem/accounts';
 import { ZERO_G_TESTNET, RPC_URL, type ContractAddresses } from './constants';
 
+/** A stored credential set's place in order, and its EIP-712 digest. */
+export interface CredentialMarkRecord {
+  epoch: number;
+  version: number;
+  digest?: string;
+}
+
 /** Public config for `new AgentDNA(config)` (exported as `AgentDNAConfig`). */
 export interface AgenticIDConfig {
   /** RPC endpoint. Defaults to the 0G Galileo testnet RPC. */
@@ -54,6 +61,21 @@ export interface AgenticIDConfig {
   secretEnvPin?: {
     seen(attestorUrl: string): boolean | Promise<boolean>;
     record(attestorUrl: string): void | Promise<void>;
+  };
+  /**
+   * Memory of the newest credential set (ownership epoch, version) this
+   * client has seen for each agent, so an older one the attestor serves
+   * again is refused instead of signed anew. Every client remembers within
+   * its own lifetime; supply this store to remember across processes (the
+   * CLI backs it with a file). Keys are opaque strings; `record` is called
+   * with a newer mark than `seen` answered, and should keep the newer of it
+   * and what it holds. `where` names the store in the error that refuses an
+   * older set, for an owner whose attestor's data was reset on purpose.
+   */
+  credentialMarks?: {
+    seen(key: string): CredentialMarkRecord | undefined | Promise<CredentialMarkRecord | undefined>;
+    record(key: string, mark: CredentialMarkRecord): void | Promise<void>;
+    where?: string;
   };
 }
 
@@ -103,6 +125,8 @@ export interface Ctx {
     seen(attestorUrl: string): boolean | Promise<boolean>;
     record(attestorUrl: string): void | Promise<void>;
   };
+  /** See {@link AgenticIDConfig.credentialMarks}. */
+  credentialMarks?: AgenticIDConfig['credentialMarks'];
 }
 
 const DEFAULT_COMPONENT_APP_IDS = ['0g-attestor', '0g-kms', '0g-sandbox-provider'];
@@ -148,6 +172,7 @@ export function buildCtx(config: AgenticIDConfig): Ctx {
     componentAppIdsExplicit: config.componentAppIds !== undefined,
     attestorConfig,
     secretEnvPin: config.secretEnvPin,
+    credentialMarks: config.credentialMarks,
     publicClient: createPublicClient({ chain, transport: http(rpcUrl) }),
   };
 }

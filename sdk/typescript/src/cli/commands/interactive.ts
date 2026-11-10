@@ -24,11 +24,12 @@ import type { ServeProof, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
-import { CliError } from '../errors';
+import { CliError, cancelled, isCancelled } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
 import { applyAssignments, assertModelPresent, assertOthersFitFramework, isHarnessFramework, parseAssignments, renderSettings } from '../settings';
+import { answerPending, credOp, credOwnerOp } from '../credentials';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
@@ -37,8 +38,8 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
-const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -188,7 +189,7 @@ export function makeBrake(
     const client = getClient();
     if (!client?.interrupt) { print('\n(this agent image has no interrupt endpoint — /reset is the only stop)\n'); return; }
     client.interrupt().then(
-      (r) => print(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + (r.note ?? 'not supported') + ')\n'),
+      (r) => print(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + cleanCell(r.note ?? 'not supported') + ')\n'),
       // NOT a prompt: the loop's ask() is pending right now — a notice only.
       // The seat argument is deliberately NOT called from here.
       (e) => print(brakeInterruptLine(e)),
@@ -206,7 +207,7 @@ export function brakeInterruptLine(e: unknown): string {
     // reclaims and resends.
     return '\n⚠ this agent is now driven by another client — send a message to take the seat back\n';
   }
-  return `\n(interrupt failed: ${msg})\n`;
+  return `\n(interrupt failed: ${cleanCell(msg)})\n`;
 }
 
 /**
@@ -226,7 +227,7 @@ export async function routeTaskFailure(
 ): Promise<'reclaimed' | 'left' | 'raw'> {
   const d = await seat((e as Error)?.message ?? '', seatHint, 'leaves the seat with the other client');
   if (d !== null) return d;
-  if (rawLine) print(rawLine);
+  if (rawLine) print(cleanStream(rawLine));
   return 'raw';
 }
 
@@ -288,7 +289,7 @@ export function renderInboxMessage(m: AgentInboxMessage): string {
     : m.trigger === 'schedule' ? `reminder · ${label}`
     : label || cleanCell(m.trigger);
   const lines = [`◆ agent · ${why}`];
-  if (m.text?.trim()) lines.push(m.text.replace(/\s+$/, ''));
+  if (m.text?.trim()) lines.push(cleanStream(m.text).replace(/\s+$/, ''));
   if (m.status === 'failed') lines.push(`(that turn failed: ${cleanCell(m.error ?? 'no reason given')})`);
   else if (m.status === 'cancelled') lines.push('(that turn was cancelled)');
   return `${lines.join('\n')}\n`;
@@ -419,10 +420,12 @@ function prefetchModelIds(ag: AgenticID): void {
     }
   }).catch(() => { /* only completions; explicit operations refresh strictly */ });
 }
+const CRED_SUBS = ['ls', 'set ', 'rm ', 'connect ', 'disconnect ', 'reveal ', 'pending', 'approve ', 'deny ', 'log', 'presets'];
 const L1_ARGS: Record<string, string[] | (() => string[])> = {
   use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT,
   retry: AGENT, clone: AGENT, transfer: AGENT, call: AGENT, rate: AGENT,
   grant: AGENT, revoke: AGENT, authorizer: AGENT, settings: AGENT,
+  cred: () => [...AGENT(), 'pending', 'notify ', 'presets'],
   list: ['--mine'],
 };
 const L2_ARGS: Record<string, string[] | (() => string[])> = {
@@ -431,8 +434,12 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/cancel': ['all'],
   '/inbox': ['all'],
   '/settings': ['provider=', 'model=', 'thinking=', 'others='],
+  '/cred': CRED_SUBS,
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
+
+// L1 commands whose second word is a subcommand once the agent is named.
+const SUB_AFTER_AGENT: Record<string, string[]> = { cred: CRED_SUBS };
 
 // Commands whose LATER arguments also complete (the generic rule is "first
 // argument only; the rest is free-form" — right for prompts and amounts,
@@ -492,6 +499,13 @@ export function completeLine(
     const hits = completeTail(cmd, word, models, state.providers);
     return hits.length ? [hits, word] : [[], line];
   }
+  // `cred <agent> <sub>`: the second word is the subcommand, not another agent.
+  if (SUB_AFTER_AGENT[cmd] && rest.includes(' ')) {
+    if (rest.split(' ').length !== 2) return [[], line];
+    const subs = SUB_AFTER_AGENT[cmd];
+    const hits = subs.filter((c) => c.startsWith(word));
+    return [hits.length ? hits : subs, word];
+  }
   const cand = state.args[cmd];
   const list = typeof cand === 'function' ? cand() : (cand ?? []);
   const hits = list.filter((c) => c.startsWith(rest));
@@ -530,7 +544,7 @@ export function printAbovePrompt(
   rl.prompt(true);
 }
 import type { CommandContext } from '../types';
-import { cellText, cleanCell, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
+import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
 
 /** Column widths of the REPL listing; its header and every row share them. */
 const LIST_COLS = { id: 6, phase: 11, framework: 12, seal: 13, agentSeal: 13, owner: 24 } as const;
@@ -583,7 +597,113 @@ function containerUrl(sandboxId: string, proxy: string): string {
     : `https://8080-${sandboxId}.${proxy}`;
 }
 const og = (wei: bigint | null | undefined): string => (wei == null ? 'n/a' : `${(Number(wei) / 1e18).toFixed(6)} OG`);
-const out = (s: string): void => void process.stdout.write(s);
+/** The shell's question: the answer to q. fresh asks for a line typed after
+ *  q is shown (see run); main is the shell's own prompt; cancel rejects the
+ *  question waiting, if any other than the prompt, and says whether it did. */
+type Ask = ((q: string) => Promise<string>) & {
+  fresh?: (q: string) => Promise<string>;
+  main?: (q: string) => Promise<string>;
+  cancel?: () => boolean;
+};
+
+/** An answer to a signing question this soon after it is shown was typed before it. */
+const READ_MS = 300;
+
+/**
+ * The shell's `ask` as a line QUEUE, not rl.question: lines that arrive while
+ * no question is pending (piped input racing the ~4s async banner) used to be
+ * consumed by readline with no listener and silently dropped — commands
+ * vanished with exit 0 (feedback.md F5). Buffer them instead. ask.fresh is
+ * for a question whose answer signs something: on a terminal (tty), what was
+ * typed before it is shown (during a turn, say) is not its answer — neither
+ * a whole line, nor keys not yet sent with Enter, nor a line that comes in
+ * too soon after it to have been typed for it. A terminal whose line editing
+ * the shell does not do (its output is redirected) holds such keys itself,
+ * so there it is not asked at all.
+ */
+export function lineQueue(
+  rl: {
+    on(ev: 'line', f: (l: string) => void): unknown; on(ev: 'close', f: () => void): unknown; setPrompt(q: string): void; prompt(): void;
+    terminal?: boolean;
+  },
+  tty: () => boolean,
+): Ask {
+  const pendingLines: string[] = [];
+  const waiters: Array<{ res: (s: string) => void; rej: (e: Error) => void; main: boolean }> = [];
+  // readline keeps keys typed so far as the line being edited (and would
+  // show them after the next question, ready for Enter), and its offset from
+  // the last redraw (which would move that question up over lines printed
+  // since).
+  const clearEdit = (): void => {
+    const edit = rl as { line?: unknown; cursor?: unknown; prevRows?: unknown };
+    if (typeof edit.line === 'string') edit.line = '';
+    if (typeof edit.cursor === 'number') edit.cursor = 0;
+    if (typeof edit.prevRows === 'number') edit.prevRows = 0;
+  };
+  rl.on('line', (l) => {
+    const w = waiters.shift();
+    if (w) w.res(l);
+    else pendingLines.push(l);
+  });
+  let stdinClosed = false;
+  rl.on('close', () => {
+    // EOF while a question is pending — surface the same code rl.question
+    // would, which run() already treats as a normal way to leave.
+    stdinClosed = true;
+    for (const w of waiters.splice(0)) {
+      w.rej(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
+    }
+  });
+  const wait = (q: string, main: boolean): Promise<string> => {
+    const buffered = pendingLines.shift();
+    if (buffered !== undefined) {
+      out(`${q}${buffered}\n`); // keep the transcript readable in pipes/logs
+      return Promise.resolve(buffered);
+    }
+    if (stdinClosed) {
+      return Promise.reject(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
+    }
+    rl.setPrompt(q);
+    rl.prompt();
+    return new Promise((res, rej) => waiters.push({ res, rej, main }));
+  };
+  const ask: Ask = (q: string): Promise<string> => wait(q, false);
+  ask.main = (q: string): Promise<string> => wait(q, true);
+  ask.cancel = (): boolean => {
+    const i = waiters.findIndex((w) => !w.main);
+    if (i < 0) return false;
+    const [w] = waiters.splice(i, 1);
+    clearEdit();
+    w.rej(cancelled());
+    return true;
+  };
+  ask.fresh = async (q: string): Promise<string> => {
+    if (!tty()) return ask(q);
+    if (rl.terminal === false) {
+      throw new Error('a question that signs is asked only when the session\'s output is a terminal: answer with /cred pending, then /cred approve <id> or /cred deny <id>');
+    }
+    for (;;) {
+      pendingLines.length = 0;
+      clearEdit();
+      const shown = Date.now();
+      const a = await ask(q);
+      if (!a.trim() || Date.now() - shown >= READ_MS) return a;
+      out('  (that came in before the question could be read: answer again)\n');
+    }
+  };
+  return ask;
+}
+
+/** Writes to the terminal as is: only for the shell's own control sequences. */
+const term = (s: string): void => void process.stdout.write(s);
+/**
+ * Writes text to the terminal with escape sequences, control characters
+ * (newlines and tabs kept) and bidi controls removed. Everything the shell
+ * prints goes through here unless it is the shell's own control sequence
+ * (term): much of what it prints comes from the agent or its server, and
+ * nothing of that may restyle, hide or rewrite what the owner reads.
+ */
+const out = (s: string): void => term(cleanStream(s));
 
 interface Session {
   ag: AgenticID;
@@ -748,12 +868,12 @@ export async function pollRunning(
   const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
   let spin = 0;
   let spinnerShown = false;
-  const clearSpinner = (): void => { if (spinnerShown) { out('\r\x1b[2K'); spinnerShown = false; } };
+  const clearSpinner = (): void => { if (spinnerShown) { term('\r\x1b[2K'); spinnerShown = false; } };
   const ticker = process.stdout.isTTY
     ? setInterval(() => {
         if (signal?.aborted) return;
         spin = (spin + 1) % SPIN.length;
-        out(`\r\x1b[2K  ${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · esc stops waiting, not the deploy)`);
+        term(`\r\x1b[2K  ${cleanCell(`${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · esc stops waiting, not the deploy)`)}`);
         spinnerShown = true;
       }, 1000)
     : null;
@@ -861,44 +981,15 @@ export async function run(ctx: CommandContext): Promise<void> {
     completer: (line: string): [string[], string] =>
       completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds }),
   });
-  // `ask` is a line QUEUE, not rl.question: lines that arrive while no
-  // question is pending (piped input racing the ~4s async banner) used to be
-  // consumed by readline with no listener and silently dropped — commands
-  // vanished with exit 0 (feedback.md F5). Buffer them instead.
-  const pendingLines: string[] = [];
-  const waiters: Array<{ res: (s: string) => void; rej: (e: Error) => void }> = [];
-  rl.on('line', (l) => {
-    const w = waiters.shift();
-    if (w) w.res(l);
-    else pendingLines.push(l);
-  });
   activeRl = rl;
-  let stdinClosed = false;
-  rl.on('close', () => {
-    // EOF while a question is pending — surface the same code rl.question
-    // would, which run() already treats as a normal way to leave.
-    stdinClosed = true;
-    for (const w of waiters.splice(0)) {
-      w.rej(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
-    }
-  });
-  const ask = (q: string): Promise<string> => {
-    const buffered = pendingLines.shift();
-    if (buffered !== undefined) {
-      out(`${q}${buffered}\n`); // keep the transcript readable in pipes/logs
-      return Promise.resolve(buffered);
-    }
-    if (stdinClosed) {
-      return Promise.reject(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
-    }
-    rl.setPrompt(q);
-    rl.prompt();
-    return new Promise((res, rej) => waiters.push({ res, rej }));
-  };
+  const ask = lineQueue(rl, () => !!process.stdin.isTTY);
   const irq: Interrupt = { streaming: null, brake: null };
 
   let lastSigint = 0;
   rl.on('SIGINT', () => {
+    // A question (not the shell's prompt) is waiting: cancel it, and the
+    // command that asked.
+    if (ask.cancel?.()) { out('\n'); return; }
     if (irq.streaming) { irq.streaming.abort(); return; } // interrupt the turn, stay in the REPL
     const now = Date.now();
     if (now - lastSigint < 2000) { rl.close(); process.exit(0); }
@@ -909,6 +1000,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   readline.emitKeypressEvents(process.stdin, rl);
   process.stdin.on('keypress', (_s, key) => {
     if (key?.name !== 'escape') return;
+    if (ask.cancel?.()) { out('\n'); return; }
     if (irq.streaming) { irq.streaming.abort(); return; }
     irq.brake?.(); // idle Esc in a session: stop a background/orphaned task
   });
@@ -921,8 +1013,13 @@ export async function run(ctx: CommandContext): Promise<void> {
       // masquerade as a missing-wallet error. (feedback.md F1)
       parseAgentRef(ctx.positionals[0]);
       const ag = await withWallet(ctx);
-      const s = await attach(ag, requireAttestorUrl(ctx.env), ctx.positionals[0], ask);
-      await sessionRepl(s, ask, irq, ctx);
+      try {
+        const s = await attach(ag, requireAttestorUrl(ctx.env), ctx.positionals[0], ask);
+        await sessionRepl(s, ask, irq, ctx);
+      } catch (e) {
+        if (!isCancelled(e)) throw e;
+        out('cancelled\n');
+      }
     }
     await managerRepl(ctx, ask, irq);
   } catch (e) {
@@ -960,7 +1057,7 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · hello <id> · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
+  'commands: list · use <id> · hello <id> · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · cred <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
@@ -987,6 +1084,18 @@ const L1_HELP_FULL = `manager commands
                           it thinks with, and how hard); with assignments —
                           model=… provider=… thinking=low|high|max
                           others=<json> — merge and write it (owner-signed)
+  cred <id> [sub …]       the agent's credentials (API keys, tokens): bare
+                          lists them (never values); set <name> [k=v …] adds
+                          or changes one (preset=<name> — cred presets lists them,
+                          host=, header='Name: … {v}', basic=, query=, body=,
+                          path=yes, use=sign signer=<json>, reveal=yes|no,
+                          expires=, desc=; the value
+                          is asked for, not echoed); rm <name>; connect <name>
+                          <mcp-url> (prints a link to open); disconnect <name>; reveal <name>
+                          on|off; pending; approve|deny [<id>]; log [n].
+                          cred pending: counts on all your agents; cred
+                          notify [email|off]: where you are emailed;
+                          cred presets: the presets
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
                           Someone else's: goes through its fork policy — works
                           iff the seller granted YOUR wallet. Lands offline
@@ -1009,7 +1118,9 @@ const L1_HELP_FULL = `manager commands
                           (Enter keeps the current value; secrets echo *)
   whoami                  show attestor / wallet / api-key / ack status
   help                    this text
-  quit                    exit (Ctrl-C twice also works)`;
+  quit                    exit (Ctrl-C twice also works)
+At a question a command asks (a value, an amount, a confirmation), Ctrl-C or
+Esc cancels it and the command.`;
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   // The environment marker in every prompt: cross-environment mistakes (a
@@ -1028,7 +1139,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     const art = pandaLines();
     const caption = ['', '', '', '   \x1b[1m0G AgentDNA\x1b[0m', '   interactive shell', '', '', ''];
     out('\n');
-    art.forEach((l, i) => out(`  ${l}${caption[i] ?? ''}\n`));
+    art.forEach((l, i) => term(`  ${l}${caption[i] ?? ''}\n`));
     out('\n');
   } else {
     out('\n╭──────────────────────────────────────╮\n');
@@ -1083,7 +1194,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   for (;;) {
     activeCompletions = L1_WORDS;
     activeArgs = L1_ARGS;
-    const line = (await ask(`\n0g-agentdna [${hostOf(ctx.env.attestorUrl)}]> `)).trim();
+    const line = (await ((ask as Ask).main ?? ask)(`\n0g-agentdna [${hostOf(ctx.env.attestorUrl)}]> `)).trim();
     // Bare Enter refreshes the account status — the L1 analog of L2's
     // bare-Enter agent refresh.
     // Quote-aware, so a value with a space in it (`settings 286
@@ -1395,6 +1506,18 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
+      if (cmd === 'cred') {
+        // The owner's credentials for an agent (cli/credentials.ts); every
+        // subcommand is owner-signed.
+        if (!args[0]) { out('usage: cred <agentId|sealId> [ls|set|rm|connect|disconnect|reveal|pending|approve|deny|log] · cred pending · cred notify [email|off] · cred presets — `help` has the keys\n'); continue; }
+        const ag = await withWallet(ctx);
+        if (await credOwnerOp(ag, args, credIO(ask))) continue;
+        const row = await findAgentRow(ag, args[0]);
+        if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
+        await credInShell(irq, args[1] === 'connect', (io) => credOp(ag, row.sealId, args.slice(1), { ...credIO(ask), ...io }, row.phase === 'running' && row.url ? row.url : undefined));
+        continue;
+      }
+
       if (cmd === 'authorizer') {
         // Extra args are ambiguous (`authorizer <id> <addr> off` — set or
         // clear?) — refuse rather than silently act on a guess.
@@ -1660,7 +1783,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     } catch (e) {
       // Keep the REPL alive on operational errors; show the remedy if present.
       const ce = e as CliError;
-      out(`error: ${friendlyChainError(e) ?? ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`);
+      if (isCancelled(e)) out('cancelled\n');
+      else out(`error: ${friendlyChainError(e) ?? ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`);
     }
   }
 }
@@ -1961,9 +2085,53 @@ async function withWallet(ctx: CommandContext): Promise<AgenticID> {
   return clientFor(ctx, true);
 }
 
+/**
+ * Where the session sends the agent's owner routes (credentials, settings):
+ * the URL the attestor has for the agent now. The agent may be on a new
+ * sandbox since this session connected (a reset from elsewhere), and the URL
+ * the session holds then reaches nothing. The held one is used when the
+ * attestor cannot say; none when the agent is not running here.
+ */
+export async function ownerRouteUrl(ag: AgenticID, s: Session): Promise<string | undefined> {
+  if (!s.client || !s.url) return undefined;
+  return ag.credentials.agentUrl(s.sealId).catch(() => s.url);
+}
+
+/**
+ * Runs a `cred` operation in the shell. A connect waits for the login to
+ * complete and says so, as the one-shot command does; Ctrl-C or Esc stops
+ * the wait (the login goes on in the browser).
+ */
+async function credInShell(irq: Interrupt, connect: boolean, run: (io: { wait?: boolean; signal?: AbortSignal }) => Promise<void>): Promise<void> {
+  if (!connect) return run({});
+  const ac = new AbortController();
+  irq.streaming = ac;
+  try {
+    await run({ wait: true, signal: ac.signal });
+  } finally {
+    irq.streaming = null;
+  }
+}
+
+/** How credOp talks inside the REPL: lines out, values through askSecret. */
+function credIO(ask: (q: string) => Promise<string>) {
+  return {
+    json: false, out: (l: string) => out(`${l}\n`), secret: (p: string) => askSecret(ask, p),
+    // The credential prompts' terminal reset: on a terminal only.
+    raw: (s: string) => { if (process.stdout.isTTY) term(s); },
+  };
+}
+
 /** Prompt for a secret with the typed characters not echoed. readline has no
  *  native masking, so suppress stdout echo for the duration of the question. */
 function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise<string> {
+  // A terminal whose line editing the shell does not do (its output is
+  // redirected) shows what is typed as it is typed.
+  if (process.stdin.isTTY && activeRl?.terminal === false) {
+    return Promise.reject(new CliError('BAD_FLAG', 'a value is typed here only when the session\'s output is a terminal: the terminal would show it as you type', {
+      remedy: 'start the session without redirecting its output',
+    }));
+  }
   return new Promise((res, rej) => {
     const stdout = process.stdout as unknown as { write: (s: string) => boolean };
     const orig = stdout.write.bind(stdout);
@@ -2238,7 +2406,10 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   out('\n');
   if (art) {
     for (let i = 0; i < Math.max(art.length, fields.length); i++) {
-      out(`  ${art[i] ?? ' '.repeat(16)}   ${fields[i] ?? ''}\n`);
+      // The avatar's cells are the CLI's own colour codes (svgPixelLines):
+      // written as they are; the fields are cleaned.
+      term(`  ${art[i] ?? ' '.repeat(16)}   `);
+      out(`${fields[i] ?? ''}\n`);
     }
   } else {
     for (const f of fields) out(`  ${f}\n`);
@@ -2278,11 +2449,12 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /clear /compact /tasks /result /cancel /inbox /schedules /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /tasks /result /cancel /inbox /schedules /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
-                          turn in flight (the runtime cancels server-side)
+                          turn in flight (the runtime cancels server-side);
+                          at a question a command asks, they cancel it
   (bare Enter)            refresh this agent's phase/url from the attestor
   /hello                  identity, routes/services, serve-proof verification
   /balance                this agent's agentSeal gas + the account prepaid
@@ -2298,6 +2470,15 @@ const L2_HELP_FULL = `session commands
                           others=<json> merge into it and write it back
                           (owner-signed). Applies at the next boot — /reset
                           applies it now
+  /cred [sub …]           this agent's credentials — same as \`cred <id>\` in the
+                          manager: bare lists, set <name> [k=v …], rm, connect,
+                          disconnect,
+                          reveal <name> on|off, pending, approve|deny [<id>],
+                          log [n], presets. The agent writes [[credential:<name>]]
+                          where a key goes; sealed fills it in on the way out.
+                          A request the agent waits on (to read a value, to get
+                          a credential, to be connected) comes up here at the
+                          prompt; your answer goes back to the agent
   /think [low|high|max]   reasoning depth for thinking models (glm etc.) —
                           shorthand for /settings thinking=…, so it is written
                           to the owner's document (owner-signed) and applies at
@@ -2387,7 +2568,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       seatPromptPending = true;
       try {
         out(`\n⚠ this agent is now driven by another client\n`);
-        const takeBack = (await ask(`press Enter to take the seat back (anything else ${leavesWhat}): `)).trim();
+        // Cancelling the question leaves the seat, as any answer but Enter does.
+        const takeBack = (await ask(`press Enter to take the seat back (anything else ${leavesWhat}): `).catch((e: unknown) => {
+          if (isCancelled(e)) return 'cancelled';
+          throw e;
+        })).trim();
         if (takeBack === '') {
           try {
             if (s.url) { await s.ag.agent.claimAgent(s.url, BigInt(s.agentId), clientInstanceId); out(`seat reclaimed — ${reclaimedHint}\n`); return 'reclaimed'; }
@@ -2428,6 +2613,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     return ` [${transport}${code ? ` · ${code}` : ''}${msg && msg !== code ? ` · ${msg.slice(0, 80)}` : ''}]`;
   };
   const messages: ChatMessage[] = [];
+  // Requests the agent waits on are put in front of the owner here, at the
+  // prompt; what the owner decided goes to the agent as the next message.
+  const credLater = new Set<string>();
+  const queued: string[] = [];
   try {
   for (;;) {
     activeCompletions = L2_WORDS;
@@ -2442,12 +2631,36 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       out(h.text);
       h.shown();
     }
-    atPrompt = true;
+    if (s.client && s.url && !queued.length) {
+      const ac = new AbortController();
+      irq.streaming = ac; // Esc stops waiting for a login
+      try {
+        const ag = await withWallet(ctx);
+        const tell = await answerPending(ag, s.sealId, { ...credIO(ask), ask: (ask as Ask).fresh ?? ask }, {
+          agentUrl: await ownerRouteUrl(ag, s), later: credLater, tokenize, signal: ac.signal,
+        });
+        if (tell.length) queued.push(tell.join('\n'));
+      } catch (e) {
+        // No owner wallet here: nothing to decide. Anything else the owner
+        // must see (a decision that did not go through).
+        if (!(e instanceof CliError && e.code === 'WALLET_REQUIRED')) {
+          out(`\n(credential requests: ${cleanCell(e instanceof Error ? e.message : String(e))})\n`);
+        }
+      } finally {
+        irq.streaming = null;
+      }
+    }
     let line: string;
-    try {
-      line = (await ask(`\nagent ${s.agentId} › `)).trim();
-    } finally {
-      atPrompt = false;
+    if (queued.length) {
+      line = queued.shift()!;
+      out(`\nagent ${s.agentId} › ${line}\n`);
+    } else {
+      atPrompt = true;
+      try {
+        line = (await ((ask as Ask).main ?? ask)(`\nagent ${s.agentId} › `)).trim();
+      } finally {
+        atPrompt = false;
+      }
     }
     if (!line) {
       // Bare Enter = live status refresh (phase moves on its own during
@@ -2569,7 +2782,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         try {
           const r = await s.ag.agent.clearConversation(s.url, BigInt(s.agentId), clientInstanceId);
           messages.length = 0;
-          out(`${r.note ?? 'conversation cleared'}\n`);
+          out(`${cleanCell(r.note ?? 'conversation cleared')}\n`);
         } catch (e) {
           // clear is a seat-gated POST — a displaced 409 is a seat event here too
           if (await routeTaskFailure(out, displacedSeat, e, '', 'retry /clear') !== 'raw') continue;
@@ -2591,7 +2804,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out('compacting the conversation (one or more model calls; can take a few minutes)…\n');
         try {
           const r = await s.ag.agent.compactConversation(s.url, BigInt(s.agentId), clientInstanceId);
-          out(`${r.note ?? 'conversation compacted'}\n`);
+          out(`${cleanCell(r.note ?? 'conversation compacted')}\n`);
         } catch (e) {
           // compact is a seat-gated POST — a displaced 409 is a seat event;
           // every other 409 (e.g. "compact refused") stays a compact error
@@ -2621,7 +2834,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (line === '/agentlog' || line.startsWith('/agentlog ')) {
         if (!s.client?.logs) { out(s.client ? '(logs unavailable — owner key needed)' : `agent is ${s.phase} — /start or /reset first`); out('\n'); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
-        out(`${await s.client.logs({ tail: n })}\n`); continue;
+        out(`${cleanStream(await s.client.logs({ tail: n }))}\n`); continue;
       }
       if (line === '/startuplog' || line.startsWith('/startuplog ')) {
         // The sealed runtime serves /log from early boot — mid-`deploying` is
@@ -2640,7 +2853,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // with, and how hard. Bare shows it; key=value writes it (merged).
         // Owner-signed in both directions, so it needs the wallet client and
         // not the session's (possibly keyless) one.
-        await settingsOp(await withWallet(ctx), s.sealId, tokenize(line).slice(1), s.client && s.url ? s.url : undefined, s.framework);
+        const ag = await withWallet(ctx);
+        await settingsOp(ag, s.sealId, tokenize(line).slice(1), await ownerRouteUrl(ag, s), s.framework);
+        continue;
+      }
+      if (line === '/cred' || line.startsWith('/cred ')) {
+        const args = tokenize(line).slice(1);
+        const ag = await withWallet(ctx);
+        const url = await ownerRouteUrl(ag, s);
+        await credInShell(irq, args[0] === 'connect', (io) => credOp(ag, s.sealId, args, { ...credIO(ask), ...io }, url));
         continue;
       }
       if (line === '/think' || line.startsWith('/think ')) {
@@ -2658,7 +2879,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         }
         if (!(THINKING_LEVELS as readonly string[]).includes(arg)) { out(`usage: /think ${THINKING_LEVELS.join('|')}\n`); continue; }
         if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
-        const written = await settingsOp(ag, s.sealId, [`thinking=${arg}`], s.client && s.url ? s.url : undefined);
+        const written = await settingsOp(ag, s.sealId, [`thinking=${arg}`], await ownerRouteUrl(ag, s));
         // Only mirror it into this session once the write actually landed —
         // a refused or conflicted write must not leave the per-message
         // override claiming a level the agent was never given.
@@ -2699,7 +2920,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         }));
         if (displacedFromTasks && (await displacedSeat(displacedFromTasks, 'retry /tasks')) !== null) continue;
         for (const t of rows.reverse()) {
-          out(`  ${t.id}  ${t.status.padEnd(12)} ${Math.round((Date.now() - t.at) / 1000)}s ago  ${t.prompt}\n`);
+          out(`  ${cleanCell(t.id)}  ${cleanCell(t.status).padEnd(12)} ${Math.round((Date.now() - t.at) / 1000)}s ago  ${cleanCell(t.prompt)}\n`);
         }
         out('re-attach with /result [id] (default: latest)\n');
         continue;
@@ -2711,8 +2932,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (named && s.client?.taskInfo) {
           const t = await s.client.taskInfo(named).catch(() => null);
           if (t && t.type !== 'turn') {
-            out(`${cleanCell(t.id)} — ${t.status} · by ${t.actor} · ${cleanCell(t.label)}\n`);
-            if (t.output_text) out(`${t.output_text}\n`);
+            out(`${cleanCell(t.id)} — ${cleanCell(t.status)} · by ${cleanCell(t.actor)} · ${cleanCell(t.label)}\n`);
+            if (t.output_text) out(`${cleanStream(t.output_text)}\n`);
             else if (t.type === 'command') out('(a command\'s output goes to the agent, which reports on it when the command finishes — /inbox)\n');
             if (t.error) out(`error: ${cleanCell(t.error)}\n`);
             continue;
@@ -2737,8 +2958,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!snap) continue;
         if (snap.status === 'completed' || snap.status === 'cancelled' || snap.status === 'failed') {
           out(`task ${id} — ${snap.status}\n`);
-          if (snap.output_text) out(`${snap.output_text}\n`);
-          if (snap.error) out(`error: ${snap.error.message}\n`);
+          if (snap.output_text) out(`${cleanStream(snap.output_text)}\n`);
+          if (snap.error) out(`error: ${cleanCell(snap.error.message)}\n`);
           continue;
         }
         // Still running: re-attach live. Text so far arrives via the replay
@@ -2749,7 +2970,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const ac = new AbortController();
         irq.streaming = ac;
         try {
-          for await (const delta of s.client.followTask(id, { signal: ac.signal })) out(delta);
+          for await (const delta of s.client.followTask(id, { signal: ac.signal })) out(cleanStream(delta));
           out('\n');
         } catch (e) {
           out(ac.signal.aborted
@@ -2829,7 +3050,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
               for (;;) {
                 try {
                   const t = await s.client.cancelTask(tid);
-                  out(`⏹ cancel ${tid} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
+                  out(`⏹ cancel ${cleanCell(tid)} — ${t.status === 'completed' ? 'already finished' : cleanCell(t.status)}\n`);
                   break;
                 } catch (e) {
                   const d = await routeTaskFailure(out, displacedSeat, e, `(cancel ${tid} failed: ${(e as Error).message})\n`, `retry /cancel ${tid}`);
@@ -2847,7 +3068,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           for (;;) {
             try {
               const t = await s.client.cancelTask(id);
-              out(`⏹ cancel ${id} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
+              out(`⏹ cancel ${cleanCell(id)} — ${t.status === 'completed' ? 'already finished' : cleanCell(t.status)}\n`);
               break;
             } catch (e) {
               const d = await routeTaskFailure(out, displacedSeat, e, `(cancel failed: ${(e as Error).message})\n`, `retry /cancel ${id}`);
@@ -2875,7 +3096,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (await routeTaskFailure(out, displacedSeat, e, `(interrupt failed: ${(e as Error).message})\n`, 'retry the interrupt') !== 'raw') return null;
           return null;
         });
-        if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing to stop, or: ${r.note ?? 'not supported'})\n`);
+        if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing to stop, or: ${cleanCell(r.note ?? 'not supported')})\n`);
         continue;
       }
       if (line === '/inbox' || line === '/inbox all') {
@@ -2904,6 +3125,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // Show the remedy too: an error whose whole point is "do this instead"
       // (a refused settings write, a missing wallet) is useless without it.
       const ce = e as CliError;
+      if (isCancelled(e)) { out('cancelled\n'); continue; }
       out(`error: ${ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`); continue;
     }
 
@@ -2937,7 +3159,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       let statusShown = false;
       let sawToolActivity = false;
       const clearActivity = (): void => {
-        if (statusShown) { out('\r\x1b[2K'); statusShown = false; }
+        if (statusShown) { term('\r\x1b[2K'); statusShown = false; }
       };
       const paintStatus = (): void => {
         if (!process.stdout.isTTY || ac.signal.aborted) return;
@@ -2946,7 +3168,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!statusShown && reply && !reply.endsWith('\n')) out('\n');
         const secs = Math.floor((Date.now() - turnT0) / 1000);
         spin = (spin + 1) % SPIN.length;
-        out(`\r\x1b[2K  ${SPIN[spin]} ${status}… (${secs}s · esc to interrupt)`);
+        term(`\r\x1b[2K  ${cleanCell(`${SPIN[spin]} ${status}… (${secs}s · esc to interrupt)`)}`);
         statusShown = true;
       };
       const onActivity = process.stdout.isTTY
@@ -2958,7 +3180,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             // a failure worth reporting.
             if (/tool|bash|subagent|rlm_child/i.test(label) && label !== 'thinking') sawToolActivity = true;
             if (label.startsWith('turn/end')) { clearActivity(); return; }
-            status = label;
+            status = cleanCell(label);
             paintStatus();
           }
         : undefined;
@@ -2988,7 +3210,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         };
         for await (const delta of s.client.chatStream(messages, opts)) {
           clearActivity();
-          out(delta); reply += delta;
+          out(cleanStream(delta)); reply += delta;
           lastOutputAt = Date.now();
           status = 'writing';
         }
@@ -3015,7 +3237,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // hard-interrupt + reap — so the disconnect Esc just did IS the stop.
           out(stopped?.aborted || (stopped && /disconnects/.test(stopped.note ?? ''))
             ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
-            : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${stopped.note}` : ''}; /cancel stops it${s.client?.cancelTask ? '' : ' (bare form — this image has no per-id cancel)'})`);
+            : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${cleanCell(stopped.note)}` : ''}; /cancel stops it${s.client?.cancelTask ? '' : ' (bare form — this image has no per-id cancel)'})`);
         } else if (/lost the agent while following/.test((e as Error).message)) {
           // Responses transport: the SDK already auto-resumed through drops
           // and only gives up after repeated reconnect failures — the agent
@@ -3051,7 +3273,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         s.currentTask = null;
       }
       if (failure && !s.framework && !retriedWithPick) {
-        out(`\n(chat failed: ${failure})\nthis framework may need a model selector — pick it:\n`);
+        out(`\n(chat failed: ${cleanCell(failure)})\nthis framework may need a model selector — pick it:\n`);
         s.framework = await pickFramework(s.attestorUrl, ask);
         retriedWithPick = true;
         continue; // retry the same user message once with the selector
@@ -3079,7 +3301,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // while the actual cause (the 400 body) is only in the container log. A
       // turn that fails EVERY time is usually the model or config it was just
       // given, so point at the log the way the connection-drop branches do.
-      if (failure) out(`\n(chat failed: ${failure}) — /agentlog has the agent's full error (a turn that fails every time usually means the model or config just set)`);
+      if (failure) out(`\n(chat failed: ${cleanCell(failure)}) — /agentlog has the agent's full error (a turn that fails every time usually means the model or config just set)`);
       out('\n');
       messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
       break;

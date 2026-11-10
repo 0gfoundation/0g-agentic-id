@@ -49,6 +49,9 @@ pub struct Watcher {
     /// Used to enqueue SandboxTeardown on ownership transfer (Layer 2). The
     /// worker holds the admin signer; the indexer only detects + enqueues.
     jobs: Arc<dyn JobQueue>,
+    /// Owner credential sets: a transfer starts a new ownership epoch and
+    /// drops the previous owner's set.
+    credentials: Arc<dyn attestor_shared::credentials_repo::CredentialRepo>,
     pool: PgPool,
     http: reqwest::Client,
     start_block: Option<u64>,
@@ -73,6 +76,7 @@ impl Watcher {
             deployments,
             events,
             jobs,
+            credentials: attestor_shared::credentials_repo::PostgresCredentialRepo::new(pool.clone()),
             pool,
             http: reqwest::Client::new(),
             start_block: cfg.indexer_start_block,
@@ -219,6 +223,16 @@ impl Watcher {
             ev.to
         };
         self.deployments.set_owner(ev.tokenId, live_owner).await?;
+        // A new ownership: credential sets are signed per epoch, so the
+        // previous owner's set can never be served again, and it is dropped.
+        if let Some(d) = self.deployments.get_by_agent_id(ev.tokenId).await? {
+            if let Err(e) = self.credentials.set_epoch(d.seal_id, block as i64).await {
+                tracing::warn!(seal_id = ?d.seal_id, error = %e, "transfer: credential epoch update failed");
+            }
+            if let Err(e) = self.credentials.clear(d.seal_id).await {
+                tracing::warn!(seal_id = ?d.seal_id, error = %e, "transfer: credential clear failed");
+            }
+        }
         // Drop the container pubkey binding so the prior owner's resumed
         // container (reused SANDBOX_SEAL_KEY, stale attestation) can no longer
         // skip the freshness window — it now fails /provision instead of
@@ -671,6 +685,7 @@ mod tests {
             deployments,
             events,
             jobs,
+            credentials: attestor_shared::credentials_repo::in_memory(),
             pool,
             http: reqwest::Client::new(),
             start_block: None,
@@ -742,6 +757,25 @@ mod tests {
 
         let jobs = Arc::new(InMemoryJobQueue::new());
         let w = test_watcher(deployments.clone(), events.clone(), jobs.clone());
+        // The seller's credentials: a set with a writeback, a pending count
+        // and a reminder already sent.
+        let creds = w.credentials.clone();
+        creds
+            .put(
+                seal_id,
+                seller,
+                0,
+                0,
+                serde_json::json!({"set": {}}),
+                serde_json::json!({"rt": {}}),
+            )
+            .await
+            .unwrap();
+        creds.set_pending(seal_id, 2).await.unwrap();
+        assert!(creds
+            .claim_reminder(seal_id, "rt", 1, 1_900_000_000)
+            .await
+            .unwrap());
         w.on_transfer(
             AgenticID::Transfer {
                 from: seller,
@@ -753,6 +787,26 @@ mod tests {
         .await
         .expect("transfer handled");
 
+        assert!(
+            creds.get(seal_id).await.unwrap().is_none(),
+            "the seller's set and writebacks are deleted"
+        );
+        assert!(
+            creds.pending_counts(&[seal_id]).await.unwrap().is_empty(),
+            "pending count deleted"
+        );
+        assert!(
+            creds
+                .claim_reminder(seal_id, "rt", 1, 1_900_000_000)
+                .await
+                .unwrap(),
+            "reminder records deleted, so the buyer's entries are reminded afresh"
+        );
+        assert_eq!(
+            creds.epoch(seal_id).await.unwrap(),
+            100,
+            "a new ownership epoch"
+        );
         let after = deployments.get(seal_id).await.unwrap().expect("seeded");
         assert_eq!(after.owner, buyer, "owner synced to new on-chain owner");
         assert!(

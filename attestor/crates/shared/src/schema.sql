@@ -289,3 +289,50 @@ ALTER TABLE inference_provider_registry ADD COLUMN IF NOT EXISTS publisher BYTEA
 -- No acceptance MAC: the table lives on the tapp FDE volume, and every read
 -- re-checks the row's environment and version.
 ALTER TABLE inference_provider_registry DROP COLUMN IF EXISTS acceptance_mac;
+
+-- ── Owner credential sets (sealed credential proxy) ──────────────────────
+-- One row per seal: the owner-signed set (auth::credentials) as posted
+-- and the values the container wrote back for that version. Deleted when
+-- the agent changes hands.
+CREATE TABLE IF NOT EXISTS credential_sets (
+    seal_id     BYTEA PRIMARY KEY,
+    owner       BYTEA  NOT NULL,
+    owner_epoch BIGINT NOT NULL DEFAULT 0,
+    version     BIGINT NOT NULL DEFAULT 0,
+    document    JSONB  NOT NULL,
+    writebacks  JSONB  NOT NULL DEFAULT '{}'::jsonb,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_credential_sets_owner ON credential_sets (owner);
+-- Ownership epoch per seal: the block of the agent's last transfer (0 =
+-- never transferred). A set signed for an earlier epoch is refused, so a set
+-- the agent's earlier owner signed can never be reinstated.
+CREATE TABLE IF NOT EXISTS credential_epochs (
+    seal_id BYTEA PRIMARY KEY,
+    epoch   BIGINT NOT NULL
+);
+-- The container's last reported count of requests waiting for the owner
+-- (signed status reports), and the count last notified, so the owner is
+-- told when it rises, not on every report.
+CREATE TABLE IF NOT EXISTS credential_pending (
+    seal_id          BYTEA PRIMARY KEY,
+    pending          INT NOT NULL DEFAULT 0,
+    notified_pending INT NOT NULL DEFAULT 0,
+    notified_at      TIMESTAMPTZ,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Expiry reminders already sent, one per entry, set version and expiry.
+CREATE TABLE IF NOT EXISTS credential_reminders (
+    seal_id    BYTEA  NOT NULL,
+    name       TEXT   NOT NULL,
+    version    BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    sent_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (seal_id, name, version, expires_at)
+);
+-- Where an owner wants to be told about pending requests (owner-signed).
+CREATE TABLE IF NOT EXISTS credential_notify (
+    owner      BYTEA PRIMARY KEY,
+    email      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
