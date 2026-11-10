@@ -408,6 +408,11 @@ TEEDataVerifier（AccessProof + OwnershipProof 双签名校验）、NonceRegistr
 `attestFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 290
 个 Foundry 测试（28 个测试套件）与部署 / 升级 / Etherscan verify 全套脚本。
 
+**[`docs/credentials.zh.md`](docs/credentials.zh.md) — 凭据管理：实现说明**
+
+用通俗的话说明 agent 怎样不看到 owner 的密钥也能使用：各方各管什么、密钥的四种用法、
+请求与批准、版本、登录、转让和信任边界。先读这篇，再看下面的规格。
+
 **[`sealed/CREDENTIALS.zh.md`](sealed/CREDENTIALS.zh.md) — owner 凭据**
 
 owner 如何把 API key、token、签名密钥和 MCP 登录交给 agent，同时让它们留在
