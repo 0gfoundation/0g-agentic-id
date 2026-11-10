@@ -64,7 +64,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):
-# sealed (root, PID 1) drops the agent process to it so the agent cannot
+# sealed (root, the loader's child) drops the agent process to it so the agent cannot
 # read sealed's memory or bootstrap env. Its home is /home/agent, which
 # sealed creates at boot (agent:agent 0700, privsep.PrepareAgentHome) and
 # which is HOME for everything the agent runs, so its tools' caches and
