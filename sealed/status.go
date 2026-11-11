@@ -220,8 +220,10 @@ func (s *runtimeStatus) SupervisorFailed(message string) {
 	defer s.mu.Unlock()
 	s.supervisorFailure = message
 }
-func (s *runtimeStatus) SupervisorRecovered() {
+func (s *runtimeStatus) SupervisorRecovered() (changed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	changed = s.supervisorFailure != ""
 	s.supervisorFailure = ""
+	return changed
 }

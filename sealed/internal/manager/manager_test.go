@@ -437,10 +437,10 @@ func TestArmState_ProofFieldsFromRuntime(t *testing.T) {
 }
 
 // A reload whose caller's context ends with the call (a settings push, a
-// model key) still leaves the new process supervised: a later crash is
-// restarted.
+// model key) still leaves the new process supervised, by one liveness loop
+// however many reloads ran: a later crash is restarted, once.
 func TestReloadSupervisesBeyondTheCallersContext(t *testing.T) {
-	startCh := make(chan struct{}, 5)
+	startCh := make(chan struct{}, 32)
 	a := &fakeAdapter{
 		startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
 			startCh <- struct{}{}
@@ -448,25 +448,39 @@ func TestReloadSupervisesBeyondTheCallersContext(t *testing.T) {
 		},
 	}
 	m := New(a, state.New(), Config{
-		LivenessProbeInterval: 1 * time.Hour,
+		LivenessProbeInterval: 5 * time.Millisecond,
 		BackoffSeq:            []time.Duration{1 * time.Millisecond},
 		MaxRetries:            3,
 		GracefulStopTimeout:   1 * time.Millisecond,
 	})
+	defer m.Stop(context.Background())
 	if err := m.Start(context.Background(), StartParams{}); err != nil {
 		t.Fatal(err)
 	}
 	<-startCh
-	ctx, cancel := context.WithCancel(context.Background())
-	if err := m.Reload(ctx); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 5; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		if err := m.Reload(ctx); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		<-startCh
 	}
-	cancel()
-	<-startCh
+	time.Sleep(30 * time.Millisecond)
+	if n := m.liveLoops.Load(); n != 1 {
+		t.Fatalf("%d liveness loops after five reloads", n)
+	}
 	a.triggerExit(errors.New("crashed"))
 	select {
 	case <-startCh:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("a crash after a reload under an ended context was not restarted")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if n := len(startCh); n != 0 {
+		t.Fatalf("one crash restarted %d extra times", n)
+	}
+	if n := m.liveLoops.Load(); n != 1 {
+		t.Fatalf("%d liveness loops after the restart", n)
 	}
 }

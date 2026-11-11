@@ -320,7 +320,10 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	onFailed := func(err error) {
 		logger.Logf("FAIL supervisor: max retries exceeded: %v", err)
 		currentStatus.SupervisorFailed("supervisor exhausted retries: " + err.Error())
-		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "supervisor exhausted retries: "+err.Error(), cfg.StatusBinding)
+		// What the status says now: a model key that cannot be used, say,
+		// is why the restarts failed and is shown over this.
+		level, msg := currentStatus.Get()
+		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, msg, cfg.StatusBinding)
 	}
 	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, credRT, credValues, credStore, sealedProxy, onFailed); err != nil {
 		logger.Logf("FAIL agent: %v", err)
@@ -1063,8 +1066,12 @@ func startAgent(
 			switch outcome := pushed.apply(ctx); outcome {
 			case "unchanged":
 				// Whatever recovered the framework (its own restart, a
-				// settings push), the next outage starts the backoff anew.
+				// settings push), the next outage starts the backoff anew,
+				// and a running framework clears a failed restart.
 				retry = 30 * time.Second
+				if agent.Phase() == state.PhaseRunning && currentStatus.SupervisorRecovered() {
+					reportStatus()
+				}
 			case "deferred":
 				again(5 * time.Second)
 			case "stopped", "restart_failed":
@@ -1082,8 +1089,7 @@ func startAgent(
 				}
 			default:
 				retry = 30 * time.Second
-				if agent.Phase() == state.PhaseRunning {
-					currentStatus.SupervisorRecovered()
+				if agent.Phase() == state.PhaseRunning && currentStatus.SupervisorRecovered() {
 					reportStatus()
 				}
 				logger.Logf("OK   model key: applied (%s)", outcome)

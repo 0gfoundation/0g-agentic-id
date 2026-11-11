@@ -141,17 +141,32 @@ type Manager struct {
 	// Stop tears down everything.
 	stopCh chan struct{}
 	once   sync.Once
+
+	// Supervision runs under the manager's own context (base, ended by
+	// Stop), one generation at a time: hookLifecycle ends the previous
+	// generation's liveness loop and makes its exit callback a no-op, so
+	// one loop watches the one process, whoever started it.
+	base       context.Context
+	baseCancel context.CancelFunc
+	lifeMu     sync.Mutex
+	lifeCancel context.CancelFunc
+	lifeGen    atomic.Uint64
+	// liveLoops counts running liveness loops (tests).
+	liveLoops atomic.Int32
 }
 
 // New constructs a Manager. Adapter must already have its Restore calls
 // completed (config in place). cfg is normalized to defaults internally.
 func New(adapter Adapter, agent *state.Agent, cfg Config) *Manager {
 	cfg.applyDefaults()
+	base, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		adapter: adapter,
-		agent:   agent,
-		cfg:     cfg,
-		stopCh:  make(chan struct{}),
+		adapter:    adapter,
+		agent:      agent,
+		cfg:        cfg,
+		stopCh:     make(chan struct{}),
+		base:       base,
+		baseCancel: cancel,
 	}
 }
 
@@ -173,7 +188,7 @@ func (m *Manager) Start(ctx context.Context, params StartParams) error {
 		return err
 	}
 	m.armState(res)
-	m.hookLifecycle(ctx)
+	m.hookLifecycle()
 	logger.Logf("manager: agent armed, supervision active (probe=%s, max_retries=%d)",
 		m.cfg.LivenessProbeInterval, m.cfg.MaxRetries)
 	return nil
@@ -181,7 +196,10 @@ func (m *Manager) Start(ctx context.Context, params StartParams) error {
 
 // Stop terminates supervision and the agent process. Idempotent.
 func (m *Manager) Stop(ctx context.Context) {
-	m.once.Do(func() { close(m.stopCh) })
+	m.once.Do(func() {
+		close(m.stopCh)
+		m.baseCancel()
+	})
 	_ = m.adapter.Stop(ctx, m.cfg.GracefulStopTimeout)
 	m.agent.Clear()
 }
@@ -217,9 +235,9 @@ func (m *Manager) Reload(ctx context.Context) error {
 	}
 	m.armState(res)
 	// Supervision outlives the caller: a reload asked for by a request (a
-	// settings push, a model key) must not leave the new process
-	// unwatched once that request is done.
-	m.hookLifecycle(context.WithoutCancel(ctx))
+	// settings push, a model key) leaves the new process watched once that
+	// request is done (hookLifecycle uses the manager's own context).
+	m.hookLifecycle()
 	logger.Logf("manager: reload complete; back to Running")
 	return nil
 }
@@ -258,7 +276,9 @@ func (m *Manager) armState(res framework.StartResult) {
 }
 
 // hookLifecycle wires up the death watcher + liveness probe for a freshly
-// (re-)started process. Each successful Start replaces the previous hooks.
+// (re-)started process. Each successful Start replaces the previous hooks:
+// the previous generation's liveness loop ends and its exit callback does
+// nothing.
 //
 // Liveness probe is the source of truth for "agent is unreachable". Process
 // exit (cmd.Wait returning) is treated as a hint, not a verdict:
@@ -273,8 +293,20 @@ func (m *Manager) armState(res framework.StartResult) {
 // Without this distinction we race openclaw's self-restart and crashloop the
 // agent (each spawn briefly listens, then exits 0 to hand off to a child we
 // don't track, but our restart preempts it).
-func (m *Manager) hookLifecycle(ctx context.Context) {
+func (m *Manager) hookLifecycle() {
+	m.lifeMu.Lock()
+	if m.lifeCancel != nil {
+		m.lifeCancel()
+	}
+	ctx, cancel := context.WithCancel(m.base)
+	m.lifeCancel = cancel
+	gen := m.lifeGen.Add(1)
+	m.lifeMu.Unlock()
+
 	m.adapter.MonitorExit(func(err error) {
+		if m.lifeGen.Load() != gen {
+			return // a process this generation does not watch
+		}
 		if err != nil {
 			logger.Logf("manager: process exited with error: %v", err)
 			go m.tryRestart(ctx)
@@ -287,6 +319,8 @@ func (m *Manager) hookLifecycle(ctx context.Context) {
 }
 
 func (m *Manager) runLivenessLoop(ctx context.Context) {
+	m.liveLoops.Add(1)
+	defer m.liveLoops.Add(-1)
 	ticker := time.NewTicker(m.cfg.LivenessProbeInterval)
 	defer ticker.Stop()
 	for {
@@ -354,7 +388,7 @@ func (m *Manager) restart(ctx context.Context) {
 		}
 
 		m.armState(res)
-		m.hookLifecycle(ctx)
+		m.hookLifecycle()
 		logger.Logf("manager: restart attempt %d succeeded; back to Running", attempt)
 		return
 	}
