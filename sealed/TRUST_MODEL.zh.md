@@ -598,7 +598,11 @@ payload。socket **没有裸 hash 签名，也没有 EIP-191 version `0x00`
    schema 的 envelope。见 [`AGENT_DOCTRINE.zh.md`](AGENT_DOCTRINE.zh.md)
    §4.1 Refusal 1。最要紧的 framework 渠道是 `chain.Update`：链上
    门槛是 `msg.sender == agentSeal`，而 `/sign/transaction` 会签
-   agent 自己拼的 `update`。
+   agent 自己拼的 `update`。在 0g-harness 下（`framework.SigningRules`），
+   这条渠道不靠钢印：socket 拒签调用 AgenticID `update` 或 `updateAt`
+   的交易（`internal/proxy/signrules.go`）。这对这个合约是完整的：它的
+   门槛是 `msg.sender == agentSeal`，而 socket 不签能把 agentSeal 账户
+   借给别的代码的 EIP-7702 授权。
 
 这就划出了承重墙：
 
@@ -607,7 +611,7 @@ payload。socket **没有裸 hash 签名，也没有 EIP-191 version `0x00`
 | `agent_seal_priv` 不出 TEE | 整套塌，连 Group A 都丢（攻击者线下任意伪造）|
 | **sign socket 永不签裸 hash 或 EIP-191 version `0x00`** | agent 线下伪造 serve-proof 内容（任意 `task_hash` / `data_hashes` / 时间戳 / `submitter`），并为它们铸出 VerifiedFeedbackRegistry 标记（FIND-01）。任何把 socket 桥接成 agent 工具的 adapter 同理 |
 | sealed proxy 控制响应 header | 现在影响很小。proxy 在每条转发路径上都会丢掉上游 backend 设的 `X-Agent-Proof`，客户端看到的这个头总是 runtime 自己的。即便漏过一个，它也只能带 socket 域的签名（验不成 serve-proof），或从别的响应里搬来的真 proof（`task_hash` 对不上这条响应）|
-| **agent 钢印** | socket *能*签的东西上 Group B 失效：`chain.Update`（经 `/sign/transaction` 发 `update` tx）以及 agent 发出的任何 personal_sign / EIP-712 声明。serve-proof 的 Group B 仍机械成立，Group A 在所有渠道上仍成立 |
+| **agent 钢印** | socket *能*签的东西上 Group B 失效：`chain.Update`（经 `/sign/transaction` 发 `update` tx；0g-harness 下 socket 拒签，不在其中）以及 agent 发出的任何 personal_sign / EIP-712 声明。serve-proof 的 Group B 仍机械成立，Group A 在所有渠道上仍成立 |
 
 `report.Status` 和 settings seed 不在这张表里。sealed 在进程内对
 `StatusReport.v2:…` / `SettingsSeed:…` 做裸 keccak256 后签名，而 socket
@@ -660,15 +664,13 @@ framework 自动签名以外，agent 自己也会通过 unix socket
 - 作为 agentSeal 签 EIP-712 结构化数据（Permit、Seaport 等）
 - 作为 agentSeal 发链上交易
 
-在 0g-harness 的组合里，`seal-guard.mjs` 通过拒绝同时点名 socket 拼法和
-`/sign/` 路径的 tool 调用，把模型引向原生工具
-（`seal_sign`、`seal_sign_typed_data`、`seal_sign_transaction` ——
-每个端点一个工具，每次调用都是一条结构化的 session log 记录）。
-socket 的其它端点——`/settings` 和 `/services`——刻意不在守卫范围：
-平台文档明说 agent 可以 curl `/settings`（没有覆盖读取的结构化工
-具），而且两者都不签任何东西。
-这是引导而非强制：其它间接写法仍可绕开，session log 也不是
-防篡改的。其它框架则按各自组合允许的方式到达 socket。
+在 0g-harness 下，sealed 记录 socket 签出的每个签名和规则拒绝的每个请求，
+记录在 agent 够不着的地方（`internal/proxy/signlog.go`），owner 经
+`GET /_seal/signatures` 读取。不管 agent 用哪种方式到达 socket 都会记下，
+所以不需要把 agent 引向某一种方式。socket 的端点在那里也是 MCP 工具
+（socket 上的 `POST /mcp`），由 harness 注册成原生工具；每个工具都经过
+对应端点，签名、拒绝、记录与端点完全一样。其它框架按各自组合允许的方式
+到达 socket，不做记录。
 
 socket 按不变量**永不**签的东西（`sealed/internal/proxy/sign.go`）：
 
@@ -681,7 +683,8 @@ EIP-712 digest、或 socket 从字段组装的交易上。sealed 自己在进程
 签名里，只有三种在这几种形状之外：`report.Status` 和 settings seed 是裸
 keccak256 digest，serve-proof 是 `0x00`。`chain.Update` 不在其外：它是
 普通交易，跟 `/sign/transaction` 产出的形状相同，签名域分不开这两者——
-所以这条渠道靠的是钢印（见上面的承重墙表）。
+所以这条渠道靠的是钢印（见上面的承重墙表）；在 0g-harness 下由 socket
+自己拒签（`internal/proxy/signrules.go`）。
 把 socket 桥接成 agent 工具的 adapter（例如 0g-harness 的 `seal_sign`）
 不得补上这两条缺失的路径。
 

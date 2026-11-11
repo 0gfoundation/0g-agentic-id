@@ -62,6 +62,14 @@ type RuntimeSnapshot struct {
 	// §6.2) to the sovereignty section. Set by adapters that declare it
 	// (0g-harness).
 	RefuseExport bool
+	// SealTools says the framework offers the runtime's MCP tools (the sign
+	// socket's server `seal`, and `seal-reveal` when credentials are on), so
+	// the doc names them next to the socket endpoints.
+	SealTools bool
+	// SigningRules says the sign socket holds the agent to the runtime's
+	// signing rules and record (framework.SigningRules), so the doc states
+	// them in place of the doctrine-only wording.
+	SigningRules bool
 }
 
 // PlatformContext is the complete set of sections sealed injects into
@@ -201,14 +209,14 @@ func buildCapabilities(rs RuntimeSnapshot) string {
 
 	// Signing mechanics
 	if rs.SealSignSock != "" && rs.AgentSeal != "" {
-		b.WriteString(buildSigningSection(rs.SealSignSock))
+		b.WriteString(buildSigningSection(rs.SealSignSock, rs.SealTools, rs.SigningRules))
 		b.WriteString("### Your current settings\n\n")
 		b.WriteString("Read the settings currently adopted by this runtime with `curl --unix-socket \"$SEAL_SIGN_SOCK\" http://localhost/settings`. The response includes provider, model, thinking, and the managed route's base_url, format, registry_version and route_hash. Native framework routes omit base_url. It contains no API key and does not read the owner's pending configuration from the attestor.\n\n")
 		b.WriteString("You may POST `{\"thinking\":\"high\"}` (low, high or max) to the same socket endpoint for a temporary change. It restarts the framework process and interrupts the current task. The change lasts until a container restart or an owner settings push. Provider, model and routing changes require the owner's settings/reset channel. Do not edit framework configuration files to make these changes.\n\n")
 	}
 
 	if rs.CredSock != "" {
-		b.WriteString(buildCredentialsSection())
+		b.WriteString(buildCredentialsSection(rs.SealTools))
 	}
 
 	// Public URL + service exposure
@@ -219,7 +227,7 @@ func buildCapabilities(rs RuntimeSnapshot) string {
 	return b.String()
 }
 
-func buildSigningSection(signSock string) string {
+func buildSigningSection(signSock string, tools, rules bool) string {
 	var b strings.Builder
 	b.WriteString("### Signing as agentSeal\n\n")
 	b.WriteString("Your runtime identity (agentSeal) and the trust chain backing it are defined in the injected identity section. The rules governing what you will and will not sign — and why — are in the injected sovereignty section. Read both before requesting a signature.\n\n")
@@ -233,14 +241,25 @@ func buildSigningSection(signSock string) string {
 	b.WriteString("  Returns: `{\"signature\", \"address\", \"digest\"}`.\n\n")
 	b.WriteString("- `/sign/transaction` — sign a chain transaction (returns raw signed RLP hex; you broadcast it through any RPC endpoint you choose).\n")
 	b.WriteString("  Body: `{chain_id, nonce, to, value, data, gas_limit, max_fee_per_gas, max_priority_fee_per_gas, type}` (type defaults to `\"dynamic\"` for EIP-1559; use `\"legacy\"` with `gas_price` for legacy chains).\n")
-	b.WriteString("  Returns: `{\"raw_tx\", \"tx_hash\", \"address\", \"signature\"}`. Never use this endpoint for AgenticID update/updateAt on your own token — that is the drift watcher's reserved channel.\n\n")
+	if rules {
+		b.WriteString("  Returns: `{\"raw_tx\", \"tx_hash\", \"address\", \"signature\"}`. The socket refuses a call to AgenticID update/updateAt: that is the drift watcher's reserved channel.\n\n")
+	} else {
+		b.WriteString("  Returns: `{\"raw_tx\", \"tx_hash\", \"address\", \"signature\"}`. Never use this endpoint for AgenticID update/updateAt on your own token — that is the drift watcher's reserved channel.\n\n")
+	}
 	b.WriteString("These are the only three shapes the socket signs: an EIP-191 `0x19 0x45` personal message, an EIP-712 `0x19 0x01` digest, or a transaction it assembles from the fields. It has no raw-hash signing and no EIP-191 version `0x00` (intended-validator) signing, by design: that is the domain your serve-proofs are signed in, so nothing you sign here can stand in for one.\n\n")
 	b.WriteString("Example (curl over unix socket):\n\n")
 	b.WriteString("    curl --unix-socket \"$SEAL_SIGN_SOCK\" \\\n")
 	b.WriteString("      -H 'Content-Type: application/json' \\\n")
 	b.WriteString("      -d '{\"message\":\"hello\"}' \\\n")
 	b.WriteString("      http://localhost/sign/personal_sign\n\n")
-	b.WriteString("If your framework's tool list includes native sign tools, prefer them: a native tool call lands in the session log as a structured record, while a shell command is an opaque string. If it does not, the curl route above is the documented way to reach the socket — the socket is the capability, the tool is just the preferred channel.\n\n")
+	if rules {
+		b.WriteString("The runtime keeps a record of every signature this socket makes and every request it refuses, and your owner can read it, whichever way you reach the socket.\n\n")
+	} else {
+		b.WriteString("If your framework's tool list includes native sign tools, prefer them: a native tool call lands in the session log as a structured record, while a shell command is an opaque string. If it does not, the curl route above is the documented way to reach the socket — the socket is the capability, the tool is just the preferred channel.\n\n")
+	}
+	if tools {
+		b.WriteString("These endpoints are also tools in your tool list, from the runtime's MCP server `seal` (your framework may put a prefix before each name, as in `seal__seal_sign`): `seal_sign`, `seal_sign_typed_data`, `seal_sign_transaction`, `seal_services`, `seal_register_service`, `seal_settings` and `seal_set_thinking`. A tool does what its endpoint does; use whichever is at hand.\n\n")
+	}
 	b.WriteString("### When to use agentSeal\n\n")
 	b.WriteString("- A contract caller / verifier requires `msg.sender == AGENT_SEAL` or checks an EIP-712 signature against `AGENT_SEAL`.\n")
 	b.WriteString("- You need an off-chain claim that a third party can verify came from a legitimate TEE runtime (not just \"the agent says so\").\n")
@@ -251,7 +270,7 @@ func buildSigningSection(signSock string) string {
 	return b.String()
 }
 
-func buildCredentialsSection() string {
+func buildCredentialsSection(tools bool) string {
 	var b strings.Builder
 	b.WriteString("### Credentials your owner gave you\n\n")
 	b.WriteString("Your owner can store credentials for you (API keys, tokens). The runtime keeps the values; you use them by name. Where a key belongs in a request, write the placeholder `[[credential:<name>]]` (an entry derived from a token request is `[[credential:derived:<name>]]`). The runtime replaces it on the way out, only for the hosts and request positions the owner allowed for that entry (a header, the basic-auth password, a query parameter, a path segment, or a top-level JSON or form field), and removes the value from the response. In a body, the placeholder is the whole value of a top-level field, written as it is (`-d 'token=[[credential:<name>]]'`); the rest of a form body is url-encoded. Anywhere else the request is refused with an `X-Seal-Credential-Error` header naming why. A request carrying a credential never follows a redirect.\n\n")
@@ -263,6 +282,9 @@ func buildCredentialsSection() string {
 	b.WriteString("- `POST /credentials/request` `{\"op\": \"add\" | \"login\", \"name\", \"preset\"?, \"url\"?, \"reason\"}` — ask your owner for a credential you do not have (`add`), or to log you in to the MCP server at `url` (`login`). Returns 202 with an `auth_req_id`. Your owner is shown the request in their own session (or emailed) and answers it there: an `add` by setting the credential, a `login` by logging in in their browser. Say in a sentence what you asked for and why, then end your turn; once they have answered you are told, and the entry is in `GET /credentials`. Do not guess where or how your owner decides.\n")
 	b.WriteString("- `POST /credentials/sign` `{\"name\", \"personal_sign\" | \"typed_data\" | \"transaction\"}` — sign with a wallet entry; returns the signature, never the key. The value under the key is the same body the sign socket takes, for example `{\"name\": \"wallet\", \"personal_sign\": {\"message\": \"hello\"}}`.\n")
 	b.WriteString("- `GET /events?after=<seq>&wait=30` — waits for changes (an entry added or removed, a request decided).\n\n")
+	if tools {
+		b.WriteString("The same endpoints are tools from the `seal` server: `seal_credentials`, `seal_credential_token`, `seal_credential_request`, `seal_credential_sign` and `seal_credential_delete` (for derived entries); reveal below is `seal_credential_reveal`, from the server `seal-reveal`.\n\n")
+	}
 	b.WriteString("Signing entries (`use: sign`) are never written into a request; the runtime signs with them. The list shows each one's `signer`. For `sigv4` (AWS) give your AWS tool the entry's `access_key_id` and the placeholder as its secret: the runtime signs the request again with the real key on its way to the entry's hosts. For `sigv4` or `hmac` on a request you build yourself, add the header `X-Seal-Sign: <name>` and the runtime signs it. A `jwt` entry's placeholder stands for a freshly minted token wherever the entry allows it, including in its own token request.\n\n")
 	b.WriteString("An MCP server your owner logged you in to is an entry whose hosts are that server's: configure the server in your MCP client with the header `Authorization: Bearer [[credential:<name>]]`. The runtime keeps the login and refreshes its token; you never handle either.\n\n")
 	b.WriteString("Example:\n\n")
@@ -305,7 +327,7 @@ func buildPublicURLSection(publicURL string) string {
 // These are facts about sealed's behavior, not rules the agent enforces
 // (enforcement is sealed's job via the watcher + reconciler).
 
-func buildConstraints(_ RuntimeSnapshot) string {
+func buildConstraints(rs RuntimeSnapshot) string {
 	var b strings.Builder
 	b.WriteString("### Runtime constraints\n\n")
 	b.WriteString("You are not a standalone process. The sealed runtime manages your lifecycle and enforces constraints you must be aware of when advising your owner:\n\n")
@@ -313,7 +335,11 @@ func buildConstraints(_ RuntimeSnapshot) string {
 	// Drift auto-commit. Framework-specific constraints (version
 	// whitelist, config-hash semantics, tracked-path layout) are the
 	// ADAPTER's to author and inject alongside this section.
-	b.WriteString("**Drift auto-commit.** Your chain-persistent paths (listed in the injected persistent-state notes) are monitored by a 30s watcher tick. Changes are automatically encrypted, uploaded to 0G Storage, and anchored on the AgenticID contract via a signed `Update` transaction from agentSeal. You do not control when this happens — sealed does it for you. **Never sign an AgenticID update/updateAt transaction for your own token yourself** (through the sign socket or its tools): iData writes are the watcher's reserved channel — it signs them from its own verified state, and a self-signed update would race the watcher and corrupt the chain snapshot. If the chain transaction fails (e.g. insufficient gas), sealed classifies it as `warning` severity and reports to attestor immediately.\n\n")
+	selfUpdate := "(through the sign socket or its tools)"
+	if rs.SigningRules {
+		selfUpdate = "(the sign socket refuses it, and its tools with it)"
+	}
+	b.WriteString("**Drift auto-commit.** Your chain-persistent paths (listed in the injected persistent-state notes) are monitored by a 30s watcher tick. Changes are automatically encrypted, uploaded to 0G Storage, and anchored on the AgenticID contract via a signed `Update` transaction from agentSeal. You do not control when this happens — sealed does it for you. **Never sign an AgenticID update/updateAt transaction for your own token yourself** " + selfUpdate + ": iData writes are the watcher's reserved channel — it signs them from its own verified state, and a self-signed update would race the watcher and corrupt the chain snapshot. If the chain transaction fails (e.g. insufficient gas), sealed classifies it as `warning` severity and reports to attestor immediately.\n\n")
 
 	return b.String()
 }

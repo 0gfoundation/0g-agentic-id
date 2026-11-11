@@ -268,8 +268,15 @@ updates need none.
    network layer blocking the harness from connecting out directly (§9).
 4. **Signing**: the sign socket signs three formats only: personal_sign, EIP-712
    and transactions. It never signs raw hashes and cannot sign in the ServeProof
-   domain. What it may sign within those formats is the signing policy (§9,
-   item 4).
+   domain. Within those formats it refuses a transaction to AgenticID `update`
+   or `updateAt` (the drift watcher commits iData), and it records every
+   signature it makes and every request it refuses, for the owner to read.
+   What else it may sign is the signing policy (§9, item 4).
+
+The sign socket's and the credential socket's endpoints are also MCP tools
+(`POST /mcp` on the sockets). The tools are defined in sealed and run through
+the endpoints, so the harness mounts them and adds nothing to what the sockets
+allow.
 
 ### 4.3 Rules sealed enforces
 
@@ -286,7 +293,9 @@ the harness runs only official versions, they can ship on their own (§8):
 3. Which interfaces are reachable from outside: the adapter lists the routes
    and methods, and sealed lets only those through. An interface the harness
    adds on its own is not reachable.
-4. What may be signed: the signing policy (§9, item 4).
+4. What may be signed: sealed refuses AgenticID `update` / `updateAt` and
+   records every signature and refusal; the rest is the signing policy (§9,
+   item 4).
 
 Matching plugins inside the harness may stay, but only as conveniences, not as
 boundaries.
@@ -719,13 +728,15 @@ exists at all (§9, item 5).
 
 ### The other three frameworks are unaffected
 
-The four frameworks are four separate images, but each image's sealed is built
-from the same source with all four adapters, and the attestor, SDK, attestor
+The four frameworks are four separate images, and each image's sealed is built
+from the same source: the 0g-harness image's with its own adapter alone (the
+`harnessonly` build tag), the other three with all four. The attestor, SDK, attestor
 console and `verify-agent.sh` are shared by all four. The other three are
 therefore unaffected provided that:
 - step one's inference proxy, doctrine injection, token handling, exact routes,
-  no-export rule and service field caps, and ServeProof v2, take effect only
-  where an adapter declares them, and only the 0g-harness adapter does;
+  no-export rule and service field caps, the sign socket's rule and record, the
+  runtime's tools, and ServeProof v2, take effect only where an adapter
+  declares them, and only the 0g-harness adapter does;
 - ServeProof v1's format and verification and the registry's v1 entry point
   stay unchanged;
 - the attestor checks `validSealedHashes` only for containers that report a
@@ -746,9 +757,10 @@ therefore unaffected provided that:
    proxy, which needs a test of whether the container allows it.
 3. Whether to filter responses for verbatim iData.
 4. Signing policy: what may be signed within the three formats. Today the socket
-   signs anything, and only the doctrine guides the model; harness code can call
-   the sign socket without the model, so sealed needs rules by transaction
-   target, method, value and signing domain.
+   signs anything but AgenticID `update` / `updateAt`, and records what it
+   signs; only the doctrine guides the model. Harness code can call the sign
+   socket without the model, so sealed needs rules by transaction target,
+   method, value and signing domain.
 5. Whether to support harness self-update: it amounts to deploying an
    owner-defined program inside the sealed environment (§8).
 

@@ -67,8 +67,9 @@ sealed 的五个组件各自通过一个窄切面消费它:
 `chain`、`platform`。
 
 - **adapter 选择由 binding 驱动**:adapter 在自己的 `New()` 里
-  `framework.Register` 自注册;`main.go` 注册所有随二进制打包的
-  adapter,Phase 2 解密完 iData 后按**链上 framework binding 的
+  `framework.Register` 自注册;`main.go` 注册这次编译打包的所有
+  adapter(`adapters.go`;0g-harness 镜像用 `harnessonly` 标签编译,只打包
+  它自己的,见 `adapters_harnessonly.go`),Phase 2 解密完 iData 后按**链上 framework binding 的
   `name`** 选出激活的那个——决定"哪个框架解释这份 iData"的是 agent
   被 mint 的身份,不是部署配置。`AGENT_FRAMEWORK` env 只是链上无
   binding 时的 fallback(本地 dev);两者都在且不一致时 binding 赢,
@@ -98,7 +99,9 @@ sealed 的五个组件各自通过一个窄切面消费它:
   `Roles()` 毫无关系。
 
   **跑哪个 adapter 仍然与镜像无关** —— 那是链上 binding 决定的(见上面
-  §2.1),每个镜像里的 sealed 二进制都注册了全部 adapter。但镜像必须真的
+  §2.1),除 0g-harness 外每个镜像里的 sealed 二进制都注册了全部 adapter
+  (0g-harness 镜像只注册它自己的,所以 binding 指向别的框架时,在选 adapter
+  那一步就会失败)。但镜像必须真的
   **带着**被选中 adapter 所需的运行时,而**这个配对没有任何校验**:binding
   指向一个运行时缺失的框架,容器会正常起来然后在 Start 阶段失败。所以部署
   非默认镜像时必须显式传 `sealedImage`。
@@ -145,6 +148,8 @@ sealed 的五个组件各自通过一个窄切面消费它:
 | `BearerTranslator` | `TranslateBearer(token) (frameworkToken string, ok bool)` | proxy,在 `Auth` 为 `bearer` 的路由上:只转发带 owner token 的请求,并把它换成框架自己的 token,框架看不到 owner 的 token。`AuthResponse` 这时交给 owner 的是 owner 的 token,不是框架的 | `AuthResponse` 返回的 token 原样转发 |
 | `PlaintextCommitter` | `CommitsPlaintext() bool` | uploader:上传的每个条目都在 `dataDescription` 里带一个对明文的加盐 sha256 承诺(`LAYERS.zh.md` §7.1) | 没有承诺 |
 | `ServiceFieldLimiter` | `ServiceFieldLimits() (description, inputExample int)` | proxy,注册服务时:描述或输入示例超长(按字节)就拒绝 | 不限长度 |
+| `SigningRules` | `AppliesSigningRules() bool` | 签名 socket:拒签发往 AgenticID `update` / `updateAt` 的交易(drift watcher 的通道),并把每个签名和拒绝记下来给 owner(`GET /_seal/signatures`)。同时设置 `RuntimeSnapshot.SigningRules`,让 agent 文档写明。只有 0g-harness | socket 在三种格式内照签,不做记录;`/_seal/signatures` 返回 404 |
+| `RuntimeTools` | `ServesRuntimeTools() bool` | 签名 socket 和交出 socket:`POST /mcp` 把它们的端点(以及凭据 socket 的端点)作为 MCP 工具提供,由你的框架从 `tools/list` 注册、用 `tools/call` 回调。同时设置 `RuntimeSnapshot.SealTools`,让 agent 文档列出它们。只有 0g-harness(它的 `seal-tools` 插件) | `/mcp` 返回 404 |
 | `LayeredRuntime` | `UseHarness(hash, dir)`、`HarnessHash()`、`InferenceTarget()` | bootstrap 和 `layered.go`:`Start` 运行哪个 harness 包、按 attestor 的目标换包,以及 serve-proof v2(`LAYERS.zh.md` §5、§7)。只有 0g-harness | 运行镜像安装的框架;serve-proof 仍是 v1 |
 
 实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
@@ -720,7 +725,7 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
   agent 的教义里*(见 [AGENT_DOCTRINE.zh.md](AGENT_DOCTRINE.zh.md));
   你的 adapter 应该装一套等价于 openclaw SOUL 规则的东西,让来自外部
   prompt 的签名请求被拒绝。如果你的 adapter 把 socket 桥接成 agent
-  工具(像 0g-harness 的 `seal_sign` 那样),它只能转发到这几个端点,**绝不**
+  工具(像 0g-harness 的 `seal-tools` 挂载运行时的 MCP 工具那样),它只能转发到这几个端点,**绝不**
   能加裸 hash 或 `0x00` 签名路径。任何一条都会让 agent 能伪造
   serve-proof。
 - **`/log`、`/log.html`、`/log/agent`(`.html`)** ——bootstrap 和
@@ -824,7 +829,7 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
 
 1. 在 `internal/framework/<yourfw>/` 实现 `framework.Framework` +
    `MonitorExit`,在你的 `New()` 里 `framework.Register` 自注册;在
-   `main.go` 加一行注册。CLI 型框架照 git 历史里已下线的
+   `adapters.go` 加一行注册。CLI 型框架照 git 历史里已下线的
    `claudecode/`(内嵌 bridge 模式,另见 §12 的下线原因),服务型框架
    照 `openclaw/`。
 2. 声明你的 role 集,包括保留的 `framework` leaf(含空版本 →
@@ -1333,8 +1338,8 @@ skill、推理 pin),跟 openclaw、hermes 追踪的是同一个面;DSH 自己的
 因为 harness 进程里那个 `Agent` 对象本来就长期存活,一句普通的后续消息就已经
 能接上同一个 turn 的上下文,不需要另开一条应答通道。
 
-**进程那一半。**0g-harness(连同平台插件 `seal-tools`、`seal-guard`、
-`subagent-guard`)在进程内组出整棵插件树——不走 loader、不走 profile、不吃
+**进程那一半。**0g-harness(连同平台插件 `seal-tools`、`subagent-guard`)
+在进程内组出整棵插件树——不走 loader、不走 profile、不吃
 `$DSH_HOME` 的任何 patch 层;0g-harness 镜像在构建时装一个确定版本的 harness,依赖树
 锁定,所以组合跟着镜像哈希走,agent 改自己家目录也改不动下次启动挂什么。harness
 常驻一个 `Agent` 对象,owner 的轮次一次跑一个,每一轮的输出交给开启这一轮的一方:

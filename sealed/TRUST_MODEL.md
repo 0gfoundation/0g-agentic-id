@@ -709,7 +709,13 @@ different ways:
    [`AGENT_DOCTRINE.md`](AGENT_DOCTRINE.md) §4.1 Refusal 1. The
    framework channel where this matters most is `chain.Update`: the
    on-chain gate is `msg.sender == agentSeal`, and `/sign/transaction`
-   will sign an `update` the agent assembles itself.
+   will sign an `update` the agent assembles itself. Under 0g-harness
+   (`framework.SigningRules`) that channel is not left to doctrine: the
+   socket refuses a transaction that calls AgenticID `update` or
+   `updateAt` (`internal/proxy/signrules.go`). That covers the contract:
+   its gate is `msg.sender == agentSeal`, and the socket signs no
+   EIP-7702 authorization that would lend agentSeal's account to other
+   code.
 
 That marks out the **load-bearing wall**:
 
@@ -718,7 +724,7 @@ That marks out the **load-bearing wall**:
 | `agent_seal_priv` stays inside TEE | Whole thing collapses, Group A goes with it (attacker forges arbitrary signatures offline) |
 | **Sign socket never signs raw hashes or EIP-191 version `0x00`** | The agent forges serve-proof contents offline (any `task_hash` / `data_hashes` / timestamps / `submitter`) and mints VerifiedFeedbackRegistry marks for them (FIND-01). The same holds for any adapter that bridges the socket into an agent tool |
 | sealed proxy controls response headers | Little, now. The proxy drops any `X-Agent-Proof` an upstream backend sets, on every relay path, so the header a client sees is the runtime's own. Even one that got through could carry only socket-domain signatures, which don't verify as serve-proofs, or a genuine proof lifted from another response, whose `task_hash` won't match this one |
-| **Agent doctrine** | Group B fails on what the socket *can* sign: `chain.Update` (an `update` tx via `/sign/transaction`) and any personal_sign / EIP-712 claim the agent issues. The serve-proof's Group B still holds mechanically, and Group A holds on every channel |
+| **Agent doctrine** | Group B fails on what the socket *can* sign: `chain.Update` (an `update` tx via `/sign/transaction`; not under 0g-harness, where the socket refuses it) and any personal_sign / EIP-712 claim the agent issues. The serve-proof's Group B still holds mechanically, and Group A holds on every channel |
 
 `report.Status` and the settings seed are not on that list. sealed signs
 them in-process as a raw keccak256 over `StatusReport.v2:…` /
@@ -783,16 +789,15 @@ the unix socket (`/sign/personal_sign`, `/sign/typed_data`,
 - Sign EIP-712 structured data (Permit, Seaport, etc.) as agentSeal
 - Send chain transactions as agentSeal
 
-In the 0g-harness composition, `seal-guard.mjs` steers the model toward the
-native tools (`seal_sign`, `seal_sign_typed_data`,
-`seal_sign_transaction` — one per endpoint, every call a structured
-session-log record) by denying tool calls that name a socket spelling
-AND a `/sign/` path. The socket's other endpoints — `/settings` and
-`/services` — are deliberately NOT guarded: the platform doc tells the
-agent to curl `/settings` (no structured tool covers reads), and neither
-signs anything. That is a steer, not an enforcement: other indirections
-still get past it, and the session log is not tamper-evident. The other
-frameworks reach the socket however their own composition allows.
+Under 0g-harness, sealed records every signature the socket makes, and every
+request a rule refuses, out of the agent's reach
+(`internal/proxy/signlog.go`); the owner reads the record over
+`GET /_seal/signatures`. It holds whichever way the agent reaches the socket,
+so nothing steers the agent toward one channel. The socket's endpoints are
+also MCP tools there (`POST /mcp` on the socket), which the harness registers
+as native tools; each runs through its endpoint, so it signs, refuses and
+records exactly as the endpoint does. The other frameworks reach the socket
+however their own composition allows, and keep no record.
 
 What the socket **never** signs, by invariant (`sealed/internal/proxy/sign.go`):
 
@@ -807,7 +812,8 @@ those shapes: `report.Status` and the settings seed are raw keccak256
 digests, and the serve-proof is `0x00`. `chain.Update` does not: it is an
 ordinary transaction, the same shape `/sign/transaction` produces, so the
 signing domain does not separate the two — which is why that channel
-relies on doctrine (the load-bearing-wall table above). An adapter that
+relies on doctrine (the load-bearing-wall table above), or, under 0g-harness,
+on the socket refusing the call (`internal/proxy/signrules.go`). An adapter that
 bridges the socket into an agent tool (for example 0g-harness's `seal_sign`)
 must not add either missing path.
 

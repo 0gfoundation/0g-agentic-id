@@ -40,7 +40,7 @@ import (
 //
 // This set is an allowlist on purpose. The composition also carries the
 // platform's OWN decisions — the sandbox policy mode, the spine invariant
-// checks, the filesystem root, seal-tools/seal-guard — and those are not
+// checks, the filesystem root, seal-tools — and those are not
 // owner business: they are the part of the boundary the image hash attests.
 //
 // `workspaceContext` was in this set and is NOT any more. It mounts the

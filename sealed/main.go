@@ -45,10 +45,6 @@ import (
 	"seal-verify/internal/credproxy"
 	"seal-verify/internal/dataplane"
 	"seal-verify/internal/framework"
-	"seal-verify/internal/framework/harness"
-	"seal-verify/internal/framework/hermes"
-	"seal-verify/internal/framework/openclaw"
-	"seal-verify/internal/framework/prime"
 	"seal-verify/internal/inference"
 	"seal-verify/internal/layers"
 	"seal-verify/internal/logger"
@@ -109,26 +105,11 @@ type storageDescription struct {
 }
 
 func main() {
-	// Register every bundled adapter (side-effect of New()). Which one this
-	// deployment actually uses is resolved AFTER the chain bootstrap, from
-	// the on-chain framework binding (see resolveAdapter); registration is
-	// cheap and touches no disk.
-	//
-	// openclaw, hermes and prime-agent ship today. The adapter interface +
-	// platform seam are framework-agnostic (see FRAMEWORK_ADAPTER.md); a
-	// claude-code adapter was prototyped to validate the seam and retired — a
-	// per-request CLI couldn't host owner-built public services, the shape
-	// this platform is for. That port's lessons live on as a case study in
-	// the doc.
-	//
-	// prime-agent needs a node+python image (its runtime is TypeScript over a
-	// Python IPython kernel); registration is harmless on an image without
-	// them, since selection is per-agent and an unusable adapter simply never
-	// gets picked.
-	openclaw.New()
-	hermes.New()
-	prime.New()
-	harness.New()
+	// Register the adapters this build bundles (adapters.go, or
+	// adapters_harnessonly.go for the 0g-harness image). Which one this
+	// deployment uses is resolved after the chain bootstrap, from the
+	// on-chain framework binding (resolveAdapter).
+	registerAdapters()
 
 	// agent_seal_priv lives only in this process's memory: make it
 	// non-dumpable before anything else runs, so no sibling process can
@@ -182,6 +163,12 @@ func main() {
 	//   before provision completes; handlers return 503 until agent_seal_priv
 	//   is loaded into state.Agent.
 	sealedProxy := proxy.New(agent, cfg.PublicURL)
+	// For an adapter that declares framework.SigningRules (0g-harness), what
+	// the sign socket signs is recorded for the owner and it does not sign
+	// AgenticID's iData writes (the watcher's); both are set up before it
+	// listens.
+	sealedProxy.EnableSignLog()
+	sealedProxy.SetAgenticID(cfg.ContractAddr)
 	sealedProxy.Listen()
 	sealedProxy.ListenInternal(sealSignSockPath)
 	if cfg.APIKey != "" {

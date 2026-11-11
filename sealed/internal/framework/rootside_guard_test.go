@@ -1072,17 +1072,79 @@ func TestMainWiresBootHardening(t *testing.T) {
 		t.Errorf("main() logs (line %d) before privsep.Harden (line %d), which settles the time zone that first log line reads", first.Line, harden.Line)
 	}
 	// The adapters register, and so declare their trees, before Harden
-	// reclaims root's home.
+	// reclaims root's home: main() calls registerAdapters first, which
+	// registers every adapter in the default build (adapters.go) and the
+	// 0g-harness adapter alone in the 0g-harness image's (harnessonly) build.
+	reg := findPlainCall(t, s, "registerAdapters")
+	switch {
+	case reg.Line == 0:
+		t.Fatal("main() does not call registerAdapters")
+	case reg.Line > harden.Line:
+		t.Errorf("registerAdapters (line %d) must run before privsep.Harden (line %d): the adapters declare the trees Harden leaves in root's home", reg.Line, harden.Line)
+	}
+	all := registeredIn(t, s, "adapters.go")
 	for _, pkg := range adapterPackages {
-		name := filepath.Base(pkg)
-		reg := findPackageCall(t, s, name, "New")
-		switch {
-		case reg.Line == 0:
-			t.Errorf("main() does not register %s (%s.New)", pkg, name)
-		case reg.Line > harden.Line:
-			t.Errorf("%s.New (line %d) must run before privsep.Harden (line %d): it declares the trees Harden leaves in root's home", name, reg.Line, harden.Line)
+		if name := filepath.Base(pkg); !all[name] {
+			t.Errorf("adapters.go does not register %s (%s.New)", pkg, name)
 		}
 	}
+	if only := registeredIn(t, s, "adapters_harnessonly.go"); len(only) != 1 || !only["harness"] {
+		t.Errorf("adapters_harnessonly.go registers %v, want the 0g-harness adapter alone", only)
+	}
+}
+
+// findPlainCall finds, in main(), the first call to the package-level
+// function fn of package main.
+func findPlainCall(t *testing.T, s *moduleScan, fn string) token.Position {
+	t.Helper()
+	f, err := parser.ParseFile(s.fset, filepath.Join(moduleRoot(t), "main.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pos token.Position
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "main" || fd.Recv != nil {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && pos.Line == 0 {
+				if id, ok := call.Fun.(*ast.Ident); ok && id.Name == fn {
+					pos = s.fset.Position(call.Pos())
+				}
+			}
+			return true
+		})
+	}
+	return pos
+}
+
+// registeredIn lists the packages whose New() the registerAdapters function
+// in file (of package main) calls.
+func registeredIn(t *testing.T, s *moduleScan, file string) map[string]bool {
+	t.Helper()
+	f, err := parser.ParseFile(s.fset, filepath.Join(moduleRoot(t), file), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]bool{}
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "registerAdapters" || fd.Recv != nil {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if se, ok := call.Fun.(*ast.SelectorExpr); ok && se.Sel.Name == "New" {
+					if x, ok := se.X.(*ast.Ident); ok {
+						out[x.Name] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	return out
 }
 
 // findPackageCall finds, in main(), the first call to pkg.fn (to any

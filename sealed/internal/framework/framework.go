@@ -301,6 +301,24 @@ type ServiceFieldLimiter interface {
 	ServiceFieldLimits() (description, inputExample int)
 }
 
+// SigningRules is implemented by adapters whose agents the sign socket holds
+// to the runtime's signing rules (sealed/LAYERS.md §4.3): it refuses a
+// transaction to AgenticID update or updateAt, the drift watcher's channel,
+// and records every signature it makes and every request it refuses, for
+// the owner to read (GET /_seal/signatures). Without it the socket signs as
+// it always has, and keeps no record.
+type SigningRules interface {
+	AppliesSigningRules() bool
+}
+
+// RuntimeTools is implemented by adapters whose framework mounts the
+// runtime's tools: the agent sockets serve their endpoints as MCP tools on
+// POST /mcp (internal/sealmcp), and the framework registers them. Without it
+// /mcp is not served.
+type RuntimeTools interface {
+	ServesRuntimeTools() bool
+}
+
 // LayeredRuntime is implemented by adapters whose framework runs as a
 // harness official version package, picked by hash (sealed/LAYERS.md §5;
 // only 0g-harness). sealed tells the adapter which unpacked package to run;

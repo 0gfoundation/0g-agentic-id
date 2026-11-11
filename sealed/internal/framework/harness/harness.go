@@ -62,9 +62,10 @@
 //	spawn.go        Start/Stop/probes + the harness lifecycle and the routes
 //	                it advertises
 //
-// The harness itself, with its platform plugins (seal-tools, seal-guard,
-// subagent-guard), lives in github.com/0gfoundation/0g-harness; the image
-// installs a pinned version of it (images/harness/Dockerfile).
+// The harness itself, with its platform plugins (seal-tools, which registers
+// the runtime's tools, and subagent-guard), lives in
+// github.com/0gfoundation/0g-harness; the image installs a pinned version of
+// it (images/harness/Dockerfile).
 package harness
 
 import (
@@ -100,6 +101,8 @@ var (
 	_ framework.PlaintextCommitter  = (*Adapter)(nil)
 	_ framework.BearerTranslator    = (*Adapter)(nil)
 	_ framework.ServiceFieldLimiter = (*Adapter)(nil)
+	_ framework.SigningRules        = (*Adapter)(nil)
+	_ framework.RuntimeTools        = (*Adapter)(nil)
 )
 
 // Adapter is the 0g-harness implementation of framework.Framework.

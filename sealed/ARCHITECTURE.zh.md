@@ -14,7 +14,7 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 | attestor | sandbox 起来后向 attestor 发起 RA，换 `agent_seal_priv`。详见 [`attestor/`](../attestor/README.zh.md) |
 | AgenticID 合约 | 读 `intelligentDatasOf` / `sealedKeysOf`、签 `update` tx 把演化推上链 |
 | 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 下载，通过同一 client 的 Go SDK 在进程内上传（`internal/dataplane/upload.go`），签名密钥从不离开 sealed |
-| agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、0g-harness（`main.go:118-121`）；链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
+| agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、0g-harness（`adapters.go`）；0g-harness 镜像用 `harnessonly` 标签编译 sealed，只带它自己的 adapter（`adapters_harnessonly.go`）。链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
 
 本文档讲**当前代码里实际跑的形态**和**为什么这么分**。
 
@@ -156,7 +156,10 @@ native 的 `openai` 和 `anthropic` 也一样，用 sealed 固定的官方地址
 说明放进每个请求的系统提示末尾，key 由凭证代理代填，harness 拿到的是占位值。owner 经
 `/_seal/auth` 拿到的令牌不是 harness 校验的那个，proxy 在入口核对后换掉；harness 的路由
 逐条列出（`framework.Route.Endpoints`）；它可以经签名 socket 请求重启
-（`POST /harness/restart`）。它上传的每个 iData 条目都带加盐的明文承诺
+（`POST /harness/restart`）。签名 socket 拒签发往 AgenticID `update` 或 `updateAt` 的交易，
+并把每个签名和拒绝记下来给 owner（`/_seal/signatures`）；各 socket 把端点作为 MCP 工具提供
+（`POST /mcp`，`internal/sealmcp`），由 harness 注册成原生工具。这两项都由 adapter 声明
+（`framework.SigningRules`、`framework.RuntimeTools`），只有 0g-harness 声明。它上传的每个 iData 条目都带加盐的明文承诺
 （`internal/uploader/commitments.go`）。attestor 声明分层流程后，sealed 上报自己的哈希、
 签 ServeProof v2，并按 attestor 指定的目标版本换 harness 和 sealed（`layered.go`）。
 完整设计见 `LAYERS.zh.md`。
@@ -237,6 +240,7 @@ sealed/
 │   ├── manager/                  agent 进程生命周期 + 监工
 │   ├── uploader/                 drift → 0g-storage upload + 签名 chain.Update
 │   ├── watcher/                  30s tick 跑 EvolutionFor、触发 uploader.Apply
+│   ├── sealmcp/                  把 agent socket 的端点作为 MCP 工具提供（socket 上的 POST /mcp）
 │   └── proxy/                    :8080 反向代理 + 签名 + 日志页
 ├── Dockerfile                    实际发布的 openclaw sealed 镜像（0g-sealed）：images/openclaw/ base 上加 bootstrap 二进制
 ├── images/openclaw/              openclaw base 镜像构建脚本（独立产物，跟 sealed bootstrap 镜像分层）
@@ -555,6 +559,7 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 | `/_seal/claim` | **owner 钱包** | 占单驾驶座（tag `0GSealClaim`，与设置推送一样绑定 body 摘要）；被挤下的客户端实例下一次驾驶请求得到 409。只在 proxy 内存里——重启即清空座位（`internal/proxy/occupancy.go`） |
 | `/_seal/clear` | **owner 钱包** | 清掉 agent 唯一的持久化对话并重启框架进程（tag `0GSealClear`，占座门控）；框架不在服务端保留历史时答 501（`CONVERSATION.zh.md`） |
 | `/_seal/credentials*`、`/_seal/oauth/callback` | **owner 钱包**；回调来自 owner 的浏览器 | owner 给 agent 的凭据：加载签名凭据集、列出、处理待办、读取使用记录、发起 MCP 登录；回调完成登录。与凭据代理、凭据 socket 和根证书一起提供（[CREDENTIALS.zh.md](CREDENTIALS.zh.md)） |
+| `/_seal/signatures` | **owner 钱包** | 只有 0g-harness（`framework.SigningRules`；其他框架返回 404）：签名 socket 签过和拒绝过什么（tag `0GSealSignatures`，`?after=<seq>`），每个签名或拒绝一条记录，带能认出它的信息（消息的哈希和开头、typed data 的 digest 和 domain、交易的哈希、链、目标、金额、nonce 和方法选择器），保留最近 1000 条，sealed 重启后仍在（`internal/proxy/signlog.go`） |
 | `/_seal/compact` | **owner 钱包** | 立刻对这份对话运行框架自己的压缩，不重启（tag `0GSealCompact`，占座门控）：同一时间只跑一个、一条签名消息只接受一次、与 synth 门上的一轮永不重叠——每种拒绝都答 409；adapter 无法触发框架的压缩时答 501——没实现 `SessionCompactor`，或已安装的版本缺少它要调用的东西（openclaw 2026.7.1 之前没有 `sessions compact` 这条 CLI 命令）（`internal/proxy/compact.go`、`CONVERSATION.zh.md`） |
 | `/v1/*` | 用户、owner | framework chat API，反代到 gateway(bearer 鉴权;响应一律不带 proof 签名——这是 owner↔agent 的操控通道);未声明的路径一律 404——没有 catch-all 转发 |
 | `/api/*` | 外部调用方 | agent 注册的服务(精确路径,经 sign socket 的 `/services` 注册),反代到 agent 的 loopback backend;响应先缓冲再带 proof 签名(`X-Agent-Proof`),backend 发 SSE 也一样 |
@@ -562,7 +567,7 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 | `/v1/inbox`、`/v1/events`、`/v1/tasks`、`/v1/schedules` | owner | 仅 0g-harness(声明为 kind `inbox` / `events` / `tasks` / `schedules`):agent 自己开的 turn 说的话(后台任务结束、提醒到点)、可续接的实时事件流(turn、任务、inbox、提醒的变化)、每个 turn / 后台命令 / subagent 及其执行者,以及 agent 设的提醒。其他框架都不声明,SDK 只在声明了的 agent 上提供这些方法(`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
 | `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
 | `/log/agent` + `/log/agent.html` | 运维 | agent 子进程的 stdout/stderr（实时）;路径经 adapter 的 `SubprocessLogPath()` 解析。`/log/openclaw`（`.html`）作为 legacy 别名保留 |
-| `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名；永不签裸 hash，也永不签 EIP-191 version `0x00` —— serve-proof 所在的域，见下）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）+ `/settings`（agent 自己提配置变更 —— 见下）|
+| `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名；永不签裸 hash，也永不签 EIP-191 version `0x00` —— serve-proof 所在的域，见下）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）+ `/settings`（agent 自己提配置变更 —— 见下）+ `/harness/restart` 和 `/mcp`（只有 0g-harness：重启 harness，以及把上面这些端点和凭据 socket 的端点作为 MCP 工具提供；取值 socket 自己提供它的工具）|
 
 带 proof 签名的只有三处:`/hello`、`/_seal/auth` 和 agent 注册的 `/api/*`
 服务——而且只在 `VERIFIED_FEEDBACK_ADDR` 可用且锚定(它的 `getIdentityRegistry()`
@@ -593,7 +598,10 @@ sign socket 是 sealed 跟外界（其实是同容器的 agent 进程）的关�
 serve-proof 正是签在这个 `0x00` 域里、绑定 VerifiedFeedbackRegistry，
 所以 agent 经 socket 签出的任何东西都验不成 serve-proof（审计
 FIND-01；见 `internal/proxy/sign.go` 文件头，由 `sign_test.go` 钉死）。
-在这几种形状之内，socket 只是传输层 —— **拒绝逻辑在 agent 侧由
+在这几种形状之内，socket 只是传输层；0g-harness（`framework.SigningRules`）例外：
+socket 拒签发往 AgenticID `update` 或 `updateAt` 的交易，这是 drift watcher 的通道
+（`internal/proxy/signrules.go`），并把签出的每个签名和拒绝的每个请求记下来给 owner
+（`internal/proxy/signlog.go`、`/_seal/signatures`）—— **拒绝逻辑在 agent 侧由
 SOUL.md 的拒绝规则约束**（任何来自外部 prompt 的 sign 请求都要拒，
 不靠"用人话描述待签内容" 这种容易被身份钓鱼骗过的启发式）。详见
 `internal/framework/openclaw/soulmd.go`。

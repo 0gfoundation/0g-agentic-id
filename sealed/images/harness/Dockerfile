@@ -55,6 +55,9 @@ RUN V=$(go list -m -f '{{.Version}}' github.com/0gfoundation/0g-storage-client) 
 # Stage 2 — sealed bootstrap binary, and the loader that verifies and runs it.
 # The loader is built with the sealed binary's sha256 compiled in, so it runs
 # exactly this bootstrap and nothing else (sealed/LAYERS.md, base layer).
+# sealed is built with the harnessonly tag: the 0g-harness adapter is the only
+# one in it (adapters_harnessonly.go); the other frameworks' images build it
+# without the tag.
 FROM golang:1.24-alpine AS bootstrap-builder
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -62,7 +65,7 @@ RUN go mod download
 COPY *.go ./
 COPY internal/ ./internal/
 COPY cmd/ ./cmd/
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap . \
+RUN CGO_ENABLED=0 GOOS=linux go build -tags harnessonly -ldflags="-s -w" -o bootstrap . \
  && H="$(sha256sum bootstrap | cut -d' ' -f1)" \
  && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.expectedSealedHash=$H" -o loader ./cmd/loader \
  && echo "loader pinned to bootstrap sha256 $H"
@@ -92,7 +95,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap . \
 # fails the build.
 FROM debian:13-slim AS harness-package
 ARG NODE_VERSION=24.22.1
-ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/087affcac42a3bcad2d05fe5ab1ba089167f4b61
+ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/79b9864d86ee649a803745f9de88cca097cea8c0
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils python3 make g++ \
  && rm -rf /var/lib/apt/lists/*

@@ -23,7 +23,7 @@
 - sandbox policy 模式;
 - 文件系统根目录;
 - spine 的 invariant 自检;
-- 平台那一层:harness 本身、seal-tools、seal-guard、subagent-guard。
+- 平台那一层:harness 本身、seal-tools、subagent-guard。
 
 ## 进程
 
@@ -57,11 +57,10 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | 后台任务(打开 `toolJobs` 时) | `dsh-tool-jobs`:命令可以放到后台跑;agent 空闲时任务结束,会开启新的一轮,这一轮的回复进收件箱 |
 | 子 agent(打开 `subagents` 时) | `dsh-subagent` + `dsh-subagent-spawn-in-process` + `dsh-tool-subagent`:一次性的助手,以后台任务的形式运行,最多一层,工具只有 `read` 和 `skill` |
 | 定时提醒(打开 `schedule` 时) | `dsh-schedule`,加上 harness 自带的最小 `sessionPersistence` 服务(提供 dsh-schedule 需要的落盘确认) |
-| **平台控制点** | 见下面三项 |
+| **平台控制点** | 见下面两项 |
 
-三个平台控制点:
-- **`seal-tools`**:把 `seal_sign`、`seal_sign_transaction`、`seal_sign_typed_data`、`seal_register_service` 做成原生工具,每次签名都会记在 session log 里。三个签名工具和签名 socket 的三个签名端点一一对应。注册服务时,sealed 限制描述最长 280 字节、输入示例最长 2048 字节。
-- **`seal-guard`**:把 shell 对 socket `/sign/` 端点的调用引导到上面的签名工具;`/settings` 和 `/services` 照常开放。
+两个平台控制点:
+- **`seal-tools`**:把运行时的工具做成原生工具。工具由 sealed 在 socket 上列出(POST /mcp:签名 socket 上是签名、服务、设置和凭据,取值单独在自己的 socket 上),每次调用都走对应 socket 端点本身,所以工具的检查、拒绝和记录与端点完全一样。注册服务时,sealed 限制描述最长 280 字节、输入示例最长 2048 字节。
 - **`subagent-guard`**:写文件、执行命令、签名,只有主 agent 能做。
 
 **故意没挂这些**(每条都有原因):
@@ -88,7 +87,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 - **为什么不行**:这个文件 agent 自己就能改(privsep 把 `$DSH_HOME` 交给了 agent 用户,它有 bash 和 `fs-local`),又不属于任何 role,没人恢复它,没人把它上链,验证方也看不见它。owner 的一个开关,不能开出一条"不上链、agent 可写"的系统提示词通道,这属于平台边界的事。
 - **怎样才能放开**:先把 `~/.dsh/AGENTS.md` 做成上链的 role(还没做,见文末)。
 
-平台自己的组合决定不开放给 owner:sandbox policy 模式、spine 的 invariant 自检、文件系统根目录、seal-tools、seal-guard、subagent-guard。这些属于镜像哈希背书的边界。
+平台自己的组合决定不开放给 owner:sandbox policy 模式、spine 的 invariant 自检、文件系统根目录、seal-tools、subagent-guard。这些属于镜像哈希背书的边界。
 
 ## 为什么挂 shell(而不是禁掉)
 
@@ -98,7 +97,7 @@ privsep 让框架子进程以低权限的 `agent` 用户运行。把它和 seale
 
 后台任务、子 agent、定时提醒,是同一套组合上的 owner 开关。更大的能力变化按档位来:
 
-- **一份平台审核过的档位菜单。** 比如 `minimal` / `coder`。每个档位都是 harness 自带的一套组合,区别只在挂哪些能力插件,比如 `coder` 多挂 e2b 工具沙盒和常驻 shell。平台那一层每个档位都一样,owner 永远动不了:harness 的接口、seal-tools/guard、subagent-guard、doctrine 注入、推理路由。
+- **一份平台审核过的档位菜单。** 比如 `minimal` / `coder`。每个档位都是 harness 自带的一套组合,区别只在挂哪些能力插件,比如 `coder` 多挂 e2b 工具沙盒和常驻 shell。平台那一层每个档位都一样,owner 永远动不了:harness 的接口、seal-tools、subagent-guard、doctrine 注入、推理路由。
 - **部署时选档。** owner 部署时选一个档位,就像现在选 framework 和 model 一样。选的档位写进链上的 `framework` binding,验证方能看到这个 agent 跑的是哪个能力档。档位的具体内容照样由镜像哈希背书。
 - **换档只能 reset。** 换档要走 reset,和换 framework/model 是同一条路,不能在运行时热切换。挂哪些插件是被度量边界的一部分,换档就是换一套插件集合。这和上面四个白名单选项不是一回事:那些选项只是传进一套不变组合的值,所以推送一次配置、重启进程就能生效。
 

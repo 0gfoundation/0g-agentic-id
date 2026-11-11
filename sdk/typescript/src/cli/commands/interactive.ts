@@ -20,7 +20,7 @@ import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentTaskInfo, AgentTaskStop, ChatMessage } from '../../AgentClient';
-import type { ServeProof, TaskReveal } from '../../types';
+import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
@@ -39,7 +39,7 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -250,6 +250,22 @@ export function inFlightIds(rows: Array<{ id: string; status: string }>): string
 }
 
 /** A span of seconds, short: 12s, 4m, 3h, 2d. */
+/** One line for a record of the agent's sign socket (`/signatures`). */
+export function renderSignature(r: SignatureRecord): string {
+  let what: string;
+  if (r.kind === 'personal_sign') {
+    what = r.text !== undefined ? `message ${JSON.stringify(r.text)}` : `message of ${r.length ?? '?'} bytes`;
+  } else if (r.kind === 'typed_data') {
+    const d = r.domain ?? {};
+    what = `typed data ${r.primary_type ?? '?'}${d.name ? ` for ${d.name}` : ''}${d.verifying_contract ? ` at ${d.verifying_contract}` : ''}${d.chain_id ? ` on chain ${d.chain_id}` : ''}`;
+  } else {
+    const target = r.create ? 'a new contract' : r.to ?? '?';
+    what = `transaction to ${target}${r.selector ? ` (${r.selector})` : ''} on chain ${r.chain_id ?? '?'}, value ${r.value ?? '0'} wei, nonce ${r.nonce ?? '?'}`;
+  }
+  const id = r.tx_hash ?? r.digest ?? r.msg_hash ?? '';
+  return `#${r.seq} ${r.ts} ${r.result === 'refused' ? `REFUSED ${what}: ${r.reason ?? ''}` : `${what}${id ? ` ${id}` : ''}`}`;
+}
+
 function span(seconds: number): string {
   const s = Math.max(0, Math.round(seconds));
   if (s < 60) return `${s}s`;
@@ -2449,7 +2465,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /tasks /result /cancel /inbox /schedules /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /tasks /result /cancel /inbox /schedules /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -2525,6 +2541,7 @@ const L2_HELP_FULL = `session commands
   /schedules              the reminders the agent set for itself
                           (0g-harness)
   /agentlog [n]           agent process log, last n lines (owner-only)
+  /signatures [n]         what the agent signed as itself and what the runtime refused, last n (owner-only; 0g-harness)
   /startuplog [n]         sealed runtime startup log, last n lines
   /back  (or /unuse)      return to the manager
   /quit                   exit`;
@@ -2835,6 +2852,21 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!s.client?.logs) { out(s.client ? '(logs unavailable — owner key needed)' : `agent is ${s.phase} — /start or /reset first`); out('\n'); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
         out(`${cleanStream(await s.client.logs({ tail: n }))}\n`); continue;
+      }
+      if (line === '/signatures' || line.startsWith('/signatures ')) {
+        if (!s.url) { try { await refreshSession(s); } catch { /* gate below reports */ } }
+        if (!s.url) { out(`no container yet (${s.phase}) — nothing to read; /start or /reset creates one\n`); continue; }
+        const n = Number(line.split(/\s+/)[1]) || 20;
+        try {
+          const recs = (await s.ag.agent.signatures(s.url, BigInt(s.agentId))).slice(-n);
+          out(recs.length ? `${recs.map(renderSignature).join('\n')}\n` : 'the agent has signed nothing as itself yet\n');
+        } catch (e) {
+          const msg = (e as Error).message;
+          out(/HTTP 404/.test(msg)
+            ? `this agent's runtime keeps no signature record${s.framework ? ` (${s.framework})` : ''} — only 0g-harness agents have one\n`
+            : `signatures: ${msg}\n`);
+        }
+        continue;
       }
       if (line === '/startuplog' || line.startsWith('/startuplog ')) {
         // The sealed runtime serves /log from early boot — mid-`deploying` is

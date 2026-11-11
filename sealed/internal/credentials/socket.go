@@ -39,7 +39,9 @@ func readJSON(r *http.Request, v any) *credproxy.Error {
 
 // HarnessHandler serves /run/seal-cred.sock: list, token requests, wallet
 // signatures, requests for the owner, deleting derived entries, and events.
-// It never returns a value.
+// It never returns a value. For a framework that mounts the runtime's
+// tools, its endpoints are also tools of the sign socket's MCP server
+// (Tools).
 func (s *Store) HarnessHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /credentials", func(w http.ResponseWriter, r *http.Request) {
@@ -164,5 +166,6 @@ func (s *Store) RevealHandler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"value": string(value)})
 	})
+	mux.Handle("POST /mcp", s.revealMCP(mux))
 	return mux
 }

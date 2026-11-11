@@ -143,6 +143,11 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		ZGComputeRouted:     rendered.resolved.Endpoint != nil && provider == "0g-compute",
 		BootTime:            time.Now(),
 		RefuseExport:        true,
+		// The harness lists the runtime's tools from the sockets and
+		// registers them (its seal-tools plugin); the sign socket applies the
+		// runtime's signing rules (AppliesSigningRules).
+		SealTools:    rt.SealSignSock != "",
+		SigningRules: true,
 	})
 	doc := platform.AssembleAgentDoc(pc, a.FrameworkFacts())
 	be := bridgeEnv{
@@ -554,6 +559,14 @@ const (
 func (a *Adapter) ServiceFieldLimits() (description, inputExample int) {
 	return serviceDescriptionMax, serviceInputExampleMax
 }
+
+// AppliesSigningRules implements framework.SigningRules: the sign socket
+// refuses AgenticID iData writes and records every signature for the owner.
+func (a *Adapter) AppliesSigningRules() bool { return true }
+
+// ServesRuntimeTools implements framework.RuntimeTools: the harness's
+// seal-tools plugin registers the tools the sockets list.
+func (a *Adapter) ServesRuntimeTools() bool { return true }
 
 // MonitorExit satisfies manager.Adapter: invoke onExit once when the harness
 // exits, with cmd.Wait's error.

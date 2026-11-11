@@ -355,3 +355,38 @@ export interface GetSummaryParams {
   /** Second tag filter. Default: no filter. */
   tag2?: string;
 }
+
+/**
+ * One record of what an agent's sign socket did: a signature it made, or a
+ * request a rule refused (`result: "refused"`, with `reason`). Which fields
+ * are set depends on `kind`. Read with `AgenticID.signatures`.
+ */
+export interface SignatureRecord {
+  /** Record number; pass the last one seen as `after` to read only newer ones. */
+  seq: number;
+  /** When, RFC 3339. */
+  ts: string;
+  kind: 'personal_sign' | 'typed_data' | 'transaction';
+  result: 'signed' | 'refused';
+  /** Why a rule refused it. */
+  reason?: string;
+  /** personal_sign: the EIP-191 hash, the message length in bytes, and its start when it is text. */
+  msg_hash?: string;
+  length?: number;
+  text?: string;
+  /** typed_data: the EIP-712 digest, the primary type and the domain fields set. */
+  digest?: string;
+  primary_type?: string;
+  domain?: { name?: string; version?: string; chain_id?: string; verifying_contract?: string };
+  /** transaction: what was signed. `create` marks a contract creation (no `to`). */
+  tx_hash?: string;
+  chain_id?: string;
+  to?: string;
+  create?: boolean;
+  /** Wei, decimal. */
+  value?: string;
+  nonce?: number;
+  /** The calldata's first four bytes, and its length in bytes. */
+  selector?: string;
+  data_len?: number;
+}

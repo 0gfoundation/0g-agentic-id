@@ -125,6 +125,7 @@ export type {
   AppendResponseParams,
   ReadAllFeedbackParams,
   GetSummaryParams,
+  SignatureRecord,
 } from './types';
 
 // ── Constants ──

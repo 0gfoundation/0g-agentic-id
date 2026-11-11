@@ -13,15 +13,22 @@
 //   - 127.0.0.1 binds are also exposed by Daytona in some configurations.
 //   - A unix socket is purely intra-container; fs permission is the ACL.
 //
-// Six routes (signSocketRoutes is the complete set; sign_test.go pins it):
+// Seven routes (signSocketRoutes is the complete set; sign_test.go pins it):
 //
 //	POST     /sign/personal_sign  EIP-191 0x45 — body {"message": str} or {"message_hex": "0x..."}
 //	POST     /sign/typed_data     EIP-712 (EIP-191 0x01) — body is the standard TypedData JSON
 //	POST     /sign/transaction    raw RLP — body has chain_id, nonce, to, value, data,
 //	                                        gas_limit, max_fee_per_gas, max_priority_fee_per_gas
 //	GET/POST /services            agent service registry (services.go) — signs nothing
-//	POST     /settings            agent half of the settings channel (settings.go) — signs nothing
+//	GET/POST /settings            agent half of the settings channel (settings.go) — signs nothing
 //	POST     /harness/restart     restart the harness (restart.go) — signs nothing
+//	POST     /mcp                 these routes as MCP tools (signtools.go) — signs only
+//	                              through the three routes above; served only for an
+//	                              adapter that declares framework.RuntimeTools
+//
+// For an adapter that declares framework.SigningRules (0g-harness), every
+// signature the three sign routes make, and every request a rule refuses, is
+// recorded for the owner (signlog.go); the rules are in signrules.go.
 //
 // SIGNING-DOMAIN INVARIANT. Every signature this socket produces is over one
 // of exactly three preimage shapes, each built here from the request:
@@ -61,6 +68,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 
@@ -135,6 +143,7 @@ func (s *Server) signSocketRoutes() []signRoute {
 		{"/services", s.handleServices},
 		{"/settings", s.handleAgentSettings},
 		{"/harness/restart", s.handleHarnessRestart},
+		{"/mcp", s.handleSignMCP},
 	}
 }
 
@@ -182,6 +191,9 @@ func (s *Server) handleSignPersonalSign(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	out, err := evmsign.PersonalSign(req, s.signKey)
+	if err == nil && s.appliesSigningRules() {
+		s.signLog.add(personalRecord(req, out))
+	}
 	writeSigned(w, out, err)
 }
 
@@ -199,6 +211,9 @@ func (s *Server) handleSignTypedData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := evmsign.TypedData(td, s.signKey)
+	if err == nil && s.appliesSigningRules() {
+		s.signLog.add(typedRecord(td, out))
+	}
 	writeSigned(w, out, err)
 }
 
@@ -215,7 +230,22 @@ func (s *Server) handleSignTransaction(w http.ResponseWriter, r *http.Request) {
 		writeSignError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
-	out, err := evmsign.Transaction(req, s.signKey)
+	rules := s.appliesSigningRules()
+	var check func(*types.Transaction) error
+	if rules {
+		check = func(tx *types.Transaction) error {
+			err := s.checkTransaction(tx)
+			var refused *evmsign.Refused
+			if errors.As(err, &refused) {
+				s.signLog.add(refusedTxRecord(tx, req.ChainID, refused.Reason))
+			}
+			return err
+		}
+	}
+	out, err := evmsign.TransactionChecked(req, s.signKey, check)
+	if err == nil && rules {
+		s.signLog.add(txRecord(out))
+	}
 	writeSigned(w, out, err)
 }
 

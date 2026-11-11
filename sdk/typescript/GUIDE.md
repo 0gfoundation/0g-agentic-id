@@ -765,6 +765,13 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   // is "not now", nothing changed (a compaction or a turn already running, the
   // framework busy, or a reused signature: retry later).
 
+  // `ag.agent.signatures(base, agentId, { after })` (CLI `/signatures`) reads
+  // what the agent signed as itself and what the runtime refused, oldest
+  // first, whichever way the agent reached its sign socket: a message's hash
+  // and start, a typed-data digest and domain, a transaction's hash, chain,
+  // target, value, nonce and selector. The runtime keeps the last 1000.
+  // 0g-harness agents only; the other frameworks keep no record (HTTP 404).
+
   // Chat — present ONLY if the agent declares a chat route AND this ag has a
   // key. Streams under the hood (`stream: true`), so a long reasoning turn
   // keeps bytes flowing and never trips an idle-timeout hop in front of the

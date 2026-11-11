@@ -57,7 +57,7 @@ Nothing outside that allowlist is settable by anyone. Measured code decides:
 - the sandbox policy mode;
 - the filesystem root;
 - the spine invariant checks;
-- the platform plane: the harness, seal-tools, seal-guard and subagent-guard.
+- the platform plane: the harness, seal-tools and subagent-guard.
 
 ## The process
 
@@ -116,8 +116,7 @@ commit, as long as the chain still holds what this container last committed
 | background jobs (`toolJobs` on) | `dsh-tool-jobs`: commands run in the background; a job finishing while the agent is idle opens a turn, whose reply goes to the inbox |
 | subagents (`subagents` on) | `dsh-subagent` + `dsh-subagent-spawn-in-process` + `dsh-tool-subagent`. Each helper is one-shot and runs in the background as a job. Depth is 1. Its tools are `read` and `skill` only |
 | reminders (`schedule` on) | `dsh-schedule`, plus the harness's minimal `sessionPersistence` service (the flush checkpoint dsh-schedule requires) |
-| **platform control points** | `seal-tools`: `seal_sign`, `seal_sign_transaction`, `seal_sign_typed_data` and `seal_register_service` as native, session-logged tools. The three sign tools map the sign socket's three sign endpoints one-to-one. sealed caps a registered service's description at 280 bytes and its input example at 2048 |
-| | `seal-guard`: steers shell calls away from the socket's `/sign/` endpoints; `/settings` and `/services` stay open |
+| **platform control points** | `seal-tools`: the runtime's tools as native tools. sealed lists them on its sockets (POST /mcp: signing, services, settings and credentials on the sign socket, reveal on its own socket) and runs each call through the socket's own endpoint, so a tool checks, refuses and records exactly as the endpoint does. sealed caps a registered service's description at 280 bytes and its input example at 2048 |
 | | `subagent-guard`: only the main agent writes files, runs commands or signs |
 
 **Deliberately NOT mounted** (each a decision):
@@ -168,9 +167,8 @@ so in the log. The other knobs still apply (`settings.go`).
   option is making `~/.dsh/AGENTS.md` a tracked role (deferred, see below).
 
 The platform's own composition decisions are NOT owner-settable: the sandbox
-policy mode, the spine invariant checks, the filesystem root, seal-tools,
-seal-guard and subagent-guard. They are the part of the boundary the image hash
-attests.
+policy mode, the spine invariant checks, the filesystem root, seal-tools and
+subagent-guard. They are the part of the boundary the image hash attests.
 
 ## Why shell is mounted (not banned)
 
@@ -189,7 +187,7 @@ composition. Larger capability changes take the shape of tiers:
   `coder`. Each tier is a composition the harness ships, and tiers differ only
   in which capability plugins mount: e.g. `coder` adds the e2b tool sandbox and
   a persistent shell. The platform plane is identical across tiers and never
-  owner-selectable: the harness surface, seal-tools/guard, subagent-guard,
+  owner-selectable: the harness surface, seal-tools, subagent-guard,
   doctrine injection and the inference route.
 - **Picked at deploy, visible on chain.** The owner picks a tier at deploy,
   like framework + model. The tier id is recorded in the on-chain `framework`

@@ -128,3 +128,30 @@ func TestCapabilities_CredentialsSectionFollowsTheSocket(t *testing.T) {
 		}
 	}
 }
+
+// The runtime's MCP tools are named only for a framework that offers them,
+// and the record of signatures and the refused iData write only where the
+// sign socket applies them; every other framework reads the doc as before.
+func TestCapabilities_SealToolsAndSigningRulesFollowTheAdapter(t *testing.T) {
+	rs := RuntimeSnapshot{SealSignSock: "/s", AgentSeal: "0x01", CredSock: "/c", CredRevealSock: "/r"}
+	plain := Build(rs)
+	rs.SealTools, rs.SigningRules = true, true
+	declared := Build(rs)
+	for _, s := range []string{"`seal_sign_transaction`", "`seal_credential_sign`", "`seal_credential_reveal`", "server `seal-reveal`",
+		"keeps a record of every signature", "The socket refuses a call to AgenticID update/updateAt"} {
+		if strings.Contains(plain.Capabilities, s) {
+			t.Errorf("rendered %s for a framework that declares neither", s)
+		}
+		if !strings.Contains(declared.Capabilities, s) {
+			t.Errorf("did not render %s where declared", s)
+		}
+	}
+	for _, s := range []string{"If your framework's tool list includes native sign tools, prefer them", "Never use this endpoint for AgenticID update/updateAt on your own token"} {
+		if !strings.Contains(plain.Capabilities, s) || strings.Contains(declared.Capabilities, s) {
+			t.Errorf("%q is the wording of a framework without the signing rules only", s)
+		}
+	}
+	if !strings.Contains(plain.Constraints, "(through the sign socket or its tools)") || !strings.Contains(declared.Constraints, "(the sign socket refuses it, and its tools with it)") {
+		t.Error("the drift note does not follow the signing rules")
+	}
+}

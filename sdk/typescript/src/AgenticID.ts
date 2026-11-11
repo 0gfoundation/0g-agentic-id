@@ -41,7 +41,7 @@ import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRo
 import type {
   ServeProof, GiveFeedbackParams, GiveFeedbackResult, AppendResponseParams,
   ReadAllFeedbackParams, GetSummaryParams, Feedback, FeedbackSummary, ServeData,
-  TaskReveal,
+  TaskReveal, SignatureRecord,
 } from './types';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -682,6 +682,28 @@ export class AgentApi {
     });
     if (!r.ok) throw new Error(`compactConversation: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json().catch(() => ({}))) as { note?: string };
+  }
+
+  /**
+   * What the agent's sign socket signed, and what its rules refused, oldest
+   * first: one record per signature or refusal, with what identifies it (a
+   * message's hash and start, a typed-data digest and domain, a transaction's
+   * hash, chain, target, value, nonce and selector). The runtime keeps the
+   * last 1000 and keeps them across its restarts; it records every request,
+   * whichever way the agent reached the socket. Only a 0g-harness agent's
+   * runtime keeps the record; the other frameworks answer 404. `after` is a
+   * record number (`seq`): only newer records come back. Owner-signed (tag
+   * `0GSealSignatures`, the read-only grammar).
+   */
+  async signatures(base: string, agentId: bigint, opts?: { after?: number }): Promise<SignatureRecord[]> {
+    const { message, signature } = await this.signOwner('0GSealSignatures', base, agentId);
+    const query = opts?.after !== undefined ? `?after=${opts.after}` : '';
+    const r = await fetch(`${base}/_seal/signatures${query}`, {
+      headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!r.ok) throw new Error(`signatures: HTTP ${r.status}: ${plainText(await r.text())}`);
+    return (await r.json()) as SignatureRecord[];
   }
 
   /** Sign `0GSealAuth` (audience-bound) and exchange it at `{base}/_seal/auth` for a token. */

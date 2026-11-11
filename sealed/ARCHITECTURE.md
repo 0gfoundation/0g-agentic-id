@@ -17,7 +17,7 @@ External components it integrates with:
 | attestor | After the sandbox comes up, it initiates RA against attestor to receive `agent_seal_priv`. See [`attestor/`](../attestor/README.md) for details |
 | AgenticID contract | Reads `intelligentDatasOf` / `sealedKeysOf`, signs `update` txs that push evolution on chain |
 | 0G storage | The actual carrier for each iData's encrypted plaintext; sealed downloads via the `0g-storage-client` CLI and uploads in-process via the same client's Go SDK (`internal/dataplane/upload.go`), so the signing key never leaves sealed |
-| the agent framework | Four adapters are compiled in and self-register at startup — openclaw, hermes, prime-agent, 0g-harness (`main.go:118-121`); the on-chain binding's `name` selects one, `AGENT_FRAMEWORK` is only the no-binding fallback. openclaw is the reference implementation: an npm package sealed installs and spawns as a subprocess on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); another framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
+| the agent framework | Four adapters are compiled in and self-register at startup — openclaw, hermes, prime-agent, 0g-harness (`adapters.go`); the 0g-harness image builds sealed with the `harnessonly` tag and carries only its own adapter (`adapters_harnessonly.go`). The on-chain binding's `name` selects one, `AGENT_FRAMEWORK` is only the no-binding fallback. openclaw is the reference implementation: an npm package sealed installs and spawns as a subprocess on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); another framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
 
 This document describes **the form actually running in current code** and **why it's organized that way**.
 
@@ -195,7 +195,12 @@ proxy fills the key, so the harness holds a placeholder. The token the owner
 gets from `/_seal/auth` is not the one the harness checks; the proxy checks it
 at the entry and swaps it. The harness's routes are listed one by one
 (`framework.Route.Endpoints`), and it can ask over the sign socket to be
-restarted (`POST /harness/restart`). Every iData entry it uploads carries a
+restarted (`POST /harness/restart`). The sign socket refuses a transaction to
+AgenticID `update` or `updateAt` and records every signature and refusal for
+the owner (`/_seal/signatures`), and the sockets serve their endpoints as MCP
+tools (`POST /mcp`, `internal/sealmcp`), which the harness registers as native
+tools; both are adapter-declared (`framework.SigningRules`,
+`framework.RuntimeTools`), and only 0g-harness declares them. Every iData entry it uploads carries a
 salted plaintext commitment (`internal/uploader/commitments.go`). Once the
 attestor declares the layered flow, sealed reports its own hash, signs
 ServeProof v2, and switches the harness and sealed to the versions the
@@ -287,6 +292,7 @@ sealed/
 │   ├── manager/                  agent process lifecycle + supervision
 │   ├── uploader/                 drift → 0g-storage upload + signed chain.Update
 │   ├── watcher/                  30s tick running EvolutionFor, triggers uploader.Apply
+│   ├── sealmcp/                  an agent socket's endpoints as MCP tools (POST /mcp on the socket)
 │   └── proxy/                    :8080 reverse proxy + signing + log pages
 ├── Dockerfile                    the openclaw sealed image that ships (0g-sealed): the bootstrap binary on the images/openclaw/ base
 ├── images/openclaw/              openclaw base-image build scripts (independent artifact, layered separately from the sealed bootstrap image)
@@ -629,6 +635,7 @@ container's `:8080`.
 | `/_seal/claim` | **owner's wallet** | take the single-driver seat (tag `0GSealClaim`, body-digest-bound like the settings push); the displaced client instance gets 409 on its next driving request. Proxy memory only — a restart clears the seat (`internal/proxy/occupancy.go`) |
 | `/_seal/clear` | **owner's wallet** | wipe the agent's ONE persisted conversation and restart the framework process (tag `0GSealClear`, seat-gated); 501 when the framework keeps no server-side history (`CONVERSATION.md`) |
 | `/_seal/credentials*`, `/_seal/oauth/callback` | **owner's wallet**; the callback is the owner's browser | the owner's credentials for the agent: load a signed set, list it, decide requests, read the audit log, start an MCP login; the callback completes one. Served with the credential proxy, its sockets and its CA ([CREDENTIALS.md](CREDENTIALS.md)) |
+| `/_seal/signatures` | **owner's wallet** | 0g-harness only (`framework.SigningRules`; 404 for the other frameworks): what the sign socket signed and refused (tag `0GSealSignatures`, `?after=<seq>`), one record per signature or refusal with what identifies it (a message's hash and start, a typed-data digest and domain, a transaction's hash, chain, target, value, nonce and selector), the last 1000, kept across restarts of sealed (`internal/proxy/signlog.go`) |
 | `/_seal/compact` | **owner's wallet** | run the framework's own compaction on that conversation now, no restart (tag `0GSealCompact`, seat-gated): one at a time, a signed message accepted once, never overlapping a synthesized-door turn — each refusal a 409; 501 when the adapter cannot trigger the framework's compaction — no `SessionCompactor`, or an installed version without what it drives (openclaw before 2026.7.1 has no `sessions compact` CLI command) (`internal/proxy/compact.go`, `CONVERSATION.md`) |
 | `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth; responses never proof-signed — the owner↔agent steering channel); every undeclared path 404s — there is no catch-all relay |
 | `/api/*` | external callers | agent-registered services (exact path, registered over the sign socket's `/services`), reverse-proxied to the agent's loopback backend; responses buffered and proof-signed (`X-Agent-Proof`), even when the backend emits SSE |
@@ -636,7 +643,7 @@ container's `:8080`.
 | `/v1/inbox`, `/v1/events`, `/v1/tasks`, `/v1/schedules` | owner | 0g-harness only (declared as the kinds `inbox` / `events` / `tasks` / `schedules`): the words of turns the agent opened itself (a background job finished, a reminder came due), a resumable live feed of turn, task, inbox and reminder changes, every turn, background command and subagent with who did it, and the agent's reminders. The other frameworks declare none of them, and the SDK offers them only where they are declared (`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
 | `/log/agent` + `/log/agent.html` | ops | agent subprocess stdout/stderr (live); path resolved via the adapter's `SubprocessLogPath()`. `/log/openclaw`(`.html`) survives as a legacy alias |
-| `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`; never a raw hash and never EIP-191 version `0x00`, the serve-proof's domain — see below) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) |
+| `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`; never a raw hash and never EIP-191 version `0x00`, the serve-proof's domain — see below) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) + `/harness/restart` and `/mcp` (0g-harness only: a restart of the harness, and the same endpoints and the credential socket's as MCP tools; the reveal socket serves its own) |
 
 Exactly three surfaces are proof-signed: `/hello`, `/_seal/auth` and the
 agent-registered `/api/*` services — and only when `VERIFIED_FEEDBACK_ADDR`
@@ -676,7 +683,12 @@ EIP-191 version `0x00` data. Serve-proofs are signed in that `0x00`
 domain, bound to the VerifiedFeedbackRegistry, so nothing the agent
 signs through the socket verifies as one (audit FIND-01;
 `internal/proxy/sign.go` header, pinned by `sign_test.go`). Within
-those shapes the socket is just transport. **Refusal logic lives on
+those shapes the socket is just transport, except under 0g-harness
+(`framework.SigningRules`): there it refuses a transaction to AgenticID
+`update` or `updateAt`, the drift watcher's channel
+(`internal/proxy/signrules.go`), and records every signature it makes and
+every request it refuses, for the owner (`internal/proxy/signlog.go`,
+`/_seal/signatures`). **Refusal logic lives on
 the agent side, constrained by SOUL.md's refusal rules**: any sign
 request originating from external prompts must be refused, without
 relying on "describe what to sign in plain language" heuristics,

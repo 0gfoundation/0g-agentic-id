@@ -121,7 +121,9 @@
 1. **入口**：外部只能连 8080。sealed 只转发清单里的 harness 路由和方法。清单写在 sealed 的 adapter 里，harness 不能自己加。对外服务的响应签 ServeProof。
 2. **推理**：harness 只能经 sealed 调模型。sealed 代填 key，只转发到 owner 设置的路由，模型名也按 owner 的设置，并在每个模型请求里放入平台说明和 doctrine。harness 改了自己的代码，也去不掉这两样。
 3. **出站**：harness 除调模型以外的外发请求，比如搜网页、调第三方 API、装依赖，也经过 sealed，由 sealed 代填凭证、按白名单放行。这一条依赖网络层能拦住 harness 绕过 sealed 直连外网（见第 9 节）。
-4. **签名**：签名 socket 只签三种格式：personal_sign、EIP-712 和交易；不签任意哈希，也签不了 ServeProof 所在的那一类。三种格式之内能签什么内容，由签名策略决定（第 9 节第 4 条）。
+4. **签名**：签名 socket 只签三种格式：personal_sign、EIP-712 和交易；不签任意哈希，也签不了 ServeProof 所在的那一类。三种格式之内，它拒签发往 AgenticID `update` 或 `updateAt` 的交易（iData 由 drift watcher 提交），并把签出的每个签名和拒绝的每个请求记下来给 owner 看。其余能签什么，由签名策略决定（第 9 节第 4 条）。
+
+签名 socket 和凭据 socket 的端点也作为 MCP 工具提供（socket 上的 `POST /mcp`）。工具定义在 sealed 里，经对应端点执行，harness 挂载即可，不会多出 socket 不允许的事。
 
 ### 4.3 由 sealed 执行的规则
 
@@ -129,7 +131,7 @@ harness 一旦能被 agent 改，写在 harness 里的规则，agent 改几行�
 1. 模型每次都看到平台说明和 doctrine：推理代理把它们放进每个模型请求。harness 没有模型 key，只能经 sealed 调模型。平台说明不写成文件交给 harness，所以任何角色里都没有平台文字，上链前不用剥离。
 2. 只有 owner 能用 harness 的接口：入口验 owner 的令牌，令牌不交给 harness。
 3. 外部能访问哪些接口：adapter 逐条列出路由和方法，sealed 只放行这些。harness 自己加的接口，外部访问不到。
-4. 能签什么：由签名策略决定（第 9 节第 4 条）。
+4. 能签什么：sealed 拒签 AgenticID `update` / `updateAt`，并记录每次签名和拒绝；其余由签名策略决定（第 9 节第 4 条）。
 
 harness 里同类的插件可以保留，但只算方便，不算边界。
 
@@ -326,8 +328,8 @@ harness 只跑官方版本，原来写在 harness 里的规则都还在，所以
 
 ### 不影响其他三个框架
 
-四个框架是四个独立镜像，但每个镜像里的 sealed 都由同一份源码编译，四个 adapter 都在里面。attestor、SDK、attestor 控制台和 `verify-agent.sh` 也由四个框架共用。所以其他三个框架不受影响，前提是：
-- 第一步的推理代理、doctrine 注入、令牌、逐条路由、不许导出的规则和服务字段上限，以及 ServeProof v2，都由 adapter 声明才生效，只有 0g-harness 的 adapter 声明；
+四个框架是四个独立镜像，每个镜像里的 sealed 都由同一份源码编译：0g-harness 镜像的只带它自己的 adapter（编译标签 `harnessonly`），其他三个的带全部四个。attestor、SDK、attestor 控制台和 `verify-agent.sh` 也由四个框架共用。所以其他三个框架不受影响，前提是：
+- 第一步的推理代理、doctrine 注入、令牌、逐条路由、不许导出的规则和服务字段上限、签名 socket 的规则和记录、运行时的工具，以及 ServeProof v2，都由 adapter 声明才生效，只有 0g-harness 的 adapter 声明；
 - ServeProof v1 的格式和验证照旧，注册合约的旧入口不变；
 - attestor 只对上报了 sealed 哈希的容器查 `validSealedHashes`，只有带加载器的 0g-harness 镜像会上报；其他镜像照旧只查镜像哈希；
 - AgenticID 升级后，已有函数的行为不变；
@@ -338,7 +340,7 @@ harness 只跑官方版本，原来写在 harness 里的规则都还在，所以
 1. 推理路由是否只允许平台路由，好让 owner 无法从自己的 provider 账号看到请求内容。0G 路由是否向 key 持有人展示请求内容，尚未核实。
 2. 出站：怎么拦住 harness 绕过 sealed 直连外网。一是平台创建沙盒时的网络限制，要实测在我们的沙盒里能否生效；二是 sealed 在容器里按用户设防火墙，只放行 agent 用户连 sealed 的代理，要实测容器里能否设。
 3. 是否做响应原文过滤。
-4. 签名策略：三种格式之内能签什么内容。现在什么都签，内容只靠 doctrine 让模型把关；harness 的代码可以不经过模型直接调签名 socket，所以要在 sealed 里按交易目标、方法、金额和签名域等定规则。
+4. 签名策略：三种格式之内能签什么内容。现在除了 AgenticID `update` / `updateAt` 什么都签，签过的都有记录，内容只靠 doctrine 让模型把关；harness 的代码可以不经过模型直接调签名 socket，所以要在 sealed 里按交易目标、方法、金额和签名域等定规则。
 5. 是否支持 harness 自更新：它相当于在 sealed 环境里部署一个 owner 定义的程序（第 8 节）。
 
 ## 10. sealed 和 attestor、合约之间的接口

@@ -135,6 +135,12 @@ type Server struct {
 	// restartHarness backs POST /harness/restart on the sign socket
 	// (restart.go); nil answers 501.
 	restartHarness func(ctx context.Context) error
+
+	// signLog records what the sign socket signs and refuses (signlog.go).
+	signLog signLog
+	// agenticID is the contract whose iData writes the sign socket does not
+	// sign (signrules.go); zero turns the rule off.
+	agenticID common.Address
 }
 
 // OwnerResolver returns the agent's owner as of right now, by reading the
@@ -350,6 +356,7 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/credentials/login", s.handleCredentialLogin)
 	mux.HandleFunc("/_seal/credentials/disconnect", s.handleCredentialDisconnect)
 	mux.HandleFunc("/_seal/oauth/callback", s.handleOAuthCallback)
+	mux.HandleFunc("/_seal/signatures", s.handleSignatures)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {
