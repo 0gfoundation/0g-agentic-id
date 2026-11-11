@@ -100,7 +100,7 @@ The agent can ask for three things: a value handed over, a new credential (namin
 
 The key the agent calls its model with is kept in the credential set too, one entry per provider (`model.0g-compute`, `model.anthropic`, …).
 
-- **Who uses it.** sealed, not the agent: it hands the key to the framework for its model calls. The agent cannot see the entry, read the value or use it anywhere else.
+- **Who uses it.** sealed hands the key to the framework for its model calls. The entry is not in the agent's list of credentials and cannot be revealed. Whether the agent's tools can read the key depends on the framework, as for the key given at create/reset: 0g-harness on 0g-compute never gets it (sealed fills it in on the way out); openclaw, hermes, prime and 0g-harness on `openai`/`anthropic` receive the key itself, so their tools can read it.
 - **Which one.** The agent's settings choose the provider (`settings <agent> provider=…`), and sealed takes that provider's key; a key for another provider is only kept. With no provider in the settings, the one provider holding a key is used.
 - **Where it may go.** To the provider's address in the platform's provider list as it was when the key was set; a later change to the list does not move the key.
 - **Changing it.** `cred <agent> set model` takes effect at once: 0g-harness on 0g-compute switches without restarting; the other frameworks restart in a few seconds.

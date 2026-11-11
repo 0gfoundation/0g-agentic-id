@@ -207,6 +207,10 @@ func TestModelInUseFollowsTheStoredEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-calls
+	// The boot's first set is what the owner set before: no record of a change.
+	if audit, _ := json.Marshal(s.AuditSince(0)); strings.Contains(string(audit), "model key") {
+		t.Fatalf("the first load was recorded as a change: %s", audit)
+	}
 	k, _ := s.ModelKey("0g-compute")
 	s.SetModelInUse(ModelInUse{Provider: "0g-compute", Source: "credentials", ValueHash: k.ValueHash, Issue: "x"})
 	if _, err := s.Load(ctx, f.defsDoc(t, 2, []Definition{modelDef("0g-compute")}, []string{"sk-1"}), 0); err != nil {

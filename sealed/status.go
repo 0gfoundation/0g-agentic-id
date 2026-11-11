@@ -48,6 +48,10 @@ type runtimeStatus struct {
 	// It shows like pinned, after it, until a settings push applies.
 	settingsIssue     string
 	supervisorFailure string
+	// modelKeyIssue is why the framework is stopped: the model key the
+	// settings choose cannot be used (modelkey.go). Cleared once a key
+	// renders, whichever start path rendered it.
+	modelKeyIssue string
 	// ownerChanged is set while the agent belongs to an owner other than the
 	// one this container was started for: the container no longer serves it.
 	ownerChanged string
@@ -62,6 +66,9 @@ func (s *runtimeStatus) effective() (string, string) {
 	}
 	if s.supervisorFailure != "" {
 		return "error", s.supervisorFailure
+	}
+	if s.modelKeyIssue != "" {
+		return "error", s.modelKeyIssue
 	}
 	if s.level == "running" && s.pinned != "" {
 		return "warning", s.pinned
@@ -108,6 +115,17 @@ func (s *runtimeStatus) OwnerChanged(message string) string {
 	prev, _ := s.effective()
 	s.ownerChanged = message
 	return prev
+}
+
+// ModelKeyIssue sets (or, with "", clears) the model key error described on
+// runtimeStatus and reports whether it changed. The message must carry no
+// secret values.
+func (s *runtimeStatus) ModelKeyIssue(message string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := s.modelKeyIssue != message
+	s.modelKeyIssue = message
+	return changed
 }
 
 // SettingsIssue sets (or, with "", clears) the settings warning described

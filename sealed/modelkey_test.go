@@ -182,7 +182,9 @@ func TestModelKeyApply(t *testing.T) {
 	}
 	// Another route (a pinned registry version): never in place.
 	heldHost = "router-api.0g.ai"
-	keys.loadPinned = func(context.Context, inference.ProviderCredential) (*inference.Registry, error) { return inference.DefaultRegistry, nil }
+	keys.loadPinned = func(context.Context, inference.ProviderCredential) (*inference.Registry, error) {
+		return inference.DefaultRegistry, nil
+	}
 	store["0g-compute"] = credentials.ModelKey{Provider: "0g-compute", Value: []byte("sk-3"),
 		RouteHash: zgRoute(t), Registry: &inference.RegistryPin{Version: 2, Digest: "0x" + strings.Repeat("cd", 32)}}
 	if got := a.apply(ctx); got != "restarted" || reloads != 2 {
@@ -200,8 +202,20 @@ func TestModelKeyApply(t *testing.T) {
 		inUse.Source != "none" || !strings.Contains(inUse.Issue, "attestor down") {
 		t.Fatalf("unusable: %s %+v", got, inUse)
 	}
+	// The choice fails, yet the restart passes (a passing failure, or a
+	// restart that began meanwhile): looked at again, not taken as applied.
+	reloadErr = nil
+	if got := a.apply(ctx); got != "deferred" {
+		t.Fatalf("restart passed after a failure: %s", got)
+	}
+	reloadErr = errors.New("pre-start: attestor down")
+	if got := a.apply(ctx); got != "stopped" {
+		t.Fatalf("still unusable: %s", got)
+	}
 	// Tried again once it can be used.
-	keys.loadPinned = func(context.Context, inference.ProviderCredential) (*inference.Registry, error) { return inference.DefaultRegistry, nil }
+	keys.loadPinned = func(context.Context, inference.ProviderCredential) (*inference.Registry, error) {
+		return inference.DefaultRegistry, nil
+	}
 	reloadErr = nil
 	if got := a.apply(ctx); got != "restarted" || applied.credential.APIKey != "sk-4" {
 		t.Fatalf("recovered: %s", got)
@@ -229,8 +243,11 @@ func TestRemovedKeyInUseStopsTheFramework(t *testing.T) {
 		keys: keys, current: func() settings.Doc { return doc },
 		applied:    func() modelChoice { return applied },
 		setApplied: func(c modelChoice) { applied = c },
-		render:     func(context.Context, modelChoice, settings.Resolved) error { t.Fatal("rendered without a key"); return nil },
-		swap:       func(string, []byte) bool { t.Fatal("swapped"); return false },
+		render: func(context.Context, modelChoice, settings.Resolved) error {
+			t.Fatal("rendered without a key")
+			return nil
+		},
+		swap: func(string, []byte) bool { t.Fatal("swapped"); return false },
 		// The restart renders the current choice, which fails: stopped.
 		reload: func(ctx context.Context) error {
 			_, err := keys.resolve(ctx, keys.choose(doc))

@@ -100,7 +100,7 @@ agent 可以提出三种请求：交出某个值、新增一个凭据（指定�
 
 agent 调用模型用的 key 也放在凭据集里，一家服务一条（`model.0g-compute`、`model.anthropic` 等）。
 
-- **谁在用**：sealed，不是 agent。sealed 把 key 交给框架调模型用；agent 看不到这条，读不到值，也不能拿去别处用。
+- **谁在用**：sealed 把 key 交给框架调模型用。这一条不在 agent 能看到的凭据列表里，也不能交出。agent 的工具能不能读到 key，取决于框架，和创建/重置时交的 key 一样：0g-compute 上的 0g-harness 拿不到（sealed 在请求发出时填进去）；openclaw、hermes、prime，以及用 `openai`/`anthropic` 的 0g-harness，拿到的是 key 本身，它们的工具读得到。
 - **用哪条**：agent 的设置决定用哪家（`settings <agent> provider=…`），sealed 取那一家的 key；别家的 key 只存着。设置里没写 provider 时，只有一家有 key 就用这一家。
 - **能发到哪**：设置 key 时平台服务列表里这家的地址；之后列表再变，key 也不会被发到新地址。
 - **更换**：`cred <agent> set model` 立即生效：0g-compute 上的 0g-harness 直接换上，不重启；其他框架重启一下，几秒钟。

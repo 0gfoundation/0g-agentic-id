@@ -200,14 +200,17 @@ func (s *Store) ReleaseSystem(name string) {
 }
 
 // swapModelsLocked installs the model keys of a newly loaded set, notes the
-// changes in the owner's audit log, and reports whether any changed.
-func (s *Store) swapModelsLocked(keys map[string]ModelKey) bool {
+// changes in the owner's audit log (when audit), and reports whether any
+// changed.
+func (s *Store) swapModelsLocked(keys map[string]ModelKey, audit bool) bool {
 	changed := false
 	for p, k := range keys {
 		old, ok := s.models[p]
 		if !ok || !sameModelKey(old, k) {
 			changed = true
-			s.audit("model", k.Name, "", "model key set")
+			if audit {
+				s.audit("model", k.Name, "", "model key set")
+			}
 			continue
 		}
 		// The same key sealed again: what the owner reads names the entry
@@ -219,7 +222,9 @@ func (s *Store) swapModelsLocked(keys map[string]ModelKey) bool {
 	for p, old := range s.models {
 		if _, ok := keys[p]; !ok {
 			changed = true
-			s.audit("model", old.Name, "", "model key removed")
+			if audit {
+				s.audit("model", old.Name, "", "model key removed")
+			}
 		}
 	}
 	s.models = keys

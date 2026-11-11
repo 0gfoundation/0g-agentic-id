@@ -814,6 +814,12 @@ func startAgent(
 		if credStore != nil {
 			credStore.SetModelInUse(choice.inUse())
 		}
+		// A key renders: whatever stopped the framework over its model key
+		// is over, whichever start path got here.
+		if currentStatus.ModelKeyIssue("") {
+			level, msg := currentStatus.Get()
+			go report.Status(cfg.AttestorURL, agentSealPriv, sealID, level, msg, cfg.StatusBinding)
+		}
 		return nil
 	}
 	renderSettings := func(ctx context.Context, doc settings.Doc) error {
@@ -1013,10 +1019,18 @@ func startAgent(
 			setInUse: credStore.SetModelInUse,
 		}
 		var applyModelKeys func()
-		// retry backs off while a key cannot be used (an attestor that
-		// cannot serve its registry version, say); a (re)start under way is
-		// waited out briefly.
-		retry := 30 * time.Second // touched under settingsApply only
+		// One retry pending at a time, touched under settingsApply only: it
+		// backs off while a key cannot be used (an attestor that cannot serve
+		// its registry version, say); a (re)start under way is waited out
+		// briefly.
+		var retryTimer *time.Timer
+		retry := 30 * time.Second
+		again := func(d time.Duration) {
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
+			retryTimer = time.AfterFunc(d, applyModelKeys)
+		}
 		applyModelKeys = func() {
 			settingsApply.Lock()
 			defer settingsApply.Unlock()
@@ -1028,14 +1042,13 @@ func startAgent(
 			switch outcome := pushed.apply(ctx); outcome {
 			case "unchanged":
 			case "deferred":
-				time.AfterFunc(5*time.Second, applyModelKeys)
+				again(5 * time.Second)
 			case "stopped":
-				// The reason may name the provider: the owner reads it.
-				logger.Logf("warn: model key: the key the settings choose cannot be used; the framework is stopped (the owner's credential view says why); trying again in %s", retry)
-				msg := "the agent's model key cannot be used: the framework is stopped until it can (cred <agent> shows why)"
-				currentStatus.SupervisorFailed(msg)
-				go report.Status(cfg.AttestorURL, agentSealPriv, sealID, "error", msg, cfg.StatusBinding)
-				time.AfterFunc(retry, applyModelKeys)
+				logger.Logf("warn: model key: the key the settings choose cannot be used; the framework is stopped until it can (cred <agent> shows why); trying again in %s", retry)
+				currentStatus.ModelKeyIssue("the agent's model key cannot be used: the framework is stopped until it can (cred <agent> shows why)")
+				level, m := currentStatus.Get()
+				go report.Status(cfg.AttestorURL, agentSealPriv, sealID, level, m, cfg.StatusBinding)
+				again(retry)
 				if retry *= 2; retry > 10*time.Minute {
 					retry = 10 * time.Minute
 				}
@@ -1068,12 +1081,20 @@ func startAgent(
 			return err
 		}
 		prev := live.get()
+		appliedMu.Lock()
+		running := applied
+		appliedMu.Unlock()
 		live.set(doc)
 		if err := renderResolved(ctx, choice, resolved); err != nil {
 			// Re-render the owner's document so a rejected agent attempt
 			// cannot leave the framework configured from a half-applied one.
 			live.set(prev)
 			_ = renderSettings(ctx, prev)
+			// Nothing restarted: the process still runs on what it ran on,
+			// so a model key change waiting behind this is still applied.
+			appliedMu.Lock()
+			applied = running
+			appliedMu.Unlock()
 			return fmt.Errorf("render: %w", err)
 		}
 		err = mgr.Reload(ctx)
