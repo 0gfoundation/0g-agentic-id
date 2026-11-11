@@ -190,14 +190,17 @@ func (s *Server) signTools() []sealmcp.Tool {
 		},
 	}
 	s.mu.RLock()
-	restart, creds := s.restartHarness, s.credentials
+	creds := s.credentials
 	s.mu.RUnlock()
 	// The credential socket's endpoints, when credentials are on: one server
 	// for all of the runtime's tools but reveal, which keeps its own socket.
 	if c, ok := creds.(interface{ Tools() []sealmcp.Tool }); ok {
 		tools = append(tools, c.Tools()...)
 	}
-	if restart != nil {
+	// Listed for a framework that runs from a harness package, whether or
+	// not the restart is wired yet: the harness lists the tools while its
+	// first start is still under way, before the restart is (restart.go).
+	if _, ok := s.getAdapter().(framework.LayeredRuntime); ok {
 		tools = append(tools, sealmcp.Tool{
 			Name: "seal_restart_harness",
 			Description: "Restart your harness process: the runtime stops it and starts it again from the version it is set to run. Files on disk stay; the current task ends. " +

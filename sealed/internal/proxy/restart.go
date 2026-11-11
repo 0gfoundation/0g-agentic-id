@@ -14,6 +14,7 @@ import (
 	"context"
 	"net/http"
 
+	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 )
 
@@ -33,6 +34,12 @@ func (s *Server) handleHarnessRestart(w http.ResponseWriter, r *http.Request) {
 	restart := s.restartHarness
 	s.mu.RUnlock()
 	if restart == nil {
+		// The restart is wired once the first start has returned; a harness
+		// asking before then is told to ask again.
+		if _, ok := s.getAdapter().(framework.LayeredRuntime); ok {
+			http.Error(w, "the runtime is still starting the harness; ask again in a moment", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "this framework has no harness restart", http.StatusNotImplemented)
 		return
 	}

@@ -27,6 +27,14 @@ type declaringAdapter struct{ framework.Framework }
 func (declaringAdapter) AppliesSigningRules() bool { return true }
 func (declaringAdapter) ServesRuntimeTools() bool  { return true }
 
+// harnessAdapter is a declaringAdapter that runs from a harness package
+// (framework.LayeredRuntime), as 0g-harness does.
+type harnessAdapter struct{ declaringAdapter }
+
+func (harnessAdapter) UseHarness(string, string)            {}
+func (harnessAdapter) HarnessHash() string                  { return "" }
+func (harnessAdapter) InferenceTarget() (url, model string) { return "", "" }
+
 // rulesServer is signServer bound to an adapter that declares them.
 func rulesServer(t *testing.T) (*Server, common.Address) {
 	t.Helper()

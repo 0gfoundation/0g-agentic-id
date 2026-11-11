@@ -41,3 +41,17 @@ func TestHarnessRestart(t *testing.T) {
 		t.Fatal("the restart did not run")
 	}
 }
+
+// A framework that runs from a harness package, asking before the restart
+// is wired (during its first start), is told to ask again (503), not that it
+// has none.
+func TestHarnessRestart_NotYetWired(t *testing.T) {
+	s, _ := signServer(t)
+	s.adapter = harnessAdapter{}
+	mux, _ := s.signSocketMux()
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/harness/restart", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("restart before it is wired: %d %s", rec.Code, rec.Body)
+	}
+}

@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -49,9 +48,11 @@ func TestSignMCP_ListsTheSocketsEndpoints(t *testing.T) {
 	if got := names(); got != base {
 		t.Fatalf("tools: %s", got)
 	}
-	s.SetHarnessRestart(func(context.Context) error { return nil })
+	// A framework that runs from a harness package lists the restart before
+	// it is wired: its harness asks for the list during the first start.
+	s.adapter = harnessAdapter{}
 	if got := names(); got != "seal_register_service,seal_restart_harness,seal_services,seal_set_thinking,seal_settings,seal_sign,seal_sign_transaction,seal_sign_typed_data" {
-		t.Fatalf("tools with a harness restart: %s", got)
+		t.Fatalf("tools for a harness-package framework: %s", got)
 	}
 }
 
@@ -125,7 +126,7 @@ func TestSignMCP_TransactionArguments(t *testing.T) {
 // takes (DSH, openclaw, hermes, prime-agent).
 func TestSignMCP_SchemasInTheCommonSubset(t *testing.T) {
 	s, _ := rulesServer(t)
-	s.SetHarnessRestart(func(context.Context) error { return nil })
+	s.adapter = harnessAdapter{}
 	for _, tool := range s.signTools() {
 		schema := tool.Schema
 		if schema == nil {
