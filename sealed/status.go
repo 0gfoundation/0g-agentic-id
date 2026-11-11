@@ -36,9 +36,10 @@ type runtimeStatus struct {
 	mu      sync.Mutex
 	level   string // "running" | "warning" | "error"
 	message string
-	// pinned is an owner-recoverable condition that no runtime event
-	// clears for the life of this boot (today: an owner-supplied sealed
-	// key that did not apply, so the agent cannot call its model). While
+	// pinned is an owner-recoverable condition for the life of this boot
+	// (today: an owner-supplied sealed key that did not apply, so the agent
+	// cannot call its model), cleared only once a model key from the
+	// credential set is in use. While
 	// the runtime itself is "running", it shows as a "warning" with this
 	// message, so a later drift success or heartbeat cannot report the
 	// agent healthy. A real warning or error still takes precedence.
@@ -64,11 +65,13 @@ func (s *runtimeStatus) effective() (string, string) {
 	if s.ownerChanged != "" {
 		return "error", s.ownerChanged
 	}
-	if s.supervisorFailure != "" {
-		return "error", s.supervisorFailure
-	}
+	// Before a supervisor failure: the restarts it gave up on failed over
+	// the model key, and this says so.
 	if s.modelKeyIssue != "" {
 		return "error", s.modelKeyIssue
+	}
+	if s.supervisorFailure != "" {
+		return "error", s.supervisorFailure
 	}
 	if s.level == "running" && s.pinned != "" {
 		return "warning", s.pinned
@@ -100,11 +103,14 @@ func (s *runtimeStatus) Set(level, message string) string {
 }
 
 // Pin sets (or, with "", clears) the pinned warning described on
-// runtimeStatus. The message must carry no secret values.
-func (s *runtimeStatus) Pin(message string) {
+// runtimeStatus and reports whether it changed. The message must carry no
+// secret values.
+func (s *runtimeStatus) Pin(message string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	changed := s.pinned != message
 	s.pinned = message
+	return changed
 }
 
 // OwnerChanged sets (or, with "", clears) the owner-change error described

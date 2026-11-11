@@ -318,6 +318,12 @@ func TestModelKeyIssueStatus(t *testing.T) {
 	if level, msg := s.Get(); level != "error" || msg != "stopped over its model key" {
 		t.Fatalf("got %s %q", level, msg)
 	}
+	// The restarts the supervisor gave up on failed over the key: the key says so.
+	s.SupervisorFailed("supervisor exhausted retries")
+	if _, msg := s.Get(); msg != "stopped over its model key" {
+		t.Fatalf("got %q", msg)
+	}
+	s.SupervisorRecovered()
 	if !s.ModelKeyIssue("") || s.ModelKeyIssue("") {
 		t.Fatal("clearing is a change once")
 	}

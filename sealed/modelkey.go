@@ -156,7 +156,8 @@ var stoppedChoice = modelChoice{source: "stopped"}
 // stops the framework rather than leave it on a key the owner's state no
 // longer chooses. It returns what it did: "unchanged", "deferred" (a
 // (re)start is under way, or may have been: look again shortly),
-// "in_place", "restarted" or "stopped".
+// "in_place", "restarted", "restart_failed" (the key rendered, the
+// framework did not start) or "stopped" (the key cannot be used).
 func (a modelApply) apply(ctx context.Context) string {
 	choice := a.keys.choose(a.current())
 	prev := a.applied()
@@ -192,7 +193,12 @@ func (a modelApply) apply(ctx context.Context) string {
 		// meanwhile. Look again once that is done.
 		return "deferred"
 	case err == nil:
-		err = rerr
+		// The key rendered; the framework did not start for another reason.
+		a.setApplied(stoppedChoice)
+		in := choice.inUse()
+		in.Issue = "the framework did not restart on this key: " + rerr.Error()
+		a.setInUse(in)
+		return "restart_failed"
 	}
 	a.setApplied(stoppedChoice)
 	a.setInUse(credentials.ModelInUse{Provider: choice.doc.Provider, Source: "none",

@@ -628,10 +628,10 @@ func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Ope
 			values[name] = beforeValues[name]
 		}
 	}
-	// The first set this boot loads is what the owner set before, not a change.
+	// The first set this boot loads is recorded as loaded, not as a change.
 	first := s.mark == (Mark{})
 	s.version, s.mark, s.defs, s.defHashes, s.values = o.Set.Version, o.Mark, defs, hashes, values
-	if s.swapModelsLocked(models, !first) && s.onModels != nil {
+	if s.swapModelsLocked(models, first) && s.onModels != nil {
 		refresh = append(refresh, func() { go s.onModels() })
 	}
 	// Login entries refresh their access token themselves.

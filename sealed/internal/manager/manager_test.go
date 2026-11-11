@@ -435,3 +435,38 @@ func TestArmState_ProofFieldsFromRuntime(t *testing.T) {
 	}
 	check("after Reload")
 }
+
+// A reload whose caller's context ends with the call (a settings push, a
+// model key) still leaves the new process supervised: a later crash is
+// restarted.
+func TestReloadSupervisesBeyondTheCallersContext(t *testing.T) {
+	startCh := make(chan struct{}, 5)
+	a := &fakeAdapter{
+		startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+			startCh <- struct{}{}
+			return framework.StartResult{Upstream: "http://x"}, nil
+		},
+	}
+	m := New(a, state.New(), Config{
+		LivenessProbeInterval: 1 * time.Hour,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+	})
+	if err := m.Start(context.Background(), StartParams{}); err != nil {
+		t.Fatal(err)
+	}
+	<-startCh
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := m.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	<-startCh
+	a.triggerExit(errors.New("crashed"))
+	select {
+	case <-startCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("a crash after a reload under an ended context was not restarted")
+	}
+}

@@ -220,6 +220,18 @@ func TestModelKeyApply(t *testing.T) {
 	if got := a.apply(ctx); got != "restarted" || applied.credential.APIKey != "sk-4" {
 		t.Fatalf("recovered: %s", got)
 	}
+	// The key renders but the framework does not start: not the key's fault,
+	// and tried again.
+	store["0g-compute"] = credentials.ModelKey{Provider: "0g-compute", Value: []byte("sk-5"),
+		RouteHash: zgRoute(t), Registry: &inference.RegistryPin{Version: 6, Digest: "0x" + strings.Repeat("cd", 32)}}
+	reloadErr = errors.New("start: port in use")
+	if got := a.apply(ctx); got != "restart_failed" || applied.source != "stopped" || !strings.Contains(inUse.Issue, "did not restart") {
+		t.Fatalf("restart failed: %s %+v", got, inUse)
+	}
+	reloadErr = nil
+	if got := a.apply(ctx); got != "restarted" || applied.credential.APIKey != "sk-5" {
+		t.Fatalf("restart retried: %s", got)
+	}
 	// The key removed: back to the one handed over at create/reset.
 	delete(store, "0g-compute")
 	if got := a.apply(ctx); got != "restarted" || applied.source != "deploy" || rendered[len(rendered)-1] != "sk-boot" {

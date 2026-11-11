@@ -803,6 +803,21 @@ func startAgent(
 	// applied is the choice the framework was last rendered with.
 	var appliedMu sync.Mutex
 	var applied modelChoice
+	// Status reports from the model key paths go through one goroutine and
+	// carry the state as it is when sent, so they arrive in order.
+	statusNudge := make(chan struct{}, 1)
+	go func() {
+		for range statusNudge {
+			level, msg := currentStatus.Get()
+			report.Status(cfg.AttestorURL, agentSealPriv, sealID, level, msg, cfg.StatusBinding)
+		}
+	}()
+	reportStatus := func() {
+		select {
+		case statusNudge <- struct{}{}:
+		default:
+		}
+	}
 	renderResolved := func(ctx context.Context, choice modelChoice, resolved settings.Resolved) error {
 		if err := adapter.RenderSettings(ctx, resolved); err != nil {
 			return err
@@ -816,9 +831,15 @@ func startAgent(
 		}
 		// A key renders: whatever stopped the framework over its model key
 		// is over, whichever start path got here.
-		if currentStatus.ModelKeyIssue("") {
-			level, msg := currentStatus.Get()
-			go report.Status(cfg.AttestorURL, agentSealPriv, sealID, level, msg, cfg.StatusBinding)
+		changed := currentStatus.ModelKeyIssue("")
+		// A key from the set: the boot's own key (secretenv) not applying no
+		// longer keeps the agent from its model. Falling back to that key
+		// fails to resolve, which the model key status reports instead.
+		if choice.source == "credentials" && currentStatus.Pin("") {
+			changed = true
+		}
+		if changed {
+			reportStatus()
 		}
 		return nil
 	}
@@ -1041,13 +1062,20 @@ func startAgent(
 			defer cancel()
 			switch outcome := pushed.apply(ctx); outcome {
 			case "unchanged":
+				// Whatever recovered the framework (its own restart, a
+				// settings push), the next outage starts the backoff anew.
+				retry = 30 * time.Second
 			case "deferred":
 				again(5 * time.Second)
-			case "stopped":
-				logger.Logf("warn: model key: the key the settings choose cannot be used; the framework is stopped until it can (cred <agent> shows why); trying again in %s", retry)
-				currentStatus.ModelKeyIssue("the agent's model key cannot be used: the framework is stopped until it can (cred <agent> shows why)")
-				level, m := currentStatus.Get()
-				go report.Status(cfg.AttestorURL, agentSealPriv, sealID, level, m, cfg.StatusBinding)
+			case "stopped", "restart_failed":
+				if outcome == "stopped" {
+					logger.Logf("warn: model key: the key the settings choose cannot be used; the framework is stopped until it can (cred <agent> shows why); trying again in %s", retry)
+					currentStatus.ModelKeyIssue("the agent's model key cannot be used: the framework is stopped until it can (cred <agent> shows why)")
+				} else {
+					logger.Logf("warn: model key: the framework did not restart on the new key (cred <agent> shows why); trying again in %s", retry)
+					currentStatus.SupervisorFailed("the framework did not restart after a model key change; trying again")
+				}
+				reportStatus()
 				again(retry)
 				if retry *= 2; retry > 10*time.Minute {
 					retry = 10 * time.Minute
@@ -1056,6 +1084,7 @@ func startAgent(
 				retry = 30 * time.Second
 				if agent.Phase() == state.PhaseRunning {
 					currentStatus.SupervisorRecovered()
+					reportStatus()
 				}
 				logger.Logf("OK   model key: applied (%s)", outcome)
 			}

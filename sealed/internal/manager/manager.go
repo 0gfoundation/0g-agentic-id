@@ -216,7 +216,10 @@ func (m *Manager) Reload(ctx context.Context) error {
 		return fmt.Errorf("reload start: %w", err)
 	}
 	m.armState(res)
-	m.hookLifecycle(ctx)
+	// Supervision outlives the caller: a reload asked for by a request (a
+	// settings push, a model key) must not leave the new process
+	// unwatched once that request is done.
+	m.hookLifecycle(context.WithoutCancel(ctx))
 	logger.Logf("manager: reload complete; back to Running")
 	return nil
 }
