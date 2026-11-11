@@ -156,6 +156,11 @@ type Manager struct {
 	lifeGen    atomic.Uint64
 	// liveLoops counts running liveness loops (tests).
 	liveLoops atomic.Int32
+	// reloadAsked is set by a Reload skipped for a restart under way. Each
+	// restart attempt renders what was asked before it began; before giving
+	// up, a restart tries once more if a reload was asked after its last
+	// attempt rendered.
+	reloadAsked atomic.Bool
 }
 
 // New constructs a Manager. Adapter must already have its Restore calls
@@ -217,7 +222,8 @@ func (m *Manager) Stop(ctx context.Context) {
 // guard as restart()).
 func (m *Manager) Reload(ctx context.Context) error {
 	if !m.inFlight.CompareAndSwap(false, true) {
-		logger.Logf("manager: reload requested while another (re-)start is in flight; skipping")
+		logger.Logf("manager: reload requested while another (re-)start is in flight; it renders the change")
+		m.reloadAsked.Store(true)
 		return nil
 	}
 	defer m.inFlight.Store(false)
@@ -322,16 +328,6 @@ func (m *Manager) hookLifecycle() {
 	go m.runLivenessLoop(ctx)
 }
 
-// endGeneration ends the current generation's supervision.
-func (m *Manager) endGeneration() {
-	m.lifeMu.Lock()
-	defer m.lifeMu.Unlock()
-	if m.lifeCancel != nil {
-		m.lifeCancel()
-		m.lifeCancel = nil
-	}
-}
-
 func (m *Manager) recovered() {
 	if m.cfg.OnRecovered != nil {
 		m.cfg.OnRecovered()
@@ -386,7 +382,8 @@ func (m *Manager) restart(ctx context.Context) {
 	logger.Logf("manager: entering Restarting phase")
 
 	var lastErr error
-	for attempt := 1; m.cfg.MaxRetries < 0 || attempt <= m.cfg.MaxRetries; attempt++ {
+	extra := 0 // attempts granted to reloads asked during the last one
+	for attempt := 1; m.cfg.MaxRetries < 0 || attempt <= m.cfg.MaxRetries+extra; attempt++ {
 		backoff := m.backoffFor(attempt - 1)
 		logger.Logf("manager: restart attempt %d/%d after %s", attempt, m.cfg.MaxRetries, backoff)
 
@@ -401,32 +398,32 @@ func (m *Manager) restart(ctx context.Context) {
 		// Best-effort stop in case the adapter still holds a stale process.
 		_ = m.adapter.Stop(ctx, m.cfg.GracefulStopTimeout)
 
+		// This attempt renders whatever a reload asked for so far.
+		m.reloadAsked.Store(false)
 		if err := m.preStart(ctx); err != nil {
 			logger.Logf("manager: restart attempt %d: pre-start failed: %v", attempt, err)
 			lastErr = err
-			continue
-		}
-		res, err := m.adapter.Start(ctx, m.params.Runtime)
-		if err != nil {
+		} else if res, err := m.adapter.Start(ctx, m.params.Runtime); err != nil {
 			logger.Logf("manager: restart attempt %d failed: %v", attempt, err)
 			lastErr = err
-			continue
+		} else {
+			m.armState(res)
+			m.hookLifecycle()
+			m.recovered()
+			logger.Logf("manager: restart attempt %d succeeded; back to Running", attempt)
+			return
 		}
-
-		m.armState(res)
-		m.hookLifecycle()
-		m.recovered()
-		logger.Logf("manager: restart attempt %d succeeded; back to Running", attempt)
-		return
+		// A reload asked for after the last attempt rendered: one more, on it.
+		if m.cfg.MaxRetries >= 0 && attempt == m.cfg.MaxRetries+extra && m.reloadAsked.Load() {
+			logger.Logf("manager: a reload was asked during the last attempt; one more")
+			extra++
+		}
 	}
 
 	if lastErr == nil {
 		lastErr = errors.New("max retries exceeded with no specific adapter error")
 	}
 	logger.Logf("manager: max retries (%d) exceeded; entering Failed: %v", m.cfg.MaxRetries, lastErr)
-	// Given up: this generation's loop does not start the same sequence
-	// again. A reload (a settings push, a model key) starts a new one.
-	m.endGeneration()
 	m.agent.SetPhase(state.PhaseFailed)
 	if m.cfg.OnFailed != nil {
 		m.cfg.OnFailed(lastErr)

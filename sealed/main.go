@@ -329,7 +329,10 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	}
 	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, credRT, credValues, credStore, sealedProxy, onFailed, statusReports); err != nil {
 		logger.Logf("FAIL agent: %v", err)
-		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", err.Error(), cfg.StatusBinding)
+		// Recorded, so a later report (a recovery, a model key retry) does
+		// not read "running" past it.
+		currentStatus.SupervisorFailed(err.Error())
+		statusReports.Soon()
 		return
 	}
 	logger.Logf("OK   agent ready (upstream listening, agentState armed, supervisor active)")
@@ -1036,6 +1039,7 @@ func startAgent(
 			swap:     func(host string, v []byte) bool { return credStore.SwapSystemValue("sealed:inference", host, v) },
 			reload:   mgr.Reload,
 			busy:     mgr.Busy,
+			failed:   func() bool { return agent.Phase() == state.PhaseFailed },
 			setInUse: credStore.SetModelInUse,
 		}
 		var applyModelKeys func()

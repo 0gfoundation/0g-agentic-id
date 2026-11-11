@@ -142,8 +142,10 @@ type modelApply struct {
 	// reload restarts the framework on the current choice (its PreStart
 	// renders it); while that cannot be rendered, the framework stays stopped.
 	reload func(ctx context.Context) error
-	// busy reports a framework (re)start under way.
+	// busy reports a framework (re)start under way; failed, a framework
+	// the supervisor gave up on.
 	busy     func() bool
+	failed   func() bool
 	setInUse func(credentials.ModelInUse)
 }
 
@@ -161,14 +163,23 @@ var stoppedChoice = modelChoice{source: "stopped"}
 func (a modelApply) apply(ctx context.Context) string {
 	choice := a.keys.choose(a.current())
 	prev := a.applied()
-	if choice.source == prev.source && choice.issue == prev.issue && choice.doc.Provider == prev.doc.Provider &&
-		choice.credential.APIKey == prev.credential.APIKey && sameRoute(choice.credential, prev.credential) {
+	same := choice.source == prev.source && choice.issue == prev.issue && choice.doc.Provider == prev.doc.Provider &&
+		choice.credential.APIKey == prev.credential.APIKey && sameRoute(choice.credential, prev.credential)
+	// A choice rendered is not a framework running: one the supervisor gave
+	// up on (a restart that failed after the key changed) is started again.
+	if same && !a.failed() {
 		return "unchanged"
 	}
 	// A (re)start under way renders what it read before this change, and a
 	// reload asked for meanwhile is skipped.
 	if a.busy() {
 		return "deferred"
+	}
+	if same {
+		if err := a.reload(ctx); err != nil {
+			return a.restartFailed(choice, err)
+		}
+		return "restarted"
 	}
 	resolved, err := a.keys.resolve(ctx, choice)
 	if err == nil {
@@ -194,16 +205,22 @@ func (a modelApply) apply(ctx context.Context) string {
 		return "deferred"
 	case err == nil:
 		// The key rendered; the framework did not start for another reason.
-		a.setApplied(stoppedChoice)
-		in := choice.inUse()
-		in.Issue = "the framework did not restart on this key: " + rerr.Error()
-		a.setInUse(in)
-		return "restart_failed"
+		return a.restartFailed(choice, rerr)
 	}
 	a.setApplied(stoppedChoice)
 	a.setInUse(credentials.ModelInUse{Provider: choice.doc.Provider, Source: "none",
 		Issue: "the model key the settings choose cannot be used (" + err.Error() + "); the framework is stopped until it can"})
 	return "stopped"
+}
+
+// restartFailed records a framework that did not start on a choice that
+// rendered: not the key's fault, and tried again.
+func (a modelApply) restartFailed(choice modelChoice, err error) string {
+	a.setApplied(stoppedChoice)
+	in := choice.inUse()
+	in.Issue = "the framework did not restart on this key: " + err.Error()
+	a.setInUse(in)
+	return "restart_failed"
 }
 
 func endpointHost(ep *inference.Endpoint) string {

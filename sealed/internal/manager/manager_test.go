@@ -485,53 +485,88 @@ func TestReloadSupervisesBeyondTheCallersContext(t *testing.T) {
 	}
 }
 
-// A process that keeps failing runs one restart sequence and one OnFailed,
-// and leaves no loop to start another; a crash restarted reports the
-// recovery.
-func TestRestartGivesUpOnceAndReportsRecovery(t *testing.T) {
-	var fail atomic.Bool
-	a := &fakeAdapter{
-		startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
-			if fail.Load() {
-				return framework.StartResult{}, errors.New("permanent failure")
-			}
-			return framework.StartResult{Upstream: "http://x"}, nil
-		},
-		livenessFn: func() error {
-			if fail.Load() {
-				return errors.New("down")
-			}
-			return nil
-		},
-	}
-	var failed, recovered atomic.Int32
+// A crash restarted reports the recovery.
+func TestRestartReportsRecovery(t *testing.T) {
+	startCh := make(chan struct{}, 4)
+	a := &fakeAdapter{startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+		startCh <- struct{}{}
+		return framework.StartResult{Upstream: "http://x"}, nil
+	}}
+	var recovered atomic.Int32
 	m := New(a, state.New(), Config{
-		LivenessProbeInterval: 2 * time.Millisecond,
+		LivenessProbeInterval: 1 * time.Hour,
 		BackoffSeq:            []time.Duration{1 * time.Millisecond},
 		MaxRetries:            3,
 		GracefulStopTimeout:   1 * time.Millisecond,
-		OnFailed:              func(error) { failed.Add(1) },
 		OnRecovered:           func() { recovered.Add(1) },
 	})
 	defer m.Stop(context.Background())
 	if err := m.Start(context.Background(), StartParams{}); err != nil {
 		t.Fatal(err)
 	}
-	a.triggerExit(errors.New("crashed"))
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for recovered.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	<-startCh
+	if recovered.Load() != 0 {
+		t.Fatal("the first start is not a recovery")
 	}
+	a.triggerExit(errors.New("crashed"))
+	<-startCh
+	time.Sleep(20 * time.Millisecond)
 	if recovered.Load() != 1 {
 		t.Fatalf("a restarted crash reported %d recoveries", recovered.Load())
 	}
-	fail.Store(true)
-	a.triggerExit(errors.New("crashed again"))
-	time.Sleep(200 * time.Millisecond)
-	if n := failed.Load(); n != 1 {
-		t.Fatalf("OnFailed ran %d times", n)
+}
+
+// A reload asked for while the last restart attempt runs is not lost: the
+// restart tries once more, on what the reload asked for.
+func TestReloadDuringTheLastAttemptIsTried(t *testing.T) {
+	var fixed atomic.Bool
+	inLast := make(chan struct{})
+	release := make(chan struct{})
+	var starts atomic.Int32
+	a := &fakeAdapter{startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+		n := starts.Add(1)
+		switch {
+		case n == 1:
+			return framework.StartResult{Upstream: "http://x"}, nil
+		case n == 4: // the last of three attempts: the owner fixes it meanwhile
+			close(inLast)
+			<-release
+			return framework.StartResult{}, errors.New("still broken")
+		case fixed.Load():
+			return framework.StartResult{Upstream: "http://x"}, nil
+		default:
+			return framework.StartResult{}, errors.New("broken")
+		}
+	}}
+	var failed atomic.Int32
+	ag := state.New()
+	m := New(a, ag, Config{
+		LivenessProbeInterval: 1 * time.Hour,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+		OnFailed:              func(error) { failed.Add(1) },
+	})
+	defer m.Stop(context.Background())
+	var rendered atomic.Int32
+	if err := m.Start(context.Background(), StartParams{PreStart: func(context.Context) error {
+		rendered.Add(1)
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
 	}
-	if n := m.liveLoops.Load(); n != 0 {
-		t.Fatalf("%d liveness loops after giving up", n)
+	a.triggerExit(errors.New("crashed"))
+	<-inLast
+	fixed.Store(true)
+	if err := m.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for ag.Phase() != state.PhaseRunning && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if ag.Phase() != state.PhaseRunning || failed.Load() != 0 || starts.Load() != 5 {
+		t.Fatalf("phase %v, failed %d, starts %d", ag.Phase(), failed.Load(), starts.Load())
 	}
 }

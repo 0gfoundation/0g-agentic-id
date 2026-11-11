@@ -130,7 +130,7 @@ func TestModelKeyApply(t *testing.T) {
 	applied := keys.choose(doc)
 	var rendered []string
 	var swapped []string
-	reloads, busy := 0, false
+	reloads, busy, failed := 0, false, false
 	heldHost := "router-api.0g.ai"
 	var reloadErr error
 	var inUse credentials.ModelInUse
@@ -152,6 +152,7 @@ func TestModelKeyApply(t *testing.T) {
 		},
 		reload:   func(context.Context) error { reloads++; return reloadErr },
 		busy:     func() bool { return busy },
+		failed:   func() bool { return failed },
 		setInUse: func(m credentials.ModelInUse) { inUse = m },
 	}
 	ctx := context.Background()
@@ -228,9 +229,23 @@ func TestModelKeyApply(t *testing.T) {
 	if got := a.apply(ctx); got != "restart_failed" || applied.source != "stopped" || !strings.Contains(inUse.Issue, "did not restart") {
 		t.Fatalf("restart failed: %s %+v", got, inUse)
 	}
+	// The supervisor's own restart rendered the key (recorded as applied)
+	// and gave up: the retry starts the framework again.
+	applied = keys.choose(doc)
+	failed = true
+	before := reloads
+	if got := a.apply(ctx); got != "restart_failed" || reloads != before+1 {
+		t.Fatalf("given up, still failing: %s reloads=%d", got, reloads-before)
+	}
+	applied = keys.choose(doc)
 	reloadErr = nil
-	if got := a.apply(ctx); got != "restarted" || applied.credential.APIKey != "sk-5" {
-		t.Fatalf("restart retried: %s", got)
+	if got := a.apply(ctx); got != "restarted" || reloads != before+2 || len(rendered) == 0 {
+		t.Fatalf("given up, then started: %s reloads=%d", got, reloads-before)
+	}
+	failed = false
+	reloadErr = nil
+	if got := a.apply(ctx); got != "unchanged" {
+		t.Fatalf("running: %s", got)
 	}
 	// The key removed: back to the one handed over at create/reset.
 	delete(store, "0g-compute")
@@ -266,6 +281,7 @@ func TestRemovedKeyInUseStopsTheFramework(t *testing.T) {
 			return err
 		},
 		busy:     func() bool { return false },
+		failed:   func() bool { return false },
 		setInUse: func(m credentials.ModelInUse) { inUse = m },
 	}
 	delete(store, "anthropic")
