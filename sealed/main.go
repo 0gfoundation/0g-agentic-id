@@ -56,6 +56,7 @@ import (
 	"seal-verify/internal/report"
 	"seal-verify/internal/scrub"
 	"seal-verify/internal/secretenv"
+	"seal-verify/internal/servicehost"
 	"seal-verify/internal/settings"
 	"seal-verify/internal/state"
 	"seal-verify/internal/uploader"
@@ -949,6 +950,18 @@ func startAgent(
 		chainIDStr = res.client.ChainID().String()
 	}
 
+	// Resume untrusted services only after the live owner and identity have
+	// been restored. Each program has its own filesystem/process sandbox.
+	if adapter.Name() == "0g-harness" || adapter.Name() == "dsh" {
+		host, err := servicehost.New(privsep.StateDir+"/services", strings.ToLower(res.owner)+":"+sealID)
+		if err != nil {
+			logger.Logf("service hosting unavailable: %v", err)
+		} else {
+			sealedProxy.SetServiceHost(host)
+			sealedStop.add(func(context.Context) { host.Close() })
+			host.Resume()
+		}
+	}
 	mgr := manager.New(adapter, agent, manager.Config{
 		OnFailed: onFailed,
 	})

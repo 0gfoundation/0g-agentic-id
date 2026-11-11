@@ -65,6 +65,9 @@ func (s *Server) ObserveOwner(owner string) (locked, changed bool) {
 	for _, cancel := range cancels {
 		cancel()
 	}
+	if host := s.getServiceHost(); host != nil {
+		host.Close()
+	}
 	s.mu.RLock()
 	c := s.credentials
 	s.mu.RUnlock()

@@ -146,7 +146,7 @@ func (s *Server) signTools() []sealmcp.Tool {
 						"backend":       str("Loopback upstream http://127.0.0.1:<port> — host and port only, no path."),
 						"description":   str("One short sentence for /hello."),
 						"input_example": str("A literal JSON body example, if the route takes one."),
-						"transport":     str("\"mcp\" when the backend is an MCP server (POST only); omit for plain HTTP."),
+						"transport":     str("\"mcp\" when the backend is an MCP server (register POST; GET/DELETE also forward); omit for plain HTTP."),
 					}, "path", "method", "backend"),
 				},
 			}, "services"),
@@ -211,7 +211,7 @@ func (s *Server) signTools() []sealmcp.Tool {
 			Prepare: func(map[string]any) (any, error) { return nil, nil },
 		})
 	}
-	return tools
+	return append(tools, s.serviceHostTools()...)
 }
 
 func prepareTransaction(args map[string]any) (any, error) {

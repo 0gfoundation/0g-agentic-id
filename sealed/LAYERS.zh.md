@@ -370,3 +370,7 @@ ProvisionBoot.v2:0x<seal_id>:<generation>:<sha256(ticket) 十六进制>:<boot_id
 **ServeProof v2**：摘要、信封和已知答案向量见第 7 节。
 
 **harness 官方版本包**：装好的 0g-harness 包目录打成 gzip tar（名字排序、属主 0、时间 0、硬链接存成文件、gzip 不带时间），包名是它的 sha256。只能有目录、普通文件和不指向包外的链接。`sealed/images/harness/Dockerfile` 的 `harness-package` 阶段产出它。
+
+## 托管 MCP 程序
+
+owner Harness 可以通过 sealed 的私有服务管理工具发布和托管独立 MCP 程序。[MCP_SERVICES.zh.md](MCP_SERVICES.zh.md) 说明 manifest、隔离边界、恢复与流式证明策略。owner 设置 `others.mcpServers` 配置额外的 DSH 原生 MCP 连接；`seal` 和 `seal-reveal` 是保留命名空间。

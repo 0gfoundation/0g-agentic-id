@@ -37,21 +37,16 @@ type ServiceEntry struct {
 	Description  string `json:"description,omitempty"`   // one short sentence
 	InputExample string `json:"input_example,omitempty"` // literal JSON body, if any
 	Backend      string `json:"backend"`                 // loopback upstream: http://127.0.0.1:<port>
-	// Transport marks the service's protocol for consumers. Empty (the
-	// default) = a plain HTTP endpoint. "mcp" = an MCP server endpoint: the
-	// backend speaks the MCP streamable-HTTP protocol (JSON-RPC over POST),
-	// so an MCP-capable client can mount <public-url><path> as an MCP server
-	// and the agent's tools become the client's tools. MCP routes must be
-	// POST: the proxy pins one method per path, and POST is the protocol's
-	// workhorse (a stateless server never needs the optional GET SSE
-	// channel, which the one-method pin could not serve anyway).
+	// Transport marks plain HTTP or an MCP Streamable HTTP endpoint. MCP
+	// registrations name POST; the proxy also relays GET/DELETE and lets
+	// the backend return 405 when an optional method is unsupported.
 	Transport string `json:"transport,omitempty"` // "" (plain HTTP) | "mcp"
 }
 
 // reservedPrefixes are platform-owned paths an agent service may not shadow.
 // Agent paths must already be under /api/, so this is belt-and-suspenders
 // against a future /api/-reserved path or a validation slip.
-var reservedPrefixes = []string{"/hello", "/healthz", "/log", "/_seal/", "/admin/"}
+var reservedPrefixes = []string{"/hello", "/healthz", "/log", "/_seal/", "/admin/", "/api/mcp/"}
 
 var validMethods = map[string]bool{
 	http.MethodGet: true, http.MethodPost: true, http.MethodPut: true,
@@ -160,9 +155,15 @@ func validateLoopbackBackend(backend string) error {
 // getServices returns a copy of the current agent-registered services.
 func (s *Server) getServices() []ServiceEntry {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	out := make([]ServiceEntry, len(s.services))
 	copy(out, s.services)
+	host := s.serviceHost
+	s.mu.RUnlock()
+	if host != nil {
+		for _, svc := range host.List() {
+			out = append(out, ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description})
+		}
+	}
 	return out
 }
 
@@ -205,6 +206,11 @@ func (s *Server) helloServiceList() []report.Service {
 // request path (query string excluded by the caller). Exact match for now;
 // subpath/prefix routing is a later refinement.
 func (s *Server) matchService(path string) (ServiceEntry, bool) {
+	if host := s.getServiceHost(); host != nil {
+		if svc, _, ok := host.Match(path); ok {
+			return ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description}, true
+		}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, e := range s.services {

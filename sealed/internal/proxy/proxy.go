@@ -60,6 +60,7 @@ import (
 	"seal-verify/internal/logger"
 	"seal-verify/internal/privsep"
 	"seal-verify/internal/report"
+	"seal-verify/internal/servicehost"
 	"seal-verify/internal/state"
 )
 
@@ -79,8 +80,9 @@ type Server struct {
 	// /log/agent reports unavailable.
 	mu           sync.RWMutex
 	adapter      framework.Framework
-	agentLogPath string            // adapter's subprocess log file; empty renders "not available"
-	services     []ServiceEntry    // agent-registered external services (see services.go); nil until first POST /services
+	agentLogPath string         // adapter's subprocess log file; empty renders "not available"
+	services     []ServiceEntry // agent-registered external services (see services.go); nil until first POST /services
+	serviceHost  *servicehost.Manager
 	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ every framework path 404s
 
 	// synth backs the synthesized /v1/responses surface (responses.go) for
@@ -770,16 +772,35 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	//   - neither → 404 (fail-closed); no forward-all fallback.
 	signed := false
 	frameworkRoute := false
+	mcpService := false
+	client := http.DefaultClient
 	if svc, ok := s.matchService(r.URL.Path); ok {
-		if !strings.EqualFold(svc.Method, r.Method) {
+		mcpService = svc.Transport == "mcp"
+		allowed := strings.EqualFold(svc.Method, r.Method)
+		if mcpService {
+			allowed = r.Method == http.MethodPost || r.Method == http.MethodGet || r.Method == http.MethodDelete
+		}
+		if !allowed {
 			// RFC 9110: a 405 should carry Allow naming the one method
 			// this pinned path accepts (the proxy pins exactly one).
 			w.Header().Set("Allow", svc.Method)
+			if mcpService {
+				w.Header().Set("Allow", "POST, GET, DELETE")
+			}
 			http.Error(w, "method not allowed for "+svc.Path, http.StatusMethodNotAllowed)
 			return
 		}
 		signed = true
 		upstream = svc.Backend
+		if host := s.getServiceHost(); host != nil {
+			if status, socket, ok := host.Match(r.URL.Path); ok {
+				if status.State != "running" {
+					http.Error(w, "service is not ready", 503)
+					return
+				}
+				client = servicehost.Client(socket)
+			}
+		}
 	} else if rt, ok := s.matchFrameworkRoute(r.URL.Path); ok {
 		frameworkRoute = true
 		// A route that lists its endpoints forwards those requests only:
@@ -870,7 +891,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		upReq.Header.Set("Origin", "http://"+upHost)
 	}
 
-	resp, err := http.DefaultClient.Do(upReq)
+	resp, err := client.Do(upReq)
 	if err != nil {
 		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
 		return
@@ -881,6 +902,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// and before a serve-proof is computed, so the proof covers the bytes
 	// the caller receives.
 	s.scrubResponse(resp)
+	// MCP SSE may contain server-to-client requests during a tool call.
+	// Buffering would deadlock sampling/elicitation. A stream has no complete
+	// body to sign in an initial header: explicitly label it unsigned; /hello
+	// remains the signed identity/discovery surface. Finite JSON stays signed.
+	if mcpService && isEventStream(resp) {
+		w.Header().Set("X-Agent-Proof-Mode", "stream-unsigned")
+		resp.Header.Set("X-Accel-Buffering", "no")
+		resp.Header.Set("Cache-Control", "no-cache")
+		streamRelay(w, resp)
+		return
+	}
 
 	// An SSE stream can't be buffered + signed: the serve-proof signs a complete
 	// body, which a stream doesn't have until it ends. Relay it verbatim with
@@ -948,9 +980,9 @@ func isEventStream(resp *http.Response) bool {
 // shouldStreamRelay decides whether a response is relayed as an unsigned stream
 // rather than buffered + signed. Only a framework-declared route (the
 // owner↔agent steering channel: chat/UI) may stream: it has no attribution
-// consumer, so an unsigned stream is fine. Agent-registered /api/* services
-// never stream here — they stay buffered + signed so the attributable surface
-// keeps its X-Agent-Proof even when it emits SSE.
+// consumer, so an unsigned stream is fine. Plain agent-registered /api/* services
+// stay buffered and signed here. MCP SSE takes its explicit unsigned streaming
+// branch in handleProxy before this framework-only helper.
 func shouldStreamRelay(frameworkRoute bool, resp *http.Response) bool {
 	return frameworkRoute && isEventStream(resp)
 }
@@ -1236,7 +1268,7 @@ const agentProofHeader = "X-Agent-Proof"
 // X-Agent-Proof. Keys from net/http are canonical already; the comparison is
 // case-insensitive anyway so a non-canonical map key cannot slip past.
 func isAgentProofHeader(k string) bool {
-	return strings.EqualFold(k, agentProofHeader)
+	return strings.EqualFold(k, agentProofHeader) || strings.EqualFold(k, "X-Agent-Proof-Mode")
 }
 
 // writeServeProof signs the contract-shaped envelope with agent_seal_priv and
