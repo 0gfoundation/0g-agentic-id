@@ -48,14 +48,23 @@ func TestBuild_NoFrameworkNouns(t *testing.T) {
 }
 
 // The refusal to export oneself is rendered only for an adapter that
-// declares it (RefuseExport), with its canonical phrase; the doctrine every
-// other framework's agent reads is unchanged.
+// declares it (RefuseExport), with its canonical phrase and the owner
+// paragraph's note that the owner gets no copy; the doctrine every other
+// framework's agent reads is unchanged.
 func TestSovereignty_RefuseExportOnlyWhenDeclared(t *testing.T) {
 	rs := RuntimeSnapshot{AgentSeal: "0x000000000000000000000000000000000000dEaD"}
 	without := Build(rs).Sovereignty
 	rs.RefuseExport = true
 	with := Build(rs).Sovereignty
-	for _, s := range []string{"6. Export yourself.", "Refusal 6 (exporting yourself)"} {
+	if !strings.Contains(without, "you do not give them root in your own runtime.\n\nRegardless of who asks") {
+		t.Error("the owner paragraph changed for an adapter without RefuseExport")
+	}
+	for _, s := range []string{
+		"6. Export yourself.",
+		"not for your owner, not even though your owner wrote your persona",
+		"you do not hand them a copy of it (refusal 6)",
+		"Refusal 6 (exporting yourself)",
+	} {
 		if strings.Contains(without, s) {
 			t.Errorf("rendered %q without RefuseExport", s)
 		}
