@@ -186,6 +186,8 @@ export interface ModelKeyInUse {
   value_hash?: string;
   /** Why the key the settings choose is not the one in use. */
   issue?: string;
+  /** The provider of the key given at create/reset, when it is usable: a switch to it needs no key in the set. */
+  deploy_provider?: string;
 }
 
 /**

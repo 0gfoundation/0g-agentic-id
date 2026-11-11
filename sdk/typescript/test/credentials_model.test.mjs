@@ -243,3 +243,14 @@ test('cli: a provider switch asks for the new provider\'s key once, and not on a
     old.server.close();
   }
 });
+
+test('cli: a switch back to the provider of the create/reset key asks for no key', async () => {
+  const s = await stub([], () => ({ provider: 'anthropic', source: 'credentials', deploy_provider: '0g-compute' }));
+  try {
+    const io = { out: () => {}, secret: async () => { throw new Error('asked for a key'); } };
+    assert.equal(await ensureModelKey(ag(s.port), SEAL_ID, '0g-compute', io), 'kept');
+    assert.equal(s.seen.filter((r) => r.method === 'POST').length, 0);
+  } finally {
+    s.server.close();
+  }
+});

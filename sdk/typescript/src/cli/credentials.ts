@@ -660,6 +660,8 @@ export async function ensureModelKey(ag: AgenticID, sealId: Hash, provider: stri
   const cred = ag.credentials;
   const { state } = await modelKeyState(cred, sealId, at);
   if (state === 'old') return 'unsupported';
+  // The key given at create/reset is for that provider: nothing to add.
+  if (state?.deploy_provider === provider) return 'kept';
   // An attestor that keeps no credential sets: the reset path too.
   const cur = await cred.get(sealId).catch((e: unknown) => {
     if (/HTTP 404/.test(e instanceof Error ? e.message : String(e))) return undefined;

@@ -67,6 +67,13 @@ func TestModelKeyChoice(t *testing.T) {
 	if c.source != "credentials" || c.credential.APIKey != "sk-cred" || !c.credential.Bound || c.valueHash != "0xaa" {
 		t.Fatalf("set key: %+v", c)
 	}
+	// The owner learns which provider the create/reset key serves, if usable.
+	if c.inUse().DeployProvider != "0g-compute" {
+		t.Fatalf("deploy provider: %+v", c.inUse())
+	}
+	if (&modelKeys{boot: inference.ProviderCredential{Invalid: true}}).choose(settings.Doc{Provider: "0g-compute"}).deployProvider != "" {
+		t.Fatal("an unusable create/reset key named as usable")
+	}
 	if c := keys.choose(settings.Doc{Provider: "openai", Model: "m"}); c.source != "deploy" || c.credential.APIKey != "sk-boot" {
 		t.Fatalf("no key for the provider: %+v", c)
 	}
@@ -179,6 +186,10 @@ func TestModelKeyApply(t *testing.T) {
 	// The provider's key, same route: swapped in place where sealed holds it.
 	if got := a.apply(ctx); got != "in_place" || reloads != 0 || swapped[0] != "sk-1" || rendered[0] != "sk-1" {
 		t.Fatalf("in place: %s reloads=%d", got, reloads)
+	}
+	// In use once swapped: the framework already runs on it.
+	if inUse.Source != "credentials" || inUse.Provider != "0g-compute" {
+		t.Fatalf("in use after the swap: %+v", inUse)
 	}
 	// Held for another host (or not held: the framework has the key itself): restarted.
 	heldHost = "elsewhere.example"

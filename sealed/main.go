@@ -813,6 +813,19 @@ func startAgent(
 	var appliedMu sync.Mutex
 	var applied modelChoice
 	reportStatus := statusReports.Soon
+	// markInUse tells the owner which key the framework runs on, once it
+	// runs: after a start, a restart or a reload, not when it renders.
+	markInUse := func() {
+		if credStore == nil {
+			return
+		}
+		appliedMu.Lock()
+		c := applied
+		appliedMu.Unlock()
+		if c.source != stoppedChoice.source {
+			credStore.SetModelInUse(c.inUse())
+		}
+	}
 	renderResolved := func(ctx context.Context, choice modelChoice, resolved settings.Resolved) error {
 		if err := adapter.RenderSettings(ctx, resolved); err != nil {
 			return err
@@ -821,9 +834,6 @@ func startAgent(
 		appliedMu.Lock()
 		applied = choice
 		appliedMu.Unlock()
-		if credStore != nil {
-			credStore.SetModelInUse(choice.inUse())
-		}
 		// A key renders: whatever stopped the framework over its model key
 		// is over, whichever start path got here.
 		changed := currentStatus.ModelKeyIssue("")
@@ -908,6 +918,7 @@ func startAgent(
 		// A confirmed start, whoever brought it up, clears an earlier
 		// supervisor failure.
 		OnRecovered: func() {
+			markInUse()
 			if currentStatus.SupervisorRecovered() {
 				reportStatus()
 			}
@@ -968,6 +979,7 @@ func startAgent(
 	}); err != nil {
 		return err
 	}
+	markInUse()
 
 	// Confirm only the document used by the successful initial framework start,
 	// before registering runtime settings mutation callbacks.

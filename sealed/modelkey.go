@@ -39,9 +39,19 @@ type modelChoice struct {
 	source     string // "credentials", "deploy" or "none"
 	valueHash  string
 	issue      string
+	// deployProvider is the create/reset key's provider when it is usable.
+	deployProvider string
 }
 
 func (m *modelKeys) choose(doc settings.Doc) modelChoice {
+	c := m.chooseKey(doc)
+	if m.boot.APIKey != "" && !m.boot.Invalid {
+		c.deployProvider = m.boot.Provider
+	}
+	return c
+}
+
+func (m *modelKeys) chooseKey(doc settings.Doc) modelChoice {
 	if m.store != nil {
 		eff := doc
 		var issue string
@@ -114,7 +124,7 @@ func (m *modelKeys) registry(ctx context.Context, c inference.ProviderCredential
 
 // inUse is what the owner reads about the choice.
 func (c modelChoice) inUse() credentials.ModelInUse {
-	return credentials.ModelInUse{Provider: c.doc.Provider, Source: c.source, ValueHash: c.valueHash, Issue: c.issue}
+	return credentials.ModelInUse{Provider: c.doc.Provider, Source: c.source, ValueHash: c.valueHash, Issue: c.issue, DeployProvider: c.deployProvider}
 }
 
 // sameRoute reports whether a and b differ in the key alone: the same
@@ -134,7 +144,9 @@ type modelApply struct {
 	applied func() modelChoice
 	// setApplied records what the framework runs on (render records it too).
 	setApplied func(modelChoice)
-	// render renders the framework's settings and records the choice.
+	// render renders the framework's settings and records the choice; what
+	// the owner reads as in use changes once the framework runs on it (the
+	// manager's OnRecovered, or setInUse after a swap in place).
 	render func(ctx context.Context, c modelChoice, resolved settings.Resolved) error
 	// swap replaces the key sealed holds for the framework on host; false
 	// when it holds none there.
@@ -187,6 +199,7 @@ func (a modelApply) apply(ctx context.Context) string {
 		inPlace := choice.doc.Provider == prev.doc.Provider && sameRoute(choice.credential, prev.credential) && resolved.Endpoint != nil
 		if err = a.render(ctx, choice, resolved); err == nil {
 			if inPlace && a.swap(endpointHost(resolved.Endpoint), []byte(resolved.APIKey)) {
+				a.setInUse(choice.inUse())
 				return "in_place"
 			}
 		} else {

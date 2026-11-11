@@ -56,6 +56,10 @@ type ModelInUse struct {
 	ValueHash string `json:"value_hash,omitempty"`
 	// Issue says why a key the owner set is not the one in use.
 	Issue string `json:"issue,omitempty"`
+	// DeployProvider is the provider of the key handed over at
+	// create/reset, when that key is usable: a switch to it needs no key in
+	// the set.
+	DeployProvider string `json:"deploy_provider,omitempty"`
 }
 
 var (
