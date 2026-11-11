@@ -258,6 +258,68 @@ type SettleDelayer interface {
 	SettleDelay() time.Duration
 }
 
+// UncommittedKeeper is implemented by adapters whose roles keep, at boot,
+// what the agent changed on disk after its last commit. A stop or a crash
+// can end the container before the watcher commits a change; on the next
+// boot of the same container bootstrap leaves such a role's disk content in
+// place instead of restoring the chain version over it, and the watcher
+// commits it. Bootstrap does that only while the chain still holds the
+// version the container last had in sync (main.go, synced.go); after any
+// other change on chain, the chain version is restored as usual.
+//
+// KeepsUncommitted names the roles this applies to: content the agent
+// writes, never platform-owned state such as the framework binding.
+type UncommittedKeeper interface {
+	KeepsUncommitted(role string) bool
+}
+
+// BearerTranslator is implemented by adapters whose framework's own bearer
+// token stays in sealed (sealed/LAYERS.md §4.3): /_seal/auth hands the owner
+// another token, and on a route whose Auth is "bearer" the proxy forwards
+// only a request that carries the owner's token, with the framework's in its
+// place. The framework process, and every command it runs, never sees the
+// owner's token.
+type BearerTranslator interface {
+	// TranslateBearer returns the framework's token for the owner's; ok is
+	// false when token is not the owner's.
+	TranslateBearer(token string) (frameworkToken string, ok bool)
+}
+
+// PlaintextCommitter is implemented by adapters whose roles carry a salted
+// commitment to their plaintext in every entry sealed uploads
+// (sealed/LAYERS.md §7.1; internal/uploader/commitments.go).
+type PlaintextCommitter interface {
+	CommitsPlaintext() bool
+}
+
+// ServiceFieldLimiter is implemented by adapters whose agents' service
+// registrations have bounded text (sealed/LAYERS.md §6.1): the proxy refuses
+// a registration whose description or input example is longer, in bytes.
+// The signed /hello lists every registered service, so unbounded fields
+// would make it a channel for whatever the agent writes into them.
+type ServiceFieldLimiter interface {
+	ServiceFieldLimits() (description, inputExample int)
+}
+
+// LayeredRuntime is implemented by adapters whose framework runs as a
+// harness official version package, picked by hash (sealed/LAYERS.md §5;
+// only 0g-harness). sealed tells the adapter which unpacked package to run;
+// under the layered flow it also switches packages as the attestor targets
+// them and signs serve-proofs v2, which name the package's hash.
+type LayeredRuntime interface {
+	// UseHarness makes the package unpacked at dir, whose sha256 is hash
+	// (64 lowercase hex), the one the next Start runs. "" for both runs the
+	// framework the image installed without a package.
+	UseHarness(hash, dir string)
+	// HarnessHash is the hash of the package the running process started
+	// from, "" before the first Start or without a package.
+	HarnessHash() string
+	// InferenceTarget is the endpoint sealed's inference route forwards the
+	// framework's model calls to, and the model it names, as of the last
+	// Start; "" for the URL when the framework dials a provider itself.
+	InferenceTarget() (url, model string)
+}
+
 // Route is one path prefix a framework exposes through the sealed proxy.
 //
 // The proxy forwards a request to the framework upstream ONLY if its path
@@ -298,6 +360,58 @@ type Route struct {
 	Backend string
 	// Description is a one-line human summary for /hello.
 	Description string
+	// Endpoints, when set, are the only requests the route forwards: a
+	// method and a path, where a segment written {id} stands for any one
+	// segment. Any other request under Prefix 404s, or 405s when only its
+	// method is not listed; a CORS preflight (OPTIONS) passes on any listed
+	// path. Empty forwards everything under Prefix.
+	Endpoints []Endpoint
+}
+
+// Endpoint is one request a route forwards (Route.Endpoints).
+type Endpoint struct {
+	Method string
+	Path   string
+}
+
+// Allows reports whether the route forwards method on path: pathListed is
+// whether any endpoint has this path, allowed whether one has this method
+// too. A route without Endpoints allows everything.
+func (rt Route) Allows(method, path string) (allowed, pathListed bool) {
+	if len(rt.Endpoints) == 0 {
+		return true, true
+	}
+	for _, e := range rt.Endpoints {
+		if !endpointPathMatches(e.Path, path) {
+			continue
+		}
+		pathListed = true
+		if strings.EqualFold(e.Method, method) || method == http.MethodOptions {
+			return true, true
+		}
+	}
+	return false, pathListed
+}
+
+// endpointPathMatches matches path against pattern segment by segment; a
+// pattern segment {id} matches any one non-empty segment.
+func endpointPathMatches(pattern, path string) bool {
+	ps, xs := strings.Split(pattern, "/"), strings.Split(path, "/")
+	if len(ps) != len(xs) {
+		return false
+	}
+	for i := range ps {
+		if ps[i] == "{id}" {
+			if xs[i] == "" {
+				return false
+			}
+			continue
+		}
+		if ps[i] != xs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // RouteProvider is implemented by adapters that declare their public HTTP

@@ -51,6 +51,9 @@ type onChainDescription struct {
 	Role       string     `json:"role"`
 	StoragePtr storagePtr `json:"storage_ptr"`
 	Encryption string     `json:"encryption"`
+	// Commitments is set for adapters that declare plaintext commitments
+	// (commitments.go).
+	Commitments *commitments `json:"commitments,omitempty"`
 }
 
 type storagePtr struct {
@@ -118,10 +121,19 @@ type Uploader struct {
 	// an error stops the commit (the agent no longer belongs to the owner
 	// this container was started for, say). Set before the watcher starts.
 	commitGate func() error
+
+	// plaintextCommitments puts a salted plaintext commitment into every
+	// entry this uploader writes (commitments.go).
+	plaintextCommitments bool
 }
 
 // SetCommitGate installs commitGate. Call it before the first Apply.
 func (u *Uploader) SetCommitGate(f func() error) { u.commitGate = f }
+
+// SetPlaintextCommitments turns plaintext commitments on, for an adapter
+// that declares them (framework.PlaintextCommitter). Call it before the
+// first Apply.
+func (u *Uploader) SetPlaintextCommitments(on bool) { u.plaintextCommitments = on }
 
 // New constructs a production Uploader wired to a concrete chain.Client
 // and the dataplane storage backend. Returns an error if

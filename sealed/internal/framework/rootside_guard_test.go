@@ -95,8 +95,13 @@ var allowedDirectCalls = map[string]struct {
 	"internal/logger/logger.go Flush os.OpenFile":             {1, "LogPath in the root-only state directory, opened O_NOFOLLOW"},
 	"internal/proxy/sign.go Server.ListenInternal net.Listen": {1, "the sign socket is created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link"},
 	"internal/proxy/agentsock.go ServeAgentSocket net.Listen": {1, "the credential sockets are created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link (as for the sign socket)"},
-	"cmd/loader/supervise.go verifyFile os.Open":              {1, "hashes /bootstrap, a root-only image file, before sealed or any agent process exists; the loader links only the standard library and x/sys (its TestLinkedPackages), so not privsep"},
-	"cmd/loader/supervise.go supervisor.run exec.Command":     {1, "starts /bootstrap, the root-only image file verifyFile just matched against the hash built into the loader, before any agent process exists"},
+	"cmd/loader/supervise.go verifyFile os.Open":              {1, "hashes /bootstrap, a root-only image file, or a program sealed staged in the loader's root-only state directory (/var/lib/loader, 0700), before it runs; the loader links only the standard library and x/sys (its TestLinkedPackages), so not privsep"},
+	"cmd/loader/supervise.go supervisor.runOnce exec.Command": {1, "starts the program verifyFile just matched against its hash: /bootstrap, a root-only image file, or a staged program in the root-only state directory; between sealed runs the loader has ended every other process (killLeftovers)"},
+	"cmd/loader/state.go stateDir.prepare os.MkdirAll":        {1, "creates /var/lib/loader, the loader's state directory, under the root-only /var/lib before any sealed runs"},
+	"cmd/loader/state.go stateDir.prepare os.Chmod":           {1, "makes /var/lib/loader 0700: only root (the loader and sealed) enters it"},
+	"cmd/loader/state.go stateDir.read os.ReadFile":           {1, "reads a file in /var/lib/loader, which only root can enter"},
+	"cmd/loader/state.go stateDir.write os.WriteFile":         {1, "writes a file in /var/lib/loader, which only root can enter"},
+	"cmd/loader/state.go stateDir.write os.Rename":            {1, "renames a file within /var/lib/loader, which only root can enter"},
 }
 
 // rootCommands is everything root executes: the functions that may call

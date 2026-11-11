@@ -740,6 +740,27 @@ func TestRemoveAllDeepTree(t *testing.T) {
 	}
 }
 
+// Symlink creates the link itself, refuses an existing entry, and never
+// creates it through a linked parent.
+func TestSymlinkCreatesTheLinkOnly(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "a", "f"), "one")
+	if err := Symlink("f", filepath.Join(dir, "a", "l")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.Readlink(filepath.Join(dir, "a", "l")); err != nil || got != "f" {
+		t.Fatalf("link holds %q (%v), want f", got, err)
+	}
+	if err := Symlink("f", filepath.Join(dir, "a", "l")); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("Symlink over an existing entry = %v, want fs.ErrExist", err)
+	}
+	mustSymlink(t, filepath.Join(dir, "a"), filepath.Join(dir, "link"))
+	wantUnsafe(t, "Symlink into a linked directory", Symlink("f", filepath.Join(dir, "link", "l2")))
+	if _, err := os.Lstat(filepath.Join(dir, "a", "l2")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a link was created through the linked directory: %v", err)
+	}
+}
+
 // Rename moves an entry between directories without following links;
 // RenameNoReplace refuses to replace an existing destination.
 func TestRenameAcrossDirectories(t *testing.T) {

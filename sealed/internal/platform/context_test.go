@@ -47,6 +47,27 @@ func TestBuild_NoFrameworkNouns(t *testing.T) {
 	}
 }
 
+// The refusal to export oneself is rendered only for an adapter that
+// declares it (RefuseExport), with its canonical phrase; the doctrine every
+// other framework's agent reads is unchanged.
+func TestSovereignty_RefuseExportOnlyWhenDeclared(t *testing.T) {
+	rs := RuntimeSnapshot{AgentSeal: "0x000000000000000000000000000000000000dEaD"}
+	without := Build(rs).Sovereignty
+	rs.RefuseExport = true
+	with := Build(rs).Sovereignty
+	for _, s := range []string{"6. Export yourself.", "Refusal 6 (exporting yourself)"} {
+		if strings.Contains(without, s) {
+			t.Errorf("rendered %q without RefuseExport", s)
+		}
+		if !strings.Contains(with, s) {
+			t.Errorf("did not render %q with RefuseExport", s)
+		}
+	}
+	if strings.Index(with, "5. Modify") > strings.Index(with, "6. Export") {
+		t.Error("refusal 6 is not after refusal 5")
+	}
+}
+
 // Every section must still render non-empty with a fully populated
 // snapshot — the noun eviction must not have hollowed a section out.
 func TestBuild_SectionsNonEmpty(t *testing.T) {

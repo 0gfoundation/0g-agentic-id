@@ -123,22 +123,43 @@ ECIES 加密给容器，状态、心跳和版本确认在同一数据库事务�
 sealed 要求配套的 provider 和 attestor（v3 证书、attestor TLS 声明、上面的
 `/provision` 形状）；所有 agent 都要重建到它上面。
 
-### 加载器（0g-harness 镜像）和优雅退出
+### 加载器（0g-harness 镜像）、停机和分层运行
 
-0g-harness 镜像里的 PID 1 不是 sealed，而是加载器（`cmd/loader`）。它用编镜像时编进去的
-sha256（`-X main.expectedSealedHash`，`images/harness/Dockerfile`）核对 `/bootstrap`，
-别的什么都不运行。它把 sealed 作为子进程启动，环境变量原样传下去；转发 SIGTERM、SIGINT、
-SIGQUIT 和 SIGHUP；收到停止信号后 sealed 2 分钟内没退出就杀掉；回收所有孤儿进程；sealed
-退出时用同样的状态退出，所以 sealed 退出照旧会结束容器。它和 sealed 一样是 root、不可
-dump、设置 `no_new_privs`，只链接标准库和 `golang.org/x/sys`（`TestLinkedPackages`）。
-其他镜像里 sealed 仍是 PID 1。
+0g-harness 镜像里的 PID 1 不是 sealed，而是加载器（`cmd/loader`）。它每次执行 sealed
+之前先核对哈希：镜像自带的 `/bootstrap` 对编镜像时编进去的 sha256
+（`-X main.expectedSealedHash`，`images/harness/Dockerfile`），换上来的版本对它的名字；
+再向 `CHAIN_RPC_URL` 发一次 `eth_call`，读 AgenticID 的 `isValidSealedHash`，链上明确
+答"不在"的版本不执行（`allowlist.go`）。它把 sealed 作为子进程启动，环境变量原样传下去，
+另加 `SEALED_HASH`（它核对过的哈希）和 `SEALED_TRIAL`（试运行）；转发 SIGTERM、SIGINT、
+SIGQUIT 和 SIGHUP；收到停止信号后 sealed 2 分钟内没退出就杀掉；回收所有孤儿进程。没有
+分层流程时，sealed 退出它就用同样的状态退出，所以 sealed 退出照旧会结束容器。分层流程下
+（`LAYERS.zh.md` 第 3 节、3.1）它还按 sealed 的请求（SIGUSR1）换 sealed 版本：以试运行
+方式启动新版本，没确认起来就退回原版本，换之前清掉旧 sealed 留下的进程；sealed 自己退出时
+重启它，10 分钟内最多 5 次。它的状态目录是 `/var/lib/loader`（只有 root 能进）。它和
+sealed 一样是 root、不可 dump、设置 `no_new_privs`，只链接标准库和 `golang.org/x/sys`
+（`TestLinkedPackages`）。其他镜像里 sealed 仍是 PID 1。
 
-不是 PID 1 的 sealed 会处理 SIGTERM 和 SIGINT（`shutdown.go`）：停下监视器并等它正在
-跑的一轮结束，停掉框架，再跑最后一轮并提交改动（`watcher.Final`、`uploader.Apply`），
-然后以 0 退出，总共不超过 90 秒。没有这一步，停容器会丢掉最后一次提交之后 agent 对链上
-已有内容（人设、已提交的技能）的修改：下次启动会用链上版本把它们覆盖回去。agent 新加的文件
-留在磁盘上，重启后照样提交。平台的停止超时短于 90 秒时，提交仍会被打断。
-作为 PID 1 时 sealed 不装处理函数，内核照旧忽略这些信号。
+不是 PID 1 的 sealed 会处理 SIGTERM 和 SIGINT（`shutdown.go`）：停下监视器，停掉框架
+（之后不再重启它），等监视器手上那一轮跑完，然后以 0 退出，总共不超过 90 秒。它不另起
+提交：平台发出停止信号约 10 秒后就杀掉容器，一次 0G 存储上传就可能用掉大半。最后一次提交
+之后的改动留在磁盘上：sealed 在 `/var/lib/sealed/synced.json`（只有 root 能读写）记着
+这个容器每个角色最后和链上一致的版本，下次启动时链上没变而磁盘变了，就保留磁盘上的，由
+监视器提交，不拿链上版本覆盖（`synced.go`；只对声明了 `framework.UncommittedKeeper` 的
+adapter，即 0g-harness）。重建容器只留下链上的 iData。作为 PID 1 时 sealed 不处理这些
+信号，行为和以前一样。
+
+0g-harness 的 harness 从官方版本包运行：`/opt/0g-harness/<sha256>/`，root 所有，agent
+只能读和执行，镜像自带的那个由 `/opt/0g-harness/base` 指明（`internal/layers`）。只要
+sealed 知道 provider 的 endpoint，它的模型调用就经 sealed 的推理代理（`internal/inferproxy`），
+native 的 `openai` 和 `anthropic` 也一样，用 sealed 固定的官方地址
+（`inference.NativeEndpoint`）：sealed 定地址和模型名，把平台
+说明放进每个请求的系统提示末尾，key 由凭证代理代填，harness 拿到的是占位值。owner 经
+`/_seal/auth` 拿到的令牌不是 harness 校验的那个，proxy 在入口核对后换掉；harness 的路由
+逐条列出（`framework.Route.Endpoints`）；它可以经签名 socket 请求重启
+（`POST /harness/restart`）。它上传的每个 iData 条目都带加盐的明文承诺
+（`internal/uploader/commitments.go`）。attestor 声明分层流程后，sealed 上报自己的哈希、
+签 ServeProof v2，并按 attestor 指定的目标版本换 harness 和 sealed（`layered.go`）。
+完整设计见 `LAYERS.zh.md`。
 
 ### settings document 为什么走 `/provision`
 

@@ -819,9 +819,9 @@ doctrine refusals 2/4 kernel-enforced: a de-privileged agent process
 cannot ptrace sealed, read `/proc/<sealed pid>/mem`, or read the
 bootstrap environment of sealed or of PID 1 (sealed also sets
 `PR_SET_DUMPABLE=0`; in the 0g-harness image PID 1 is the loader,
-`cmd/loader`, which is root, sets `PR_SET_DUMPABLE=0` too, and runs only the
-`/bootstrap` whose hash is compiled into it, so the image hash still covers
-sealed). sealed
+`cmd/loader`, which is root, sets `PR_SET_DUMPABLE=0` too, and runs a sealed
+only after checking its hash and that the chain does not refuse it — see "The
+0g-harness layered runtime" below). sealed
 also sets `no_new_privs` on itself, which every process it starts inherits:
 an exec in the agent's processes never grants privileges, so a setuid-root
 binary in the image (`su`, `mount`, `passwd`, ...) runs with the agent's
@@ -1272,3 +1272,57 @@ does not cover: within a key's own permissions the agent may use it as it
 likes, and after a reset sealed trusts the attestor to serve the latest
 set (revoke a removed key at its provider).
 
+
+## The 0g-harness layered runtime
+
+The 0g-harness image splits the runtime into layers (`LAYERS.md`): base (the
+image), sealed, the harness official version, and the agent's data. What each
+check rests on:
+
+- **Which sealed runs.** The loader runs a sealed only after checking its
+  hash (the image's own against the hash compiled into the loader, a
+  switched-to version against its name) and asking the chain whether
+  AgenticID's `validSealedHashes` lists it; an explicit "no" keeps it from
+  running. The loader trusts the chain endpoint's answer, as sealed does for
+  every chain read; with no answer to be had it runs the version, and the
+  attestor, which checks the same list before it hands out the key, refuses
+  an unlisted one. Under the layered flow sealed reports its hash at
+  `/provision`, signed with the container key, and the attestor re-checks it
+  at every key release.
+- **Switching versions.** The running sealed, already verified and holding
+  the container key, checks a target version on chain, downloads it from the
+  attestor over its pinned TLS, keeps it only if it hashes to its name, and
+  hands it to the loader, which checks it again. A version that does not come
+  up is rolled back and not tried again in the container.
+- **Which harness runs.** The harness runs from an official version package
+  unpacked into a directory root owns and the agent can only read; sealed
+  takes a package only if its hash is its name and the chain lists it in
+  `validHarnessHashes` (a package it cannot confirm is run only when it is
+  already in the container). The harness holds no key: neither the agent key,
+  nor the model key (the inference route fills it), nor the owner's chat token
+  (the proxy swaps the owner's for the harness's own at the entry).
+- **What reaches the model.** Every model call goes through sealed's
+  inference route, which sends it to the owner's route (0G Compute at its
+  registry address, openai and anthropic at their official addresses fixed in
+  sealed) with the model the owner's settings pin, and appends the platform
+  doc (identity, doctrine) to its system prompt. A v2 serve-proof's
+  `inference_url` and `model` say where the route forwarded and with which
+  model name; they do not prove that an answer came from that model, since
+  the harness can answer without one. A process of the agent's that bypasses
+  the route and dials a model itself is stopped only by egress limits
+  (`LAYERS.md` §9, item 2).
+- **What is reachable from outside.** Only the harness endpoints sealed lists
+  (method and path) are forwarded; agent service registrations have bounded
+  descriptions and examples.
+- **Exporting itself.** The doctrine's refusal 6 has the agent refuse to hand
+  out its persona, skills, memory, files or code; it is a soft rule the model
+  applies (`LAYERS.md` §6).
+- **Plaintext commitments.** Every iData entry the agent uploads carries a
+  salted commitment to its plaintext. The salt comes from the role's data key,
+  which only sealed holds, so nobody else can test a guess against a
+  commitment; revealing one salt proves one version or one file.
+- **Uncommitted edits across a restart.** A boot keeps what the agent changed
+  on disk after its last commit when the chain has not moved since; the record
+  of what the container last had in sync is root-only. This trusts the
+  container's disk between a stop and a start, as files the agent added
+  already were (they survive and are committed after the restart).

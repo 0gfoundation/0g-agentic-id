@@ -166,6 +166,11 @@ and degrades gracefully when absent):
 | `ConversationHistory` | `ConversationHistory(ctx)` | the stateful responses door drops client-sent history: it sends the prior turns this returns, then only the client's current turn. Return none when your gateway replays its own session (openclaw) — a client's history on top would reach the model twice | client-sent history keeps being forwarded verbatim |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear` (owner-signed) + CLI `/clear`, followed by a process restart | the route answers 501 — history is client-held, nothing server-side to clear |
 | `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact` (owner-signed, single-flight, replay-refused, never overlapping a synthesized-door turn) + CLI `/compact`: run the framework's OWN compaction now, no restart; the note is shown to the owner. Wrap `framework.ErrCompactRefused` when the framework declines for now (busy, changed) — the owner gets a 409 to retry, not a failure; wrap `framework.ErrCompactUnsupported` when the installed framework version lacks what your adapter uses to trigger compaction (openclaw before 2026.7.1 has no `sessions compact` CLI command) — a 501, as without the interface | the route answers 501 — the framework cannot be asked to compact from outside |
+| `UncommittedKeeper` | `KeepsUncommitted(role) bool` | bootstrap Phase A: a boot of the same container keeps the disk content of a named role that the agent changed after its last commit, as long as the chain still holds what this container last had in sync (`synced.go`); the watcher then commits it. Name only content the agent writes, never platform state such as the framework binding | every boot restores the chain version over the disk |
+| `BearerTranslator` | `TranslateBearer(token) (frameworkToken string, ok bool)` | proxy, on routes whose `Auth` is `bearer`: only a request carrying the owner's token is forwarded, with the framework's token in its place, so the framework never sees the owner's. `AuthResponse` then hands out the owner's token, not the framework's | the token `AuthResponse` returns is forwarded as-is |
+| `PlaintextCommitter` | `CommitsPlaintext() bool` | uploader: every entry it uploads carries a salted sha256 commitment to its plaintext in `dataDescription` (`LAYERS.md` §7.1) | no commitments |
+| `ServiceFieldLimiter` | `ServiceFieldLimits() (description, inputExample int)` | proxy, on service registration: a longer description or input example (bytes) is refused | no length caps |
+| `LayeredRuntime` | `UseHarness(hash, dir)`, `HarnessHash()`, `InferenceTarget()` | bootstrap and `layered.go`: which harness package `Start` runs, switching packages as the attestor targets them, and serve-proof v2 (`LAYERS.md` §5, §7). Only 0g-harness | the framework the image installed runs; serve-proofs stay v1 |
 
 Declare compile-time assertions for everything you implement
 (`var _ framework.VersionReconciler = (*Adapter)(nil)`) — silent non-implementation of an optional
@@ -1201,7 +1206,11 @@ The one obligation that replaced all four is step 4.
     chat only. Rule: **constrained interfaces exposed by default; a full
     framework UI only after a per-endpoint audit proves no shell / file /
     exec is reachable through it.** When in doubt, don't declare the route
-    — an undeclared prefix 404s at the proxy.
+    — an undeclared prefix 404s at the proxy. A route can also list its
+    exact endpoints (`Route.Endpoints`: method and path, `{id}` matching one
+    segment); the proxy then forwards only those, 404 for an unlisted path
+    and 405 for an unlisted method. 0g-harness lists the endpoints of its
+    protocol v1.
 
 ## 12. Port report: integrating claude-code (2026-07) — retired, kept as case study
 

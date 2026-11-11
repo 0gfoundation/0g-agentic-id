@@ -27,11 +27,17 @@ boots. The attestor renames `dsh` in its deployment records when it starts
 In 0g-harness (`src/composition.mjs`), in code. 0g-harness is the process this
 adapter runs.
 
-- **Fixed at build time.** The 0g-harness image installs one exact build of it
-  at build time (`../../images/harness/Dockerfile`, `HARNESS_REF`), with its
-  whole dependency tree locked. So the plugin set and every platform decision
-  in it ride the image hash (measured, and listed on chain in
-  `validFrameworkHashes`).
+- **Fixed at build time, run by hash.** The 0g-harness image builds one exact
+  build of it (`../../images/harness/Dockerfile`, `HARNESS_REF`), with its
+  whole dependency tree locked, into a package: a deterministic tar of the
+  installed tree, named by its sha256. The image unpacks it as
+  `/opt/0g-harness/<sha256>/`, owned by root and read-only to the agent, and
+  `/opt/0g-harness/base` names it. So the plugin set and every platform
+  decision in it ride the package hash, and the image's own package rides the
+  image hash as well (measured, and listed on chain in
+  `validFrameworkHashes`). Under the layered flow sealed runs the package the
+  attestor targets, once the chain lists its hash in `validHarnessHashes`
+  (`../../LAYERS.md` §5); otherwise it runs `base`.
 - **Out of the agent's reach.** The composition is **not** a `cordis.yml`, a
   profile, or any `$DSH_HOME` patch layer, so an agent editing its own home
   cannot change what mounts next boot. This is the structural form of doctrine
@@ -56,10 +62,21 @@ Nothing outside that allowlist is settable by anyone. Measured code decides:
 ## The process
 
 `spawn.go` starts the harness and wires it up:
-- It runs `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`
-  as the agent user, on loopback port 8794.
+- It runs `node /opt/0g-harness/<sha256>/bin/0g-harness.mjs` as the agent
+  user, on loopback port 8794 (on an image without packages,
+  `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`).
 - It passes the environment `environ()` builds. The contract is the harness's
   `docs/PROTOCOL.md`.
+- The harness calls the model through sealed's inference route
+  (`internal/inferproxy`), a loopback address, for every provider sealed
+  knows the endpoint of: the registry's managed providers, and `openai` and
+  `anthropic` at their official endpoints, fixed in sealed. The route names
+  the owner's model, appends the agent doc to the system prompt and sets the
+  key; the harness holds a placeholder (`../../CONFIG_SURFACE.md` §3, §7).
+- The harness checks its own token on `/v1/*` (`SEAL_BRIDGE_TOKEN`). The
+  owner gets a different one from `/_seal/auth`, and sealed's proxy swaps it
+  for the harness's on the way in, so nothing the harness runs sees the
+  owner's token.
 
 The harness then does three things:
 - it keeps one agent with one conversation (`owner-chat`);
@@ -72,6 +89,16 @@ The harness then does three things:
 capability: `chat`, `responses`, `inbox`, `events`, `tasks`, `schedules`. A
 client enables a feature only on the kinds an agent declares. The other
 frameworks declare none of the last four, and nothing about them changes.
+Each route lists its exact endpoints, those of the harness's protocol v1
+(`routes_test.go`), and sealed's proxy forwards nothing else: an unlisted
+path gets 404, an unlisted method 405.
+
+The harness can ask sealed to restart it (`POST /harness/restart` on the sign
+socket): sealed stops the process and starts it again from the package it is
+set to run (`../../LAYERS.md` §5.3). A boot keeps the persona
+(`APPEND_SYSTEM.md`) and the `skills/` the agent changed after its last
+commit, as long as the chain still holds what this container last committed
+(`../../LAYERS.md` §3).
 
 ## Current composition
 
@@ -89,7 +116,7 @@ frameworks declare none of the last four, and nothing about them changes.
 | background jobs (`toolJobs` on) | `dsh-tool-jobs`: commands run in the background; a job finishing while the agent is idle opens a turn, whose reply goes to the inbox |
 | subagents (`subagents` on) | `dsh-subagent` + `dsh-subagent-spawn-in-process` + `dsh-tool-subagent`. Each helper is one-shot and runs in the background as a job. Depth is 1. Its tools are `read` and `skill` only |
 | reminders (`schedule` on) | `dsh-schedule`, plus the harness's minimal `sessionPersistence` service (the flush checkpoint dsh-schedule requires) |
-| **platform control points** | `seal-tools`: `seal_sign`, `seal_sign_transaction`, `seal_sign_typed_data` and `seal_register_service` as native, session-logged tools. The three sign tools map the sign socket's three sign endpoints one-to-one |
+| **platform control points** | `seal-tools`: `seal_sign`, `seal_sign_transaction`, `seal_sign_typed_data` and `seal_register_service` as native, session-logged tools. The three sign tools map the sign socket's three sign endpoints one-to-one. sealed caps a registered service's description at 280 bytes and its input example at 2048 |
 | | `seal-guard`: steers shell calls away from the socket's `/sign/` endpoints; `/settings` and `/services` stay open |
 | | `subagent-guard`: only the main agent writes files, runs commands or signs |
 

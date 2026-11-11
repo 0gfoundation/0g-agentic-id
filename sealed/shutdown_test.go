@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"os"
 	"reflect"
 	"sync"
@@ -96,15 +95,11 @@ func TestHandleStopSignalsExitsWhenBudgetRunsOut(t *testing.T) {
 	rec.wait(t, 2*time.Second)
 }
 
-// stopFakes records the order in which stopAgentAndCommit drives its parts.
+// stopFakes records the order in which stopAgent drives its parts.
 type stopFakes struct {
-	mu      sync.Mutex
-	order   []string
-	done    chan struct{}
-	drifted []string
-	plain   map[string][]byte
-	applied map[string][]byte
-	err     error
+	mu    sync.Mutex
+	order []string
+	done  chan struct{}
 }
 
 func newStopFakes() *stopFakes {
@@ -117,90 +112,73 @@ func (f *stopFakes) record(s string) {
 	f.order = append(f.order, s)
 }
 
+func (f *stopFakes) recorded() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.order...)
+}
+
+// An idle watcher: Run returns as soon as Stop is called.
 func (f *stopFakes) Stop() {
 	f.record("watcher.Stop")
 	close(f.done)
 }
 func (f *stopFakes) Done() <-chan struct{} { return f.done }
-func (f *stopFakes) Final(ctx context.Context, onDrift func(map[string][]byte, []string)) {
-	f.record("watcher.Final")
-	if len(f.drifted) > 0 {
-		onDrift(f.plain, f.drifted)
-	}
-}
 
 type stopManagerFake struct{ f *stopFakes }
 
 func (m stopManagerFake) Stop(context.Context) { m.f.record("manager.Stop") }
 
-type stopCommitterFake struct{ f *stopFakes }
-
-func (c stopCommitterFake) Apply(_ context.Context, plaintexts map[string][]byte) error {
-	c.f.record("uploader.Apply")
-	c.f.applied = plaintexts
-	return c.f.err
-}
-
-func TestStopAgentAndCommitOrder(t *testing.T) {
+func TestStopAgentOrder(t *testing.T) {
 	f := newStopFakes()
-	f.drifted = []string{"skills/"}
-	f.plain = map[string][]byte{"skills/": []byte("manifest")}
-	stopAgentAndCommit(context.Background(), f, stopManagerFake{f}, stopCommitterFake{f}, func() bool { return false })
-
-	want := []string{"watcher.Stop", "manager.Stop", "watcher.Final", "uploader.Apply"}
-	if !reflect.DeepEqual(f.order, want) {
-		t.Fatalf("order %v, want %v", f.order, want)
-	}
-	if string(f.applied["skills/"]) != "manifest" {
-		t.Fatalf("committed %v, want the final tick's plaintexts", f.applied)
-	}
-}
-
-func TestStopAgentAndCommitNothingDrifted(t *testing.T) {
-	f := newStopFakes()
-	stopAgentAndCommit(context.Background(), f, stopManagerFake{f}, stopCommitterFake{f}, func() bool { return false })
-	want := []string{"watcher.Stop", "manager.Stop", "watcher.Final"}
-	if !reflect.DeepEqual(f.order, want) {
-		t.Fatalf("order %v, want %v", f.order, want)
-	}
-}
-
-func TestStopAgentAndCommitFailedCommitIsLogged(t *testing.T) {
-	f := newStopFakes()
-	f.drifted = []string{"APPEND_SYSTEM.md"}
-	f.plain = map[string][]byte{"APPEND_SYSTEM.md": []byte("persona")}
-	f.err = errors.New("storage unreachable")
-	// Returns normally: a failed commit leaves the drift for the next boot
-	// to find against chain, and sealed still exits.
-	stopAgentAndCommit(context.Background(), f, stopManagerFake{f}, stopCommitterFake{f}, func() bool { return false })
-	if f.order[len(f.order)-1] != "uploader.Apply" {
-		t.Fatalf("order %v, want the commit attempted last", f.order)
-	}
-}
-
-func TestStopAgentAndCommitSkipsCommitForNewOwner(t *testing.T) {
-	f := newStopFakes()
-	f.drifted = []string{"skills/"}
-	stopAgentAndCommit(context.Background(), f, stopManagerFake{f}, stopCommitterFake{f}, func() bool { return true })
+	stopAgent(context.Background(), f, stopManagerFake{f})
 	want := []string{"watcher.Stop", "manager.Stop"}
-	if !reflect.DeepEqual(f.order, want) {
-		t.Fatalf("order %v, want %v (no final tick, no commit)", f.order, want)
+	if got := f.recorded(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("order %v, want %v", got, want)
 	}
 }
 
-// watcherStuck is a watcher whose tick in progress never finishes.
-type watcherStuck struct{ *stopFakes }
+// watcherBusy is a watcher with a tick under way: Run returns when the test
+// ends the tick, not when Stop is called.
+type watcherBusy struct{ *stopFakes }
 
-func (w watcherStuck) Stop()                 { w.record("watcher.Stop") }
-func (w watcherStuck) Done() <-chan struct{} { return nil }
+func (w watcherBusy) Stop() { w.record("watcher.Stop") }
 
-func TestStopAgentAndCommitGivesUpOnAStuckTick(t *testing.T) {
+func TestStopAgentWaitsForTheTickUnderWay(t *testing.T) {
+	f := newStopFakes()
+	returned := make(chan struct{})
+	go func() {
+		stopAgent(context.Background(), watcherBusy{f}, stopManagerFake{f})
+		close(returned)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(f.recorded()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	// The agent is stopped before the tick ends.
+	if got, want := f.recorded(), []string{"watcher.Stop", "manager.Stop"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("order %v, want %v", got, want)
+	}
+	select {
+	case <-returned:
+		t.Fatal("stopAgent returned while the tick was under way")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(f.done)
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stopAgent did not return after the tick ended")
+	}
+}
+
+func TestStopAgentGivesUpOnAStuckTick(t *testing.T) {
 	f := newStopFakes()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	stopAgentAndCommit(ctx, watcherStuck{f}, stopManagerFake{f}, stopCommitterFake{f}, func() bool { return false })
-	want := []string{"watcher.Stop"}
-	if !reflect.DeepEqual(f.order, want) {
-		t.Fatalf("order %v, want %v (nothing after the stuck tick)", f.order, want)
+	stopAgent(ctx, watcherBusy{f}, stopManagerFake{f})
+	want := []string{"watcher.Stop", "manager.Stop"}
+	if got := f.recorded(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("order %v, want %v", got, want)
 	}
 }

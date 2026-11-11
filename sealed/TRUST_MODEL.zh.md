@@ -691,8 +691,8 @@ owner 没法从外面直接 post。这次 uid 拆分同时把 doctrine 第 2/4 �
 "偷钥匙"的那一半变成内核强制：降权后的 agent 进程无法 ptrace
 sealed、读不了 `/proc/<sealed pid>/mem`、也读不了 sealed 或 PID 1 的引导环境变量
 （sealed 另外自设 `PR_SET_DUMPABLE=0`；0g-harness 镜像里的 PID 1 是加载器
-`cmd/loader`，同样是 root、同样设 `PR_SET_DUMPABLE=0`，而且只运行哈希编进它里面的那个
-`/bootstrap`，所以镜像哈希仍然覆盖 sealed）。sealed 还给自己设置
+`cmd/loader`，同样是 root、同样设 `PR_SET_DUMPABLE=0`，执行 sealed 之前先核对哈希，
+并确认链上没有拒绝它，见下面"0g-harness 的分层运行"）。sealed 还给自己设置
 `no_new_privs`，它启动的每个进程都会继承：agent 的进程里任何 exec 都不会
 获得权限，所以镜像里的 setuid-root 二进制（`su`、`mount`、`passwd` 等）
 以 agent 的 uid 运行，uid 拆分也就不依赖这些二进制个个都没有本地提权漏洞
@@ -1044,3 +1044,36 @@ agentSeal，并绑定 owner、agent、链和条目名；整个凭据集由 owner
 使用；reset 之后，sealed 依赖 attestor 提供最新的凭据集（删除的密钥要在
 服务商那边吊销）。
 
+
+## 0g-harness 的分层运行
+
+0g-harness 镜像把运行环境分成几层（`LAYERS.zh.md`）：base（镜像）、sealed、harness
+官方版本和 agent 的数据。每一处校验靠的是：
+
+- **跑哪个 sealed。** 加载器执行 sealed 之前核对它的哈希（镜像自带的对编进加载器的哈希，
+  换上来的版本对它的名字），并在链上查 AgenticID 的 `validSealedHashes` 里有没有它；链上
+  明确答"没有"就不执行。加载器信链上节点的回答，sealed 读链上数据也是这样；查不到答案时
+  照常执行，而 attestor 下发私钥前查的是同一个白名单，不在的版本拿不到私钥。分层流程下
+  sealed 在 `/provision` 报上自己的哈希，用容器密钥签名，attestor 每次下发私钥都复查。
+- **换版本。** 正在运行的 sealed 本身已校验过、持有容器密钥，由它在链上核对目标版本，
+  经固定的 TLS 从 attestor 下载，哈希对上名字才留下，交给加载器，加载器再核对一次。
+  起不来的版本会被退回，在这个容器里不再换。
+- **跑哪个 harness。** harness 从官方版本包运行，包解开在 root 所有、agent 只能读的目录
+  里；sealed 只用哈希对上名字、链上 `validHarnessHashes` 列着的包（确认不了时，只跑容器里
+  已有的）。harness 不持有任何密钥：agent 私钥没有，模型 key 由推理代理代填，owner 的聊天
+  令牌由 proxy 在入口换成 harness 自己的。
+- **模型看到什么。** 每次模型调用都经 sealed 的推理代理：按 owner 设置的模型名，发到
+  owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方
+  地址），并把平台说明（身份、doctrine）放在系统提示末尾。v2 serve-proof 的
+  `inference_url` 和 `model` 说明推理代理往哪里转发、用哪个模型名，不证明某条回答出自这个
+  模型：harness 可以不经模型生成回答。agent 的进程绕过推理代理自己连模型，只能靠出站限制挡
+  （`LAYERS.zh.md` 第 9 节第 2 条）。
+- **外部能访问什么。** 只转发 sealed 列出的 harness 接口（方法加路径）；agent 注册服务的
+  描述和示例有长度上限。
+- **导出自己。** doctrine 的第 6 条拒绝让 agent 不交出自己的人设、技能、记忆、文件和
+  代码；这是模型执行的软规则（`LAYERS.zh.md` 第 6 节）。
+- **明文承诺。** agent 上传的每个 iData 条目都带加盐的明文承诺。盐由角色的数据密钥算出，
+  只有 sealed 持有，所以别人没法拿猜测去对承诺；交出一个盐只证明一个版本或一个文件。
+- **重启时未提交的改动。** 链上没变时，开机保留 agent 在最后一次提交之后在磁盘上的改动；
+  记录"最后和链上一致的版本"的文件只有 root 能读写。这依赖停机到再启动之间容器磁盘可信，
+  和 agent 新加的文件一样（它们本来就留在磁盘上，重启后提交）。

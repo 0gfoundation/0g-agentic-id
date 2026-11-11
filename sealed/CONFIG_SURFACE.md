@@ -38,7 +38,7 @@ vocabulary:
 
 | Field | Meaning |
 |---|---|
-| `provider` | who serves the model. an ID from the signed platform registry (`GET /inference/providers`), seeded by `internal/inference/providers.json`; managed providers supply fixed endpoints, and native providers use framework wiring |
+| `provider` | who serves the model. an ID from the signed platform registry (`GET /inference/providers`), seeded by `internal/inference/providers.json`; managed providers supply fixed endpoints; native providers use the framework's own wiring, except under 0g-harness, where sealed fixes their official endpoints (§3) |
 | `model` | the model id, spelled the way that provider spells it |
 | `thinking` | the owner's reasoning-depth preference, one of `settings.Levels` = `{low, high, max}` (`settings.go:56`) |
 | `others` | everything beyond the three named settings: this framework's own knobs — `json.RawMessage`, opaque (`settings.go:45`). Formerly `framework`; a live drill showed owners read that name as "choose the framework", which is the one thing it cannot do (the framework binding is minted identity) — renamed |
@@ -115,6 +115,21 @@ the hermes and 0g-harness adapters both shipped that bug (`zgcompute.go:62-65`,
 now still gets a bound, and there is a regression test for exactly that
 (`internal/settings/settings_test.go`,
 `TestNativeProviderStillGetsBoundedReasoning`).
+
+**0g-harness: every provider through sealed.** 0g-harness calls the model
+only through sealed's inference route (`internal/inferproxy`;
+`sealed/LAYERS.md` §4.2), native providers included. The route forwards to
+`Resolved.Endpoint` for a registered managed provider, and for `openai` and
+`anthropic` to their official endpoints, fixed in sealed
+(`inference.NativeEndpoint`: `https://api.openai.com/v1` on the OpenAI wire,
+`https://api.anthropic.com` on the Anthropic wire). Those are not registry
+entries, so the registry the attestor serves cannot re-point them, and the
+route hash a sealed key is bound to stays the same. The harness's
+`SEAL_MODEL_BASE_URL` is the route's loopback address; the route puts the
+owner's model on every request, appends the agent doc to the system prompt
+and sets the key (`harness/spawn.go` `modelEndpoint`). Only a provider sealed
+knows no endpoint of is still dialled by the harness itself. The other three
+frameworks keep their own wiring for native providers.
 
 
 Additional managed providers use only their own catalog/static metadata and declared
@@ -468,7 +483,7 @@ what each framework's client actually reads:
 | openclaw | by reference: the config holds `{source: env, id: <VAR>}`, so only the variable NAME is on disk; `spawn.go` exports the value |
 | hermes | **literally, on disk**, in `model.api_key` — hermes's `custom` provider declares `env_vars=()` and reads the key only from `config.yaml`; injecting it via env produced a live 401 from the router, hermes having dialled it keyless (`hermes/spawn.go:165-172`) |
 | prime-agent | by reference: `models.json` holds `apiKey: "SEAL_MODEL_API_KEY"` (`prime/modelsjson.go:72`); the bridge env holds the value |
-| 0g-harness | the harness env only — and deliberately NOT in the deterministic, logged `settingsEnv` slice, so the rendered environment can be compared and logged without handling a secret (`harness/settings.go:198-204`) |
+| 0g-harness | not at all: sealed's inference route sets it on the endpoint's host (through the credential proxy when that holds it), and the harness's `SEAL_MODEL_API_KEY` is the placeholder `sealed-inference-route` (`harness/spawn.go` `holdInferenceKey`, `routedKeyPlaceholder`). Only for a provider sealed knows no endpoint of does the key go into the harness env — never into the deterministic, logged `settingsEnv` slice (`harness/settings.go` `settingsEnv`) |
 
 hermes writing the key to disk needed a `stripSecrets` on the capture path
 while `config.yaml` was a chain role. Both `stripSecrets` implementations are

@@ -221,8 +221,10 @@ func settingsEnv(s settings.Resolved, k harnessKnobs) []string {
 
 	if s.Endpoint != nil {
 		// Endpoint wiring only when the PLATFORM routes this model: the 0g
-		// router exists in no framework's built-in table, so we supply it. A
-		// framework built-in ships its own and must not be re-pointed by us.
+		// router exists in no framework's built-in table, so we supply it.
+		// Start points the harness at sealed's inference route instead,
+		// which forwards to this endpoint, or to a native provider's
+		// official one (spawn.go modelEndpoint).
 		env["SEAL_MODEL_BASE_URL"] = s.Endpoint.BaseURL
 		env["SEAL_MODEL_API"] = wireAPI(s.Endpoint.Format)
 	}

@@ -30,7 +30,7 @@ func (u *Uploader) pushLeaf(
 	if err != nil {
 		return chain.IntelligentData{}, fmt.Errorf("upload %s: %w", role, err)
 	}
-	descJSON, err := json.Marshal(onChainDescription{
+	desc := onChainDescription{
 		Role: role,
 		StoragePtr: storagePtr{
 			RootHash: "0x" + hex.EncodeToString(root[:]),
@@ -38,7 +38,11 @@ func (u *Uploader) pushLeaf(
 			Size:     len(ciphertext),
 		},
 		Encryption: "AES-GCM-256",
-	})
+	}
+	if u.plaintextCommitments {
+		desc.Commitments = commitmentsOf(leafCommitment(dataKey, role, root, plaintext))
+	}
+	descJSON, err := json.Marshal(desc)
 	if err != nil {
 		return chain.IntelligentData{}, fmt.Errorf("marshal dataDescription: %w", err)
 	}

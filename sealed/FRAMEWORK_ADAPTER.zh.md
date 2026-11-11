@@ -141,6 +141,11 @@ sealed 的五个组件各自通过一个窄切面消费它:
 | `ConversationHistory` | `ConversationHistory(ctx)` | 有状态 responses 门丢掉客户端发的历史:先发这里返回的历史,再只发客户端的当前轮。网关自己会重放会话时返回空(openclaw)——再叠客户端的历史,模型会看到两遍 | 客户端历史继续原样转发 |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear`(owner 签名)+ CLI `/clear`,随后进程重启 | 该路由答 501——历史在客户端侧,服务端无可清 |
 | `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact`(owner 签名、同一时间只跑一个、拒绝重放、与 synth 门上的一轮永不重叠)+ CLI `/compact`:立刻运行框架**自己的**压缩,不重启;note 展示给 owner。框架暂时拒绝(忙、会话已变)时包装 `framework.ErrCompactRefused`——owner 收到可重试的 409,而不是失败;已安装的框架版本缺少你的 adapter 用来触发压缩的东西时(openclaw 2026.7.1 之前没有 `sessions compact` 这条 CLI 命令),包装 `framework.ErrCompactUnsupported`——答 501,和没实现这个接口一样 | 该路由答 501——无法从外部让该框架压缩 |
+| `UncommittedKeeper` | `KeepsUncommitted(role) bool` | bootstrap Phase A:同一容器再次启动时,对列出的 role,agent 在上次提交之后改过的盘上内容保留,前提是链上仍是这个容器上次同步时的版本(`synced.go`);随后 watcher 提交它。只列 agent 自己写的内容,不列 framework binding 这类平台状态 | 每次启动都用链上版本覆盖盘上内容 |
+| `BearerTranslator` | `TranslateBearer(token) (frameworkToken string, ok bool)` | proxy,在 `Auth` 为 `bearer` 的路由上:只转发带 owner token 的请求,并把它换成框架自己的 token,框架看不到 owner 的 token。`AuthResponse` 这时交给 owner 的是 owner 的 token,不是框架的 | `AuthResponse` 返回的 token 原样转发 |
+| `PlaintextCommitter` | `CommitsPlaintext() bool` | uploader:上传的每个条目都在 `dataDescription` 里带一个对明文的加盐 sha256 承诺(`LAYERS.zh.md` §7.1) | 没有承诺 |
+| `ServiceFieldLimiter` | `ServiceFieldLimits() (description, inputExample int)` | proxy,注册服务时:描述或输入示例超长(按字节)就拒绝 | 不限长度 |
+| `LayeredRuntime` | `UseHarness(hash, dir)`、`HarnessHash()`、`InferenceTarget()` | bootstrap 和 `layered.go`:`Start` 运行哪个 harness 包、按 attestor 的目标换包,以及 serve-proof v2(`LAYERS.zh.md` §5、§7)。只有 0g-harness | 运行镜像安装的框架;serve-proof 仍是 v1 |
 
 实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
 悄悄没实现 = 功能悄悄关闭。
@@ -1005,7 +1010,10 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
     (ghostty `/pty` + `BrowserFiles`)和 hermes(`/api/pty` + 文件端点)
     都恰好带这套 UI;现在两者都只声明 chat。规则:**受限接口默认暴露;
     框架完整 UI 只有在逐端点审计证明其下无 shell/文件/exec 可达后才暴露。**
-    拿不准就别声明 route——未声明的前缀在 proxy 层 404。
+    拿不准就别声明 route——未声明的前缀在 proxy 层 404。route 还可以列出
+    确切的 endpoint(`Route.Endpoints`:方法和路径,`{id}` 匹配一段),proxy
+    就只转发这些:没列的路径 404,没列的方法 405。0g-harness 列的是它
+    protocol v1 的 endpoint。
 
 ## 12. 移植实录:接入 claude-code(2026-07)—— 已下线,保留为案例
 

@@ -25,6 +25,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"seal-verify/internal/attestorhttp"
+	"seal-verify/internal/layers"
 	"seal-verify/internal/logger"
 )
 
@@ -74,6 +75,13 @@ var credentialsPending atomic.Pointer[func() int]
 // SetCredentialsPending makes every later report carry the pending
 // credential-request count f returns (StatusReport.v3).
 func SetCredentialsPending(f func() int) { credentialsPending.Store(&f) }
+
+var targetsHandler atomic.Pointer[func(layers.Targets)]
+
+// SetTargetsHandler hands f the versions an attestor running the layered
+// flow names in its reply to a status report (sealed/LAYERS.md §3.1). f runs
+// on its own goroutine, after the report has returned.
+func SetTargetsHandler(f func(layers.Targets)) { targetsHandler.Store(&f) }
 
 // Status posts a status report (running / error / warning / starting / stopping)
 // for a sealId under this boot's receipt. Failures are logged; this is a
@@ -139,6 +147,14 @@ func Status(attestorURL string, agentSealPriv []byte, sealID, status, errorDetai
 		return
 	}
 	logger.Logf("OK   status reported: %s", status)
+	var reply struct {
+		Targets *layers.Targets `json:"targets"`
+	}
+	if json.Unmarshal(respBody, &reply) == nil && reply.Targets != nil {
+		if f := targetsHandler.Load(); f != nil {
+			go (*f)(*reply.Targets)
+		}
+	}
 }
 
 // SeedSettings hands attestor a configuration document recovered from a

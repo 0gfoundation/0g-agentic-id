@@ -36,7 +36,9 @@ const AgenticIDABI = `[
   {"type":"function","name":"intelligentDatasOf","stateMutability":"view","inputs":[{"name":"tokenId","type":"uint256"}],"outputs":[{"name":"","type":"tuple[]","components":[{"name":"dataDescription","type":"string"},{"name":"dataHash","type":"bytes32"}]}]},
   {"type":"function","name":"sealedKeysOf","stateMutability":"view","inputs":[{"name":"tokenId","type":"uint256"}],"outputs":[{"name":"","type":"bytes[]"}]},
   {"type":"function","name":"update","stateMutability":"nonpayable","inputs":[{"name":"tokenId","type":"uint256"},{"name":"newDatas","type":"tuple[]","components":[{"name":"dataDescription","type":"string"},{"name":"dataHash","type":"bytes32"}]},{"name":"sealedKeys","type":"bytes[]"}],"outputs":[]},
-  {"type":"event","name":"ITransferred","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"tokenId","type":"uint256","indexed":true},{"name":"entries","type":"tuple[]","indexed":false,"components":[{"name":"dataHash","type":"bytes32"},{"name":"sealedKey","type":"bytes"}]}]}
+  {"type":"event","name":"ITransferred","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"tokenId","type":"uint256","indexed":true},{"name":"entries","type":"tuple[]","indexed":false,"components":[{"name":"dataHash","type":"bytes32"},{"name":"sealedKey","type":"bytes"}]}]},
+  {"type":"function","name":"isValidSealedHash","stateMutability":"view","inputs":[{"name":"sealedHash","type":"bytes32"}],"outputs":[{"name":"","type":"bool"}]},
+  {"type":"function","name":"isValidHarnessHash","stateMutability":"view","inputs":[{"name":"harnessHash","type":"bytes32"}],"outputs":[{"name":"","type":"bool"}]}
 ]`
 
 // transferScanChunk is the backward-scan window for ITransferred. 0G testnet
@@ -303,6 +305,40 @@ func (c *Client) Update(
 	}
 	logger.Logf("chain.Update OK: tokenId=%s tx=%s gas_used=%d", tokenID.String(), signed.Hash().Hex(), receipt.GasUsed)
 	return signed.Hash(), nil
+}
+
+// IsValidSealedHash reads AgenticID.isValidSealedHash: whether the deployer
+// listed this sealed program hash (sealed/LAYERS.md §3.1).
+func (c *Client) IsValidSealedHash(ctx context.Context, hash [32]byte) (bool, error) {
+	return c.callBool(ctx, "isValidSealedHash", hash)
+}
+
+// IsValidHarnessHash reads AgenticID.isValidHarnessHash: whether the
+// deployer listed this harness official version package (sealed/LAYERS.md
+// §5.1).
+func (c *Client) IsValidHarnessHash(ctx context.Context, hash [32]byte) (bool, error) {
+	return c.callBool(ctx, "isValidHarnessHash", hash)
+}
+
+// callBool calls a view function of AgenticID that returns one bool.
+func (c *Client) callBool(ctx context.Context, method string, args ...any) (bool, error) {
+	data, err := c.abi.Pack(method, args...)
+	if err != nil {
+		return false, err
+	}
+	out, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &c.contract, Data: data}, nil)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", method, err)
+	}
+	res, err := c.abi.Unpack(method, out)
+	if err != nil || len(res) == 0 {
+		return false, fmt.Errorf("unpack %s: %v", method, err)
+	}
+	v, ok := res[0].(bool)
+	if !ok {
+		return false, fmt.Errorf("%s return type: %T", method, res[0])
+	}
+	return v, nil
 }
 
 // getIdentityRegistrySelector is VerifiedFeedbackRegistry.getIdentityRegistry()

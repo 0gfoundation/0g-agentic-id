@@ -1,0 +1,20 @@
+{
+  "description": "Later boot under the layered runtime (sealed/LAYERS.md): the attestor declared \"layered\": true in GET /provision and the loader named the sealed program's hash, so the request adds sealed_hash and container_signature signs the ProvisionBoot.v2 message, which appends that hash. Same TEST-ONLY key and fields as boot-v1.json; never use the key outside tests.",
+  "test_only_container_key": {
+    "private_key": "0x3039aed7d54f4e29d521883f3f81787eaea2fe2300cdef9d37c57655e289afd8",
+    "derivation": "keccak256(\"agentdna1.4 test container key\")",
+    "address": "0x6Cc01F350e9Cbe7A15Cb5919344a8289a7b9c82f",
+    "pubkey": "0x038038c5cc4de940c65aef5e05053b3703b9aac292f8e58e99c93a05a205f472fa"
+  },
+  "recorded_container_pubkey": "0x038038c5cc4de940c65aef5e05053b3703b9aac292f8e58e99c93a05a205f472fa",
+  "request": {
+    "seal_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "boot_ticket": "1111111111111111111111111111111111111111111111111111111111111111",
+    "boot_generation": 7,
+    "boot_id": "0x7777777777777777777777777777777777777777777777777777777777777777",
+    "boot_started_at": 1700000000123,
+    "sealed_hash": "0x5555555555555555555555555555555555555555555555555555555555555555",
+    "container_signature": "0x276f4461784f83a3990a96af3303707ab8c09617a85b4ca09d6d27c5529191001cb56e25ef5ad17e263d24bc303d7d91d6e1ec724c877fe500ebc60ee1ffb8891b"
+  },
+  "canonical": "ProvisionBoot.v2:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7:3138bb9bc78df27c473ecfd1410f7bd45ebac1f59cf3ff9cfe4db77aab7aedd3:7777777777777777777777777777777777777777777777777777777777777777:1700000000123:5555555555555555555555555555555555555555555555555555555555555555"
+}

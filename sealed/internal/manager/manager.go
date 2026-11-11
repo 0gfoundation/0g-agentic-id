@@ -179,12 +179,29 @@ func (m *Manager) Start(ctx context.Context, params StartParams) error {
 	return nil
 }
 
-// Stop terminates supervision and the agent process. Idempotent.
+// Stop terminates supervision and the agent process, for good: a reload or
+// crash-restart under way finishes first (or ctx ends the wait), and none
+// starts the agent again afterwards. The shared agent state is left as it
+// is, because sealed's stop (shutdown.go) lets a commit the watcher has
+// under way finish with it. Idempotent.
 func (m *Manager) Stop(ctx context.Context) {
 	m.once.Do(func() { close(m.stopCh) })
+	// Closing stopCh ends a crash-restart's backoff wait; holding inFlight,
+	// never released, makes every later Reload and restart a no-op.
+	for !m.inFlight.CompareAndSwap(false, true) {
+		select {
+		case <-ctx.Done():
+			_ = m.adapter.Stop(ctx, m.cfg.GracefulStopTimeout)
+			return
+		case <-time.After(stopPollInterval):
+		}
+	}
 	_ = m.adapter.Stop(ctx, m.cfg.GracefulStopTimeout)
-	m.agent.Clear()
 }
+
+// stopPollInterval is how often Stop checks whether a reload or restart
+// under way has finished.
+const stopPollInterval = 50 * time.Millisecond
 
 // Reload stops the running agent and re-spawns it. Used by the watcher
 // when a framework dim drift requires the binary on disk to actually
@@ -196,10 +213,15 @@ func (m *Manager) Stop(ctx context.Context) {
 // guard as restart()).
 func (m *Manager) Reload(ctx context.Context) error {
 	if !m.inFlight.CompareAndSwap(false, true) {
-		logger.Logf("manager: reload requested while another (re-)start is in flight; skipping")
+		logger.Logf("manager: reload requested while another (re-)start is in flight, or after Stop; skipping")
 		return nil
 	}
 	defer m.inFlight.Store(false)
+	select {
+	case <-m.stopCh:
+		return errors.New("manager: stopped")
+	default:
+	}
 
 	logger.Logf("manager: reload — stopping current process")
 	if err := m.adapter.Stop(ctx, m.cfg.GracefulStopTimeout); err != nil {

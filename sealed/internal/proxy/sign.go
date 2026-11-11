@@ -13,7 +13,7 @@
 //   - 127.0.0.1 binds are also exposed by Daytona in some configurations.
 //   - A unix socket is purely intra-container; fs permission is the ACL.
 //
-// Five routes (signSocketRoutes is the complete set; sign_test.go pins it):
+// Six routes (signSocketRoutes is the complete set; sign_test.go pins it):
 //
 //	POST     /sign/personal_sign  EIP-191 0x45 — body {"message": str} or {"message_hex": "0x..."}
 //	POST     /sign/typed_data     EIP-712 (EIP-191 0x01) — body is the standard TypedData JSON
@@ -21,6 +21,7 @@
 //	                                        gas_limit, max_fee_per_gas, max_priority_fee_per_gas
 //	GET/POST /services            agent service registry (services.go) — signs nothing
 //	POST     /settings            agent half of the settings channel (settings.go) — signs nothing
+//	POST     /harness/restart     restart the harness (restart.go) — signs nothing
 //
 // SIGNING-DOMAIN INVARIANT. Every signature this socket produces is over one
 // of exactly three preimage shapes, each built here from the request:
@@ -133,6 +134,7 @@ func (s *Server) signSocketRoutes() []signRoute {
 		{"/sign/transaction", s.handleSignTransaction},
 		{"/services", s.handleServices},
 		{"/settings", s.handleAgentSettings},
+		{"/harness/restart", s.handleHarnessRestart},
 	}
 }
 

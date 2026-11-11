@@ -12,7 +12,7 @@
 
 放在 0g-harness(`src/composition.mjs`)里,用代码写死。0g-harness 就是本适配器启动的那个进程。
 
-- **构建镜像时就定死。** 0g-harness 镜像在构建时装一个确定版本的 harness(`../../images/harness/Dockerfile` 里的 `HARNESS_REF`),连同它锁定的整棵依赖树。所以插件集合,以及里面每一条平台决定,都包含在镜像哈希里:被度量,并且登记在链上的 `validFrameworkHashes` 里。
+- **构建镜像时定死,按哈希运行。** 0g-harness 镜像在构建时把一个确定版本的 harness(`../../images/harness/Dockerfile` 里的 `HARNESS_REF`),连同它锁定的整棵依赖树,打成一个包:装好的目录树的确定性 tar,以它的 sha256 命名。镜像把包解到 `/opt/0g-harness/<sha256>/`,属主是 root,agent 只读;`/opt/0g-harness/base` 写着它的哈希。所以插件集合,以及里面每一条平台决定,都包含在包哈希里;镜像自带的包同时也包含在镜像哈希里(被度量,并且登记在链上的 `validFrameworkHashes` 里)。分层流程下,sealed 运行 attestor 指定的包,前提是链上 `validHarnessHashes` 列了它的哈希(`../../LAYERS.zh.md` §5);否则运行 `base`。
 - **agent 改不动。** 组合**不是** `cordis.yml`,不是 profile,也不在 `$DSH_HOME` 下的任何 patch 文件里。agent 就算改自己的家目录,也改不动下次启动挂什么。这是 doctrine 第 5 条(agent 不能重写自己的运行时)在结构上的落地。
 - **版本对得上。** 构建镜像时还会检查一件事:装上的 0g-harness 版本,必须等于 `whitelist.go` 写进每个 0g-harness agent 的 `framework` role 的版本。这样,role 里写的永远是实际运行的版本。harness 自己锁定它所用的 DSH 包(它的 `npm-shrinkwrap.json`)。
 
@@ -27,14 +27,19 @@
 
 ## 进程
 
-`spawn.go` 以 agent 用户身份运行 `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`,监听本机回环端口 8794,环境变量由 `environ()` 生成。这些环境变量的约定写在 harness 的 `docs/PROTOCOL.md` 里。
+`spawn.go` 以 agent 用户身份运行 `node /opt/0g-harness/<sha256>/bin/0g-harness.mjs`(没有包的镜像上是 `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`),监听本机回环端口 8794,环境变量由 `environ()` 生成。这些环境变量的约定写在 harness 的 `docs/PROTOCOL.md` 里。
+
+- 只要 sealed 知道 provider 的 endpoint,harness 就通过 sealed 的推理代理(`internal/inferproxy`,一个回环地址)调用模型:注册表里的 managed provider,以及 `openai` 和 `anthropic`(sealed 固定的官方 endpoint)。代理写上 owner 的模型,在 system prompt 末尾附上 agent doc,并设置密钥;harness 手里只有占位符(`../../CONFIG_SURFACE.zh.md` §3、§7)。
+- harness 在 `/v1/*` 上检查它自己的 token(`SEAL_BRIDGE_TOKEN`)。owner 从 `/_seal/auth` 拿到的是另一个 token,sealed 的 proxy 在请求进来时把它换成 harness 的,所以 harness 运行的任何东西都看不到 owner 的 token。
 
 harness 做三件事:
 - 只保留一个 agent、一段对话(`owner-chat`);
 - 把这段对话和它的轮次记录存在一起(`../../CONVERSATION.zh.md`);
 - 把每一轮的输出交给开启这一轮的一方。owner 开启的轮次,交给 owner 的那个请求;agent 自己开启的轮次(后台任务结束、提醒到点),进收件箱。
 
-`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后四种,对它们没有任何改变。
+`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后四种,对它们没有任何改变。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。
+
+harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)和 `skills/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
 
 ## 当前组合
 
@@ -55,7 +60,7 @@ harness 做三件事:
 | **平台控制点** | 见下面三项 |
 
 三个平台控制点:
-- **`seal-tools`**:把 `seal_sign`、`seal_sign_transaction`、`seal_sign_typed_data`、`seal_register_service` 做成原生工具,每次签名都会记在 session log 里。三个签名工具和签名 socket 的三个签名端点一一对应。
+- **`seal-tools`**:把 `seal_sign`、`seal_sign_transaction`、`seal_sign_typed_data`、`seal_register_service` 做成原生工具,每次签名都会记在 session log 里。三个签名工具和签名 socket 的三个签名端点一一对应。注册服务时,sealed 限制描述最长 280 字节、输入示例最长 2048 字节。
 - **`seal-guard`**:把 shell 对 socket `/sign/` 端点的调用引导到上面的签名工具;`/settings` 和 `/services` 照常开放。
 - **`subagent-guard`**:写文件、执行命令、签名,只有主 agent 能做。
 

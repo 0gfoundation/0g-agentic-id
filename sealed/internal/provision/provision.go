@@ -5,13 +5,20 @@
 //
 // One sealed boot is one claim, under one random boot_id:
 //
-//	GET  /provision?seal_id=0x<seal>  → {"generation", "certificate_required"}
+//	GET  /provision?seal_id=0x<seal>  → {"generation", "certificate_required", "layered"}
 //	POST /provision                   → the claim, signed with the container key
 //
 // The provider's certificate (SANDBOX_SEAL_ATTESTATION) rides the POST only
 // when the attestor has no container key recorded for this deployment yet
 // (certificate_required); later boots prove possession of the recorded key.
 // Each POST is signed afresh with a later boot_started_at.
+//
+// "layered": true declares that the attestor runs the layered runtime
+// (sealed/LAYERS.md §8): it checks the sealed program's hash against
+// validSealedHashes before it hands out the key. Only then does a sealed the
+// loader started (Boot.SealedHash) report that hash, as sealed_hash, signed
+// into the claim (ProvisionBoot.v2). An attestor without the declaration
+// gets the v1 claim it knows, which has no such field.
 package provision
 
 import (
@@ -32,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"seal-verify/internal/attestorhttp"
+	"seal-verify/internal/layers"
 	"seal-verify/internal/logger"
 )
 
@@ -65,6 +73,9 @@ type Boot struct {
 	Ticket string
 	// Started is when sealed started; provisioning gives up retryWindow after it.
 	Started time.Time
+	// SealedHash is the sha256 of this sealed program as the loader verified
+	// it (64 lowercase hex), or "" when sealed was not started by the loader.
+	SealedHash string
 }
 
 // Result is what /provision hands the container.
@@ -92,12 +103,23 @@ type Result struct {
 	// credentials.Document plus the owner epoch the attestor vouches for),
 	// or nil when there is none.
 	Credentials []byte
+	// Layered is true when this boot ran the layered flow: the attestor
+	// declared it and took the reported sealed hash.
+	Layered bool
+	// Targets are the versions the attestor named for this agent in the
+	// answer that declared the layered flow, to a sealed the loader started
+	// (zero otherwise). Set when provisioning failed too: a version the
+	// attestor refuses (taken off validSealedHashes) can still switch to the
+	// one it names.
+	Targets layers.Targets
 }
 
 // authorization is the GET /provision answer.
 type authorization struct {
-	Generation          int64 `json:"generation"`
-	CertificateRequired bool  `json:"certificate_required"`
+	Generation          int64          `json:"generation"`
+	CertificateRequired bool           `json:"certificate_required"`
+	Layered             bool           `json:"layered"`
+	Targets             layers.Targets `json:"targets"`
 }
 
 // provisionRequest is the POST /provision body.
@@ -108,6 +130,7 @@ type provisionRequest struct {
 	BootGeneration     int64           `json:"boot_generation"`
 	BootID             string          `json:"boot_id"`
 	BootStartedAt      int64           `json:"boot_started_at"`
+	SealedHash         string          `json:"sealed_hash,omitempty"`
 	ContainerSignature string          `json:"container_signature"`
 }
 
@@ -154,6 +177,8 @@ type claim struct {
 	ticketHash [32]byte
 	// startedAt is the boot_started_at of the last signed POST.
 	startedAt int64
+	// targets are the versions the last layered authorization named.
+	targets layers.Targets
 }
 
 // FromAttestor runs Phase 1 and returns the decrypted payload. Transient
@@ -179,6 +204,10 @@ func FromAttestor(boot Boot) Result {
 	key, err := crypto.ToECDSA(boot.SealKey)
 	if err != nil {
 		logger.Logf("FAIL provision: SANDBOX_SEAL_KEY is not a secp256k1 private key")
+		return Result{}
+	}
+	if boot.SealedHash != "" && !lowerHex(boot.SealedHash, 32) {
+		logger.Logf("FAIL provision: the sealed hash from the loader is not 64 lowercase hex")
 		return Result{}
 	}
 	client, err := attestorhttp.Client(boot.AttestorURL)
@@ -209,12 +238,15 @@ func (c *claim) run() Result {
 	for attempt := 1; ; attempt++ {
 		if auth == nil {
 			found, outcome := c.discover()
+			if outcome == proceed && c.layered(found) {
+				c.targets = found.Targets
+			}
 			switch {
 			case outcome == stop:
-				return Result{}
+				return c.failed()
 			case outcome == proceed && refused != 0 && found.Generation == refused:
 				logger.Logf("FAIL provision: refused and no newer boot authorized; reset required")
-				return Result{}
+				return c.failed()
 			case outcome == proceed:
 				auth, refused = &found, 0
 			}
@@ -225,7 +257,7 @@ func (c *claim) run() Result {
 			case proceed:
 				return result
 			case stop:
-				return Result{}
+				return c.failed()
 			case reauthorize:
 				// The next successful discovery decides: a newer generation
 				// is claimed at once, the same one ends provisioning.
@@ -236,10 +268,16 @@ func (c *claim) run() Result {
 			}
 		}
 		if !c.wait(attempt, backoff) {
-			return Result{}
+			return c.failed()
 		}
 		backoff = min(2*backoff, maxBackoff)
 	}
+}
+
+// failed is the result of a provisioning that did not succeed: no key, and
+// the versions the last layered authorization named.
+func (c *claim) failed() Result {
+	return Result{Targets: c.targets}
 }
 
 // wait sleeps backoff before the next attempt, or reports false when that
@@ -311,7 +349,11 @@ func (c *claim) provision(auth authorization) (Result, action) {
 	outcome := classify(status)
 	switch outcome {
 	case proceed:
-		return c.open(body)
+		result, outcome := c.open(body)
+		if outcome == proceed && c.layered(auth) {
+			result.Layered, result.Targets = true, auth.Targets
+		}
+		return result, outcome
 	case stop:
 		logger.Logf("FAIL provision: HTTP %d: %s", status, attestorhttp.Excerpt(body))
 	default:
@@ -320,9 +362,19 @@ func (c *claim) provision(auth authorization) (Result, action) {
 	return Result{}, outcome
 }
 
+// layered reports whether a claim under auth runs the layered flow: the
+// attestor declared it and the loader named this program's hash.
+func (c *claim) layered(auth authorization) bool {
+	return auth.Layered && c.boot.SealedHash != ""
+}
+
 // request builds the POST body for auth, signed at c.startedAt.
 func (c *claim) request(auth authorization) (provisionRequest, error) {
-	signature, err := crypto.Sign(crypto.Keccak256([]byte(bootMessage(c.boot.Certificate.SealID, auth.Generation, c.ticketHash, c.bootID[:], c.startedAt))), c.key)
+	message := bootMessage(c.boot.Certificate.SealID, auth.Generation, c.ticketHash, c.bootID[:], c.startedAt)
+	if c.layered(auth) {
+		message = bootMessageV2(c.boot.Certificate.SealID, auth.Generation, c.ticketHash, c.bootID[:], c.startedAt, c.boot.SealedHash)
+	}
+	signature, err := crypto.Sign(crypto.Keccak256([]byte(message)), c.key)
 	if err != nil {
 		return provisionRequest{}, err
 	}
@@ -334,6 +386,9 @@ func (c *claim) request(auth authorization) (provisionRequest, error) {
 		BootID:             "0x" + hex.EncodeToString(c.bootID[:]),
 		BootStartedAt:      c.startedAt,
 		ContainerSignature: "0x" + hex.EncodeToString(signature),
+	}
+	if c.layered(auth) {
+		request.SealedHash = "0x" + c.boot.SealedHash
 	}
 	if auth.CertificateRequired {
 		request.Certificate = c.boot.CertificateJSON
@@ -430,4 +485,10 @@ func lowerHex(value string, size int) bool {
 
 func bootMessage(seal string, generation int64, ticketHash [32]byte, bootID []byte, startedAt int64) string {
 	return fmt.Sprintf("ProvisionBoot.v1:0x%s:%d:%x:%x:%d", seal, generation, ticketHash, bootID, startedAt)
+}
+
+// bootMessageV2 is the layered claim: bootMessage's fields, then the sealed
+// hash (64 lowercase hex, no 0x).
+func bootMessageV2(seal string, generation int64, ticketHash [32]byte, bootID []byte, startedAt int64, sealedHash string) string {
+	return fmt.Sprintf("ProvisionBoot.v2:0x%s:%d:%x:%x:%d:%s", seal, generation, ticketHash, bootID, startedAt, sealedHash)
 }

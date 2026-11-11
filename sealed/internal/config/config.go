@@ -31,6 +31,12 @@
 //	                            framework binding (local dev); the binding is authoritative
 //	SANDBOX_PROXY_DOMAIN,       (optional) compose the public URL (composePublicURL)
 //	DAYTONA_SANDBOX_ID
+//	SEALED_HASH                 set by the loader (cmd/loader) for the sealed it starts:
+//	                            the sha256 it verified, 64 lowercase hex. Unset when
+//	                            sealed is PID 1. Reported at /provision under the
+//	                            layered runtime (sealed/LAYERS.md)
+//	SEALED_TRIAL                set by the loader ("1") when it starts a sealed version
+//	                            it switched to and has not seen come up yet
 //
 // CHAIN_RPC_URL and INDEXER_URL are public and must not embed credentials
 // (an API token in the URL's userinfo, path or query). sealed prints both in
@@ -118,6 +124,15 @@ type Bootstrap struct {
 	// proxy infrastructure). See ARCHITECTURE.zh.md §8
 	// (AGENT_PUBLIC_URL 怎么暴露给 agent).
 	PublicURL string
+
+	// SealedHash is SEALED_HASH: this program's sha256 as the loader
+	// verified it, 64 lowercase hex, or "" when sealed is PID 1 (no loader).
+	// A malformed value is passed on as is, and provisioning refuses it.
+	SealedHash string
+	// Trial is SEALED_TRIAL=1: the loader switched to this version and rolls
+	// back to the previous one if it exits before it has come up
+	// (layers.go).
+	Trial bool
 }
 
 // Load reads env vars and runs the certificate self-check (Phase 0). Returns
@@ -170,6 +185,8 @@ func Load() (*Bootstrap, error) {
 		FallbackIndexer:      os.Getenv("INDEXER_URL"),
 		Framework:            strings.TrimSpace(os.Getenv("AGENT_FRAMEWORK")),
 		PublicURL:            composePublicURL(),
+		SealedHash:           os.Getenv("SEALED_HASH"),
+		Trial:                os.Getenv("SEALED_TRIAL") == "1",
 	}, nil
 }
 

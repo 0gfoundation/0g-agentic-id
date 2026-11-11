@@ -313,6 +313,110 @@ func TestStop_HaltsLivenessLoop(t *testing.T) {
 	}
 }
 
+// After Stop nothing starts the agent again: not a reload (the drift
+// handler's), not a crash-restart.
+func TestStop_NothingStartsAfterward(t *testing.T) {
+	a := &fakeAdapter{}
+	m := New(a, state.New(), Config{
+		LivenessProbeInterval: time.Hour,
+		BackoffSeq:            []time.Duration{time.Millisecond},
+		MaxRetries:            3,
+	})
+	if err := m.Start(context.Background(), StartParams{}); err != nil {
+		t.Fatal(err)
+	}
+	m.Stop(context.Background())
+	_ = m.Reload(context.Background())
+	a.triggerExit(errors.New("killed"))
+	time.Sleep(30 * time.Millisecond)
+	if n := atomic.LoadInt32(&a.startCalls); n != 1 {
+		t.Fatalf("Start called %d times, want only the first", n)
+	}
+}
+
+// A reload under way when Stop is called finishes first; Stop then stops
+// the process the reload started, so none is left running.
+func TestStop_WaitsForAReloadUnderWay(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	note := func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, s)
+	}
+	inReload := make(chan struct{})
+	release := make(chan struct{})
+	var reloading atomic.Bool
+	a := &fakeAdapter{
+		stopFn: func() error {
+			if reloading.CompareAndSwap(true, false) {
+				close(inReload)
+				<-release
+			}
+			note("stop")
+			return nil
+		},
+		startFn: func(framework.RuntimeContext) (framework.StartResult, error) {
+			note("start")
+			return framework.StartResult{Upstream: "http://127.0.0.1:0"}, nil
+		},
+	}
+	m := New(a, state.New(), Config{LivenessProbeInterval: time.Hour, MaxRetries: 1})
+	if err := m.Start(context.Background(), StartParams{}); err != nil {
+		t.Fatal(err)
+	}
+	reloading.Store(true)
+	go func() { _ = m.Reload(context.Background()) }()
+	<-inReload
+
+	stopped := make(chan struct{})
+	go func() {
+		m.Stop(context.Background())
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned while the reload was under way")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after the reload finished")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"start", "stop", "start", "stop"}
+	if len(order) != len(want) {
+		t.Fatalf("order %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("order %v, want %v", order, want)
+		}
+	}
+}
+
+// Stop leaves the shared agent state alone: sealed's stop lets a commit the
+// watcher has under way finish with it.
+func TestStop_KeepsAgentState(t *testing.T) {
+	const seal = "0x5ea1"
+	agent := state.New()
+	agent.SeedChainSnapshot("config", "abc", "0xroot")
+	m := New(&fakeAdapter{}, agent, Config{LivenessProbeInterval: time.Hour})
+	if err := m.Start(context.Background(), StartParams{SealID: seal}); err != nil {
+		t.Fatal(err)
+	}
+	m.Stop(context.Background())
+	if got := agent.ChainEntry("config"); got.ContentHash != "abc" || got.DataHash != "0xroot" {
+		t.Fatalf("chain snapshot after Stop = %+v, want it kept", got)
+	}
+	if _, _, gotSeal, _, _ := agent.Snapshot(); gotSeal != seal {
+		t.Fatalf("sealID after Stop = %q, want %q", gotSeal, seal)
+	}
+}
+
 // PreStart must run before EVERY spawn, not just the first. Anything that
 // only runs on the initial Start is frozen at container boot — which is how
 // the owner's thinking level used to get reverted by the next harness

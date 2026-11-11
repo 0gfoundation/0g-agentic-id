@@ -111,7 +111,7 @@ func (w *Watcher) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-		w.tick(ctx, w.cfg.OnDrift)
+		w.tick(ctx)
 	}
 }
 
@@ -124,15 +124,6 @@ func (w *Watcher) Stop() {
 // Done is closed once Run has returned.
 func (w *Watcher) Done() <-chan struct{} {
 	return w.doneCh
-}
-
-// Final runs one more tick now, after Run has stopped, and hands any drift
-// to onDrift instead of the configured OnDrift. sealed's shutdown uses it to
-// commit what changed since the last tick, without the framework reconcile
-// the regular handler may do (that would restart the framework it has just
-// stopped).
-func (w *Watcher) Final(ctx context.Context, onDrift func(plaintexts map[string][]byte, drifted []string)) {
-	w.tick(ctx, onDrift)
 }
 
 // dimsToPoll returns the role names this watcher should poll on every
@@ -155,7 +146,7 @@ func (w *Watcher) dimsToPoll() []string {
 // chainSnapshot.
 //
 // One summary log line per tick — drift roles marked with `!`.
-func (w *Watcher) tick(ctx context.Context, onDrift func(plaintexts map[string][]byte, drifted []string)) {
+func (w *Watcher) tick(ctx context.Context) {
 	type dimResult struct {
 		dim     string
 		hash    string
@@ -206,8 +197,8 @@ func (w *Watcher) tick(ctx context.Context, onDrift func(plaintexts map[string][
 
 	// Single dispatch after logging so the summary always lands even if
 	// the callback panics.
-	if onDrift != nil && len(driftedRoles) > 0 {
-		onDrift(plaintexts, driftedRoles)
+	if w.cfg.OnDrift != nil && len(driftedRoles) > 0 {
+		w.cfg.OnDrift(plaintexts, driftedRoles)
 	}
 }
 

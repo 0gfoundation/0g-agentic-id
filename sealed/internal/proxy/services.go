@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"strings"
 
+	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/report"
 )
@@ -57,13 +58,26 @@ var validMethods = map[string]bool{
 	http.MethodPatch: true, http.MethodDelete: true,
 }
 
+// fieldLimits bound a registration's description and input example, in
+// bytes, for adapters that declare them (framework.ServiceFieldLimiter);
+// zero leaves a field unbounded.
+type fieldLimits struct {
+	description, inputExample int
+}
+
 // validateServices checks the agent-supplied list as a whole. Any violation
 // rejects the ENTIRE POST (all-or-nothing) so a bad entry can't partially
 // land. Returns normalized entries (method upper-cased) or an error.
-func validateServices(in []ServiceEntry) ([]ServiceEntry, error) {
+func validateServices(in []ServiceEntry, limits fieldLimits) ([]ServiceEntry, error) {
 	seen := make(map[string]bool, len(in))
 	out := make([]ServiceEntry, 0, len(in))
 	for i, e := range in {
+		if limits.description > 0 && len(e.Description) > limits.description {
+			return nil, fmt.Errorf("services[%d].description is %d bytes, over the %d allowed", i, len(e.Description), limits.description)
+		}
+		if limits.inputExample > 0 && len(e.InputExample) > limits.inputExample {
+			return nil, fmt.Errorf("services[%d].input_example is %d bytes, over the %d allowed", i, len(e.InputExample), limits.inputExample)
+		}
 		if !strings.HasPrefix(e.Path, "/api/") || len(e.Path) <= len("/api/") {
 			return nil, fmt.Errorf("services[%d].path %q must start with /api/ and name something after it", i, e.Path)
 		}
@@ -220,7 +234,11 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 			writeSignError(w, http.StatusBadRequest, "decode body: "+err.Error())
 			return
 		}
-		entries, err := validateServices(body.Services)
+		var limits fieldLimits
+		if l, ok := s.getAdapter().(framework.ServiceFieldLimiter); ok {
+			limits.description, limits.inputExample = l.ServiceFieldLimits()
+		}
+		entries, err := validateServices(body.Services, limits)
 		if err != nil {
 			writeSignError(w, http.StatusBadRequest, err.Error())
 			return

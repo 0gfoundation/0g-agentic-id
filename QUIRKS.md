@@ -485,6 +485,19 @@ and git then refuses every command (`missing config key GIT_CONFIG_KEY_0`;
 seen on dev, 2026-11-05). Any variable sealed adds to `CredentialEnv` must
 pass that pattern (`internal/framework/gitcred_test.go` applies it).
 
+### 0g-harness logs "platform doc ABSENT" while the doc rides sealed's inference route
+
+When sealed knows the model's endpoint (every registry provider, plus
+`openai` and `anthropic`), the agent doc is not a file: sealed's inference
+route appends it to the system prompt of every model request
+(`sealed/internal/inferproxy`, `sealed/LAYERS.md` §4.2) and leaves
+`SEAL_AGENT_DOC` unset. The harness (`src/composition.mjs`) then logs
+`WARN platform doc ABSENT — agent will not know its identity or doctrine`,
+and `platform doc: ABSENT` in its `agent ready` line. Both are expected: the
+doc is on every request. Do not "fix" it by setting `SEAL_AGENT_DOC` as well;
+the harness would add the doc as its own section and the model would read it
+twice.
+
 ---
 
 ## Fault localization (serve-proof / sealed runtime)

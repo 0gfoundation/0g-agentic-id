@@ -1,8 +1,9 @@
 # Layered runtime (design draft)
 
 Status: draft. This document first explains what each layer does, then sets
-out the target design. Only the image-side-first part (§8) is implemented: the
-loader and sealed's graceful stop.
+out the target design. The sealed side (the loader, sealed, the 0g-harness
+image) is implemented as §8 "Image side first" describes; the attestor,
+contract and SDK side is not. The interfaces between the two are in §10.
 
 ## 1. Layers at a glance
 
@@ -39,9 +40,12 @@ only base, sealed and the official harness get fields of their own.
   signing channels; it enforces the rules that cannot be left to the harness
   (§4.3); it tracks and uploads iData; it signs ServeProofs.
 - **Decided by**: the project.
-- **Loading and verification**: the loader fetches sealed by hash and checks it
-  against `validSealedHashes` before exec. The attestor checks again before
-  every key release.
+- **Loading and verification**: base carries one sealed, whose hash is built
+  into the loader. For a version change, the running sealed first checks on
+  chain that the target is in `validSealedHashes`, then fetches it from the
+  attestor by hash and hands it to the loader. Before every exec the loader
+  checks the program's hash and asks the chain whether it is in
+  `validSealedHashes`. The attestor checks again before every key release.
 - **In the ServeProof**: `sealedHash`, naming the sealed program that runs. The
   address and model name the inference channel forwarded to are two more
   fields, `inferenceURL` and `model` (§7).
@@ -114,9 +118,11 @@ images, ServeProof and behaviour (compatibility requirements in §8).
 1. The platform injects the container key when it creates the container and
    issues a certificate. The certificate attests only the image hash, which is
    base.
-2. The loader is PID 1 in base. It checks sealed's hash against the allowlist
-   before running it. sealed receives the container key the moment it runs, so
-   the check has to come first.
+2. The loader is PID 1 in base. Before it runs any sealed it checks the hash
+   (the one base carries against the hash built into the loader, a
+   switched-to version against its name), then asks the chain whether that
+   hash is in `validSealedHashes`. sealed receives the container key the
+   moment it runs, so the check has to come first.
 3. sealed asks the attestor for the agent identity key and reports its own hash;
    the base hash is in the certificate. The attestor releases the key only if
    base is in `validFrameworkHashes` and sealed is in `validSealedHashes`, and
@@ -127,9 +133,20 @@ images, ServeProof and behaviour (compatibility requirements in §8).
    releasing the key, and the diff has no allowlist; it is recorded. The harness
    can use the sign socket, and the signing policy decides what it may sign.
 
-The loader fetches the allowlist over the same pinned TLS that sealed uses for
-the attestor today. A sealed version taken off the allowlist is no longer run
-by the loader either.
+The loader links only the standard library: it reads the allowlist with one
+`eth_call` to `CHAIN_RPC_URL`, AgenticID's `isValidSealedHash`, through the
+endpoint sealed reads the chain through. A version the chain says is not
+listed does not run; the loader falls back to the version it replaced, then to
+the one base carries, and when none is listed it runs nothing and only a
+recreate helps. When no answer can be had (the endpoint unreachable, or a
+contract without the function yet) the version runs: the attestor checks the
+same allowlist before releasing the key, so an unlisted version gets none, and
+once its provision is refused it hands over to the target the attestor names
+(§3.1).
+
+For a version change the running sealed does the download: it checks on chain
+that the target is listed, fetches it by hash over the same pinned TLS it uses
+for the attestor, and hands it to the loader.
 
 ## 3. Base layer
 
@@ -143,15 +160,21 @@ The loader (`sealed/cmd/loader`) does four things:
 1. Hardens itself first: non-dumpable and `no_new_privs`, like sealed.
 2. Keeps the container key, the certificate and the rest of the create-time
    environment in its own environment, and hands them unchanged to every
-   sealed it starts. An in-place swap does not restart the container, and the
-   platform does not inject them again. The loader is root and non-dumpable, so
-   another uid cannot read its `/proc/1/environ`.
-3. Fetches the sealed allowlist and this agent's target version from the
-   attestor, gets the program by hash and verifies it, and starts it as a
-   child. Base carries an initial sealed; other versions are downloaded by hash.
-4. Supervises sealed: forwards stop signals and reaps orphans; restarts sealed
-   when it exits; on a version change, verifies the new version first, then
-   restarts.
+   sealed it starts, plus `SEALED_HASH` (the hash it checked) and
+   `SEALED_TRIAL` (on trial). An in-place swap does not restart the container,
+   and the platform does not inject them again. The loader is root and
+   non-dumpable, so another uid cannot read its `/proc/1/environ`.
+3. Starts sealed once its hash checks out and the chain lists it (§2): the
+   version it last switched to, or the one base carries. A switched-to version
+   is placed by sealed in the loader's state directory (`/var/lib/loader`,
+   which only root can enter).
+4. Supervises sealed: forwards stop signals and reaps orphans. When sealed asks
+   to switch, it checks the new version's hash once more, stops the old
+   sealed, ends the processes it left behind, and starts the new version on
+   trial; if that version exits before it confirms it came up, the loader goes
+   back to the version it replaced and records the new one as not to be
+   switched to again. Under the layered flow it restarts a sealed that exits
+   on its own, at most 5 times in 10 minutes.
 
 Restarts come in four levels, from heaviest to lightest. Each level includes
 the lighter ones: a recreate or a container restart starts the loader, sealed
@@ -165,33 +188,50 @@ and the harness in turn, and a sealed restart also restarts the harness.
 | Harness restart | The official harness version, the diff | sealed, container, disk | An official version change, a diff change (§5.3); owner settings; rollback |
 
 The last three keep the disk: turns and background tasks in progress stop,
-while the conversation, inbox and reminders live on disk and survive. A
-recreate keeps only the iData on chain.
+while the conversation, inbox and reminders live on disk and survive. So do
+the persona and skills the agent changed after its last commit: sealed keeps,
+on disk and root-only, the version this container last had in sync with the
+chain, and when on the next boot the chain has not moved but the disk has, it
+keeps the disk and lets the watcher commit it, instead of restoring the chain
+version over it. On a stop signal sealed only stops the harness and lets the
+watcher's tick under way finish; it starts no commit of its own, because the
+platform kills the container about 10 s after the signal, too soon for an
+upload and a transaction. A recreate keeps only the iData on chain; changes
+made after the last commit go with the old container, at most 30 s of them.
 
 ### 3.1 In-place sealed update
 
-1. **Release**: the project builds a new sealed and stores it by hash. The
-   deployer (the contract owner) registers the hash in `validSealedHashes`,
-   effective immediately.
+1. **Release**: the project builds a new sealed and gives it to the attestor,
+   which stores it by hash (§10). The deployer (the contract owner) registers
+   the hash in `validSealedHashes`, effective immediately.
 2. **Trigger**: while the old version stays listed, the owner signs to switch.
    Delisting the old version makes the update mandatory: for agents running
-   it, the attestor sets the target to the newest listed version. sealed learns
-   its target from the attestor's reply to its periodic status report and
-   passes it to the loader.
-3. **Download**: the loader downloads the new version by hash, verifies it, and
-   confirms with the attestor that it is listed.
-4. **Handover**: the loader tells the old sealed to stop. The old sealed commits
-   pending iData changes, then stops the harness.
-5. **Start**: the loader starts the new sealed with the container key and the
-   create-time environment.
+   it, the attestor sets the target to the newest listed version. The attestor
+   names the target in its answer to the boot discovery (`GET /provision`) and
+   in its replies to status reports.
+3. **Download**: sealed checks on chain that the target is in
+   `validSealedHashes`, downloads it from the attestor by hash, places it in
+   the loader's state directory only if the hash matches, and asks the loader
+   to switch.
+4. **Handover**: the loader checks the hash once more, asks the chain once more
+   that it is listed, and tells the old sealed to stop. The old sealed stops
+   the harness and exits, and the loader ends the processes it left behind.
+   Changes made after the last commit stay on disk; the new sealed keeps and
+   commits them when it starts (§3).
+5. **Start**: the loader starts the new sealed on trial, with the container key
+   and the create-time environment.
 6. **Re-provision**: the new sealed asks the attestor for the identity key with
    the same container key and reports its new hash. The attestor checks base
    and sealed against the allowlists and releases the key again.
-7. **Restore**: the new sealed restores iData, starts the harness and reports
-   status. The sealed hash in ServeProofs changes with it.
-8. **Rollback**: if the new version fails to start or provision is refused, the
-   loader returns to the old version it keeps locally. If the old version is
-   also delisted, only a recreate helps.
+7. **Restore**: the new sealed restores iData, starts the harness, reports
+   status, then confirms to the loader that it came up. The sealed hash in
+   ServeProofs changes with it.
+8. **Rollback**: if the new version exits before it confirms (it fails to
+   start, or its provision is refused), the loader goes back to the version it
+   replaced and records the new one as not to be switched to again in this
+   container. If that version is delisted too, its provision is refused and it
+   switches to the target the attestor names; with no usable version left, only
+   a recreate helps.
 
 Port 8080 pauses for about one normal sealed start.
 
@@ -257,9 +297,14 @@ boundaries.
 
 - Official version: the harness package the project publishes, with source,
   `package.json`, a lockfile with integrity hashes, and every dependency
-  installed for base's node version (native modules built). Packages are stored
-  by hash, and the deployer registers them in `validHarnessHashes` on chain.
-  Base carries one; sealed downloads and verifies the others by hash.
+  installed for base's node version (native modules built). A package is the
+  installed package directory as a gzip'd tar, named by its sha256; the
+  attestor stores packages by hash, and the deployer registers them in
+  `validHarnessHashes` on chain. Base carries one, unpacked at
+  `/opt/0g-harness/<hash>/` and named by `/opt/0g-harness/base`; sealed
+  downloads the others by hash, verifies them and unpacks them to the same
+  place. A package may hold only directories, regular files and links that stay
+  inside it.
 - Diff: the 0g-harness adapter defines `harness/` as a tracked role, recording
   which official version it applies to and the changes against it. The working
   directory on disk is the full source, and sealed computes the diff when it
@@ -306,9 +351,13 @@ boundaries.
    diff brings in that needs a native build fails to install and rolls back
    (§5.3); pure-JS dependencies are unaffected.
 2. The installed version goes into a read-only directory the agent cannot
-   modify. It stays on disk for later restarts; after a recreate the disk is
-   empty and it is installed again. sealed starts the harness from there as the
-   agent user, with no keys or tokens in its environment.
+   modify (root's; the agent can only read and run it). It stays on disk for
+   later restarts; after a recreate the disk is empty and it is installed
+   again. sealed starts the harness from there as the agent user, with no model
+   key, owner token or other secret in its environment: the inference proxy
+   fills the model key, and the token the harness checks is not the one the
+   owner holds (§4.3). sealed records which official version this container
+   runs, and runs it again after a container restart.
 3. The harness and the agent's own commands run as the same user, so sealed
    cannot confirm from outside that the process answering on the port is the
    one it started. That takes a listening socket that sealed creates and hands
@@ -322,15 +371,21 @@ boundaries.
 1. When the working directory changes, the 30-second watcher computes a new
    diff and commits it like any other role.
 2. A new version applies at the next harness restart. The harness can request a
-   restart over the sign socket. sealed commits pending changes first, then
-   starts it as in §5.2.
+   restart over the sign socket (`POST /harness/restart`); sealed answers, then
+   restarts it as in §5.2. A restart leaves the disk alone, and the watcher
+   commits uncommitted changes as usual.
 3. If a new version fails to start or fails its health check, sealed returns to
-   the last version that ran, kept locally. In a new container without that
+   the last version that ran, kept locally, and records the new one as not to
+   be switched to again in this container. In a new container without that
    copy, it falls back to base's official package without the diff.
 4. Official versions follow the sealed rules (§3.1): the attestor records each
-   agent's target official version and sends it in status-report replies; while
-   the old version stays listed, the owner signs to switch; when the deployer
-   delists it, the agent must move to the newest listed official version. sealed
+   agent's target official version and sends it in its answer to the boot
+   discovery and in status-report replies; while the old version stays listed,
+   the owner signs to switch; when the deployer delists it, the agent must move
+   to the newest listed official version. At boot sealed tries the target, the
+   version this container ran last and base's, in that order, and runs the
+   first one that is listed and installs; when it can confirm none (the chain
+   unreadable), it runs the version this container has and logs so. sealed
    applies the diff to the new version; if it does not apply, the role becomes
    the new official version with an empty diff and is committed, and the old
    diff stays in chain history.
@@ -412,7 +467,33 @@ keeps every v1 field and gives each layer its own field:
 - Field names and the harness iData role name are not decided; this document
   calls them `harnessHash` and `harness/` for now.
 - The digest adds these fields to v1's, with a version tag, so a v1 signature
-  and a v2 signature cannot stand in for each other.
+  and a v2 signature cannot stand in for each other:
+
+  ```
+  proofHashV2 = keccak256(abi.encode(
+      keccak256("AgentDNA.ServeProof.v2"),
+      chainId, identityRegistry, submitter, agentId, timestamp, deadline,
+      taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash,
+      sealedHash, harnessHash,
+      keccak256(bytes(inferenceURL)), keccak256(bytes(model))))
+  ```
+
+  Every field is a 32-byte word, so abi.encode is a plain concatenation; the
+  signature is v1's (EIP-191 version 0x00, bound to the registry's address).
+  The v1 preimage opens with the chain id and is 9 words long, v2's with the
+  version tag and 14 words.
+- In `X-Agent-Proof`, the v2 envelope adds `version` (2), `sealed_hash`,
+  `harness_hash`, `inference_url` and `model` after the v1 fields; a v1
+  envelope has no `version`. A verifier picks the digest by `version`. A
+  provider the framework wires itself has no inference address through
+  sealed, and `inference_url` is the empty string.
+- Known-answer vector: the v1 vector's inputs, plus sealedHash 0x55…55,
+  harnessHash 0x66…66, inferenceURL `https://router.example/v1` and model
+  `model-x`, give proofHashV2
+  `0xdac99843c8993224fa49be6989ea6cb8fc3c5190e2d2e8be132e9d073ba73a73`, and the
+  digest bound to 0x…B7
+  `0x50f91a86a4e744dddd29bc16e936ab717a8c54074458e4332c5f43661538df4e`
+  (`sealed/internal/proxy/serveproof_v2_test.go`).
 - The registry gets a v2 entry point: it verifies the signature and records
   these fields with the feedback, the inference address and model name in an
   event. The v1 entry point is unchanged.
@@ -425,8 +506,13 @@ keeps every v1 field and gives each layer its own field:
   - the inference address against the provider registry in sealed. The address
     and model name come from the inference proxy's configuration at the time,
     not from the harness; sealed is allowlisted, so they can be trusted.
-- Native providers such as openai and anthropic also need their official
-  addresses in the registry, instead of framework-specific wiring.
+- The two native providers, openai and anthropic, have their official
+  addresses in sealed's code (`https://api.openai.com/v1`,
+  `https://api.anthropic.com`) and go through the inference proxy too, not
+  through framework wiring. The addresses are not in the registry the attestor
+  serves: the attestor cannot change them, so an owner's sealed key is filled
+  in only toward the official address; and the routes' hashes in the registry
+  stay as they are, so keys already sealed keep working.
 - The inference address and model name mean "where sealed's inference proxy
   forwards, and with which model name". They do not prove that an answer came
   from that model: the harness is the agent's code and can answer without one.
@@ -476,6 +562,24 @@ the plaintext. Each entry therefore also carries a plaintext commitment:
 - `dataHashes` in the ServeProof stays the ciphertext roots. A verifier uses it
   to find the entries on chain, then reads their commitments.
 
+The sha256 construction (`root` is a 32-byte storage root, `‖` is
+concatenation):
+
+```
+salt(root) = HMAC-SHA256(data key, "AgentDNA.Commitment.v1" ‖ 0x00 ‖ role ‖ 0x00 ‖ root)
+leaf role    sha256(salt(dataHash) ‖ sha256(plaintext))
+directory    the Merkle root of its entries in manifest (path) order:
+               leaf = sha256(0x00 ‖ sha256(path) ‖ sha256(salt(entry storage root) ‖ content_hash))
+               node = sha256(0x01 ‖ left ‖ right), split as RFC 6962 does
+               (the left part holds the largest power of two below n)
+```
+
+It goes into the entry's description as `"commitments": {"sha256": "0x…"}`.
+The sealed side is implemented (`sealed/internal/uploader/commitments.go`, with
+known-answer vectors in `commitments_test.go` next to it). Handing a salt to a
+verifier, or producing a proof, is not: who may ask, and through which
+interface, is not decided.
+
 ## 8. Rollout
 
 ### Step one: split the layers, official harness only
@@ -485,8 +589,8 @@ harness source and runs only official versions.
 
 1. **Split base and sealed, ship ServeProof v2**:
    - the loader; `validSealedHashes` and `validHarnessHashes` on AgenticID;
-     two-layer checks in the attestor; in-place sealed updates (§3.1); sealed's
-     graceful stop;
+     two-layer checks in the attestor; in-place sealed updates (§3.1);
+     uncommitted changes kept across a stop and a restart (§3);
    - ServeProof v2 in all five implementations, the registry's v2 entry point,
      and test vectors;
    - both lists are new and hold 0g-harness versions only. AgenticID and the
@@ -529,36 +633,49 @@ proofs that look the same.
 ### Image side first
 
 The image side can ship before the attestor, contracts and SDK, replacing the
-current 0g-harness image. Until they ship, the new image runs in a compatible
-mode:
+current 0g-harness image. Everything sealed-side in step one is in the new
+image: the loader's checks, version switches, trials, rollbacks and restarts
+(§3, §3.1); fetching, verifying, unpacking, switching and rolling back official
+harness packages (§5.2, §5.3); reporting the sealed hash and ServeProof v2
+(§7); keeping uncommitted changes across a stop and a restart (§3); plaintext
+commitments on upload (§7.1).
+
+All of it takes effect only once the attestor declares support for the new flow
+in its `GET /provision` answer (`"layered": true`, §10). Until then the new
+image runs in a compatible mode:
 - the loader runs only the sealed built into the image: its sha256 is compiled
-  into the loader when the image is built, a mismatch runs nothing, and no other
-  version is downloaded, so there are no in-place updates yet; when sealed exits
-  the loader exits too, as when sealed is PID 1;
+  into the loader when the image is built, and a mismatch runs nothing; when
+  sealed exits the loader exits too, as when sealed is PID 1;
 - sealed reports no sealed hash (an old attestor would refuse it) and signs
   ServeProof v1; sealed and the harness are both in the image, so the image hash
   still covers everything;
 - the harness runs only the official version built into the image;
-- sealed is not PID 1, and on a stop signal it stops the harness, commits what
-  is pending and exits (`sealed/shutdown.go`), within 90 s.
-
-Once the other three ship, the attestor declares support for the new flow in its
-`GET /provision` answer; only then does sealed report its hash and sign v2, and
-the loader swap sealed to the target version. That logic goes into the new image
-beforehand, so no further image is needed then.
+- uncommitted changes are still kept across a stop and a restart: that does not
+  depend on the attestor.
 
 ### Neutral proxies: can ship separately
 
 While the harness runs only official versions, the rules written in it still
 hold, so the neutral proxies need not ship with step one:
-- an inference proxy for every provider;
-- the doctrine injected by the inference proxy, with sealed no longer writing
-  the `/run` platform-doc file for 0g-harness;
-- the token kept from the harness;
-- exact routes for 0g-harness;
-- service field caps;
-- the §6.2 rule in the doctrine.
+- an inference proxy for every provider: sealed runs an inference proxy on a
+  loopback port as the harness's model address; each request goes to the
+  owner's route (0G Compute at its registry address, openai and anthropic at
+  their official addresses fixed in sealed, §7) with the model name the
+  owner's settings pin, the credential proxy fills the key on the way out, and
+  the harness holds a placeholder for a key. Only chat, messages and
+  model-list calls pass;
+- the doctrine injected by the inference proxy: the platform doc, doctrine
+  included, goes at the end of every model request's system prompt, and sealed
+  no longer writes the `/run` platform-doc file for 0g-harness;
+- the token kept from the harness: the token the owner gets from
+  `/_seal/auth` is not the one the harness checks; the proxy checks the
+  owner's at the entry and forwards with the harness's in its place;
+- exact routes for 0g-harness: method and path, per harness protocol 1;
+  anything else gets 404;
+- service field caps: 280 bytes of description, 2048 of input example;
+- the §6.2 rule in the doctrine, as refusal 6.
 
+All of them are in the new image, independent of the attestor's declaration.
 They must be live before self-update is opened.
 
 ### Later: user-customised harness
@@ -627,3 +744,53 @@ therefore unaffected provided that:
    target, method, value and signing domain.
 5. Whether to support harness self-update: it amounts to deploying an
    owner-defined program inside the sealed environment (§8).
+
+## 10. Interfaces between sealed and the attestor and contracts
+
+sealed implements the following; the attestor, contract and SDK side
+implements the same. It applies only to containers that report a sealed hash,
+i.e. the loader-based 0g-harness image.
+
+**Boot discovery** (`GET /provision?seal_id=…`): the answer adds, next to
+`generation` and `certificate_required`:
+- `layered`: `true` says the attestor runs the new flow: it takes the sealed
+  hash and checks it against `validSealedHashes`, replies with target
+  versions, serves `/artifacts`, and the registry has the v2 entry point;
+- `targets`: optional, `{"sealed": "0x<sha256>", "harness": "0x<sha256>"}`,
+  the versions this agent should run; a layer without a target is left out.
+
+**Boot claim** (`POST /provision`): when `layered` is true and the loader
+started sealed, the body adds `sealed_hash` (`0x` and 64 lowercase hex), and
+the container signature covers
+
+```
+ProvisionBoot.v2:0x<seal_id>:<generation>:<sha256(ticket) hex>:<boot_id hex>:<boot_started_at>:<sealed hash hex>
+```
+
+that is, v1's message followed by the sealed hash. The shared fixture is
+`sealed/internal/inference/testdata/boot-v2.json`. A sealed hash not in the
+allowlist gets 403: sealed gets no key, and switches to `targets.sealed` from
+the same answer.
+
+**Status report** (`POST /status`): the reply may carry the same `targets`;
+sealed switches the harness or sealed by it.
+
+**Download**: `GET /artifacts/0x<sha256>` returns the program or package named
+by that hash. sealed checks the hash of what it downloaded and discards it on
+a mismatch. Size limit 1 GiB.
+
+**Contract**: AgenticID adds `isValidSealedHash(bytes32) returns (bool)` and
+`isValidHarnessHash(bytes32) returns (bool)`, shaped like
+`isValidFrameworkHash`; sealed reads them on chain before switching versions,
+and the loader reads `isValidSealedHash` before every sealed it starts.
+
+**iData entry descriptions**: every entry a 0g-harness agent uploads adds
+`commitments` to its description (§7.1); an older sealed ignores the field.
+
+**ServeProof v2**: digest, envelope and known-answer vector in §7.
+
+**Official harness package**: the installed 0g-harness package directory as a
+gzip'd tar (names sorted, owner 0, mtime 0, hard links stored as files, gzip
+without a timestamp), named by its sha256. It may hold only directories,
+regular files and links that stay inside it. The `harness-package` stage of
+`sealed/images/harness/Dockerfile` produces it.

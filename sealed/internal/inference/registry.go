@@ -208,6 +208,28 @@ func EndpointCompatibility(ep *Endpoint, provider string) map[string]any {
 	return make(map[string]any)
 }
 
+// nativeEndpoints are the official endpoints of the two native providers,
+// for a framework that calls every model through sealed's inference route
+// (sealed/LAYERS.md §4.2). The registry names no endpoint for a native
+// provider (NewRegistry refuses one), and these are not in it either: fixed
+// in sealed, they are not something the registry the attestor serves can
+// change, so a key the owner sealed to the agent for a native provider goes
+// to that provider's own host and nowhere else, and the route hash the key
+// is bound to stays what it was.
+var nativeEndpoints = map[string]Endpoint{
+	"openai":    {ProviderID: "openai", Format: WireOpenAI, BaseURL: "https://api.openai.com/v1", EnvKey: "OPENAI_API_KEY"},
+	"anthropic": {ProviderID: "anthropic", Format: WireAnthropic, BaseURL: "https://api.anthropic.com", EnvKey: "ANTHROPIC_API_KEY"},
+}
+
+// NativeEndpoint is the official endpoint of native provider id.
+func NativeEndpoint(id string) (*Endpoint, bool) {
+	e, ok := nativeEndpoints[id]
+	if !ok {
+		return nil, false
+	}
+	return &e, true
+}
+
 func IsManagedURL(raw string) bool {
 	for _, p := range DefaultRegistry.providers {
 		for _, endpoint := range p.Endpoints {

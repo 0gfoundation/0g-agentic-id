@@ -94,3 +94,31 @@ func TestAdditionalProviderCatalogDoesNotFallBackToCompute(t *testing.T) {
 		t.Fatalf("outage must keep provider fallback without compute guesses: %+v %+v %v", facts, endpoint, err)
 	}
 }
+
+// The native providers' official endpoints: one per native provider in the
+// registry, each speaking that provider's one wire format.
+func TestNativeEndpoints(t *testing.T) {
+	for id, want := range map[string]struct {
+		base   string
+		format WireFormat
+	}{
+		"openai":    {"https://api.openai.com/v1", WireOpenAI},
+		"anthropic": {"https://api.anthropic.com", WireAnthropic},
+	} {
+		ep, ok := NativeEndpoint(id)
+		if !ok || ep.BaseURL != want.base || ep.Format != want.format || ep.ProviderID != id {
+			t.Fatalf("%s: %+v, %v", id, ep, ok)
+		}
+		if p := DefaultRegistry.providers[id]; !p.Native || len(p.Formats) != 1 || p.Formats[0] != want.format {
+			t.Fatalf("%s is not the registry's native provider of that format: %+v", id, p)
+		}
+	}
+	if _, ok := NativeEndpoint(ZGComputeProvider); ok {
+		t.Fatal("0g-compute has a native endpoint")
+	}
+	for id, p := range DefaultRegistry.providers {
+		if _, ok := NativeEndpoint(id); p.Native && !ok {
+			t.Fatalf("native provider %s has no official endpoint", id)
+		}
+	}
+}

@@ -146,28 +146,60 @@ sealed never sends one. This sealed requires the matching provider and
 attestor (v3 certificate, attestor TLS statement, the `/provision` shape
 above); every agent is recreated onto it.
 
-### The loader (0g-harness image) and graceful stop
+### The loader (0g-harness image), stopping, and the layered runtime
 
 In the 0g-harness image PID 1 is not sealed but the loader (`cmd/loader`).
-It checks `/bootstrap` against the sha256 compiled into it when the image is
-built (`-X main.expectedSealedHash`, `images/harness/Dockerfile`) and runs
-nothing else. It starts sealed as its child with the environment unchanged,
-forwards SIGTERM, SIGINT, SIGQUIT and SIGHUP, kills sealed if it has not
-exited 2 min after a stop signal, reaps every orphan, and exits with sealed's
-status, so a sealed exit still ends the container. Like sealed it is root,
-non-dumpable and sets `no_new_privs`, and it links only the standard library
-and `golang.org/x/sys` (`TestLinkedPackages`). The other images keep sealed as
-PID 1.
+Before it runs any sealed it checks the hash (`/bootstrap`, the image's own,
+against the sha256 compiled in when the image is built,
+`-X main.expectedSealedHash`, `images/harness/Dockerfile`; a switched-to
+version against its name), then sends one `eth_call` to `CHAIN_RPC_URL` for
+AgenticID's `isValidSealedHash`: a version the chain says is not listed does
+not run (`allowlist.go`). It starts sealed as its child with the environment
+unchanged plus `SEALED_HASH` (the hash it checked) and `SEALED_TRIAL` (on
+trial), forwards SIGTERM, SIGINT, SIGQUIT and SIGHUP, kills sealed if it has
+not exited 2 min after a stop signal, and reaps every orphan. Without the
+layered flow it exits with sealed's status when sealed exits, so a sealed exit
+still ends the container. Under the layered flow (`LAYERS.md` §3, §3.1) it
+also switches sealed versions when sealed asks (SIGUSR1): it starts the new
+version on trial, goes back to the old one if the new one exits before
+confirming it came up, and ends what the old sealed left behind before the
+switch; and it restarts a sealed that exits on its own, at most 5 times in
+10 minutes. Its state directory is `/var/lib/loader`, which only root can
+enter. Like sealed it is root, non-dumpable and sets `no_new_privs`, and it
+links only the standard library and `golang.org/x/sys`
+(`TestLinkedPackages`). The other images keep sealed as PID 1.
 
 A sealed that is not PID 1 handles SIGTERM and SIGINT (`shutdown.go`): it
-stops the watcher and waits for its tick in progress, stops the framework,
-runs one last tick and commits any drift (`watcher.Final`, `uploader.Apply`),
-then exits 0, all within 90 s. Without that, a stop loses the agent's edits,
-made after the last commit, to what is already on chain (the persona, a skill
-already committed): the next boot writes the chain version back over them. A
-file the agent added survives on disk and is committed after the restart. A
-platform stop timeout shorter than 90 s still cuts the commit short. As PID 1 sealed installs no handler, and the kernel ignores the signal,
-as before.
+stops the watcher, stops the framework (which nothing restarts afterwards),
+waits for the watcher's tick in progress, and exits 0, all within 90 s. It
+starts no commit of its own: the platform kills the container about 10 s
+after the stop signal, and one 0G storage upload can take most of that.
+Changes made after the last commit stay on disk instead: sealed keeps, in
+`/var/lib/sealed/synced.json` (root-only), the version of each role this
+container last had in sync with the chain, and when on the next boot the
+chain has not moved but the disk has, it keeps the disk and lets the watcher
+commit it, instead of restoring the chain version over it (`synced.go`; for
+adapters that declare `framework.UncommittedKeeper`, i.e. 0g-harness). A
+recreate keeps only the iData on chain. As PID 1 sealed does not handle these
+signals, as before.
+
+The 0g-harness harness runs from an official version package:
+`/opt/0g-harness/<sha256>/`, root's, readable and runnable by the agent but
+not writable, with the image's own named by `/opt/0g-harness/base`
+(`internal/layers`). Its model calls go through sealed's inference proxy
+(`internal/inferproxy`) for every provider sealed knows the endpoint of, the
+native `openai` and `anthropic` included, at official URLs fixed in sealed
+(`inference.NativeEndpoint`): sealed sets the address and the model name, puts the
+platform doc at the end of every request's system prompt, and the credential
+proxy fills the key, so the harness holds a placeholder. The token the owner
+gets from `/_seal/auth` is not the one the harness checks; the proxy checks it
+at the entry and swaps it. The harness's routes are listed one by one
+(`framework.Route.Endpoints`), and it can ask over the sign socket to be
+restarted (`POST /harness/restart`). Every iData entry it uploads carries a
+salted plaintext commitment (`internal/uploader/commitments.go`). Once the
+attestor declares the layered flow, sealed reports its own hash, signs
+ServeProof v2, and switches the harness and sealed to the versions the
+attestor targets (`layered.go`). The full design is in `LAYERS.md`.
 
 ### Why the settings document comes down `/provision`
 
