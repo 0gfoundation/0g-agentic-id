@@ -98,9 +98,16 @@ Entry(string name,bytes32 defHash)
 
 **交出**（`$SEAL_CRED_REVEAL_SOCKET`）：`POST /credentials/reveal {name, reason}`。设置了 `allow_reveal` 时返回 `{value}`。否则返回 403 `authorization_pending` 和 `auth_req_id`；owner 决定后，agent 原样重发请求。403 `access_denied` 表示被拒绝。批准只针对 agent 申请时的那个值：之后换出或轮换得到的 token 需要重新申请。对换出的 token，owner 看到的是它自己的域名、过期时间，以及换取时用的参数。签名密钥（`use: sign`）从不交出（403 `not_allowed`）。登录条目交出的是 access token，不是存储的登录状态。这个 socket 和上面的 socket 分开，是为了让以另一个用户运行工具的 harness 可以不让工具访问它；两个 socket 都属于 agent 用户，现有框架的工具也以这个用户运行。
 
-## 框架的推理 key
+## 框架的模型 key
 
-框架调用模型用的 key（owner 的 `SEAL_SECRET_ENV`，加密给 agentSeal、provision 之后由 sealed 解开；或旧的明文 `API_KEY`），对**走平台路由的模型（0g-compute）上的 0g-harness**由 sealed 保管：它成为条目 `sealed:inference`，只以 `Authorization: Bearer {v}` 或 `x-api-key: {v}` 填写，只发往路由的域名。0g-harness 拿到的是 `SEAL_MODEL_API_KEY=[[credential:sealed:inference]]`，`SEAL_MODEL_BASE_URL` 是经代理显式形式访问的路由地址，因此它和它运行的任何工具都读不到 key。这个条目不能交出。owner 变更时和其他条目一起清掉，之后框架重启也不会再保管它：0g-harness 在没有 key 的情况下启动，直到新 owner reset 这个 agent。adapter 通过 `RuntimeContext.CredHold` 做到这一点。
+框架调用模型用的 key 来自两处之一：
+
+- **凭据集**：名为 `model.<provider>`、带 `inference: {provider, route_hash?, registry?}` 的条目（`cred <agent> set model`）。凭据集可以同时存好几家的 key；用哪家由 agent 的设置决定，sealed 取那一家的 key。设置里没写 provider 时，凭据集里只有一家的 key 就用这一家；有好几家就都不用，并在下面的 `issue` 里说明。它的 `use` 是 `model`，模型 key 出现之前的镜像不认识这个值，会跳过这一条。定义里只有这些，别的都不能有（域名、位置、交出、写回、到期、模板、签名方式；带了的条目会被跳过）；值是一行可打印字符。`route_hash` 和 `registry` 对 key 的绑定方式与创建/重置时交的 key 相同：没有这两项，用镜像内置的路由；有这两项，用那一版已接受的注册表里这家服务的路由，sealed 读回并核对后才用这个 key。模型 key 不会进入代理的条目，不会出现在 harness 的列表里，也不能交出。
+- **创建/重置时交的 key**（owner 的 `SEAL_SECRET_ENV`，加密给 agentSeal、provision 之后由 sealed 解开；或旧的明文 `API_KEY`）：凭据集里没有设置所选那家的 key 时使用。
+
+owner 推送的模型 key 立即生效。sealed 为框架保管着 key（见下文）并且只有 key 变了（同一家服务、同一路由）时，就地替换，框架不重启；其他情况下，sealed 用新 key 渲染框架的设置并重启框架，和推送设置时一样。不是设置所选那家的 key 只保存，不使用。设置所选的 key 用不了时（删掉了正在用的 key 而这家没有别的 key，或者读不到它绑定的注册表版本），sealed 让框架停下，不让它继续用 owner 已经不选的 key；之后自动重试，间隔逐步拉长到每 10 分钟一次，owner 再推送也会立即应用。每次框架启动前，sealed 先释放它为上一个进程保管的 key，新进程需要时再重新保管。推送设置切换 provider 时，要有新那家的 key 才接受（否则返回 409 `CREDENTIAL_PROVIDER_MISMATCH`）。`GET /_seal/credentials` 说明当前用的是哪个 key：`model: {provider, source, value_hash?, issue?}`，`source` 为 `credentials`（凭据集里的条目，带它的 `value_hash`）、`deploy`（创建/重置时交的 key）或 `none`；`issue` 说明设置所选的 key 为什么没在用。owner 的使用记录会记下每次设置或删除模型 key（`model`）。
+
+key 的去向：对**走平台路由的模型（0g-compute）上的 0g-harness**由 sealed 保管：它成为条目 `sealed:inference`，只以 `Authorization: Bearer {v}` 或 `x-api-key: {v}` 填写，只发往路由的域名。0g-harness 拿到的是 `SEAL_MODEL_API_KEY=[[credential:sealed:inference]]`，`SEAL_MODEL_BASE_URL` 是经代理显式形式访问的路由地址，因此它和它运行的任何工具都读不到 key。这个条目不能交出。owner 变更时和其他条目一起清掉，之后框架重启也不会再保管它：0g-harness 在没有 key 的情况下启动，直到新 owner reset 这个 agent。adapter 通过 `RuntimeContext.CredHold` 做到这一点。
 
 其他情况下框架仍然直接拿到 key，它的工具也能读到：使用框架内置 provider（`openai`、`anthropic`）的 0g-harness，openclaw 和 hermes（`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`；hermes 还会写进自己的配置文件），以及 prime（`SEAL_MODEL_API_KEY`）。
 
@@ -166,7 +173,7 @@ agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` /
 
 | 路由 | Tag | |
 |---|---|---|
-| `GET` / `POST /_seal/credentials` | `0GSealCredentials` | 列出已加载条目 / 加载签名凭据集（更旧的版本返回 409 `stale_version`） |
+| `GET` / `POST /_seal/credentials` | `0GSealCredentials` | 列出已加载条目和当前用的模型 key（`model`）/ 加载签名凭据集（更旧的版本返回 409 `stale_version`） |
 | `GET /_seal/credentials/pending` | `0GSealCredPending` | 待办：sealed 记录的 `facts` 与 agent 给出的 `reason` 分开展示 |
 | `POST /_seal/credentials/decide` | `0GSealCredDecide` | `{auth_req_id, decision: "once" \| "deny", approval?, signature?}` |
 | `GET /_seal/credentials/audit?after=` | `0GSealCredAudit` | agent 做了什么（代填、换 token、签名、交出、登录、写回），以及凭据集里哪些条目被跳过、原因是什么，不含值。按时间从旧到新，分三份各保留最近 1000 条：代理使用；钱包签名；其余记录（owner 的决定、登录、断开、加载、sealed 自己做的事），所以 agent 能引发的记录不会把 owner 的记录挤掉。从某份里挤出的记录按类（操作、条目、域名、结果）计数，不会不留痕迹地丢掉。agent 可以随意重复的操作（换 token、刷新、写回、失败的签名、预先允许的交出）以及 sealed 自己提供的值（`sealed:` 条目，如框架的推理 key）的成功使用，每类合并为一条记录，带 `count`、`first` 和最近一次的 `ts`；每种操作的每种结果（冒号之前的部分）各有 32 类的额度，再多的只按结果合并计数，所以对一种结果的大量请求只会让这种结果之后的记录变模糊；总数超过 1024 类后，所有操作的新类别都只按结果合并计数。域名和条目名截到有限长度，控制字符和格式字符显示为 `?`，标准 HTTP 方法以外的方法记为 `OTHER`。stop/start 后保留，并记下属于哪个 owner，只为同一个 owner 恢复；启动时读不了的已保存记录原样保留，不会被覆盖 |

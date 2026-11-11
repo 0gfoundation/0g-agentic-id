@@ -28,6 +28,8 @@ type CredentialService interface {
 	PendingList() []credentials.Pending
 	Decide(ctx context.Context, authReqID, decision string, a *credentials.Approval, sig string) error
 	AuditSince(after int64) []credentials.AuditRecord
+	// ModelInUse says which model key the framework runs on.
+	ModelInUse() credentials.ModelInUse
 	StartLogin(ctx context.Context, name, redirectURI string) (string, error)
 	FinishLogin(ctx context.Context, state, code, oauthError, iss string) (string, error)
 	Disconnect(ctx context.Context, name string) (revoked bool, note string, err error)
@@ -220,7 +222,7 @@ func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request) {
 		if entries == nil {
 			entries = []credentials.EntryInfo{}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"version": c.Version(), "entries": entries})
+		writeJSON(w, http.StatusOK, map[string]any{"version": c.Version(), "entries": entries, "model": c.ModelInUse()})
 	case http.MethodPost:
 		body, ok := readSignedBody(w, r, s, "0GSealCredentials", sealID, owner)
 		if !ok {

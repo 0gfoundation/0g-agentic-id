@@ -221,6 +221,10 @@ func (m *Manager) Reload(ctx context.Context) error {
 	return nil
 }
 
+// Busy reports a start, reload or restart under way: a Reload asked for
+// now is skipped.
+func (m *Manager) Busy() bool { return m.inFlight.Load() }
+
 // preStart runs the caller's pre-start hook, if any. Kept separate so all
 // three start paths (initial, reload, crash-restart) share one call site and
 // none can be added later without it.

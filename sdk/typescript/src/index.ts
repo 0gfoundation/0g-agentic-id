@@ -75,6 +75,8 @@ export {
   definitionOf,
   inputOf,
   credentialPlaintext,
+  modelKeyName,
+  MODEL_KEY_PREFIX,
   CREDENTIALS_DOMAIN_NAME,
   CREDENTIALS_DOMAIN_VERSION,
 } from './Credentials';
@@ -87,6 +89,9 @@ export type {
   CredentialPosition,
   TokenRequestTemplate,
   PendingCredentialRequest,
+  CredentialInference,
+  ModelKeyInUse,
+  LoadedCredentials,
 } from './Credentials';
 
 // ── Reputation: serve-proof transport + verification ──

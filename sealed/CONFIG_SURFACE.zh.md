@@ -363,8 +363,10 @@ v2 明文绑定 provider ID；v3 还绑定 endpoint/协议的路由 hash，以�
 版本和摘要。每次启动（含 stop/start）读取并校验该历史版本，匹配路由后才渲染，
 不改用最新地址。旧明文/v1 密钥仅属于 compute。显式提供的密文校验失败时，
 拒绝回退到明文 key，拒绝渲染 settings，并记录 `secret_env_not_applied: <reason>`。
-热更新中 provider 与凭据不匹配时，在改动 live document 前返回 HTTP 409
-`CREDENTIAL_PROVIDER_MISMATCH`；通过 reset 注入新 provider 的 key。
+凭据集里设置所选那家的模型 key（`model.<provider>`，见 CREDENTIALS.zh.md）
+优先于这个 key，绑定方式相同。热更新切换 provider 而没有新那家的 key 时，在改动
+live document 前返回 HTTP 409 `CREDENTIAL_PROVIDER_MISMATCH`；用
+`cred <agent> set model provider=…`（或带 key 的 reset）补上。
 密钥到达各框架的方式依然不同，这是各框架
 客户端实际读取的地方:
 

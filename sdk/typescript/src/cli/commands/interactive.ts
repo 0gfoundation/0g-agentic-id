@@ -29,7 +29,7 @@ import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
 import { applyAssignments, assertModelPresent, assertOthersFitFramework, isHarnessFramework, parseAssignments, renderSettings } from '../settings';
-import { answerPending, credOp, credOwnerOp } from '../credentials';
+import { answerPending, credOp, credOwnerOp, ensureModelKey, resetModelKeyNote } from '../credentials';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
@@ -1462,6 +1462,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const provider = plan.provider;
         await ag.agent.assertProviderSupported(provider, { sealId: row.sealId, framework });
         const apiKey = await inferenceKey(ctx, ask, provider);
+        const keyNote = await resetModelKeyNote(ag, row.sealId, provider);
+        if (keyNote) out(`${keyNote}\n`);
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(ag, row.sealId, plan, out);
         out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
@@ -1502,7 +1504,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
-        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework);
+        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework, ask);
         continue;
       }
 
@@ -1514,7 +1516,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (await credOwnerOp(ag, args, credIO(ask))) continue;
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
-        await credInShell(irq, args[1] === 'connect', (io) => credOp(ag, row.sealId, args.slice(1), { ...credIO(ask), ...io }, row.phase === 'running' && row.url ? row.url : undefined));
+        await credInShell(irq, args.slice(1), (io) => credOp(ag, row.sealId, args.slice(1), { ...credIO(ask), ...io }, row.phase === 'running' && row.url ? row.url : undefined));
         continue;
       }
 
@@ -1837,7 +1839,7 @@ let cachedClient: { key: string; ag: AgenticID } | null = null;
  * Returns the document now in force (unchanged on a bare show), so a caller
  * like /think can report the level that actually landed.
  */
-async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null): Promise<SettingsDoc | null> {
+async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null, ask?: (q: string) => Promise<string>): Promise<SettingsDoc | null> {
   const assignments = parseAssignments(args); // throws CliError on a bad key/level
   assertOthersFitFramework(assignments, framework);
   const { settings: current, version } = await ag.agent.getSettings(sealId);
@@ -1851,7 +1853,18 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
   // last-known-good cannot cover — refuse before signing, and say so.
   assertModelPresent(next, current !== null);
   const providerChanged = changesProvider(current, next);
-  if (providerChanged) requireConfiguredInferenceKey(next.provider ?? '0g-compute');
+  // The agent takes the switch only with a key for the new provider in its
+  // credential set; an image from before model keys in the set takes it at
+  // a reset with the key.
+  let pendingReset = false;
+  if (providerChanged) {
+    const provider = next.provider ?? '0g-compute';
+    const keyIO = ask ? credIO(ask) : { out: (l: string) => out(`${l}\n`), secret: async () => '', savedModelKey: (p: string) => configuredInferenceKey(p) };
+    if (await ensureModelKey(ag, sealId, provider, keyIO, serveBase ? { agentUrl: serveBase } : undefined) === 'unsupported') {
+      requireConfiguredInferenceKey(provider);
+      pendingReset = true;
+    }
+  }
   try {
     const { version: written } = await ag.agent.setSettings(sealId, next, {
       baseVersion: version,
@@ -1859,9 +1872,11 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
     });
     for (const l of renderSettings(next)) out(`  ${l}\n`);
     if (providerChanged) {
-      out(`written — version ${written}; provider change pending — run reset with the ${next.provider} key\n`);
       completionProvider = next.provider ?? '0g-compute';
       chatModelIds = providerModelIds[completionProvider] ?? [];
+    }
+    if (pendingReset) {
+      out(`written — version ${written}; provider change pending — run reset with the ${next.provider} key\n`);
       return next;
     }
     // Push to the running container so a change made mid-conversation takes
@@ -2098,16 +2113,19 @@ export async function ownerRouteUrl(ag: AgenticID, s: Session): Promise<string |
 }
 
 /**
- * Runs a `cred` operation in the shell. A connect waits for the login to
- * complete and says so, as the one-shot command does; Ctrl-C or Esc stops
- * the wait (the login goes on in the browser).
+ * Runs a `cred` operation (`sub` is its subcommand and arguments) in the
+ * shell. A connect waits for the login to complete and says so, as the
+ * one-shot command does, and `set model` for the agent to take the key;
+ * Ctrl-C or Esc stops the wait (the login goes on in the browser).
  */
-async function credInShell(irq: Interrupt, connect: boolean, run: (io: { wait?: boolean; signal?: AbortSignal }) => Promise<void>): Promise<void> {
-  if (!connect) return run({});
+async function credInShell(irq: Interrupt, sub: string[], run: (io: { wait?: boolean; signal?: AbortSignal }) => Promise<void>): Promise<void> {
+  const connect = sub[0] === 'connect';
+  const modelSet = sub[0] === 'set' && (sub[1] === 'model' || !!sub[1]?.startsWith('model.'));
+  if (!connect && !modelSet) return run({});
   const ac = new AbortController();
   irq.streaming = ac;
   try {
-    await run({ wait: true, signal: ac.signal });
+    await run({ ...(connect ? { wait: true } : {}), signal: ac.signal });
   } finally {
     irq.streaming = null;
   }
@@ -2119,6 +2137,7 @@ function credIO(ask: (q: string) => Promise<string>) {
     json: false, out: (l: string) => out(`${l}\n`), secret: (p: string) => askSecret(ask, p),
     // The credential prompts' terminal reset: on a terminal only.
     raw: (s: string) => { if (process.stdout.isTTY) term(s); },
+    savedModelKey: (provider: string) => configuredInferenceKey(provider),
   };
 }
 
@@ -2762,6 +2781,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const provider = plan.provider;
         await s.ag.agent.assertProviderSupported(provider, { sealId: s.sealId, framework: s.framework });
         const apiKey = await inferenceKey(ctx, ask, provider);
+        const keyNote = await resetModelKeyNote(s.ag, s.sealId, provider);
+        if (keyNote) out(`${keyNote}\n`);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(s.ag, s.sealId, plan, out);
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
@@ -2854,14 +2875,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // Owner-signed in both directions, so it needs the wallet client and
         // not the session's (possibly keyless) one.
         const ag = await withWallet(ctx);
-        await settingsOp(ag, s.sealId, tokenize(line).slice(1), await ownerRouteUrl(ag, s), s.framework);
+        await settingsOp(ag, s.sealId, tokenize(line).slice(1), await ownerRouteUrl(ag, s), s.framework, ask);
         continue;
       }
       if (line === '/cred' || line.startsWith('/cred ')) {
         const args = tokenize(line).slice(1);
         const ag = await withWallet(ctx);
         const url = await ownerRouteUrl(ag, s);
-        await credInShell(irq, args[0] === 'connect', (io) => credOp(ag, s.sealId, args, { ...credIO(ask), ...io }, url));
+        await credInShell(irq, args, (io) => credOp(ag, s.sealId, args, { ...credIO(ask), ...io }, url));
         continue;
       }
       if (line === '/think' || line.startsWith('/think ')) {

@@ -196,8 +196,11 @@ type Store struct {
 	values        map[string][]byte
 	derived       map[string]derived
 	system        map[string]*credproxy.Entry // values sealed supplies to the framework
-	pending       map[string]*Pending         // by auth_req_id
-	approvals     map[string]Approval         // by request digest
+	models        map[string]ModelKey         // the owner's model keys, by provider
+	onModels      func()                      // after a load changed models
+	inUse         ModelInUse
+	pending       map[string]*Pending // by auth_req_id
+	approvals     map[string]Approval // by request digest
 	tokenMu       map[string]*sync.Mutex
 	logins        map[string]*loginAttempt // by OAuth state
 	refreshTimers map[string]*time.Timer   // login entries, by name
@@ -446,6 +449,7 @@ func NewStore(env Env, reg *credproxy.Registry) *Store {
 		defs: map[string]*Definition{}, defHashes: map[string]string{}, values: map[string][]byte{}, derived: map[string]derived{},
 		pending: map[string]*Pending{}, approvals: map[string]Approval{}, tokenMu: map[string]*sync.Mutex{},
 		logins: map[string]*loginAttempt{}, refreshTimers: map[string]*time.Timer{}, system: map[string]*credproxy.Entry{},
+		models: map[string]ModelKey{}, inUse: ModelInUse{Source: "none"},
 		events: newEventLog(), now: time.Now, auditCounts: map[string]*AuditRecord{}, auditOpKeys: map[string]int{},
 		retryUnit: time.Second,
 	}
@@ -613,15 +617,21 @@ func (s *Store) Load(ctx context.Context, doc Document, ownerEpoch uint64) (*Ope
 	for _, e := range o.Set.Entries {
 		hashes[e.Name] = strings.ToLower(e.DefHash)
 	}
+	// Model keys are sealed's own, for the framework: not the proxy's, the
+	// harness's, or the owner's to reveal.
+	defs, values, models := modelKeysOf(o.Defs, o.Values)
 	// A value sealed obtained (a rotation, a login) outlives a new set that
 	// binds the entry to the same value or login: the owner edited
 	// something else.
-	for name, d := range o.Defs {
+	for name, d := range defs {
 		if b := before[name]; d.Writeback && b != nil && b.Writeback && b.Binding() == d.Binding() && beforeValues[name] != nil {
-			o.Values[name] = beforeValues[name]
+			values[name] = beforeValues[name]
 		}
 	}
-	s.version, s.mark, s.defs, s.defHashes, s.values = o.Set.Version, o.Mark, o.Defs, hashes, o.Values
+	s.version, s.mark, s.defs, s.defHashes, s.values = o.Set.Version, o.Mark, defs, hashes, values
+	if s.swapModelsLocked(models) && s.onModels != nil {
+		refresh = append(refresh, func() { go s.onModels() })
+	}
 	// Login entries refresh their access token themselves.
 	for name, t := range s.refreshTimers {
 		t.Stop()
@@ -688,6 +698,7 @@ func (s *Store) clearLocked() {
 	// What sealed supplied for the framework came with the previous owner's
 	// deployment: it goes too, until the new owner resets the agent.
 	s.system = map[string]*credproxy.Entry{}
+	s.models, s.inUse = map[string]ModelKey{}, ModelInUse{Source: "none"}
 	for name, t := range s.refreshTimers {
 		t.Stop()
 		delete(s.refreshTimers, name)

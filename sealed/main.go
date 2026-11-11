@@ -35,6 +35,7 @@ import (
 	"seal-verify/internal/attestorhttp"
 	"seal-verify/internal/chain"
 	"seal-verify/internal/config"
+	"seal-verify/internal/credentials"
 	"seal-verify/internal/credproxy"
 	"seal-verify/internal/dataplane"
 	"seal-verify/internal/framework"
@@ -309,7 +310,7 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 
 	// The credential proxy and store come up before the framework, so the
 	// framework's first environment already points its tools at them.
-	credRT, credValues := startCredentials(cfg, res, agentSealPriv, prov, sealedProxy)
+	credRT, credValues, credStore := startCredentials(cfg, res, agentSealPriv, prov, sealedProxy)
 
 	logger.Logf("")
 	logger.Logf("--- Starting agent ---")
@@ -321,7 +322,7 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		currentStatus.SupervisorFailed("supervisor exhausted retries: " + err.Error())
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "supervisor exhausted retries: "+err.Error(), cfg.StatusBinding)
 	}
-	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, credRT, credValues, sealedProxy, onFailed); err != nil {
+	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, credRT, credValues, credStore, sealedProxy, onFailed); err != nil {
 		logger.Logf("FAIL agent: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", err.Error(), cfg.StatusBinding)
 		return
@@ -647,6 +648,7 @@ func startAgent(
 	settingsBlob []byte,
 	credRT framework.RuntimeContext,
 	credValues *credproxy.Registry,
+	credStore *credentials.Store,
 	sealedProxy *proxy.Server,
 	onFailed func(err error),
 ) error {
@@ -783,34 +785,44 @@ func startAgent(
 	// Held behind a mutex because two goroutines reach it: the manager's
 	// PreStart hook on every spawn, and an owner push arriving on the proxy.
 	live := &liveSettings{doc: settingsDoc}
-	credential := inference.ProviderCredential{Provider: inference.ZGComputeProvider, APIKey: apiKey}
+	// The model key: the owner's for the settings' provider from the
+	// credential set, else the one handed over at create/reset (modelkey.go).
+	keys := &modelKeys{boot: inference.ProviderCredential{Provider: inference.ZGComputeProvider, APIKey: apiKey}}
+	if credStore != nil {
+		keys.store = credStore
+	}
 	if cfg.InferenceCredential != nil {
-		credential = *cfg.InferenceCredential
+		keys.boot = *cfg.InferenceCredential
 	}
-	registry := inference.DefaultRegistry
-	if credential.RouteHash != "" {
-		if res.client == nil || res.client.ChainID() == nil || !res.client.ChainID().IsUint64() {
-			return fmt.Errorf("dynamic provider registry requires chain bootstrap")
-		}
-		var err error
-		registry, err = inference.LoadPinnedRegistry(ctx, cfg.AttestorURL, res.client.ChainID().Uint64(), cfg.ContractAddr, credential)
-		if err != nil {
-			return fmt.Errorf("load provider registry: %w", err)
+	if res.client != nil && res.client.ChainID() != nil && res.client.ChainID().IsUint64() {
+		chainID := res.client.ChainID().Uint64()
+		keys.loadPinned = func(ctx context.Context, c inference.ProviderCredential) (*inference.Registry, error) {
+			return inference.LoadPinnedRegistry(ctx, cfg.AttestorURL, chainID, cfg.ContractAddr, c)
 		}
 	}
-	renderResolved := func(ctx context.Context, resolved settings.Resolved) error {
+	// applied is the choice the framework was last rendered with.
+	var appliedMu sync.Mutex
+	var applied modelChoice
+	renderResolved := func(ctx context.Context, choice modelChoice, resolved settings.Resolved) error {
 		if err := adapter.RenderSettings(ctx, resolved); err != nil {
 			return err
 		}
-		live.applied(proxy.RuntimeSettingsFor(resolved, credential))
+		live.applied(proxy.RuntimeSettingsFor(resolved, choice.credential))
+		appliedMu.Lock()
+		applied = choice
+		appliedMu.Unlock()
+		if credStore != nil {
+			credStore.SetModelInUse(choice.inUse())
+		}
 		return nil
 	}
 	renderSettings := func(ctx context.Context, doc settings.Doc) error {
-		resolved, err := settings.ResolveForRegistry(ctx, doc, credential, registry)
+		choice := keys.choose(doc)
+		resolved, err := keys.resolve(ctx, choice)
 		if err != nil {
 			return err
 		}
-		return renderResolved(ctx, resolved)
+		return renderResolved(ctx, choice, resolved)
 	}
 
 	if err := settingsDoc.Validate(); err != nil {
@@ -914,7 +926,14 @@ func startAgent(
 		// model accepts a reasoning bound come from the live router catalog,
 		// and a stored copy of those goes stale and then fights the computed
 		// one.
+		//
+		// The model key sealed held for the previous process goes first: the
+		// new one holds it again only if it still needs it, so a switch to a
+		// framework built-in provider or a removed key leaves nothing behind.
 		PreStart: func(ctx context.Context) error {
+			if credStore != nil {
+				credStore.ReleaseSystem("sealed:inference")
+			}
 			return renderSettings(ctx, live.get())
 		},
 	}); err != nil {
@@ -939,13 +958,14 @@ func startAgent(
 	sealedProxy.SetSettings(live.get, func(ctx context.Context, doc settings.Doc) error {
 		settingsApply.Lock()
 		defer settingsApply.Unlock()
-		resolved, err := settings.ResolveForRegistry(ctx, doc, credential, registry)
+		choice := keys.choose(doc)
+		resolved, err := keys.resolve(ctx, choice)
 		if err != nil {
 			return err
 		}
 		prev := live.get()
 		live.set(doc)
-		if err := renderResolved(ctx, resolved); err != nil {
+		if err := renderResolved(ctx, choice, resolved); err != nil {
 			live.set(prev)
 			return fmt.Errorf("render: %w", err)
 		}
@@ -967,6 +987,71 @@ func startAgent(
 	})
 	sealedProxy.SetRuntimeSettings(live.runtime)
 
+	// A model key the owner pushes (cred set model) takes effect now: where
+	// sealed holds the key for the framework and only the key changed, it
+	// is swapped in place; otherwise the framework is rendered with it and
+	// restarted, as a settings push is. A key for a provider the settings do
+	// not use is only kept.
+	if credStore != nil {
+		pushed := modelApply{
+			keys:    keys,
+			current: live.get,
+			applied: func() modelChoice {
+				appliedMu.Lock()
+				defer appliedMu.Unlock()
+				return applied
+			},
+			setApplied: func(c modelChoice) {
+				appliedMu.Lock()
+				defer appliedMu.Unlock()
+				applied = c
+			},
+			render:   renderResolved,
+			swap:     func(host string, v []byte) bool { return credStore.SwapSystemValue("sealed:inference", host, v) },
+			reload:   mgr.Reload,
+			busy:     mgr.Busy,
+			setInUse: credStore.SetModelInUse,
+		}
+		var applyModelKeys func()
+		// retry backs off while a key cannot be used (an attestor that
+		// cannot serve its registry version, say); a (re)start under way is
+		// waited out briefly.
+		retry := 30 * time.Second // touched under settingsApply only
+		applyModelKeys = func() {
+			settingsApply.Lock()
+			defer settingsApply.Unlock()
+			if sealedProxy.OwnerLocked() {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			switch outcome := pushed.apply(ctx); outcome {
+			case "unchanged":
+			case "deferred":
+				time.AfterFunc(5*time.Second, applyModelKeys)
+			case "stopped":
+				// The reason may name the provider: the owner reads it.
+				logger.Logf("warn: model key: the key the settings choose cannot be used; the framework is stopped (the owner's credential view says why); trying again in %s", retry)
+				msg := "the agent's model key cannot be used: the framework is stopped until it can (cred <agent> shows why)"
+				currentStatus.SupervisorFailed(msg)
+				go report.Status(cfg.AttestorURL, agentSealPriv, sealID, "error", msg, cfg.StatusBinding)
+				time.AfterFunc(retry, applyModelKeys)
+				if retry *= 2; retry > 10*time.Minute {
+					retry = 10 * time.Minute
+				}
+			default:
+				retry = 30 * time.Second
+				if agent.Phase() == state.PhaseRunning {
+					currentStatus.SupervisorRecovered()
+				}
+				logger.Logf("OK   model key: applied (%s)", outcome)
+			}
+		}
+		credStore.OnModelKeys(applyModelKeys)
+		// A set loaded between the first render and now.
+		go applyModelKeys()
+	}
+
 	// The agent's own lever: same validation, same render, same restart —
 	// but nothing is persisted, so the owner's document is what comes back
 	// after a container restart. See proxy.SessionSettingsApplier for why.
@@ -977,13 +1062,14 @@ func startAgent(
 		// read and this callback must not be undone by a thinking-only change.
 		doc := live.get()
 		doc.Thinking = requested.Thinking
-		resolved, err := settings.ResolveForRegistry(ctx, doc, credential, registry)
+		choice := keys.choose(doc)
+		resolved, err := keys.resolve(ctx, choice)
 		if err != nil {
 			return err
 		}
 		prev := live.get()
 		live.set(doc)
-		if err := renderResolved(ctx, resolved); err != nil {
+		if err := renderResolved(ctx, choice, resolved); err != nil {
 			// Re-render the owner's document so a rejected agent attempt
 			// cannot leave the framework configured from a half-applied one.
 			live.set(prev)
