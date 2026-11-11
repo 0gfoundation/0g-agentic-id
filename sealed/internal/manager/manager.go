@@ -222,7 +222,7 @@ func (m *Manager) Stop(ctx context.Context) {
 // guard as restart()).
 func (m *Manager) Reload(ctx context.Context) error {
 	if !m.inFlight.CompareAndSwap(false, true) {
-		logger.Logf("manager: reload requested while another (re-)start is in flight; it renders the change")
+		logger.Logf("manager: reload requested while another (re-)start is in flight; skipping (a restart under way starts again on it)")
 		m.reloadAsked.Store(true)
 		return nil
 	}
@@ -382,10 +382,19 @@ func (m *Manager) restart(ctx context.Context) {
 	logger.Logf("manager: entering Restarting phase")
 
 	var lastErr error
-	extra := 0 // attempts granted to reloads asked during the last one
+	extra := 0         // attempts granted to reloads asked during an attempt
+	discarded := false // the previous attempt started a process on a stale render
 	for attempt := 1; m.cfg.MaxRetries < 0 || attempt <= m.cfg.MaxRetries+extra; attempt++ {
 		backoff := m.backoffFor(attempt - 1)
-		logger.Logf("manager: restart attempt %d/%d after %s", attempt, m.cfg.MaxRetries+extra, backoff)
+		if discarded {
+			backoff = 0 // not a crash to pace: replace the stale process now
+		}
+		discarded = false
+		if m.cfg.MaxRetries < 0 {
+			logger.Logf("manager: restart attempt %d after %s", attempt, backoff)
+		} else {
+			logger.Logf("manager: restart attempt %d/%d after %s", attempt, m.cfg.MaxRetries+extra, backoff)
+		}
 
 		select {
 		case <-ctx.Done():
@@ -411,6 +420,7 @@ func (m *Manager) restart(ctx context.Context) {
 			// again on what it asked for (the next attempt stops this one).
 			logger.Logf("manager: a reload was asked during attempt %d; starting again on it", attempt)
 			extra++
+			discarded = true
 			continue
 		} else {
 			m.armState(res)
@@ -429,7 +439,7 @@ func (m *Manager) restart(ctx context.Context) {
 	if lastErr == nil {
 		lastErr = errors.New("max retries exceeded with no specific adapter error")
 	}
-	logger.Logf("manager: max retries (%d) exceeded; entering Failed: %v", m.cfg.MaxRetries, lastErr)
+	logger.Logf("manager: max retries (%d) exceeded; entering Failed: %v", m.cfg.MaxRetries+extra, lastErr)
 	m.agent.SetPhase(state.PhaseFailed)
 	if m.cfg.OnFailed != nil {
 		m.cfg.OnFailed(lastErr)
