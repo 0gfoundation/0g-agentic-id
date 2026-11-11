@@ -385,7 +385,7 @@ func (m *Manager) restart(ctx context.Context) {
 	extra := 0 // attempts granted to reloads asked during the last one
 	for attempt := 1; m.cfg.MaxRetries < 0 || attempt <= m.cfg.MaxRetries+extra; attempt++ {
 		backoff := m.backoffFor(attempt - 1)
-		logger.Logf("manager: restart attempt %d/%d after %s", attempt, m.cfg.MaxRetries, backoff)
+		logger.Logf("manager: restart attempt %d/%d after %s", attempt, m.cfg.MaxRetries+extra, backoff)
 
 		select {
 		case <-ctx.Done():
@@ -406,6 +406,12 @@ func (m *Manager) restart(ctx context.Context) {
 		} else if res, err := m.adapter.Start(ctx, m.params.Runtime); err != nil {
 			logger.Logf("manager: restart attempt %d failed: %v", attempt, err)
 			lastErr = err
+		} else if m.reloadAsked.Load() {
+			// Started on what was rendered before a reload was asked: start
+			// again on what it asked for (the next attempt stops this one).
+			logger.Logf("manager: a reload was asked during attempt %d; starting again on it", attempt)
+			extra++
+			continue
 		} else {
 			m.armState(res)
 			m.hookLifecycle()

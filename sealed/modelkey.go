@@ -165,15 +165,16 @@ func (a modelApply) apply(ctx context.Context) string {
 	prev := a.applied()
 	same := choice.source == prev.source && choice.issue == prev.issue && choice.doc.Provider == prev.doc.Provider &&
 		choice.credential.APIKey == prev.credential.APIKey && sameRoute(choice.credential, prev.credential)
+	// A (re)start under way renders what it read before this change, and a
+	// reload asked for meanwhile is skipped; even with the choice rendered,
+	// it may yet give up. Look again once it is done.
+	if a.busy() {
+		return "deferred"
+	}
 	// A choice rendered is not a framework running: one the supervisor gave
 	// up on (a restart that failed after the key changed) is started again.
 	if same && !a.failed() {
 		return "unchanged"
-	}
-	// A (re)start under way renders what it read before this change, and a
-	// reload asked for meanwhile is skipped.
-	if a.busy() {
-		return "deferred"
 	}
 	if same {
 		if err := a.reload(ctx); err != nil {

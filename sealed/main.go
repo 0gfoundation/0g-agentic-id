@@ -1079,8 +1079,8 @@ func startAgent(
 					logger.Logf("warn: model key: the key the settings choose cannot be used; the framework is stopped until it can (cred <agent> shows why); trying again in %s", retry)
 					currentStatus.ModelKeyIssue("the agent's model key cannot be used: the framework is stopped until it can (cred <agent> shows why)")
 				} else {
-					logger.Logf("warn: model key: the framework did not restart on the new key (cred <agent> shows why); trying again in %s", retry)
-					currentStatus.SupervisorFailed("the framework did not restart after a model key change; trying again")
+					logger.Logf("warn: model key: the framework did not restart (cred <agent> shows why); trying again in %s", retry)
+					currentStatus.SupervisorFailed("the framework did not restart; sealed keeps trying (cred <agent> shows why)")
 				}
 				reportStatus()
 				again(retry)

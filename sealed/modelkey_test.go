@@ -170,6 +170,11 @@ func TestModelKeyApply(t *testing.T) {
 	if got := a.apply(ctx); got != "deferred" || len(rendered) != 0 {
 		t.Fatalf("busy: %s", got)
 	}
+	// Even with the choice already rendered: the restart may yet give up.
+	if got := (modelApply{keys: keys, current: a.current, applied: func() modelChoice { return keys.choose(doc) },
+		busy: func() bool { return true }, failed: func() bool { return false }}).apply(ctx); got != "deferred" {
+		t.Fatalf("busy, choice rendered: %s", got)
+	}
 	busy = false
 	// The provider's key, same route: swapped in place where sealed holds it.
 	if got := a.apply(ctx); got != "in_place" || reloads != 0 || swapped[0] != "sk-1" || rendered[0] != "sk-1" {

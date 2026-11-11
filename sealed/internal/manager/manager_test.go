@@ -570,3 +570,47 @@ func TestReloadDuringTheLastAttemptIsTried(t *testing.T) {
 		t.Fatalf("phase %v, failed %d, starts %d", ag.Phase(), failed.Load(), starts.Load())
 	}
 }
+
+// A reload asked for while a restart attempt starts, and that attempt
+// succeeds: the framework is started again on what the reload asked for.
+func TestReloadDuringASuccessfulAttemptIsApplied(t *testing.T) {
+	inAttempt := make(chan struct{})
+	release := make(chan struct{})
+	var starts atomic.Int32
+	a := &fakeAdapter{startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+		if starts.Add(1) == 2 { // the restart's first attempt
+			close(inAttempt)
+			<-release
+		}
+		return framework.StartResult{Upstream: "http://x"}, nil
+	}}
+	var version, rendered atomic.Int32
+	ag := state.New()
+	m := New(a, ag, Config{
+		LivenessProbeInterval: 1 * time.Hour,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+	})
+	defer m.Stop(context.Background())
+	if err := m.Start(context.Background(), StartParams{PreStart: func(context.Context) error {
+		rendered.Store(version.Load())
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	a.triggerExit(errors.New("crashed"))
+	<-inAttempt
+	version.Store(1)
+	if err := m.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for (ag.Phase() != state.PhaseRunning || starts.Load() < 3) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if ag.Phase() != state.PhaseRunning || rendered.Load() != 1 || starts.Load() != 3 {
+		t.Fatalf("phase %v, rendered version %d, starts %d", ag.Phase(), rendered.Load(), starts.Load())
+	}
+}
