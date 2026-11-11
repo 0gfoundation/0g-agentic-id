@@ -92,7 +92,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap . \
 # fails the build.
 FROM debian:13-slim AS harness-package
 ARG NODE_VERSION=24.22.1
-ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/2a5ffb38ccac7e5590463cf98fa3e6fb52a526bd
+ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/087affcac42a3bcad2d05fe5ab1ba089167f4b61
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
