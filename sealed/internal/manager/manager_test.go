@@ -484,3 +484,54 @@ func TestReloadSupervisesBeyondTheCallersContext(t *testing.T) {
 		t.Fatalf("%d liveness loops after the restart", n)
 	}
 }
+
+// A process that keeps failing runs one restart sequence and one OnFailed,
+// and leaves no loop to start another; a crash restarted reports the
+// recovery.
+func TestRestartGivesUpOnceAndReportsRecovery(t *testing.T) {
+	var fail atomic.Bool
+	a := &fakeAdapter{
+		startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+			if fail.Load() {
+				return framework.StartResult{}, errors.New("permanent failure")
+			}
+			return framework.StartResult{Upstream: "http://x"}, nil
+		},
+		livenessFn: func() error {
+			if fail.Load() {
+				return errors.New("down")
+			}
+			return nil
+		},
+	}
+	var failed, recovered atomic.Int32
+	m := New(a, state.New(), Config{
+		LivenessProbeInterval: 2 * time.Millisecond,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+		OnFailed:              func(error) { failed.Add(1) },
+		OnRecovered:           func() { recovered.Add(1) },
+	})
+	defer m.Stop(context.Background())
+	if err := m.Start(context.Background(), StartParams{}); err != nil {
+		t.Fatal(err)
+	}
+	a.triggerExit(errors.New("crashed"))
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for recovered.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if recovered.Load() != 1 {
+		t.Fatalf("a restarted crash reported %d recoveries", recovered.Load())
+	}
+	fail.Store(true)
+	a.triggerExit(errors.New("crashed again"))
+	time.Sleep(200 * time.Millisecond)
+	if n := failed.Load(); n != 1 {
+		t.Fatalf("OnFailed ran %d times", n)
+	}
+	if n := m.liveLoops.Load(); n != 0 {
+		t.Fatalf("%d liveness loops after giving up", n)
+	}
+}

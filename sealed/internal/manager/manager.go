@@ -63,6 +63,9 @@ type Config struct {
 	// OnFailed is invoked once when the manager exhausts retries and
 	// transitions to PhaseFailed. Pass an attestor reporter call here.
 	OnFailed func(err error)
+	// OnRecovered is invoked after a restart or reload brought a process
+	// up: a confirmed start, which clears an earlier failure.
+	OnRecovered func()
 }
 
 func (c *Config) applyDefaults() {
@@ -238,6 +241,7 @@ func (m *Manager) Reload(ctx context.Context) error {
 	// settings push, a model key) leaves the new process watched once that
 	// request is done (hookLifecycle uses the manager's own context).
 	m.hookLifecycle()
+	m.recovered()
 	logger.Logf("manager: reload complete; back to Running")
 	return nil
 }
@@ -318,6 +322,22 @@ func (m *Manager) hookLifecycle() {
 	go m.runLivenessLoop(ctx)
 }
 
+// endGeneration ends the current generation's supervision.
+func (m *Manager) endGeneration() {
+	m.lifeMu.Lock()
+	defer m.lifeMu.Unlock()
+	if m.lifeCancel != nil {
+		m.lifeCancel()
+		m.lifeCancel = nil
+	}
+}
+
+func (m *Manager) recovered() {
+	if m.cfg.OnRecovered != nil {
+		m.cfg.OnRecovered()
+	}
+}
+
 func (m *Manager) runLivenessLoop(ctx context.Context) {
 	m.liveLoops.Add(1)
 	defer m.liveLoops.Add(-1)
@@ -337,6 +357,9 @@ func (m *Manager) runLivenessLoop(ctx context.Context) {
 			continue
 		}
 		if err := m.adapter.Liveness(ctx); err != nil {
+			if ctx.Err() != nil {
+				return // a later generation watches a newer process
+			}
 			logger.Logf("manager: liveness probe failed: %v", err)
 			go m.tryRestart(ctx)
 			return // a fresh liveness loop is started by hookLifecycle on success
@@ -356,6 +379,9 @@ func (m *Manager) tryRestart(ctx context.Context) {
 }
 
 func (m *Manager) restart(ctx context.Context) {
+	if ctx.Err() != nil {
+		return // superseded: a later generation watches a newer process
+	}
 	m.agent.SetPhase(state.PhaseRestarting)
 	logger.Logf("manager: entering Restarting phase")
 
@@ -389,6 +415,7 @@ func (m *Manager) restart(ctx context.Context) {
 
 		m.armState(res)
 		m.hookLifecycle()
+		m.recovered()
 		logger.Logf("manager: restart attempt %d succeeded; back to Running", attempt)
 		return
 	}
@@ -397,6 +424,9 @@ func (m *Manager) restart(ctx context.Context) {
 		lastErr = errors.New("max retries exceeded with no specific adapter error")
 	}
 	logger.Logf("manager: max retries (%d) exceeded; entering Failed: %v", m.cfg.MaxRetries, lastErr)
+	// Given up: this generation's loop does not start the same sequence
+	// again. A reload (a settings push, a model key) starts a new one.
+	m.endGeneration()
 	m.agent.SetPhase(state.PhaseFailed)
 	if m.cfg.OnFailed != nil {
 		m.cfg.OnFailed(lastErr)

@@ -134,6 +134,28 @@ func (s *runtimeStatus) ModelKeyIssue(message string) bool {
 	return changed
 }
 
+// statusReporter sends the effective status from one goroutine, reading it
+// when it sends: reports leave in order and the last one is current.
+type statusReporter struct{ nudge chan struct{} }
+
+func newStatusReporter(send func(level, message string)) *statusReporter {
+	r := &statusReporter{nudge: make(chan struct{}, 1)}
+	go func() {
+		for range r.nudge {
+			send(currentStatus.Get())
+		}
+	}()
+	return r
+}
+
+// Soon asks for a report; asks while one is pending fold into it.
+func (r *statusReporter) Soon() {
+	select {
+	case r.nudge <- struct{}{}:
+	default:
+	}
+}
+
 // SettingsIssue sets (or, with "", clears) the settings warning described
 // on runtimeStatus and returns the previous effective level. The message
 // must carry no secret values.

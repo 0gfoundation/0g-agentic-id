@@ -317,15 +317,17 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	// onFailed is invoked by the manager exactly once if the supervisor
 	// exhausts restart retries. Reports an "error" status to the attestor
 	// so the platform can decide whether to recreate the sandbox.
+	// Reports from the supervisor and the model key paths go through one
+	// sender, in order, each with the effective status when it leaves.
+	statusReports := newStatusReporter(func(level, msg string) {
+		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, msg, cfg.StatusBinding)
+	})
 	onFailed := func(err error) {
 		logger.Logf("FAIL supervisor: max retries exceeded: %v", err)
 		currentStatus.SupervisorFailed("supervisor exhausted retries: " + err.Error())
-		// What the status says now: a model key that cannot be used, say,
-		// is why the restarts failed and is shown over this.
-		level, msg := currentStatus.Get()
-		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, msg, cfg.StatusBinding)
+		statusReports.Soon()
 	}
-	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, credRT, credValues, credStore, sealedProxy, onFailed); err != nil {
+	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, credRT, credValues, credStore, sealedProxy, onFailed, statusReports); err != nil {
 		logger.Logf("FAIL agent: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", err.Error(), cfg.StatusBinding)
 		return
@@ -654,6 +656,7 @@ func startAgent(
 	credStore *credentials.Store,
 	sealedProxy *proxy.Server,
 	onFailed func(err error),
+	statusReports *statusReporter,
 ) error {
 	apiKey := cfg.APIKey
 	publicURL := cfg.PublicURL
@@ -806,21 +809,7 @@ func startAgent(
 	// applied is the choice the framework was last rendered with.
 	var appliedMu sync.Mutex
 	var applied modelChoice
-	// Status reports from the model key paths go through one goroutine and
-	// carry the state as it is when sent, so they arrive in order.
-	statusNudge := make(chan struct{}, 1)
-	go func() {
-		for range statusNudge {
-			level, msg := currentStatus.Get()
-			report.Status(cfg.AttestorURL, agentSealPriv, sealID, level, msg, cfg.StatusBinding)
-		}
-	}()
-	reportStatus := func() {
-		select {
-		case statusNudge <- struct{}{}:
-		default:
-		}
-	}
+	reportStatus := statusReports.Soon
 	renderResolved := func(ctx context.Context, choice modelChoice, resolved settings.Resolved) error {
 		if err := adapter.RenderSettings(ctx, resolved); err != nil {
 			return err
@@ -913,6 +902,13 @@ func startAgent(
 
 	mgr := manager.New(adapter, agent, manager.Config{
 		OnFailed: onFailed,
+		// A confirmed start, whoever brought it up, clears an earlier
+		// supervisor failure.
+		OnRecovered: func() {
+			if currentStatus.SupervisorRecovered() {
+				reportStatus()
+			}
+		},
 	})
 	if err := mgr.Start(context.Background(), manager.StartParams{
 		Runtime: framework.RuntimeContext{
