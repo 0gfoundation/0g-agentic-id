@@ -601,23 +601,24 @@ func TestProvisionLogsNoSecrets(t *testing.T) {
 	}
 }
 
-// A layered claim the attestor refuses still returns the versions it named,
-// so the sealed it refused can hand over to the one it names.
-func TestRefusedLayeredClaimKeepsTheTargets(t *testing.T) {
-	vector := loadCertificateVector(t)
-	f := useFakeClock(t)
-	target := "0x" + strings.Repeat("7b", 32)
-	auth := authorization{Generation: 4, Layered: true}
-	auth.Targets.Sealed = target
-	_, server := newMockAttestor(t, vector.containerKey(t),
-		[]answer{{200, auth}}, []answer{{403, `{"error":"sealed_hash_not_listed"}`}})
-	boot := testBoot(t, server.URL, f.now)
-	boot.SealedHash = strings.Repeat("5a", 32)
-	result := FromAttestor(boot)
-	if result.AgentSealPriv != nil || result.Layered {
-		t.Fatalf("refused claim provisioned: %+v", result)
-	}
-	if result.Targets.Sealed != target {
-		t.Fatalf("targets %+v, want sealed %s", result.Targets, target)
+// A layered claim the attestor refuses still says the attestor runs the
+// layered flow, so the sealed it refused can hand over to the newest listed
+// version. A refusal from an attestor without the flow says nothing of it.
+func TestRefusedLayeredClaimKeepsTheDeclaration(t *testing.T) {
+	for _, declared := range []bool{true, false} {
+		vector := loadCertificateVector(t)
+		f := useFakeClock(t)
+		_, server := newMockAttestor(t, vector.containerKey(t),
+			[]answer{{200, authorization{Generation: 4, Layered: declared}}},
+			[]answer{{403, `{"error":"sealed_hash_not_listed"}`}})
+		boot := testBoot(t, server.URL, f.now)
+		boot.SealedHash = strings.Repeat("5a", 32)
+		result := FromAttestor(boot)
+		if result.AgentSealPriv != nil {
+			t.Fatalf("refused claim provisioned: %+v", result)
+		}
+		if result.Layered != declared {
+			t.Fatalf("declared %v: result.Layered %v", declared, result.Layered)
+		}
 	}
 }

@@ -128,14 +128,14 @@ sealed 要求配套的 provider 和 attestor（v3 证书、attestor TLS 声明�
 0g-harness 镜像里的 PID 1 不是 sealed，而是加载器（`cmd/loader`）。它每次执行 sealed
 之前先核对哈希：镜像自带的 `/bootstrap` 对编镜像时编进去的 sha256
 （`-X main.expectedSealedHash`，`images/harness/Dockerfile`），换上来的版本对它的名字；
-再向 `CHAIN_RPC_URL` 发一次 `eth_call`，读 AgenticID 的 `isValidSealedHash`，链上明确
-答"不在"的版本不执行（`allowlist.go`）。它把 sealed 作为子进程启动，环境变量原样传下去，
+再向 `CHAIN_RPC_URL` 发 `eth_call`，先读 AgenticID 的 `trustRegistry()`，再读信任合约的
+`isListed(SEALED, 哈希)`，链上明确答"不在"的版本不执行（`allowlist.go`）。它把 sealed 作为子进程启动，环境变量原样传下去，
 另加 `SEALED_HASH`（它核对过的哈希）和 `SEALED_TRIAL`（试运行）；转发 SIGTERM、SIGINT、
 SIGQUIT 和 SIGHUP；收到停止信号后 sealed 2 分钟内没退出就杀掉；回收所有孤儿进程。没有
 分层流程时，sealed 退出它就用同样的状态退出，所以 sealed 退出照旧会结束容器。分层流程下
 （`LAYERS.zh.md` 第 3 节、3.1）它还按 sealed 的请求（SIGUSR1）换 sealed 版本：以试运行
 方式启动新版本，没确认起来就退回原版本，换之前清掉旧 sealed 留下的进程；sealed 自己退出时
-重启它，10 分钟内最多 5 次。它的状态目录是 `/var/lib/loader`（只有 root 能进）。它和
+（owner 重启 sealed 也是这样）重启它，10 分钟内最多 5 次。它的状态目录是 `/var/lib/loader`（只有 root 能进）。它和
 sealed 一样是 root、不可 dump、设置 `no_new_privs`，只链接标准库和 `golang.org/x/sys`
 （`TestLinkedPackages`）。其他镜像里 sealed 仍是 PID 1。
 
@@ -156,12 +156,15 @@ native 的 `openai` 和 `anthropic` 也一样，用 sealed 固定的官方地址
 说明放进每个请求的系统提示末尾，key 由凭证代理代填，harness 拿到的是占位值。owner 经
 `/_seal/auth` 拿到的令牌不是 harness 校验的那个，proxy 在入口核对后换掉；harness 的路由
 逐条列出（`framework.Route.Endpoints`）；它可以经签名 socket 请求重启
-（`POST /harness/restart`）。签名 socket 拒签发往 AgenticID `update` 或 `updateAt` 的交易，
+（`POST /harness/restart`），owner 可以经 `POST /_seal/restart` 重启 harness 或 sealed
+（`ownerrestart.go`）。签名 socket 拒签发往 AgenticID `update` 或 `updateAt` 的交易，
 并把每个签名和拒绝记下来给 owner（`/_seal/signatures`）；各 socket 把端点作为 MCP 工具提供
 （`POST /mcp`，`internal/sealmcp`），由 harness 注册成原生工具。这两项都由 adapter 声明
 （`framework.SigningRules`、`framework.RuntimeTools`），只有 0g-harness 声明。它上传的每个 iData 条目都带加盐的明文承诺
 （`internal/uploader/commitments.go`）。attestor 声明分层流程后，sealed 上报自己的哈希、
-签 ServeProof v2，并按 attestor 指定的目标版本换 harness 和 sealed（`layered.go`）。
+签 ServeProof v2，并在开机、每次设置推送和每次心跳时按规则换 harness 和 sealed：owner 在
+设置文档 `versions` 里选的版本（信任合约列着时），否则保持正在跑的版本，它被下架时换到最新
+登记的版本（`layered.go`）。
 完整设计见 `LAYERS.zh.md`。
 
 ### settings document 为什么走 `/provision`
@@ -561,6 +564,7 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 | `/_seal/credentials*`、`/_seal/oauth/callback` | **owner 钱包**；回调来自 owner 的浏览器 | owner 给 agent 的凭据：加载签名凭据集、列出、处理待办、读取使用记录、发起 MCP 登录；回调完成登录。与凭据代理、凭据 socket 和根证书一起提供（[CREDENTIALS.zh.md](CREDENTIALS.zh.md)） |
 | `/_seal/signatures` | **owner 钱包** | 只有 0g-harness（`framework.SigningRules`；其他框架返回 404）：签名 socket 签过和拒绝过什么（tag `0GSealSignatures`，`?after=<seq>`），每个签名或拒绝一条记录，带能认出它的信息（消息的哈希和开头、typed data 的 digest 和 domain、交易的哈希、链、目标、金额、nonce 和方法选择器），保留最近 1000 条，sealed 重启后仍在（`internal/proxy/signlog.go`） |
 | `/_seal/compact` | **owner 钱包** | 立刻对这份对话运行框架自己的压缩，不重启（tag `0GSealCompact`，占座门控）：同一时间只跑一个、一条签名消息只接受一次、与 synth 门上的一轮永不重叠——每种拒绝都答 409；adapter 无法触发框架的压缩时答 501——没实现 `SessionCompactor`，或已安装的版本缺少它要调用的东西（openclaw 2026.7.1 之前没有 `sessions compact` 这条 CLI 命令）（`internal/proxy/compact.go`、`CONVERSATION.zh.md`） |
+| `/_seal/restart` | **owner 钱包** | 重启 harness（`{"layer":"harness"}`）或 sealed 本身（`{"layer":"sealed"}`，由加载器重新启动）——tag `0GSealRestart`，占座门控，一条签名消息只接受一次，先答 202 再重启。只对运行 harness 包的 adapter（0g-harness）；重启 sealed 还要求分层流程，并且这次启动已经确认起来（启动中答 503）；其他情况答 501（`internal/proxy/ownerrestart.go`、`ownerrestart.go`） |
 | `/v1/*` | 用户、owner | framework chat API，反代到 gateway(bearer 鉴权;响应一律不带 proof 签名——这是 owner↔agent 的操控通道);未声明的路径一律 404——没有 catch-all 转发 |
 | `/api/*` | 外部调用方 | agent 注册的服务(精确路径,经 sign socket 的 `/services` 注册),反代到 agent 的 loopback backend;响应先缓冲再带 proof 签名(`X-Agent-Proof`),backend 发 SSE 也一样 |
 | `/v1/responses*` | owner | 长任务面(OpenAI Responses 子集):turn 归属服务端 id、断线不死、`starting_after` 续播、`POST /{id}/cancel` 停止。框架声明了 `kind:"responses"` 路由时由其 bridge 原生提供(prime、0g-harness),否则由 sealed proxy 在框架自身 chat API 之前**合成**(openclaw、hermes)——见 `internal/proxy/responses.go` |

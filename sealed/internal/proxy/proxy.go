@@ -98,6 +98,8 @@ type Server struct {
 	// compact backs POST /_seal/compact (compact.go): its applier plus the
 	// single-flight and replay guards, under their own lock.
 	compact compactState
+	// restart is /_seal/restart (ownerrestart.go).
+	restart ownerRestart
 
 	// Stateful-door conversation binding (framework.ConversationSession),
 	// wired by main.go only for adapters that hold the conversation
@@ -349,6 +351,7 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/claim", s.handleClaim)
 	mux.HandleFunc("/_seal/clear", s.handleClear)
 	mux.HandleFunc("/_seal/compact", s.handleCompact)
+	mux.HandleFunc("/_seal/restart", s.handleOwnerRestart)
 	mux.HandleFunc("/_seal/credentials", s.handleCredentials)
 	mux.HandleFunc("/_seal/credentials/pending", s.handleCredentialPending)
 	mux.HandleFunc("/_seal/credentials/decide", s.handleCredentialDecide)

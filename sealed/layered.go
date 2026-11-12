@@ -1,24 +1,27 @@
 package main
 
-// The layered runtime (sealed/LAYERS.md), sealed's side: which harness
-// official version package the 0g-harness adapter runs, and, once the
-// attestor declares the layered flow at GET /provision, switching the sealed
-// and harness versions it targets:
+// The layered runtime (sealed/LAYERS.md), sealed's side: which sealed program
+// and which official harness package run, once the attestor declares the
+// layered flow at GET /provision.
 //
-//   - at boot, before the agent starts: a sealed target other than this
-//     program is staged for the loader, which stops this sealed and starts
-//     that one; the harness runs the targeted package, or the one this
-//     container ran last, or base's, the first of them listed in
-//     validHarnessHashes (installed from the attestor first when needed);
-//   - while running: the same, for a target named in a reply to a status
-//     report. A harness switch restarts the harness on the new package and
-//     goes back to the previous one when it does not come up. A sealed
-//     switch hands over to the loader, which goes back to this version when
-//     the new one does not come up (SEALED_TRIAL, TrialFailedExit).
+// Per layer, the version to run is (LAYERS.md §3.1, §5.3):
 //
-// A version is used only if AgenticID lists it (isValidSealedHash,
-// isValidHarnessHash) and its bytes hash to its name. A version that failed
-// to come up is not tried again in this container.
+//   - the owner's pick (versions in the settings document), while the trust
+//     registry lists it;
+//   - else the version running now, while it is listed;
+//   - else, the version running now having been delisted, the newest listed
+//     one (the registry's latest).
+//
+// sealed applies the rule at boot, after every settings push and at every
+// heartbeat. At boot the harness also falls back to the package this
+// container ran last, then base's. A harness switch restarts the harness on
+// the new package and goes back to the previous one when it does not come up.
+// A sealed switch hands over to the loader, which goes back to this version
+// when the new one does not come up (SEALED_TRIAL, TrialFailedExit).
+//
+// A version is used only if the trust registry lists it and its bytes hash to
+// its name. A version that failed to come up is not tried again in this
+// container.
 //
 // Without the declaration, the adapter runs base's package and nothing is
 // switched.
@@ -36,10 +39,11 @@ import (
 	"seal-verify/internal/layers"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manager"
+	"seal-verify/internal/settings"
 )
 
 const (
-	// listedTimeout bounds one allowlist read on chain.
+	// listedTimeout bounds one list read on chain.
 	listedTimeout = 15 * time.Second
 	// harnessRestartAttempts bounds the restarts a switch makes when another
 	// restart (an owner settings push) was under way and its own was skipped.
@@ -48,14 +52,20 @@ const (
 	applyTimeout = 30 * time.Minute
 )
 
+// The trust registry's kinds, as the list reads take them.
+var (
+	kindSealed  = [32]byte(chain.KindSealed)
+	kindHarness = [32]byte(chain.KindHarness)
+)
+
 // harnessReadyTimeout is how long a harness restarted on a new package has
 // to answer its health check. A var so tests can shorten it.
 var harnessReadyTimeout = 3 * time.Minute
 
-// allowlists are the AgenticID reads a version must pass (chain.Client).
-type allowlists interface {
-	IsValidSealedHash(ctx context.Context, hash [32]byte) (bool, error)
-	IsValidHarnessHash(ctx context.Context, hash [32]byte) (bool, error)
+// codeLists are the trust registry reads a version must pass (chain.Client).
+type codeLists interface {
+	Listed(ctx context.Context, kind, hash [32]byte) (bool, error)
+	Latest(ctx context.Context, kind [32]byte) ([32]byte, error)
 }
 
 // requestSealedSwitch asks the loader to switch (layers.RequestSwitch, which
@@ -65,20 +75,21 @@ var requestSealedSwitch = layers.RequestSwitch
 
 // layeredRuntime switches versions under the layered flow.
 type layeredRuntime struct {
-	attestorURL string
 	// sealedHash is this program's hash as the loader verified it.
 	sealedHash string
-	// allow is nil without a chain client: then no version is confirmed.
-	allow allowlists
+	// lists is nil without a chain client: then no version is confirmed.
+	lists codeLists
 
-	// harness, mgr and ready are set once the agent has started (started);
-	// harness is nil for adapters that are not packages.
+	// harness, mgr, ready and picks are set once the agent has started
+	// (started); harness is nil for adapters that are not packages.
 	harness framework.LayeredRuntime
 	mgr     interface{ Reload(context.Context) error }
 	ready   interface{ Readiness(context.Context) error }
+	// picks returns the owner's picks from the settings document in force.
+	picks func() settings.Versions
 
-	// busy lets one switch run at a time; a target arriving meanwhile waits
-	// for the next status reply.
+	// busy lets one round of the rule run at a time; a round asked for
+	// meanwhile is skipped, and the next heartbeat runs it.
 	busy sync.Mutex
 	// handedOver is set once a sealed switch was requested: this sealed is
 	// about to be stopped, and switches nothing more.
@@ -92,9 +103,9 @@ func newLayeredRuntime(cfg *config.Bootstrap, client *chain.Client) *layeredRunt
 	if err := layers.MarkLayered(); err != nil {
 		logger.Logf("layers: tell the loader about the layered flow: %v", err)
 	}
-	l := &layeredRuntime{attestorURL: cfg.AttestorURL, sealedHash: cfg.SealedHash}
+	l := &layeredRuntime{sealedHash: cfg.SealedHash}
 	if client != nil {
-		l.allow = client
+		l.lists = client
 	}
 	return l
 }
@@ -111,24 +122,26 @@ func failTrial(cfg *config.Bootstrap, what string) {
 	os.Exit(layers.TrialFailedExit)
 }
 
-// switchAfterRefusal hands over to the sealed version the attestor named
-// when provisioning this one failed, and reports whether it asked the
-// loader to. The allowlist is read on chain with a client of its own: there
-// is no agent key, and no chain bootstrap, without provisioning.
-func switchAfterRefusal(cfg *config.Bootstrap, target string) bool {
-	t, ok := layers.ParseHash(target)
-	if !ok || cfg.SealedHash == "" || t == cfg.SealedHash {
+// switchAfterRefusal hands over to the newest listed sealed version when the
+// attestor refused to provision this one because it is no longer listed, and
+// reports whether it asked the loader to. There is no settings document
+// without provisioning, so no owner pick: the new version applies the pick
+// once it has provisioned. The list is read with a chain client of its own.
+func switchAfterRefusal(cfg *config.Bootstrap) bool {
+	if cfg.SealedHash == "" {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
 	defer cancel()
 	client, err := chain.Dial(ctx, cfg.ChainRPC, cfg.ContractAddr)
 	if err != nil {
-		logger.Logf("WARN layers: chain client for the sealed target: %v", err)
+		logger.Logf("WARN layers: chain client for the sealed list: %v", err)
 		return false
 	}
 	defer client.Close()
-	return newLayeredRuntime(cfg, client).switchSealed(ctx, t)
+	l := newLayeredRuntime(cfg, client)
+	target, ok := l.target(ctx, kindSealed, "", cfg.SealedHash)
+	return ok && l.switchSealed(ctx, target)
 }
 
 // confirmTrial tells the loader that this version came up.
@@ -143,23 +156,80 @@ func confirmTrial(cfg *config.Bootstrap) {
 	logger.Logf("OK   layers: sealed %s confirmed to the loader", shortHex(cfg.SealedHash))
 }
 
-// listedSealed and listedHarness read the allowlists on chain.
-func (l *layeredRuntime) listedSealed(ctx context.Context, hash string) (bool, error) {
-	if l.allow == nil {
-		return false, fmt.Errorf("no chain client")
+// kindName names a kind in the log.
+func kindName(kind [32]byte) string {
+	if kind == kindSealed {
+		return "sealed"
 	}
-	ctx, cancel := context.WithTimeout(ctx, listedTimeout)
-	defer cancel()
-	return l.allow.IsValidSealedHash(ctx, layers.Bytes32(hash))
+	return "harness"
 }
 
-func (l *layeredRuntime) listedHarness(ctx context.Context, hash string) (bool, error) {
-	if l.allow == nil {
+// listed reads isListed(kind, hash) on chain.
+func (l *layeredRuntime) listed(ctx context.Context, kind [32]byte, hash string) (bool, error) {
+	if l.lists == nil {
 		return false, fmt.Errorf("no chain client")
 	}
 	ctx, cancel := context.WithTimeout(ctx, listedTimeout)
 	defer cancel()
-	return l.allow.IsValidHarnessHash(ctx, layers.Bytes32(hash))
+	return l.lists.Listed(ctx, kind, layers.Bytes32(hash))
+}
+
+// latest reads latest(kind) on chain: 64 hex, "" when nothing is listed.
+func (l *layeredRuntime) latest(ctx context.Context, kind [32]byte) (string, error) {
+	if l.lists == nil {
+		return "", fmt.Errorf("no chain client")
+	}
+	ctx, cancel := context.WithTimeout(ctx, listedTimeout)
+	defer cancel()
+	h, err := l.lists.Latest(ctx, kind)
+	if err != nil || h == ([32]byte{}) {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h[:]), nil
+}
+
+// failed reports whether hash failed to come up in this container before.
+func failed(kind [32]byte, hash string) bool {
+	if kind == kindSealed {
+		return layers.SealedFailed(hash)
+	}
+	return layers.HarnessFailed(hash)
+}
+
+// target applies the rule to one layer running current: the version to
+// switch to, or false to stay. A list that cannot be read keeps current.
+func (l *layeredRuntime) target(ctx context.Context, kind [32]byte, pick, current string) (string, bool) {
+	name := kindName(kind)
+	if p, ok := layers.ParseHash(pick); ok && p != current && !failed(kind, p) {
+		listed, err := l.listed(ctx, kind, p)
+		if err == nil && listed {
+			return p, true
+		}
+		logger.Logf("layers: the owner's %s pick %s is not confirmed on the %s list (%v); not switching to it", name, shortHex(p), name, err)
+	}
+	if current != "" {
+		listed, err := l.listed(ctx, kind, current)
+		if err != nil {
+			logger.Logf("WARN layers: the %s list is unreadable (%v); staying on %s", name, err, shortHex(current))
+			return "", false
+		}
+		if listed {
+			return "", false
+		}
+	}
+	latest, err := l.latest(ctx, kind)
+	switch {
+	case err != nil:
+		logger.Logf("WARN layers: %s %s is not listed and the newest listed one is unreadable (%v); staying on it", name, shortHex(current), err)
+	case latest == "":
+		logger.Logf("WARN layers: %s %s is not listed and nothing is; staying on it", name, shortHex(current))
+	case latest == current || failed(kind, latest):
+		logger.Logf("WARN layers: %s %s is not listed and the newest listed one cannot be used here; staying on it", name, shortHex(current))
+	default:
+		logger.Logf("layers: %s %s is not listed; moving to the newest listed one, %s", name, shortHex(current), shortHex(latest))
+		return latest, true
+	}
+	return "", false
 }
 
 // switchSealed stages sealed version target for the loader and asks it to
@@ -169,15 +239,15 @@ func (l *layeredRuntime) switchSealed(ctx context.Context, target string) bool {
 		return false
 	}
 	if layers.SealedFailed(target) {
-		logger.Logf("layers: sealed target %s failed to come up in this container before; staying on %s", shortHex(target), shortHex(l.sealedHash))
+		logger.Logf("layers: sealed %s failed to come up in this container before; staying on %s", shortHex(target), shortHex(l.sealedHash))
 		return false
 	}
-	ok, err := l.listedSealed(ctx, target)
+	ok, err := l.listed(ctx, kindSealed, target)
 	if err != nil || !ok {
-		logger.Logf("WARN layers: sealed target %s is not confirmed in validSealedHashes (%v); staying on %s", shortHex(target), err, shortHex(l.sealedHash))
+		logger.Logf("WARN layers: sealed %s is not confirmed on the sealed list (%v); staying on %s", shortHex(target), err, shortHex(l.sealedHash))
 		return false
 	}
-	body, err := layers.FetchArtifact(ctx, l.attestorURL, target)
+	body, err := layers.FetchArtifact(ctx, target)
 	if err != nil {
 		logger.Logf("WARN layers: fetch sealed %s: %v", shortHex(target), err)
 		return false
@@ -197,39 +267,57 @@ func (l *layeredRuntime) switchSealed(ctx context.Context, target string) bool {
 	return true
 }
 
-// chooseHarness picks the package to start at boot: the target, the one
-// this container ran last, then base's — the first one listed in
-// validHarnessHashes that is installed or installs. When none can be
-// confirmed (the chain unreachable, nothing listed), it starts the one this
-// container ran last, or base's, and says so.
-func (l *layeredRuntime) chooseHarness(ctx context.Context, target, base string) (string, string) {
+// chooseHarness picks the package to start at boot: the owner's pick, the
+// one this container ran last, the newest listed one, then base's — the
+// first one on the harness list that is installed or installs. When none
+// can be confirmed (the chain unreachable, nothing listed), it starts the
+// one this container ran last, or base's, and says so.
+func (l *layeredRuntime) chooseHarness(ctx context.Context, pick, base string) (string, string) {
 	sel := layers.LoadHarnessSelection()
-	var candidates []string
 	seen := map[string]bool{}
-	for _, c := range []string{target, sel.Current, base} {
-		if h, ok := layers.ParseHash(c); ok && !seen[h] && !layers.HarnessFailed(h) {
-			seen[h] = true
-			candidates = append(candidates, h)
+	try := func(c string) (string, bool) {
+		h, ok := layers.ParseHash(c)
+		if !ok || seen[h] || layers.HarnessFailed(h) {
+			return "", false
 		}
-	}
-	for _, c := range candidates {
-		ok, err := l.listedHarness(ctx, c)
+		seen[h] = true
+		ok, err := l.listed(ctx, kindHarness, h)
 		if err != nil || !ok {
-			logger.Logf("layers: harness %s is not confirmed in validHarnessHashes (%v)", shortHex(c), err)
-			continue
+			logger.Logf("layers: harness %s is not confirmed on the harness list (%v)", shortHex(h), err)
+			return "", false
 		}
-		if err := l.installHarness(ctx, c); err != nil {
-			logger.Logf("WARN layers: install harness %s: %v", shortHex(c), err)
-			continue
+		if err := l.installHarness(ctx, h); err != nil {
+			logger.Logf("WARN layers: install harness %s: %v", shortHex(h), err)
+			return "", false
 		}
-		if c != sel.Current {
-			l.saveSelection(c, sel.Current)
+		return h, true
+	}
+	for i := 0; i < 4; i++ {
+		var c string
+		switch i {
+		case 0:
+			c = pick
+		case 1:
+			c = sel.Current
+		case 2:
+			latest, err := l.latest(ctx, kindHarness)
+			if err != nil {
+				logger.Logf("layers: the newest listed harness is unreadable: %v", err)
+			}
+			c = latest
+		case 3:
+			c = base
 		}
-		return c, layers.HarnessDir(c)
+		if h, ok := try(c); ok {
+			if h != sel.Current {
+				l.saveSelection(h, sel.Current)
+			}
+			return h, layers.HarnessDir(h)
+		}
 	}
 	for _, c := range []string{sel.Current, base} {
 		if c != "" && layers.HarnessInstalled(c) {
-			logger.Logf("WARN layers: no harness version could be confirmed in validHarnessHashes; starting %s, the one this container has", shortHex(c))
+			logger.Logf("WARN layers: no harness version could be confirmed on the harness list; starting %s, the one this container has", shortHex(c))
 			return c, layers.HarnessDir(c)
 		}
 	}
@@ -237,14 +325,14 @@ func (l *layeredRuntime) chooseHarness(ctx context.Context, target, base string)
 	return "", ""
 }
 
-// installHarness makes sure the package hash is unpacked, fetching it from
-// the attestor when it is not.
+// installHarness makes sure the package hash is unpacked, downloading it
+// from the artifacts release when it is not.
 func (l *layeredRuntime) installHarness(ctx context.Context, hash string) error {
 	if layers.HarnessInstalled(hash) {
 		return nil
 	}
-	logger.Logf("layers: fetching harness %s from the attestor", shortHex(hash))
-	body, err := layers.FetchArtifact(ctx, l.attestorURL, hash)
+	logger.Logf("layers: downloading harness %s from the artifacts release", shortHex(hash))
+	body, err := layers.FetchArtifact(ctx, hash)
 	if err != nil {
 		return err
 	}
@@ -263,15 +351,16 @@ func (l *layeredRuntime) saveSelection(current, previous string) {
 	}
 }
 
-// started hands the runtime what switching the harness needs, once the
-// agent has started.
-func (l *layeredRuntime) started(adapter manager.Adapter, mgr *manager.Manager) {
-	l.ready, l.mgr = adapter, mgr
+// started hands the runtime what switching versions needs, once the agent
+// has started: the manager, and where the owner's picks are read from.
+func (l *layeredRuntime) started(adapter manager.Adapter, mgr *manager.Manager, picks func() settings.Versions) {
+	l.ready, l.mgr, l.picks = adapter, mgr, picks
 	l.harness, _ = any(adapter).(framework.LayeredRuntime)
 }
 
-// apply acts on the versions a status reply names (report.SetTargetsHandler).
-func (l *layeredRuntime) apply(t layers.Targets) {
+// recheck applies the rule to both layers while the agent runs: after a
+// settings push, and at every heartbeat (a delisting is noticed there).
+func (l *layeredRuntime) recheck() {
 	if !l.busy.TryLock() {
 		return
 	}
@@ -281,13 +370,20 @@ func (l *layeredRuntime) apply(t layers.Targets) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
 	defer cancel()
-	if s, ok := layers.ParseHash(t.Sealed); ok && s != l.sealedHash {
-		// A new sealed starts its own harness, at its own target.
+	var picks settings.Versions
+	if l.picks != nil {
+		picks = l.picks()
+	}
+	if s, ok := l.target(ctx, kindSealed, picks.Sealed, l.sealedHash); ok {
+		// A new sealed starts its own harness, by the same rule.
 		if l.switchSealed(ctx, s) {
 			return
 		}
 	}
-	if h, ok := layers.ParseHash(t.Harness); ok && l.harness != nil && h != l.harness.HarnessHash() {
+	if l.harness == nil {
+		return
+	}
+	if h, ok := l.target(ctx, kindHarness, picks.Harness, l.harness.HarnessHash()); ok {
 		l.switchHarness(ctx, h)
 	}
 }
@@ -299,9 +395,9 @@ func (l *layeredRuntime) switchHarness(ctx context.Context, target string) {
 		return
 	}
 	prev := l.harness.HarnessHash()
-	ok, err := l.listedHarness(ctx, target)
+	ok, err := l.listed(ctx, kindHarness, target)
 	if err != nil || !ok {
-		logger.Logf("WARN layers: harness target %s is not confirmed in validHarnessHashes (%v); staying on %s", shortHex(target), err, shortHex(prev))
+		logger.Logf("WARN layers: harness %s is not confirmed on the harness list (%v); staying on %s", shortHex(target), err, shortHex(prev))
 		return
 	}
 	if err := l.installHarness(ctx, target); err != nil {

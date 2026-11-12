@@ -34,9 +34,10 @@ adapter runs.
   `/opt/0g-harness/<sha256>/`, owned by root and read-only to the agent, and
   `/opt/0g-harness/base` names it. So the plugin set and every platform
   decision in it ride the package hash, and the image's own package rides the
-  image hash as well (measured, and listed on chain in
-  `validFrameworkHashes`). Under the layered flow sealed runs the package the
-  attestor targets, once the chain lists its hash in `validHarnessHashes`
+  image hash as well (measured, and listed on chain on the trust registry's
+  image list). Under the layered flow sealed runs the package the version
+  rule picks — the owner's pick while listed, else the one running, else the
+  newest listed — each on the trust registry's harness list
   (`../../LAYERS.md` §5); otherwise it runs `base`.
 - **Out of the agent's reach.** The composition is **not** a `cordis.yml`, a
   profile, or any `$DSH_HOME` patch layer, so an agent editing its own home

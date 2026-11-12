@@ -46,7 +46,6 @@ import (
 	"seal-verify/internal/dataplane"
 	"seal-verify/internal/framework"
 	"seal-verify/internal/inference"
-	"seal-verify/internal/layers"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manager"
 	"seal-verify/internal/manifest"
@@ -237,9 +236,9 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	})
 	agentSealPriv := prov.AgentSealPriv
 	if agentSealPriv == nil {
-		// A version the attestor no longer provisions (taken off
-		// validSealedHashes) still hands over to the one it names.
-		if switchAfterRefusal(cfg, prov.Targets.Sealed) {
+		// A version the attestor no longer provisions (taken off the sealed
+		// list) still hands over to the newest listed one.
+		if prov.Layered && switchAfterRefusal(cfg) {
 			return
 		}
 		failTrial(cfg, "provisioning")
@@ -292,14 +291,19 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	}
 	sealedProxy.SetAdapter(adapter)
 
-	// The layered runtime (layered.go): a sealed target other than this
-	// program is handed to the loader before the agent starts, and the
-	// harness starts on the package it picks.
+	// The layered runtime (layered.go): when the rule picks a sealed version
+	// other than this program (the owner's pick, or the newest listed one
+	// once this one is delisted), it is handed to the loader before the agent
+	// starts; the harness starts on the package the rule picks.
 	var lr *layeredRuntime
+	var picks settings.Versions
 	if prov.Layered {
+		if doc, err := settings.Parse(prov.Settings); err == nil && doc.Versions != nil {
+			picks = *doc.Versions
+		}
 		lr = newLayeredRuntime(cfg, res.client)
 		ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
-		if target, ok := layers.ParseHash(prov.Targets.Sealed); ok && lr.switchSealed(ctx, target) {
+		if target, ok := lr.target(ctx, kindSealed, picks.Sealed, cfg.SealedHash); ok && lr.switchSealed(ctx, target) {
 			cancel()
 			return
 		}
@@ -309,8 +313,7 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		hash, dir := baseHarness()
 		if lr != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
-			target, _ := layers.ParseHash(prov.Targets.Harness)
-			hash, dir = lr.chooseHarness(ctx, target, hash)
+			hash, dir = lr.chooseHarness(ctx, picks.Harness, hash)
 			cancel()
 		}
 		h.UseHarness(hash, dir)
@@ -370,6 +373,7 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	level, msg := currentStatus.Get()
 	report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, msg, cfg.StatusBinding)
 	confirmTrial(cfg)
+	sealedSettled.Store(true)
 }
 
 // applySecretEnv opens SEAL_SECRET_ENV (issue #166) and makes its inference
@@ -1008,8 +1012,9 @@ func startAgent(
 	}
 
 	// A framework that runs from a package can ask to be restarted over the
-	// sign socket; under the layered flow its package hash goes into every
-	// serve-proof (v2), and status replies may switch versions (layered.go).
+	// sign socket, and its owner over /_seal/restart (ownerrestart.go); under
+	// the layered flow its package hash goes into every serve-proof (v2), and
+	// the owner's version picks apply (layered.go).
 	if harness, ok := any(adapter).(framework.LayeredRuntime); ok {
 		sealedProxy.SetHarnessRestart(mgr.Reload)
 		if lr != nil {
@@ -1025,8 +1030,15 @@ func startAgent(
 		}
 	}
 	if lr != nil {
-		lr.started(adapter, mgr)
-		report.SetTargetsHandler(lr.apply)
+		lr.started(adapter, mgr, func() settings.Versions {
+			if v := live.get().Versions; v != nil {
+				return *v
+			}
+			return settings.Versions{}
+		})
+	}
+	if _, ok := any(adapter).(framework.LayeredRuntime); ok {
+		sealedProxy.SetOwnerRestart(ownerRestarter(mgr, lr))
 	}
 
 	// The owner's hot path: push a document, have it take effect without
@@ -1058,6 +1070,10 @@ func startAgent(
 			currentStatus.SupervisorRecovered()
 		}
 		logger.Logf("settings: applied (provider=%s model=%s thinking=%s)", doc.Provider, doc.Model, doc.Thinking)
+		// The owner's version picks take effect now (layered.go).
+		if lr != nil {
+			go lr.recheck()
+		}
 		// A document that applied clears a boot-time settings warning; say
 		// so now rather than at the next heartbeat.
 		if doc.Validate() == nil && currentStatus.SettingsIssue("") != "running" {
@@ -1199,7 +1215,13 @@ func startAgent(
 	// 5 min keeps signed-tx volume low; first beat fires immediately after
 	// the initial "running" report from runMainPipeline so the cadence is
 	// regular regardless of when this goroutine starts.
-	go runHeartbeat(watchCtx, cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, cfg.StatusBinding)
+	// Under the layered flow every beat also applies the version rule, so a
+	// delisted version is left within one interval (layered.go).
+	var onBeat func()
+	if lr != nil {
+		onBeat = lr.recheck
+	}
+	go runHeartbeat(watchCtx, cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, cfg.StatusBinding, onBeat)
 
 	return nil
 }
@@ -1215,7 +1237,7 @@ func startAgent(
 // warning, or error) and never clobbers a real failure.
 const heartbeatInterval = 5 * time.Minute
 
-func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte, sealID string, binding *report.Binding) {
+func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte, sealID string, binding *report.Binding, onBeat func()) {
 	t := time.NewTicker(heartbeatInterval)
 	defer t.Stop()
 	for {
@@ -1225,6 +1247,9 @@ func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte,
 		case <-t.C:
 			level, msg := currentStatus.Get()
 			report.Status(attestorURL, agentSealPriv, sealID, level, msg, binding)
+			if onBeat != nil {
+				go onBeat()
+			}
 		}
 	}
 }

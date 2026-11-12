@@ -335,7 +335,7 @@ Attestor's validation has three independent gates:
 | Gate | Predicate | Source of truth |
 |---|---|---|
 | **Sandbox identity** | First provision: the certificate's scope (chain, TappRegistry, appId, `registered_at`) and its recovered signer equal the provider instance the attestor discovers and trusts, and its key is the one the provider reported for the sandbox the attestor created under the current ticket (a sealed sandbox created at the provider directly has another key). Later boots: the provider instance recorded at first provision still equals it | the attestor's provider discovery (TappRegistry, SandboxServing) |
-| **Image legitimacy** | `AgenticID.isValidFrameworkHash(image_hash) == true`, at first provision and again for the recorded hash on every later boot | AgenticID contract's `validFrameworkHashes` allowlist (Attestor-maintained set of approved Sealed runtime image hashes) |
+| **Image legitimacy** | `AgenticID.isValidFrameworkHash(image_hash) == true`, at first provision and again for the recorded hash on every later boot | the image list the deployer keeps on chain: the TrustRegistry's (`IMAGE`), which `isValidFrameworkHash` reads since AgenticID 1.4.0; AgenticID's own `validFrameworkHashes` before it |
 | **Freshness OR record** | First provision: `ticket_issued_at − 300 ≤ ts ≤ now + 300`. Later boots: the boot claim recovers the address of the recorded `container_pubkey` | the deployment's container record (`container_pubkey`, image hash and provider instance), written with the first provision's binding in one transaction |
 
 **The first gate** checks the provider signer and complete app-instance
@@ -346,12 +346,12 @@ epoch or provider key fails every later boot of a container certified under
 the old one (`provider instance no longer trusted; reset required`). Older
 certificate versions are not migrated: every agent is recreated under v3.
 
-**The second gate**, the `validFrameworkHashes` allowlist, follows
-the same spirit as Tapp's "code identity on chain, reviewed by the
-user before use." The sealed runtime's image hash is registered
-on-chain too (on the AgenticID contract's `validFrameworkHashes`),
-and users should manually check that the on-chain hash matches a
-reproducible build from the open-source sealed runtime repository.
+**The second gate**, the image list, follows the same spirit as
+Tapp's "code identity on chain, reviewed by the user before use." The
+sealed runtime's image hash is registered on-chain too (the
+TrustRegistry's image list, read through AgenticID), and users should
+manually check that the on-chain hash matches a reproducible build
+from the open-source sealed runtime repository.
 
 sealed itself is **not** registered as a standalone Tapp app. It is
 a container spawned by 0g-Sandbox, not a top-level app, so it
@@ -359,9 +359,9 @@ deliberately **does not** route through TappRegistry, and
 `acknowledgeApps` does not apply to it. **The one piece missing today
 is the wallet-side ack**: after a user audits the image, there is no
 on-chain place to record "I've reviewed this hash." Closing the gap
-is a matter of adding a per-wallet ack of the current
-`validFrameworkHashes` snapshot on the AgenticID contract (mirroring
-`TappRegistry.acknowledgeApps` in shape). sealed neither needs nor
+is a matter of adding a per-wallet ack of the current image list on
+the TrustRegistry (mirroring `TappRegistry.acknowledgeApps` in
+shape). sealed neither needs nor
 will be migrated into TappRegistry.
 
 All three must pass. On success, Attestor **ECIES-encrypts**
@@ -1287,24 +1287,27 @@ check rests on:
 
 - **Which sealed runs.** The loader runs a sealed only after checking its
   hash (the image's own against the hash compiled into the loader, a
-  switched-to version against its name) and asking the chain whether
-  AgenticID's `validSealedHashes` lists it; an explicit "no" keeps it from
-  running. The loader trusts the chain endpoint's answer, as sealed does for
+  switched-to version against its name) and asking the chain whether the
+  trust registry's sealed list has it (AgenticID names the registry); an
+  explicit "no" keeps it from running. The loader trusts the chain endpoint's answer, as sealed does for
   every chain read; with no answer to be had it runs the version, and the
   attestor, which checks the same list before it hands out the key, refuses
   an unlisted one. Under the layered flow sealed reports its hash at
   `/provision`, signed with the container key, and the attestor re-checks it
   at every key release.
 - **Switching versions.** The running sealed, already verified and holding
-  the container key, checks a target version on chain, downloads it from the
-  attestor over its pinned TLS, keeps it only if it hashes to its name, and
-  hands it to the loader, which checks it again. A version that does not come
+  the container key, picks the version by one rule (the owner's pick while
+  listed, else the running one, else — that one delisted — the newest
+  listed), checks it on chain, downloads it by hash from the public artifacts
+  release, keeps it only if it hashes to its name, and hands it to the loader,
+  which checks it again. The attestor names no version: what it could change
+  is only which listed one an agent runs, and it does not hold that choice. A version that does not come
   up is rolled back and not tried again in the container.
 - **Which harness runs.** The harness runs from an official version package
   unpacked into a directory root owns and the agent can only read; sealed
-  takes a package only if its hash is its name and the chain lists it in
-  `validHarnessHashes` (a package it cannot confirm is run only when it is
-  already in the container). The harness holds no key: neither the agent key,
+  takes a package only if its hash is its name and the chain lists it on the
+  trust registry's harness list (a package it cannot confirm is run only when
+  it is already in the container). The harness holds no key: neither the agent key,
   nor the model key (the inference route fills it), nor the owner's chat token
   (the proxy swaps the owner's for the harness's own at the entry).
 - **What reaches the model.** Every model call goes through sealed's

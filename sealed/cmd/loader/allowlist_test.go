@@ -16,18 +16,39 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
-func TestIsValidSealedHashSelector(t *testing.T) {
+func keccakHex(s string) string {
 	h := sha3.NewLegacyKeccak256()
-	h.Write([]byte("isValidSealedHash(bytes32)"))
-	if got := hex.EncodeToString(h.Sum(nil)[:4]); got != isValidSealedHashSelector {
-		t.Fatalf("selector %s, want %s", got, isValidSealedHashSelector)
+	h.Write([]byte(s))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func TestSelectorsAndKind(t *testing.T) {
+	for want, sig := range map[string]string{
+		trustRegistrySelector: "trustRegistry()",
+		isListedSelector:      "isListed(bytes32,bytes32)",
+	} {
+		if got := keccakHex(sig)[:8]; got != want {
+			t.Fatalf("%s selector %s, want %s", sig, got, want)
+		}
+	}
+	if got := keccakHex("sealed"); got != sealedKind {
+		t.Fatalf("SEALED kind %s, want %s", got, sealedKind)
 	}
 }
 
-// fakeRPC answers eth_call isValidSealedHash from a map: true, false, or
-// absent (a JSON-RPC error, as a contract without the function reverts).
+// The AgenticID and trust registry fakeRPC serves.
+const (
+	fakeAgenticID = "0x00000000000000000000000000000000000000a9"
+	fakeRegistry  = "0x00000000000000000000000000000000000000b0"
+)
+
+// fakeRPC answers AgenticID.trustRegistry() with fakeRegistry (a JSON-RPC
+// error when listed is nil, as an AgenticID before 1.4.0 reverts) and the
+// registry's isListed(SEALED, hash) from listed: true, false, or absent (an
+// error).
 func fakeRPC(t *testing.T, listed map[string]bool) *httptest.Server {
 	t.Helper()
+	reverted := `{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Method string            `json:"method"`
@@ -40,14 +61,25 @@ func fakeRPC(t *testing.T, listed map[string]bool) *httptest.Server {
 		}
 		var call struct{ To, Data string }
 		_ = json.Unmarshal(req.Params[0], &call)
-		hash := strings.TrimPrefix(call.Data, "0x"+isValidSealedHashSelector)
-		v, ok := listed[hash]
-		if !ok {
-			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}}`)
-			return
+		switch {
+		case strings.EqualFold(call.To, fakeAgenticID) && call.Data == "0x"+trustRegistrySelector:
+			if listed == nil {
+				_, _ = io.WriteString(w, reverted)
+				return
+			}
+			word := strings.Repeat("0", 24) + strings.TrimPrefix(fakeRegistry, "0x")
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":"0x`+word+`"}`)
+		case strings.EqualFold(call.To, fakeRegistry) && strings.HasPrefix(call.Data, "0x"+isListedSelector+sealedKind):
+			v, ok := listed[strings.TrimPrefix(call.Data, "0x"+isListedSelector+sealedKind)]
+			if !ok {
+				_, _ = io.WriteString(w, reverted)
+				return
+			}
+			word := strings.Repeat("0", 63) + map[bool]string{true: "1", false: "0"}[v]
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":"0x`+word+`"}`)
+		default:
+			_, _ = io.WriteString(w, reverted)
 		}
-		word := strings.Repeat("0", 63) + map[bool]string{true: "1", false: "0"}[v]
-		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":"0x`+word+`"}`)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -56,7 +88,7 @@ func fakeRPC(t *testing.T, listed map[string]bool) *httptest.Server {
 func TestAllowlistAnswers(t *testing.T) {
 	listed, delisted, unknown := strings.Repeat("aa", 32), strings.Repeat("bb", 32), strings.Repeat("cc", 32)
 	srv := fakeRPC(t, map[string]bool{listed: true, delisted: false})
-	a := newAllowlist(srv.URL, "0x00000000000000000000000000000000000000A9")
+	a := newAllowlist(srv.URL, fakeAgenticID)
 	if refused, err := a.refuses(listed); refused || err != nil {
 		t.Fatalf("listed: %v %v", refused, err)
 	}
@@ -66,12 +98,18 @@ func TestAllowlistAnswers(t *testing.T) {
 	if refused, err := a.refuses(unknown); refused || err == nil {
 		t.Fatalf("no answer: %v %v", refused, err)
 	}
-	if newAllowlist("", "0x00000000000000000000000000000000000000A9") != nil || newAllowlist(srv.URL, "") != nil {
+	if newAllowlist("", fakeAgenticID) != nil || newAllowlist(srv.URL, "") != nil {
 		t.Fatal("an allowlist without its endpoint or contract")
 	}
 	var none *allowlist
 	if refused, err := none.refuses(listed); refused || err != nil {
 		t.Fatalf("no allowlist: %v %v", refused, err)
+	}
+	// An AgenticID before 1.4.0 names no trust registry: no answer, so the
+	// version runs.
+	pre := newAllowlist(fakeRPC(t, nil).URL, fakeAgenticID)
+	if refused, err := pre.refuses(delisted); refused || err == nil {
+		t.Fatalf("no trust registry: %v %v", refused, err)
 	}
 }
 
@@ -97,7 +135,7 @@ func TestRunSkipsWhatTheChainDoesNotList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.allow = newAllowlist(fakeRPC(t, map[string]bool{staged: false, s.builtin.hash: true}).URL, "0x00000000000000000000000000000000000000A9")
+	s.allow = newAllowlist(fakeRPC(t, map[string]bool{staged: false, s.builtin.hash: true}).URL, fakeAgenticID)
 	if code := waitCode(t, runAsync(s)); code != 7 {
 		t.Fatalf("exit code %d, want 7 (the image's own, run in place of the delisted one)", code)
 	}
@@ -105,7 +143,7 @@ func TestRunSkipsWhatTheChainDoesNotList(t *testing.T) {
 		t.Fatalf("current %q, want the image's version", got)
 	}
 
-	s.allow = newAllowlist(fakeRPC(t, map[string]bool{s.builtin.hash: false}).URL, "0x00000000000000000000000000000000000000A9")
+	s.allow = newAllowlist(fakeRPC(t, map[string]bool{s.builtin.hash: false}).URL, fakeAgenticID)
 	if code := waitCode(t, runAsync(s)); code != 1 {
 		t.Fatalf("exit code %d, want 1 (nothing listed, nothing run)", code)
 	}

@@ -10,17 +10,18 @@
 // the image holds both binaries, so the image hash covers the pair.
 //
 // Before it runs any sealed, the loader also asks the chain whether that
-// version is in AgenticID's validSealedHashes (allowlist.go): one the chain
-// says is not listed does not run.
+// version is on the trust registry's sealed list (allowlist.go): one the
+// chain says is not listed does not run.
 //
 // Under the layered flow (once sealed says the attestor runs it) the loader
-// also switches sealed versions in place: sealed stages the version the
-// attestor targets in the loader's state directory, which only root can
-// enter, after checking it against the allowlist and its hash, and asks for
-// the switch (SIGUSR1). The loader hashes the staged program again, stops the
-// running sealed, ends whatever it left behind, and starts the new one on
-// trial; if that one exits before it confirms it came up, the loader goes
-// back to the version it replaced. A sealed that exits on its own is
+// also switches sealed versions in place: sealed stages the version to run
+// (the owner's pick, or the newest listed one when its own is delisted) in
+// the loader's state directory, which only root can enter, after checking it
+// against the list and its hash, and asks for the switch (SIGUSR1). The
+// loader hashes the staged program again, stops the running sealed, ends
+// whatever it left behind, and starts the new one on trial; if that one
+// exits before it confirms it came up, the loader goes back to the version
+// it replaced. A sealed that exits on its own (an owner restart is one) is
 // restarted, a bounded number of times. Without the layered flow the loader
 // runs /bootstrap only and exits when it exits, as when sealed is PID 1.
 //

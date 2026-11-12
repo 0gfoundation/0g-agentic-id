@@ -63,35 +63,52 @@ func TestVerifyingReader(t *testing.T) {
 func TestFetchArtifact(t *testing.T) {
 	data := []byte("harness package")
 	h := sum(data)
+	requests := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
 		switch r.URL.Path {
-		case "/artifacts/0x" + h:
+		case "/" + h:
+			// The release answers with a redirect to its storage host.
+			http.Redirect(w, r, "/storage/"+h, http.StatusFound)
+		case "/storage/" + h:
 			_, _ = w.Write(data)
-		case "/artifacts/0x" + strings.Repeat("11", 32):
+		case "/" + strings.Repeat("11", 32):
 			_, _ = w.Write([]byte("not what was asked for"))
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer srv.Close()
-	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
+	old := ArtifactsURL
+	ArtifactsURL = srv.URL
+	defer func() { ArtifactsURL = old }()
 
-	body, err := FetchArtifact(context.Background(), srv.URL, h)
+	body, err := FetchArtifact(context.Background(), h)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, err := readAll(body); err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("fetched %q, %v", got, err)
 	}
-	body, err = FetchArtifact(context.Background(), srv.URL, strings.Repeat("11", 32))
+	body, err = FetchArtifact(context.Background(), strings.Repeat("11", 32))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := readAll(body); !errors.Is(err, ErrHashMismatch) {
 		t.Fatalf("wrong bytes: %v, want ErrHashMismatch", err)
 	}
-	if _, err := FetchArtifact(context.Background(), srv.URL, strings.Repeat("22", 32)); err == nil {
+	if _, err := FetchArtifact(context.Background(), strings.Repeat("22", 32)); err == nil {
 		t.Fatal("404 accepted")
+	}
+	// A name that is not a sha256 never becomes a request.
+	before := requests
+	for _, bad := range []string{"../" + h[3:], strings.ToUpper(h), h[:63], ""} {
+		if _, err := FetchArtifact(context.Background(), bad); err == nil {
+			t.Fatalf("name %q accepted", bad)
+		}
+	}
+	if requests != before {
+		t.Fatalf("%d requests for malformed names", requests-before)
 	}
 }
 

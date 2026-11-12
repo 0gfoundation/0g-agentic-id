@@ -1253,7 +1253,7 @@ postinstall 才是装 uv、Python 和 kernel 的地方,而且它照样导出同�
 版本序列跟 npm 的不必一致 —— 这里 release 0.7.2 就是 npm 0.84.1。
 
 **安装该放在镜像里,而且这有安全收益。**框架在镜像构建期装好,它的字节就被镜像
-哈希覆盖了 —— 也就是进链上 `validFrameworkHashes` 的那个度量。openclaw 和
+哈希覆盖了 —— 也就是登记在链上镜像名单（信任合约）里的那个度量。openclaw 和
 hermes 在首次 Start 时重新钉版本,所以那些 agent 实际跑的框架是启动那一刻
 registry 给什么就是什么,**在度量之外**。因此这个 adapter 运行时不装任何东西:
 Start 校验已安装版本与 binding 是否一致,不一致就明确失败;并且不实现

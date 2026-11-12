@@ -19,6 +19,7 @@ package settings
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -47,6 +48,18 @@ type Doc struct {
 	// that word — choosing WHICH framework runs — is exactly what this field
 	// cannot do (the framework binding is minted identity).
 	Others json.RawMessage `json:"others,omitempty"`
+	// Versions is the owner's pick of the layered runtime's versions
+	// (sealed/LAYERS.md §10). Only the 0g-harness image's layered runtime
+	// reads it; nil picks nothing.
+	Versions *Versions `json:"versions,omitempty"`
+}
+
+// Versions names the sealed program and the official harness package the
+// owner wants, each as its sha256 ("0x" + 64 hex); a layer left empty is not
+// picked. A pick runs only while the trust registry lists it.
+type Versions struct {
+	Sealed  string `json:"sealed,omitempty"`
+	Harness string `json:"harness,omitempty"`
 }
 
 // Levels is the reasoning-depth vocabulary the owner may choose from.
@@ -118,7 +131,23 @@ func (d Doc) Validate() error {
 	if len(d.Others) > 0 && !json.Valid(d.Others) {
 		return fmt.Errorf("settings: others section is not valid JSON")
 	}
+	if v := d.Versions; v != nil {
+		for layer, h := range map[string]string{"sealed": v.Sealed, "harness": v.Harness} {
+			if h != "" && !isHash(h) {
+				return fmt.Errorf("settings: versions.%s %q is not a sha256 (0x + 64 hex)", layer, h)
+			}
+		}
+	}
 	return nil
+}
+
+// isHash reports whether s is "0x" followed by 64 hex digits.
+func isHash(s string) bool {
+	if len(s) != 66 || !strings.HasPrefix(s, "0x") {
+		return false
+	}
+	_, err := hex.DecodeString(s[2:])
+	return err == nil
 }
 
 // Resolve computes everything the platform derives for this document. Call

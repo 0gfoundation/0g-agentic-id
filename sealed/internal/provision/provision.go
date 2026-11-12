@@ -14,11 +14,11 @@
 // Each POST is signed afresh with a later boot_started_at.
 //
 // "layered": true declares that the attestor runs the layered runtime
-// (sealed/LAYERS.md §8): it checks the sealed program's hash against
-// validSealedHashes before it hands out the key. Only then does a sealed the
-// loader started (Boot.SealedHash) report that hash, as sealed_hash, signed
-// into the claim (ProvisionBoot.v2). An attestor without the declaration
-// gets the v1 claim it knows, which has no such field.
+// (sealed/LAYERS.md §8): it checks the sealed program's hash against the
+// trust registry's sealed list before it hands out the key. Only then does a
+// sealed the loader started (Boot.SealedHash) report that hash, as
+// sealed_hash, signed into the claim (ProvisionBoot.v2). An attestor without
+// the declaration gets the v1 claim it knows, which has no such field.
 package provision
 
 import (
@@ -39,7 +39,6 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"seal-verify/internal/attestorhttp"
-	"seal-verify/internal/layers"
 	"seal-verify/internal/logger"
 )
 
@@ -104,22 +103,18 @@ type Result struct {
 	// or nil when there is none.
 	Credentials []byte
 	// Layered is true when this boot ran the layered flow: the attestor
-	// declared it and took the reported sealed hash.
+	// declared it and took the reported sealed hash. Set when provisioning
+	// failed too, when the attestor declared the flow to a sealed the loader
+	// started: a version it refuses (taken off the sealed list) can still
+	// switch to the newest listed one.
 	Layered bool
-	// Targets are the versions the attestor named for this agent in the
-	// answer that declared the layered flow, to a sealed the loader started
-	// (zero otherwise). Set when provisioning failed too: a version the
-	// attestor refuses (taken off validSealedHashes) can still switch to the
-	// one it names.
-	Targets layers.Targets
 }
 
 // authorization is the GET /provision answer.
 type authorization struct {
-	Generation          int64          `json:"generation"`
-	CertificateRequired bool           `json:"certificate_required"`
-	Layered             bool           `json:"layered"`
-	Targets             layers.Targets `json:"targets"`
+	Generation          int64 `json:"generation"`
+	CertificateRequired bool  `json:"certificate_required"`
+	Layered             bool  `json:"layered"`
 }
 
 // provisionRequest is the POST /provision body.
@@ -177,8 +172,9 @@ type claim struct {
 	ticketHash [32]byte
 	// startedAt is the boot_started_at of the last signed POST.
 	startedAt int64
-	// targets are the versions the last layered authorization named.
-	targets layers.Targets
+	// declared is whether the last authorization declared the layered flow
+	// to this sealed.
+	declared bool
 }
 
 // FromAttestor runs Phase 1 and returns the decrypted payload. Transient
@@ -238,8 +234,8 @@ func (c *claim) run() Result {
 	for attempt := 1; ; attempt++ {
 		if auth == nil {
 			found, outcome := c.discover()
-			if outcome == proceed && c.layered(found) {
-				c.targets = found.Targets
+			if outcome == proceed {
+				c.declared = c.layered(found)
 			}
 			switch {
 			case outcome == stop:
@@ -275,9 +271,9 @@ func (c *claim) run() Result {
 }
 
 // failed is the result of a provisioning that did not succeed: no key, and
-// the versions the last layered authorization named.
+// whether the last authorization declared the layered flow.
 func (c *claim) failed() Result {
-	return Result{Targets: c.targets}
+	return Result{Layered: c.declared}
 }
 
 // wait sleeps backoff before the next attempt, or reports false when that
@@ -351,7 +347,7 @@ func (c *claim) provision(auth authorization) (Result, action) {
 	case proceed:
 		result, outcome := c.open(body)
 		if outcome == proceed && c.layered(auth) {
-			result.Layered, result.Targets = true, auth.Targets
+			result.Layered = true
 		}
 		return result, outcome
 	case stop:

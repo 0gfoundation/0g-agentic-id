@@ -133,7 +133,7 @@ func (s *supervisor) run() int {
 	for {
 		chosen, ok := s.allowed(cur)
 		if !ok {
-			s.logf("FAIL no sealed version this container has is in validSealedHashes; the agent needs a reset onto a current image")
+			s.logf("FAIL no sealed version this container has is on the sealed list; the agent needs a reset onto a current image")
 			return 1
 		}
 		if chosen.hash != cur.hash {
@@ -239,13 +239,13 @@ func (s *supervisor) allowed(v version) (version, bool) {
 	for _, c := range candidates {
 		refused, err := s.allow.refuses(c.hash)
 		if err != nil {
-			s.logf("validSealedHashes unreadable for %s (%v); running it, the attestor checks it before any key", short(c.hash), err)
+			s.logf("the sealed list is unreadable for %s (%v); running it, the attestor checks it before any key", short(c.hash), err)
 			return c, true
 		}
 		if !refused {
 			return c, true
 		}
-		s.logf("sealed %s is not in validSealedHashes; not running it", short(c.hash))
+		s.logf("sealed %s is not on the sealed list; not running it", short(c.hash))
 	}
 	return version{}, false
 }
@@ -290,7 +290,7 @@ func (s *supervisor) requested(cur version) (version, bool) {
 		return version{}, false
 	}
 	if refused, _ := s.allow.refuses(h); refused {
-		s.logf("refusing the switch to %s: it is not in validSealedHashes", short(h))
+		s.logf("refusing the switch to %s: it is not on the sealed list", short(h))
 		return version{}, false
 	}
 	return v, true

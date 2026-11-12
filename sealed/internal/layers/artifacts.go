@@ -24,37 +24,58 @@ var maxArtifactBytes int64 = MaxArtifactBytes
 // artifactTimeout bounds one artifact download, body included.
 const artifactTimeout = 15 * time.Minute
 
+// ArtifactsURL is where the official artifacts are published: the assets of
+// the `artifacts` release of the public GitHub repository
+// 0gfoundation/0g-agentic-id, each named by its sha256 (64 lowercase hex).
+// Where an artifact comes from does not matter for trust: its name comes
+// from the trust registry's lists, and a download counts only if it hashes
+// to that name. A var so tests serve their own.
+var ArtifactsURL = "https://github.com/0gfoundation/0g-agentic-id/releases/download/artifacts"
+
+// artifactClient downloads artifacts with the system's roots, following the
+// release's redirect to GitHub's storage host.
+var artifactClient = &http.Client{Timeout: artifactTimeout}
+
 // ErrHashMismatch is returned when what was read does not hash to the
 // artifact's name.
 var ErrHashMismatch = errors.New("the artifact does not hash to its name")
 
-// FetchArtifact opens the artifact named by hash (64 hex) at the attestor,
-// GET {attestorURL}/artifacts/0x<hash>, over the same pinned TLS sealed
-// uses for every attestor call. The returned reader yields at most
-// MaxArtifactBytes and, at its end, fails with ErrHashMismatch unless what it
-// yielded hashes to hash: a caller that reads it to io.EOF has the verified
-// bytes, and must discard them on any error.
-func FetchArtifact(ctx context.Context, attestorURL, hash string) (io.ReadCloser, error) {
-	client, err := attestorhttp.Client(attestorURL)
-	if err != nil {
-		return nil, fmt.Errorf("attestor client: %w", err)
+// FetchArtifact opens the artifact named by hash (64 lowercase hex),
+// ArtifactsURL/<hash>. The returned reader yields at most MaxArtifactBytes
+// and, at its end, fails with ErrHashMismatch unless what it yielded hashes
+// to hash: a caller that reads it to io.EOF has the verified bytes, and must
+// discard them on any error.
+func FetchArtifact(ctx context.Context, hash string) (io.ReadCloser, error) {
+	if !isArtifactName(hash) {
+		return nil, fmt.Errorf("artifact name %q is not a sha256 (64 lowercase hex)", hash)
 	}
-	long := *client
-	long.Timeout = artifactTimeout
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, attestorURL+"/artifacts/0x"+hash, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ArtifactsURL+"/"+hash, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := long.Do(req)
+	resp, err := artifactClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GET /artifacts/0x%s: %w", hash, err)
+		return nil, fmt.Errorf("download artifact %s: %w", hash, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		resp.Body.Close()
-		return nil, fmt.Errorf("GET /artifacts/0x%s: HTTP %d: %s", hash, resp.StatusCode, attestorhttp.Excerpt(body))
+		return nil, fmt.Errorf("download artifact %s: HTTP %d: %s", hash, resp.StatusCode, attestorhttp.Excerpt(body))
 	}
 	return VerifyingReader(resp.Body, hash), nil
+}
+
+// isArtifactName reports whether name is a sha256 as 64 lowercase hex.
+func isArtifactName(name string) bool {
+	if len(name) != 64 {
+		return false
+	}
+	for _, c := range name {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // VerifyingReader reads r up to MaxArtifactBytes and fails at the end

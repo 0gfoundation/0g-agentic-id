@@ -12,7 +12,7 @@
 
 放在 0g-harness(`src/composition.mjs`)里,用代码写死。0g-harness 就是本适配器启动的那个进程。
 
-- **构建镜像时定死,按哈希运行。** 0g-harness 镜像在构建时把一个确定版本的 harness(`../../images/harness/Dockerfile` 里的 `HARNESS_REF`),连同它锁定的整棵依赖树,打成一个包:装好的目录树的确定性 tar,以它的 sha256 命名。镜像把包解到 `/opt/0g-harness/<sha256>/`,属主是 root,agent 只读;`/opt/0g-harness/base` 写着它的哈希。所以插件集合,以及里面每一条平台决定,都包含在包哈希里;镜像自带的包同时也包含在镜像哈希里(被度量,并且登记在链上的 `validFrameworkHashes` 里)。分层流程下,sealed 运行 attestor 指定的包,前提是链上 `validHarnessHashes` 列了它的哈希(`../../LAYERS.zh.md` §5);否则运行 `base`。
+- **构建镜像时定死,按哈希运行。** 0g-harness 镜像在构建时把一个确定版本的 harness(`../../images/harness/Dockerfile` 里的 `HARNESS_REF`),连同它锁定的整棵依赖树,打成一个包:装好的目录树的确定性 tar,以它的 sha256 命名。镜像把包解到 `/opt/0g-harness/<sha256>/`,属主是 root,agent 只读;`/opt/0g-harness/base` 写着它的哈希。所以插件集合,以及里面每一条平台决定,都包含在包哈希里;镜像自带的包同时也包含在镜像哈希里(被度量,并且登记在链上信任合约的镜像名单里)。分层流程下,sealed 运行版本规则选出的包:owner 选的版本(名单里列着时),否则正在跑的,否则最新登记的,都要在信任合约的 harness 名单里(`../../LAYERS.zh.md` §5);否则运行 `base`。
 - **agent 改不动。** 组合**不是** `cordis.yml`,不是 profile,也不在 `$DSH_HOME` 下的任何 patch 文件里。agent 就算改自己的家目录,也改不动下次启动挂什么。这是 doctrine 第 5 条(agent 不能重写自己的运行时)在结构上的落地。
 - **版本对得上。** 构建镜像时还会检查一件事:装上的 0g-harness 版本,必须等于 `whitelist.go` 写进每个 0g-harness agent 的 `framework` role 的版本。这样,role 里写的永远是实际运行的版本。harness 自己锁定它所用的 DSH 包(它的 `npm-shrinkwrap.json`)。
 

@@ -262,3 +262,28 @@ func TestDynamicRouteBindingRejectsAnAddressChangeAndKeepsTheOldSnapshot(t *test
 		t.Fatal("a new registry changed the running container's snapshot")
 	}
 }
+
+// The owner's version picks round-trip through the stored blob, and only
+// sha256 hashes are accepted.
+func TestVersionsPicks(t *testing.T) {
+	h := "0x" + strings.Repeat("ab", 32)
+	d, err := Parse([]byte(`{"model":"m","versions":{"sealed":"` + h + `"}}`))
+	if err != nil || d.Versions == nil || d.Versions.Sealed != h || d.Versions.Harness != "" {
+		t.Fatalf("parsed %+v, %v", d.Versions, err)
+	}
+	if err := d.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := d.Marshal()
+	if err != nil || !strings.Contains(string(b), `"versions":{"sealed":"`+h+`"}`) {
+		t.Fatalf("marshalled %s, %v", b, err)
+	}
+	if b, _ := (Doc{Model: "m"}).Marshal(); strings.Contains(string(b), "versions") {
+		t.Fatalf("a document without picks names versions: %s", b)
+	}
+	for _, bad := range []string{"ab", strings.Repeat("ab", 32), "0x" + strings.Repeat("zz", 32), "0x" + strings.Repeat("ab", 31)} {
+		if err := (Doc{Model: "m", Versions: &Versions{Harness: bad}}).Validate(); err == nil {
+			t.Fatalf("accepted versions.harness %q", bad)
+		}
+	}
+}
