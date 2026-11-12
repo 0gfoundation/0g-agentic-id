@@ -175,7 +175,7 @@ test('CLI only reads providers and logs in; publication stays in the SDK/API',as
     const listed=await cli(s.base,['providers','--json'],undefined,{AGENTIC_PRIVATE_KEY:''});
     assert.equal(listed.code,0,listed.stdout+listed.stderr);assert.equal(JSON.parse(listed.stdout).data.providers.at(-1).id,'partner');
     const env={XDG_CONFIG_HOME:join(dir,'config')};
-    const login=await cli(s.base,[],'login partner\n\n\nnew-partner-key\nwhoami\nquit\n',env);
+    const login=await cli(s.base,[],'login partner\nnew-partner-key\nwhoami\nquit\n',env);
     assert.equal(login.code,0,login.stdout+login.stderr);assert.equal(loadApiKey('partner',env),'new-partner-key');
     assert.ok(!login.stdout.includes('new-partner-key')&&!login.stderr.includes('new-partner-key'));
     assert.equal(s.writes(),1,'only the SDK call may publish');

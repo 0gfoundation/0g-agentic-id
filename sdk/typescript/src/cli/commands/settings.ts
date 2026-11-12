@@ -29,7 +29,7 @@ import { SettingsConflictError } from '../../Settings';
 import type { CommandContext } from '../types';
 import { changesProvider } from '../../Providers';
 import { configuredInferenceKey, requireConfiguredInferenceKey, requiresProviderReset } from '../inference';
-import { ensureModelKey, readSecret } from '../credentials';
+import { commandKeyPrompt, ensureModelKey, readSecret } from '../credentials';
 
 const ZERO_HASH = `0x${'0'.repeat(64)}` as Hash;
 
@@ -107,7 +107,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   let pendingReset = false;
   if (changesProvider(current, next)) {
     const provider = next.provider ?? '0g-compute';
-    const keyIO = { out: note, secret: ctx.json ? async () => '' : readSecret, savedModelKey: (p: string) => configuredInferenceKey(p) };
+    const keyIO = { json: ctx.json, out: note, secret: readSecret, keyPrompt: commandKeyPrompt(ctx.json, note) };
     if (await ensureModelKey(ag, sealId, provider, keyIO, base ? { agentUrl: base } : undefined) === 'unsupported') {
       requireConfiguredInferenceKey(provider);
       pendingReset = true;

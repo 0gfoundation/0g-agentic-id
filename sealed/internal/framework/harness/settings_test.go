@@ -434,23 +434,23 @@ func TestBridgeEnv_CredentialComesFromTheSettingsDocument(t *testing.T) {
 	}
 }
 
-// A platform-routed endpoint with no key must not reach the spawn: the router
-// answers an unauthenticated call with a 401, so the container would come up
-// healthy and fail every single turn.
-func TestStart_RoutedEndpointWithoutAKeyFails(t *testing.T) {
+// A platform-routed model with no key does not stop the start: the owner sees
+// that no model key is in use and sets one; until then model calls fail.
+func TestStart_RoutedEndpointWithoutAKeyStarts(t *testing.T) {
 	catalogServer(t, reasoningModel("glm-5.3"))
 	a := New()
+	dshHome = t.TempDir()
 	if err := a.RenderSettings(context.Background(), settings.Resolve(context.Background(),
 		settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3"}, "")); err != nil {
 		t.Fatalf("RenderSettings: %v", err)
 	}
+	// Past the key, Start goes on to spawn the harness, which this test
+	// environment does not have: any error left is that one.
 	_, err := a.Start(context.Background(), framework.RuntimeContext{APIKey: "sk-from-runtimecontext"})
-	if err == nil {
-		t.Fatal("Start on a routed endpoint with no resolved key must fail, got nil error")
+	if err != nil && strings.Contains(err.Error(), "inference key") {
+		t.Fatalf("Start refused a routed model with no key: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no inference key") {
-		t.Errorf("the error must name the missing credential, got: %v", err)
-	}
+	_ = a.Stop(context.Background(), 0)
 }
 
 // The half of the settings.yaml migration only this package can write.

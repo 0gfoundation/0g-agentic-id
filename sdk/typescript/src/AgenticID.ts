@@ -80,6 +80,24 @@ export const MIN_SANDBOX_BALANCE_WEI = 10n ** 17n;
 export type WaitLevel = 'minted' | 'running';
 
 /**
+ * Options of a start, reset or retry that creates a container. `apiKey` is
+ * the agent's model key for `provider`: stored in its credential set and,
+ * for older images, sent with the request (see AgentApi.storeModelKey).
+ */
+export interface ModelKeyLifecycleOpts {
+  provider?: string;
+  framework?: string;
+  sealedImage?: string;
+  apiKey?: string;
+  sealedSecretEnv?: string;
+  secretEnv?: SecretEnvMode;
+  /** The credential set already holds the key: send it with the request only (older images). */
+  keepStoredModelKey?: boolean;
+  /** Told when the key could not be stored in the credential set (it still goes with the request). */
+  onWarn?: (warning: string) => void;
+}
+
+/**
  * Facade-normalized deploy/clone acceptance — camelCase like every other
  * SDK return (the attestor's wire JSON speaks snake_case; the mapping
  * happens here so callers never see mixed casing).
@@ -129,11 +147,38 @@ export class AgentApi {
   private readonly attestor: AttestorClient;
   private readonly infra: SandboxClient;
   private readonly ctx: Ctx;
-  constructor(ctx: Ctx, initialConfig?: import('./context').AttestorPublicConfig) {
+  private readonly credentials: CredentialsApi;
+  constructor(ctx: Ctx, initialConfig?: import('./context').AttestorPublicConfig, credentials?: CredentialsApi) {
     this.ctx = ctx;
     this.id = new AgenticIDClient(ctx);
     this.attestor = new AttestorClient(ctx, initialConfig);
     this.infra = new SandboxClient(ctx);
+    this.credentials = credentials ?? new CredentialsApi(ctx, this.attestor);
+  }
+
+  /**
+   * LEGACY(model-key): a model key given to deploy/start/reset/retry goes two
+   * ways while environments move to model keys in the credential set: into
+   * the set as `model.<provider>` (stored before the request, so the new
+   * container boots with it; an image that reads the set prefers it) and with
+   * the request, for images that read only that. Once every environment's
+   * 0g-harness reads the set, the request half goes, and this with it.
+   *
+   * `keepStoredModelKey`: the set already holds the key for the provider, the
+   * request carries it for older images only. Returns whether the set holds
+   * a key for the provider, so a create without one is not refused for it.
+   */
+  private async storeModelKey(sealId: Hash, opts: { provider?: string; apiKey?: string; keepStoredModelKey?: boolean; onWarn?: (warning: string) => void }): Promise<boolean> {
+    if (!opts.apiKey && (!opts.provider || opts.provider === '0g-compute')) return false;
+    const provider = opts.provider ?? (await this.getSettings(sealId)).settings?.provider ?? '0g-compute';
+    if (!opts.apiKey || opts.keepStoredModelKey) return this.credentials.hasModelKey(sealId, provider).catch(() => false);
+    try {
+      await this.credentials.setModelKey(sealId, provider, opts.apiKey, { push: false });
+      return true;
+    } catch (e) {
+      opts.onWarn?.(`the model key was not stored in the agent's credential set (${e instanceof Error ? e.message : String(e)}); this boot gets it with the request only`);
+      return false;
+    }
   }
 
   /**
@@ -262,8 +307,17 @@ export class AgentApi {
     if (!opts?.wait) return accepted;
     // 'minted'  → block on the on-chain mint only (agentId, no url yet).
     // 'running' → also block on provision (container up + reachable url).
-    if (opts.wait === 'running') return { ...accepted, ...(await this.waitForRunning(accepted.sealId, opts)) };
+    // LEGACY(model-key): the key rode the request; once minted it also goes
+    // into the credential set (see storeModelKey), and a running agent that
+    // booted before that is handed the set.
+    const key = params.sandbox?.apiKey;
     const agentId = await this.waitForMint(accepted.sealId, opts);
+    if (key) await this.storeModelKey(accepted.sealId, { provider: params.inference?.provider ?? '0g-compute', apiKey: key });
+    if (opts.wait === 'running') {
+      const running = await this.waitForRunning(accepted.sealId, opts);
+      if (key) await this.credentials.resyncModelKey(accepted.sealId, { agentUrl: running.url }).catch(() => undefined);
+      return { ...accepted, ...running };
+    }
     return { ...accepted, agentId };
   }
 
@@ -981,13 +1035,14 @@ export class AgentApi {
    * existing document is never replaced.
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
-  start(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void>;
-  start(sealId: Hash, arg?: string | { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
+  start(sealId: Hash, opts?: ModelKeyLifecycleOpts): Promise<void>;
+  async start(sealId: Hash, arg?: string | ModelKeyLifecycleOpts): Promise<void> {
     if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
+    const keyInCredentials = await this.storeModelKey(sealId, arg ?? {});
     // `framework` resolves the right sealed image for a first provision (a
     // mint-only hermes/prime agent otherwise boots the default snapshot) —
     // same resolution deploy/reset use. (review #154 opportunity)
-    return this.attestor.lifecycle('start', { sealId, provider: arg?.provider, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey, sealedSecretEnv: arg?.sealedSecretEnv, secretEnv: arg?.secretEnv });
+    return this.attestor.lifecycle('start', { sealId, provider: arg?.provider, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey, sealedSecretEnv: arg?.sealedSecretEnv, secretEnv: arg?.secretEnv, keyInCredentials });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
@@ -1011,8 +1066,9 @@ export class AgentApi {
    * reset onto another `provider` until its settings name one: write them
    * with {@link setSettings} first.
    */
-  reset(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
-    return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
+  async reset(sealId: Hash, opts?: ModelKeyLifecycleOpts): Promise<void> {
+    const keyInCredentials = await this.storeModelKey(sealId, opts ?? {});
+    return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv, keyInCredentials });
   }
 
   /**
@@ -1067,8 +1123,11 @@ export class AgentApi {
   async setSettings(
     sealId: Hash,
     settings: SettingsDoc,
-    opts: { baseVersion: number; onWarn?: (warning: string) => void },
+    opts: { baseVersion: number; onWarn?: (warning: string) => void; modelKey?: string },
   ): Promise<{ version: number }> {
+    // A provider switch takes the new provider's key with it: stored (and
+    // pushed to the running agent) first, so the agent can switch to it.
+    if (opts.modelKey) await this.credentials.setModelKey(sealId, settings.provider ?? '0g-compute', opts.modelKey);
     return this.attestor.setSettings({
       sealId,
       settings,
@@ -1106,8 +1165,9 @@ export class AgentApi {
    * creation — like {@link reset}, the LLM key must be re-supplied (and is
    * sealed the same way, see `secretEnv`).
    */
-  retry(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
-    return this.attestor.retry({ sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
+  async retry(sealId: Hash, opts?: ModelKeyLifecycleOpts): Promise<void> {
+    const keyInCredentials = await this.storeModelKey(sealId, opts ?? {});
+    return this.attestor.retry({ sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv, keyInCredentials });
   }
 
   /**
@@ -1311,12 +1371,12 @@ export class AgenticID {
   constructor(config: AgenticIDConfig, initialConfig?: import('./context').AttestorPublicConfig) {
     const ctx = buildCtx(config);
     this.ctx = ctx;
-    this.agent = new AgentApi(ctx, initialConfig);
+    this.attestor = new AttestorClient(ctx, initialConfig);
+    this.credentials = new CredentialsApi(ctx, this.attestor);
+    this.agent = new AgentApi(ctx, initialConfig, this.credentials);
     this.reputation = new ReputationApi(ctx);
     this.infra = new SandboxClient(ctx);
-    this.attestor = new AttestorClient(ctx, initialConfig);
     this.admin = new AdminApi(this.attestor);
-    this.credentials = new CredentialsApi(ctx, this.attestor);
   }
 
   /**

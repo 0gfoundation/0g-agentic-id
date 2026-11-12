@@ -23,9 +23,14 @@ export async function deployWithInference(ag: AgenticID, params: {
     description: 'deployed from 0g-agentdna',
     framework: params.framework,
     inference: { provider: params.provider, model: params.model },
-    ...(params.provision && !mintFirst ? { sandbox: { apiKey: params.apiKey! } } : {}),
+    ...(params.provision && !mintFirst ? { sandbox: { apiKey: params.apiKey } } : {}),
   });
   const mint = await ag.agent.waitForMint(deployment.sealId, { timeoutMs: 180000 });
+  // LEGACY(model-key): the key rode the create request; once minted it also
+  // goes into the agent's credential set (a mint-first start does both).
+  if (params.apiKey && params.provision && !mintFirst) {
+    await ag.credentials.setModelKey(deployment.sealId, params.provider, params.apiKey, { push: false }).catch(() => undefined);
+  }
   // A mint-only agent also keeps the chosen pin as its settings document, so
   // the container a later reset starts boots on it whatever happens to the
   // copy in the minted persona.

@@ -190,6 +190,14 @@ export interface ModelKeyInUse {
   deploy_provider?: string;
 }
 
+/** {@link CredentialsApi.modelKeys}. */
+export interface ModelKeysView {
+  /** The providers the credential set holds a key for. */
+  stored: Array<{ provider: string; valueHash: string }>;
+  /** The key the running agent uses; null: not running; `unsupported`: an image from before model keys in the set. */
+  inUse: ModelKeyInUse | null | 'unsupported';
+}
+
 /**
  * What the running agent has loaded: the entries the agent may use (names and
  * where they may go, never values) and, from an image that takes model keys
@@ -557,7 +565,7 @@ export class CredentialsApi {
    * route in the registry version the attestor serves now, checked against
    * this agent's image first.
    */
-  async setModelKey(sealId: Hash, provider: string, value: string, opts?: { agentUrl?: string }): Promise<{ version: number; valueHash: Hash; pushWarning?: string }> {
+  async setModelKey(sealId: Hash, provider: string, value: string, opts?: { agentUrl?: string; push?: boolean }): Promise<{ version: number; valueHash: Hash; pushWarning?: string }> {
     const seal = sealId.toLowerCase() as Hash;
     const name = modelKeyName(provider);
     if (!PROVIDER_RE.test(provider) || !NAME_RE.test(name)) throw new Error(`credentials: not a provider id: ${JSON.stringify(provider)}`);
@@ -569,13 +577,56 @@ export class CredentialsApi {
     const entry: CredentialInput = { name, value, hosts: [], positions: [], use: 'model', inference: { provider, ...binding } };
     const doc = await this.buildDocument(seal, [...others, entry], cur.version, cur);
     const version = await this.store(seal, doc, cur.version);
-    const pushWarning = await this.push(seal, doc, opts?.agentUrl).then(() => undefined, (e: unknown) => String(e instanceof Error ? e.message : e));
+    // `push: false`: a container about to be recreated takes it at its boot.
+    const pushWarning = opts?.push === false ? undefined
+      : await this.push(seal, doc, opts?.agentUrl).then(() => undefined, (e: unknown) => String(e instanceof Error ? e.message : e));
     return { version, valueHash: keccak256(fromB64(doc.values[name])), pushWarning };
   }
 
   /** Remove the agent's model key for one provider (see {@link setModelKey}). */
   async removeModelKey(sealId: Hash, provider: string, opts?: { agentUrl?: string }): Promise<{ version: number; pushWarning?: string }> {
     return this.remove(sealId, modelKeyName(provider), opts);
+  }
+
+  /**
+   * The agent's model keys: the providers its credential set holds a key for,
+   * and which key the running agent uses. `inUse` is null when the agent
+   * cannot be asked (not running), `unsupported` when its image predates
+   * model keys in the set.
+   */
+  async modelKeys(sealId: Hash, opts?: { agentUrl?: string }): Promise<ModelKeysView> {
+    const cur = await this.get(sealId);
+    const stored = cur.definitions.filter((d) => d.inference).map((d) => ({ provider: d.inference!.provider, valueHash: d.value_hash }));
+    const loaded = await this.loaded(sealId, opts).catch(() => undefined);
+    return { stored, inUse: !loaded ? null : loaded.model ?? 'unsupported' };
+  }
+
+  /**
+   * Whether the agent has a model key for `provider`: one in its credential
+   * set, or (asked of the running agent) the key handed over at
+   * create/reset being for that provider.
+   */
+  async hasModelKey(sealId: Hash, provider: string, opts?: { agentUrl?: string }): Promise<boolean> {
+    const view = await this.modelKeys(sealId, opts);
+    return view.stored.some((k) => k.provider === provider)
+      || (!!view.inUse && view.inUse !== 'unsupported' && view.inUse.deploy_provider === provider);
+  }
+
+  /**
+   * After a boot: when the credential set holds a key for the provider the
+   * running agent uses and the agent does not run on it (it booted before the
+   * key was stored, or did not get the set at its boot), push the set again.
+   */
+  async resyncModelKey(sealId: Hash, opts?: { agentUrl?: string }): Promise<'in_sync' | 'pushed' | 'not_running' | 'unsupported'> {
+    const view = await this.modelKeys(sealId, opts);
+    if (view.inUse === null) return 'not_running';
+    if (view.inUse === 'unsupported') return 'unsupported';
+    const provider = view.inUse.provider;
+    if (!provider || !view.stored.some((k) => k.provider === provider) || view.inUse.source === 'credentials') return 'in_sync';
+    const cur = await this.get(sealId);
+    if (!cur.document) return 'in_sync';
+    await this.push(sealId.toLowerCase() as Hash, cur.document, opts?.agentUrl);
+    return 'pushed';
   }
 
   private async buildDocument(

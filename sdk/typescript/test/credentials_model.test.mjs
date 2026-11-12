@@ -6,7 +6,29 @@ import { createServer } from 'node:http';
 import { keccak256 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { CredentialsApi, credentialSetTypes, CREDENTIALS_DOMAIN_NAME, CREDENTIALS_DOMAIN_VERSION } from '../dist/index.js';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { credOp, ensureModelKey, renderCredentials } from '../dist/cli/credentials.js';
+import { pickModelKey } from '../dist/cli/modelkey.js';
+import { completeCred } from '../dist/cli/commands/interactive.js';
+
+// The CLI keeps model keys on this machine: these tests never reach the real
+// ones, and every prompt below brings its own draft store.
+process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), 'agentdna-test-'));
+
+/** A model key prompt over an in-memory draft store, recording what it asked. */
+function keys({ draft = {}, interactive = false, confirm = true, typed = '' } = {}) {
+  const asked = [];
+  const keyPrompt = {
+    interactive,
+    out: () => {},
+    secret: async (p) => { asked.push(['secret', p]); return typed; },
+    confirm: async (q) => { asked.push(['confirm', q]); return confirm; },
+    draft: { get: (p) => draft[p] ?? null, save: (p, k) => { draft[p] = k; } },
+  };
+  return { keyPrompt, asked, draft };
+}
 
 const SEAL_PUB = '0x024e3b81af9c2234cad09d679ce6035ed1392347ce64ce405f5dcd36228a25de6e';
 const SEAL_ID = '0x0fb3604de692a0a2ceae1d9e655d0dc28a8a81340534df4ba5c9a66a375f7c8f';
@@ -64,7 +86,7 @@ async function stub(defs, model = () => ({ provider: '0g-compute', source: 'depl
       }
       if (req.method === 'GET' && url.pathname.startsWith('/deployment/')) return json(200, { agent_card: { url: `http://127.0.0.1:${server.address().port}/hello` } });
       if (req.method === 'POST' && url.pathname === '/_seal/credentials') {
-        loaded = JSON.parse(body);
+        loaded = { ...JSON.parse(body), __pushed: true };
         return json(200, { version: loaded.set.version, skipped: {} });
       }
       if (req.method === 'GET' && url.pathname === '/_seal/credentials') {
@@ -131,7 +153,7 @@ test('sdk: a model key is one printable line, for a provider id; it is never rev
   }
 });
 
-test('cli: cred set model takes the settings provider, offers the saved key, and reports it in use', async () => {
+test('cli: cred set model takes the settings provider, offers the key on this machine first, and reports it in use', async () => {
   // The agent applies a key for its settings' provider.
   const s = await stub([], (doc) => doc.defs['model.0g-compute']
     ? { provider: '0g-compute', source: 'credentials', value_hash: hashOf(doc, 'model.0g-compute') }
@@ -139,10 +161,9 @@ test('cli: cred set model takes the settings provider, offers the saved key, and
   try {
     const a = ag(s.port);
     const lines = [];
-    const prompts = [];
-    await credOp(a, SEAL_ID, ['set', 'model'], { json: false, out: (l) => lines.push(l),
-      secret: async (p) => { prompts.push(p); return ''; }, savedModelKey: (p) => (p === '0g-compute' ? 'sk-saved' : null) });
-    assert.match(prompts[0], /^0g-compute model key \(Enter uses the key login saved/);
+    const k = keys({ draft: { '0g-compute': 'sk-saved' }, interactive: true });
+    await credOp(a, SEAL_ID, ['set', 'model'], { json: false, out: (l) => lines.push(l), secret: async () => '', keyPrompt: k.keyPrompt });
+    assert.deepEqual(k.asked, [['confirm', 'use the 0g-compute key saved on this machine?']], 'only asked whether to use the draft');
     assert.ok(s.stored().document.defs['model.0g-compute'], 'stored under the settings provider');
     assert.ok(lines.some((l) => /^added model\.0g-compute — version 4/.test(l)), lines.join('\n'));
     assert.ok(lines.includes('in use now'), lines.join('\n'));
@@ -155,7 +176,9 @@ test('cli: a key for a provider the settings do not use is kept, and the owner i
   const s = await stub([], () => ({ provider: '0g-compute', source: 'deploy' }));
   try {
     const lines = [];
-    await credOp(ag(s.port), SEAL_ID, ['set', 'model', 'provider=anthropic'], { json: false, out: (l) => lines.push(l), secret: async () => 'sk-ant' });
+    const k = keys({ typed: 'sk-ant' });
+    await credOp(ag(s.port), SEAL_ID, ['set', 'model', 'provider=anthropic'], { json: false, out: (l) => lines.push(l), secret: async () => '', keyPrompt: k.keyPrompt });
+    assert.equal(k.draft.anthropic, 'sk-ant', 'a key piped in becomes the key on this machine');
     assert.ok(lines.some((l) => /kept — the agent's settings use 0g-compute; .*provider=anthropic/.test(l)), lines.join('\n'));
   } finally {
     s.server.close();
@@ -165,7 +188,7 @@ test('cli: a key for a provider the settings do not use is kept, and the owner i
 test('cli: an image from before model keys in cred is refused before anything is signed', async () => {
   const s = await stub([], () => null);
   try {
-    await assert.rejects(credOp(ag(s.port), SEAL_ID, ['set', 'model'], { json: false, out: () => {}, secret: async () => 'sk' }),
+    await assert.rejects(credOp(ag(s.port), SEAL_ID, ['set', 'model'], { json: false, out: () => {}, secret: async () => '', keyPrompt: keys({ typed: 'sk' }).keyPrompt }),
       (e) => e.code === 'INFERENCE_PROVIDER_UNSUPPORTED' && /image/.test(e.message));
     assert.equal(s.seen.filter((r) => r.method === 'POST').length, 0);
   } finally {
@@ -177,7 +200,7 @@ test('cli: with no provider in the settings, set model means the one kept, or 0g
   for (const [kept, want] of [[[], 'model.0g-compute'], [['anthropic'], 'model.anthropic']]) {
     const s = await stub(kept.map((p) => ({ name: `model.${p}`, use: 'model', inference: { provider: p } })));
     try {
-      await credOp(ag(s.port, { settings: null }), SEAL_ID, ['set', 'model'], { json: true, out: () => {}, secret: async () => 'sk-x' });
+      await credOp(ag(s.port, { settings: null }), SEAL_ID, ['set', 'model'], { json: true, out: () => {}, secret: async () => '', keyPrompt: keys({ typed: 'sk-x' }).keyPrompt });
       const names = s.stored().document.set.entries.map((e) => e.name);
       assert.deepEqual(names.filter((n) => n === want), [want], `${kept}: ${names}`);
     } finally {
@@ -186,7 +209,7 @@ test('cli: with no provider in the settings, set model means the one kept, or 0g
   }
   const s = await stub(['0g-compute', 'anthropic'].map((p) => ({ name: `model.${p}`, use: 'model', inference: { provider: p } })));
   try {
-    await assert.rejects(credOp(ag(s.port, { settings: null }), SEAL_ID, ['set', 'model'], { json: true, out: () => {}, secret: async () => 'sk' }),
+    await assert.rejects(credOp(ag(s.port, { settings: null }), SEAL_ID, ['set', 'model'], { json: true, out: () => {}, secret: async () => '', keyPrompt: keys({ typed: 'sk' }).keyPrompt }),
       /give provider=/);
   } finally {
     s.server.close();
@@ -215,7 +238,7 @@ test('cli: cred rm model removes the settings provider\'s key and says what the 
     (doc) => (doc.defs['model.0g-compute'] ? { provider: '0g-compute', source: 'credentials', value_hash: hashOf(doc, 'model.0g-compute') } : { provider: '0g-compute', source: 'deploy' }));
   try {
     const lines = [];
-    await credOp(ag(s.port), SEAL_ID, ['rm', 'model'], { json: false, out: (l) => lines.push(l), secret: async () => '' });
+    await credOp(ag(s.port), SEAL_ID, ['rm', 'model'], { json: false, out: (l) => lines.push(l), secret: async () => '', keyPrompt: keys({ interactive: true, confirm: true }).keyPrompt });
     assert.equal(s.stored().document.defs['model.0g-compute'], undefined);
     assert.ok(lines.some((l) => /it was in use: the agent goes back to the 0g-compute key given at create\/reset/.test(l)), lines.join('\n'));
   } finally {
@@ -227,18 +250,18 @@ test('cli: a provider switch asks for the new provider\'s key once, and not on a
   const s = await stub([{ name: 'model.anthropic', use: 'model', inference: { provider: 'anthropic' } }]);
   try {
     const a = ag(s.port);
-    const io = { out: () => {}, secret: async () => 'sk-openai' };
+    const io = { json: false, out: () => {}, secret: async () => '', keyPrompt: keys({ typed: 'sk-openai' }).keyPrompt };
     assert.equal(await ensureModelKey(a, SEAL_ID, 'anthropic', io), 'kept');
     assert.equal(s.seen.filter((r) => r.method === 'POST').length, 0);
     assert.equal(await ensureModelKey(a, SEAL_ID, 'openai', io), 'added');
     assert.ok(s.stored().document.defs['model.openai']);
-    await assert.rejects(ensureModelKey(a, SEAL_ID, 'acme', { out: () => {}, secret: async () => '' }), (e) => e.code === 'INFERENCE_KEY_REQUIRED');
+    await assert.rejects(ensureModelKey(a, SEAL_ID, 'acme', { json: false, out: () => {}, secret: async () => '', keyPrompt: keys().keyPrompt }), (e) => e.code === 'INFERENCE_KEY_REQUIRED');
   } finally {
     s.server.close();
   }
   const old = await stub([], () => null);
   try {
-    assert.equal(await ensureModelKey(ag(old.port), SEAL_ID, 'openai', { out: () => {}, secret: async () => 'sk' }), 'unsupported');
+    assert.equal(await ensureModelKey(ag(old.port), SEAL_ID, 'openai', { json: false, out: () => {}, secret: async () => '', keyPrompt: keys({ typed: 'sk' }).keyPrompt }), 'unsupported');
   } finally {
     old.server.close();
   }
@@ -247,10 +270,96 @@ test('cli: a provider switch asks for the new provider\'s key once, and not on a
 test('cli: a switch back to the provider of the create/reset key asks for no key', async () => {
   const s = await stub([], () => ({ provider: 'anthropic', source: 'credentials', deploy_provider: '0g-compute' }));
   try {
-    const io = { out: () => {}, secret: async () => { throw new Error('asked for a key'); } };
+    const io = { json: false, out: () => {}, secret: async () => { throw new Error('asked for a key'); } };
     assert.equal(await ensureModelKey(ag(s.port), SEAL_ID, '0g-compute', io), 'kept');
     assert.equal(s.seen.filter((r) => r.method === 'POST').length, 0);
   } finally {
     s.server.close();
   }
+});
+
+test('sdk: modelKeys, hasModelKey, and resync pushes the set to an agent that booted without it', async () => {
+  // The running agent uses its create/reset key until it is handed the set.
+  const s = await stub([{ name: 'model.0g-compute', use: 'model', inference: { provider: '0g-compute' } }],
+    (doc) => (doc.__pushed ? { provider: '0g-compute', source: 'credentials', value_hash: hashOf(doc, 'model.0g-compute') } : { provider: '0g-compute', source: 'deploy', deploy_provider: 'anthropic' }));
+  try {
+    const a = ag(s.port);
+    const view = await a.credentials.modelKeys(SEAL_ID);
+    assert.deepEqual(view.stored.map((k) => k.provider), ['0g-compute']);
+    assert.equal(view.inUse.source, 'deploy');
+    assert.equal(await a.credentials.hasModelKey(SEAL_ID, '0g-compute'), true, 'in the set');
+    assert.equal(await a.credentials.hasModelKey(SEAL_ID, 'anthropic'), true, 'the create/reset key');
+    assert.equal(await a.credentials.hasModelKey(SEAL_ID, 'openai'), false);
+    assert.equal(await a.credentials.resyncModelKey(SEAL_ID), 'pushed');
+    assert.ok(s.seen.some((r) => r.method === 'POST' && r.path === '/_seal/credentials'));
+  } finally {
+    s.server.close();
+  }
+  const old = await stub([], () => null);
+  try {
+    assert.equal(await ag(old.port).credentials.resyncModelKey(SEAL_ID), 'unsupported');
+  } finally {
+    old.server.close();
+  }
+});
+
+test('cli: one key per provider: the key on this machine is offered first, a new key replaces it', async () => {
+  // Interactive, a draft, taken.
+  let k = keys({ draft: { anthropic: 'sk-old' }, interactive: true, confirm: true });
+  assert.equal(await pickModelKey('anthropic', k.keyPrompt), 'sk-old');
+  assert.deepEqual(k.asked.map((a) => a[0]), ['confirm']);
+  // Interactive, a draft, declined: the new key replaces it.
+  k = keys({ draft: { anthropic: 'sk-old' }, interactive: true, confirm: false, typed: 'sk-new' });
+  assert.equal(await pickModelKey('anthropic', k.keyPrompt), 'sk-new');
+  assert.equal(k.draft.anthropic, 'sk-new');
+  // Interactive, no draft: the typed key is kept as the draft.
+  k = keys({ interactive: true, typed: 'sk-first' });
+  assert.equal(await pickModelKey('openai', k.keyPrompt), 'sk-first');
+  assert.equal(k.draft.openai, 'sk-first');
+  assert.deepEqual(k.asked.map((a) => a[0]), ['secret']);
+  // Interactive, nothing given: none for an optional key, an error otherwise.
+  k = keys({ interactive: true });
+  assert.equal(await pickModelKey('0g-compute', k.keyPrompt, { optional: true }), null);
+  assert.match(k.asked[0][1], /Enter: none for now/);
+  await assert.rejects(pickModelKey('0g-compute', keys({ interactive: true }).keyPrompt), (e) => e.code === 'INFERENCE_KEY_REQUIRED');
+  // A script is asked nothing: a piped key replaces the draft; else the draft.
+  k = keys({ draft: { anthropic: 'sk-old' }, typed: 'sk-piped' });
+  assert.equal(await pickModelKey('anthropic', k.keyPrompt), 'sk-piped');
+  assert.equal(k.draft.anthropic, 'sk-piped');
+  assert.ok(!k.asked.some((a) => a[0] === 'confirm'));
+  k = keys({ draft: { anthropic: 'sk-old' } });
+  assert.equal(await pickModelKey('anthropic', k.keyPrompt), 'sk-old');
+  assert.equal(await pickModelKey('openai', keys().keyPrompt, { optional: true }), null);
+  await assert.rejects(pickModelKey('openai', keys().keyPrompt), (e) => e.code === 'INFERENCE_KEY_REQUIRED');
+});
+
+test('cli: removing the key in use asks first; no keeps it', async () => {
+  const s = await stub([{ name: 'model.0g-compute', use: 'model', inference: { provider: '0g-compute' } }],
+    (doc) => (doc.defs['model.0g-compute'] ? { provider: '0g-compute', source: 'credentials', value_hash: hashOf(doc, 'model.0g-compute') } : { provider: '0g-compute', source: 'none' }));
+  try {
+    const lines = [];
+    const k = keys({ interactive: true, confirm: false });
+    await credOp(ag(s.port), SEAL_ID, ['rm', 'model'], { json: false, out: (l) => lines.push(l), secret: async () => '', keyPrompt: k.keyPrompt });
+    assert.match(k.asked[0][1], /model\.0g-compute is the key the agent uses/);
+    assert.ok(s.stored().document.defs['model.0g-compute'], 'kept');
+    assert.ok(lines.includes('kept'));
+  } finally {
+    s.server.close();
+  }
+});
+
+test('cli: cred completion: subcommands, names, model providers, options and values', () => {
+  const names = ['github', 'model.0g-compute'];
+  const providers = ['0g-compute', 'anthropic'];
+  assert.deepEqual(completeCred(['se'], names, providers), ['set ']);
+  assert.deepEqual(completeCred(['set', ''], names, providers), ['model ', 'github ']);
+  assert.deepEqual(completeCred(['set', 'model', ''], names, providers), ['provider=']);
+  assert.deepEqual(completeCred(['set', 'model', 'provider=a'], names, providers), ['provider=anthropic']);
+  assert.ok(completeCred(['set', 'github', ''], names, providers).includes('host='));
+  assert.ok(completeCred(['set', 'github', 'preset='], names, providers).includes('preset=github'));
+  assert.deepEqual(completeCred(['set', 'github', 'reveal='], names, providers), ['reveal=yes', 'reveal=no']);
+  assert.deepEqual(completeCred(['rm', ''], names, providers), ['model ', 'github ']);
+  assert.deepEqual(completeCred(['rm', 'model', 'p'], names, providers), ['provider=']);
+  assert.deepEqual(completeCred(['reveal', 'github', 'o'], names, providers), ['on', 'off']);
+  assert.deepEqual(completeCred(['log', ''], names, providers), []);
 });

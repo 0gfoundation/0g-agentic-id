@@ -232,8 +232,10 @@ export interface DeployParams {
      *  signed before the agent (and its agentSeal key) exists, so the key
      *  cannot be sealed and rides the envelope in clear: the wallet prompt
      *  shows it. To keep it out of the prompt, deploy without `sandbox`,
-     *  wait for the mint, then `start(sealId, { apiKey })`. */
-    apiKey: string;
+     *  wait for the mint, then `start(sealId, { apiKey })`. Omit it to
+     *  start without a model key (an agent that cannot call its model until
+     *  one is set with `credentials.setModelKey`). */
+    apiKey?: string;
     /** See {@link SecretEnvMode}. `'sealed'` makes this call throw before
      *  anything is signed, because a one-shot deploy cannot seal the key. */
     secretEnv?: SecretEnvMode;
@@ -969,6 +971,9 @@ export class AttestorClient {
       apiKey?: string;
       /** Credential provider; defaults to legacy compute. */
       provider?: string;
+      /** The agent's credential set holds a model key for `provider`: a
+       *  create without a key is not refused for it. */
+      keyInCredentials?: boolean;
       /** The key already sealed to this agent (the value {@link sealApiKey}
        *  returned, e.g. on an integrator's server), in place of `apiKey`:
        *  signed verbatim as `SEAL_SECRET_ENV`, so the key never has to reach
@@ -986,7 +991,7 @@ export class AttestorClient {
     // WITH a sandboxId resumes an existing (stopped) container instead.
     const create = op === 'reset' || (op === 'start' && !params.sandboxId);
     if (!create && !params.sandboxId) throw new Error(`${op}: sandboxId is required`);
-    if (create && params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined) {
+    if (create && params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined && !params.keyInCredentials) {
       throw new SecretEnvRefusedError('invalid_input', `reset/start for ${params.provider} requires its API key`);
     }
     // Every boot a start or reset brings about is served the agent's settings
@@ -1241,9 +1246,11 @@ export class AttestorClient {
     sealedSecretEnv?: string;
     /** How `apiKey` travels; see {@link SecretEnvMode}. Default `'auto'`. */
     secretEnv?: SecretEnvMode;
+    /** As for {@link lifecycle}: the credential set holds the provider's model key. */
+    keyInCredentials?: boolean;
     envelopeTtlSec?: number;
   }): Promise<void> {
-    if (params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined) {
+    if (params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined && !params.keyInCredentials) {
       throw new SecretEnvRefusedError('invalid_input', `retry for ${params.provider} requires its API key`);
     }
     const { account } = requireWallet(this.ctx);

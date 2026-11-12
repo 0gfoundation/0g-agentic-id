@@ -29,6 +29,8 @@ import {
   type TokenRequestTemplate,
 } from '../Credentials';
 import { CliError, isCancelled } from './errors';
+import { pickModelKey, type KeyPrompt } from './modelkey';
+import { createInterface } from 'node:readline';
 import { emitOk } from './envelope';
 
 /** The keys `cred <agent> set <name>` takes. */
@@ -614,10 +616,7 @@ async function modelSetOp(ag: AgenticID, sealId: Hash, provider: string, defs: C
       remedy: `reset the agent (it starts on the current image), then repeat; until then a reset with the ${provider} key changes it`,
     });
   }
-  const saved = io.savedModelKey?.(provider) ?? null;
-  const typed = (await io.secret(`${provider} model key (${saved ? 'Enter uses the key login saved, ' : ''}Ctrl-C cancels): `)).trim();
-  const value = typed || saved;
-  if (!value) throw new CliError('BAD_FLAG', `${name} needs a value (pipe it in, or type it at the prompt)`, { remedy: MODEL_USAGE });
+  const value = (await pickModelKey(provider, keyPromptOf(io)))!;
   const out = await cred.setModelKey(sealId, provider, value, at).catch(conflict);
   if (io.json) return emitOk({ sealId, version: out.version, name, provider, valueHash: out.valueHash, pushWarning: out.pushWarning ?? null });
   io.out(`${defs.some((d) => d.name === name) ? 'changed' : 'added'} ${name} — version ${out.version}`);
@@ -633,20 +632,18 @@ async function modelRmOp(ag: AgenticID, sealId: Hash, provider: string, defs: Cr
   const name = modelKeyName(provider);
   if (!defs.some((d) => d.name === name)) throw new CliError('BAD_FLAG', `no model key for ${provider}`, { remedy: 'cred <agent>' });
   const { state } = await modelKeyState(cred, sealId, at);
+  const inUse = !!state && state !== 'old' && state.source === 'credentials' && state.provider === provider;
+  const prompt = keyPromptOf(io);
+  if (inUse && prompt.interactive && !await prompt.confirm(`${name} is the key the agent uses: without another ${provider} key it cannot call its model. Remove it?`, false)) {
+    return io.out('kept');
+  }
   const out = await cred.removeModelKey(sealId, provider, at).catch(conflict);
   if (io.json) return emitOk({ sealId, version: out.version, removed: name, pushWarning: out.pushWarning ?? null });
   io.out(`removed ${name} — version ${out.version}. Revoke it at the provider too: removing it here does not.`);
-  if (state && state !== 'old' && state.source === 'credentials' && state.provider === provider) {
-    io.out(`it was in use: the agent goes back to the ${provider} key given at create/reset, if it has one; without one its framework stops until there is a key (cred <agent> set model provider=${provider})`);
+  if (inUse) {
+    io.out(`it was in use: the agent goes back to the ${provider} key given at create/reset, if it has one; without one it cannot call its model until there is a key (cred <agent> set model provider=${provider})`);
   }
   if (out.pushWarning) io.out(`the running agent did not take it: ${out.pushWarning} — it keeps the key until its next boot`);
-}
-
-/** Said at a reset: the set's key for the provider wins over the one the reset gives. */
-export async function resetModelKeyNote(ag: AgenticID, sealId: Hash, provider: string): Promise<string | undefined> {
-  const cur = await ag.credentials.get(sealId).catch(() => undefined);
-  if (!cur?.definitions.some((d) => d.name === modelKeyName(provider))) return undefined;
-  return `the agent uses ${modelKeyName(provider)} from cred, not the key this reset gives (cred <agent> set model changes it)`;
 }
 
 /**
@@ -656,7 +653,7 @@ export async function resetModelKeyNote(ag: AgenticID, sealId: Hash, provider: s
  * `unsupported`: the running agent's image, or the attestor, predates model
  * keys in the set (a reset with the key does it there).
  */
-export async function ensureModelKey(ag: AgenticID, sealId: Hash, provider: string, io: Pick<CredIO, 'out' | 'secret' | 'savedModelKey'>, at?: { agentUrl: string }): Promise<'kept' | 'added' | 'unsupported'> {
+export async function ensureModelKey(ag: AgenticID, sealId: Hash, provider: string, io: Pick<CredIO, 'json' | 'out' | 'secret' | 'keyPrompt'>, at?: { agentUrl: string }): Promise<'kept' | 'added' | 'unsupported'> {
   const cred = ag.credentials;
   const { state } = await modelKeyState(cred, sealId, at);
   if (state === 'old') return 'unsupported';
@@ -670,9 +667,8 @@ export async function ensureModelKey(ag: AgenticID, sealId: Hash, provider: stri
   if (!cur) return 'unsupported';
   const name = modelKeyName(provider);
   if (cur.definitions.some((d) => d.name === name)) return 'kept';
-  const saved = io.savedModelKey?.(provider) ?? null;
-  const value = (await io.secret(`${provider} model key for this agent (${saved ? 'Enter uses the key login saved, ' : ''}Ctrl-C cancels): `)).trim() || saved;
-  if (!value) throw new CliError('INFERENCE_KEY_REQUIRED', `the agent has no ${provider} model key`, { remedy: `cred <agent> set model provider=${provider}, then repeat` });
+  io.out(`the agent has no ${provider} model key yet`);
+  const value = (await pickModelKey(provider, keyPromptOf(io)))!;
   const out = await cred.setModelKey(sealId, provider, value, at).catch(conflict);
   io.out(`added ${name} — version ${out.version}${out.pushWarning ? `; not applied to the running agent: ${out.pushWarning}` : ''}`);
   if (state === null) io.out(`the agent is not running: on an image from before model keys in cred, the switch takes a reset with the ${provider} key`);
@@ -750,6 +746,14 @@ export function renderAudit(recs: AuditRecord[]): string[] {
   return lines;
 }
 
+/** Entry names last read per agent (by sealId), for completion in the shell. */
+const credNames = new Map<string, string[]>();
+
+/** The entry names last read for an agent in this process; none before a read. */
+export function cachedCredNames(sealId: string): string[] {
+  return credNames.get(sealId.toLowerCase()) ?? [];
+}
+
 /** How the operation talks to whoever runs it. */
 export interface CredIO {
   /** `--json`: emit one envelope instead of lines. */
@@ -763,8 +767,35 @@ export interface CredIO {
   secret(prompt: string): Promise<string>;
   /** Write the CLI's own control sequence (a terminal reset), unfiltered; absent off a terminal. */
   raw?(s: string): void;
-  /** The model key `login` saved for a provider, offered at the model key prompt. */
-  savedModelKey?(provider: string): string | null;
+  /** How a model key is asked for (cli/modelkey.ts); by default, as a script is: nothing asked. */
+  keyPrompt?: KeyPrompt;
+}
+
+/** The model key prompt of an operation: its own, or a script's. */
+function keyPromptOf(io: Pick<CredIO, 'json' | 'out' | 'secret' | 'keyPrompt'>): KeyPrompt {
+  return io.keyPrompt ?? { interactive: false, out: io.out, secret: io.secret, confirm: async (_q, def) => def };
+}
+
+/** A yes/no question on the terminal; Enter answers `def`. */
+export async function readConfirm(question: string, def: boolean): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const a = (await new Promise<string>((resolve) => rl.question(`${question} [${def ? 'Y/n' : 'y/N'}] `, resolve))).trim().toLowerCase();
+    return a ? a.startsWith('y') : def;
+  } finally {
+    rl.close();
+  }
+}
+
+/** The model key prompt of a one-shot command: a person at a terminal is asked; a script (stdin piped, `--json`) is not. */
+export function commandKeyPrompt(json: boolean, out: (line: string) => void): KeyPrompt {
+  const interactive = !!process.stdin.isTTY && !json;
+  return {
+    interactive,
+    out,
+    secret: (prompt) => (interactive || !process.stdin.isTTY ? readSecret(prompt) : Promise.resolve('')),
+    confirm: readConfirm,
+  };
 }
 
 function conflict(e: unknown): never {
@@ -815,7 +846,13 @@ function pickPending(list: PendingCredentialRequest[], raw: string | undefined):
  */
 export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: CredIO, agentUrl?: string): Promise<void> {
   const [sub = 'ls', ...rest] = args;
-  const cred = ag.credentials;
+  // Every read of the set leaves its names for completion.
+  const cred = Object.create(ag.credentials) as AgenticID['credentials'];
+  cred.get = async (seal: Hash) => {
+    const cur = await ag.credentials.get(seal);
+    credNames.set(seal.toLowerCase(), cur.definitions.map((d) => d.name));
+    return cur;
+  };
   const at = agentUrl ? { agentUrl } : undefined;
   switch (sub) {
     case 'presets':

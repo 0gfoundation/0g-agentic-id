@@ -100,13 +100,15 @@ agent 可以提出三种请求：交出某个值、新增一个凭据（指定�
 
 agent 调用模型用的 key 也放在凭据集里，一家服务一条（`model.0g-compute`、`model.anthropic` 等）。
 
+- **一家服务一把 key，不管从哪里给**：`login` 存在本机的 key 是其他各步首先提供的那一把。创建或重置 agent、`cred <agent> set model`、`settings` 切换到别家时，都会先问"用本机存的 X key？"。回答否并给一把新的，新的就替换本机那一把。用管道传 key 的脚本不会被提问，它给的 key 替换本机那一把。
 - **谁在用**：sealed 把 key 交给框架调模型用。这一条不在 agent 能看到的凭据列表里，也不能交出。agent 的工具能不能读到 key，取决于框架，和创建/重置时交的 key 一样：0g-compute 上的 0g-harness 拿不到（sealed 在请求发出时填进去）；openclaw、hermes、prime，以及用 `openai`/`anthropic` 的 0g-harness，拿到的是 key 本身，它们的工具读得到。
 - **用哪条**：agent 的设置决定用哪家（`settings <agent> provider=…`），sealed 取那一家的 key；别家的 key 只存着。设置里没写 provider 时，只有一家有 key 就用这一家。
 - **能发到哪**：设置 key 时平台服务列表里这家的地址；之后列表再变，key 也不会被发到新地址。
 - **更换**：`cred <agent> set model` 立即生效：0g-compute 上的 0g-harness 直接换上，不重启；其他框架重启一下，几秒钟。
 - **换服务**：`settings <agent> provider=X model=…` 时，如果凭据集里还没有 X 的 key，会当场问你，存进去后再切换。
-- **没有时**：用创建/重置时交的 key。凭据集里已有这家的 key 时，重置不会替换它，要换用 `cred <agent> set model`。
-- **删掉正在用的 key**：创建/重置时交的 key 是同一家的，就改用它；不是的话，框架停下，直到有 key 为止。删掉的 key 不会再被使用。
+- **创建和重置**：key 和其他凭据一样写进凭据集。老镜像还在用的这段时间里，它也随创建或重置请求一起发出，供只认请求的老镜像使用；能读凭据集的镜像以凭据集里的为准。凭据集里已有这家的 key 时，重置什么都不问。
+- **没有时**：用 0g-compute 的 0g-harness agent 可以不带模型 key 创建或重置：照常运行，调模型时失败，补上 key 后生效。其他框架、其他服务创建或重置时必须有 key。
+- **删掉正在用的 key**：会先确认。创建/重置时交的 key 是同一家的，就改用它；不是的话，调不了模型，直到有 key 为止。删掉的 key 不会再被使用。
 
 ## 转让
 

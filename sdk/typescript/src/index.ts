@@ -27,7 +27,7 @@ if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
 
 // ── Facade + namespaces ──
 export { AgenticID as AgentDNA, AgenticID, AgentApi, AdminApi, ReputationApi } from './AgenticID';
-export type { ContainerStatus, DeployAccepted, WaitLevel } from './AgenticID';
+export type { ContainerStatus, DeployAccepted, WaitLevel, ModelKeyLifecycleOpts } from './AgenticID';
 export { makeAgentClient } from './AgentClient';
 export type {
   AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask,
@@ -91,6 +91,7 @@ export type {
   PendingCredentialRequest,
   CredentialInference,
   ModelKeyInUse,
+  ModelKeysView,
   LoadedCredentials,
 } from './Credentials';
 
