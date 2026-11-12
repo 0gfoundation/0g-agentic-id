@@ -102,7 +102,7 @@ export async function resetModelKey(
   if (cur?.definitions.some((d) => d.name === name)) {
     const saved = (io.draft ?? machineDraft).get(provider);
     if (saved) {
-      io.out(`the agent uses ${name} from cred (cred <agent> set model changes it)`);
+      io.out(`the agent uses ${name} from cred (cred <agent> set model changes it); an image from before model keys in cred uses the ${provider} key on this machine, sent with the reset`);
       return { apiKey: saved, keepStoredModelKey: true };
     }
     io.out(`the agent uses ${name} from cred; an image from before model keys in cred also needs it with the reset (a key given here also replaces the one in cred)`);
