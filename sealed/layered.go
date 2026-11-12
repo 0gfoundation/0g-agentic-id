@@ -308,6 +308,12 @@ func (l *layeredRuntime) switchHarness(ctx context.Context, target string) {
 		logger.Logf("WARN layers: install harness %s: %v; staying on %s", shortHex(target), err, shortHex(prev))
 		return
 	}
+	if v, ok := l.harness.(framework.RuntimePackageValidator); ok {
+		if err := v.ValidateRuntimePackage(layers.HarnessDir(target)); err != nil {
+			logger.Logf("WARN layers: incompatible harness target (%v); staying on %s", err, shortHex(prev))
+			return
+		}
+	}
 	logger.Logf("layers: switching the harness from %s to %s", shortHex(prev), shortHex(target))
 	l.harness.UseHarness(target, layers.HarnessDir(target))
 	if err := l.restartOn(ctx, target); err != nil {

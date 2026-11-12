@@ -1,4 +1,4 @@
-//go:build harnessonly
+//go:build harnessonly && !zghonly
 
 package main
 

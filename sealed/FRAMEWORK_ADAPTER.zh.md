@@ -151,6 +151,7 @@ sealed 的五个组件各自通过一个窄切面消费它:
 | `SigningRules` | `AppliesSigningRules() bool` | 签名 socket:拒签发往 AgenticID `update` / `updateAt` 的交易(drift watcher 的通道),并把每个签名和拒绝记下来给 owner(`GET /_seal/signatures`)。同时设置 `RuntimeSnapshot.SigningRules`,让 agent 文档写明。只有 0g-harness | socket 在三种格式内照签,不做记录;`/_seal/signatures` 返回 404 |
 | `RuntimeTools` | `ServesRuntimeTools() bool` | 签名 socket 和交出 socket:`POST /mcp` 把它们的端点(以及凭据 socket 的端点)作为 MCP 工具提供,由你的框架从 `tools/list` 注册、用 `tools/call` 回调。同时设置 `RuntimeSnapshot.SealTools`,让 agent 文档列出它们。只有 0g-harness(它的 `seal-tools` 插件) | `/mcp` 返回 404 |
 | `LayeredRuntime` | `UseHarness(hash, dir)`、`HarnessHash()`、`InferenceTarget()` | bootstrap 和 `layered.go`:`Start` 运行哪个 harness 包、按 attestor 的目标换包,以及 serve-proof v2(`LAYERS.zh.md` §5、§7)。只有 0g-harness | 运行镜像安装的框架;serve-proof 仍是 v1 |
+| `RuntimePackageValidator` | `ValidateRuntimePackage(dir)` | 引导和在线换包在启动前检查执行协议；zgh 后端拒绝 DSH 包 | 沿用既有选包逻辑 |
 
 实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
 悄悄没实现 = 功能悄悄关闭。

@@ -29,6 +29,7 @@ if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
 export { AgenticID as AgentDNA, AgenticID, AgentApi, AdminApi, ReputationApi } from './AgenticID';
 export type { ContainerStatus, DeployAccepted, WaitLevel } from './AgenticID';
 export { makeAgentClient } from './AgentClient';
+export type { NativeSessions, NativeTasks, NativeResource, NativeEvent } from './NativeResources';
 export type {
   AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask,
   AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,

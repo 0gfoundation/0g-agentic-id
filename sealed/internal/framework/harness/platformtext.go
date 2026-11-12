@@ -12,7 +12,7 @@ import (
 // this adapter can neither restate a platform mechanism wrong nor silently
 // drop one.
 func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
-	return platform.FrameworkFacts{
+	facts := platform.FrameworkFacts{
 		Home: "~/.dsh/",
 		Tracked: []platform.PathNote{
 			{Path: "~/.dsh/skills/<name>/ or <name>.md", Note: "your installed skills — durable capabilities you can invoke by name across sessions. A skill you write and never save here does not survive this container's next restart"},
@@ -38,4 +38,11 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 		// does need to know — that its route is set from outside and not from
 		// a file it can edit — the Untracked note above says.
 	}
+	if a.zgh {
+		facts.VersionScheme = "sealed zgh integration versions"
+		facts.VersionMax = a.preferredVersion()
+		facts.Versions = []string{a.preferredVersion()}
+		facts.Untracked = append(facts.Untracked, platform.PathNote{Note: "~/.dsh/zgh and local zgh memory: sessions, tasks, raw messages, metadata and runtime files stay on disk only, never iData"})
+	}
+	return facts
 }

@@ -60,6 +60,11 @@ const (
 // Start: take the pin RenderSettings resolved → write the agent doc → spawn
 // the harness de-privileged → wait for it to listen.
 func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (framework.StartResult, error) {
+	if a.zgh {
+		if err := a.checkZGHRuntime(); err != nil {
+			return framework.StartResult{}, err
+		}
+	}
 	a.mu.RLock()
 	initialized, token, version := a.initialized, a.bridgeToken, a.binding.PackageVersion
 	rendered := a.rendered
@@ -126,7 +131,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	pc := platform.Build(platform.RuntimeSnapshot{
 		SealedVersion:       rt.SealedVersion,
 		FrameworkVersion:    version,
-		WhitelistMax:        whitelistMax(),
+		WhitelistMax:        a.preferredVersion(),
 		AgentSeal:           rt.AgentSeal,
 		AgentID:             rt.AgentID,
 		Owner:               rt.Owner,
@@ -156,6 +161,11 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		modelBaseURL: modelBaseURL,
 		settingsEnv:  rendered.env,
 		rt:           rt,
+	}
+	if a.zgh && rt.CredHTTPSProxy != "" {
+		// Node's native fetch opts into HTTPS_PROXY; zgh's HTTP tools then
+		// use the same sealed placeholder substitution as subprocess tools.
+		be.settingsEnv = append(append([]string(nil), be.settingsEnv...), "NODE_USE_ENV_PROXY=1")
 	}
 	// The model is called through sealed's inference route (sealed/LAYERS.md
 	// §4.2): every request goes to the endpoint above, names the owner's
@@ -597,6 +607,9 @@ func (a *Adapter) SubprocessLogPath() string { return framework.LogPath(logName)
 // (sealed/LAYERS.md §4.3), so an endpoint the harness's code adds is not
 // reachable from outside until sealed lists it.
 func (a *Adapter) FrameworkRoutes() []framework.Route {
+	if a.zgh {
+		return a.zghRoutes()
+	}
 	backend := fmt.Sprintf("http://127.0.0.1:%d", bridgePort)
 	route := func(prefix, kind, description string, endpoints ...framework.Endpoint) framework.Route {
 		return framework.Route{Prefix: prefix, Kind: kind, Auth: "bearer", Signed: false, Backend: backend, Description: description, Endpoints: endpoints}
