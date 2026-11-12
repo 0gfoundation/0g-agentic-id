@@ -24,7 +24,7 @@ test('L2 /settings model=glm-5.3 narrows to the match', () => {
 
 test('L2 /settings bare offers the keys', () => {
   const [hits] = completeLine('/settings ', L2);
-  assert.deepEqual(hits.sort(), ['model=', 'others=', 'provider=', 'thinking='].sort());
+  assert.deepEqual(hits.sort(), ['harness=', 'model=', 'others=', 'provider=', 'sealed=', 'thinking='].sort());
 });
 
 test('L2 /settings thinking= offers the trio', () => {

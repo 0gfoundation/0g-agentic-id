@@ -16,7 +16,7 @@ import { SDK_VERSION } from './constants';
 import { agenticIDAbi, cloneGateAbi, tappRegistryAbi } from './abi';
 import {
   canonicalSettings, modelAdvisory, settingsAuthMessage, SettingsConflictError, sha256Hex,
-  THINKING_LEVELS, type SettingsDoc,
+  THINKING_LEVELS, versionPicksProblem, type SettingsDoc,
 } from './Settings';
 import {
   SECRET_ENV_SCHEME,
@@ -1134,6 +1134,8 @@ export class AttestorClient {
       && !(THINKING_LEVELS as readonly string[]).includes(thinking.trim().toLowerCase())) {
       throw new Error(`setSettings: thinking must be one of ${THINKING_LEVELS.join('|')}, got "${thinking}"`);
     }
+    const versionsProblem = versionPicksProblem(params.settings.versions);
+    if (versionsProblem) throw new Error(`setSettings: ${versionsProblem}`);
     if (params.settings.provider) await this.assertProviderSupported(params.settings.provider, { sealId: params.sealId });
     if (params.onWarn) {
       for (const w of await modelAdvisory(params.settings, await this.providerDefinition(params.settings.provider ?? '0g-compute'))) params.onWarn(w);

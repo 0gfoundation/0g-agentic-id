@@ -14,9 +14,10 @@
  *   serveProofRequestURIs), against sealed's requestURIForms table and
  *   katTaskHashEdge, agreeing with the SDK's requestUriOf.
  *
- * Same known-answer vector as contracts, sealed and test/serveproof.test.mjs,
- * plus a cross-check against the SDK's production builder and a
- * signServeProof round trip recovered the way the console recovers it.
+ * Same known-answer vectors as contracts, sealed and test/serveproof.test.mjs
+ * (v1) and test/serveproof-v2.test.mjs (v2), plus a cross-check against the
+ * SDK's production builder and a signServeProof round trip recovered the way
+ * the console recovers it, for both versions.
  */
 
 import { test } from 'node:test';
@@ -43,6 +44,7 @@ const KAT_CHAIN_ID = 16602;
 const KAT_IDENTITY = '0x00000000000000000000000000000000000000A9';
 const KAT_VALIDATOR = '0x00000000000000000000000000000000000000B7';
 const KAT_SIGNED_DIGEST = '0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b';
+const KAT_SIGNED_DIGEST_V2 = '0x50f91a86a4e744dddd29bc16e936ab717a8c54074458e4332c5f43661538df4e';
 const KAT_LEGACY_DIGEST = '0x6286d77e85057c51844833e65baab36380e73b1f8a5ec91cbdf23de60e077dcf';
 // The shared fixed tuple, shaped the way an X-Agent-Proof envelope carries it.
 const KAT_ENVELOPE = {
@@ -54,6 +56,15 @@ const KAT_ENVELOPE = {
   data_hashes: [`0x${'22'.repeat(32)}`, `0x${'33'.repeat(32)}`],
   framework_hash: `0x${'44'.repeat(32)}`,
   validator: KAT_VALIDATOR.toLowerCase(),
+};
+// The v2 envelope: the same tuple plus what each layer ran (sealed/LAYERS.md §7).
+const KAT_ENVELOPE_V2 = {
+  ...KAT_ENVELOPE,
+  version: 2,
+  sealed_hash: `0x${'55'.repeat(32)}`,
+  harness_hash: `0x${'66'.repeat(32)}`,
+  inference_url: 'https://router.example/v1',
+  model: 'model-x',
 };
 
 /** `function <name>(…) { … }` from the page source, by brace matching. */
@@ -97,6 +108,15 @@ function sdkParams(env, validator) {
     dataHashes: env.data_hashes,
     frameworkHash: env.framework_hash,
     validator,
+    ...(env.version === undefined
+      ? {}
+      : {
+          version: env.version,
+          sealedHash: env.sealed_hash,
+          harnessHash: env.harness_hash,
+          inferenceURL: env.inference_url,
+          model: env.model,
+        }),
   };
 }
 
@@ -107,6 +127,32 @@ test('console serveProofSignedDigest matches the cross-impl known-answer vector'
   assert.notEqual(got, KAT_LEGACY_DIGEST, 'must not be the personal_sign wrap');
   // validator casing does not matter (the console checksums it)
   assert.equal(digest(KAT_CHAIN_ID, KAT_IDENTITY, KAT_VALIDATOR.toLowerCase(), KAT_ENVELOPE), KAT_SIGNED_DIGEST);
+});
+
+test('console serveProofSignedDigest picks v2 by the envelope version and matches its vector', () => {
+  const { digest } = loadConsole();
+  assert.equal(digest(KAT_CHAIN_ID, KAT_IDENTITY, KAT_VALIDATOR, KAT_ENVELOPE_V2), KAT_SIGNED_DIGEST_V2);
+  assert.equal(
+    digest(KAT_CHAIN_ID, KAT_IDENTITY, KAT_VALIDATOR, KAT_ENVELOPE_V2),
+    buildServeProofSigningHash(sdkParams(KAT_ENVELOPE_V2, KAT_VALIDATOR)),
+  );
+  // An empty inference address (a provider the framework dials itself) hashes too.
+  const direct = { ...KAT_ENVELOPE_V2, inference_url: '' };
+  assert.equal(
+    digest(KAT_CHAIN_ID, KAT_IDENTITY, KAT_VALIDATOR, direct),
+    buildServeProofSigningHash(sdkParams(direct, KAT_VALIDATOR)),
+  );
+  // An unknown version, or a v2 envelope without its strings, is an error, never a v1 digest.
+  assert.throws(() => digest(KAT_CHAIN_ID, KAT_IDENTITY, KAT_VALIDATOR, { ...KAT_ENVELOPE_V2, version: 3 }), /unsupported serve-proof version 3/);
+  assert.throws(() => digest(KAT_CHAIN_ID, KAT_IDENTITY, KAT_VALIDATOR, { ...KAT_ENVELOPE_V2, model: undefined }), /without a string model/);
+});
+
+test('console recovers an SDK-signed v2 proof, and not under the v1 digest', async () => {
+  const { ethers, digest } = loadConsole();
+  const seal = privateKeyToAccount(`0x${'5e'.repeat(32)}`);
+  const signed = await signServeProof(sdkParams(KAT_ENVELOPE_V2, KAT_VALIDATOR), (hash) => seal.sign({ hash }));
+  assert.equal(ethers.recoverAddress(digest(KAT_CHAIN_ID, KAT_IDENTITY, KAT_VALIDATOR, KAT_ENVELOPE_V2), signed.signature), seal.address);
+  assert.notEqual(ethers.recoverAddress(digest(KAT_CHAIN_ID, KAT_IDENTITY, KAT_VALIDATOR, KAT_ENVELOPE), signed.signature), seal.address);
 });
 
 test('console digest agrees with the SDK builder on edge-shaped envelopes', () => {
@@ -168,8 +214,9 @@ test('console taskHash over its uri reproduces katTaskHashEdge; candidates agree
 
 const haveCastJq = spawnSync('sh', ['-c', 'command -v cast && command -v jq'], { stdio: 'ignore' }).status === 0;
 
-test('verify-agent.sh check 3b digest matches the known-answer vector (--kat)', { skip: !haveCastJq && 'cast or jq not on PATH' }, () => {
+test('verify-agent.sh check 3b digest matches the v1 and v2 known-answer vectors (--kat)', { skip: !haveCastJq && 'cast or jq not on PATH' }, () => {
   const r = spawnSync('bash', [VERIFY_AGENT, '--kat'], { encoding: 'utf8' });
   assert.equal(r.status, 0, `verify-agent.sh --kat failed:\n${r.stdout}${r.stderr}`);
-  assert.match(r.stdout, new RegExp(KAT_SIGNED_DIGEST));
+  assert.match(r.stdout, new RegExp(`v1 KAT \\(${KAT_SIGNED_DIGEST}\\)`));
+  assert.match(r.stdout, new RegExp(`v2 KAT \\(${KAT_SIGNED_DIGEST_V2}\\)`));
 });

@@ -234,7 +234,7 @@ test('verifyProof: a v0 proof parsed from its header verifies (envelope validato
   const v = await session.verifyProof(parsed);
   assert.deepEqual(v, {
     ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true,
-    taskMatches: null, reasons: [],
+    layersListed: null, taskMatches: null, reasons: [],
   });
 });
 

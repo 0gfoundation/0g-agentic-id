@@ -24,7 +24,10 @@ import { buildClient } from '../sdk';
 import { CliError } from '../errors';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef, type AgentRef } from '../ref';
-import { applyAssignments, assertModelPresent, assertOthersFitFramework, parseAssignments, renderSettings } from '../settings';
+import {
+  VERSION_KEYS, applyAssignments, assertModelPresent, assertOthersFitFramework, assertVersionsFitFramework,
+  isHarnessFramework, parseAssignments, renderListedVersions, renderSettings,
+} from '../settings';
 import { SettingsConflictError } from '../../Settings';
 import type { CommandContext } from '../types';
 import { changesProvider } from '../../Providers';
@@ -81,18 +84,30 @@ export async function run(ctx: CommandContext): Promise<void> {
   });
 
   if (!writing) {
+    // A 0g-harness agent can be pinned to versions the trust registry lists;
+    // show them. Advisory: no registry, or an unreadable one, shows nothing.
+    const listed = isHarnessFramework(await frameworkOf(ctx.env.attestorUrl, sealId))
+      ? await ag.agent.listedVersions().catch(() => null)
+      : null;
     if (ctx.json) {
-      emitOk({ sealId, settings: current, version });
+      emitOk({ sealId, settings: current, version, ...(listed ? { listedVersions: { sealed: listed.sealed, harness: listed.harness } } : {}) });
       return;
     }
     for (const line of renderSettings(current)) print(line);
+    if (listed) for (const line of renderListedVersions(listed, current?.versions)) print(line);
     return;
   }
 
-  // Before anything is signed: a 0g-harness switch in others= for an agent that runs
-  // another framework does nothing there, or worse (cli/settings.ts).
-  if (assignments.some((a) => a.key === 'others' && a.value !== undefined)) {
-    assertOthersFitFramework(assignments, await frameworkOf(ctx.env.attestorUrl, sealId));
+  // Before anything is signed: a 0g-harness switch in others=, or a version
+  // pick, for an agent that runs another framework does nothing there, or
+  // worse (cli/settings.ts).
+  const frameworkBound = assignments.some(
+    (a) => (a.key === 'others' || (VERSION_KEYS as readonly string[]).includes(a.key)) && a.value !== undefined,
+  );
+  if (frameworkBound) {
+    const framework = await frameworkOf(ctx.env.attestorUrl, sealId);
+    assertOthersFitFramework(assignments, framework);
+    assertVersionsFitFramework(assignments, framework);
   }
   const next = applyAssignments(current, assignments);
   // Before anything is signed: a document with no model is the one state the

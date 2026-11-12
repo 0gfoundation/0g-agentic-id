@@ -1,7 +1,13 @@
 [
   {
     "type": "constructor",
-    "inputs": [],
+    "inputs": [
+      {
+        "name": "trustRegistry_",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
     "stateMutability": "nonpayable"
   },
   {
@@ -34,32 +40,6 @@
     "type": "function",
     "name": "acceptOwnership",
     "inputs": [],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
-    "name": "addTrustedAttestor",
-    "inputs": [
-      {
-        "name": "attestor",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
-    "name": "addValidFrameworkHash",
-    "inputs": [
-      {
-        "name": "frameworkHash",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
     "outputs": [],
     "stateMutability": "nonpayable"
   },
@@ -634,6 +614,19 @@
   },
   {
     "type": "function",
+    "name": "instanceBoundAttestorsRequired",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "intelligentDatasOf",
     "inputs": [
       {
@@ -1070,32 +1063,6 @@
   },
   {
     "type": "function",
-    "name": "removeTrustedAttestor",
-    "inputs": [
-      {
-        "name": "attestor",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
-    "name": "removeValidFrameworkHash",
-    "inputs": [
-      {
-        "name": "frameworkHash",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
     "name": "renounceOwnership",
     "inputs": [],
     "outputs": [],
@@ -1401,6 +1368,53 @@
     ],
     "outputs": [],
     "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "trustRegistry",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "trustedAttestorAppBinding",
+    "inputs": [
+      {
+        "name": "attestor",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "registry",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "appId",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "registeredAt",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "appOwner",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -1998,32 +2012,6 @@
   },
   {
     "type": "event",
-    "name": "TrustedAttestorAdded",
-    "inputs": [
-      {
-        "name": "attestor",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "TrustedAttestorRemoved",
-    "inputs": [
-      {
-        "name": "attestor",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
     "name": "URIUpdated",
     "inputs": [
       {
@@ -2111,32 +2099,6 @@
         "type": "bytes[]",
         "indexed": false,
         "internalType": "bytes[]"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "ValidFrameworkHashAdded",
-    "inputs": [
-      {
-        "name": "frameworkHash",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "ValidFrameworkHashRemoved",
-    "inputs": [
-      {
-        "name": "frameworkHash",
-        "type": "bytes32",
-        "indexed": true,
-        "internalType": "bytes32"
       }
     ],
     "anonymous": false

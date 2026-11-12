@@ -10,6 +10,7 @@
  *   settings <agent> model=0gm-1.0-35b-a3b change one field
  *   settings <agent> thinking=             clear one field
  *   settings <agent> others='{"a": 1}'      the framework's own opaque knobs
+ *   settings <agent> sealed=0x… harness=0x… pick the layered runtime's versions
  *
  * Assignments MERGE into the stored document — the owner is editing one
  * field, not re-authoring the whole thing. The wire write is still a whole
@@ -21,13 +22,19 @@
  */
 
 import { CliError } from './errors';
-import { SETTINGS_FIELDS, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../Settings';
+import { THINKING_LEVELS, type SettingsDoc, type ThinkingLevel, type VersionPicks } from '../Settings';
 
-/** The document's named fields. `others` is opaque JSON; the rest are
+/** The layered runtime's version picks, spelled as their own keys and
+ *  written into the document's `versions` (0g-harness only). */
+export const VERSION_KEYS = ['sealed', 'harness'] as const;
+export type VersionKey = (typeof VERSION_KEYS)[number];
+
+/** The keys the grammar takes: the document's named fields (SETTINGS_FIELDS),
+ *  `versions` spelled as its two picks. `others` is opaque JSON; the rest are
  *  strings. Anything else a container understands is writable through the
  *  SDK, but not through this grammar — the CLI refuses keys it cannot
  *  describe, so a typo can never become a stored field. */
-export const SETTINGS_KEYS = SETTINGS_FIELDS;
+export const SETTINGS_KEYS = ['provider', 'model', 'thinking', 'others', ...VERSION_KEYS] as const;
 export type SettingsKey = (typeof SETTINGS_KEYS)[number];
 
 /** One `key=value`. `value === undefined` means "clear this field". */
@@ -36,7 +43,9 @@ export interface Assignment {
   value: string | ThinkingLevel | unknown | undefined;
 }
 
-const USAGE = '0g-agentdna settings <agent> [provider=… model=… thinking=low|high|max others=<json>]';
+const USAGE = '0g-agentdna settings <agent> [provider=… model=… thinking=low|high|max others=<json> sealed=0x… harness=0x…]';
+
+const isVersionKey = (key: string): key is VersionKey => (VERSION_KEYS as readonly string[]).includes(key);
 
 /** How to quote a JSON value, in either place it can be typed. */
 const FRAMEWORK_QUOTING =
@@ -44,8 +53,9 @@ const FRAMEWORK_QUOTING =
 
 /**
  * Parse `key=value` positionals. Throws `BAD_FLAG` (exit 2) on an unknown
- * key, a bad thinking level, or an `others=` value that is not JSON — all
- * usage errors worth failing on before any network work.
+ * key, a bad thinking level, an `others=` value that is not JSON, or a
+ * version pick that is not a sha256 hash — all usage errors worth failing on
+ * before any network work.
  */
 export function parseAssignments(args: string[]): Assignment[] {
   const out: Assignment[] = [];
@@ -71,6 +81,11 @@ export function parseAssignments(args: string[]): Assignment[] {
     if (key === 'thinking' && !(THINKING_LEVELS as readonly string[]).includes(raw)) {
       throw new CliError('BAD_FLAG', `thinking must be one of ${THINKING_LEVELS.join('|')}, got "${raw}"`, {
         remedy: USAGE,
+      });
+    }
+    if (isVersionKey(key) && !/^0x[0-9a-fA-F]{64}$/.test(raw)) {
+      throw new CliError('BAD_FLAG', `${key}= takes a version's sha256 hash, "0x" + 64 hex, got "${raw}"`, {
+        remedy: `settings <agent>   # on a 0g-harness agent, lists the versions the trust registry has; ${key}= clears the pick`,
       });
     }
     if (key === 'others') {
@@ -131,11 +146,34 @@ export function assertOthersFitFramework(assignments: Assignment[], framework: s
   );
 }
 
+/**
+ * Refuse version picks for an agent known to run another framework, before
+ * anything is signed: only the 0g-harness image's layered runtime reads
+ * `versions`, so elsewhere a pick would be stored and silently do nothing.
+ * An unknown framework (a legacy row) is not refused.
+ */
+export function assertVersionsFitFramework(assignments: Assignment[], framework: string | null | undefined): void {
+  if (!framework || isHarnessFramework(framework)) return;
+  const picks = assignments.filter((a) => isVersionKey(a.key) && a.value !== undefined).map((a) => a.key);
+  if (!picks.length) return;
+  throw new CliError(
+    'BAD_FLAG',
+    `${picks.join('= and ')}= pick${picks.length > 1 ? '' : 's'} the layered runtime's versions, which only 0g-harness agents have; this agent runs ${framework}`,
+    { remedy: 'leave them out: this agent runs on the version its image carries' },
+  );
+}
+
 /** Merge assignments onto the stored document, producing the document to write. */
 export function applyAssignments(base: SettingsDoc | null, assignments: Assignment[]): SettingsDoc {
   const doc: SettingsDoc = { ...(base ?? {}) };
   for (const a of assignments) {
-    if (a.value === undefined) delete doc[a.key];
+    if (isVersionKey(a.key)) {
+      const picks: VersionPicks = { ...(doc.versions ?? {}) };
+      if (a.value === undefined) delete picks[a.key];
+      else picks[a.key] = a.value as string;
+      if (picks.sealed || picks.harness) doc.versions = picks;
+      else delete doc.versions;
+    } else if (a.value === undefined) delete doc[a.key];
     else if (a.key === 'others') doc.others = a.value;
     else doc[a.key] = a.value as string & ThinkingLevel;
   }
@@ -185,10 +223,42 @@ export function renderSettings(doc: SettingsDoc | null): string[] {
   if (!doc || Object.keys(doc).length === 0) return ['(not configured — the agent boots on its framework defaults)'];
   const show = (v: unknown): string =>
     v === undefined || v === null ? '—' : typeof v === 'string' ? v : JSON.stringify(v);
-  const extra = Object.keys(doc).filter(
-    (k) => !(SETTINGS_KEYS as readonly string[]).includes(k) && doc[k] !== undefined,
+  // `versions` shows as its two picks, the keys that write them; a value of
+  // another shape shows as itself.
+  const v = doc.versions as unknown;
+  const picks = v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  const flat: Record<string, unknown> = { ...doc, versions: picks ? undefined : v };
+  if (picks) for (const k of VERSION_KEYS) flat[k] = picks[k] || undefined;
+  const extra = Object.keys(flat).filter(
+    (k) => !(SETTINGS_KEYS as readonly string[]).includes(k) && flat[k] !== undefined,
   );
-  return [...SETTINGS_KEYS.filter((k) => doc[k] !== undefined), ...extra].map(
-    (k) => `${k.padEnd(11)}${show(doc[k])}`,
+  return [...SETTINGS_KEYS.filter((k) => flat[k] !== undefined), ...extra].map(
+    (k) => `${k.padEnd(11)}${show(flat[k])}`,
   );
+}
+
+/**
+ * The versions an owner can pick (0g-harness): the trust registry's sealed
+ * and harness lists in listing order, the last one the newest — what an
+ * agent with no pick moves to once its own version is delisted. The picks in
+ * `picks` are marked, and a pick no longer listed says that it does not run.
+ */
+export function renderListedVersions(
+  listed: { sealed: readonly string[]; harness: readonly string[] },
+  picks?: VersionPicks,
+): string[] {
+  const lines = ['versions the trust registry lists (oldest first; pick with sealed=<hash> harness=<hash>):'];
+  for (const layer of VERSION_KEYS) {
+    const hashes = listed[layer];
+    const pick = picks?.[layer]?.toLowerCase();
+    if (!hashes.length) lines.push(`  ${layer.padEnd(8)} (none listed)`);
+    hashes.forEach((h, i) => {
+      const tags = [i === hashes.length - 1 ? 'newest' : '', pick === h.toLowerCase() ? 'picked' : ''].filter(Boolean);
+      lines.push(`  ${layer.padEnd(8)} ${h}${tags.length ? `  (${tags.join(', ')})` : ''}`);
+    });
+    if (pick && !hashes.some((h) => h.toLowerCase() === pick)) {
+      lines.push(`  ${layer.padEnd(8)} ${picks![layer]}  (picked, not listed: not run)`);
+    }
+  }
+  return lines;
 }

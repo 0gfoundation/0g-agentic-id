@@ -247,7 +247,8 @@ One document per agent says which model it thinks with and how hard. It is **not
 
 ```ts
 const { settings, version } = await ag.agent.getSettings(sealId);
-// settings → { provider?, model?, thinking?: 'low'|'high'|'max', framework?: <any JSON> } | null
+// settings → { provider?, model?, thinking?: 'low'|'high'|'max', others?: <any JSON>,
+//              versions?: { sealed?, harness? } } | null
 //            null = never configured (not an error)
 // version  → what to write back against; 0 when there is no document yet
 
@@ -258,6 +259,8 @@ await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3
 ```
 
 **Whole-document write.** `setSettings` replaces the document — read it first and spread it to change one field. A `thinking` outside `low|high|max` (case-insensitive, as the container compares it) is refused before signing.
+
+**Version picks (0g-harness).** `versions: { sealed, harness }` pins the layered runtime to a sealed program and an official harness version, each by its sha256 (`"0x"` + 64 hex; anything else is refused before signing). `ag.agent.listedVersions()` reads what the trust registry lists — `{ registry, sealed: [...], harness: [...] }` in listing order, the last the newest; `null` on a chain without a trust registry (AgenticID before 1.4.0). The agent runs a pick while it is listed; a layer with no pick keeps its running version while that stays listed and otherwise moves to the newest. The container applies a pushed document at once (`pushSettingsToContainer`), every boot, and every five minutes; the other frameworks ignore `versions`.
 
 **Who may read or write it.** Owner-signed, both directions, against the **live on-chain owner** read at request time — so a seller cannot keep configuring (or reading) an agent they already sold. The SDK signs `AgenticID.Settings.v1:<sealId>:<ts>:<base_version>:<sha256 of the document>` (EIP-191) for a write, and the same message minus the digest for a read (`GET /settings`, no body, base version 0). A rejected call is a clearly-worded HTTP 401. The document is on **no** listing tier and on no public deployment row: `getSettings` is the only way to read it.
 
@@ -318,6 +321,11 @@ const data = await response.json();                   // your normal response bo
 //           validator: "0x…" } | null
 //   (validator = the VerifiedFeedbackRegistry the proof was signed for; diagnostics
 //    only — it is not part of the on-chain proof)
+// A 0g-harness agent on the layered runtime signs a v2 proof, which adds what
+// each layer ran: { …, version: 2, sealedHash: "0x…", harnessHash: "0x…",
+//   inferenceURL: "https://…" (or "" when the framework dials its provider itself),
+//   model: "…" }. Without `version` it is v1 (every other image). The version picks
+// the digest and the registry entry point; the SDK handles both.
 // low-level escape hatch (you build the whole request): ag.reputation.capture(() => fetch(…))
 
 // 2. verify before spending gas (signer == on-chain agentSeal, deadline, dataHashes ⊆ iData).
@@ -329,7 +337,12 @@ const data = await response.json();                   // your normal response bo
 //    the CLI's `rate` does.
 await ag.reputation.verifyProof(proof);
 // → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true,
-//     taskMatches: null, reasons: [] }
+//     layersListed: null, taskMatches: null, reasons: [] }
+// layersListed: null for a v1 proof. For v2, whether the image (frameworkHash),
+// the sealed program and the official harness version it names are all on the
+// trust registry's lists now (AgenticID.trustRegistry(), 1.4.0+) — `ok` needs it;
+// a version delisted since the proof was signed fails, with the layer named in
+// reasons. The registry does not check the lists, so such a proof still redeems.
 // signer attribution only. Pass { task } (the TaskExchange fetchWithProof
 // recorded) to also get taskMatches — the proof bound to THIS exchange's
 // bytes; ok requires the match, and task: null fails closed. Hand-rolled
@@ -368,6 +381,10 @@ await ag.reputation.verifyProof(proof);
 // beyond the registry's nonce retention, state changing between the check and
 // the attest, and non-proof tx failures (gas, RPC) — the proof stays
 // unconsumed, so retry with attestFeedback where that can help.
+// A v2 proof goes to attestVersionedFeedback (VerifiedFeedbackRegistry 1.3.0+;
+// on an older registry it is refused before anything is broadcast), atomically
+// through a batcher that has giveFeedbackAndAttestVersioned (the SDK asks it
+// gas-free once), else on the sequential path with the same preflight.
 // NOTE: an agent's OWNER cannot attest feedback on their own agent — the
 // verified registry rejects it (VerifiedFeedbackSelfFeedback). Feedback must
 // come from a different wallet than the one that owns `agentId`. Neither can
@@ -434,6 +451,7 @@ await ag.reputation.getVerifiedSummary({ agentId });            // unscoped → 
 await ag.reputation.getVerifiedClients(agentId);                // → [ "0x…", … ]  clients with ≥1 verified entry
 await ag.reputation.getVerifiedIndexes(agentId, buyer);         // → [ 1n, 2n ]
 await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHashes: ["0x…"], frameworkHash: "0x…" }  (verified entries only)
+await ag.reputation.getServeLayers(agentId, buyer, idx);        // → { sealedHash: "0x…", harnessHash: "0x…" }  (v2 entries; zero for v1; registry 1.3.0+)
 
 // owner responds to a feedback entry; the client who left it can revoke
 await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackIndex: idx, responseURI: 'ipfs://Qm…', responseHash: keccak256(toBytes('thanks')) });
@@ -765,6 +783,15 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   // is "not now", nothing changed (a compaction or a turn already running, the
   // framework busy, or a reused signature: retry later).
 
+  // `ag.agent.restartRuntime(base, agentId, 'harness' | 'sealed', instanceId?)`
+  // (CLI `/restart`) restarts one layer of a 0g-harness runtime in place: the
+  // harness process (conversation and disk stay), or sealed itself — the loader
+  // starts it again and the agent is away for about one start. Either applies
+  // the owner's version picks and the trust registry's lists. 202 once under
+  // way; 501 where there is no such restart (other frameworks, an image without
+  // the loader), 503 while sealed is still starting, 409 for a reused signature
+  // or a displaced window.
+
   // `ag.agent.signatures(base, agentId, { after })` (CLI `/signatures`) reads
   // what the agent signed as itself and what the runtime refused, oldest
   // first, whichever way the agent reached its sign socket: a message's hash
@@ -936,7 +963,7 @@ The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G
 
 ## Advanced
 
-Raw ABIs (`agenticIDAbi`, `canonicalReputationAbi`, `verifiedFeedbackAbi`, `feedbackBatcherAbi`, `cloneGateAbi`, `standardCloneAuthorizerAbi`, `tappRegistryAbi`, `sandboxServingAbi`) and serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`, and for the `taskHash` commitment `taskHashOf`, `requestUriOf`, `requestUriCandidates`) are exported.
+Raw ABIs (`agenticIDAbi`, `trustRegistryAbi`, `canonicalReputationAbi`, `verifiedFeedbackAbi`, `feedbackBatcherAbi`, `cloneGateAbi`, `standardCloneAuthorizerAbi`, `tappRegistryAbi`, `sandboxServingAbi`), serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`, `serveProofLayers`, `SERVE_PROOF_VERSION`, `SERVE_PROOF_V2_TAG`, and for the `taskHash` commitment `taskHashOf`, `requestUriOf`, `requestUriCandidates`) and trust-registry reads (`trustRegistryOf`, `isListed`, `listedHashes`, `TRUST_KINDS`) are exported.
 
 **Serve-proof canonical digest** (for independent verifiers): two hashes.
 The inner `proofHash` is
@@ -955,7 +982,19 @@ It is **not** personal_sign: a personal_sign (`0x19 0x45`) signature over
 `proofHash` is rejected, and nothing falls back to it. `buildServeProofMessageHash` /
 `buildServeProofSigningHash` are the TS implementation; the Go side lives in
 `sealed/internal/proxy/`. `npm run test:kav` pins both hashes to the
-known-answer vectors the contracts and sealed also assert. The sealed proxy
+known-answer vectors the contracts and sealed also assert.
+
+That is v1, the proof without a `version`. A v2 proof (`version: 2`, signed by
+0g-harness agents on the layered runtime) opens its preimage with a tag and
+adds what each layer ran, under the same 0x00 wrap:
+`keccak256(abi.encode(keccak256("AgentDNA.ServeProof.v2"), chainId,
+identityRegistry, submitter, agentId, timestamp, deadline, taskHash,
+keccak256(abi.encodePacked(dataHashes)), frameworkHash, sealedHash, harnessHash,
+keccak256(bytes(inferenceURL)), keccak256(bytes(model))))` — 14 words against
+v1's 9, so neither signature verifies as the other. The builders, `signServeProof`
+and `verifyServeProofSignature` pick the digest by the `version` field (pass
+`version: 2` and the four layer fields for v2); the registry redeems v2 through
+`attestVersionedFeedback` (1.3.0+). `npm run test:kav` pins the v2 vector too. The sealed proxy
 learns the validator from `VERIFIED_FEEDBACK_ADDR` (injected by the attestor)
 and echoes it as the envelope's `validator` field (diagnostics only, not part
 of the on-chain tuple); when that variable is unset, malformed or zero — or
@@ -1007,7 +1046,7 @@ For the old CLI update path and automatic local-config migration, see
 
 Two levels. The **manager** (`0g-agentdna>`): `list` (public listing with sealIds and the same FRAMEWORK/AGENTSEAL/OWNER columns as `0g-agentdna list`, `⇄ #<agentId>` on agent-owned agents, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `settings <id> [key=value …]` (show or change the agent's configuration document), `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login [provider]` (guided setup: attestor URL → owner key → provider → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
 
-The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/compact` (keep the conversation but have the framework summarize its older part now — 0g-harness, and openclaw 2026.7.1 or later; one or more model calls, can take minutes) `/tasks` `/result [id]` `/cancel [id|all]` `/inbox [all]` `/schedules` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed. On a 0g-harness agent, what the agent says on its own (a background job finished, a reminder came due) prints above the prompt as it arrives, and what came while you were away prints when you enter; `/tasks` lists every turn, background command and subagent with who did it, `/cancel <id>` stops any of them and `/cancel all` everything running. On the other frameworks `/inbox` and `/schedules` say the agent has none.
+The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/compact` (keep the conversation but have the framework summarize its older part now — 0g-harness, and openclaw 2026.7.1 or later; one or more model calls, can take minutes) `/restart harness|sealed` (0g-harness: restart one layer of the runtime in place) `/tasks` `/result [id]` `/cancel [id|all]` `/inbox [all]` `/schedules` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed. On a 0g-harness agent, what the agent says on its own (a background job finished, a reminder came due) prints above the prompt as it arrives, and what came while you were away prints when you enter; `/tasks` lists every turn, background command and subagent with who did it, `/cancel <id>` stops any of them and `/cancel all` everything running. On the other frameworks `/inbox` and `/schedules` say the agent has none.
 
 Configuration persists under `~/.config/0g-agentdna/` — `config.json` (attestor URL), `credentials` (owner key + provider-scoped inference keys, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. `rate` checks a ticket on what the registry checks — expiry and the signature — and discards one that fails on its own merits (bad signature — e.g. one banked from a pre-1.2.0 sealed image — or expiry), but keeps one that fails only because no VerifiedFeedbackRegistry, or a different one, is configured on this side. A ticket whose data hashes the agent has since replaced (it commits state drift every 30 s) still redeems — the registry records the version that served you without comparing it to current chain state — so `rate` only notes it and goes ahead. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 
@@ -1018,7 +1057,7 @@ Configuration persists under `~/.config/0g-agentdna/` — `config.json` (attesto
 | `doctor` | Checks every deploy prerequisite — attestor reachable, RPC, wallet, gas, trust-root ack, sandbox balance ≥ 0.1 OG — and prints a remedy per failing item. Exit 0 when all green, 3 otherwise. |
 | `status <agent>` | One agent's full picture: phase, all three coordinates (agentId / sealId / agentSeal), url, failure reason. `<agent>` is a decimal agentId **or** a `0x…` sealId — the CLI converts between them. When a failed deployment's reason is withheld from the public listing (#64), a configured key makes the CLI fetch it via the owner-signed listing automatically. |
 | `list [--mine] [--phase p]` | Deployment listing; `--mine` (owner-signed, needs the key) adds the owner-only fields. Empty result is `[]` + exit 0. |
-| `settings <agent> [k=v …]` | Show the agent's configuration document; with `key=value` assignments, change it. Keys: `provider`, `model`, `thinking` (`low\|high\|max`), `framework` (opaque JSON — quote it: `framework='{"a": 1}'`, in the REPL too). Assignments **merge** onto the stored document; an empty value (`thinking=`) clears a field. **Both** directions are owner-signed (needs the key). A write is a compare-and-swap against the version just read: a concurrent edit by another client is refused with `SETTINGS_CONFLICT` (exit 3), never overwritten. A merged document with no `model` is refused before signing — that is the one state the container hard-fails on. The chosen model is checked against its provider's configured catalog before signing — an absence is a warning on stderr. Native providers without a catalog accept a manual model ID. A provider change requires a registered matching key and image support, then reports pending reset; execute `reset` with that provider's key. |
+| `settings <agent> [k=v …]` | Show the agent's configuration document; with `key=value` assignments, change it. Keys: `provider`, `model`, `thinking` (`low\|high\|max`), `others` (opaque JSON — quote it: `others='{"a": 1}'`, in the REPL too), and on a 0g-harness agent `sealed` / `harness` (a version's sha256 from the trust registry's lists, which a bare show prints; refused for an agent of another framework). Assignments **merge** onto the stored document; an empty value (`thinking=`) clears a field. **Both** directions are owner-signed (needs the key). A write is a compare-and-swap against the version just read: a concurrent edit by another client is refused with `SETTINGS_CONFLICT` (exit 3), never overwritten. A merged document with no `model` is refused before signing — that is the one state the container hard-fails on. The chosen model is checked against its provider's configured catalog before signing — an absence is a warning on stderr. Native providers without a catalog accept a manual model ID. A provider change requires a registered matching key and image support, then reports pending reset; execute `reset` with that provider's key. |
 
 Environment variables (override the config files):
 

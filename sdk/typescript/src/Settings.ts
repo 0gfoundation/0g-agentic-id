@@ -86,6 +86,15 @@ export interface SettingsDoc {
    */
   others?: unknown;
   /**
+   * The owner's pick of the layered runtime's versions (0g-harness): the
+   * sealed program and the official harness package, each by its sha256
+   * ("0x" + 64 hex) from the trust registry's lists. A pick runs while the
+   * registry lists it; a layer with no pick keeps its running version while
+   * that stays listed, and otherwise moves to the newest listed one
+   * (sealed/LAYERS.md §10). The other frameworks ignore it.
+   */
+  versions?: VersionPicks;
+  /**
    * The document is EXTENSIBLE by design: the container defines the
    * vocabulary, so a field newer than this SDK is legitimate. It is carried
    * through {@link canonicalSettings} untouched, which is what keeps an
@@ -94,12 +103,37 @@ export interface SettingsDoc {
   [key: string]: unknown;
 }
 
+/** The layered runtime's version picks — Go's `settings.Versions`. */
+export interface VersionPicks {
+  sealed?: string;
+  harness?: string;
+}
+
 /** `'0g-compute'` — the provider for which the platform routes the model. */
 export const ZG_COMPUTE_PROVIDER = '0g-compute';
 
 /** The fields the PLATFORM names and guarantees, in Go declaration order.
  *  Everything else in a document belongs to the container. */
-export const SETTINGS_FIELDS = ['provider', 'model', 'thinking', 'others'] as const;
+export const SETTINGS_FIELDS = ['provider', 'model', 'thinking', 'others', 'versions'] as const;
+
+/**
+ * What is wrong with a document's version picks, or null: each pick, when
+ * set, must be "0x" + 64 hex (the container's `settings.Validate` refuses
+ * anything else, and storing it would only fail the live push and then the
+ * next boot).
+ */
+export function versionPicksProblem(versions: unknown): string | null {
+  if (versions === undefined || versions === null) return null;
+  if (typeof versions !== 'object' || Array.isArray(versions)) return 'versions must be an object {sealed?, harness?}';
+  for (const layer of ['sealed', 'harness'] as const) {
+    const pick = (versions as Record<string, unknown>)[layer];
+    if (pick === undefined || pick === '') continue;
+    if (typeof pick !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(pick)) {
+      return `versions.${layer} must be a sha256 hash, "0x" + 64 hex (got ${JSON.stringify(pick)})`;
+    }
+  }
+  return null;
+}
 
 /**
  * THE serialization. Its output is what gets hashed into the signed header
@@ -133,6 +167,22 @@ export function canonicalSettings(doc: SettingsDoc): string {
   if (doc.others !== undefined && doc.others !== null) {
     const raw = JSON.stringify(doc.others);
     if (raw !== undefined) parts.push(`"others":${raw}`);
+  }
+  // A pointer in Go: dropped when nil. Here an object with no pick is
+  // dropped too — it picks nothing either way.
+  const v = doc.versions as unknown;
+  if (v !== undefined && v !== null) {
+    if (typeof v === 'object' && !Array.isArray(v)) {
+      const picks = v as VersionPicks;
+      const inner: string[] = [];
+      if (picks.sealed) inner.push(`"sealed":${JSON.stringify(picks.sealed)}`);
+      if (picks.harness) inner.push(`"harness":${JSON.stringify(picks.harness)}`);
+      if (inner.length) parts.push(`"versions":{${inner.join(',')}}`);
+    } else {
+      // Not the shape the container takes: passed through for it to refuse.
+      const raw = JSON.stringify(v);
+      if (raw !== undefined) parts.push(`"versions":${raw}`);
+    }
   }
   // Anything this SDK version has never heard of goes through untouched, in
   // its own order. The container owns the vocabulary, so a field newer than

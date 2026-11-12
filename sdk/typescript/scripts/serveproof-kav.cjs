@@ -12,6 +12,11 @@
 //                Reputation.t.sol pins the inner hash only — deprecated fork)
 //   - sealed:    TestServeProofDigest_KnownAnswerVector (serveproof_test.go)
 // and test/serveproof.test.mjs repeats them under `npm test`.
+// v2 (sealed/LAYERS.md §7) adds sealedHash 0x55…55, harnessHash 0x66…66,
+// inferenceURL "https://router.example/v1" and model "model-x" to the same
+// inputs: contracts test_serveProofDigestV2_knownAnswerVector
+// (VersionedFeedback.t.sol), sealed TestServeProofDigestV2_KnownAnswerVector
+// (serveproof_v2_test.go), test/serveproof-v2.test.mjs.
 //
 // Run with:  npm run build && node scripts/serveproof-kav.cjs
 // (no test runner needed). Fails the process if an SDK hash drifts.
@@ -56,4 +61,27 @@ assert.strictEqual(
 assert.strictEqual(hashMessage({ raw: got }).toLowerCase(), LEGACY_DIGEST, 'legacy digest vector drifted');
 assert.notStrictEqual(signed.toLowerCase(), LEGACY_DIGEST, 'signed digest must not be the personal_sign wrap');
 
-console.log('serveproof-kav: OK — SDK proofHash + v0 signed digest match the cross-impl vectors');
+const WANT_PROOF_HASH_V2 = '0xdac99843c8993224fa49be6989ea6cb8fc3c5190e2d2e8be132e9d073ba73a73';
+const WANT_SIGNED_DIGEST_V2 = '0x50f91a86a4e744dddd29bc16e936ab717a8c54074458e4332c5f43661538df4e';
+const v2 = {
+  ...params,
+  version: 2,
+  sealedHash: '0x' + '55'.repeat(32),
+  harnessHash: '0x' + '66'.repeat(32),
+  inferenceURL: 'https://router.example/v1',
+  model: 'model-x',
+};
+const gotV2 = buildServeProofMessageHash(v2);
+assert.strictEqual(
+  gotV2.toLowerCase(),
+  WANT_PROOF_HASH_V2,
+  `ServeProof v2 digest drifted from the cross-impl known-answer vector:\n got  ${gotV2}\n want ${WANT_PROOF_HASH_V2}`,
+);
+const signedV2 = buildServeProofSigningHash({ ...v2, validator: VALIDATOR });
+assert.strictEqual(
+  signedV2.toLowerCase(),
+  WANT_SIGNED_DIGEST_V2,
+  `ServeProof v2 signed digest drifted from the cross-impl known-answer vector:\n got  ${signedV2}\n want ${WANT_SIGNED_DIGEST_V2}`,
+);
+
+console.log('serveproof-kav: OK — SDK proofHash + v0 signed digest match the cross-impl vectors (v1 and v2)');

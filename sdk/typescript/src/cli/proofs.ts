@@ -32,6 +32,13 @@ export interface SavedProof {
     taskHash: `0x${string}`; dataHashes: `0x${string}`[]; frameworkHash: `0x${string}`;
     signature: `0x${string}`;
     validator?: `0x${string}`; // envelope diagnostics: lets `rate` tell a registry mismatch from a bad ticket
+    // v2 (absent on a v1 ticket): the version picks the digest and the
+    // registry entry point, so a ticket keeps all of it.
+    version?: number;
+    sealedHash?: `0x${string}`;
+    harnessHash?: `0x${string}`;
+    inferenceURL?: string;
+    model?: string;
   };
   task: TaskReveal;
 }
@@ -80,6 +87,15 @@ export function saveProof(proof: ServeProof, task: TaskReveal, endpoint: string)
       frameworkHash: proof.frameworkHash,
       signature: proof.signature,
       ...(proof.validator ? { validator: proof.validator } : {}),
+      ...(proof.version === undefined
+        ? {}
+        : {
+            version: proof.version,
+            sealedHash: proof.sealedHash,
+            harnessHash: proof.harnessHash,
+            inferenceURL: proof.inferenceURL,
+            model: proof.model,
+          }),
     },
     task,
   };
@@ -156,5 +172,14 @@ export function toServeProof(e: SavedProof): ServeProof {
     frameworkHash: e.proof.frameworkHash,
     signature: e.proof.signature,
     ...(e.proof.validator ? { validator: e.proof.validator } : {}),
+    ...(e.proof.version === undefined
+      ? {}
+      : {
+          version: e.proof.version,
+          sealedHash: e.proof.sealedHash,
+          harnessHash: e.proof.harnessHash,
+          inferenceURL: e.proof.inferenceURL,
+          model: e.proof.model,
+        }),
   };
 }

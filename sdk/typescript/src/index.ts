@@ -64,8 +64,9 @@ export {
   sha256Hex,
   modelAdvisory,
   fetchRouterModelIds,
+  versionPicksProblem,
 } from './Settings';
-export type { SettingsDoc, ThinkingLevel } from './Settings';
+export type { SettingsDoc, ThinkingLevel, VersionPicks } from './Settings';
 export {
   CredentialsApi,
   CredentialsConflictError,
@@ -108,8 +109,13 @@ export {
   buildServeProof,
   signServeProof,
   verifyServeProofSignature,
+  serveProofLayers,
+  SERVE_PROOF_VERSION,
+  SERVE_PROOF_V2_TAG,
 } from './ServeProof';
-export type { BuildServeProofHashParams, BuildServeProofSigningHashParams } from './ServeProof';
+export type { BuildServeProofHashParams, BuildServeProofSigningHashParams, ServeProofLayers } from './ServeProof';
+export { TRUST_KINDS, trustRegistryOf, isListed, listedHashes } from './TrustRegistry';
+export type { TrustKind } from './TrustRegistry';
 export { taskHashOf, requestUriOf, requestUriCandidates } from './taskHash';
 
 // ── Types ──
@@ -119,6 +125,7 @@ export type {
   Feedback,
   FeedbackSummary,
   ServeData,
+  ServeLayers,
   GiveFeedbackParams,
   GiveFeedbackResult,
   TaskReveal,
@@ -143,6 +150,7 @@ export type { ContractAddresses } from './constants';
 // ── ABIs (advanced usage) ──
 export {
   agenticIDAbi,
+  trustRegistryAbi,
   cloneGateAbi,
   standardCloneAuthorizerAbi,
   canonicalReputationAbi,

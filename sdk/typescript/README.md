@@ -141,7 +141,7 @@ await ag.agent.listMyDeployments();           // owner-signed; full detail
 // the container, so widening the vocabulary never needs an attestor change.
 // Owner-signed BOTH ways — it is on no listing and on no public row.
 const { settings, version } = await ag.agent.getSettings(sealId);
-//   settings → { provider, model, thinking, framework } | null   (null = never configured)
+//   settings → { provider, model, thinking, others, versions } | null   (null = never configured)
 //   version  → the number to write back against (0 when there is no document)
 await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3b', thinking: 'high' }, {
   baseVersion: version,                       // compare-and-swap: a stale one is refused, not applied
@@ -149,7 +149,7 @@ await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3
 });                                           // → { version }
 ```
 
-`setSettings` writes the WHOLE document (spread the current one to change a field) and is owner-signed: the attestor verifies the signer against the **live on-chain owner**, so a seller cannot keep configuring an agent they sold — and the same signature gates the READ, because the document is the owner's, not public. It is deliberately **not** on chain — configuration is re-suppliable, where the agent's memory is not. The container picks it up on its next boot (`reset` to apply immediately) and reports success, which promotes it to last-known-good; a container that keeps coming back WITHOUT ever confirming is handed that last-known-good document instead, so a document that prevents boot costs a boot rather than the agent. `framework` is an opaque JSON section for that framework's own knobs — the platform neither parses nor validates it. `onWarn` is advisory only: an unlisted model is reported against its provider's configured catalog without blocking; native providers without a catalog accept manual model IDs. Non-compute providers require runtime image support and a provider-bound key; see [providers](./PROVIDERS.md).
+`setSettings` writes the WHOLE document (spread the current one to change a field) and is owner-signed: the attestor verifies the signer against the **live on-chain owner**, so a seller cannot keep configuring an agent they sold — and the same signature gates the READ, because the document is the owner's, not public. It is deliberately **not** on chain — configuration is re-suppliable, where the agent's memory is not. The container picks it up on its next boot (`reset` to apply immediately) and reports success, which promotes it to last-known-good; a container that keeps coming back WITHOUT ever confirming is handed that last-known-good document instead, so a document that prevents boot costs a boot rather than the agent. `others` is an opaque JSON section for that framework's own knobs — the platform neither parses nor validates it. On 0g-harness, `versions: { sealed, harness }` pins the layered runtime to versions the trust registry lists (`ag.agent.listedVersions()`); the [guide](./GUIDE.md#agagent--lifecycle--reads) has the rule. `onWarn` is advisory only: an unlisted model is reported against its provider's configured catalog without blocking; native providers without a catalog accept manual model IDs. Non-compute providers require runtime image support and a provider-bound key; see [providers](./PROVIDERS.md).
 
 Every write is a **compare-and-swap** on `baseVersion` — the version you read before editing (0 = "no document yet"). If the stored version has moved on, the write is refused with `SettingsConflictError`, which carries the document that is actually there. Re-read, re-apply, write again; do not loop on it, or the other writer's change is the one that disappears.
 
@@ -210,6 +210,10 @@ if (proof) {
 }
 // optional params: valueDecimals / tag1 / tag2 / endpoint / feedbackURI / feedbackHash
 // escape hatch: attestFeedback(agentId, idx, proof) marks an entry submitted separately
+// a v2 proof (0g-harness on the layered runtime: version 2 + sealedHash, harnessHash,
+// inferenceURL, model) goes to attestVersionedFeedback — VerifiedFeedbackRegistry
+// 1.3.0+, refused before broadcast on an older one; verifyProof also checks its
+// layers against the trust registry's lists (layersListed)
 
 // canonical reads (raw 8004 feedback — permissionless, verified or not)
 await ag.reputation.getLastIndex(agentId, buyer);          // → 2n
@@ -225,6 +229,7 @@ await ag.reputation.getVerifiedSummary({ agentId });       // proof-backed entri
 await ag.reputation.getVerifiedClients(agentId);           // clients with ≥1 verified entry
 await ag.reputation.getVerifiedIndexes(agentId, buyer);    // → [1n, …]
 await ag.reputation.getServeData(agentId, buyer, idx);     // → { dataHashes, frameworkHash }
+await ag.reputation.getServeLayers(agentId, buyer, idx);   // → { sealedHash, harnessHash } (v2 proofs; zero for v1)
 // task-receipt opening: pass `task` (method/uri/body hashes/status of the rated
 // interaction) to giveFeedback and the contract verifies it against the proof's
 // taskHash, recording the URI as the entry's TEE-verified endpoint
@@ -368,7 +373,7 @@ const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (
 
 - **[Agents as owners (nested agents)](./GUIDE.md#agents-as-owners-nested-agents)** — an in-container agent runs this SDK as itself over the sign socket (`sealAccount()`), never holding a raw key.
 - **[Addresses](./GUIDE.md#addresses)** — a deployment artifact, not baked into the SDK; `fromAttestor` fills them. Exported constants: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` / `RPC_URL` / `CHAIN_ID` / `RECEIPT_WAIT`.
-- **[Advanced](./GUIDE.md#advanced)** — raw ABIs + serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`, the last three taking the VerifiedFeedbackRegistry as `validator`; `taskHashOf` / `requestUriOf` / `requestUriCandidates` for the taskHash commitment) and the canonical digest spec (EIP-191 version 0x00, intended validator = the registry; 0.2.0 is a hard cut from personal_sign).
+- **[Advanced](./GUIDE.md#advanced)** — raw ABIs + serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`, the last three taking the VerifiedFeedbackRegistry as `validator`, all four picking v1 or v2 by the proof's `version`; `taskHashOf` / `requestUriOf` / `requestUriCandidates` for the taskHash commitment; trust-registry reads) and the canonical digest spec (EIP-191 version 0x00, intended validator = the registry; 0.2.0 is a hard cut from personal_sign).
 - **[CLI](./GUIDE.md#cli-0g-agentdna)** `npx @0gfoundation/0g-agentdna` — interactive shell (deploy/use agents, chat with Esc-interruptible turns); `doctor` / `status <agent>` / `list` subcommands with `--json` for scripts.
 
 ## Notes
