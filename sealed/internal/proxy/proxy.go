@@ -773,6 +773,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	signed := false
 	frameworkRoute := false
 	mcpService := false
+	managedEndpoint := false
 	client := http.DefaultClient
 	if svc, ok := s.matchService(r.URL.Path); ok {
 		mcpService = svc.Transport == "mcp"
@@ -794,11 +795,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		upstream = svc.Backend
 		if host := s.getServiceHost(); host != nil {
 			if status, socket, ok := host.Match(r.URL.Path); ok {
+				managedEndpoint = true
 				if status.State != "running" {
 					http.Error(w, "service is not ready", 503)
 					return
 				}
-				client = servicehost.Client(socket)
+				client = host.HTTPClient(status.ID, socket)
 			}
 		}
 	} else if rt, ok := s.matchFrameworkRoute(r.URL.Path); ok {
@@ -834,6 +836,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Runtime input must never fall through to the owner harness or a shared
+	// user-registered backend. Managed daemons also reject it in their transport.
+	if _, supplied := r.Header[servicehost.RuntimeInputHeader]; supplied && !managedEndpoint {
+		http.Error(w, "runtime input requires a managed request service", http.StatusBadRequest)
+		return
+	}
+	// MCP uses HTTP, not WebSocket upgrades. In particular, managed Unix
+	// endpoints must not fall through to a TCP reverse proxy for localhost.
+	if mcpService && isWebSocketUpgrade(r) {
+		http.Error(w, "MCP WebSocket upgrade unsupported", http.StatusBadRequest)
+		return
+	}
 	// WS upgrades cannot be buffered + signed; hand off to httputil.
 	if isWebSocketUpgrade(r) {
 		s.wsReverseProxy(upstream).ServeHTTP(w, r)

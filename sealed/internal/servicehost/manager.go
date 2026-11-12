@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"golang.org/x/sys/unix"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +28,7 @@ type Status struct {
 	Path        string `json:"path"`
 	Description string `json:"description,omitempty"`
 	State       string `json:"state"`
+	Mode        string `json:"mode,omitempty"`
 	Desired     bool   `json:"desired"`
 	Error       string `json:"error,omitempty"`
 	UID         uint32 `json:"uid"`
@@ -38,6 +41,7 @@ type entry struct {
 	done       chan struct{}
 	cancel     context.CancelFunc
 	generation uint64
+	taskDir    string
 }
 
 type Manager struct {
@@ -47,6 +51,7 @@ type Manager struct {
 	binding  string
 	entries  map[string]*entry
 	closed   bool
+	workers  map[uint32]*worker
 }
 
 // New binds durable service state to this container's owner and identity.
@@ -70,11 +75,19 @@ func New(base, binding string) (*Manager, error) {
 	if st.Uid != 0 || st.Mode&077 != 0 {
 		return nil, fmt.Errorf("service state must be root-owned 0700")
 	}
-	m := &Manager{base: base, binding: binding, entries: map[string]*entry{}}
+	m := &Manager{base: base, binding: binding, entries: map[string]*entry{}, workers: map[uint32]*worker{}}
 	// Source releases are public owner-authored code; work/run remain private to each service UID.
 	programID := sha256.Sum256([]byte(base))
 	m.programs = fmt.Sprintf("/var/lib/sealed-service-programs/%x", programID[:8])
 	if err := privsep.MkdirAll(m.programs, 0755); err != nil {
+		return nil, err
+	}
+	// Loader startup has already killed the previous sealed's descendants.
+	// Never resume a request or any caller-provided runtime input after reboot.
+	if err := privsep.RemoveAll(filepath.Join(m.programs, taskDirName)); err != nil {
+		return nil, err
+	}
+	if err := privsep.MkdirAll(filepath.Join(m.programs, taskDirName), 0755); err != nil {
 		return nil, err
 	}
 	b, err := privsep.ReadFile(filepath.Join(base, "registry.json"), privsep.LimitConfig)
@@ -110,6 +123,7 @@ func New(base, binding string) (*Manager, error) {
 			}
 			e.Path = "/api/mcp/" + e.ID
 			e.State = "stopped"
+			e.Mode = e.Manifest.Mode
 			e.Error = ""
 			m.entries[e.ID] = e
 		}
@@ -220,7 +234,7 @@ func (m *Manager) Publish(man Manifest) (Status, error) {
 			return Status{}, err
 		}
 	}
-	e := &entry{Manifest: man, Status: Status{ID: man.ID, Version: v, Path: "/api/mcp/" + man.ID, Description: man.Description, State: "stopped", UID: uid}}
+	e := &entry{Manifest: man, Status: Status{ID: man.ID, Version: v, Path: "/api/mcp/" + man.ID, Description: man.Description, State: "stopped", UID: uid, Mode: man.Mode}}
 	m.entries[man.ID] = e
 	if err := m.persistLocked(); err != nil {
 		if old == nil {
@@ -288,6 +302,10 @@ func (m *Manager) Start(id string) (Status, error) {
 		e.Desired = false
 		return Status{}, err
 	}
+	if e.Manifest.Mode == "request" {
+		e.State = "running"
+		return e.Status, nil
+	}
 	if err := m.spawnLocked(e); err != nil {
 		e.State = "failed"
 		e.Error = err.Error()
@@ -342,13 +360,31 @@ func (m *Manager) command(ctx context.Context, e *entry) (*exec.Cmd, error) {
 		return nil, err
 	}
 	base := filepath.Join(m.programs, e.ID)
+	if e.taskDir != "" {
+		base = e.taskDir
+	}
 	args := []string{fmt.Sprintf("--as=%d", int64(e.Manifest.MemoryMB)<<20), fmt.Sprintf("--nproc=%d", e.Manifest.Processes), "--nofile=256", "--fsize=67108864", "--", launcher, fmt.Sprint(e.UID), bwrap,
 		"--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try",
 		"--unshare-user",
 		"--cap-drop", "ALL", "--uid", fmt.Sprint(e.UID), "--gid", fmt.Sprint(e.UID),
 		"--clearenv", "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/work", "--setenv", "TMPDIR", "/tmp", "--setenv", "MCP_SOCKET", "/run/service.sock",
 		"--ro-bind", "/usr", "/usr", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/etc", "--dir", "/run",
-		"--ro-bind", filepath.Join(base, "versions", e.Version), "/app", "--bind", filepath.Join(base, "work"), "/work", "--bind", filepath.Join(base, "run"), "/run", "--chdir", "/app"}
+		"--ro-bind", filepath.Join(m.programs, e.ID, "versions", e.Version), "/app", "--bind", filepath.Join(base, "run"), "/run", "--chdir", "/app"}
+	if e.taskDir != "" {
+		args = append(args, "--tmpfs", "/work")
+	} else {
+		args = append(args, "--bind", filepath.Join(base, "work"), "/work")
+	}
+	// Only the immutable image-bundled package is shared, never owner state or
+	// a harness's writable diff. Read the base pointer without importing layers
+	// (layers already depends on framework and would introduce a cycle).
+	if b, err := privsep.ReadFile("/opt/0g-harness/base", 128); err == nil {
+		h := strings.TrimSpace(string(b))
+		if decoded, err := hex.DecodeString(h); err == nil && len(decoded) == 32 {
+			runtime := filepath.Join("/opt/0g-harness", h)
+			args = append(args, "--ro-bind", runtime, runtime, "--setenv", "HARNESS_RUNTIME_ROOT", runtime)
+		}
+	}
 	if e.Manifest.Network == "none" {
 		args = append(args, "--unshare-net")
 	}
@@ -463,6 +499,13 @@ func (m *Manager) Stop(id string) (Status, error) {
 	}
 	e.generation++
 	cancel, done := e.cancel, e.done
+	var taskWaits []chan struct{}
+	for _, w := range m.workers {
+		if w.service == id {
+			w.cancel()
+			taskWaits = append(taskWaits, w.done)
+		}
+	}
 	e.cancel = nil
 	e.cmd = nil
 	e.State = "stopped"
@@ -471,6 +514,9 @@ func (m *Manager) Stop(id string) (Status, error) {
 	}
 	out := e.Status
 	m.mu.Unlock()
+	for _, d := range taskWaits {
+		<-d
+	}
 	if done != nil {
 		select {
 		case <-done:
@@ -488,6 +534,10 @@ func (m *Manager) Resume() {
 	defer m.mu.Unlock()
 	for _, e := range m.entries {
 		if e.Desired {
+			if e.Manifest.Mode == "request" {
+				e.State = "running"
+				continue
+			}
 			if err := m.spawnLocked(e); err != nil {
 				e.State = "failed"
 				e.Error = err.Error()
@@ -502,6 +552,10 @@ func (m *Manager) Close() {
 	m.mu.Lock()
 	m.closed = true
 	var waits []chan struct{}
+	for _, w := range m.workers {
+		w.cancel()
+		waits = append(waits, w.done)
+	}
 	for _, e := range m.entries {
 		e.generation++
 		if e.cancel != nil {

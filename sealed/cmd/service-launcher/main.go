@@ -25,7 +25,7 @@ func run() error {
 		return fmt.Errorf("requires sealed root, uid and a trusted sandbox command")
 	}
 	uid, err := strconv.Atoi(os.Args[1])
-	if err != nil || uid < 200000 || uid >= 200016 {
+	if err != nil || !((uid >= 200000 && uid < 200016) || (uid >= 210000 && uid < 210032)) {
 		return fmt.Errorf("invalid service identity")
 	}
 	if err = syscall.Setgroups([]int{}); err != nil {

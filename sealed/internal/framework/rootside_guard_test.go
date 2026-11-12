@@ -90,21 +90,23 @@ var allowedDirectCalls = map[string]struct {
 	count  int
 	reason string
 }{
-	"cmd/service-launcher/main.go run syscall.Exec":                {1, "trusted image helper first drops supplementary groups, gid and uid to the bounded service identity, then execs the trusted bwrap binary; no service code executes as root"},
-	"internal/servicehost/manager.go Manager.Publish os.MkdirTemp": {1, "stages a release under the root-owned versions directory; service code only sees the final read-only bind mount"},
-	"internal/servicehost/manager.go Manager.Publish os.Chown":     {1, "hands only the work/run directory inode to its unique service UID; the parent remains root-owned and the previous service has been stopped, so it cannot replace the directory"},
-	"internal/framework/state.go OpenLog os.OpenFile":              {1, "framework.StateDir/log is root-only and the file is opened O_NOFOLLOW (TestOpenLogRefusesALink)"},
-	"internal/logger/logger.go Flush os.MkdirAll":                  {1, "the root-only state directory; logger cannot import privsep (privsep logs through it)"},
-	"internal/logger/logger.go Flush os.OpenFile":                  {1, "LogPath in the root-only state directory, opened O_NOFOLLOW"},
-	"internal/proxy/sign.go Server.ListenInternal net.Listen":      {1, "the sign socket is created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link"},
-	"internal/proxy/agentsock.go ServeAgentSocket net.Listen":      {1, "the credential sockets are created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link (as for the sign socket)"},
-	"cmd/loader/supervise.go verifyFile os.Open":                   {1, "hashes /bootstrap, a root-only image file, or a program sealed staged in the loader's root-only state directory (/var/lib/loader, 0700), before it runs; the loader links only the standard library and x/sys (its TestLinkedPackages), so not privsep"},
-	"cmd/loader/supervise.go supervisor.runOnce exec.Command":      {1, "starts the program verifyFile just matched against its hash: /bootstrap, a root-only image file, or a staged program in the root-only state directory; between sealed runs the loader has ended every other process (killLeftovers)"},
-	"cmd/loader/state.go stateDir.prepare os.MkdirAll":             {1, "creates /var/lib/loader, the loader's state directory, under the root-only /var/lib before any sealed runs"},
-	"cmd/loader/state.go stateDir.prepare os.Chmod":                {1, "makes /var/lib/loader 0700: only root (the loader and sealed) enters it"},
-	"cmd/loader/state.go stateDir.read os.ReadFile":                {1, "reads a file in /var/lib/loader, which only root can enter"},
-	"cmd/loader/state.go stateDir.write os.WriteFile":              {1, "writes a file in /var/lib/loader, which only root can enter"},
-	"cmd/loader/state.go stateDir.write os.Rename":                 {1, "renames a file within /var/lib/loader, which only root can enter"},
+	"cmd/service-launcher/main.go run syscall.Exec":                        {1, "trusted image helper first drops supplementary groups, gid and uid to the bounded service identity, then execs the trusted bwrap binary; no service code executes as root"},
+	"internal/servicehost/manager.go Manager.Publish os.MkdirTemp":         {1, "stages a release under the root-owned versions directory; service code only sees the final read-only bind mount"},
+	"internal/servicehost/manager.go Manager.Publish os.Chown":             {1, "hands only the work/run directory inode to its unique service UID; the parent remains root-owned and the previous service has been stopped, so it cannot replace the directory"},
+	"internal/servicehost/request.go taskTransport.RoundTrip os.MkdirTemp": {1, "creates a task directory under sealed's root-owned programs/tasks parent; caller data is never written there"},
+	"internal/servicehost/request.go taskTransport.RoundTrip os.Chown":     {1, "hands a newly created run inode to one reserved worker UID before its sandbox starts; its parent is root-owned"},
+	"internal/framework/state.go OpenLog os.OpenFile":                      {1, "framework.StateDir/log is root-only and the file is opened O_NOFOLLOW (TestOpenLogRefusesALink)"},
+	"internal/logger/logger.go Flush os.MkdirAll":                          {1, "the root-only state directory; logger cannot import privsep (privsep logs through it)"},
+	"internal/logger/logger.go Flush os.OpenFile":                          {1, "LogPath in the root-only state directory, opened O_NOFOLLOW"},
+	"internal/proxy/sign.go Server.ListenInternal net.Listen":              {1, "the sign socket is created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link"},
+	"internal/proxy/agentsock.go ServeAgentSocket net.Listen":              {1, "the credential sockets are created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link (as for the sign socket)"},
+	"cmd/loader/supervise.go verifyFile os.Open":                           {1, "hashes /bootstrap, a root-only image file, or a program sealed staged in the loader's root-only state directory (/var/lib/loader, 0700), before it runs; the loader links only the standard library and x/sys (its TestLinkedPackages), so not privsep"},
+	"cmd/loader/supervise.go supervisor.runOnce exec.Command":              {1, "starts the program verifyFile just matched against its hash: /bootstrap, a root-only image file, or a staged program in the root-only state directory; between sealed runs the loader has ended every other process (killLeftovers)"},
+	"cmd/loader/state.go stateDir.prepare os.MkdirAll":                     {1, "creates /var/lib/loader, the loader's state directory, under the root-only /var/lib before any sealed runs"},
+	"cmd/loader/state.go stateDir.prepare os.Chmod":                        {1, "makes /var/lib/loader 0700: only root (the loader and sealed) enters it"},
+	"cmd/loader/state.go stateDir.read os.ReadFile":                        {1, "reads a file in /var/lib/loader, which only root can enter"},
+	"cmd/loader/state.go stateDir.write os.WriteFile":                      {1, "writes a file in /var/lib/loader, which only root can enter"},
+	"cmd/loader/state.go stateDir.write os.Rename":                         {1, "renames a file within /var/lib/loader, which only root can enter"},
 }
 
 // rootCommands is everything root executes: the functions that may call

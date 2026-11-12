@@ -106,7 +106,7 @@ commit, as long as the chain still holds what this container last committed
 
 | capability | plugins |
 |---|---|
-| chat + agent loop | spine (`dsh-agent-spine-demo`): session, tools, system-prompt, agent, agent-loop, skills, job registry |
+| chat + agent loop | explicit DSH 0.2 core in `src/plugins/core.mjs`: session, tools, system-prompt, agent, agent-loop, skills, job registry |
 | inference | `dsh-llm-pi-ai` (route rendered from the owner's settings by the adapter), `dsh-credentials-local` |
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | filesystem | `dsh-fs-local` + `dsh-tool-fs` |
@@ -115,26 +115,22 @@ commit, as long as the chain still holds what this container last committed
 | loop hygiene | `dsh-tool-call-timeout-policy` |
 | background jobs (`toolJobs` on) | `dsh-tool-jobs`: commands run in the background; a job finishing while the agent is idle opens a turn, whose reply goes to the inbox |
 | subagents (`subagents` on) | `dsh-subagent` + `dsh-subagent-spawn-in-process` + `dsh-tool-subagent`. Each helper is one-shot and runs in the background as a job. Depth is 1. Its tools are `read` and `skill` only |
-| reminders (`schedule` on) | `dsh-schedule`, plus the harness's minimal `sessionPersistence` service (the flush checkpoint dsh-schedule requires) |
-| **platform control points** | `seal-tools`: the runtime's tools as native tools. sealed lists them on its sockets (POST /mcp: signing, services, settings and credentials on the sign socket, reveal on its own socket) and runs each call through the socket's own endpoint, so a tool checks, refuses and records exactly as the endpoint does. sealed caps a registered service's description at 280 bytes and its input example at 2048 |
+| persistence | DSH single-writer `dsh-session-persistence-jsonl`; legacy 0.1.1 conversations migrate through the released session-format catalog |
+| reminders (`schedule` on) | `dsh-schedule` and `dsh-tool-schedule`, with native session persistence and a separate JSON schedule store |
+| **platform control points** | DSH native `dsh-mcp-client` through private stdio-to-Unix bridges. sealed lists tools on its sockets (POST /mcp: signing, services, settings and credentials on the sign socket, reveal on its own socket) and runs each call through that socket's endpoint; checks, refusals and records remain in sealed |
 | | `subagent-guard`: only the main agent writes files, runs commands or signs |
 
 **Deliberately NOT mounted** (each a decision):
 
-- **`session-persistence-*`**: its log format is pinned v0 with no
-  compatibility promise, and no concrete backend ships. The harness persists
-  the conversation itself, and restores it as a resume, without a
-  `seedLength`. So pending inbox work and reminders survive a restart. It
-  provides only the durability checkpoint dsh-schedule needs.
 - **`settings-file`**: its hot-reload would layer `$DSH_HOME/settings.yaml`
   over the composition, letting an agent edit inject an arbitrary inference
   route. Instead, the pin reaches the harness as `SEAL_MODEL_*` env, rendered
   from the owner's settings document before Start (`settings.go`). No
   `settings.yaml` exists.
 - **`tool-cordis`**: in-process tool definition, unaudited and gone on restart.
-- **The `sandbox` stack**: privsep (the kernel uid split) is the isolation
-  wall. DSH's own `sandbox-local` fails closed without bwrap/Landlock, which
-  slim TEE containers lack.
+- **The DSH `sandbox` stack**: the owner Harness uses local executors behind
+  privsep's kernel UID boundary. Hosted programs use sealed's independently
+  supervised bubblewrap sandboxes; the Harness image includes that launcher.
 - **`web`, `e2b`, persistent `terminal`, `goals`, `agent-presets`,
   continuable subagents**: capability surface deferred (see below).
 

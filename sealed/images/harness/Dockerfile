@@ -96,7 +96,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -tags harnessonly -ldflags="-s -w" -o boot
 # fails the build.
 FROM debian:13-slim AS harness-package
 ARG NODE_VERSION=24.22.1
-ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/1e1f9709a6b9c017dfe610694b40418a5cffa90e
+ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/3e84390ad60cda99a5459915c58992331c652093
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
@@ -111,7 +111,7 @@ RUN npm install -g --no-fund --no-audit "${HARNESS_REF}" \
  && GOT="$(node -p "require('$H/package.json').version")" \
  && WANT="$(sed -n '/supportedVersions = \[\]string{/,/^}/p' /tmp/harness-whitelist.go | grep -oE '"[^"]+"' | tail -1 | tr -d '"')" \
  && if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "installed 0g-harness $GOT but whitelist.go records $WANT in the framework role" >&2; exit 1; fi \
- && echo "packaging 0g-harness $GOT with DSH $(node -p "require('$H/node_modules/@deepseek-ai/dsh-agent-spine-demo/package.json').version")" \
+ && echo "packaging 0g-harness $GOT with DSH $(node -p "require('$H/node_modules/@deepseek-ai/dsh-agent/package.json').version")" \
  && if [ -n "$(find "$H" ! -type d ! -type f ! -type l)" ]; then echo "the package holds an entry that is not a directory, file or link" >&2; exit 1; fi \
  && if [ -n "$(find "$H" -type l -lname '/*')" ]; then echo "the package holds a link with an absolute target" >&2; exit 1; fi \
  && (cd "$H" && find . -type l | while read -r l; do r="$(realpath -m --relative-to=. "$(dirname "$l")/$(readlink "$l")")"; case "$r" in ..|../*) echo "link $l leaves the package" >&2; exit 1;; esac; done) \
