@@ -144,6 +144,8 @@ pub async fn handle(
             description: req.description.clone(),
             image: req.image.clone(),
             sandbox_envelope: req.sandbox_envelope.clone(),
+            // Waiting for a set only matters to a container about to boot.
+            await_credentials: req.await_credentials && req.sandbox_envelope.is_some(),
         })
         .await?;
     tracing::info!(?seal_id, "DeployJob enqueued");

@@ -4,6 +4,7 @@ use alloy::primitives::{Address, Bytes, B256};
 use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
     auth::status::NOT_RESUMABLE,
+    credentials_repo::CredentialRepo,
     oss::OssClient,
     sandbox::{envelope_names_sandbox, SandboxError, NOT_CURRENT_SANDBOX},
     AgentId, ChainClient, CloneFromParams, CloneRetryParams, Config, CryptoModule, DeploymentRepo,
@@ -22,6 +23,12 @@ use std::sync::Arc;
 /// regularly exceed it.
 pub(crate) const PROVISION_TIMEOUT: ChronoDuration = ChronoDuration::minutes(5);
 
+/// How long a deploy's container waits for the owner's credential set when
+/// the deploy says one follows (`await_credentials`): the SDK stores the
+/// model key there right after the deploy is accepted, which takes a few
+/// seconds, and a container created at once boots before it.
+pub(crate) const AWAIT_CREDENTIALS: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Clone)]
 pub struct Ctx {
     pub cfg: Config,
@@ -35,6 +42,9 @@ pub struct Ctx {
     /// OSS client for AgentCard uploads. Required — deploy fails if
     /// not configured (no more placeholder URIs).
     pub oss: Arc<OssClient>,
+
+    /// The owners' credential sets: a deploy's container may wait for one.
+    pub credentials: Arc<dyn CredentialRepo>,
 }
 
 /// Jobs may wait past a transfer. Recheck the live owner immediately before
@@ -216,6 +226,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             description,
             image,
             sandbox_envelope,
+            await_credentials,
         } => {
             handle_deploy(
                 ctx,
@@ -226,6 +237,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 description,
                 image,
                 sandbox_envelope,
+                await_credentials,
             )
             .await
         }
@@ -1161,6 +1173,38 @@ fn build_serve_url(
     )
 }
 
+/// Wait until the agent has a credential set for its current ownership, or
+/// `limit` passes; whether one came. A container created after it gets the
+/// set at its first boot. Without one it boots as before: the request half
+/// of the key (LEGACY(model-key)) still reaches it.
+async fn wait_for_credentials(ctx: &Ctx, seal_id: SealId, limit: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    tracing::info!(?seal_id, "container waits for the owner's credential set");
+    loop {
+        if credential_set_stored(ctx, seal_id).await {
+            tracing::info!(?seal_id, "credential set stored; creating the container");
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            tracing::warn!(
+                ?seal_id,
+                "no credential set within {limit:?}; creating the container without it"
+            );
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(std::time::Duration::from_secs(1))).await;
+    }
+}
+
+/// A set the attestor would serve this agent's next boot (`credentials_for_boot`).
+async fn credential_set_stored(ctx: &Ctx, seal_id: SealId) -> bool {
+    let Ok(epoch) = ctx.credentials.epoch(seal_id).await else {
+        return false;
+    };
+    matches!(ctx.credentials.get(seal_id).await, Ok(Some(c)) if c.owner_epoch == epoch)
+}
+
 async fn handle_deploy(
     ctx: &Ctx,
     seal_id: SealId,
@@ -1170,6 +1214,7 @@ async fn handle_deploy(
     description: String,
     image: Option<String>,
     sandbox_envelope: Option<SandboxEnvelope>,
+    await_credentials: bool,
 ) -> anyhow::Result<()> {
     // WYSIWYS: the owner-signed i_data is encrypted and minted verbatim —
     // no synthesis, no per-role merging. The deploy edge already enforced
@@ -1277,7 +1322,12 @@ async fn handle_deploy(
     let mint_fut = run_mint_track(ctx, seal_id, mint_params);
 
     let (storage_res, mint_res, container_res) = if let Some(env) = &sandbox_envelope {
-        let container_fut = run_container_track(ctx, seal_id, env);
+        let container_fut = async {
+            if await_credentials {
+                wait_for_credentials(ctx, seal_id, AWAIT_CREDENTIALS).await;
+            }
+            run_container_track(ctx, seal_id, env).await
+        };
         let (s, m, c) = tokio::join!(storage_fut, mint_fut, container_fut);
         (s, m, Some(c))
     } else {
@@ -2282,6 +2332,9 @@ mod tests {
             deployments: deployments.clone(),
             events: events.clone(),
             oss,
+            credentials: Arc::new(
+                attestor_shared::credentials_repo::InMemoryCredentialRepo::default(),
+            ),
         };
         TestCtx {
             ctx,
@@ -2595,6 +2648,7 @@ mod tests {
             "DeFi helper".to_string(),
             None,
             Some(dummy_envelope("create")),
+            false,
         )
         .await
         .expect("deploy must succeed despite a container failure");
@@ -2655,6 +2709,7 @@ mod tests {
             "DeFi helper".to_string(),
             None,
             Some(dummy_envelope("create")),
+            false,
         )
         .await;
 
@@ -2671,6 +2726,112 @@ mod tests {
         );
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert_eq!(d.phase, DeploymentPhase::Failed, "mint failure = Failed");
+    }
+
+    /// Store a credential set for `seal` at its current epoch, as
+    /// `POST /credentials` does.
+    async fn store_set(ctx: &Ctx, seal: SealId) {
+        let epoch = ctx.credentials.epoch(seal).await.unwrap();
+        ctx.credentials
+            .put(
+                seal,
+                Address::from([0x66; 20]),
+                epoch,
+                0,
+                serde_json::json!({"set": {}}),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A deploy's container waits for the owner's credential set: at once
+    /// when it is stored, until it is stored, and not past the limit; a set
+    /// from an earlier ownership does not count.
+    #[tokio::test(start_paused = true)]
+    async fn the_container_waits_for_the_credential_set() {
+        let t = make_test_ctx();
+        let limit = std::time::Duration::from_secs(60);
+
+        let none = dummy_seal();
+        let at = tokio::time::Instant::now();
+        assert!(
+            !wait_for_credentials(&t.ctx, none, limit).await,
+            "no set: gives up"
+        );
+        assert!(at.elapsed() >= limit, "and only at the limit");
+
+        let stored = B256::repeat_byte(0x21);
+        store_set(&t.ctx, stored).await;
+        let at = tokio::time::Instant::now();
+        assert!(
+            wait_for_credentials(&t.ctx, stored, limit).await,
+            "a stored set"
+        );
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(1),
+            "is taken at once"
+        );
+
+        let earlier = B256::repeat_byte(0x22);
+        store_set(&t.ctx, earlier).await;
+        t.ctx.credentials.set_epoch(earlier, 7).await.unwrap();
+        assert!(
+            !wait_for_credentials(&t.ctx, earlier, limit).await,
+            "an earlier ownership's set is not"
+        );
+
+        let later = B256::repeat_byte(0x23);
+        let ctx = t.ctx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            store_set(&ctx, later).await;
+        });
+        let at = tokio::time::Instant::now();
+        assert!(
+            wait_for_credentials(&t.ctx, later, limit).await,
+            "a set stored while waiting"
+        );
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(5),
+            "is taken when it is stored"
+        );
+    }
+
+    /// With `await_credentials` and the set stored, the deploy creates its
+    /// container as before.
+    #[tokio::test]
+    async fn deploy_waiting_for_credentials_creates_the_container() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::NotStarted,
+            StageStatus::NotStarted,
+            None,
+            None,
+        );
+        store_set(&t.ctx, seal).await;
+        handle_deploy(
+            &t.ctx,
+            seal,
+            Address::from([0x66; 20]),
+            default_test_i_data(),
+            "Sage".to_string(),
+            "DeFi helper".to_string(),
+            None,
+            Some(dummy_envelope("create")),
+            true,
+        )
+        .await
+        .expect("deploy");
+        assert_eq!(
+            t.sandbox.create_calls.load(Ordering::SeqCst),
+            1,
+            "the container is created"
+        );
     }
 
     // ── handle_clone ──────────────────────────────────────────────────

@@ -528,6 +528,23 @@ test('a one-shot deploy keeps its legacy shape (the agent does not exist yet)', 
   });
 });
 
+test('a deploy that awaits the credential set signs await_credentials and sends it', async () => {
+  await withAttestor({}, async (a) => {
+    const { c, signed } = client(a.port);
+    await c.deploy({ name: 'n', description: 'd', sandbox: { apiKey: KEY }, awaitCredentials: true });
+    assert.equal(JSON.parse(signed[0]).await_credentials, true, 'in what the owner signs');
+    assert.equal(a.posts.at(-1).body.await_credentials, true, 'and in the request');
+    // A mint-only deploy has no container to hold.
+    await c.deploy({ name: 'n', description: 'd', awaitCredentials: true });
+    assert.ok(!('await_credentials' in JSON.parse(signed[2])));
+    assert.ok(!('await_credentials' in a.posts.at(-1).body));
+    // Not asked for: both as before.
+    await c.deploy({ name: 'n', description: 'd', sandbox: { apiKey: KEY } });
+    assert.ok(!('await_credentials' in JSON.parse(signed[3])));
+    assert.ok(!('await_credentials' in a.posts.at(-1).body));
+  });
+});
+
 test('no key: a keyless reset needs no seal, and a resume signs an empty payload', async () => {
   await withAttestor({}, async (a) => {
     const { c, signed } = client(a.port);

@@ -246,6 +246,12 @@ export interface DeployParams {
   };
   /** Seconds the sandbox envelope stays valid. Default 180. */
   envelopeTtlSec?: number;
+  /** The caller stores the agent's credential set right after the attestor
+   *  accepts the deploy (`AgentApi.deploy` does with a model key): the
+   *  attestor creates the container once the set is stored, or after a
+   *  minute, so its first boot gets the set. Signed with the deploy; an
+   *  attestor from before ignores it. Only with `sandbox`. */
+  awaitCredentials?: boolean;
 }
 
 export interface DeployCloneResponse {
@@ -1349,6 +1355,7 @@ export class AttestorClient {
 
     // Owner canonical — must match CanonicalDeploy (order is irrelevant; the
     // attestor deserializes then re-checks each field).
+    const awaitCredentials = !!(params.awaitCredentials && params.sandbox);
     const canonical = JSON.stringify({
       domain: DEPLOY_DOMAIN,
       idempotency_key: idempotencyKey,
@@ -1357,6 +1364,7 @@ export class AttestorClient {
       description: params.description,
       image: params.image ?? null,
       i_data: iData,
+      ...(awaitCredentials ? { await_credentials: true } : {}),
     });
     const ownerSig = await walletClient.signMessage({ account, message: canonical });
     // Provision only when a sandbox is given; omit it → mint-only deploy
@@ -1375,6 +1383,7 @@ export class AttestorClient {
       image: params.image ?? null,
       i_data: iData,
       ...(sandbox_envelope ? { sandbox_envelope } : {}),
+      ...(awaitCredentials ? { await_credentials: true } : {}),
     });
   }
 

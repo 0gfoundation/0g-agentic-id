@@ -32,7 +32,7 @@ function agentApi({ stored = [], failSet = false, failSetOnce = false, refuse = 
     },
     retry: async (p) => { await p.beforeWrite?.(); calls.push(['retry', p]); },
     setSettings: async (p) => { calls.push(['setSettings', p.settings.provider]); return { version: 2 }; },
-    deploy: async () => { calls.push(['deploy']); return { seal_id: SEAL, agent_seal_addr: `0x${'a5'.repeat(20)}` }; },
+    deploy: async (p) => { calls.push(['deploy', p.awaitCredentials]); return { seal_id: SEAL, agent_seal_addr: `0x${'a5'.repeat(20)}` }; },
   };
   api.waitForMint = async () => { calls.push(['minted']); return 7n; };
   return { api, calls };
@@ -115,6 +115,7 @@ test('deploy stores the key as it creates the agent, without waiting for the min
   const res = await api.deploy(DEPLOY, { preflight: false });
   assert.deepEqual(calls.map((c) => c[0]), ['deploy', 'setModelKey']);
   assert.deepEqual(calls[1], ['setModelKey', 'anthropic', 'sk-1', false]);
+  assert.equal(calls[0][1], true, 'the container waits for the set');
   assert.equal(res.modelKeyStored, true);
 });
 
@@ -130,6 +131,7 @@ test('deploy without a key touches no set', async () => {
   const { api, calls } = agentApi();
   const res = await api.deploy({ sandbox: {} }, { preflight: false });
   assert.deepEqual(calls.map((c) => c[0]), ['deploy']);
+  assert.equal(calls[0][1], undefined, 'and holds no container');
   assert.equal(res.modelKeyStored, undefined);
 });
 

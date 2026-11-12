@@ -570,7 +570,9 @@ await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …
 `retry`) is stored in the agent's credential set as `model.<provider>`,
 sealed to the agent ([credentials](../../docs/credentials.md#the-model-key)):
 `deploy` stores it as soon as the attestor accepts the agent, without
-waiting for the mint (`modelKeyStored` in the result); `start` / `reset` /
+waiting for the mint (`modelKeyStored` in the result), and the attestor
+creates the container once it is stored, or after a minute, so the first
+boot has it (`awaitCredentials`, signed with the deploy); `start` / `reset` /
 `retry` store it after their own checks pass, before the request is signed.
 Each store is one more owner signature. A container whose image reads model
 keys from the set takes the key from there at boot, so with one stored, a

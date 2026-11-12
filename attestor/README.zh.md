@@ -225,7 +225,7 @@ cargo run -p attestor-indexer# 第三个终端
 
 | 路径 | 干什么 | 鉴权 |
 |---|---|---|
-| `POST /deploy` | 用户部署 agent。sandbox envelope 的 `env` 含 `API_KEY` / `SEAL_SECRET_ENV` 以外的键时返回 `400` 并指出该键 | owner EIP-191 + sandbox envelope EIP-191 |
+| `POST /deploy` | 用户部署 agent。sandbox envelope 的 `env` 含 `API_KEY` / `SEAL_SECRET_ENV` 以外的键时返回 `400` 并指出该键。带 `await_credentials: true`（与其余字段一起签名）时，等 agent 的凭据集存好再创建容器，最多等 60 秒：SDK 在部署被接受后立即把模型 key 存进凭据集，立即创建的容器会先于它启动 | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | 源 owner 为另一 owner 铸一个全新 agent，复用源的链上 iData（dataKey 重封给新 agentSeal）；落 Offline，由新 owner 自行上线 | owner EIP-191，校验签名者 == **链上实时 `ownerOf(source)`**（非自声明 owner） |
 | `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。只有当前启动票据为其签发的 sandbox 才能 `start`（resume），否则返回 `409`：AgentDNA 0.4 之前创建的 sandbox（没有启动票据，或票据没有签发时间），以及 reset 的 create 失败后仍留在记录上的旧 sandbox，都无法 provision，需 reset。envelope 的 `resource_id` 不是该部署当前 sandbox 的 `start` 或 `stop` 同样返回 `409`（API 与 worker 都会检查），因此 reset 之前留存的 sandbox id 不会以该 agent 的名义被启动或停止。create envelope（reset、首次 provision 的 `start`、带 envelope 的 `retry`）的 `env` 含 `API_KEY` / `SEAL_SECRET_ENV` 以外的键时返回 `400` 并指出该键，不会排入任何任务 | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
 | `GET /settings?seal_id=0x…` | owner 读自己的配置文档，连带当前 `version`（下一次写要签的 base）。文档是 owner 的，不进任何公开层——只有这一条路能读。响应还带 `confirmed_version` / `attempts` / `fallback_active`：客户端据此告诉 owner「上次推送没起来、agent 正跑着上一份文档、再推一次就是重试」| owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |

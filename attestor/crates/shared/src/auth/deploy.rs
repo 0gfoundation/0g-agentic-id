@@ -23,6 +23,9 @@ pub struct CanonicalDeploy {
     pub image: Option<String>,
     #[serde(default)]
     pub i_data: Vec<IDataInput>,
+    /// See `DeployRequest::await_credentials`; absent means false.
+    #[serde(default)]
+    pub await_credentials: bool,
 }
 
 impl Canonical for CanonicalDeploy {
@@ -70,6 +73,9 @@ pub fn verify_deploy_signature(
     if canon_idata != req_idata {
         anyhow::bail!("owner envelope: i_data mismatch");
     }
+    if canon.await_credentials != req.await_credentials {
+        anyhow::bail!("owner envelope: await_credentials mismatch");
+    }
     Ok(())
 }
 
@@ -97,7 +103,20 @@ mod tests {
         image: Option<String>,
         i_data: Vec<IDataInput>,
     ) -> DeployRequest {
-        let canonical = serde_json::json!({
+        build_signed(signer, idem, name, description, image, i_data, None)
+    }
+
+    /// `build`, with `await_credentials` in the signed payload when given.
+    fn build_signed(
+        signer: &PrivateKeySigner,
+        idem: &str,
+        name: &str,
+        description: &str,
+        image: Option<String>,
+        i_data: Vec<IDataInput>,
+        await_credentials: Option<bool>,
+    ) -> DeployRequest {
+        let mut canonical = serde_json::json!({
             "domain": CanonicalDeploy::DOMAIN,
             "idempotency_key": idem,
             "owner": format!("0x{}", hex::encode(signer.address().into_array())),
@@ -106,6 +125,9 @@ mod tests {
             "image": image,
             "i_data": i_data,
         });
+        if let Some(a) = await_credentials {
+            canonical["await_credentials"] = serde_json::json!(a);
+        }
         let bytes = serde_json::to_vec(&canonical).unwrap();
         let digest = eip191_digest(&bytes);
         let sig = signer.sign_hash_sync(&B256::from(digest)).unwrap();
@@ -124,6 +146,7 @@ mod tests {
                 signed_message_b64: String::new(),
                 wallet_signature: Bytes::new(),
             }),
+            await_credentials: await_credentials.unwrap_or(false),
         }
     }
 
@@ -141,6 +164,45 @@ mod tests {
         req.name = "Evil".to_string();
         let err = verify_deploy_signature(&req, crypto().as_ref()).unwrap_err();
         assert!(err.to_string().contains("name mismatch"), "got: {err}");
+    }
+
+    /// `await_credentials` is part of what the owner signed: it verifies as
+    /// signed, and neither side of a mismatch is taken.
+    #[test]
+    fn await_credentials_is_signed() {
+        let signer = PrivateKeySigner::random();
+        let req = build_signed(
+            &signer,
+            "idem-1",
+            "Sage",
+            "hi",
+            None,
+            Vec::new(),
+            Some(true),
+        );
+        verify_deploy_signature(&req, crypto().as_ref()).expect("signed true, sent true");
+        let mut added = build(&signer, "idem-1", "Sage", "hi", None, Vec::new());
+        added.await_credentials = true;
+        let err = verify_deploy_signature(&added, crypto().as_ref()).unwrap_err();
+        assert!(
+            err.to_string().contains("await_credentials mismatch"),
+            "got: {err}"
+        );
+        let mut dropped = build_signed(
+            &signer,
+            "idem-1",
+            "Sage",
+            "hi",
+            None,
+            Vec::new(),
+            Some(true),
+        );
+        dropped.await_credentials = false;
+        let err = verify_deploy_signature(&dropped, crypto().as_ref()).unwrap_err();
+        assert!(
+            err.to_string().contains("await_credentials mismatch"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -186,6 +248,7 @@ mod tests {
                 signed_message_b64: String::new(),
                 wallet_signature: Bytes::new(),
             }),
+            await_credentials: false,
         };
         let err = verify_deploy_signature(&req, crypto().as_ref()).unwrap_err();
         assert!(err.to_string().contains("domain"), "got: {err}");

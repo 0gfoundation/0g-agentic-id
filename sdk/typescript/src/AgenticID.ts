@@ -334,10 +334,12 @@ export class AgentApi {
       );
     }
     if (opts?.preflight !== false) await this.preflightOwnerReady();
-    const created = acceptedOf(await this.attestor.deploy(params));
     // The key goes into the credential set as the agent is created: the
-    // attestor takes the deploying owner's set before the mint. (It also
-    // rode the create request for older images: legacy/modelKey.ts.)
+    // attestor takes the deploying owner's set before the mint, and holds
+    // the container until it is stored (`awaitCredentials`), so the first
+    // boot gets it. (It also rides the create request for older images:
+    // legacy/modelKey.ts.)
+    const created = acceptedOf(await this.attestor.deploy(params.sandbox?.apiKey ? { ...params, awaitCredentials: true } : params));
     const key = params.sandbox?.apiKey;
     const provider = params.inference?.provider ?? '0g-compute';
     const accepted: DeployAccepted = key ? { ...created, modelKeyStored: await this.storeModelKey(created.sealId, provider, key) } : created;
