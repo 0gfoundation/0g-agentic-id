@@ -18,10 +18,12 @@
 package settings
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"seal-verify/internal/inference"
@@ -139,6 +141,19 @@ func (d Doc) Validate() error {
 		}
 	}
 	return nil
+}
+
+// OnlyVersionsChanged reports whether d differs from prev in its version
+// picks alone. Such a push changes nothing the framework renders, so it
+// needs no framework restart: the version rule switches what it must.
+func (d Doc) OnlyVersionsChanged(prev Doc) bool {
+	if reflect.DeepEqual(d.Versions, prev.Versions) {
+		return false
+	}
+	d.Versions, prev.Versions = nil, nil
+	a, errA := d.Marshal()
+	b, errB := prev.Marshal()
+	return errA == nil && errB == nil && bytes.Equal(a, b)
 }
 
 // isHash reports whether s is "0x" followed by 64 hex digits.

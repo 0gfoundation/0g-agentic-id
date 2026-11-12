@@ -27,7 +27,7 @@ five did not exist at all in the world of §11.
 |---|---|---|
 | **Who may write it** — owner / agent / platform | Without it there is no basis to accept or reject a change | §5 — four writers, four different authorities |
 | **Persistence** — durable / this-boot-only / never stored | Conflating "not tracked" with "must never be tracked" is how a key reaches chain | §4 (one column) and §7 (the credential, which has none) |
-| **Effect** — hot / harness restart / container rebuild | This is what decides whether a change needs a reset | §8 — every accepted change restarts the framework process |
+| **Effect** — hot / harness restart / container rebuild | This is what decides whether a change needs a reset | §8 — every accepted change restarts the framework process, except one that changes only the version picks |
 | **Domain** — the legal values | Without it there is no validation, and an agent can write itself into a non-booting config | §2, `Doc.Validate` — deliberately thin, and §2 says why |
 | **Binding** — which file, which key, per framework | Where the value actually lands | §6, `RenderSettings` — the one step that stays per-framework |
 
@@ -42,8 +42,9 @@ vocabulary:
 | `model` | the model id, spelled the way that provider spells it |
 | `thinking` | the owner's reasoning-depth preference, one of `settings.Levels` = `{low, high, max}` (`settings.go:56`) |
 | `others` | everything beyond the three named settings: this framework's own knobs — `json.RawMessage`, opaque (`settings.go:45`). Formerly `framework`; a live drill showed owners read that name as "choose the framework", which is the one thing it cannot do (the framework binding is minted identity) — renamed |
+| `versions` | the layered runtime's version picks, `{sealed, harness}`, each a sha256 (`0x` + 64 hex). Only the 0g-harness image under the layered flow reads it, and a pick runs only while the trust registry lists it (LAYERS.md §10) |
 
-`framework` is opaque on purpose, and the opacity is load-bearing in three
+`others` is opaque on purpose, and the opacity is load-bearing in three
 places at once: the platform does not parse it, attestor does not know it
 exists, and the SDK mirrors it as an untyped member. Widening the vocabulary —
 a new knob for one framework — is therefore a change in ONE adapter, not a
@@ -67,7 +68,8 @@ nothing else.
   `framework/harness/spawn.go:65`) while the other two only warn and run modelless
   (`framework/openclaw/spawn.go:65`, `framework/hermes/spawn.go:300`);
 - `thinking` must be one of `Levels`, case-insensitively;
-- `framework` must be valid JSON, and nothing more.
+- `others` must be valid JSON, and nothing more;
+- each `versions` pick must be `0x` + 64 hex.
 
 A boot whose document fails `Validate` still starts where the adapter allows
 it, but sealed then reports `warning` (`owner settings unusable (…); write the
@@ -515,7 +517,10 @@ an encrypt story.
 
 ## 8. When a change takes effect
 
-Every accepted change restarts the framework process. There is no ladder:
+Every accepted change restarts the framework process, except one that changes
+only `versions` under the layered flow: it swaps the document in force and
+restarts nothing, and the version rule restarts only the layer it switches
+(`Doc.OnlyVersionsChanged`, LAYERS.md §3.1). Otherwise there is no ladder:
 
 - `manager.StartParams.PreStart` (`internal/manager/manager.go:122`) runs the
   render immediately before EVERY `adapter.Start` — the first one, a `Reload`,

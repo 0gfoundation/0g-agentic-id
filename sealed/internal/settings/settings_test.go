@@ -287,3 +287,26 @@ func TestVersionsPicks(t *testing.T) {
 		}
 	}
 }
+
+// A push that changes only the picks needs no framework restart; any other
+// change, or none, does.
+func TestOnlyVersionsChanged(t *testing.T) {
+	h1, h2 := "0x"+strings.Repeat("ab", 32), "0x"+strings.Repeat("cd", 32)
+	base := Doc{Provider: "0g-compute", Model: "m", Thinking: "max", Others: json.RawMessage(`{"toolJobs":true}`)}
+	with := func(d Doc, v *Versions) Doc { d.Versions = v; return d }
+	for name, c := range map[string]struct {
+		prev, next Doc
+		want       bool
+	}{
+		"picks added":         {base, with(base, &Versions{Harness: h1}), true},
+		"pick changed":        {with(base, &Versions{Harness: h1}), with(base, &Versions{Harness: h2}), true},
+		"picks cleared":       {with(base, &Versions{Sealed: h1}), base, true},
+		"nothing changed":     {with(base, &Versions{Harness: h1}), with(base, &Versions{Harness: h1}), false},
+		"model and picks":     {base, func() Doc { d := with(base, &Versions{Harness: h1}); d.Model = "n"; return d }(), false},
+		"others, picks equal": {base, func() Doc { d := base; d.Others = json.RawMessage(`{"toolJobs":false}`); return d }(), false},
+	} {
+		if got := c.next.OnlyVersionsChanged(c.prev); got != c.want {
+			t.Errorf("%s: OnlyVersionsChanged = %v, want %v", name, got, c.want)
+		}
+	}
+}

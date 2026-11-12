@@ -1111,22 +1111,31 @@ func startAgent(
 	// so a document that cannot be rendered never becomes the one the next
 	// crash-restart would pick up.
 	var settingsApply sync.Mutex
-	sealedProxy.SetSettings(live.get, func(ctx context.Context, doc settings.Doc) error {
+	sealedProxy.SetSettings(live.get, func(ctx context.Context, doc settings.Doc) (bool, error) {
 		settingsApply.Lock()
 		defer settingsApply.Unlock()
+		// Under the layered flow a push that changes only the version picks
+		// restarts nothing here: the version rule switches what it must, and
+		// restarts only the layer it changes (layered.go).
+		if lr != nil && doc.OnlyVersionsChanged(live.get()) {
+			live.set(doc)
+			logger.Logf("settings: version picks applied (no framework restart)")
+			go lr.recheck()
+			return false, nil
+		}
 		choice := keys.choose(doc)
 		resolved, err := keys.resolve(ctx, choice)
 		if err != nil {
-			return err
+			return false, err
 		}
 		prev := live.get()
 		live.set(doc)
 		if err := renderResolved(ctx, choice, resolved); err != nil {
 			live.set(prev)
-			return fmt.Errorf("render: %w", err)
+			return false, fmt.Errorf("render: %w", err)
 		}
 		if err := mgr.Reload(ctx); err != nil {
-			return fmt.Errorf("restart: %w", err)
+			return true, fmt.Errorf("restart: %w", err)
 		}
 		if agent.Phase() == state.PhaseRunning {
 			currentStatus.SupervisorRecovered()
@@ -1143,7 +1152,7 @@ func startAgent(
 				go report.Status(cfg.AttestorURL, agentSealPriv, sealID, level, msg, cfg.StatusBinding)
 			}
 		}
-		return nil
+		return true, nil
 	})
 	sealedProxy.SetRuntimeSettings(live.runtime)
 
