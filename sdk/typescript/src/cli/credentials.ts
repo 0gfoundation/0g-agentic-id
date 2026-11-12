@@ -17,6 +17,9 @@ import {
   CredentialsConflictError,
   definitionOf,
   inputOf,
+  MODEL_KEY_PREFIX,
+  modelKeyName,
+  type ModelKeyInUse,
   type CredentialMCP,
   type CredentialSigner,
   type CredentialDefinition,
@@ -44,6 +47,8 @@ type OAuth2Preset = (typeof OAUTH2_PRESETS)[number];
 const OAUTH2_USAGE =
   'cred <agent> set <name> preset=oauth2-refresh|oauth2-client token_url=https://… client_id=… api_host=api.example [client_secret=<entry>] [scope=…]';
 
+const MODEL_USAGE = 'cred <agent> set model [provider=<id>]';
+
 export const CRED_USAGE = `usage:
   cred <agent>                         list the agent's credentials (never values)
   ${SET_USAGE}
@@ -53,6 +58,11 @@ export const CRED_USAGE = `usage:
                                        trades for access tokens; the agent uses [[credential:derived:<name>]] on api_host
   cred presets                         the presets, and where to create each key
   cred <agent> rm <name>               remove one (revoke it at its provider as well)
+  ${MODEL_USAGE}
+                                       the agent's model key for a provider (default: the one its settings use);
+                                       the settings choose which provider's key is used, so keys for several may be kept
+  cred <agent> rm model [provider=<id>]
+                                       remove a model key
   cred <agent> connect <name> [<mcp-url>] [client_id=… client_secret_entry=… scope=a,b]
                                        connect an MCP server to the agent (you log in through a link); sealed keeps the tokens
   cred <agent> disconnect <name>       revoke that connection at the server (when it offers that) and remove it
@@ -470,22 +480,22 @@ function dateText(unix: number): string {
 /** A login entry's state as the running agent has it; null when the agent cannot be asked. */
 export type LoginStates = Record<string, { loggedInAt?: number; awaiting?: boolean }> | null;
 
-async function loginStates(cred: AgenticID['credentials'], sealId: Hash, at?: { agentUrl: string }): Promise<LoginStates> {
-  const loaded = await cred.loaded(sealId, at).catch(() => undefined);
-  if (!loaded) return null;
-  const out: Record<string, { loggedInAt?: number; awaiting?: boolean }> = {};
-  for (const e of loaded.entries) {
-    if (e.status === 'awaiting_login') out[e.name] = { awaiting: true };
-    else if (e.logged_in_at) out[e.name] = { loggedInAt: e.logged_in_at };
-  }
-  return out;
-}
+/**
+ * What the running agent says about its model key: `null` when it cannot be
+ * asked (not running), `old` when its image predates model keys in the set.
+ */
+export type ModelKeyState = ModelKeyInUse | null | 'old';
 
-/** One block per credential: what it is for, where it may go, how it may be used. */
-export function renderCredentials(defs: CredentialDefinition[], version: number, logins?: LoginStates): string[] {
-  if (!defs.length) return [`no credentials (version ${version})`];
-  const lines = [`version ${version}`];
-  for (const d of defs) {
+/**
+ * One block per credential the agent uses (what it is for, where it may go,
+ * how it may be used), then the model keys, which sealed uses itself. With
+ * `model` (what the running agent says), which model key is in use.
+ */
+export function renderCredentials(defs: CredentialDefinition[], version: number, logins?: LoginStates, model?: ModelKeyState): string[] {
+  const keys = defs.filter((d) => d.inference);
+  const forAgent = defs.filter((d) => !d.inference);
+  const lines = forAgent.length || keys.length ? [`version ${version}`] : [`no credentials (version ${version})`];
+  for (const d of forAgent) {
     lines.push('');
     lines.push(`${d.name}  →  [[credential:${d.name}]]${d.description ? `   ${d.description}` : ''}`);
     lines.push(`  hosts      ${d.hosts.join(', ') || '—'}`);
@@ -512,7 +522,161 @@ export function renderCredentials(defs: CredentialDefinition[], version: number,
       lines.push(`  gives      [[credential:${derived}]] on ${t.hosts.join(', ') || '—'} (${t.positions.map(positionText).join(' · ') || '—'})`);
     }
   }
+  if (keys.length || model !== undefined) lines.push(...renderModelKeys(keys, model));
   return lines;
+}
+
+/** The model keys, and which one the framework uses. */
+function renderModelKeys(keys: CredentialDefinition[], model: ModelKeyState | undefined): string[] {
+  const lines = ['', "model keys  (sealed hands the key to the framework; the agent's settings choose the provider)"];
+  const inUse = model && model !== 'old' ? model : undefined;
+  const width = Math.max(0, ...keys.map((d) => d.name.length));
+  for (const d of keys) {
+    const p = d.inference!.provider;
+    const state = !inUse ? '' : inUse.source === 'credentials' && inUse.provider === p ? 'in use' : 'kept, not in use';
+    lines.push(`  ${d.name.padEnd(width)}  ${state}`.trimEnd());
+  }
+  if (model === null) lines.push('  in use: unknown — the agent is not running');
+  else if (model === 'old') lines.push("  in use: unknown — the agent's image predates model keys in cred (a reset moves it to the current image)");
+  else if (inUse?.source === 'deploy') lines.push(`  in use: the ${inUse.provider} key given at create/reset (cred <agent> set model replaces it)`);
+  else if (inUse?.source === 'none') lines.push(`  in use: none — add one: cred <agent> set model provider=${inUse.provider || '0g-compute'}`);
+  if (inUse?.issue) lines.push(`  ${printable(inUse.issue)}`);
+  return lines;
+}
+
+/** What the running agent says about its model key (see {@link ModelKeyState}). */
+async function modelKeyState(cred: AgenticID['credentials'], sealId: Hash, at?: { agentUrl: string }): Promise<{ state: ModelKeyState; logins: LoginStates }> {
+  const loaded = await cred.loaded(sealId, at).catch(() => undefined);
+  if (!loaded) return { state: null, logins: null };
+  const logins: Record<string, { loggedInAt?: number; awaiting?: boolean }> = {};
+  for (const e of Array.isArray(loaded.entries) ? loaded.entries : []) {
+    if (e.status === 'awaiting_login') logins[e.name] = { awaiting: true };
+    else if (e.logged_in_at) logins[e.name] = { loggedInAt: e.logged_in_at };
+  }
+  return { state: loaded.model ?? 'old', logins };
+}
+
+/**
+ * The provider a `model` subcommand means: `provider=`, or `model.<id>`;
+ * else the one the agent's settings use; with none there, the one provider
+ * the set holds a key for, or 0g-compute when it holds none.
+ */
+async function modelProviderOf(ag: AgenticID, sealId: Hash, name: string, args: string[], defs: CredentialDefinition[]): Promise<string> {
+  let provider = name.startsWith(MODEL_KEY_PREFIX) ? name.slice(MODEL_KEY_PREFIX.length) : undefined;
+  for (const a of args) {
+    const m = /^provider=(.*)$/.exec(a);
+    if (!m) throw usage(`unknown argument "${a}"`, MODEL_USAGE);
+    if (provider !== undefined && provider !== m[1]) throw usage(`${name} and provider=${m[1]} name two providers`, MODEL_USAGE);
+    provider = m[1];
+  }
+  if (provider === undefined) {
+    const { settings } = await ag.agent.getSettings(sealId);
+    if (settings?.provider) return settings.provider;
+    const stored = defs.filter((d) => d.inference).map((d) => d.inference!.provider);
+    if (stored.length > 1) throw usage(`the agent's settings name no provider and keys for ${stored.join(', ')} are kept: give provider=`, MODEL_USAGE);
+    provider = stored[0] ?? '0g-compute';
+  }
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(provider) || !NAME_RE.test(modelKeyName(provider))) throw usage(`not a provider id: "${provider}"`, MODEL_USAGE);
+  return provider;
+}
+
+const MODEL_WAIT_MS = 120_000;
+const MODEL_POLL_MS = 2_000;
+
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
+  });
+}
+
+/** What became of a model key pushed to the running agent, once it says. */
+async function modelApplied(cred: AgenticID['credentials'], sealId: Hash, provider: string, valueHash: string, io: CredIO, at?: { agentUrl: string }): Promise<string> {
+  const until = Date.now() + MODEL_WAIT_MS;
+  for (;;) {
+    // The agent applies the key after it took the set.
+    await pause(MODEL_POLL_MS, io.signal);
+    const m = (await cred.loaded(sealId, at).catch(() => undefined))?.model;
+    if (m?.source === 'credentials' && m.provider === provider && m.value_hash?.toLowerCase() === valueHash.toLowerCase()) return 'in use now';
+    if (m?.issue) return `kept, but not in use: ${printable(m.issue)}`;
+    if (m?.provider && m.provider !== provider) return `kept — the agent's settings use ${m.provider}; this key is used once they switch (settings <agent> provider=${provider})`;
+    if (Date.now() >= until || io.signal?.aborted) return 'kept; not confirmed in use yet — cred <agent> shows which key is in use';
+  }
+}
+
+/** `cred <agent> set model …`: the value is asked for, as any other. */
+async function modelSetOp(ag: AgenticID, sealId: Hash, provider: string, defs: CredentialDefinition[], io: CredIO, at?: { agentUrl: string }): Promise<void> {
+  const cred = ag.credentials;
+  const name = modelKeyName(provider);
+  const { state } = await modelKeyState(cred, sealId, at);
+  if (state === 'old') {
+    throw new CliError('INFERENCE_PROVIDER_UNSUPPORTED', "this agent's image does not take model keys from cred", {
+      remedy: `reset the agent (it starts on the current image), then repeat; until then a reset with the ${provider} key changes it`,
+    });
+  }
+  const saved = io.savedModelKey?.(provider) ?? null;
+  const typed = (await io.secret(`${provider} model key (${saved ? 'Enter uses the key login saved, ' : ''}Ctrl-C cancels): `)).trim();
+  const value = typed || saved;
+  if (!value) throw new CliError('BAD_FLAG', `${name} needs a value (pipe it in, or type it at the prompt)`, { remedy: MODEL_USAGE });
+  const out = await cred.setModelKey(sealId, provider, value, at).catch(conflict);
+  if (io.json) return emitOk({ sealId, version: out.version, name, provider, valueHash: out.valueHash, pushWarning: out.pushWarning ?? null });
+  io.out(`${defs.some((d) => d.name === name) ? 'changed' : 'added'} ${name} — version ${out.version}`);
+  if (out.pushWarning) return io.out(`stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot`);
+  if (state === null) return io.out('the agent is not running: it takes the key when it starts on a current image (an image from before model keys in cred skips it and keeps the key given at create/reset)');
+  io.out(`waiting for the running agent to take it (up to ${MODEL_WAIT_MS / 60_000} minutes)…`);
+  io.out(await modelApplied(cred, sealId, provider, out.valueHash, io, at));
+}
+
+/** `cred <agent> rm model …`. */
+async function modelRmOp(ag: AgenticID, sealId: Hash, provider: string, defs: CredentialDefinition[], io: CredIO, at?: { agentUrl: string }): Promise<void> {
+  const cred = ag.credentials;
+  const name = modelKeyName(provider);
+  if (!defs.some((d) => d.name === name)) throw new CliError('BAD_FLAG', `no model key for ${provider}`, { remedy: 'cred <agent>' });
+  const { state } = await modelKeyState(cred, sealId, at);
+  const out = await cred.removeModelKey(sealId, provider, at).catch(conflict);
+  if (io.json) return emitOk({ sealId, version: out.version, removed: name, pushWarning: out.pushWarning ?? null });
+  io.out(`removed ${name} — version ${out.version}. Revoke it at the provider too: removing it here does not.`);
+  if (state && state !== 'old' && state.source === 'credentials' && state.provider === provider) {
+    io.out(`it was in use: the agent goes back to the ${provider} key given at create/reset, if it has one; without one its framework stops until there is a key (cred <agent> set model provider=${provider})`);
+  }
+  if (out.pushWarning) io.out(`the running agent did not take it: ${out.pushWarning} — it keeps the key until its next boot`);
+}
+
+/** Said at a reset: the set's key for the provider wins over the one the reset gives. */
+export async function resetModelKeyNote(ag: AgenticID, sealId: Hash, provider: string): Promise<string | undefined> {
+  const cur = await ag.credentials.get(sealId).catch(() => undefined);
+  if (!cur?.definitions.some((d) => d.name === modelKeyName(provider))) return undefined;
+  return `the agent uses ${modelKeyName(provider)} from cred, not the key this reset gives (cred <agent> set model changes it)`;
+}
+
+/**
+ * A provider switch in the settings: the set must hold a key for the new
+ * provider, or the agent would refuse the switch. Asks for one (Enter takes
+ * the key login saved) and stores it, unless the set holds one already.
+ * `unsupported`: the running agent's image, or the attestor, predates model
+ * keys in the set (a reset with the key does it there).
+ */
+export async function ensureModelKey(ag: AgenticID, sealId: Hash, provider: string, io: Pick<CredIO, 'out' | 'secret' | 'savedModelKey'>, at?: { agentUrl: string }): Promise<'kept' | 'added' | 'unsupported'> {
+  const cred = ag.credentials;
+  const { state } = await modelKeyState(cred, sealId, at);
+  if (state === 'old') return 'unsupported';
+  // The key given at create/reset is for that provider: nothing to add.
+  if (state?.deploy_provider === provider) return 'kept';
+  // An attestor that keeps no credential sets: the reset path too.
+  const cur = await cred.get(sealId).catch((e: unknown) => {
+    if (/HTTP 404/.test(e instanceof Error ? e.message : String(e))) return undefined;
+    throw e;
+  });
+  if (!cur) return 'unsupported';
+  const name = modelKeyName(provider);
+  if (cur.definitions.some((d) => d.name === name)) return 'kept';
+  const saved = io.savedModelKey?.(provider) ?? null;
+  const value = (await io.secret(`${provider} model key for this agent (${saved ? 'Enter uses the key login saved, ' : ''}Ctrl-C cancels): `)).trim() || saved;
+  if (!value) throw new CliError('INFERENCE_KEY_REQUIRED', `the agent has no ${provider} model key`, { remedy: `cred <agent> set model provider=${provider}, then repeat` });
+  const out = await cred.setModelKey(sealId, provider, value, at).catch(conflict);
+  io.out(`added ${name} — version ${out.version}${out.pushWarning ? `; not applied to the running agent: ${out.pushWarning}` : ''}`);
+  if (state === null) io.out(`the agent is not running: on an image from before model keys in cred, the switch takes a reset with the ${provider} key`);
+  return 'added';
 }
 
 /** The name sealed gives a value a token request keeps (sealed/internal/credentials/token.go). */
@@ -599,6 +763,8 @@ export interface CredIO {
   secret(prompt: string): Promise<string>;
   /** Write the CLI's own control sequence (a terminal reset), unfiltered; absent off a terminal. */
   raw?(s: string): void;
+  /** The model key `login` saved for a provider, offered at the model key prompt. */
+  savedModelKey?(provider: string): string | null;
 }
 
 function conflict(e: unknown): never {
@@ -659,13 +825,22 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     case 'ls':
     case 'list': {
       const cur = await cred.get(sealId);
-      // Whether a login entry's login is done is the running agent's to say.
-      const logins = cur.definitions.some((d) => d.mcp) ? await loginStates(cred, sealId, at) : undefined;
-      if (io.json) return emitOk({ sealId, version: cur.version, ownerEpoch: cur.ownerEpoch, credentials: cur.definitions, ...(logins !== undefined ? { logins } : {}) });
-      for (const l of renderCredentials(cur.definitions, cur.version, logins)) io.out(l);
+      // Whether a login entry's login is done, and which model key is in
+      // use, is the running agent's to say.
+      const { state, logins } = await modelKeyState(cred, sealId, at);
+      const shownLogins = cur.definitions.some((d) => d.mcp) ? logins : undefined;
+      if (io.json) {
+        return emitOk({ sealId, version: cur.version, ownerEpoch: cur.ownerEpoch, credentials: cur.definitions,
+          ...(shownLogins !== undefined ? { logins: shownLogins } : {}), modelInUse: state === 'old' ? null : state });
+      }
+      for (const l of renderCredentials(cur.definitions, cur.version, shownLogins, state)) io.out(l);
       return;
     }
     case 'set': {
+      if (rest[0] === 'model' || rest[0]?.startsWith(MODEL_KEY_PREFIX)) {
+        const cur = await cred.get(sealId);
+        return modelSetOp(ag, sealId, await modelProviderOf(ag, sealId, rest[0], rest.slice(1), cur.definitions), cur.definitions, io, at);
+      }
       // Grammar first, before anything is read or signed.
       const name = checkCredName(rest[0]);
       const patch = parseCredArgs(rest.slice(1));
@@ -690,6 +865,10 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     case 'rm': {
       const [name] = rest;
       if (!name) throw new CliError('BAD_FLAG', 'missing <name>', { remedy: 'cred <agent> rm <name>' });
+      if (name === 'model' || name.startsWith(MODEL_KEY_PREFIX)) {
+        const cur = await cred.get(sealId);
+        return modelRmOp(ag, sealId, await modelProviderOf(ag, sealId, name, rest.slice(1), cur.definitions), cur.definitions, io, at);
+      }
       const cur = await cred.get(sealId);
       const def = cur.definitions.find((d) => d.name === name);
       if (!def) throw new CliError('BAD_FLAG', `no credential named ${name}`, { remedy: 'cred <agent>' });

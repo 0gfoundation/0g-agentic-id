@@ -614,6 +614,22 @@ export class AttestorClient {
       ...(accepted.version > 0 ? { digest: acceptedRegistryDigest(accepted.document!, accepted.signature!) } : {}) } } : undefined;
   }
 
+  /**
+   * Where a model key set through the credential set may go
+   * (Credentials.setModelKey): the provider's route in the registry version
+   * the attestor serves now, which sealed reads back and checks before it uses
+   * the key; with no registry published, the image's built-in route (nothing
+   * to bind). The agent's image must support the provider.
+   */
+  async modelKeyBinding(provider: string, sealId: `0x${string}`): Promise<{ route_hash?: string; registry?: import('./Providers').ProviderRegistryPin }> {
+    await this.assertProviderSupported(provider, { sealId });
+    const accepted = await this.getProviderRegistry();
+    const definition = accepted.providers.find((p) => p.id === provider);
+    if (!definition) throw new Error(`UNSUPPORTED_INFERENCE_PROVIDER: ${provider}`);
+    if (accepted.version === 0) return {};
+    return { route_hash: routeHash(definition), registry: { version: accepted.version, digest: acceptedRegistryDigest(accepted.document!, accepted.signature!) } };
+  }
+
   /** Verify support for an exact runtime image before signing an owner action. */
   async assertProviderSupported(provider: string, options: { sealId?: `0x${string}`; framework?: string; sealedImage?: string } = {}): Promise<void> {
     const definition = await this.providerDefinition(provider);

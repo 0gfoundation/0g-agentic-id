@@ -60,19 +60,20 @@ type credentialsBoot struct {
 
 // startCredentials brings up the credential store, the proxy, its CA files
 // and the two harness sockets, loads the provisioned set, and returns the
-// runtime fields that point the framework at them, and the registry whose
-// values sealed keeps out of what leaves it. Any failure leaves the agent
-// running without credentials rather than not running.
-func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSealPriv []byte, prov provision.Result, sealedProxy *proxy.Server) (framework.RuntimeContext, *credproxy.Registry) {
+// runtime fields that point the framework at them, the registry whose
+// values sealed keeps out of what leaves it, and the store (for the model
+// keys in the set). Any failure leaves the agent running without
+// credentials rather than not running.
+func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSealPriv []byte, prov provision.Result, sealedProxy *proxy.Server) (framework.RuntimeContext, *credproxy.Registry, *credentials.Store) {
 	var none framework.RuntimeContext
 	if res.client == nil || res.agentID == nil || res.client.ChainID() == nil {
 		logger.Logf("credentials: off (no chain client)")
-		return none, nil
+		return none, nil, nil
 	}
 	key, err := crypto.ToECDSA(agentSealPriv)
 	if err != nil {
 		logger.Logf("FAIL credentials: agentSeal key: %v", err)
-		return none, nil
+		return none, nil, nil
 	}
 	client, agentID := res.client, res.agentID
 	liveOwner := func(ctx context.Context) (common.Address, error) {
@@ -86,11 +87,11 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 	ca, err := credproxy.NewCA()
 	if err != nil {
 		logger.Logf("FAIL credentials: CA: %v", err)
-		return none, nil
+		return none, nil, nil
 	}
 	if err := writeCredentialFiles(ca); err != nil {
 		logger.Logf("FAIL credentials: %v", err)
-		return none, nil
+		return none, nil, nil
 	}
 	audit := &auditSink{}
 	store := credentials.NewStore(credentials.Env{
@@ -119,14 +120,14 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		logger.Logf("FAIL credentials: proxy listen: %v", err)
-		return none, nil
+		return none, nil, nil
 	}
 	go func() { _ = srv.Serve(ln) }()
 	port := ln.Addr().(*net.TCPAddr).Port
 
 	if err := proxy.ServeAgentSocket(credSockPath, "credential", store.HarnessHandler()); err != nil {
 		logger.Logf("FAIL credentials: %v", err)
-		return none, nil
+		return none, nil, nil
 	}
 	// The reveal socket's tool, for a framework that mounts the runtime's
 	// tools (the adapter is bound by now).
@@ -135,7 +136,7 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 	}
 	if err := proxy.ServeAgentSocket(credRevealSockPath, "credential reveal", store.RevealHandler()); err != nil {
 		logger.Logf("FAIL credentials: %v", err)
-		return none, nil
+		return none, nil, nil
 	}
 	sealedProxy.SetCredentials(store)
 	sealedProxy.SetScrubber(reg)
@@ -173,7 +174,7 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 		CredSock:       credSockPath,
 		CredRevealSock: credRevealSockPath,
 		CredGitConfig:  credGitConfigPath,
-	}, reg
+	}, reg, store
 }
 
 // loadProvisioned loads the set /provision handed over. It reports false

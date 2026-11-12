@@ -9,6 +9,7 @@
  */
 
 import { buildClient } from '../sdk';
+import { configuredInferenceKey } from '../inference';
 import { CliError } from '../errors';
 import { print } from '../envelope';
 import { parseAgentRef } from '../ref';
@@ -39,5 +40,5 @@ export async function run(ctx: CommandContext): Promise<void> {
   const ref = parseAgentRef(first);
   const ag = await buildClient(ctx.env, { withWallet: true });
   const sealId = await resolveSealId(ag, ref, first);
-  await credOp(ag, sealId, rest, { json: ctx.json, wait: !ctx.json, out: show, secret: readSecret });
+  await credOp(ag, sealId, rest, { json: ctx.json, wait: !ctx.json, out: show, secret: readSecret, savedModelKey: (p) => configuredInferenceKey(p) });
 }

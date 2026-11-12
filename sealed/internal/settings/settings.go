@@ -171,7 +171,7 @@ func ResolveForCredential(ctx context.Context, d Doc, credential inference.Provi
 
 func ResolveForRegistry(ctx context.Context, d Doc, credential inference.ProviderCredential, registry *inference.Registry) (Resolved, error) {
 	if credential.Invalid {
-		return Resolved{}, fmt.Errorf("INVALID_INFERENCE_CREDENTIAL: reset with a valid owner/provider-bound key")
+		return Resolved{}, fmt.Errorf("INVALID_INFERENCE_CREDENTIAL: add a model key with cred <agent> set model, or reset with a valid owner/provider-bound key")
 	}
 	if d.Provider == "" {
 		return Resolve(ctx, d, ""), nil
@@ -181,10 +181,10 @@ func ResolveForRegistry(ctx context.Context, d Doc, credential inference.Provide
 		boundProvider = inference.ZGComputeProvider
 	}
 	if d.Provider != boundProvider {
-		return Resolved{}, fmt.Errorf("CREDENTIAL_PROVIDER_MISMATCH: key belongs to %s; reset with a key for %s", boundProvider, d.Provider)
+		return Resolved{}, fmt.Errorf("CREDENTIAL_PROVIDER_MISMATCH: the agent has no model key for %s (its key is for %s): add one with cred <agent> set model provider=%s, or reset with a key for %s", d.Provider, boundProvider, d.Provider, d.Provider)
 	}
 	if d.Provider != inference.ZGComputeProvider && !credential.Bound {
-		return Resolved{}, fmt.Errorf("PROVIDER_BOUND_CREDENTIAL_REQUIRED: reset with a v2 key for %s", d.Provider)
+		return Resolved{}, fmt.Errorf("PROVIDER_BOUND_CREDENTIAL_REQUIRED: add a key with cred <agent> set model provider=%s, or reset with a key for %s", d.Provider, d.Provider)
 	}
 	if credential.RouteHash != "" {
 		hash, err := registry.RouteHash(d.Provider)
@@ -192,7 +192,7 @@ func ResolveForRegistry(ctx context.Context, d Doc, credential inference.Provide
 			return Resolved{}, err
 		}
 		if hash != credential.RouteHash {
-			return Resolved{}, fmt.Errorf("CREDENTIAL_ROUTE_MISMATCH: reset to authorize the new route for %s", d.Provider)
+			return Resolved{}, fmt.Errorf("CREDENTIAL_ROUTE_MISMATCH: set the key again (cred <agent> set model provider=%s) or reset, to authorize the new route for %s", d.Provider, d.Provider)
 		}
 	} else if registry != inference.DefaultRegistry {
 		return Resolved{}, fmt.Errorf("PROVIDER_BOUND_CREDENTIAL_REQUIRED: dynamic registry requires a v3 key")
