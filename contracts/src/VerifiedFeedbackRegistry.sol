@@ -8,7 +8,7 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
-import {IVerifiedFeedbackRegistry, TaskReveal} from "./interfaces/IVerifiedFeedbackRegistry.sol";
+import {IVerifiedFeedbackRegistry, TaskReveal, VersionedServeProof} from "./interfaces/IVerifiedFeedbackRegistry.sol";
 import {ServeProof} from "./interfaces/IAgenticIDReputationRegistry.sol";
 import {ICanonicalReputationRegistry} from "./interfaces/ICanonicalReputationRegistry.sol";
 import {IAgenticID} from "./interfaces/IAgenticID.sol";
@@ -66,6 +66,10 @@ error VerifiedFeedbackEndpointRequired();
 /// @dev The ServeProof's timestamp is zero or later than its deadline (audit
 /// FIND-15). The sealed runtime always signs timestamp = now, deadline = now + 1h.
 error VerifiedFeedbackInvalidProofTimestamp();
+/// @dev attestVersionedFeedback got a version this registry has no digest for
+/// (2 is the only one since 1.3.0; a v1 proof carries no version and goes
+/// through attestFeedback / attestFeedbackWithTask).
+error VerifiedFeedbackUnsupportedVersion(uint16 version);
 
 /// @title Verified Feedback Registry
 /// @notice TEE-verification layer over the official ERC-8004 Reputation
@@ -106,7 +110,17 @@ contract VerifiedFeedbackRegistry is
 
     /// @notice Current implementation version. See contracts/UPGRADING.md for
     ///         the bump rules.
-    /// @dev 1.2.0 — ServeProof hardening (beacon upgrade; storage unchanged,
+    /// @dev 1.3.0 — versioned ServeProofs (beacon upgrade; ServeData gains
+    ///      trailing sealedHash / harnessHash — mapping-stored struct,
+    ///      append-safe, old entries read zero). attestVersionedFeedback takes
+    ///      a VersionedServeProof and picks the digest by its version — 2 only:
+    ///      _serveProofHashV2, opened by keccak256("AgentDNA.ServeProof.v2"),
+    ///      so a v1 and a v2 signature never verify as each other — under v1's
+    ///      wrap and checks; its optional task reveal covers both v1 entry
+    ///      points. New event VersionedFeedbackVerified (after FeedbackVerified)
+    ///      and view getServeLayers. The v1 entry points, digest and events are
+    ///      unchanged.
+    ///      1.2.0 — ServeProof hardening (beacon upgrade; storage unchanged,
     ///      ABI gains only the two-step-ownership surface below plus new
     ///      errors and NonceMaxAgeUpdated, but consensus-critical — ships with new sealed images + SDK in one
     ///      window): the signed digest becomes EIP-191 version 0x00
@@ -143,13 +157,17 @@ contract VerifiedFeedbackRegistry is
     ///      `uri` field (mapping-stored struct — append-safe, old entries read "").
     ///      1.0.0 — initial: attest-only companion to the canonical ERC-8004
     ///      Reputation Registry, replacing the AgenticIDReputationRegistry fork.
-    string public constant VERSION = "1.2.0";
+    string public constant VERSION = "1.3.0";
 
     /// @dev Nonce-key tag — same keccak256(tag, agentId, signature) derivation
     ///      as the fork registry (each registry keeps its own nonce store). The
     ///      signed DIGEST is no longer shared with the fork since 1.2.0 (see
-    ///      `_serveProofDigest`).
+    ///      `_serveProofDigest`). Versioned proofs use the same derivation:
+    ///      their signatures are over different digests, so keys never collide.
     bytes32 private constant _SERVEPROOF_TAG = keccak256("SERVEPROOF");
+
+    /// @dev Opens the v2 inner-hash preimage. v1's opens with the chain id.
+    bytes32 private constant _SERVEPROOF_V2_TAG = keccak256("AgentDNA.ServeProof.v2");
 
     /// @dev Per-entry bound on |value| (raw, before decimal normalization) —
     ///      the deprecated fork registry's write-time bound. Entries outside it
@@ -171,6 +189,10 @@ contract VerifiedFeedbackRegistry is
         ///      the entry was attested without a reveal. Appended in 1.1.0 —
         ///      mapping-stored struct, so old entries read the zero value.
         string    uri;
+        /// @dev Set only by attestVersionedFeedback (appended in 1.3.0); zero
+        ///      for entries attested with a v1 proof.
+        bytes32   sealedHash;
+        bytes32   harnessHash;
     }
 
     /// @custom:storage-location erc7201:0g.storage.VerifiedFeedbackRegistry
@@ -271,15 +293,52 @@ contract VerifiedFeedbackRegistry is
         ServeProof calldata proof,
         TaskReveal calldata task
     ) external whenNotPaused {
-        // Open the taskHash commitment: recompute it from the revealed receipt
-        // materials exactly as the sealed proxy built it — keccak256(method ‖
-        // uri ‖ reqBodyHash ‖ respBodyHash ‖ decimal statusCode). The hash is
-        // inside the seal-signed digest, so a match proves the interaction hit
-        // `task.uri`. encodePacked is ambiguous at both variable-width ends:
-        // method whitelist + leading '/' pin the method‖uri boundary, and a
-        // fixed 3-digit status pins the tail — a 1–2 digit status would let a
-        // reveal shift body-hash bytes into `uri` (FIND-02). 100..999 is what
-        // Go's net/http emits, so no genuine receipt is orphaned.
+        _attest(agentId, feedbackIndex, proof, _openTask(task, proof.taskHash));
+    }
+
+    function attestVersionedFeedback(
+        uint256 agentId,
+        uint64 feedbackIndex,
+        VersionedServeProof calldata proof,
+        TaskReveal calldata task
+    ) external whenNotPaused {
+        if (proof.version != 2) revert VerifiedFeedbackUnsupportedVersion(proof.version);
+        string memory verifiedUri = bytes(task.method).length == 0 ? "" : _openTask(task, proof.taskHash);
+        // Same agentId binding as the v1 path (see _attest).
+        if (agentId != proof.agentId) revert VerifiedFeedbackProofAgentMismatch(agentId, proof.agentId);
+        _checkRedeemer(proof.submitter, proof.timestamp, proof.deadline);
+        address identityRegistry = _getVerifiedFeedbackStorage().identityRegistry;
+        address agentSeal = _redeemSignature(
+            identityRegistry, proof.agentId, proof.deadline, proof.signature,
+            _serveProofHashV2(block.chainid, identityRegistry, proof)
+        );
+
+        ServeData storage slot_ =
+            _mark(agentId, feedbackIndex, agentSeal, proof.dataHashes, proof.frameworkHash, verifiedUri);
+        slot_.sealedHash = proof.sealedHash;
+        slot_.harnessHash = proof.harnessHash;
+
+        emit FeedbackVerified(
+            agentId, msg.sender, feedbackIndex,
+            proof.dataHashes, proof.frameworkHash, proof.taskHash, verifiedUri
+        );
+        emit VersionedFeedbackVerified(
+            agentId, msg.sender, feedbackIndex,
+            proof.version, proof.sealedHash, proof.harnessHash, proof.inferenceURL, proof.model
+        );
+    }
+
+    /// @dev Opens a taskHash commitment and returns the TEE-verified endpoint:
+    ///      recompute it from the revealed receipt materials exactly as the
+    ///      sealed proxy built it — keccak256(method ‖ uri ‖ reqBodyHash ‖
+    ///      respBodyHash ‖ decimal statusCode). The hash is inside the
+    ///      seal-signed digest, so a match proves the interaction hit
+    ///      `task.uri`. encodePacked is ambiguous at both variable-width ends:
+    ///      method whitelist + leading '/' pin the method‖uri boundary, and a
+    ///      fixed 3-digit status pins the tail — a 1–2 digit status would let a
+    ///      reveal shift body-hash bytes into `uri` (FIND-02). 100..999 is what
+    ///      Go's net/http emits, so no genuine receipt is orphaned.
+    function _openTask(TaskReveal calldata task, bytes32 taskHash) private pure returns (string memory) {
         if (!_isKnownMethod(task.method)) revert VerifiedFeedbackInvalidTaskReveal();
         bytes memory uriBytes = bytes(task.uri);
         if (uriBytes.length == 0 || uriBytes[0] != "/") revert VerifiedFeedbackInvalidTaskReveal();
@@ -291,13 +350,12 @@ contract VerifiedFeedbackRegistry is
             task.respBodyHash,
             bytes(Strings.toString(uint256(task.statusCode)))
         ));
-        if (recomputed != proof.taskHash) revert VerifiedFeedbackTaskMismatch(proof.taskHash, recomputed);
-
-        _attest(agentId, feedbackIndex, proof, task.uri);
+        if (recomputed != taskHash) revert VerifiedFeedbackTaskMismatch(taskHash, recomputed);
+        return task.uri;
     }
 
-    /// @dev Shared attest routine. `verifiedUri` is "" for the plain path and
-    ///      the receipt-opened endpoint for attestFeedbackWithTask.
+    /// @dev Shared v1 attest routine. `verifiedUri` is "" for the plain path
+    ///      and the receipt-opened endpoint for attestFeedbackWithTask.
     function _attest(
         uint256 agentId,
         uint64 feedbackIndex,
@@ -311,6 +369,26 @@ contract VerifiedFeedbackRegistry is
         if (agentId != proof.agentId) revert VerifiedFeedbackProofAgentMismatch(agentId, proof.agentId);
         address agentSeal = _verifyServeProof(proof);
 
+        _mark(agentId, feedbackIndex, agentSeal, proof.dataHashes, proof.frameworkHash, verifiedUri);
+
+        emit FeedbackVerified(
+            agentId, msg.sender, feedbackIndex,
+            proof.dataHashes, proof.frameworkHash, proof.taskHash, verifiedUri
+        );
+    }
+
+    /// @dev What every verified proof, of any version, earns once its
+    ///      signature checks out: the conformance and canonical-entry checks,
+    ///      then the mark with v1's audit data. Returns the mark so a versioned
+    ///      path can add its own fields.
+    function _mark(
+        uint256 agentId,
+        uint64 feedbackIndex,
+        address agentSeal,
+        bytes32[] calldata dataHashes,
+        bytes32 frameworkHash,
+        string memory verifiedUri
+    ) private returns (ServeData storage slot_) {
         // ERC-8004 conformance: the attester must not be the agent owner, an
         // approved operator, or the agent's own agentSeal. Conformance guard,
         // NOT sybil resistance — the serve proof is obtainable from the
@@ -339,12 +417,12 @@ contract VerifiedFeedbackRegistry is
 
         // One mark per entry. Distinct from the nonce (which is per proof):
         // two different proofs must not stack marks on one entry either.
-        ServeData storage slot_ = $.verified[agentId][msg.sender][feedbackIndex];
+        slot_ = $.verified[agentId][msg.sender][feedbackIndex];
         if (slot_.exists) revert VerifiedFeedbackAlreadyVerified(agentId, msg.sender, feedbackIndex);
 
         slot_.exists = true;
-        slot_.frameworkHash = proof.frameworkHash;
-        slot_.dataHashes = proof.dataHashes;
+        slot_.frameworkHash = frameworkHash;
+        slot_.dataHashes = dataHashes;
         slot_.uri = verifiedUri;
         $.verifiedIndexes[agentId][msg.sender].push(feedbackIndex);
 
@@ -352,11 +430,6 @@ contract VerifiedFeedbackRegistry is
             $.isVerifiedClient[agentId][msg.sender] = true;
             $.verifiedClients[agentId].push(msg.sender);
         }
-
-        emit FeedbackVerified(
-            agentId, msg.sender, feedbackIndex,
-            proof.dataHashes, proof.frameworkHash, proof.taskHash, verifiedUri
-        );
     }
 
     /// @dev The known HTTP methods a task reveal may claim — closes the
@@ -383,6 +456,14 @@ contract VerifiedFeedbackRegistry is
         ServeData storage d = _getVerifiedFeedbackStorage().verified[agentId][clientAddress][feedbackIndex];
         if (!d.exists) revert VerifiedFeedbackNotVerified(agentId, clientAddress, feedbackIndex);
         return (d.dataHashes, d.frameworkHash);
+    }
+
+    function getServeLayers(uint256 agentId, address clientAddress, uint64 feedbackIndex)
+        external view returns (bytes32 sealedHash, bytes32 harnessHash)
+    {
+        ServeData storage d = _getVerifiedFeedbackStorage().verified[agentId][clientAddress][feedbackIndex];
+        if (!d.exists) revert VerifiedFeedbackNotVerified(agentId, clientAddress, feedbackIndex);
+        return (d.sealedHash, d.harnessHash);
     }
 
     function getVerifiedIndexes(uint256 agentId, address clientAddress)
@@ -491,28 +572,42 @@ contract VerifiedFeedbackRegistry is
     ///      fork registry's; the signed digest does not since 1.2.0 (bound to
     ///      this registry — `_serveProofDigest`).
     function _verifyServeProof(ServeProof calldata proof) internal returns (address agentSeal) {
-        // Only the address the proof was signed for may redeem it — the
-        // front-running / theft guard. Checked before signature recovery so a
-        // mismatched caller reverts cheaply.
-        if (proof.submitter != msg.sender)
-            revert VerifiedFeedbackProofSubmitterMismatch(proof.submitter, msg.sender);
-        if (proof.timestamp == 0 || proof.timestamp > proof.deadline) revert VerifiedFeedbackInvalidProofTimestamp();
-
+        _checkRedeemer(proof.submitter, proof.timestamp, proof.deadline);
         address identityRegistry = _getVerifiedFeedbackStorage().identityRegistry;
-        agentSeal = IAgenticID(identityRegistry).getAgentSeal(proof.agentId);
+        agentSeal = _redeemSignature(
+            identityRegistry, proof.agentId, proof.deadline, proof.signature,
+            _serveProofHash(block.chainid, identityRegistry, proof)
+        );
+    }
+
+    /// @dev Only the address the proof was signed for may redeem it — the
+    ///      front-running / theft guard, checked before signature recovery so
+    ///      a mismatched caller reverts cheaply — and only inside its window.
+    function _checkRedeemer(address submitter, uint256 timestamp, uint256 deadline) private view {
+        if (submitter != msg.sender) revert VerifiedFeedbackProofSubmitterMismatch(submitter, msg.sender);
+        if (timestamp == 0 || timestamp > deadline) revert VerifiedFeedbackInvalidProofTimestamp();
+    }
+
+    /// @dev Recovers the agent's seal from `signature` over `proofHash` (any
+    ///      version's inner hash) and consumes the proof's nonce.
+    function _redeemSignature(
+        address identityRegistry,
+        uint256 agentId,
+        uint256 deadline,
+        bytes calldata signature,
+        bytes32 proofHash
+    ) private returns (address agentSeal) {
+        agentSeal = IAgenticID(identityRegistry).getAgentSeal(agentId);
         if (agentSeal == address(0)) revert VerifiedFeedbackNoAgentSeal();
 
         // Registry binding: the validator is this proxy, so the digest is one
         // the sign socket never produces and no other registry accepts.
-        bytes32 digest = _serveProofDigest(
-            address(this), _serveProofHash(block.chainid, identityRegistry, proof)
-        );
-        if (digest.recover(proof.signature) != agentSeal)
+        if (_serveProofDigest(address(this), proofHash).recover(signature) != agentSeal)
             revert VerifiedFeedbackInvalidProofSignature();
 
         // Replay protection: signature is unique per sealed payload.
-        bytes32 nonceKey = keccak256(abi.encode(_SERVEPROOF_TAG, proof.agentId, proof.signature));
-        _checkAndMarkNonce(nonceKey, proof.deadline);
+        bytes32 nonceKey = keccak256(abi.encode(_SERVEPROOF_TAG, agentId, signature));
+        _checkAndMarkNonce(nonceKey, deadline);
     }
 
     /// @dev The ServeProof's inner hash (unchanged by 1.2.0). Domain +
@@ -535,6 +630,35 @@ contract VerifiedFeedbackRegistry is
             proof.taskHash,
             keccak256(abi.encodePacked(proof.dataHashes)),
             proof.frameworkHash
+        ));
+    }
+
+    /// @dev The v2 inner hash: the version tag, then v1's nine words, then the
+    ///      sealed and harness hashes and the inference address and model name
+    ///      (each string hashed to one word). Fixed-width words only, so
+    ///      abi.encode is a plain concatenation, as for v1; v1's preimage opens
+    ///      with the chain id and is 9 words long, v2's with the tag and 14.
+    ///      Consensus-critical: sealed (proxy.go serveProofHashV2), the SDK,
+    ///      the attestor console and verify-agent.sh compute it too —
+    ///      known-answer vector in test/VerifiedFeedback.t.sol.
+    function _serveProofHashV2(uint256 chainId, address identityRegistry, VersionedServeProof calldata proof)
+        internal pure returns (bytes32)
+    {
+        return keccak256(abi.encode(
+            _SERVEPROOF_V2_TAG,
+            chainId,
+            identityRegistry,
+            proof.submitter,
+            proof.agentId,
+            proof.timestamp,
+            proof.deadline,
+            proof.taskHash,
+            keccak256(abi.encodePacked(proof.dataHashes)),
+            proof.frameworkHash,
+            proof.sealedHash,
+            proof.harnessHash,
+            keccak256(bytes(proof.inferenceURL)),
+            keccak256(bytes(proof.model))
         ));
     }
 

@@ -7,7 +7,10 @@ import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/Upgradeabl
 import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+
 import {AgenticID, AgenticIDNotPauser} from "../src/AgenticID.sol";
+import {TrustRegistry} from "../src/TrustRegistry.sol";
 import {CanonicalIdentityRegistryMock} from "./mocks/CanonicalIdentityRegistryMock.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
@@ -16,6 +19,8 @@ import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 /// @notice Minimal v2 impls that add a new view to prove the code swap took
 ///         effect. Same beacon+timelock upgrade path applies to every contract.
 contract AgenticIDV2 is AgenticID {
+    constructor(address trustRegistry_) AgenticID(trustRegistry_) {}
+
     function version2Tag() external pure returns (string memory) {
         return "v2";
     }
@@ -33,6 +38,7 @@ contract UpgradeableTest is Test {
     UpgradeableBeacon  internal verifierBeacon;  // TEEDataVerifier beacon
     AgenticID          internal agenticId;
     TEEDataVerifier    internal verifier;
+    TrustRegistry      internal trustRegistry;
 
     address internal owner    = address(0xA11CE);
     address internal pauser   = address(0xBABE);
@@ -64,8 +70,12 @@ contract UpgradeableTest is Test {
         CanonicalIdentityRegistryMock canonical = new CanonicalIdentityRegistryMock();
         canonical.initialize();
 
+        trustRegistry = TrustRegistry(address(new ERC1967Proxy(
+            address(new TrustRegistry()), abi.encodeCall(TrustRegistry.initialize, (owner))
+        )));
+
         // AgenticID behind beacon (owned by timelock).
-        AgenticID agenticIdImpl = new AgenticID();
+        AgenticID agenticIdImpl = new AgenticID(address(trustRegistry));
         beacon = new UpgradeableBeacon(address(agenticIdImpl), address(timelock));
         BeaconProxy agenticIdProxy = new BeaconProxy(
             address(beacon),
@@ -80,7 +90,7 @@ contract UpgradeableTest is Test {
     // ── Upgrade via Timelock ─────────────────────────────────────────────────
 
     function test_upgrade_nonTimelockCannotUpgradeBeacon() public {
-        AgenticIDV2 v2 = new AgenticIDV2();
+        AgenticIDV2 v2 = new AgenticIDV2(address(trustRegistry));
 
         vm.prank(owner);
         vm.expectRevert(); // Ownable: caller is not the owner (owner = timelock)
@@ -88,7 +98,7 @@ contract UpgradeableTest is Test {
     }
 
     function test_upgrade_throughTimelock_beforeDelay_reverts() public {
-        AgenticIDV2 v2 = new AgenticIDV2();
+        AgenticIDV2 v2 = new AgenticIDV2(address(trustRegistry));
         bytes memory callData = abi.encodeCall(UpgradeableBeacon.upgradeTo, (address(v2)));
 
         vm.prank(proposer);
@@ -101,7 +111,7 @@ contract UpgradeableTest is Test {
     }
 
     function test_upgrade_throughTimelock_afterDelay_succeeds() public {
-        AgenticIDV2 v2 = new AgenticIDV2();
+        AgenticIDV2 v2 = new AgenticIDV2(address(trustRegistry));
         bytes memory callData = abi.encodeCall(UpgradeableBeacon.upgradeTo, (address(v2)));
 
         vm.prank(proposer);
@@ -116,7 +126,7 @@ contract UpgradeableTest is Test {
         // New view callable through existing proxy → proves storage preserved and code swapped.
         assertEq(AgenticIDV2(address(agenticId)).version2Tag(), "v2");
         // Pre-existing state preserved (VERSION from the base impl).
-        assertEq(agenticId.VERSION(), "1.3.0");
+        assertEq(agenticId.VERSION(), "1.4.0");
     }
 
     function test_upgrade_verifierBeacon_throughTimelock_succeeds() public {
@@ -165,7 +175,7 @@ contract UpgradeableTest is Test {
         agenticId.pause();
 
         // View functions should not revert.
-        assertEq(agenticId.VERSION(), "1.3.0");
+        assertEq(agenticId.VERSION(), "1.4.0");
         assertEq(agenticId.pauser(), pauser);
         assertEq(agenticId.owner(), owner);
     }

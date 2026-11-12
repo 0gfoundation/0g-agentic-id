@@ -7,7 +7,7 @@
 
 ## 1. Architecture
 
-Every upgradeable contract (`AgenticID` / `TEEDataVerifier` /
+Every upgradeable contract (`AgenticID` / `TrustRegistry` / `TEEDataVerifier` /
 `VerifiedFeedbackRegistry` / `CloneGate` / the deprecated
 `AgenticIDReputationRegistry`) uses **BeaconProxy + UpgradeableBeacon +
 Implementation**. All beacons are
@@ -20,7 +20,11 @@ deploying a new one and re-delegating. `StandardCloneAuthorizer` is immutable
 which source owners opt into per agent via `CloneGate.setCloneAuthorizer`.
 
 `AgenticID` no longer reimplements ERC-8004 — it **custody-binds to the official
-ERC-8004 Identity Registry** (binding semantics in §2).
+ERC-8004 Identity Registry** (binding semantics in §2). Since AgenticID 1.4.0 the
+deployer's trust decisions — which attestors may mint and set URIs (with their
+Tapp app bindings) and which code may run an agent (image, sealed and harness
+lists) — live in `TrustRegistry`; AgenticID's implementation fixes the registry
+address and its trust reads forward there.
 Reputation is split (§2.1): feedback lives in the canonical ERC-8004
 Reputation Registry; `VerifiedFeedbackRegistry` stamps TEE verification marks
 (ServeProof, §2.2). The `AgenticIDReputationRegistry` fork is deprecated and
@@ -56,7 +60,7 @@ recreates the sandbox).
 | Role | Identity | Timelock-protected |
 |---|---|---|
 | Timelock | owner of every beacon; the only caller of `beacon.upgradeTo`. `minDelay` 1 day on mainnet (`Deploy.s.sol` enforces ≥ 86400 on chain 16661), 0 on testnet / dev | — |
-| Owner (`Ownable2StepUpgradeable` from AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; `OwnableUpgradeable` before, and on the deprecated fork) | attestor allowlist / framework-hash whitelist / verifier + TEE-oracle swap / pauser rotation / `setMaxProofAge` (raise-only within 2 hours–365 days in TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; the deployed fork stays unrestricted) | no — direct calls, effective immediately |
+| Owner (`Ownable2StepUpgradeable` from AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0 and on TrustRegistry; `OwnableUpgradeable` before, and on the deprecated fork) | attestors and code lists (TrustRegistry; on AgenticID before 1.4.0) / verifier + TEE-oracle swap / pauser rotation / `setMaxProofAge` (raise-only within 2 hours–365 days in TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; the deployed fork stays unrestricted) | no — direct calls, effective immediately |
 | Pauser | emergency switch | no (emergency path can't be delayed) |
 
 **Governance split (deliberate).** Privileged admin calls are **direct owner
@@ -238,12 +242,13 @@ registerWithSeal / iCloneFrom all start with an empty payment wallet (locked by 
 
 ## 3. Deploy
 
-`script/Deploy.s.sol` deploys all 15 contracts in one run (Timelock + 4 × (impl +
-beacon + proxy: TEEDataVerifier / AgenticID / VerifiedFeedbackRegistry / CloneGate)
-+ FeedbackBatcher + StandardCloneAuthorizer); verified-feedback/verifier/clone-gate
-bind to the freshly-minted AgenticID, AgenticID binds to `CANONICAL_8004`, and the
-verified-feedback registry anchors to `CANONICAL_8004_REPUTATION` (both chainId
-defaults):
+`script/Deploy.s.sol` deploys all 18 contracts in one run (Timelock + 5 × (impl +
+beacon + proxy: TEEDataVerifier / TrustRegistry / AgenticID /
+VerifiedFeedbackRegistry / CloneGate) + FeedbackBatcher + StandardCloneAuthorizer);
+the AgenticID implementation fixes the fresh TrustRegistry,
+verified-feedback/clone-gate bind to the freshly-minted AgenticID, AgenticID binds
+to `CANONICAL_8004`, and the verified-feedback registry anchors to
+`CANONICAL_8004_REPUTATION` (both chainId defaults):
 
 ```bash
 export OWNER=0x...
@@ -290,15 +295,18 @@ The delay, admin and role-set rules live in `script/MainnetGovernance.sol`
 (covered by `test/DeployScript.t.sol`); the incremental
 `DeployVerifiedFeedback.s.sol` / `DeployCloneGate.s.sol` apply its other half
 — on chain 16661 they refuse a `TIMELOCK` (the new beacon's owner) that is not
-a TimelockController with `minDelay ≥ 86400`. The run prints all 15 addresses
+a TimelockController with `minDelay ≥ 86400`. The run prints all 18 addresses
 — record them in §6.
 
-**Required post-deploy (fresh contract = empty allowlists):** the owner must
-`addTrustedAttestor(<attestor>)` (else mint reverts `AgenticIDNotTrustedAttestor`),
-`addTrustedAttestor(<CloneGate proxy>)` (the gate is the `msg.sender` of clone
-mints — without it every `cloneFrom` reverts), and
-`addValidFrameworkHash(<sealed image hash>)` (else `image_hash not in
-validFrameworkHashes`).
+**Required post-deploy (fresh TrustRegistry = empty lists):** the owner must, on
+the TrustRegistry, trust the attestor (`bindTrustedAttestorApp`, or
+`addTrustedAttestor` while instance binding is not required — else mint reverts
+`AgenticIDNotTrustedAttestor`) and the CloneGate proxy the same way (the gate is
+the `msg.sender` of clone mints — without it every `cloneFrom` reverts), and
+`list(IMAGE, <sealed image hash>)` (else `image_hash not in
+validFrameworkHashes`); for 0g-harness loader images also
+`list(SEALED, <sealed program hash>)` and `list(HARNESS, <package hash>)`
+(sealed/LAYERS.md §10). `multicall` takes them in one transaction.
 
 ## 4. Upgrade
 
@@ -309,11 +317,13 @@ migrate. The upgrade mechanism is generic across every beacon-proxied contract,
 covered by `test/Upgradeable.t.sol` (AgenticID + TEEDataVerifier),
 `test/UpgradeReputation.t.sol` (the deprecated fork, incl. storage survival +
 post-upgrade behavior), `test/UpgradeVerifiedFeedback.t.sol`
-(VerifiedFeedbackRegistry 1.1.0 → 1.2.0: storage survival, the ServeProof
-format cut, two-step ownership) and `test/UpgradeGovernance.t.sol`
-(AgenticID + TEEDataVerifier 1.1.0 → 1.2.0 from frozen copies of the deployed
-1.1.0 source, through a mainnet-shaped 1-day Timelock: state survival,
-two-step ownership, the zero-address setter guards).
+(VerifiedFeedbackRegistry 1.1.0 → 1.3.0: storage survival, the ServeProof
+format cut, two-step ownership), `test/UpgradeGovernance.t.sol`
+(AgenticID 1.1.0 → 1.4.0 + TEEDataVerifier 1.1.0 → 1.2.0 from frozen copies of
+the deployed 1.1.0 source, through a mainnet-shaped 1-day Timelock: state
+survival, two-step ownership, the zero-address setter guards) and
+`test/UpgradeAgenticID.t.sol` (AgenticID 1.3.0 → 1.4.0 from the frozen 1.3.0
+source: the trust-list migration, the switch, rollback).
 
 ## 5. Verify
 
@@ -605,11 +615,14 @@ that version's beacon upgrade executed):
 | VerifiedFeedbackRegistry | **1.2.0** (2026-10-21) | **1.2.0** (2026-10-23) | **1.2.0** (2026-11-02) |
 | CloneGate | **1.1.0** (2026-10-21) | **1.1.0** (2026-10-23) | **1.1.0** (2026-11-02) |
 
-> All three environments are at parity and run the source's versions: AgenticID
+> All three environments are at parity: AgenticID
 > **1.3.0** (instance-bound attestors required on all three, §6.1 / §6.2 / §6.2m),
 > TEEDataVerifier **1.2.0**, VerifiedFeedbackRegistry **1.2.0** and CloneGate
 > **1.1.0**. Mainnet moved to them on 2026-11-02, AgenticID straight from 1.1.0
-> (changelog entries below). Each environment has its own impls (dev
+> (changelog entries below). The source is ahead of all three: AgenticID
+> **1.4.0**, TrustRegistry **1.0.0**, VerifiedFeedbackRegistry **1.3.0** and
+> FeedbackBatcher v5 are deployed nowhere yet (changelog below; the rollout is
+> UPGRADING.md "AgenticID 1.4.0"). Each environment has its own impls (dev
 > and test deployed separately on the same chain). The 1.2.0 / 1.1.0 impls
 > are solc 0.8.24 builds (optimizer runs 200, via-IR — the `foundry.toml` of
 > `27aef57`); AgenticID 1.3.0 and its library are built with the current
@@ -625,6 +638,35 @@ that version's beacon upgrade executed):
 
 Changelog:
 
+- **AgenticID 1.4.0 + TrustRegistry 1.0.0 — not deployed yet** — the trust
+  decisions move to a new beacon-proxied `TrustRegistry` (sealed/LAYERS.md
+  §10): the attestor list with its app bindings and instance mode — same
+  functions, events and errors as AgenticID 1.3.0 — plus code lists by kind
+  (`IMAGE`, which takes over `validFrameworkHashes`, `SEALED`, `HARNESS`; any
+  `bytes32` kind) with `list` / `delist` / `isListed` / `latest` / `listed`,
+  and `multicall` for owner batches. AgenticID 1.4.0 is a beacon upgrade with
+  no storage change: the four trust fields stay in place, retired (never read or
+  written again, so a rollback to 1.3.0 finds them as they were). Its
+  implementation takes the registry in the constructor (`trustRegistry()`), so
+  the upgrade switches every trust read at once; `isTrustedAttestor`,
+  `isValidFrameworkHash` (the image list), `trustedAttestorAppBinding` and
+  `instanceBoundAttestorsRequired` forward; the list-management functions and
+  their events leave AgenticID's ABI (the IAgenticID ERC-165 id changes); no
+  linked library (23,788 B). The lists must be in the registry before the
+  upgrade executes — `script/MigrateTrust.s.sol` (UPGRADING.md). Rehearsed on
+  forks of all three environments on 2026-11-11 (`MODE=rehearse`: copy, check,
+  upgrade, every candidate reads the same): dev 2 bound attestors + 148 image
+  hashes, test 2 + 16, mainnet 2 + 11, instance binding required on all three.
+- **VerifiedFeedbackRegistry 1.3.0 — not deployed yet** — versioned ServeProofs
+  (ServeProof v2, the 0g-harness layered runtime): `attestVersionedFeedback`
+  takes a `VersionedServeProof` (version 2 only, else
+  `VerifiedFeedbackUnsupportedVersion`) whose digest adds `sealedHash`,
+  `harnessHash`, `inferenceURL` and `model` behind a version tag, under v1's
+  wrap and checks, with an optional task reveal; `ServeData` gains trailing
+  `sealedHash` / `harnessHash` (append-safe); new `VersionedFeedbackVerified`
+  event and `getServeLayers` view. The v1 entry points, digest and events are
+  unchanged. **FeedbackBatcher v5 — not deployed yet** — adds
+  `giveFeedbackAndAttestVersioned`; a new address, like every batcher change.
 - **AgenticID 1.3.0 — dev beacon-upgraded 2026-10-26, test 2026-10-27,
   mainnet 2026-11-02** — instance-bound trusted attestors (app identities,
   [`attestor/APP_IDENTITY.md`](../attestor/APP_IDENTITY.md)). Minor per
