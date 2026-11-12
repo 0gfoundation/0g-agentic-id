@@ -14,6 +14,7 @@
  */
 
 import * as readline from 'node:readline';
+import { nativeCommand, nativeHelp } from '../nativeCommands';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
@@ -2636,7 +2637,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   const queued: string[] = [];
   try {
   for (;;) {
-    activeCompletions = L2_WORDS;
+    activeCompletions = nativeHelp(s.client)
+      ? [...L2_WORDS.filter(x => !['/inbox', '/schedules'].includes(x)),
+          ...(s.client?.nativeSessions ? ['/sessions', '/session'] : []),
+          ...(s.client?.nativeTasks ? ['/task'] : [])]
+      : L2_WORDS;
     activeArgs = L2_ARGS;
     // While not connected (deploying/stopped/offline) the phase is in flux —
     // auto-refresh before every prompt, printing only when it moves (and
@@ -2687,13 +2692,20 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     }
     if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
     if (line === '/quit' || line === '/exit') { process.exit(0); }
-    if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
+    if (line === '/help') { out(`${nativeHelp(s.client) ?? L2_HELP_FULL}\n`); continue; }
 
     try {
       if (line === '/hello') {
         if (s.phase !== 'running' || !s.url) { out(`agent is ${s.phase} — not reachable; /start or /reset first\n`); continue; }
         await showHello(s.ag, s.url);
         continue;
+      }
+      if (/^\/(sessions|session|task|tasks|result|cancel)(?:\s|$)/.test(line) &&
+          (s.client?.nativeSessions || s.client?.nativeTasks)) {
+        const nativeAbort = new AbortController();
+        irq.streaming = nativeAbort;
+        try { if (await nativeCommand(s.client, line, out, nativeAbort.signal)) continue; }
+        finally { irq.streaming = null; }
       }
       if (line === '/balance') {
         // Agent-focused: this agent's own evolution-gas (agentSeal) balance,

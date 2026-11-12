@@ -247,13 +247,14 @@ sealed/
 ├── images/sealed/                通用 node 镜像（npm 安装只是热缓存）；不构建任何实际发布的镜像——openclaw 的是上面的 Dockerfile
 ├── images/hermes/                sealed sandbox 镜像，python/uv 版（hermes）
 ├── images/prime/                 sealed sandbox 镜像，node+python 版（prime-agent）
-└── images/harness/               sealed sandbox 镜像，0g-harness 版
+├── images/harness/               sealed sandbox 镜像，DSH 后端
+└── images/zgh/                   sealed sandbox 镜像，zgh 后端（沿用 AgenticID binding）
 ```
 
 ### 各包职责一句话
 
 - **chain**：所有 AgenticID 链 view / tx 在这里收口，外面拿不到 `*ethclient.Client`，只能拿语义 API（`WaitForMint` / `IntelligentDatasOf` / `Update` 等）。唯一在别处发出的交易是 0G 存储的 flow 提交，由 `dataplane.Upload` 通过存储 SDK 发出
-- **dataplane**：iData 加解密 + 0g-storage 传输；不调用 AgenticID。`UnsealDataKey(sealed, priv) → dataKey`、`Decrypt(ct, key)`、`Encrypt(pt, key)`；`Download` 经 `privsep.RootCommand` 跑 `0g-storage-client download`（只在仅 root 可写的 `PATH` 目录中解析；由 `Dockerfile` 和 `images/{hermes,prime,harness,sealed}` 按 `go.mod` 里钉住的 SDK 版本安装到 `/usr/local/bin`），输出写进仅 root 可访问的临时目录；`Upload` 通过同一 client 的 Go SDK 在进程内上传，并自己提交 0G 存储的 flow 交易（SDK 连 `CHAIN_RPC_URL`），用 sealed 持有的 agent_seal 密钥签名 —— 不起子进程、不写临时文件 —— 每个 blob 上限 90s。上传与 sealed 共用进程，因此没有隔离：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（见 `QUIRKS.md`）
+- **dataplane**：iData 加解密 + 0g-storage 传输；不调用 AgenticID。`UnsealDataKey(sealed, priv) → dataKey`、`Decrypt(ct, key)`、`Encrypt(pt, key)`；`Download` 经 `privsep.RootCommand` 跑 `0g-storage-client download`（只在仅 root 可写的 `PATH` 目录中解析；由 `Dockerfile` 和 `images/{hermes,prime,harness,sealed,zgh}` 按 `go.mod` 里钉住的 SDK 版本安装到 `/usr/local/bin`），输出写进仅 root 可访问的临时目录；`Upload` 通过同一 client 的 Go SDK 在进程内上传，并自己提交 0G 存储的 flow 交易（SDK 连 `CHAIN_RPC_URL`），用 sealed 持有的 agent_seal 密钥签名 —— 不起子进程、不写临时文件 —— 每个 blob 上限 90s。上传与 sealed 共用进程，因此没有隔离：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（见 `QUIRKS.md`）
 - **framework**：定义 `Framework` 接口（adapter 协议）+ `RuntimeContext` + `RoleSpec{Name, Shape}` + 共享类型如 `StartParams`、`StartResult`。**不依赖具体框架**
 - **settings**：`Doc`（provider / model / thinking / 一段不透明的 per-framework overlay）是 owner 的 document，也是唯一被持久化的那一半；`Resolved` 再加上平台在 Start 时算出来的部分 —— endpoint、输出预算、模型吃不吃 reasoning bound —— 哪儿都不存，因为存下来的副本会过期、然后跟算出来的值打架（`settings.go:10-15`）
 - **framework/openclaw**：参考 adapter 实现。又内部拆成 `restore.go`/`restore_paths.go`、`evolution.go`/`evolution_paths.go`、`spawn.go`、`ingest.go`（persona legacy）、`inference.go`（`RenderSettings`：owner 的 document → openclaw.json）、`disk.go`（openclaw.json read/write）、`whitelist.go`（npm 版本白名单）、`identitymd.go`/`soulmd.go`/`toolsmd.go`（IDENTITY/SOUL/TOOLS 三份 sealed-managed 平台段 + 共享 marker 工具）

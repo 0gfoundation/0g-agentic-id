@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
@@ -360,6 +362,9 @@ const legacyLLMPluginID = "llm-pi-ai"
 func (a *Adapter) handleLegacySettings(plaintext []byte) error {
 	provider, model := legacyPin(plaintext)
 	if model == "" {
+		if a.zgh && len(strings.TrimSpace(string(plaintext))) > 0 {
+			return fmt.Errorf("zgh legacy settings.yaml: cannot recover model pin; refusing to retire unreadable role")
+		}
 		logger.Logf("harness.HandleLegacy[%s]: no usable pin in the legacy entry (%d bytes); nothing to recover",
 			legacySettingsRole, len(plaintext))
 		return nil

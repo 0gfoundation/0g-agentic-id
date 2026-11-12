@@ -29,6 +29,10 @@ import (
 // itself rather than follow it, and a directory with its contents: an entry
 // the agent put at the conversation's name cannot make the clear fail.
 func (a *Adapter) ClearSession(_ context.Context) error {
+	if a.zgh {
+		// Native sessions/tasks are local runtime state, never iData.
+		return privsep.RemoveAll(dshHome + "/zgh")
+	}
 	if err := privsep.RemoveAll(conversationPath()); err != nil {
 		return fmt.Errorf("harness.ClearSession: %w", err)
 	}

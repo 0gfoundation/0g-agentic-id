@@ -338,6 +338,13 @@ type LayeredRuntime interface {
 	InferenceTarget() (url, model string)
 }
 
+// RuntimePackageValidator optionally rejects an installed official package
+// whose executable protocol is incompatible with this image's adapter.
+// Selection can then fall back to the image base before starting a process.
+type RuntimePackageValidator interface {
+	ValidateRuntimePackage(dir string) error
+}
+
 // Route is one path prefix a framework exposes through the sealed proxy.
 //
 // The proxy forwards a request to the framework upstream ONLY if its path

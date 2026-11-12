@@ -31,10 +31,10 @@ func TestRuntimeInputCannotReachSharedBackend(t *testing.T) {
 }
 
 // This opt-in test crosses the public proxy, the real sandbox/UID launcher,
-// the image-bundled Node/DSH composition and an actual native tool execution.
+// the image-bundled Node composition and an actual native tool execution.
 // /opt/0g-harness/base and the package it names must be mounted read-only by
 // the integration test container; no live model, chain or credentials are used.
-func TestPublicMCPTemporaryDSHLoop(t *testing.T) {
+func TestPublicMCPTemporaryAgentLoop(t *testing.T) {
 	if os.Getenv("SEALED_LOOP_TESTS") != "1" {
 		t.Skip("requires Linux root, Node and the companion Harness package")
 	}
@@ -96,6 +96,25 @@ export default {model,persona:'Use check_access to perform the task.',cwd:'/work
    output:{schema:{type:'boolean'},render:(_,v)=>[{type:'text',text:String(v)}]},execute:async()=>Boolean(runtimeInput.token)}))
  }}
 `, model.URL+"/v1")
+	if metadata, err := os.ReadFile(filepath.Join(root, "runtime.json")); err == nil {
+		var runtime struct {
+			Backend string `json:"backend"`
+		}
+		if err := json.Unmarshal(metadata, &runtime); err != nil {
+			t.Fatal(err)
+		}
+		if runtime.Backend == "zgh" {
+			config = fmt.Sprintf(`
+const model={provider:'loop-mock',id:'mock',baseURL:%q}
+export default {model,persona:'Use check_access to perform the task.',cwd:'/work',
+ async configure(ctx,{runtimeInput}) {
+  process.env.SERVICE_MODEL_API_KEY='model-fixture-only'
+  ctx.registerTool({name:'check_access',description:'Check access without disclosing credentials',
+   inputSchema:{type:'object',properties:{}},execute:async()=>Boolean(runtimeInput.token)})
+ }}
+`, model.URL+"/v1")
+		}
+	}
 	host, err := servicehost.New(filepath.Join(t.TempDir(), "services"), "owner:identity")
 	if err != nil {
 		t.Fatal(err)

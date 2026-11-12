@@ -314,6 +314,12 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 			hash, dir = lr.chooseHarness(ctx, target, hash)
 			cancel()
 		}
+		if v, ok := any(adapter).(framework.RuntimePackageValidator); ok {
+			if err := v.ValidateRuntimePackage(dir); err != nil {
+				logger.Logf("WARN layers: selected runtime package is incompatible (%v); using image base", err)
+				hash, dir = baseHarness()
+			}
+		}
 		h.UseHarness(hash, dir)
 	}
 

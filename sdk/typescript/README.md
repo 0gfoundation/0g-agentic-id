@@ -376,3 +376,14 @@ const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (
 - **Serve-proof binding** — attribution is `msg.sender` at submission; each proof also names a `submitter` (the redeemer) and is signed for exactly one VerifiedFeedbackRegistry. Treat proofs as sensitive regardless of transport.
 - **0G receipt timing** — `waitForTransaction` is tuned for 0G (120s + retries); if it times out the tx likely still landed — confirm by reading state.
 - **On-chain types** — `value`/`summaryValue` are `int128`, `feedbackIndex` is `uint64` (all bigint).
+
+The zgh sealed backend advertises optional `zgh-sessions-v1` and `zgh-tasks-v1`
+capabilities. A connected owner handle then has `nativeSessions` and
+`nativeTasks` for create/list/get, input, cancellation and SSE events; sessions
+also resume/fork and tasks archive. These preserve zgh's resource schemas and
+are separate from legacy `tasks` and OpenAI Responses. The CLI discovers the
+same capabilities through `/hello`: `/sessions`, `/session ...`, `/tasks`,
+`/task ...` (including show/cancel). Existing `/result` and `/cancel` keep
+their turn meaning when Responses is also present. `/help` shows the available
+commands; other frameworks keep their current behavior. Plain chat uses the
+resident owner conversation. See [the backend contract](../../sealed/ZGH.md).

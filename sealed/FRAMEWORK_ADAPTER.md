@@ -177,6 +177,7 @@ and degrades gracefully when absent):
 | `SigningRules` | `AppliesSigningRules() bool` | sign socket: refuses a transaction to AgenticID `update` / `updateAt` (the drift watcher's channel), and records every signature and refusal for the owner (`GET /_seal/signatures`). Set `RuntimeSnapshot.SigningRules` too, so the agent doc says so. Only 0g-harness | the socket signs within its three shapes and keeps no record; `/_seal/signatures` is 404 |
 | `RuntimeTools` | `ServesRuntimeTools() bool` | sign and reveal sockets: `POST /mcp` serves their endpoints (and the credential socket's) as MCP tools, which your framework registers from `tools/list` and calls back with `tools/call`. Set `RuntimeSnapshot.SealTools` too, so the agent doc names them. Only 0g-harness (its `seal-tools` plugin) | `/mcp` is 404 |
 | `LayeredRuntime` | `UseHarness(hash, dir)`, `HarnessHash()`, `InferenceTarget()` | bootstrap and `layered.go`: which harness package `Start` runs, switching packages as the attestor targets them, and serve-proof v2 (`LAYERS.md` §5, §7). Only 0g-harness | the framework the image installed runs; serve-proofs stay v1 |
+| `RuntimePackageValidator` | `ValidateRuntimePackage(dir)` | bootstrap and live package switching reject incompatible executable protocols before starting them; the zgh backend rejects DSH packages | existing package selection applies |
 
 Declare compile-time assertions for everything you implement
 (`var _ framework.VersionReconciler = (*Adapter)(nil)`) — silent non-implementation of an optional

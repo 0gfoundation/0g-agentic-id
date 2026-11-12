@@ -1,0 +1,134 @@
+# Sealed runtime with the zgh backend. Build context: sealed/.
+# See ZGH.md for artifact preparation, hashes and migration behavior.
+
+FROM golang:1.24-alpine AS storage-builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN V=$(go list -m -f '{{.Version}}' github.com/0gfoundation/0g-storage-client) \
+ && test -n "$V" \
+ && test -z "$(go list -m -f '{{if .Replace}}replaced{{end}}' github.com/0gfoundation/0g-storage-client)" \
+ && CGO_ENABLED=0 GOBIN=/out go install -ldflags="-s -w" "github.com/0gfoundation/0g-storage-client@$V"
+
+# Stage 2 — sealed bootstrap binary, and the loader that verifies and runs it.
+# The loader is built with the sealed binary's sha256 compiled in, so it runs
+# exactly this bootstrap and nothing else (sealed/LAYERS.md, base layer).
+# The zghonly build selects the zgh backend behind the existing iData contract.
+FROM golang:1.24-alpine AS bootstrap-builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY *.go ./
+COPY internal/ ./internal/
+COPY cmd/ ./cmd/
+RUN CGO_ENABLED=0 GOOS=linux go build -tags zghonly -ldflags="-s -w" -o bootstrap . \
+ && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o service-launcher ./cmd/service-launcher \
+ && H="$(sha256sum bootstrap | cut -d' ' -f1)" \
+ && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.expectedSealedHash=$H" -o loader ./cmd/loader \
+ && echo "loader pinned to bootstrap sha256 $H"
+
+# A prebuilt Linux x64 artifact from the private zgh repository. No GitHub
+# token or private source enters this public Dockerfile or any image layer.
+FROM debian:13-slim AS harness-package
+ARG ZGH_PACKAGE_SHA256
+COPY images/zgh/runtime.tgz /out/0g-harness.tgz
+RUN test "${#ZGH_PACKAGE_SHA256}" = 64 \
+ && printf '%s  %s\n' "$ZGH_PACKAGE_SHA256" /out/0g-harness.tgz | sha256sum -c -
+
+# Stage 4 — runtime.
+FROM debian:13-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils bubblewrap util-linux \
+ && rm -rf /var/lib/apt/lists/*
+
+# Low-privilege user the framework subprocess runs as (internal/privsep):
+# sealed (root, the loader's child) drops the agent process to it so the agent cannot
+# read sealed's memory or bootstrap env. Its home is /home/agent, which
+# sealed creates at boot (agent:agent 0700, privsep.PrepareAgentHome) and
+# which is HOME for everything the agent runs, so its tools' caches and
+# config go there. The harness, and every tool process it runs, starts in
+# the framework tree (/root/.dsh, DSH's home) instead, so relative paths in
+# their output land there, not in /home/agent
+# (internal/framework/harness/spawn.go explains why). /root stays root's: sealed makes it root:root 0711 at
+# boot (privsep.SecureHome) and hands the agent only its framework tree
+# inside it (privsep.OwnTree), linked into /home/agent
+# (privsep.LinkAgentHome) so the ~/.<framework> paths keep working. The
+# agent cannot create, rename or replace anything directly in /root,
+# including the toolchain configuration root uses from there; on a reused
+# container, what an earlier sealed (which let the agent own /root) left
+# there is moved into /home/agent at boot (privsep.ReclaimHome). Without a
+# usable agent account sealed refuses to provision (privsep.Required).
+RUN useradd --system --no-create-home --home-dir /home/agent --shell /usr/sbin/nologin agent
+
+ENV HOME=/root
+
+# Node from the official tarball (debian's node is too old for the SDK).
+ARG NODE_VERSION=24.22.1
+#
+# --no-same-owner: the release tarball records its build user's uid/gid
+# (1001), and GNU tar run as root restores it by default — onto
+# /usr/local/bin and /usr/local/lib as well, since they are directory
+# entries of the archive. sealed resolves every command it runs, as root
+# (RootCommand) or as the agent (AgentCommand, Sweep), only in PATH
+# directories owned by root and writable by nobody else (privsep.LookPath),
+# so the toolchain must be root-owned (checked at the end of this file).
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+      -o /tmp/node.tar.xz \
+ && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
+ && rm /tmp/node.tar.xz \
+ && node --version && npm --version
+
+# The 0g-harness official version package base ships (stage 3), unpacked
+# where sealed runs it from: /opt/0g-harness/<sha256 of the package>/, root's,
+# directories 0755 and files 0644 (0755 when executable), named in
+# /opt/0g-harness/base. The agent user can read and run it, not change it.
+COPY --from=harness-package /out/0g-harness.tgz /tmp/0g-harness.tgz
+RUN P="$(sha256sum /tmp/0g-harness.tgz | cut -d' ' -f1)" \
+ && D="/opt/0g-harness/$P" \
+ && mkdir -p "$D" \
+ && tar -xzf /tmp/0g-harness.tgz -C "$D" --no-same-owner --no-same-permissions \
+ && chown -R -h root:root /opt/0g-harness \
+ && find "$D" -type d -exec chmod 0755 {} + \
+ && find "$D" -type f -perm /111 -exec chmod 0755 {} + \
+ && find "$D" -type f ! -perm /111 -exec chmod 0644 {} + \
+ && chmod 0755 /opt/0g-harness \
+ && test -f "$D/bin/0g-harness.mjs" \
+ && printf '%s\n' "$P" > /opt/0g-harness/base \
+ && chmod 0644 /opt/0g-harness/base \
+ && rm /tmp/0g-harness.tgz \
+ && echo "base harness package $P"
+
+COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
+COPY --from=bootstrap-builder /app/bootstrap /bootstrap
+COPY --from=bootstrap-builder /app/loader /loader
+COPY --from=bootstrap-builder /app/service-launcher /usr/local/bin/sealed-service-launcher
+
+# sealed resolves every command it runs by name — as root (RootCommand) and
+# as the agent (AgentCommand, Sweep) alike — only through PATH directories
+# whose whole resolved path is owned by root and writable by nobody else,
+# and the resolved binary must be root-owned too (privsep.LookPath; the boot
+# log lists PATH entries it rejected). Fail the build, rather than the first
+# boot, when that does not hold for a command sealed needs here.
+RUN for c in npm node pkill 0g-storage-client; do \
+      w="$(command -v "$c")" || { echo "$c: not on PATH" >&2; exit 1; }; \
+      for p in "$(readlink -f "$w")" "$(readlink -f "$(dirname "$w")")"; do \
+        while :; do \
+          o="$(stat -c '%u %a' "$p")"; \
+          if [ "${o% *}" != 0 ] || [ $(( 0${o#* } & 022 )) -ne 0 ]; then \
+            echo "$p (uid ${o% *}, mode ${o#* }) is not root-only: privsep.LookPath will not resolve $c" >&2; exit 1; \
+          fi; \
+          [ "$p" = / ] && break; p="$(dirname "$p")"; \
+        done; \
+      done; \
+    done
+
+# The loader runs as PID 1: it checks /bootstrap against the hash built into
+# it, runs sealed as its child, forwards stop signals, reaps orphans, and exits
+# with sealed's status; under the layered flow it also switches sealed
+# versions sealed stages for it, and restarts a sealed that exits on its own
+# (cmd/loader). sealed spawns the harness once it has restored the agent's
+# iData. ENTRYPOINT is REQUIRED on a standalone (non-0g-sandbox-base) image —
+# without it the container boots a shell, never runs sealed, and fails as a
+# provision timeout.
+ENTRYPOINT ["/loader"]
+EXPOSE 8080

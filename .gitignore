@@ -18,3 +18,6 @@ broadcast/
 # Local-only SDK interface showcase / scratch scripts (may hold dev keys)
 showcase/
 
+
+# Private, prebuilt zgh integration artifact; never commit it.
+sealed/images/zgh/runtime.tgz

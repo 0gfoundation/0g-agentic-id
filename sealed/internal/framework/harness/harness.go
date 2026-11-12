@@ -107,7 +107,11 @@ var (
 
 // Adapter is the 0g-harness implementation of framework.Framework.
 type Adapter struct {
-	mu sync.RWMutex
+	// zgh changes the executable implementation, keeping the AgenticID role
+	// contract and its existing framework identifiers for restored agents.
+	zgh             bool
+	personaRestored bool
+	mu              sync.RWMutex
 
 	// binding is the composed framework-role state (name + pinned version).
 	binding frameworkBinding
@@ -211,7 +215,7 @@ func (a *Adapter) Defaults(role string) []byte {
 	case "framework":
 		b, err := json.Marshal(&frameworkBinding{
 			Name:           frameworkName,
-			PackageVersion: whitelistMax(),
+			PackageVersion: a.preferredVersion(),
 			SchemaVersion:  1,
 		})
 		if err != nil {
@@ -254,7 +258,7 @@ func (a *Adapter) Restore(ctx context.Context, role string, plaintext []byte) er
 // package_version resolves to whitelistMax, because version knowledge lives
 // with the code that validates versions, not with attestor.
 func (a *Adapter) restoreFramework(plaintext []byte) error {
-	next := frameworkBinding{Name: frameworkName, PackageVersion: whitelistMax(), SchemaVersion: 1}
+	next := frameworkBinding{Name: frameworkName, PackageVersion: a.preferredVersion(), SchemaVersion: 1}
 	if len(plaintext) > 0 {
 		var got frameworkBinding
 		if err := json.Unmarshal(plaintext, &got); err != nil {
@@ -272,6 +276,9 @@ func (a *Adapter) restoreFramework(plaintext []byte) error {
 			next.SchemaVersion = got.SchemaVersion
 		}
 		next.PackageVersion = coerceWhitelisted(got.PackageVersion)
+		if a.zgh {
+			next.PackageVersion = a.preferredVersion()
+		}
 		if got.PackageVersion != "" && got.PackageVersion != next.PackageVersion {
 			logger.Logf("harness.Restore[framework]: pinned version %q is not whitelisted; coerced to %q",
 				got.PackageVersion, next.PackageVersion)

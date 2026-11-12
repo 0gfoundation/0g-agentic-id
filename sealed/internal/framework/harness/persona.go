@@ -51,6 +51,9 @@ func (a *Adapter) evoAppendSystem() ([]byte, error) {
 // own edits) and touches an empty one otherwise, so a fresh container never
 // synthesizes a stock template that would land on chain as first-boot drift.
 func (a *Adapter) restoreAppendSystem(plaintext []byte) error {
+	if plaintext != nil {
+		a.personaRestored = true
+	}
 	if err := ensureDir(dshHome); err != nil {
 		return fmt.Errorf("harness.Restore[APPEND_SYSTEM.md]: %w", err)
 	}
@@ -110,6 +113,9 @@ func (a *Adapter) handleLegacyPersona(plaintext []byte) error {
 
 	var seed personaSeed
 	if err := json.Unmarshal(plaintext, &seed); err != nil {
+		if a.zgh {
+			return fmt.Errorf("zgh legacy persona: %w", err)
+		}
 		// A malformed seed must not stop the boot: log and keep defaults.
 		logger.Logf("harness.HandleLegacy[persona]: WARN parse failed (%v); keeping defaults", err)
 		return nil
@@ -121,8 +127,11 @@ func (a *Adapter) handleLegacyPersona(plaintext []byte) error {
 	// cost the owner their model.
 	a.seedFromPersona(seed.Inference.Provider, seed.Inference.Model)
 
-	if seed.SystemPrompt != "" {
+	if seed.SystemPrompt != "" && !(a.zgh && a.personaRestored) {
 		if err := a.restoreAppendSystem([]byte(seed.SystemPrompt)); err != nil {
+			if a.zgh {
+				return err
+			}
 			// Logged, never returned: Phase C propagates an error (main.go
 			// returns on it), so an unwritable persona file would take the
 			// container OFFLINE — strictly worse than running on the stock

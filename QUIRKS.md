@@ -189,7 +189,7 @@ deliberate:
   (`sealed/defaultmux.go`), so those routes are never served from the process that
   holds the key.
 - That pin is also the CLI's: the `storage-builder` stage of every image that builds
-  it (`sealed/Dockerfile`, `images/{hermes,prime,harness,sealed}`; the base image
+  it (`sealed/Dockerfile`, `images/{hermes,prime,harness,sealed,zgh}`; the base image
   `images/openclaw` has none) reads the version from
   `sealed/go.mod` (`go list -m`) and `go install`s the CLI at it, so downloads and
   uploads always move together (and a rebuilt image no longer picks up whatever

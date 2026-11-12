@@ -18,6 +18,7 @@
 
 import { proofFromResponse, requestBytesOf, normalizedMethod, type TaskExchange } from './ServeSession';
 import type { ServeProof } from './types';
+import { nativeResources, type NativeSessions, type NativeTasks } from './NativeResources';
 
 /** What a task id the agent returns must look like to be handed out. */
 const TASK_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
@@ -283,6 +284,9 @@ export interface AgentEvent {
  * reflects the currently-cached credential, if any.
  */
 export interface AgentClient {
+  /** Native resource protocols, attached only when explicitly advertised. */
+  nativeSessions?: NativeSessions;
+  nativeTasks?: NativeTasks;
   readonly token?: string;
   readonly base: string;
   readonly services: AgentServiceEntry[];
@@ -1096,6 +1100,10 @@ export function makeAgentClient(params: {
   }
 
   const tasksBase = ownerBase('tasks');
+  const nativeSessionBase = ownerBase('zgh-sessions-v1');
+  if (nativeSessionBase) client.nativeSessions = nativeResources(nativeSessionBase, doFetch);
+  const nativeTaskBase = ownerBase('zgh-tasks-v1');
+  if (nativeTaskBase) client.nativeTasks = nativeResources(nativeTaskBase, doFetch);
   if (tasksBase) {
     client.tasks = async (opts) =>
       (await getJSON<{ data: AgentTaskInfo[] }>('tasks', `${tasksBase}${query({ status: opts?.status, limit: opts?.limit })}`)).data;
