@@ -246,6 +246,10 @@ pub struct MockChain {
     /// What `identity_registry_of` answers: `Some(addr)` = the registry's
     /// getIdentityRegistry(); `None` (default) = the read fails.
     identity_registry: Mutex<Option<Address>>,
+    /// What `trust_registry` answers; None (default) = a chain without one.
+    trust_registry: Mutex<Option<Address>>,
+    /// (kind, hash) pairs the trust registry lists.
+    listed: Mutex<Vec<(B256, B256)>>,
 }
 
 impl MockChain {
@@ -283,6 +287,23 @@ impl MockChain {
             can_clone_verdict: Mutex::new(None),
             last_clone_from: Mutex::new(None),
             identity_registry: Mutex::new(None),
+            trust_registry: Mutex::new(None),
+            listed: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Give the chain a trust registry (test-only); None = AgenticID before 1.4.0.
+    pub fn set_trust_registry(&self, registry: Option<Address>) {
+        *self.trust_registry.lock().unwrap() = registry;
+    }
+
+    /// List (true) or delist (false) `hash` under the trust kind `kind` ("sealed", …).
+    pub fn set_listed(&self, kind: &str, hash: B256, listed: bool) {
+        let kind = crate::chain::trust_kind(kind);
+        let mut all = self.listed.lock().unwrap();
+        all.retain(|&(k, h)| (k, h) != (kind, hash));
+        if listed {
+            all.push((kind, hash));
         }
     }
 
@@ -396,6 +417,18 @@ impl ChainClient for MockChain {
 
     async fn is_valid_framework_hash(&self, _hash: ImageHash) -> anyhow::Result<bool> {
         Ok(self.valid_framework.load(Ordering::SeqCst))
+    }
+
+    async fn trust_registry(&self) -> anyhow::Result<Option<Address>> {
+        Ok(*self.trust_registry.lock().unwrap())
+    }
+
+    async fn is_listed(&self, registry: Address, kind: B256, hash: B256) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            Some(registry) == *self.trust_registry.lock().unwrap(),
+            "isListed on {registry:#x}, which is not the chain's trust registry"
+        );
+        Ok(self.listed.lock().unwrap().contains(&(kind, hash)))
     }
 
     async fn is_trusted_attestor(&self, _addr: Address) -> anyhow::Result<bool> {

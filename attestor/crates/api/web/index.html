@@ -4839,8 +4839,9 @@ function fireProbe(sealIdHex) {
 // Header format: `X-Agent-Proof: <sig>.<base64url(envelope_json)>`,
 // envelope = `{ agent_id, submitter, timestamp, deadline, task_hash,
 // data_hashes[], framework_hash, validator }` (`validator` is diagnostic only —
-// not part of the signed tuple). sig is over the ServeProof digest, see
-// serveProofSignedDigest.
+// not part of the signed tuple); a v2 envelope adds `{ version: 2,
+// sealed_hash, harness_hash, inference_url, model }`. sig is over the
+// ServeProof digest, see serveProofSignedDigest.
 function b64urlDecode(s) {
   const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
   return atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
@@ -4851,10 +4852,15 @@ function b64urlDecode(s) {
 // ServeProof.ts, this, attestor/scripts/verify-agent.sh check 3b; see
 // AGENTS.md). Pinned by sdk/typescript/test/serveproof-copies.test.mjs, which
 // runs this function verbatim: validator 0x…B7 + the shared fixed tuple →
-// 0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b.
-// Inner proofHash = keccak256(abi.encode(chainId, identityRegistry,
-// submitter, agentId, timestamp, deadline, taskHash,
-// keccak256(abi.encodePacked(dataHashes)), frameworkHash)); the signed digest
+// 0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b (v1) and,
+// with the v2 layers, 0x50f91a86a4e744dddd29bc16e936ab717a8c54074458e4332c5f43661538df4e.
+// The envelope's `version` picks the inner proofHash (sealed/LAYERS.md §7).
+// v1 (no version; every image before the layered runtime):
+// keccak256(abi.encode(chainId, identityRegistry, submitter, agentId,
+// timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)),
+// frameworkHash)). v2: keccak256(abi.encode(keccak256("AgentDNA.ServeProof.v2"),
+// the same nine, sealedHash, harnessHash, keccak256(inferenceURL),
+// keccak256(model))). The signed digest
 // is EIP-191 version 0x00 ("data with intended validator"):
 // keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash), validator = the
 // VerifiedFeedbackRegistry proxy. Recover it RAW (ethers.recoverAddress) —
@@ -4863,12 +4869,28 @@ function b64urlDecode(s) {
 function serveProofSignedDigest(chainId, identityRegistry, validator, envelope) {
   const dh = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
   const dhHash = ethers.keccak256(dh.length ? ethers.concat(dh) : '0x');
-  const proofHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
-    ['uint256', 'address', 'address', 'uint256', 'uint256', 'uint256', 'bytes32', 'bytes32', 'bytes32'],
-    [BigInt(chainId), identityRegistry, envelope.submitter || ethers.ZeroAddress,
-     BigInt(envelope.agent_id), BigInt(envelope.timestamp), BigInt(envelope.deadline),
-     envelope.task_hash, dhHash, envelope.framework_hash],
-  ));
+  const types = ['uint256', 'address', 'address', 'uint256', 'uint256', 'uint256', 'bytes32', 'bytes32', 'bytes32'];
+  const fields = [BigInt(chainId), identityRegistry, envelope.submitter || ethers.ZeroAddress,
+    BigInt(envelope.agent_id), BigInt(envelope.timestamp), BigInt(envelope.deadline),
+    envelope.task_hash, dhHash, envelope.framework_hash];
+  const coder = ethers.AbiCoder.defaultAbiCoder();
+  let proofHash;
+  if (envelope.version === undefined) {
+    // v1: delete this branch once the images before the layered runtime are gone.
+    proofHash = ethers.keccak256(coder.encode(types, fields));
+  } else if (envelope.version === 2) {
+    const text = (v, name) => {
+      if (typeof v !== 'string') throw new Error(`v2 proof without a string ${name}`);
+      return ethers.keccak256(ethers.toUtf8Bytes(v));
+    };
+    proofHash = ethers.keccak256(coder.encode(
+      ['bytes32', ...types, 'bytes32', 'bytes32', 'bytes32', 'bytes32'],
+      [ethers.id('AgentDNA.ServeProof.v2'), ...fields, envelope.sealed_hash, envelope.harness_hash,
+       text(envelope.inference_url, 'inference_url'), text(envelope.model, 'model')],
+    ));
+  } else {
+    throw new Error(`unsupported serve-proof version ${JSON.stringify(envelope.version)}`);
+  }
   return ethers.keccak256(ethers.concat(['0x1900', ethers.getAddress(validator), proofHash]));
 }
 
@@ -5221,7 +5243,11 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
         sigInfo, humanMsg);
       return;
     }
-    setRow('identity', 'passed', `signer ${sigInfo.short} = on-chain agent_seal`);
+    // A v2 proof also names what each layer ran (sealed/LAYERS.md §7).
+    const layers = envelope.version === 2
+      ? ` · v2: sealed ${short(String(envelope.sealed_hash))}, harness ${short(String(envelope.harness_hash))}`
+      : '';
+    setRow('identity', 'passed', `signer ${sigInfo.short} = on-chain agent_seal${layers}`);
 
     // ── Check 2: response body integrity ──
     setRow('body', 'running');

@@ -89,6 +89,22 @@ sol!(
     }
 );
 
+// TrustRegistry (contracts/src/TrustRegistry.sol), found through AgenticID's
+// `trustRegistry()` — only the list read: the attestor checks the sealed
+// program a layered boot names against the sealed list.
+sol!(
+    #[sol(rpc)]
+    interface ITrustRegistry {
+        function isListed(bytes32 kind, bytes32 hash) external view returns (bool);
+    }
+);
+
+/// A trust-registry list kind: keccak256 of its name ("image", "sealed",
+/// "harness").
+pub fn trust_kind(name: &str) -> B256 {
+    alloy::primitives::keccak256(name.as_bytes())
+}
+
 // VerifiedFeedbackRegistry — only the anchor read the startup check makes
 // (`check_verified_feedback_anchor`). The attestor never writes to it.
 sol!(
@@ -577,6 +593,25 @@ where
     async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool> {
         let c = AgenticID::new(self.contract_addr, self.provider.clone());
         Ok(c.isTrustedAttestor(addr).call().await?._0)
+    }
+
+    async fn trust_registry(&self) -> anyhow::Result<Option<Address>> {
+        let c = AgenticID::new(self.contract_addr, self.provider.clone());
+        match c.trustRegistry().call().await {
+            Ok(r) => Ok((r._0 != Address::ZERO).then_some(r._0)),
+            // The node answered with an error: the contract refused the
+            // call, as an AgenticID without the function does. A call that
+            // got no answer stays an error, never "no registry".
+            Err(alloy::contract::Error::TransportError(e)) if e.as_error_resp().is_some() => {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn is_listed(&self, registry: Address, kind: B256, hash: B256) -> anyhow::Result<bool> {
+        let r = ITrustRegistry::new(registry, self.provider.clone());
+        Ok(r.isListed(kind, hash).call().await?._0)
     }
 
     async fn identity_registry_of(&self, registry: Address) -> anyhow::Result<Address> {

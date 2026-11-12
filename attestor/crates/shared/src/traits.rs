@@ -19,6 +19,23 @@ pub trait ChainClient: Send + Sync {
     async fn is_valid_framework_hash(&self, hash: ImageHash) -> anyhow::Result<bool>;
     async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool>;
 
+    /// AgenticID `trustRegistry()` (1.4.0+): the contract holding the
+    /// deployer's trust lists (sealed/LAYERS.md §10). None when the chain has
+    /// none — an AgenticID before 1.4.0 has no such function and reverts.
+    async fn trust_registry(&self) -> anyhow::Result<Option<Address>> {
+        Ok(None)
+    }
+
+    /// TrustRegistry `isListed(kind, hash)`; `kind` is `crate::chain::trust_kind`.
+    async fn is_listed(
+        &self,
+        _registry: Address,
+        _kind: B256,
+        _hash: B256,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("trust registry reads not implemented")
+    }
+
     /// Live owner of this attestor's Tapp, used for administrative writes.
     async fn tapp_app_owner(&self, _registry: Address, _app_id: &str) -> anyhow::Result<Address> {
         anyhow::bail!("Tapp owner lookup not implemented")

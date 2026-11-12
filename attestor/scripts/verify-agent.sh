@@ -16,7 +16,9 @@
 #      VerifiedFeedbackRegistry makes, gas-free, so a validator / image skew
 #      shows up here first. Both addresses come from the same /config, so
 #      the anchoring assertion is what ties the recovery to a registry that
-#      redeems for this AgenticID
+#      redeems for this AgenticID. A v2 proof (0g-harness on the layered
+#      runtime) is also checked against the trust registry: the image, sealed
+#      and harness hashes it names must be on its lists
 #
 # Owner-run: the deployment row's sandbox_id / agent_seal_addr are
 # owner-tier fields, so this needs THAT agent's owner key.
@@ -43,31 +45,58 @@ command -v jq >/dev/null 2>&1 || { echo "verify-agent: jq is required"; exit 1; 
 
 # serveproof_digest CHAIN_ID IDENTITY_REGISTRY VALIDATOR ENVELOPE_JSON prints
 # the ServeProof signed digest for an X-Agent-Proof envelope — what agent_seal
-# signs RAW (no further wrap): keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash),
-# proofHash = keccak256(abi.encode(chainId, identityRegistry, submitter,
-# agentId, timestamp, deadline, taskHash, keccak256(packed dataHashes),
-# frameworkHash)). One of the five consensus-critical copies listed in
-# AGENTS.md; `--kat` pins it (run by sdk/typescript/test/serveproof-copies).
+# signs RAW (no further wrap): keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash).
+# The envelope's `version` picks proofHash (sealed/LAYERS.md §7):
+#   none (v1, every image before the layered runtime) — keccak256(abi.encode(
+#     chainId, identityRegistry, submitter, agentId, timestamp, deadline,
+#     taskHash, keccak256(packed dataHashes), frameworkHash));
+#   2 — keccak256(abi.encode(keccak256("AgentDNA.ServeProof.v2"), the same
+#     nine, sealedHash, harnessHash, keccak256(inferenceURL), keccak256(model))).
+# One of the five consensus-critical copies listed in AGENTS.md; `--kat` pins
+# both (run by sdk/typescript/test/serveproof-copies).
 serveproof_digest() {
-  local env_json=$4 dh inner
+  local env_json=$4 dh inner version common
   _env() { printf '%s' "$env_json" | jq -r "$1"; }
-  dh=$(cast keccak "0x$(_env '(.data_hashes // []) | map(ltrimstr("0x")) | join("")')") &&
-  inner=$(cast keccak "$(cast abi-encode \
-    'f(uint256,address,address,uint256,uint256,uint256,bytes32,bytes32,bytes32)' \
-    "$1" "$2" "$(_env '.submitter // "0x0000000000000000000000000000000000000000"')" \
-    "$(_env '.agent_id // empty')" "$(_env .timestamp)" "$(_env .deadline)" \
-    "$(_env .task_hash)" "$dh" "$(_env .framework_hash)")") &&
+  # keccak256 of an envelope string field, refused unless it is a string.
+  _strhash() { cast keccak "$(cast from-utf8 "$(printf '%s' "$env_json" | jq -er "$1 | strings")")"; }
+  version=$(_env '.version // empty')
+  dh=$(cast keccak "0x$(_env '(.data_hashes // []) | map(ltrimstr("0x")) | join("")')") || return 1
+  common=("$1" "$2" "$(_env '.submitter // "0x0000000000000000000000000000000000000000"')"
+    "$(_env '.agent_id // empty')" "$(_env .timestamp)" "$(_env .deadline)"
+    "$(_env .task_hash)" "$dh" "$(_env .framework_hash)")
+  case "$version" in
+    "") # v1: delete this branch once those images are gone.
+      inner=$(cast keccak "$(cast abi-encode \
+        'f(uint256,address,address,uint256,uint256,uint256,bytes32,bytes32,bytes32)' "${common[@]}")") ;;
+    2)
+      local url model
+      url=$(_strhash .inference_url) && model=$(_strhash .model) || return 1
+      inner=$(cast keccak "$(cast abi-encode \
+        'f(bytes32,uint256,address,address,uint256,uint256,uint256,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32)' \
+        "$(cast keccak 'AgentDNA.ServeProof.v2')" "${common[@]}" \
+        "$(_env .sealed_hash)" "$(_env .harness_hash)" "$url" "$model")") ;;
+    *) return 1 ;;
+  esac || return 1
   cast keccak "0x1900${3#0x}${inner#0x}"
 }
 
 if [ "${1:-}" = "--kat" ]; then
-  # Same fixed inputs and expected digest as contracts / sealed / the SDK.
+  # Same fixed inputs and expected digests as contracts / sealed / the SDK.
   KAT_ENV='{"agent_id":"42","submitter":"0x00000000000000000000000000000000000000C1","timestamp":1700000000,"deadline":1700003600,"task_hash":"0x1111111111111111111111111111111111111111111111111111111111111111","data_hashes":["0x2222222222222222222222222222222222222222222222222222222222222222","0x3333333333333333333333333333333333333333333333333333333333333333"],"framework_hash":"0x4444444444444444444444444444444444444444444444444444444444444444"}'
-  KAT_WANT=0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b
-  KAT_GOT=$(serveproof_digest 16602 0x00000000000000000000000000000000000000A9 \
-    0x00000000000000000000000000000000000000B7 "$KAT_ENV") || KAT_GOT=""
-  if [ "$KAT_GOT" = "$KAT_WANT" ]; then echo "OK   serveproof_digest KAT ($KAT_GOT)"; exit 0; fi
-  echo "FAIL serveproof_digest KAT: got '$KAT_GOT', want $KAT_WANT"; exit 1
+  KAT_ENV2=$(printf '%s' "$KAT_ENV" | jq -c '. + {version: 2,
+    sealed_hash: "0x5555555555555555555555555555555555555555555555555555555555555555",
+    harness_hash: "0x6666666666666666666666666666666666666666666666666666666666666666",
+    inference_url: "https://router.example/v1", model: "model-x"}')
+  kat_fail=0
+  for kat in "v1 $KAT_ENV 0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b" \
+             "v2 $KAT_ENV2 0x50f91a86a4e744dddd29bc16e936ab717a8c54074458e4332c5f43661538df4e"; do
+    read -r KAT_NAME KAT_JSON KAT_WANT <<<"$kat"
+    KAT_GOT=$(serveproof_digest 16602 0x00000000000000000000000000000000000000A9 \
+      0x00000000000000000000000000000000000000B7 "$KAT_JSON") || KAT_GOT=""
+    if [ "$KAT_GOT" = "$KAT_WANT" ]; then echo "OK   serveproof_digest $KAT_NAME KAT ($KAT_GOT)"
+    else echo "FAIL serveproof_digest $KAT_NAME KAT: got '$KAT_GOT', want $KAT_WANT"; kat_fail=1; fi
+  done
+  exit "$kat_fail"
 fi
 
 API="${API:-http://localhost:8080}"
@@ -187,6 +216,7 @@ if [ -n "$PROOF" ]; then
     | jq -Rr 'gsub("-";"+") | gsub("_";"/") | . + ("=" * ((4 - length % 4) % 4)) | @base64d' 2>/dev/null || true)
   E_AGENT=$(printf '%s' "$ENV_JSON" | jq -r '.agent_id // empty' 2>/dev/null || true)
   E_VAL=$(printf '%s' "$ENV_JSON" | jq -r '.validator // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+  E_VER=$(printf '%s' "$ENV_JSON" | jq -r '.version // empty' 2>/dev/null || true)
   if [ "$E_AGENT" = "$AGENT_ID" ]; then ok "proof envelope agent_id == $AGENT_ID"
   else bad "proof envelope agent_id='$E_AGENT' != $AGENT_ID"; fi
   if [ -z "$VF" ]; then
@@ -198,7 +228,7 @@ if [ -n "$PROOF" ]; then
     if [ -z "$DIGEST" ]; then
       bad "ServeProof digest: could not rebuild from envelope ($ENV_JSON)"
     elif VERIFY_ERR=$(cast wallet verify --no-hash --address "$DB_ADDR" "$DIGEST" "$SIG" 2>&1 >/dev/null); then
-      ok "ServeProof signature recovers to seal addr (validator $VF)"
+      ok "ServeProof ${E_VER:+v$E_VER }signature recovers to seal addr (validator $VF)"
     elif printf '%s' "$VERIFY_ERR" | grep -q "did not sign this message"; then
       hint=""; [ -n "$E_VAL" ] || hint=" (envelope has no validator — legacy sealed image? owner must /reset)"
       bad "ServeProof signature does not recover to seal addr $DB_ADDR$hint"
@@ -206,6 +236,22 @@ if [ -n "$PROOF" ]; then
       # Not a plain mismatch (malformed signature, cast usage error, …).
       bad "ServeProof signature check errored: $VERIFY_ERR"
     fi
+  fi
+fi
+
+# ── 3c. a v2 proof's layers on the trust registry's lists ───────────────
+if [ -n "$PROOF" ] && [ "${E_VER:-}" = "2" ]; then
+  TRUST=$(cast call --rpc-url "$RPC" "$CONTRACT" 'trustRegistry()(address)' 2>/dev/null || true)
+  if [ -z "$TRUST" ] || [ "$TRUST" = "0x0000000000000000000000000000000000000000" ]; then
+    bad "v2 proof, but AgenticID $CONTRACT names no trust registry to check its layers against"
+  else
+    for layer in "image .framework_hash" "sealed .sealed_hash" "harness .harness_hash"; do
+      read -r KIND FIELD <<<"$layer"
+      HASH=$(printf '%s' "$ENV_JSON" | jq -r "$FIELD // empty")
+      LISTED=$(cast call --rpc-url "$RPC" "$TRUST" 'isListed(bytes32,bytes32)(bool)' "$(cast keccak "$KIND")" "$HASH" 2>/dev/null || true)
+      if [ "$LISTED" = "true" ]; then ok "$KIND $HASH is on the trust registry's $KIND list"
+      else bad "$KIND ${HASH:-<missing>} is not on the trust registry's $KIND list"; fi
+    done
   fi
 fi
 

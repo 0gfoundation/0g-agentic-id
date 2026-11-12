@@ -315,16 +315,21 @@ sandbox provider and sealed: `crates/shared/testdata/image-attestation-v3.json`
 `AttestorTLS`). The Rust tests recompute each type hash, domain separator,
 struct hash, digest and recovered signer, and read sealed's
 `sealed/internal/inference/testdata/boot-v1-first.json` (first provision,
-carrying the certificate) and `boot-v1.json` (later boot, recorded key). API
+carrying the certificate), `boot-v1.json` (later boot, recorded key) and
+`boot-v2.json` (the layered claim, which signs the sealed hash). API
 tests cover a first boot and later boots, another container key, a changed
 provider instance, an image removed from the allowlist, `409
 certificate_required`, the certificate's issue window, and the
 `/attestor-tls` relay's 200/404/503 answers; the relay tests also check that
 a cached statement is served without consulting sandbox discovery, and still
-while discovery fails during a refresh:
+while discovery fails during a refresh. The layered flow's tests cover
+`layered` in discovery, a listed and an unlisted sealed program (`403`, the
+agent not taken offline, the newest listed version accepted under the same
+generation), a sealed hash outside the signature, a claim without one on a
+layered attestor, and a sealed hash on a chain without a trust registry:
 
 ```bash
-cargo test -p attestor-shared -- image_attestation:: attestor_tls::
+cargo test -p attestor-shared -- image_attestation:: attestor_tls:: auth::status::
 cargo test -p attestor-api -- provision:: attestor_tls::
 ```
 
