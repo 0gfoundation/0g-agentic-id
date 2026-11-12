@@ -4,6 +4,12 @@
  * agent's agentSeal public key, so it never appears in clear in the envelope
  * the owner's wallet signs (issue #166).
  *
+ * LEGACY(model-key): model keys go into the agent's credential set
+ * (Credentials.ts; an integrator's with `sealModelKey`). The secret env is the
+ * copy sent with the request for images that read only that
+ * (legacy/modelKey.ts) and goes with it; {@link eciesEncrypt} stays, the
+ * credential set seals with it.
+ *
  * The sandbox "create" envelope is signed with EIP-191 `personal_sign`, and a
  * wallet shows that message verbatim. With the key in `env.API_KEY`, the
  * prompt displayed it, and every hop that relays the envelope (an

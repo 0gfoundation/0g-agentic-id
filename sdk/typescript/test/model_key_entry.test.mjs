@@ -132,3 +132,32 @@ test('deploy without a key touches no set', async () => {
   assert.deepEqual(calls.map((c) => c[0]), ['deploy']);
   assert.equal(res.modelKeyStored, undefined);
 });
+
+const SEALED = { v: 1, sealId: SEAL, owner: `0x${'aa'.repeat(20)}`, provider: 'anthropic', value: 'Y2lwaGVy', secretEnv: 'cmVxdWVzdA==' };
+
+test('a sealed model key goes into the set as it is, and its request copy rides the request', async () => {
+  const { api, calls } = agentApi();
+  await api.reset(SEAL, { sealedModelKey: SEALED });
+  assert.deepEqual(calls[0], ['setModelKey', 'anthropic', SEALED, false]);
+  const p = calls[1][2];
+  assert.deepEqual([p.provider, p.apiKey, p.sealedSecretEnv], ['anthropic', undefined, SEALED.secretEnv]);
+});
+
+test('a sealed model key with no request copy reaches the container only through the set: a failed store refuses', async () => {
+  const bare = { ...SEALED, secretEnv: undefined };
+  const { api, calls } = agentApi();
+  await api.start(SEAL, { sealedModelKey: bare });
+  assert.equal(calls.at(-1)[2].keyInCredentials, true);
+  assert.equal(calls.at(-1)[2].sealedSecretEnv, undefined);
+  const failing = agentApi({ failSet: true });
+  await assert.rejects(failing.api.start(SEAL, { sealedModelKey: bare }), /no credential sets/);
+  assert.ok(!failing.calls.some((c) => c[0] === 'lifecycle'), 'nothing sent');
+});
+
+test('a sealed model key with a key, another provider or a request-only key is refused', async () => {
+  const { api, calls } = agentApi();
+  await assert.rejects(api.reset(SEAL, { sealedModelKey: SEALED, apiKey: 'sk' }), /apiKey or sealedModelKey/);
+  await assert.rejects(api.reset(SEAL, { sealedModelKey: SEALED, provider: 'openai' }), /for anthropic, not openai/);
+  await assert.rejects(api.retry(SEAL, { sealedModelKey: SEALED, sealedSecretEnv: 'eA==' }), /sealedModelKey or sealedSecretEnv/);
+  assert.deepEqual(calls, []);
+});

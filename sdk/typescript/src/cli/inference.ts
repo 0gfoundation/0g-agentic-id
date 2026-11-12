@@ -3,6 +3,7 @@ import type { Hash } from 'viem';
 import { inferenceKeyFromEnv, loadApiKey } from './config';
 import { CliError } from './errors';
 import { requiresMintFirst } from '../Providers';
+import { storeAfterMint } from '../legacy/modelKey';
 import {
   DEFAULT_PERSONA_INFERENCE, deploymentFactsOf, needsDefaultSettings, storeDefaultSettings,
   type DeploymentFacts,
@@ -26,11 +27,11 @@ export async function deployWithInference(ag: AgenticID, params: {
     ...(params.provision && !mintFirst ? { sandbox: { apiKey: params.apiKey } } : {}),
   });
   const mint = await ag.agent.waitForMint(deployment.sealId, { timeoutMs: 180000 });
-  // deploy stored the key in the set as it created the agent.
-  // LEGACY(model-key): an attestor that takes no set before the mint takes it
-  // now (a mint-first start stores it itself).
-  if (params.apiKey && params.provision && !mintFirst && !deployment.modelKeyStored) {
-    await ag.credentials.setModelKey(deployment.sealId, params.provider, params.apiKey, { push: false }).catch(() => undefined);
+  // deploy stored the key in the set as it created the agent (a mint-first
+  // start stores it itself); an older attestor takes it now.
+  const apiKey = params.apiKey;
+  if (apiKey && params.provision && !mintFirst) {
+    await storeAfterMint(deployment, () => ag.credentials.setModelKey(deployment.sealId, params.provider, apiKey, { push: false }).then(() => true, () => false));
   }
   // A mint-only agent also keeps the chosen pin as its settings document, so
   // the container a later reset starts boots on it whatever happens to the

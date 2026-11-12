@@ -93,6 +93,7 @@ export type {
   ModelKeyInUse,
   ModelKeysView,
   LoadedCredentials,
+  SealedModelKey,
 } from './Credentials';
 
 // ── Reputation: serve-proof transport + verification ──

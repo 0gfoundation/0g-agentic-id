@@ -2317,6 +2317,9 @@ async function eciesEncryptTo(pubkeyHex, plaintext) {
 // env for a create envelope on an EXISTING agent: the key sealed to the
 // agent when the attestor advertises the scheme, else legacy API_KEY.
 // Throws (before anything is signed) if sealing was chosen and fails.
+// LEGACY(model-key): this console sends the model key with the request only
+// and does not store it in the agent's credential set, so the request path
+// (OWNER_ENV_KEYS in sandbox.rs) stays until it does.
 async function keyEnvFor(sealId, apiKey) {
   if (!apiKey) return {};
   if (!State.config || State.config.secret_env_scheme !== SECRET_ENV_SCHEME) return { API_KEY: apiKey };

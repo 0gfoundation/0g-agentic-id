@@ -82,6 +82,8 @@ type Bootstrap struct {
 	ProviderSigner common.Address
 
 	// Optional pipeline knobs
+	// APIKey is the create/reset model key, in clear (API_KEY) or opened from
+	// SecretEnv. LEGACY(model-key): see internal/secretenv.
 	APIKey              string
 	InferenceCredential *inference.ProviderCredential
 	StatusBinding       *report.Binding

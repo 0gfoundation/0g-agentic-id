@@ -284,6 +284,14 @@ where
 /// locations, proxy endpoints, the Go runtime's settings), and gives each
 /// framework only variables it names itself, so no other owner variable has
 /// a consumer.
+///
+/// LEGACY(model-key): model keys go into the agent's credential set, which
+/// reaches every boot through `/provision`. This is the copy sent with the
+/// create, kept while images read only that and clients send only that (the
+/// SDK and CLI from before model keys in the set, this attestor's console,
+/// integrators on `sealedSecretEnv`). Once both are gone, an owner's create
+/// carries no env: empty this list, and `secret_env_scheme` in `GET /config`
+/// goes with it.
 const OWNER_ENV_KEYS: [&str; 2] = ["API_KEY", "SEAL_SECRET_ENV"];
 
 /// Why an owner-signed create `env` is refused: it names a variable other

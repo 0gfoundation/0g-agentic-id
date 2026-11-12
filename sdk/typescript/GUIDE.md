@@ -602,22 +602,29 @@ without `sandbox`, persist the provider/model settings, then
 
 **When your app supplies the key and the user signs.** Sealing in the
 browser still means the key reaches the user's browser. Seal it on your
-server instead, and hand the browser only the ciphertext:
+server instead, and hand the browser only the sealed key:
 
 ```ts
 // server: a read-only client is enough (no wallet)
 const ag = new AgentDNA({ attestorUrl, addresses, rpcUrl, chain });
-const sealed = await ag.agent.sealApiKey(sealId, { owner, apiKey });
+const sealed = await ag.credentials.sealModelKey(sealId, { owner, provider, apiKey });
 
-// browser: signs ciphertext only; the key never reaches it
-await ag.agent.start(sealId, { sealedSecretEnv: sealed });
+// browser: stores it in the agent's credential set, signing only its hash
+await ag.credentials.setModelKey(sealId, provider, sealed);
+// or with a new container, in place of apiKey
+await ag.agent.start(sealId, { sealedModelKey: sealed });
 ```
 
-`owner` must be the wallet that signs: the container applies the secret only
-while that address owns the agent on chain, so `sealApiKey` checks `ownerOf`
-once the agent is minted. `sealedSecretEnv` is accepted by `start` / `reset`
-/ `retry`, requires the attestor to advertise `secret_env_scheme`, and never
-falls back to `API_KEY`.
+`owner` must be the wallet that signs: the value is bound to it (and to the
+agent, the chain and `model.<provider>`), so `sealModelKey` checks `ownerOf`
+once the agent is minted, and `setModelKey` refuses a key sealed for another
+agent, provider or wallet. From the set the key reaches every boot of the
+agent, like the owner's own key. While older images are in use,
+`sealed.secretEnv` holds the same key as they read it with the request;
+`start` / `reset` / `retry` send it (it is present when the attestor
+advertises `secret_env_scheme`). The request-only form, `agent.sealApiKey`
+passed as `sealedSecretEnv`, still works for the request it rides and goes
+away with the request path.
 
 Every refusal on these paths throws `SecretEnvRefusedError` (exported) before
 anything is signed or sent: `signed` is always `false`, and `code` names the

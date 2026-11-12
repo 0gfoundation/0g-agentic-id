@@ -5,7 +5,11 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { keccak256 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { CredentialsApi, credentialSetTypes, CREDENTIALS_DOMAIN_NAME, CREDENTIALS_DOMAIN_VERSION } from '../dist/index.js';
+import { CredentialsApi, credentialSetTypes, CREDENTIALS_DOMAIN_NAME, CREDENTIALS_DOMAIN_VERSION, SecretEnvRefusedError } from '../dist/index.js';
+import { secp256k1 } from '@noble/curves/secp256k1';
+import { hkdf } from '@noble/hashes/hkdf';
+import { sha256 } from '@noble/hashes/sha2';
+import { gcm } from '@noble/ciphers/aes';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -395,4 +399,79 @@ test('cli: cred pending/notify/presets complete no agent subcommands', () => {
   assert.deepEqual(completeLine('cred pending ', state)[0], []);
   assert.deepEqual(completeLine('cred notify ', state)[0], []);
   assert.deepEqual(completeLine('cred 532 se', state)[0], ['set ']);
+});
+
+// ── an integrator's key: its server seals, the owner stores without it ─────
+
+// The private half of SEAL_PUB (also in sealed/internal/secretenv's tests).
+const SEAL_PRIV = '4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318';
+function open(b64) {
+  const data = Buffer.from(b64, 'base64');
+  const eph = data.subarray(0, 65);
+  const shared = secp256k1.getSharedSecret(SEAL_PRIV, eph, false);
+  const key = hkdf(sha256, Buffer.concat([eph, shared]), undefined, undefined, 32);
+  return JSON.parse(Buffer.from(gcm(key, data.subarray(65, 81)).decrypt(Buffer.concat([data.subarray(97), data.subarray(81, 97)]))).toString());
+}
+
+/** The integrator's server: no wallet; `sealApiKey` is the request copy older images read. */
+function integrator(sealApiKey = async () => 'cmVxdWVzdC1jb3B5') {
+  const asked = [];
+  const attestor = {
+    agentSealPubkeyFor: async (seal, who, what) => { asked.push([seal, who, what]); return SEAL_PUB; },
+    sealApiKey: async (p) => { asked.push(['sealApiKey', p.provider]); return sealApiKey(p); },
+  };
+  const ctx = { attestorUrl: 'http://127.0.0.1:1', chain: { id: CHAIN_ID }, addresses: { agenticID: CONTRACT } };
+  return { server: new CredentialsApi(ctx, attestor), asked };
+}
+
+test('sdk: an integrator\'s server seals the model key, and the owner stores it without ever having it', async () => {
+  const { server, asked } = integrator();
+  const sealed = await server.sealModelKey(SEAL_ID, { owner: owner.address, provider: 'anthropic', apiKey: 'sk-integrator' });
+  assert.deepEqual([sealed.v, sealed.sealId, sealed.owner, sealed.provider, sealed.secretEnv], [1, SEAL_ID, owner.address, 'anthropic', 'cmVxdWVzdC1jb3B5']);
+  assert.deepEqual(open(sealed.value), { v: 1, type: 'credential', owner: owner.address, seal_id: SEAL_ID, chain_id: CHAIN_ID, name: 'model.anthropic', value: 'sk-integrator' });
+  assert.deepEqual(asked[0], [SEAL_ID, owner.address, 'sealModelKey'], 'checked against the agent and its owner');
+
+  const s = await stub([{ name: 'github', hosts: ['api.github.com'], positions: [] }]);
+  try {
+    const a = ag(s.port);
+    const out = await a.credentials.setModelKey(SEAL_ID, 'anthropic', sealed, { push: false });
+    const doc = s.stored().document;
+    assert.equal(doc.values['model.anthropic'], sealed.value, 'stored as it is');
+    assert.equal(defOf(doc, 'model.anthropic').value_hash, hashOf(doc, 'model.anthropic'));
+    assert.equal(out.valueHash, hashOf(doc, 'model.anthropic'));
+    assert.ok(doc.defs.github, 'the other entry is kept');
+    assert.ok(!s.seen.some((r) => r.body.includes('sk-integrator')), 'the key never left the server');
+    // It reads back as the signed set.
+    assert.equal((await a.credentials.get(SEAL_ID)).definitions.find((d) => d.name === 'model.anthropic').inference.provider, 'anthropic');
+  } finally {
+    s.server.close();
+  }
+});
+
+test('sdk: a sealed model key for another agent, provider or owner, or not one, is refused before anything is signed', async () => {
+  const { server } = integrator();
+  const sealed = await server.sealModelKey(SEAL_ID, { owner: owner.address, provider: 'anthropic', apiKey: 'sk-integrator' });
+  const s = await stub([]);
+  try {
+    const a = ag(s.port);
+    await assert.rejects(a.credentials.setModelKey(`0x${'77'.repeat(32)}`, 'anthropic', sealed), /for agent/);
+    await assert.rejects(a.credentials.setModelKey(SEAL_ID, 'openai', sealed), /for anthropic, not openai/);
+    await assert.rejects(a.credentials.setModelKey(SEAL_ID, 'anthropic', { ...sealed, owner: `0x${'bb'.repeat(20)}` }), /would refuse it/);
+    await assert.rejects(a.credentials.setModelKey(SEAL_ID, 'anthropic', { ...sealed, value: '%%' }), /not base64/);
+    await assert.rejects(a.credentials.setModelKey(SEAL_ID, 'anthropic', { ...sealed, v: 2 }), /not a sealed model key/);
+    assert.equal(s.seen.filter((r) => r.method === 'POST').length, 0, 'nothing stored');
+  } finally {
+    s.server.close();
+  }
+  await assert.rejects(server.sealModelKey(SEAL_ID, { owner: 'alice', apiKey: 'sk' }), /owner is not an address/);
+  await assert.rejects(server.sealModelKey(SEAL_ID, { owner: owner.address, apiKey: 'sk\nx' }), /printable/);
+});
+
+test('sdk: with an attestor that seals no request keys, the sealed model key has no request copy; another refusal stands', async () => {
+  const none = integrator(async () => { throw new SecretEnvRefusedError('scheme_unsupported', 'no scheme'); });
+  const sealed = await none.server.sealModelKey(SEAL_ID, { owner: owner.address, apiKey: 'sk-1' });
+  assert.equal(sealed.provider, '0g-compute');
+  assert.equal(sealed.secretEnv, undefined);
+  const refused = integrator(async () => { throw new SecretEnvRefusedError('provider_binding_unsupported', 'no route'); });
+  await assert.rejects(refused.server.sealModelKey(SEAL_ID, { owner: owner.address, apiKey: 'sk-1' }), /no route/);
 });

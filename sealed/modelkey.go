@@ -17,6 +17,8 @@ import (
 // else the key handed over at create/reset. With no provider in the
 // settings, a set holding a key for exactly one provider means that one.
 type modelKeys struct {
+	// LEGACY(model-key): the key handed over at create/reset, for clients
+	// that send only that (internal/secretenv); source "deploy".
 	boot  inference.ProviderCredential
 	store modelKeySource // nil when credentials are off
 	// loadPinned reads the registry version a key is bound to.

@@ -72,7 +72,8 @@ pub struct ConfigResponse {
     /// inference key to the agent's agentSeal key (`GET /agent-seal-pubkey`)
     /// instead of signing it into the create envelope in clear. Omitted when
     /// `ATTESTOR_SECRET_ENV_ENABLED` is off, so older SDKs and images keep
-    /// the plain `API_KEY` path.
+    /// the plain `API_KEY` path. LEGACY(model-key): goes with the key sent
+    /// with the create (`OWNER_ENV_KEYS` in `sandbox.rs`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_env_scheme: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]

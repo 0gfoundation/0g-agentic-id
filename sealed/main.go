@@ -350,6 +350,8 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 // class (never a value), so the attestor and owner see why the agent
 // cannot call its model instead of a healthy "running". The ciphertext is
 // dropped from memory either way.
+//
+// LEGACY(model-key): the key handed over at create/reset (internal/secretenv).
 func applySecretEnv(cfg *config.Bootstrap, agentSealPriv []byte, res *chainBootstrapResult) {
 	if cfg.SecretEnv == "" {
 		return

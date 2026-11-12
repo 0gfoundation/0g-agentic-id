@@ -15,6 +15,7 @@ import { modelKeyName } from '../Credentials';
 import { saveApiKey } from './config';
 import { CliError } from './errors';
 import { configuredInferenceKey } from './inference';
+import { resetKeyForOlderImages } from './legacy/modelKey';
 
 /** How {@link pickModelKey} talks to whoever runs the CLI. */
 export interface KeyPrompt {
@@ -83,12 +84,8 @@ export function mayGoKeyless(framework: string, provider: string): boolean {
  * The model key a reset takes.
  *
  * The credential set holding the provider's key: the new container gets it
- * from the set. LEGACY(model-key): an image from before model keys in the set
- * reads only the key sent with the reset, so the key on this machine goes
- * along (`keepStoredModelKey`: the set is left as it is); with none here the
- * owner is asked for it, and skipping sends none. Goes with the request path.
- *
- * Otherwise the owner is asked as everywhere (see mayGoKeyless for skipping).
+ * from the set (older images: cli/legacy/modelKey.ts). Otherwise the owner is
+ * asked as everywhere (see mayGoKeyless for skipping).
  */
 export async function resetModelKey(
   cred: { get(sealId: `0x${string}`): Promise<{ definitions: Array<{ name: string }> }> },
@@ -100,14 +97,7 @@ export async function resetModelKey(
   const name = modelKeyName(provider);
   const cur = await cred.get(sealId).catch(() => undefined);
   if (cur?.definitions.some((d) => d.name === name)) {
-    const saved = (io.draft ?? machineDraft).get(provider);
-    if (saved) {
-      io.out(`the agent uses ${name} from cred (cred <agent> set model changes it); an image from before model keys in cred uses the ${provider} key on this machine, sent with the reset`);
-      return { apiKey: saved, keepStoredModelKey: true };
-    }
-    io.out(`the agent uses ${name} from cred; an image from before model keys in cred also needs it with the reset (a key given here also replaces the one in cred)`);
-    const key = await pickModelKey(provider, io, { optional: true });
-    return key ? { apiKey: key, keepStoredModelKey: false } : { keepStoredModelKey: true };
+    return resetKeyForOlderImages(provider, name, (io.draft ?? machineDraft).get(provider), io.out, () => pickModelKey(provider, io, { optional: true }));
   }
   const key = await pickModelKey(provider, io, { optional: mayGoKeyless(framework, provider) });
   return { apiKey: key ?? undefined, keepStoredModelKey: false };
