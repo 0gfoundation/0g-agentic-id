@@ -105,6 +105,10 @@ export interface ModelKeyLifecycleOpts {
 export interface DeployAccepted {
   sealId: Hash;
   agentSealAddr: Address;
+  /** A key given went into the agent's credential set (`deploy`). False: an
+   *  attestor from before sets were taken before the mint; it goes in once
+   *  minted (a wait level, or the caller with `credentials.setModelKey`). */
+  modelKeyStored?: boolean;
 }
 /** deploy/clone result once the background mint is awaited (`wait: 'minted'`). */
 type MintedResponse = DeployAccepted & { agentId: bigint };
@@ -177,7 +181,7 @@ export class AgentApi {
     const apiKey = opts.apiKey;
     if (apiKey) {
       if (opts.keepStoredModelKey) return { keyInCredentials: false };
-      return { keyInCredentials: false, beforeWrite: () => this.storeModelKey(sealId, provider, apiKey, opts.onWarn) };
+      return { keyInCredentials: false, beforeWrite: async () => { await this.storeModelKey(sealId, provider, apiKey, opts.onWarn); } };
     }
     if (provider === '0g-compute') return { keyInCredentials: false };
     const cur = await this.credentials.get(sealId).catch(() => undefined);
@@ -185,11 +189,13 @@ export class AgentApi {
   }
 
   /** Store a model key in the set; a refusal is reported, not thrown (the key still goes with the request). */
-  private async storeModelKey(sealId: Hash, provider: string, apiKey: string, onWarn?: (warning: string) => void): Promise<void> {
+  private async storeModelKey(sealId: Hash, provider: string, apiKey: string, onWarn?: (warning: string) => void): Promise<boolean> {
     try {
       await this.credentials.setModelKey(sealId, provider, apiKey, { push: false });
+      return true;
     } catch (e) {
       onWarn?.(`the model key was not stored in the agent's credential set (${e instanceof Error ? e.message : String(e)}); this boot gets it with the request only`);
+      return false;
     }
   }
 
@@ -315,16 +321,20 @@ export class AgentApi {
       );
     }
     if (opts?.preflight !== false) await this.preflightOwnerReady();
-    const accepted = acceptedOf(await this.attestor.deploy(params));
+    const created = acceptedOf(await this.attestor.deploy(params));
+    // The key goes into the credential set as the agent is created: the
+    // attestor takes the deploying owner's set before the mint.
+    // LEGACY(model-key): it also rode the create request (see modelKeyPlan).
+    const key = params.sandbox?.apiKey;
+    const provider = params.inference?.provider ?? '0g-compute';
+    const accepted: DeployAccepted = key ? { ...created, modelKeyStored: await this.storeModelKey(created.sealId, provider, key) } : created;
     if (!opts?.wait) return accepted;
     // 'minted'  → block on the on-chain mint only (agentId, no url yet).
     // 'running' → also block on provision (container up + reachable url).
-    // LEGACY(model-key): the key rode the request; once minted it also goes
-    // into the credential set (see storeModelKey), and a running agent that
-    // booted before that is handed the set.
-    const key = params.sandbox?.apiKey;
     const agentId = await this.waitForMint(accepted.sealId, opts);
-    if (key) await this.storeModelKey(accepted.sealId, params.inference?.provider ?? '0g-compute', key);
+    // LEGACY(model-key): an attestor that takes no set before the mint takes
+    // it once minted.
+    if (key && !accepted.modelKeyStored) accepted.modelKeyStored = await this.storeModelKey(accepted.sealId, provider, key);
     if (opts.wait === 'running') {
       const running = await this.waitForRunning(accepted.sealId, opts);
       if (key) await this.credentials.resyncModelKey(accepted.sealId, { agentUrl: running.url }).catch(() => undefined);

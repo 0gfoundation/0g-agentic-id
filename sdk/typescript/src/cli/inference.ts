@@ -26,9 +26,10 @@ export async function deployWithInference(ag: AgenticID, params: {
     ...(params.provision && !mintFirst ? { sandbox: { apiKey: params.apiKey } } : {}),
   });
   const mint = await ag.agent.waitForMint(deployment.sealId, { timeoutMs: 180000 });
-  // LEGACY(model-key): the key rode the create request; once minted it also
-  // goes into the agent's credential set (a mint-first start does both).
-  if (params.apiKey && params.provision && !mintFirst) {
+  // deploy stored the key in the set as it created the agent.
+  // LEGACY(model-key): an attestor that takes no set before the mint takes it
+  // now (a mint-first start stores it itself).
+  if (params.apiKey && params.provision && !mintFirst && !deployment.modelKeyStored) {
     await ag.credentials.setModelKey(deployment.sealId, params.provider, params.apiKey, { push: false }).catch(() => undefined);
   }
   // A mint-only agent also keeps the chosen pin as its settings document, so

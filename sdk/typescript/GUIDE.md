@@ -126,7 +126,7 @@ const params = {
     // image (the operator-maintained default; same fallback reset() uses).
     // Pass a name only to pin/rollback (0g-sandbox calls this field `snapshot` on the wire):
     sealedImage: process.env.SEALED_IMAGE,
-    apiKey:      process.env.AGENT_API_KEY,        // injected into the container as an env secret
+    apiKey:      process.env.AGENT_API_KEY,        // the model key: stored in the agent's credential set
   },
 };
 
@@ -219,13 +219,13 @@ await ag.agent.stop(sealId, sandboxId);     // stop a running container
 await ag.agent.start(sealId, sandboxId);    // resume a STOPPED container
 await ag.agent.start(sealId, { apiKey });   // FIRST provision: bring a mint-only /
                                             // never-provisioned agent online with a fresh
-                                            // container (apiKey required in practice). The
-                                            // semantic counterpart to a sandbox-less deploy;
-                                            // distinct from reset ("recreate an EXISTING one").
+                                            // container (apiKey: see "The model key" below).
+                                            // The semantic counterpart to a sandbox-less
+                                            // deploy; distinct from reset ("recreate an
+                                            // EXISTING one").
 await ag.agent.reset(sealId, { apiKey });   // recreate an EXISTING container: re-read iData
                                             // from chain, reselect the framework adapter.
-                                            // apiKey required in practice (attestor doesn't
-                                            // cache the model key); sealedImage optional.
+                                            // sealedImage optional.
 // A booting agent with no settings document uses the model pinned in its minted
 // persona, which leaves the chain at its first commit. So start and reset of an
 // agent that has no document and is a clone or has provisioned before first
@@ -566,10 +566,22 @@ For the router's live model catalog:
 await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …]
 ```
 
-`sandbox.apiKey` is required in practice — without it the agent boots but
-cannot reach its model. It travels inside the owner-signed "create"
-envelope into the TEE container's environment, and the attestor keeps no
-reusable copy (which is why `reset()` needs it again).
+**The model key.** `sandbox.apiKey` (and `apiKey` of `start` / `reset` /
+`retry`) is stored in the agent's credential set as `model.<provider>`,
+sealed to the agent ([credentials](../../docs/credentials.md#the-model-key)):
+`deploy` stores it as soon as the attestor accepts the agent, without
+waiting for the mint (`modelKeyStored` in the result); `start` / `reset` /
+`retry` store it after their own checks pass, before the request is signed.
+Each store is one more owner signature. A container whose image reads model
+keys from the set takes the key from there at boot, so with one stored, a
+`reset` on that image needs none. `ag.credentials.setModelKey(sealId,
+provider, apiKey)` sets or replaces it at any time. Without a key, 0g-harness
+on 0g-compute boots and its model calls fail until one is set; the other
+frameworks need one.
+
+While older images are in use, the key also travels with the request:
+inside the owner-signed "create" envelope into the TEE container's
+environment, of which the attestor keeps no copy.
 
 The owner's wallet shows that envelope verbatim when it signs. When the
 attestor's `GET /config` advertises `secret_env_scheme`, `start` / `reset` /
