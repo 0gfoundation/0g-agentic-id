@@ -70,8 +70,8 @@ async fn load(state: &AppState, seal_id: SealId) -> ApiResult<Deployment> {
 
 /// The agent's owner: the live on-chain owner once minted (never the indexed
 /// column). Before the mint, the owner its deployment row records — the
-/// address the deploy was signed for and the mint goes to — so a key can go
-/// into the set as the agent is created. That set stays good after the mint
+/// address the mint goes to (for a clone, the target owner) — so a key can
+/// go into the set as the agent is created. That set stays good after the mint
 /// (the mint starts no new credential epoch, indexer `watcher.rs`), and sealed
 /// checks its signer against the chain again before it loads it.
 async fn live_owner(state: &AppState, d: &Deployment) -> ApiResult<Address> {
