@@ -113,6 +113,19 @@ export interface CredentialMCP {
   scopes?: string[];
 }
 
+/**
+ * Makes an entry the agent's model (inference) key for one provider of the
+ * platform's provider registry: sealed hands it to the framework for that
+ * provider's model calls and nothing else. Without `route_hash` the image's
+ * built-in route; with it, the provider's route in that accepted registry
+ * version (see {@link CredentialsApi.setModelKey}).
+ */
+export interface CredentialInference {
+  provider: string;
+  route_hash?: string;
+  registry?: { version: number; digest?: string };
+}
+
 /** One credential as the owner sets it. */
 export interface CredentialInput {
   name: string;
@@ -120,8 +133,8 @@ export interface CredentialInput {
   value?: string;
   hosts: string[];
   positions: CredentialPosition[];
-  /** `inject` (default), `token_only` (only feeds a token request), `sign`. */
-  use?: 'inject' | 'token_only' | 'sign';
+  /** `inject` (default), `token_only` (only feeds a token request), `sign`; `model` for a model key. */
+  use?: 'inject' | 'token_only' | 'sign' | 'model';
   /** Required with `use: 'sign'`. */
   signer?: CredentialSigner;
   /** A login entry; it takes no value (see {@link CredentialsApi.login}). */
@@ -134,6 +147,8 @@ export interface CredentialInput {
   /** Let sealed store a rotated refresh token back for the next boot. */
   writeback?: boolean;
   tokenRequest?: TokenRequestTemplate;
+  /** A model key: no hosts, positions or other options (see {@link CredentialInference}). */
+  inference?: CredentialInference;
 }
 
 /** A stored credential, as the owner reads it back (never the value). */
@@ -142,7 +157,8 @@ export interface CredentialDefinition {
   name: string;
   hosts: string[];
   positions: CredentialPosition[];
-  use: 'inject' | 'token_only' | 'sign';
+  /** `model` marks a model key: an image from before model keys skips the entry. */
+  use: 'inject' | 'token_only' | 'sign' | 'model';
   value_hash: string;
   description?: string;
   expires_at?: number;
@@ -151,6 +167,38 @@ export interface CredentialDefinition {
   token_request?: TokenRequestTemplate;
   signer?: CredentialSigner;
   mcp?: CredentialMCP;
+  inference?: CredentialInference;
+}
+
+/** Model key entries are named `model.<provider>`. */
+export const MODEL_KEY_PREFIX = 'model.';
+
+export function modelKeyName(provider: string): string {
+  return `${MODEL_KEY_PREFIX}${provider}`;
+}
+
+/** Which model key the running agent's framework uses (`GET /_seal/credentials`). */
+export interface ModelKeyInUse {
+  provider?: string;
+  /** `credentials`: an entry of the set; `deploy`: the key given at create/reset. */
+  source: 'credentials' | 'deploy' | 'none';
+  /** The entry's value hash, when `source` is `credentials`. */
+  value_hash?: string;
+  /** Why the key the settings choose is not the one in use. */
+  issue?: string;
+  /** The provider of the key given at create/reset, when it is usable: a switch to it needs no key in the set. */
+  deploy_provider?: string;
+}
+
+/**
+ * What the running agent has loaded: the entries the agent may use (names and
+ * where they may go, never values) and, from an image that takes model keys
+ * from the set, which model key is in use (absent from an older image).
+ */
+export interface LoadedCredentials {
+  version: number;
+  entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number; logged_in_at?: number; status?: string }>;
+  model?: ModelKeyInUse;
 }
 
 /** The signed document, as sealed and the attestor read it. */
@@ -236,6 +284,7 @@ export function definitionOf(c: CredentialInput, valueHash: Hash): CredentialDef
   if (c.tokenRequest) d.token_request = c.tokenRequest;
   if (c.signer) d.signer = c.signer;
   if (c.mcp) d.mcp = c.mcp;
+  if (c.inference) d.inference = c.inference;
   return d;
 }
 
@@ -244,11 +293,12 @@ export function inputOf(d: CredentialDefinition): CredentialInput {
   return {
     name: d.name, hosts: d.hosts, positions: d.positions, use: d.use, description: d.description,
     expiresAt: d.expires_at, allowReveal: d.allow_reveal, writeback: d.writeback, tokenRequest: d.token_request,
-    signer: d.signer, mcp: d.mcp,
+    signer: d.signer, mcp: d.mcp, inference: d.inference,
   };
 }
 
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+const PROVIDER_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 /**
  * A stored set's place in order (ownership epoch, then version) and its
@@ -488,11 +538,44 @@ export class CredentialsApi {
     // A signing key signs and is never revealed (sealed refuses it). A value
     // sealed obtained for the entry (a login, a rotated token) is bound to
     // that value or login, not to this setting, so it is kept.
+    if (allow && def.inference) {
+      throw new Error(`credentials: ${name} is a model key: sealed hands it to the framework and never reveals it`);
+    }
     if (allow && def.use === 'sign') {
       throw new Error(`credentials: ${name} is a signing key: it signs and is never revealed`);
     }
     const next = current.definitions.map((d) => (d.name === name ? { ...inputOf(d), allowReveal: allow } : inputOf(d)));
     return this.put(sealId, next, { baseVersion: current.version, agentUrl: opts?.agentUrl });
+  }
+
+  /**
+   * Set the agent's model key for one provider (the entry `model.<provider>`),
+   * then push it to the running agent. The agent's settings choose which
+   * provider it uses: a key for that provider takes effect at once (sealed
+   * swaps it in, or restarts the framework with it); one for another provider
+   * is kept until the settings switch to it. The key is bound to the provider's
+   * route in the registry version the attestor serves now, checked against
+   * this agent's image first.
+   */
+  async setModelKey(sealId: Hash, provider: string, value: string, opts?: { agentUrl?: string }): Promise<{ version: number; valueHash: Hash; pushWarning?: string }> {
+    const seal = sealId.toLowerCase() as Hash;
+    const name = modelKeyName(provider);
+    if (!PROVIDER_RE.test(provider) || !NAME_RE.test(name)) throw new Error(`credentials: not a provider id: ${JSON.stringify(provider)}`);
+    // sealed sends it in a header or writes it into the framework's config.
+    if (!value || /[\u0000-\u001f\u007f]/.test(value)) throw new Error('credentials: a model key is one line of printable characters');
+    const binding = await this.attestor.modelKeyBinding(provider, seal);
+    const cur = await this.get(seal);
+    const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
+    const entry: CredentialInput = { name, value, hosts: [], positions: [], use: 'model', inference: { provider, ...binding } };
+    const doc = await this.buildDocument(seal, [...others, entry], cur.version, cur);
+    const version = await this.store(seal, doc, cur.version);
+    const pushWarning = await this.push(seal, doc, opts?.agentUrl).then(() => undefined, (e: unknown) => String(e instanceof Error ? e.message : e));
+    return { version, valueHash: keccak256(fromB64(doc.values[name])), pushWarning };
+  }
+
+  /** Remove the agent's model key for one provider (see {@link setModelKey}). */
+  async removeModelKey(sealId: Hash, provider: string, opts?: { agentUrl?: string }): Promise<{ version: number; pushWarning?: string }> {
+    return this.remove(sealId, modelKeyName(provider), opts);
   }
 
   private async buildDocument(
@@ -655,11 +738,11 @@ export class CredentialsApi {
    * never values). A login entry is listed with `status: 'awaiting_login'`
    * until its login is done, then with `logged_in_at`.
    */
-  async loaded(sealId: Hash, opts?: { agentUrl?: string }): Promise<{ version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number; logged_in_at?: number; status?: string }> }> {
+  async loaded(sealId: Hash, opts?: { agentUrl?: string }): Promise<LoadedCredentials> {
     const base = opts?.agentUrl ?? (await this.agentUrl(sealId));
     const r = await this.sealRequest(sealId, base, '0GSealCredentials', '/_seal/credentials');
     if (!r.ok) throw new Error(`credentials.loaded: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
-    return (await r.json()) as { version: number; entries: Array<{ name: string; source: string; use: string; hosts: string[]; expires_at?: number; logged_in_at?: number; status?: string }> };
+    return (await r.json()) as LoadedCredentials;
   }
 
   /** Requests waiting for the owner on this agent, with sealed's facts and the agent's reason. */

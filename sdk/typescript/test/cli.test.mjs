@@ -606,8 +606,10 @@ test('REPL `settings <id> others={…}`: the unquoted document is written as typ
 
 
 test('CLI provider switch saves pending reset without pushing an old credential', async () => {
+  // The agent's image predates model keys in cred: its credential view has
+  // no `model`, so the switch waits for a reset. Reads are not pushes.
   let pushes = 0;
-  const agent = createServer((req, res) => { pushes++; res.end('{}'); });
+  const agent = createServer((req, res) => { if (req.method !== 'GET') pushes++; res.end('{}'); });
   await new Promise((resolve) => agent.listen(0, '127.0.0.1', resolve));
   const att = await replAttestor(`http://127.0.0.1:${agent.address().port}`,
     { provider: '0g-compute', model: 'old', thinking: 'low' }, {

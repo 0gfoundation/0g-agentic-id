@@ -96,6 +96,18 @@ The agent can ask for three things: a value handed over, a new credential (namin
   - At the next boot, sealed computes the fingerprint again from the current set and keeps the writeback when they match. Editing a description or another entry keeps a login; a new value or another server ends it.
 - **Disconnecting:** `cred <agent> disconnect <name>`. When the server offers it, sealed first asks it to revoke the tokens (RFC 7009); then the entry is removed.
 
+## The model key
+
+The key the agent calls its model with is kept in the credential set too, one entry per provider (`model.0g-compute`, `model.anthropic`, …).
+
+- **Who uses it.** sealed hands the key to the framework for its model calls. The entry is not in the agent's list of credentials and cannot be revealed. Whether the agent's tools can read the key depends on the framework, as for the key given at create/reset: 0g-harness on 0g-compute never gets it (sealed fills it in on the way out); openclaw, hermes, prime and 0g-harness on `openai`/`anthropic` receive the key itself, so their tools can read it.
+- **Which one.** The agent's settings choose the provider (`settings <agent> provider=…`), and sealed takes that provider's key; a key for another provider is only kept. With no provider in the settings, the one provider holding a key is used.
+- **Where it may go.** To the provider's address in the platform's provider list as it was when the key was set; a later change to the list does not move the key.
+- **Changing it.** `cred <agent> set model` takes effect at once: 0g-harness on 0g-compute switches without restarting; the other frameworks restart in a few seconds.
+- **Switching provider.** `settings <agent> provider=X model=…` asks for X's key when the set has none, stores it, then switches.
+- **Without one.** The key given at create/reset is used. When the set holds a key for the provider, a reset does not replace it: `cred <agent> set model` does.
+- **Removing the key in use.** The agent goes back to the key given at create/reset when that one is for the same provider; otherwise its framework stops until there is a key. It never keeps using a key you removed.
+
 ## Transfer
 
 - **The attestor.** When the agent is transferred, the attestor deletes the agent's credential data and tears down the old container. On dev the old container was gone within 3 seconds of the transfer landing on chain.
@@ -124,6 +136,8 @@ The agent can ask for three things: a value handed over, a new credential (namin
 0g-agentdna cred <agent>                            list entries (never values)
 0g-agentdna cred <agent> set <name> preset=github   add or change one; the value is read without echo
 0g-agentdna cred <agent> rm <name>                  remove one (revoke it at the provider too)
+0g-agentdna cred <agent> set model [provider=<id>]  set the agent's model key (default: its settings' provider)
+0g-agentdna cred <agent> rm model [provider=<id>]   remove a model key
 0g-agentdna cred <agent> connect <name> <mcp-url>   connect an MCP server
 0g-agentdna cred <agent> disconnect <name>          disconnect, asking the server to revoke
 0g-agentdna cred <agent> reveal <name> on|off       let the agent read the value without asking

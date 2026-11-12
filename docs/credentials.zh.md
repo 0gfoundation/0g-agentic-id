@@ -96,6 +96,18 @@ agent 可以提出三种请求：交出某个值、新增一个凭据（指定�
   - 重启时，sealed 用当前凭据集重新算指纹来比对，对得上就继续用。所以改描述、改别的条目，都不会让登录失效；换了值或换了服务器，才会作废。
 - **断开**：`cred <agent> disconnect <名字>`。服务器支持的话，先请它作废 token（RFC 7009），再删掉条目。
 
+## 模型 key
+
+agent 调用模型用的 key 也放在凭据集里，一家服务一条（`model.0g-compute`、`model.anthropic` 等）。
+
+- **谁在用**：sealed 把 key 交给框架调模型用。这一条不在 agent 能看到的凭据列表里，也不能交出。agent 的工具能不能读到 key，取决于框架，和创建/重置时交的 key 一样：0g-compute 上的 0g-harness 拿不到（sealed 在请求发出时填进去）；openclaw、hermes、prime，以及用 `openai`/`anthropic` 的 0g-harness，拿到的是 key 本身，它们的工具读得到。
+- **用哪条**：agent 的设置决定用哪家（`settings <agent> provider=…`），sealed 取那一家的 key；别家的 key 只存着。设置里没写 provider 时，只有一家有 key 就用这一家。
+- **能发到哪**：设置 key 时平台服务列表里这家的地址；之后列表再变，key 也不会被发到新地址。
+- **更换**：`cred <agent> set model` 立即生效：0g-compute 上的 0g-harness 直接换上，不重启；其他框架重启一下，几秒钟。
+- **换服务**：`settings <agent> provider=X model=…` 时，如果凭据集里还没有 X 的 key，会当场问你，存进去后再切换。
+- **没有时**：用创建/重置时交的 key。凭据集里已有这家的 key 时，重置不会替换它，要换用 `cred <agent> set model`。
+- **删掉正在用的 key**：创建/重置时交的 key 是同一家的，就改用它；不是的话，框架停下，直到有 key 为止。删掉的 key 不会再被使用。
+
 ## 转让
 
 - **attestor**：发现 agent 被转让后，删掉这个 agent 的凭据数据，并拆掉旧容器。dev 上实测，转让上链后 3 秒内旧容器就没了。
@@ -124,6 +136,8 @@ agent 可以提出三种请求：交出某个值、新增一个凭据（指定�
 0g-agentdna cred <agent>                             列出条目（不含值）
 0g-agentdna cred <agent> set <名字> preset=github    新增或修改；值从不回显的输入读取
 0g-agentdna cred <agent> rm <名字>                   删除（也去服务商那里吊销）
+0g-agentdna cred <agent> set model [provider=<id>]   设置 agent 的模型 key（默认是设置里的那家）
+0g-agentdna cred <agent> rm model [provider=<id>]    删除一条模型 key
 0g-agentdna cred <agent> connect <名字> <MCP 地址>   连接 MCP 服务器
 0g-agentdna cred <agent> disconnect <名字>           断开，并请服务器作废 token
 0g-agentdna cred <agent> reveal <名字> on|off        是否允许 agent 直接读取值

@@ -58,6 +58,9 @@ func (f *fakeCredentials) Decide(_ context.Context, id, decision string, _ *cred
 	return nil
 }
 func (f *fakeCredentials) AuditSince(int64) []credentials.AuditRecord { return nil }
+func (f *fakeCredentials) ModelInUse() credentials.ModelInUse {
+	return credentials.ModelInUse{Source: "none"}
+}
 func (f *fakeCredentials) StartLogin(_ context.Context, name, redirect string) (string, error) {
 	f.loginRedirect = redirect
 	f.logins = append(f.logins, name)

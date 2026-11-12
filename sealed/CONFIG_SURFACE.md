@@ -457,9 +457,12 @@ route hash and accepted registry version/digest. The pinned historical registry
 is fetched and verified once on each boot, including stop/start;
 its route must match before rendering. Legacy plaintext/v1 keys are compute-only. An explicitly supplied
 ciphertext that fails validation refuses plaintext fallback and settings
-rendering, and records `secret_env_not_applied: <reason>`. A hot provider change
-with a different bound key returns HTTP 409 `CREDENTIAL_PROVIDER_MISMATCH`
-before changing the live document; reset supplies the new provider's key.
+rendering, and records `secret_env_not_applied: <reason>`. The credential
+set's model key for the settings' provider (`model.<provider>`, CREDENTIALS.md)
+takes the place of this key and is bound the same way. A hot provider change
+with no key for the new provider returns HTTP 409 `CREDENTIAL_PROVIDER_MISMATCH`
+before changing the live document; `cred <agent> set model provider=…` (or a
+reset with the key) supplies it.
 It still reaches each framework differently, and that is not tidiable — it is
 what each framework's client actually reads:
 

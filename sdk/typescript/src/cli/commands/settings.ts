@@ -28,7 +28,8 @@ import { applyAssignments, assertModelPresent, assertOthersFitFramework, parseAs
 import { SettingsConflictError } from '../../Settings';
 import type { CommandContext } from '../types';
 import { changesProvider } from '../../Providers';
-import { requireConfiguredInferenceKey, requiresProviderReset } from '../inference';
+import { configuredInferenceKey, requireConfiguredInferenceKey, requiresProviderReset } from '../inference';
+import { ensureModelKey, readSecret } from '../credentials';
 
 const ZERO_HASH = `0x${'0'.repeat(64)}` as Hash;
 
@@ -98,8 +99,20 @@ export async function run(ctx: CommandContext): Promise<void> {
   // Before anything is signed: a document with no model is the one state the
   // container cannot boot from and last-known-good cannot cover.
   assertModelPresent(next, current !== null);
-  let pendingReset = changesProvider(current, next);
-  if (pendingReset) requireConfiguredInferenceKey(next.provider ?? '0g-compute');
+  const base = await runningServeBase(ctx.env.attestorUrl, sealId);
+  // The agent takes a provider switch only with a key for the new provider
+  // in its credential set: asked for (Enter takes the key login saved) and
+  // stored first. An image from before model keys in the set takes it at a
+  // reset with the key.
+  let pendingReset = false;
+  if (changesProvider(current, next)) {
+    const provider = next.provider ?? '0g-compute';
+    const keyIO = { out: note, secret: ctx.json ? async () => '' : readSecret, savedModelKey: (p: string) => configuredInferenceKey(p) };
+    if (await ensureModelKey(ag, sealId, provider, keyIO, base ? { agentUrl: base } : undefined) === 'unsupported') {
+      requireConfiguredInferenceKey(provider);
+      pendingReset = true;
+    }
+  }
   const warnings: string[] = [];
   // The catalog advisory runs inside setSettings, before it signs.
   const written = await ag.agent
@@ -134,7 +147,6 @@ export async function run(ctx: CommandContext): Promise<void> {
   // the agent stays on its last-known-good. Telling the owner "applies next
   // boot" for a rejection is a lie that hides an un-bootable document.
   let rejected = false;
-  const base = await runningServeBase(ctx.env.attestorUrl, sealId);
   if (base && !pendingReset) {
     const agentId = await ag.agent.getAgentIdBySealId(sealId);
     await ag.agent
