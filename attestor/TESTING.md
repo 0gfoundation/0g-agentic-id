@@ -196,7 +196,9 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_ID=<id> SEAL_ADDR=0x… \
   node scripts/evolution-probe.cjs
 ```
 
-`verify-agent.sh` (needs `curl`, `jq` and `cast`) checks:
+`verify-agent.sh` (needs `curl`, `jq` and `cast`, and for check 2 node ≥ 18
+with the SDK built: it reads the owner-gated log through
+`sdk/typescript/scripts/owner-log.cjs`) checks:
 1. **identity tri-check** — attestor row == on-chain `getAgentSeal` ==
    the address the container was provisioned with;
 2. **decrypt health** — the sealed bootstrap log has one `decrypted` per

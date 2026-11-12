@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Post-deploy verification for a LIVE agent — the checks that prove the
-# identity chain end-to-end, runnable with curl+jq+cast only (no node).
+# identity chain end-to-end.
 #
 #   1. identity tri-check: attestor row addr == on-chain getAgentSeal
 #      == the addr the container says it was provisioned with
@@ -29,7 +29,10 @@
 #                                   # cross-impl known-answer vector (cast + jq)
 #
 # Requires: curl, jq, and cast (foundry) — cast signs the owner-scoped
-# request and does the chain read and the signature recovery.
+# request and does the chain read and the signature recovery — and, for
+# check 2, node >= 18 with the SDK built (sdk/typescript: npm run build):
+# the owner-gated startup log is read through
+# sdk/typescript/scripts/owner-log.cjs. --kat needs only cast and jq.
 #
 # Env:
 #   API         attestor base URL            (default http://localhost:8080)

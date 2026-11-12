@@ -17,10 +17,13 @@
 # /opt/0g-harness/<sha256>/ (root's, read-only to the agent) and names it in
 # /opt/0g-harness/base. sealed runs the harness from there, and under the
 # layered flow fetches other packages by hash into the same place. To publish
-# the package (the attestor's artifacts, validHarnessHashes), take it from the
-# stage:
+# the package (the `artifacts` release, the trust registry's harness list),
+# take it from the stage of the build that made the image, with the same
+# arguments (--pull included) so it comes from that build's cache: npm run
+# again, on another base, gives another package. Check that it hashes to
+# /opt/0g-harness/base.
 #
-#   cd sealed && docker build --target harness-package --output type=local,dest=out -f images/harness/Dockerfile .
+#   cd sealed && docker buildx build --pull --target harness-package --build-arg HARNESS_REF=… --output type=tar,dest=- -f images/harness/Dockerfile . | tar -xOf - out/0g-harness.tgz > 0g-harness.tgz
 #
 # The composition is authored in the harness's code — NOT in a cordis.yml /
 # profile / bundle the agent can reach — so it rides the package hash and an
@@ -30,9 +33,13 @@
 #
 #   cd sealed && docker build -t 0g-sealed-harness:0.1.0 -f images/harness/Dockerfile .
 #
-# Release checklist: a new image hash must be added to on-chain
-# validFrameworkHashes or the attestor destroys the container right after
-# provision. The container does not check that the agent's framework matches
+# Release checklist: a new image hash must be on the trust registry's image
+# list (AgenticID's validFrameworkHashes before 1.4.0) or the attestor
+# destroys the container right after provision. Under the layered flow its
+# sealed hash (the build prints "loader pinned to bootstrap sha256") and its
+# package hash go on the sealed and harness lists before it boots, and both
+# files on the `artifacts` release (sealed/LAYERS.md). The container does not
+# check that the agent's framework matches
 # the image: an 0g-harness agent booted on an image without the harness fails
 # at framework start. The SDK picks the image by the agent's framework from
 # the attestor's GET /config frameworks[] (ATTESTOR_FRAMEWORKS).
