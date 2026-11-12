@@ -8,7 +8,7 @@ import { AgentApi } from '../dist/index.js';
 const SEAL = `0x${'5e'.repeat(32)}`;
 
 /** An AgentApi whose attestor and credential set are recorded fakes. */
-function agentApi({ stored = [], failSet = false } = {}) {
+function agentApi({ stored = [], failSet = false, refuse = false } = {}) {
   const calls = [];
   const creds = {
     setModelKey: async (seal, provider, key, opts) => {
@@ -16,13 +16,19 @@ function agentApi({ stored = [], failSet = false } = {}) {
       if (failSet) throw new Error('attestor has no credential sets');
       return { version: 1, valueHash: '0x1' };
     },
-    hasModelKey: async (seal, provider) => { calls.push(['hasModelKey', provider]); return stored.includes(provider); },
+    get: async () => { calls.push(['get']); return { definitions: stored.map((p) => ({ name: `model.${p}`, inference: { provider: p } })) }; },
     resyncModelKey: async () => 'in_sync',
   };
   const api = new AgentApi({ attestorUrl: 'http://127.0.0.1:1', addresses: {} }, undefined, creds);
+  // As the real client: every check first (a refusal writes nothing), then
+  // beforeWrite, then the request.
   api.attestor = {
-    lifecycle: async (op, p) => { calls.push(['lifecycle', op, p]); },
-    retry: async (p) => { calls.push(['retry', p]); },
+    lifecycle: async (op, p) => {
+      if (refuse) throw new Error('refused by a check');
+      await p.beforeWrite?.();
+      calls.push(['lifecycle', op, p]);
+    },
+    retry: async (p) => { await p.beforeWrite?.(); calls.push(['retry', p]); },
     setSettings: async (p) => { calls.push(['setSettings', p.settings.provider]); return { version: 2 }; },
   };
   return { api, calls };
@@ -35,7 +41,18 @@ test('reset with a key stores it in the set first, unpushed, and still sends it'
   const [, op, p] = calls[1];
   assert.equal(op, 'reset');
   assert.equal(p.apiKey, 'sk-1', 'the request still carries it for older images');
-  assert.equal(p.keyInCredentials, true);
+});
+
+test('a reset a check refuses stores nothing', async () => {
+  const { api, calls } = agentApi({ refuse: true });
+  await assert.rejects(api.reset(SEAL, { provider: '0g-compute', apiKey: 'sk-1' }), /refused/);
+  assert.ok(!calls.some((c) => c[0] === 'setModelKey'));
+});
+
+test('with no provider the key is stored for the provider the request binds it to', async () => {
+  const { api, calls } = agentApi();
+  await api.reset(SEAL, { apiKey: 'sk-1' });
+  assert.deepEqual(calls[0], ['setModelKey', '0g-compute', 'sk-1', false]);
 });
 
 test('reset with keepStoredModelKey sends the key without rewriting the set', async () => {
@@ -43,10 +60,9 @@ test('reset with keepStoredModelKey sends the key without rewriting the set', as
   await api.reset(SEAL, { provider: '0g-compute', apiKey: 'sk-draft', keepStoredModelKey: true });
   assert.ok(!calls.some((c) => c[0] === 'setModelKey'));
   assert.equal(calls.at(-1)[2].apiKey, 'sk-draft');
-  assert.equal(calls.at(-1)[2].keyInCredentials, true);
 });
 
-test('a reset without a key goes through for a provider whose key the set holds', async () => {
+test('a reset without a key goes through for a provider whose key the set holds, not the old container\'s', async () => {
   const { api, calls } = agentApi({ stored: ['anthropic'] });
   await api.reset(SEAL, { provider: 'anthropic' });
   assert.equal(calls.at(-1)[2].keyInCredentials, true);
@@ -65,7 +81,6 @@ test('a key the set cannot take still rides the request, and the caller is told'
   await api.start(SEAL, { provider: '0g-compute', apiKey: 'sk-1', onWarn: (w) => warnings.push(w) });
   assert.equal(calls.at(-1)[1], 'start');
   assert.equal(calls.at(-1)[2].apiKey, 'sk-1');
-  assert.equal(calls.at(-1)[2].keyInCredentials, false);
   assert.match(warnings[0], /not stored in the agent's credential set .* with the request only/);
 });
 
@@ -79,7 +94,7 @@ test('retry with a key stores it as reset does', async () => {
   const { api, calls } = agentApi();
   await api.retry(SEAL, { provider: '0g-compute', apiKey: 'sk-1' });
   assert.deepEqual(calls[0], ['setModelKey', '0g-compute', 'sk-1', false]);
-  assert.equal(calls[1][1].keyInCredentials, true);
+  assert.equal(calls[1][1].apiKey, 'sk-1');
 });
 
 test('settings with a model key store the key for the new provider first', async () => {

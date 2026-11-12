@@ -30,8 +30,7 @@ import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, con
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
 import { applyAssignments, assertModelPresent, assertOthersFitFramework, isHarnessFramework, parseAssignments, renderSettings } from '../settings';
 import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOwnerOp, ensureModelKey } from '../credentials';
-import { pickModelKey, replKeyPrompt } from '../modelkey';
-import { modelKeyName } from '../../Credentials';
+import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
@@ -557,6 +556,8 @@ export function completeLine(
   if ((cmd === 'cred' && rest.includes(' ')) || cmd === '/cred') {
     const words = rest.split(' ');
     const agent = cmd === 'cred' ? words.shift() : undefined;
+    // `cred pending|notify|presets …` name no agent.
+    if (agent && ['pending', 'notify', 'presets'].includes(agent)) return [[], line];
     const providers = state.providers ?? knownProviders.map((p) => p.id);
     const hits = completeCred(words, state.credNames?.(agent) ?? [], providers);
     if (words.length <= 1 && !hits.length) return [CRED_SUBS, word];
@@ -1541,7 +1542,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const plan = await resetInferencePlan(ag, row.sealId, await readDeploymentFacts(attestorUrl, row.sealId));
         const provider = plan.provider;
         await ag.agent.assertProviderSupported(provider, { sealId: row.sealId, framework });
-        const key = await resetModelKey(ag, row.sealId, provider, framework, ask);
+        const key = await resetModelKey(ag.credentials, row.sealId, provider, framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(ag, row.sealId, plan, out);
         out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
@@ -2311,31 +2312,6 @@ function keyPrompt(ask: (q: string) => Promise<string>) {
   return replKeyPrompt(ask, (p: string) => askSecret(ask, p), (l: string) => out(`${l}\n`));
 }
 
-/**
- * The model key a reset takes. The credential set holding one for the
- * provider: nothing is asked, and the key on this machine, if any, goes with
- * the request for images from before model keys in the set (LEGACY(model-key):
- * goes with that path). Otherwise the owner is asked; see mayGoKeyless.
- */
-async function resetModelKey(ag: AgenticID, sealId: `0x${string}`, provider: string, framework: string, ask: (q: string) => Promise<string>): Promise<{ apiKey?: string; keepStoredModelKey: boolean }> {
-  const cur = await ag.credentials.get(sealId).catch(() => undefined);
-  if (cur?.definitions.some((d) => d.name === modelKeyName(provider))) {
-    out(`the agent uses ${modelKeyName(provider)} from cred (cred <agent> set model changes it)\n`);
-    return { apiKey: configuredInferenceKey(provider) ?? undefined, keepStoredModelKey: true };
-  }
-  const key = await pickModelKey(provider, keyPrompt(ask), { optional: mayGoKeyless(framework, provider) });
-  return { apiKey: key ?? undefined, keepStoredModelKey: false };
-}
-
-/**
- * Whether an agent may be created or reset with no model key: 0g-harness on
- * 0g-compute starts without one (its model calls fail until one is set). On
- * another provider sealed refuses a key it lacks, and the other frameworks
- * need one to be useful at all.
- */
-function mayGoKeyless(framework: string, provider: string): boolean {
-  return framework === '0g-harness' && provider === '0g-compute';
-}
 
 /** Trust-root ack (once per owner) + a prepaid-balance gate that ASKS before
  *  spending: under 0.1 OG, report the shortfall and offer to deposit now.
@@ -2882,7 +2858,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const plan = await resetInferencePlan(s.ag, s.sealId, await readDeploymentFacts(s.attestorUrl, s.sealId));
         const provider = plan.provider;
         await s.ag.agent.assertProviderSupported(provider, { sealId: s.sealId, framework: s.framework });
-        const key = await resetModelKey(s.ag, s.sealId, provider, s.framework, ask);
+        const key = await resetModelKey(s.ag.credentials, s.sealId, provider, s.framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(s.ag, s.sealId, plan, out);
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);

@@ -107,7 +107,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   let pendingReset = false;
   if (changesProvider(current, next)) {
     const provider = next.provider ?? '0g-compute';
-    const keyIO = { json: ctx.json, out: note, secret: readSecret, keyPrompt: commandKeyPrompt(ctx.json, note) };
+    const keyIO = { json: ctx.json, out: note, secret: readSecret, keyPrompt: commandKeyPrompt(ctx.json, note, { readPipe: false }) };
     if (await ensureModelKey(ag, sealId, provider, keyIO, base ? { agentUrl: base } : undefined) === 'unsupported') {
       requireConfiguredInferenceKey(provider);
       pendingReset = true;

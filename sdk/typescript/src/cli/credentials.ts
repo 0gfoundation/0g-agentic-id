@@ -28,7 +28,7 @@ import {
   type PendingCredentialRequest,
   type TokenRequestTemplate,
 } from '../Credentials';
-import { CliError, isCancelled } from './errors';
+import { cancelled, CliError, isCancelled } from './errors';
 import { pickModelKey, type KeyPrompt } from './modelkey';
 import { createInterface } from 'node:readline';
 import { emitOk } from './envelope';
@@ -780,20 +780,29 @@ function keyPromptOf(io: Pick<CredIO, 'json' | 'out' | 'secret' | 'keyPrompt'>):
 export async function readConfirm(question: string, def: boolean): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   try {
-    const a = (await new Promise<string>((resolve) => rl.question(`${question} [${def ? 'Y/n' : 'y/N'}] `, resolve))).trim().toLowerCase();
+    const a = (await new Promise<string>((resolve, reject) => {
+      // Ctrl-C cancels the question and the command, as at readSecret.
+      rl.on('SIGINT', () => reject(cancelled()));
+      rl.question(`${question} [${def ? 'Y/n' : 'y/N'}] `, resolve);
+    })).trim().toLowerCase();
     return a ? a.startsWith('y') : def;
   } finally {
     rl.close();
   }
 }
 
-/** The model key prompt of a one-shot command: a person at a terminal is asked; a script (stdin piped, `--json`) is not. */
-export function commandKeyPrompt(json: boolean, out: (line: string) => void): KeyPrompt {
+/**
+ * The model key prompt of a one-shot command: a person at a terminal is
+ * asked; a script (stdin piped, `--json`) is not. `readPipe`: a script may
+ * pipe the key in (`cred set`, whose value is read from stdin); otherwise its
+ * stdin is left alone and the key on this machine is used.
+ */
+export function commandKeyPrompt(json: boolean, out: (line: string) => void, opts: { readPipe: boolean }): KeyPrompt {
   const interactive = !!process.stdin.isTTY && !json;
   return {
     interactive,
     out,
-    secret: (prompt) => (interactive || !process.stdin.isTTY ? readSecret(prompt) : Promise.resolve('')),
+    secret: (prompt) => (interactive ? readSecret(prompt) : opts.readPipe && !process.stdin.isTTY ? readSecret(prompt) : Promise.resolve('')),
     confirm: readConfirm,
   };
 }
@@ -852,6 +861,23 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     const cur = await ag.credentials.get(seal);
     credNames.set(seal.toLowerCase(), cur.definitions.map((d) => d.name));
     return cur;
+  };
+  // …and every write it makes keeps them current.
+  const named = (seal: Hash, change: (names: string[]) => string[]) => credNames.set(seal.toLowerCase(), change(cachedCredNames(seal)));
+  cred.put = async (seal, entries, opts) => {
+    const out = await ag.credentials.put(seal, entries, opts);
+    named(seal, () => entries.map((e) => e.name));
+    return out;
+  };
+  cred.remove = async (seal, name, opts) => {
+    const out = await ag.credentials.remove(seal, name, opts);
+    named(seal, (names) => names.filter((n) => n !== name));
+    return out;
+  };
+  cred.setModelKey = async (seal, provider, value, opts) => {
+    const out = await ag.credentials.setModelKey(seal, provider, value, opts);
+    named(seal, (names) => [...new Set([...names, modelKeyName(provider)])]);
+    return out;
   };
   const at = agentUrl ? { agentUrl } : undefined;
   switch (sub) {

@@ -974,6 +974,9 @@ export class AttestorClient {
       /** The agent's credential set holds a model key for `provider`: a
        *  create without a key is not refused for it. */
       keyInCredentials?: boolean;
+      /** Run once every check that can refuse has passed, before the first
+       *  write or signature (the model key going into the credential set). */
+      beforeWrite?: () => Promise<void>;
       /** The key already sealed to this agent (the value {@link sealApiKey}
        *  returned, e.g. on an integrator's server), in place of `apiKey`:
        *  signed verbatim as `SEAL_SECRET_ENV`, so the key never has to reach
@@ -1039,6 +1042,7 @@ export class AttestorClient {
           : {}),
       };
     }
+    await params.beforeWrite?.();
     if (seed) {
       await storeDefaultSettings(
         { setSettings: (sealId, settings, opts) => this.setSettings({ sealId, settings, baseVersion: opts.baseVersion }) },
@@ -1248,6 +1252,8 @@ export class AttestorClient {
     secretEnv?: SecretEnvMode;
     /** As for {@link lifecycle}: the credential set holds the provider's model key. */
     keyInCredentials?: boolean;
+    /** As for {@link lifecycle}: run before the first write or signature. */
+    beforeWrite?: () => Promise<void>;
     envelopeTtlSec?: number;
   }): Promise<void> {
     if (params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined && !params.keyInCredentials) {
@@ -1257,23 +1263,18 @@ export class AttestorClient {
     const body: Record<string, unknown> = { seal_id: params.sealId, owner: account.address };
     if (params.apiKey || params.sealedSecretEnv !== undefined) {
       const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
-      body.sandbox_envelope = await this.signEnvelope(
-        'create',
-        '',
-        {
-          snapshot,
-          sealed: true,
-          env: await this.sandboxEnv({
-            sealId: params.sealId,
-            provider: params.provider,
-            image: snapshot,
-            apiKey: params.apiKey,
-            sealedSecretEnv: params.sealedSecretEnv,
-            mode: params.secretEnv,
-          }),
-        },
-        params.envelopeTtlSec ?? 180,
-      );
+      const env = await this.sandboxEnv({
+        sealId: params.sealId,
+        provider: params.provider,
+        image: snapshot,
+        apiKey: params.apiKey,
+        sealedSecretEnv: params.sealedSecretEnv,
+        mode: params.secretEnv,
+      });
+      await params.beforeWrite?.();
+      body.sandbox_envelope = await this.signEnvelope('create', '', { snapshot, sealed: true, env }, params.envelopeTtlSec ?? 180);
+    } else {
+      await params.beforeWrite?.();
     }
     const res = await fetch(`${this.baseUrl()}/retry`, {
       method: 'POST',

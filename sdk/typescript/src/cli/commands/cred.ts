@@ -39,5 +39,5 @@ export async function run(ctx: CommandContext): Promise<void> {
   const ref = parseAgentRef(first);
   const ag = await buildClient(ctx.env, { withWallet: true });
   const sealId = await resolveSealId(ag, ref, first);
-  await credOp(ag, sealId, rest, { json: ctx.json, wait: !ctx.json, out: show, secret: readSecret, keyPrompt: commandKeyPrompt(ctx.json, show) });
+  await credOp(ag, sealId, rest, { json: ctx.json, wait: !ctx.json, out: show, secret: readSecret, keyPrompt: commandKeyPrompt(ctx.json, show, { readPipe: true }) });
 }

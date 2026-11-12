@@ -444,9 +444,12 @@ func TestStart_RoutedEndpointWithoutAKeyStarts(t *testing.T) {
 		settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3"}, "")); err != nil {
 		t.Fatalf("RenderSettings: %v", err)
 	}
-	// Past the key, Start goes on to spawn the harness, which this test
-	// environment does not have: any error left is that one.
-	_, err := a.Start(context.Background(), framework.RuntimeContext{APIKey: "sk-from-runtimecontext"})
+	// Past the key, Start goes on to spawn the harness. An ended context
+	// stops it there (no harness here, or one not waited for): any error
+	// left is that one.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := a.Start(ctx, framework.RuntimeContext{APIKey: "sk-from-runtimecontext"})
 	if err != nil && strings.Contains(err.Error(), "inference key") {
 		t.Fatalf("Start refused a routed model with no key: %v", err)
 	}

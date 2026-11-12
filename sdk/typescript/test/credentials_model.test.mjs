@@ -10,8 +10,8 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { credOp, ensureModelKey, renderCredentials } from '../dist/cli/credentials.js';
-import { pickModelKey } from '../dist/cli/modelkey.js';
-import { completeCred } from '../dist/cli/commands/interactive.js';
+import { pickModelKey, resetModelKey } from '../dist/cli/modelkey.js';
+import { completeCred, completeLine } from '../dist/cli/commands/interactive.js';
 
 // The CLI keeps model keys on this machine: these tests never reach the real
 // ones, and every prompt below brings its own draft store.
@@ -362,4 +362,37 @@ test('cli: cred completion: subcommands, names, model providers, options and val
   assert.deepEqual(completeCred(['rm', 'model', 'p'], names, providers), ['provider=']);
   assert.deepEqual(completeCred(['reveal', 'github', 'o'], names, providers), ['on', 'off']);
   assert.deepEqual(completeCred(['log', ''], names, providers), []);
+});
+
+test('cli: a reset asks nothing when the set and this machine hold the key; with only the set, it asks for the older images', async () => {
+  const inSet = { get: async () => ({ definitions: [{ name: 'model.0g-compute' }] }) };
+  // The set and this machine: the machine's key goes along, the set is kept.
+  let k = keys({ draft: { '0g-compute': 'sk-here' }, interactive: true });
+  assert.deepEqual(await resetModelKey(inSet, SEAL_ID, '0g-compute', 'openclaw', k.keyPrompt), { apiKey: 'sk-here', keepStoredModelKey: true });
+  assert.deepEqual(k.asked, []);
+  // Only the set: asked, and a key given replaces it (one key per provider).
+  k = keys({ interactive: true, typed: 'sk-again' });
+  assert.deepEqual(await resetModelKey(inSet, SEAL_ID, '0g-compute', 'openclaw', k.keyPrompt), { apiKey: 'sk-again', keepStoredModelKey: false });
+  assert.equal(k.draft['0g-compute'], 'sk-again');
+  // ...or skipped: none goes with the reset, the set is kept.
+  k = keys({ interactive: true });
+  assert.deepEqual(await resetModelKey(inSet, SEAL_ID, '0g-compute', 'openclaw', k.keyPrompt), { keepStoredModelKey: true });
+  // Not in the set: asked as everywhere; only 0g-harness on 0g-compute may skip.
+  const none = { get: async () => ({ definitions: [] }) };
+  assert.deepEqual(await resetModelKey(none, SEAL_ID, '0g-compute', '0g-harness', keys({ interactive: true }).keyPrompt), { apiKey: undefined, keepStoredModelKey: false });
+  await assert.rejects(resetModelKey(none, SEAL_ID, 'anthropic', '0g-harness', keys({ interactive: true }).keyPrompt), (e) => e.code === 'INFERENCE_KEY_REQUIRED');
+  await assert.rejects(resetModelKey(none, SEAL_ID, '0g-compute', 'hermes', keys({ interactive: true }).keyPrompt), (e) => e.code === 'INFERENCE_KEY_REQUIRED');
+});
+
+test('cli: a piped value that is not one line never replaces the key on this machine', async () => {
+  const k = keys({ draft: { anthropic: 'sk-real' }, typed: '7\n8' });
+  await assert.rejects(pickModelKey('anthropic', k.keyPrompt), /one line of printable characters/);
+  assert.equal(k.draft.anthropic, 'sk-real');
+});
+
+test('cli: cred pending/notify/presets complete no agent subcommands', () => {
+  const state = { completions: [], args: {}, models: [], credNames: () => [] };
+  assert.deepEqual(completeLine('cred pending ', state)[0], []);
+  assert.deepEqual(completeLine('cred notify ', state)[0], []);
+  assert.deepEqual(completeLine('cred 532 se', state)[0], ['set ']);
 });

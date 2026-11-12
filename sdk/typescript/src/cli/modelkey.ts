@@ -11,6 +11,7 @@
  * new key, otherwise the draft is used.
  */
 
+import { modelKeyName } from '../Credentials';
 import { saveApiKey } from './config';
 import { CliError } from './errors';
 import { configuredInferenceKey } from './inference';
@@ -43,6 +44,11 @@ export async function pickModelKey(provider: string, io: KeyPrompt, opts: { opti
   const draft = io.draft ?? machineDraft;
   const saved = draft.get(provider);
   const keep = (key: string): string => {
+    // Checked before it replaces the key on this machine: a script's stray
+    // input must not.
+    if (/[\u0000-\u001f\u007f]/.test(key)) {
+      throw new CliError('BAD_FLAG', 'a model key is one line of printable characters', { remedy: `give the ${provider} key alone` });
+    }
     draft.save(provider, key);
     if (io.interactive) io.out(`saved as your ${provider} key on this machine`);
     return key;
@@ -59,6 +65,50 @@ export async function pickModelKey(provider: string, io: KeyPrompt, opts: { opti
   if (typed) return keep(typed);
   if (opts.optional) return null;
   throw missing(provider);
+}
+
+/**
+ * Whether an agent may be created or reset with no model key: 0g-harness on
+ * 0g-compute starts without one (its model calls fail until one is set). On
+ * another provider sealed refuses a key it lacks, and the other frameworks
+ * need one.
+ */
+export function mayGoKeyless(framework: string, provider: string): boolean {
+  return framework === '0g-harness' && provider === '0g-compute';
+}
+
+/**
+ * The model key a reset takes.
+ *
+ * The credential set holding the provider's key: the new container gets it
+ * from the set. LEGACY(model-key): an image from before model keys in the set
+ * reads only the key sent with the reset, so the key on this machine goes
+ * along (`keepStoredModelKey`: the set is left as it is); with none here the
+ * owner is asked for it, and skipping sends none. Goes with the request path.
+ *
+ * Otherwise the owner is asked as everywhere (see mayGoKeyless for skipping).
+ */
+export async function resetModelKey(
+  cred: { get(sealId: `0x${string}`): Promise<{ definitions: Array<{ name: string }> }> },
+  sealId: `0x${string}`,
+  provider: string,
+  framework: string,
+  io: KeyPrompt,
+): Promise<{ apiKey?: string; keepStoredModelKey: boolean }> {
+  const name = modelKeyName(provider);
+  const cur = await cred.get(sealId).catch(() => undefined);
+  if (cur?.definitions.some((d) => d.name === name)) {
+    const saved = (io.draft ?? machineDraft).get(provider);
+    if (saved) {
+      io.out(`the agent uses ${name} from cred (cred <agent> set model changes it)`);
+      return { apiKey: saved, keepStoredModelKey: true };
+    }
+    io.out(`the agent uses ${name} from cred; an image from before model keys in cred also needs it with the reset`);
+    const key = await pickModelKey(provider, io, { optional: true });
+    return key ? { apiKey: key, keepStoredModelKey: false } : { keepStoredModelKey: true };
+  }
+  const key = await pickModelKey(provider, io, { optional: mayGoKeyless(framework, provider) });
+  return { apiKey: key ?? undefined, keepStoredModelKey: false };
 }
 
 function missing(provider: string): CliError {
