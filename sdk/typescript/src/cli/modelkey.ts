@@ -51,6 +51,8 @@ export async function pickModelKey(provider: string, io: KeyPrompt, opts: { opti
     }
     draft.save(provider, key);
     if (io.interactive) io.out(`saved as your ${provider} key on this machine`);
+    // An environment variable (API_KEY, AGENTDNA_API_KEY…) still wins over it.
+    if (draft.get(provider) !== key) io.out(`note: an environment variable sets the ${provider} key and takes precedence over the saved one`);
     return key;
   };
   if (!io.interactive) {
@@ -103,7 +105,7 @@ export async function resetModelKey(
       io.out(`the agent uses ${name} from cred (cred <agent> set model changes it)`);
       return { apiKey: saved, keepStoredModelKey: true };
     }
-    io.out(`the agent uses ${name} from cred; an image from before model keys in cred also needs it with the reset`);
+    io.out(`the agent uses ${name} from cred; an image from before model keys in cred also needs it with the reset (a key given here also replaces the one in cred)`);
     const key = await pickModelKey(provider, io, { optional: true });
     return key ? { apiKey: key, keepStoredModelKey: false } : { keepStoredModelKey: true };
   }

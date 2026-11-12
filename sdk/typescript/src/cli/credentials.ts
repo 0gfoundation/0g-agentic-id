@@ -781,8 +781,10 @@ export async function readConfirm(question: string, def: boolean): Promise<boole
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   try {
     const a = (await new Promise<string>((resolve, reject) => {
-      // Ctrl-C cancels the question and the command, as at readSecret.
+      // Ctrl-C (or Ctrl-D, which closes it) cancels the question and the
+      // command, as at readSecret; the close after an answer changes nothing.
       rl.on('SIGINT', () => reject(cancelled()));
+      rl.on('close', () => reject(cancelled()));
       rl.question(`${question} [${def ? 'Y/n' : 'y/N'}] `, resolve);
     })).trim().toLowerCase();
     return a ? a.startsWith('y') : def;
