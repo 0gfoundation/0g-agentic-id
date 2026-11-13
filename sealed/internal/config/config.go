@@ -83,7 +83,8 @@ type Bootstrap struct {
 
 	// Optional pipeline knobs
 	// APIKey is the create/reset model key, in clear (API_KEY) or opened from
-	// SecretEnv. LEGACY(model-key): see internal/secretenv.
+	// SecretEnv, and InferenceCredential its binding. LEGACY(model-key): see
+	// internal/secretenv.
 	APIKey              string
 	InferenceCredential *inference.ProviderCredential
 	StatusBinding       *report.Binding
@@ -105,6 +106,7 @@ type Bootstrap struct {
 	// be opened only after Phase 1 (it is sealed to agentSeal_priv) and is
 	// bound to the on-chain owner, so main opens it after Phase 2 and
 	// overwrites APIKey with the result (internal/secretenv).
+	// LEGACY(model-key).
 	SecretEnv string
 
 	// Framework is the raw AGENT_FRAMEWORK env value (may be empty). The

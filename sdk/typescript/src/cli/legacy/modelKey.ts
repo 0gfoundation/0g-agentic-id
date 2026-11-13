@@ -6,8 +6,10 @@
  * A reset of an agent whose credential set holds the key needs no key for
  * an image that reads the set; an image from before that reads only the key
  * sent with the reset, so the CLI still finds one ({@link resetKeyForOlderImages}).
- * Once those images are gone, delete this file; the compiler then lists the
- * call site.
+ * Once those images are gone, delete this file with the SDK's, and remove
+ * every piece marked LEGACY(model-key) (`git grep -n 'LEGACY(model-key)'`):
+ * the compiler lists this file's call site, the marks find the rest (the
+ * secret-env pins, messages about the key given at create/reset).
  */
 
 /**

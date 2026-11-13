@@ -71,6 +71,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FileConfig {
  * tampering instead of silently downgrading to a clear-text key — across
  * CLI invocations, not just within one process. One small file so the
  * existing config.json load/save semantics stay untouched.
+ * LEGACY(model-key): the scheme seals only the request copy of a key; the
+ * pins, recordSecretEnvPin and the pin move in moveRenamedAttestor go with it.
  */
 export function loadSecretEnvPins(env: NodeJS.ProcessEnv = process.env): Record<string, true> {
   const file = join(configPaths(env).dir, 'secret-env-pins.json');
@@ -187,7 +189,7 @@ export function moveRenamedAttestor(env: NodeJS.ProcessEnv = process.env): { fro
   const to = from ? renamedAttestor(from) : undefined;
   if (!from || !to) return null;
   // Pin first: a failed write then leaves the earlier address saved, never
-  // the current one without its pin.
+  // the current one without its pin. LEGACY(model-key): goes with the pins.
   if (loadSecretEnvPins(env)[from]) {
     recordSecretEnvPin(to, env);
     if (!loadSecretEnvPins(env)[to]) return null;

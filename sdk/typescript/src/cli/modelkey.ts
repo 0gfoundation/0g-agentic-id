@@ -85,7 +85,8 @@ export function mayGoKeyless(framework: string, provider: string): boolean {
  *
  * The credential set holding the provider's key: the new container gets it
  * from the set (older images: cli/legacy/modelKey.ts). Otherwise the owner is
- * asked as everywhere (see mayGoKeyless for skipping).
+ * asked as everywhere (see mayGoKeyless for skipping). LEGACY(model-key):
+ * `keepStoredModelKey` in the result goes with the older images.
  */
 export async function resetModelKey(
   cred: { get(sealId: `0x${string}`): Promise<{ definitions: Array<{ name: string }> }> },

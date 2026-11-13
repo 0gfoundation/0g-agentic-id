@@ -540,6 +540,7 @@ function renderModelKeys(keys: CredentialDefinition[], model: ModelKeyState | un
   }
   if (model === null) lines.push('  in use: unknown — the agent is not running');
   else if (model === 'old') lines.push("  in use: unknown — the agent's image predates model keys in cred (a reset moves it to the current image)");
+  // LEGACY(model-key): the key that came with the create/reset request.
   else if (inUse?.source === 'deploy') lines.push(`  in use: the ${inUse.provider} key given at create/reset (cred <agent> set model replaces it)`);
   else if (inUse?.source === 'none') lines.push(`  in use: none — add one: cred <agent> set model provider=${inUse.provider || '0g-compute'}`);
   if (inUse?.issue) lines.push(`  ${printable(inUse.issue)}`);
@@ -621,6 +622,7 @@ async function modelSetOp(ag: AgenticID, sealId: Hash, provider: string, defs: C
   if (io.json) return emitOk({ sealId, version: out.version, name, provider, valueHash: out.valueHash, pushWarning: out.pushWarning ?? null });
   io.out(`${defs.some((d) => d.name === name) ? 'changed' : 'added'} ${name} — version ${out.version}`);
   if (out.pushWarning) return io.out(`stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot`);
+  // LEGACY(model-key): the parenthesis goes with the images that read only the request.
   if (state === null) return io.out('the agent is not running: it takes the key when it starts on a current image (an image from before model keys in cred skips it and keeps the key given at create/reset)');
   io.out(`waiting for the running agent to take it (up to ${MODEL_WAIT_MS / 60_000} minutes)…`);
   io.out(await modelApplied(cred, sealId, provider, out.valueHash, io, at));
@@ -641,6 +643,7 @@ async function modelRmOp(ag: AgenticID, sealId: Hash, provider: string, defs: Cr
   if (io.json) return emitOk({ sealId, version: out.version, removed: name, pushWarning: out.pushWarning ?? null });
   io.out(`removed ${name} — version ${out.version}. Revoke it at the provider too: removing it here does not.`);
   if (inUse) {
+    // LEGACY(model-key): "goes back to the key given at create/reset" holds only while keys come with the request.
     io.out(`it was in use: the agent goes back to the ${provider} key given at create/reset, if it has one; without one it cannot call its model until there is a key (cred <agent> set model provider=${provider})`);
   }
   if (out.pushWarning) io.out(`the running agent did not take it: ${out.pushWarning} — it keeps the key until its next boot`);
@@ -657,7 +660,8 @@ export async function ensureModelKey(ag: AgenticID, sealId: Hash, provider: stri
   const cred = ag.credentials;
   const { state } = await modelKeyState(cred, sealId, at);
   if (state === 'old') return 'unsupported';
-  // The key given at create/reset is for that provider: nothing to add.
+  // LEGACY(model-key): the key given with the create/reset request is for
+  // that provider: nothing to add.
   if (state?.deploy_provider === provider) return 'kept';
   // An attestor that keeps no credential sets: the reset path too.
   const cur = await cred.get(sealId).catch((e: unknown) => {

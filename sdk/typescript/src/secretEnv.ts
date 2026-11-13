@@ -7,8 +7,12 @@
  * LEGACY(model-key): model keys go into the agent's credential set
  * (Credentials.ts; an integrator's with `sealModelKey`). The secret env is the
  * copy sent with the request for images that read only that
- * (legacy/modelKey.ts) and goes with it; {@link eciesEncrypt} stays, the
- * credential set seals with it.
+ * (legacy/modelKey.ts), and its parts here go with it: the scheme and its
+ * variable, {@link SecretEnvMode}, `sealSecretEnv`, `checkSealedSecretEnv` and
+ * the request-only refusal codes. What stays: {@link eciesEncrypt}, which the
+ * credential set seals with; {@link SecretEnvRefusedError}, which the
+ * credential set's checks throw too; the agentSeal key checks
+ * (`parseAgentSealPubkey`, `publicKeyToAddress`).
  *
  * The sandbox "create" envelope is signed with EIP-191 `personal_sign`, and a
  * wallet shows that message verbatim. With the key in `env.API_KEY`, the
@@ -41,13 +45,14 @@ import { sha256 } from '@noble/hashes/sha2';
 import { gcm } from '@noble/ciphers/aes';
 import { getAddress, hexToBytes, keccak256, toHex, type Address, type Hex } from 'viem';
 
-/** `GET /config` value that says this attestor's sealed images open a secret env. */
+/** LEGACY(model-key): `GET /config` value that says this attestor's sealed images open a secret env. */
 export const SECRET_ENV_SCHEME = 'agent-seal-ecies-v1';
-/** The container env var that carries the sealed secret env. */
+/** LEGACY(model-key): the container env var that carries the sealed secret env. */
 export const SECRET_ENV_VAR = 'SEAL_SECRET_ENV';
 
 /**
- * How `start` / `reset` / `retry` / `deploy` deliver the inference key:
+ * LEGACY(model-key): how `start` / `reset` / `retry` / `deploy` deliver the
+ * request copy of the inference key:
  *  - `'auto'` (default): sealed to the agent when the attestor advertises
  *    `secret_env_scheme` and the agent exists already; otherwise in clear
  *    (older attestors, and a one-shot `deploy` with `sandbox`, whose agent
@@ -179,6 +184,8 @@ function randomValidPriv(): Uint8Array {
 }
 
 /**
+ * LEGACY(model-key): the request copy of a key.
+ *
  * Seal `env` for one agent. `agentSealPubkey` is the agent's agentSeal public
  * key (hex, compressed or uncompressed); `owner` is the address that will sign
  * the envelope (the container requires it to be the agent's on-chain owner).
@@ -233,6 +240,8 @@ function fromBase64(s: string): Uint8Array {
 const MIN_PLAINTEXT = 70;
 
 /**
+ * LEGACY(model-key): the request copy of a key.
+ *
  * Check that `value` has the shape `sealSecretEnv` produces (standard base64
  * of `ephemeralPub(65) ‖ nonce(16) ‖ tag(16) ‖ ct`, with a valid ephemeral
  * point) and return it trimmed. The SDK cannot decrypt it, so this does not

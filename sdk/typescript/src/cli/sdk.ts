@@ -49,6 +49,7 @@ export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = 
       ...(Object.keys(overrides).length ? { overrides } : {}),
       // Once this machine has seen an attestor advertise secret_env_scheme,
       // its absence is tampering, not a downgrade (issue #166).
+      // LEGACY(model-key): the scheme seals only the request copy of a key.
       secretEnvPin: {
         seen: (url) => !!loadSecretEnvPins()[url],
         record: (url) => recordSecretEnvPin(url),

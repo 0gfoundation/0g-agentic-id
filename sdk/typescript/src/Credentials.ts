@@ -24,7 +24,7 @@ import { plainText } from './AgentClient';
 import { getAddress, hashTypedData, hexToBytes, isAddress, keccak256, recoverAddress, toBytes, type Address, type Hash, type Hex } from 'viem';
 import type { Ctx } from './context';
 import { requireWallet } from './context';
-import { eciesEncrypt } from './secretEnv';
+import { eciesEncrypt, publicKeyToAddress } from './secretEnv';
 import { sha256Hex } from './Settings';
 import type { AttestorClient } from './AttestorClient';
 import { requestSecretEnv } from './legacy/modelKey';
@@ -198,13 +198,13 @@ export interface SealedModelKey {
 /** Which model key the running agent's framework uses (`GET /_seal/credentials`). */
 export interface ModelKeyInUse {
   provider?: string;
-  /** `credentials`: an entry of the set; `deploy`: the key given at create/reset. */
+  /** `credentials`: an entry of the set; `deploy` (LEGACY(model-key)): the key given with the create/reset request. */
   source: 'credentials' | 'deploy' | 'none';
   /** The entry's value hash, when `source` is `credentials`. */
   value_hash?: string;
   /** Why the key the settings choose is not the one in use. */
   issue?: string;
-  /** The provider of the key given at create/reset, when it is usable: a switch to it needs no key in the set. */
+  /** LEGACY(model-key): the provider of the key given with the create/reset request, when it is usable: a switch to it needs no key in the set. */
   deploy_provider?: string;
 }
 
@@ -341,6 +341,16 @@ function checkModelKey(value: string): string {
   if (!value || /[\u0000-\u001f\u007f]/.test(value)) throw new Error('credentials: a model key is one line of printable characters');
   if (toBytes(value).length > MAX_VALUE_BYTES) throw new Error(`credentials: a model key is at most ${MAX_VALUE_BYTES} bytes`);
   return value;
+}
+
+/**
+ * The checks {@link CredentialsApi.setModelKey} makes of a key and its
+ * provider before it reads or sends anything: a caller that stores a key
+ * after a request (`AgentApi.deploy`) runs them before the request. Throws.
+ */
+export function checkModelKeyInput(provider: string, value: string): void {
+  modelKeyNameOf(provider);
+  checkModelKey(value);
 }
 
 /** A sealed model key for this agent, provider and signer; its ciphertext. */
@@ -622,23 +632,51 @@ export class CredentialsApi {
    * `value` is the key, or the key sealed for this owner elsewhere
    * ({@link sealModelKey}), stored as it is: the owner signs its ciphertext's
    * hash and never has the key.
+   *
+   * The owner signs the read of the stored set, the new set and the write:
+   * three signatures, and a fourth for the push. `newAgent`: the agent was
+   * created a moment ago by this wallet (`AgentApi.deploy`) and has no set
+   * yet, so the read is skipped (two signatures); should one be stored by
+   * then, the write is refused as a conflict and made again after a read.
+   * `sealedTo`: the agentSeal address a key given in clear was sealed to.
    */
-  async setModelKey(sealId: Hash, provider: string, value: string | SealedModelKey, opts?: { agentUrl?: string; push?: boolean }): Promise<{ version: number; valueHash: Hash; pushWarning?: string }> {
+  async setModelKey(
+    sealId: Hash,
+    provider: string,
+    value: string | SealedModelKey,
+    opts?: { agentUrl?: string; push?: boolean; newAgent?: boolean },
+  ): Promise<{ version: number; valueHash: Hash; pushWarning?: string; sealedTo?: Address }> {
     const seal = sealId.toLowerCase() as Hash;
     const name = modelKeyNameOf(provider);
     const given = typeof value === 'string'
       ? { value: checkModelKey(value) }
       : { sealedValue: checkSealedModelKey(value, seal, provider, requireWallet(this.ctx).account.address) };
     const binding = await this.attestor.modelKeyBinding(provider, seal);
-    const cur = await this.get(seal);
-    const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
     const entry: EntryInput = { name, ...given, hosts: [], positions: [], use: 'model', inference: { provider, ...binding } };
-    const doc = await this.buildDocument(seal, [...others, entry], cur.version, cur);
-    const version = await this.store(seal, doc, cur.version);
+    // A key given in clear is sealed here, to the key the attestor names
+    // (checked against the chain once the agent is minted).
+    const sealing = given.value !== undefined ? await this.sealingKey(seal) : undefined;
+    const write = async (cur: Awaited<ReturnType<CredentialsApi['get']>>) => {
+      const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
+      const doc = await this.buildDocument(seal, [...others, entry], cur.version, cur, sealing);
+      return { doc, version: await this.store(seal, doc, cur.version) };
+    };
+    let written: Awaited<ReturnType<typeof write>>;
+    if (opts?.newAgent) {
+      try {
+        written = await write({ version: 0, ownerEpoch: 0, document: null, definitions: [] });
+      } catch (e) {
+        if (!(e instanceof CredentialsConflictError)) throw e;
+        written = await write(await this.get(seal));
+      }
+    } else {
+      written = await write(await this.get(seal));
+    }
+    const { doc, version } = written;
     // `push: false`: a container about to be recreated takes it at its boot.
     const pushWarning = opts?.push === false ? undefined
       : await this.push(seal, doc, opts?.agentUrl).then(() => undefined, (e: unknown) => String(e instanceof Error ? e.message : e));
-    return { version, valueHash: keccak256(fromB64(doc.values[name])), pushWarning };
+    return { version, valueHash: keccak256(fromB64(doc.values[name])), pushWarning, ...(sealing ? { sealedTo: sealing.address } : {}) };
   }
 
   /**
@@ -652,8 +690,8 @@ export class CredentialsApi {
    * The value is bound, as every value in the set, to `owner`, the agent, the
    * chain and the entry `model.<provider>`; once the agent is minted, `owner`
    * must be its on-chain owner (a {@link SecretEnvRefusedError} otherwise).
-   * `framework` / `sealedImage` matter only for the request copy older images
-   * read (`secretEnv`).
+   * LEGACY(model-key): `framework` / `sealedImage` matter only for the
+   * request copy older images read (`secretEnv`), and go with it.
    */
   async sealModelKey(
     sealId: Hash,
@@ -691,12 +729,13 @@ export class CredentialsApi {
 
   /**
    * Whether the agent has a model key for `provider`: one in its credential
-   * set, or (asked of the running agent) the key handed over at
-   * create/reset being for that provider.
+   * set, or (asked of the running agent; LEGACY(model-key)) the key handed
+   * over with the create/reset request being for that provider.
    */
   async hasModelKey(sealId: Hash, provider: string, opts?: { agentUrl?: string }): Promise<boolean> {
     const view = await this.modelKeys(sealId, opts);
     return view.stored.some((k) => k.provider === provider)
+      // LEGACY(model-key): the request copy the running container got.
       || (!!view.inUse && view.inUse !== 'unsupported' && view.inUse.deploy_provider === provider);
   }
 
@@ -717,11 +756,19 @@ export class CredentialsApi {
     return 'pushed';
   }
 
+  /** The agent's agentSeal key values are sealed to, checked as
+   *  `agentSealPubkey` checks it, with its address. */
+  private async sealingKey(seal: Hash): Promise<{ bytes: Uint8Array; address: Address }> {
+    const bytes = hexToBytes(await this.attestor.agentSealPubkey(seal));
+    return { bytes, address: publicKeyToAddress(bytes) };
+  }
+
   private async buildDocument(
     sealId: Hash,
     entries: EntryInput[],
     baseVersion: number,
     current?: Awaited<ReturnType<CredentialsApi['get']>>,
+    sealing?: { bytes: Uint8Array; address: Address },
   ): Promise<CredentialDocument> {
     const { walletClient, account } = requireWallet(this.ctx);
     const seal = sealId.toLowerCase() as Hash;
@@ -729,7 +776,7 @@ export class CredentialsApi {
     if (cur.version !== baseVersion) throw new CredentialsConflictError(cur.version, cur.ownerEpoch);
     const names = new Set<string>();
     const needsSealing = entries.some((e) => e.value !== undefined);
-    const pubkey = needsSealing ? hexToBytes(await this.attestor.agentSealPubkey(seal)) : undefined;
+    const pubkey = needsSealing ? (sealing ?? (await this.sealingKey(seal))).bytes : undefined;
     const doc: CredentialDocument = {
       set: { seal_id: seal, owner_epoch: cur.ownerEpoch, version: baseVersion + 1, entries: [] },
       signature: '',

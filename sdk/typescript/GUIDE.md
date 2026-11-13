@@ -569,17 +569,26 @@ await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …
 **The model key.** `sandbox.apiKey` (and `apiKey` of `start` / `reset` /
 `retry`) is stored in the agent's credential set as `model.<provider>`,
 sealed to the agent ([credentials](../../docs/credentials.md#the-model-key)):
-`deploy` stores it as soon as the attestor accepts the agent, without
-waiting for the mint (`modelKeyStored` in the result), and the attestor
-creates the container once it is stored, or after a minute, so the first
-boot has it (`awaitCredentials`, signed with the deploy); `start` / `reset` /
-`retry` store it after their own checks pass, before the request is signed.
-Each store is one more owner signature. A container whose image reads model
-keys from the set takes the key from there at boot, so with one stored, a
-`reset` on that image needs none. `ag.credentials.setModelKey(sealId,
-provider, apiKey)` sets or replaces it at any time. Without a key, 0g-harness
-on 0g-compute boots and its model calls fail until one is set; the other
-frameworks need one.
+`deploy` checks the key before it signs anything and stores it as soon as
+the attestor accepts the agent, without waiting for the mint
+(`modelKeyStored` in the result); the attestor creates the container once
+it is stored, ten seconds after the mint without one, or after a minute at
+the latest, so the first boot has it (`awaitCredentials`, signed with the
+deploy). `start` / `reset` / `retry` store it after their own checks pass,
+before the request is signed. A store asks the owner's wallet for three
+signatures (reading the stored set, the new set, the write); `deploy`'s for
+two, as the new agent has no set to read. A container whose image reads
+model keys from the set takes the key from there at boot, so with one
+stored, a `reset` on that image needs none, and a `retry` with the
+provider's key in the set can create a container. A key given without
+`provider` is the 0g-compute key (`model.0g-compute`): pass `provider` for
+any other provider's key. `ag.credentials.setModelKey(sealId, provider,
+apiKey)` sets or replaces it at any time (three signatures, a fourth to
+push it to the running agent). Without a key, 0g-harness on 0g-compute
+boots and its model calls fail until one is set; with no key for the
+provider in the set, the CLI asks for one for every other framework and
+provider, and the SDK refuses a create without one for a provider other
+than 0g-compute.
 
 While older images are in use, the key also travels with the request:
 inside the owner-signed "create" envelope into the TEE container's

@@ -111,7 +111,7 @@ key 的去向：对**走平台路由的模型（0g-compute）上的 0g-harness**
 
 其他情况下框架仍然直接拿到 key，它的工具也能读到：使用框架内置 provider（`openai`、`anthropic`）的 0g-harness，openclaw 和 hermes（`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`；hermes 还会写进自己的配置文件），以及 prime（`SEAL_MODEL_API_KEY`）。
 
-完全没有模型 key 时，0g-harness、openclaw 和 prime 照常启动，调模型时失败，直到 owner 设置 key；走平台路由模型的 hermes 没有 key 起不来（`hermes/spawn.go`）。
+完全没有模型 key 时，0g-harness、openclaw 和 prime 照常启动，调模型时失败，直到 owner 设置 key；走平台路由模型的 hermes 没有 key 起不来（`hermes/spawn.go`）。创建或重置能不能不带 key，由客户端决定：凭据集里没有这家的 key 时，CLI 只允许用 0g-compute 的 0g-harness 不带 key；SDK 只在服务不是 0g-compute、凭据集里也没有这家的 key 时拒绝。
 
 ## 换 token 与轮换
 

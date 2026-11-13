@@ -7,16 +7,23 @@
  * the SDK's part of it is here:
  *
  * - images that read the key only from the create/reset request: a key given
- *   to `start` / `reset` / `retry` also rides the request ({@link requestKey}),
- *   and so does a key an integrator's server seals ({@link requestSecretEnv});
+ *   to `deploy` / `start` / `reset` / `retry` also rides the request
+ *   ({@link deployRequestKey}, {@link requestKey}), and so does a key an
+ *   integrator's server seals ({@link requestSecretEnv});
  * - attestors that take no credential set before the mint: `deploy` stores
  *   the key once minted ({@link storeAfterMint}).
  *
  * The request key itself is built where every request is (AttestorClient's
- * `keyEnv` and `sealApiKey`, with secretEnv.ts), marked LEGACY(model-key)
- * there; the CLI's part is in cli/legacy/modelKey.ts. Once those images and
- * attestors are gone, delete this file; the compiler then lists every call
- * site, and the marked code goes with them.
+ * `sandboxEnv`, `keyEnv` and `sealApiKey`, with secretEnv.ts); the CLI's part
+ * is in cli/legacy/modelKey.ts. Once every image reads model keys from the
+ * set and every attestor takes a set before the mint, delete this file and
+ * cli/legacy/modelKey.ts, and remove every piece marked LEGACY(model-key)
+ * (`git grep -n 'LEGACY(model-key)'`). Deleting the files makes the compiler
+ * list the call sites that send the key; the marks find the rest (the
+ * request-building code behind them, the options, types and messages that
+ * only describe the request copy). The attestor drops the request key
+ * (`OWNER_ENV_KEYS`) only after no client sends it any more, this SDK's
+ * releases until then included.
  */
 
 import type { DeployAccepted, ModelKeyLifecycleOpts } from '../AgenticID';
@@ -33,6 +40,16 @@ export function requestKey(opts: ModelKeyLifecycleOpts): { apiKey?: string; seal
     sealedSecretEnv: opts.sealedSecretEnv ?? opts.sealedModelKey?.secretEnv,
     secretEnv: opts.secretEnv,
   };
+}
+
+/** Whether a start/reset/retry request carries the key, for images that read only the request. */
+export function carriesRequestKey(p: { apiKey?: string; sealedSecretEnv?: string }): boolean {
+  return !!p.apiKey || p.sealedSecretEnv !== undefined;
+}
+
+/** The key a deploy's create envelope carries, for images that read only the request. */
+export function deployRequestKey(sandbox: { apiKey?: string; secretEnv?: SecretEnvMode }): { apiKey?: string; mode?: SecretEnvMode } {
+  return { apiKey: sandbox.apiKey, mode: sandbox.secretEnv };
 }
 
 /** `keepStoredModelKey`: the set holds the key already, and it goes with the request only. */

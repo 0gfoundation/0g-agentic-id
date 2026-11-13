@@ -50,6 +50,9 @@ export interface AgenticIDConfig {
    */
   componentAppIds?: string[];
   /**
+   * LEGACY(model-key): only the request copy of a model key is sealed with
+   * the secret-env scheme.
+   *
    * Sticky memory for the secret-env scheme (issue #166): once an attestor
    * has advertised `secret_env_scheme`, its later absence is treated as
    * tampering and refused (`scheme_withdrawn`) rather than silently falling

@@ -8,15 +8,17 @@ import { AgentApi } from '../dist/index.js';
 const SEAL = `0x${'5e'.repeat(32)}`;
 
 /** An AgentApi whose attestor and credential set are recorded fakes. */
-function agentApi({ stored = [], failSet = false, failSetOnce = false, refuse = false } = {}) {
+function agentApi({ stored = [], failSet = false, failSetOnce = false, refuse = false, sealedTo } = {}) {
   const calls = [];
+  const setOpts = [];
   let sets = 0;
   const creds = {
     setModelKey: async (seal, provider, key, opts) => {
       calls.push(['setModelKey', provider, key, opts?.push]);
+      setOpts.push(opts);
       sets += 1;
       if (failSet || (failSetOnce && sets === 1)) throw new Error('attestor has no credential sets');
-      return { version: 1, valueHash: '0x1' };
+      return { version: 1, valueHash: '0x1', ...(sealedTo ? { sealedTo } : {}) };
     },
     get: async () => { calls.push(['get']); return { definitions: stored.map((p) => ({ name: `model.${p}`, inference: { provider: p } })) }; },
     resyncModelKey: async () => 'in_sync',
@@ -35,7 +37,8 @@ function agentApi({ stored = [], failSet = false, failSetOnce = false, refuse = 
     deploy: async (p) => { calls.push(['deploy', p.awaitCredentials]); return { seal_id: SEAL, agent_seal_addr: `0x${'a5'.repeat(20)}` }; },
   };
   api.waitForMint = async () => { calls.push(['minted']); return 7n; };
-  return { api, calls };
+  api.waitForRunning = async () => { calls.push(['running']); return { agentId: 7n, url: 'https://agent.example' }; };
+  return { api, calls, setOpts };
 }
 
 test('reset with a key stores it in the set first, unpushed, and still sends it', async () => {
@@ -127,6 +130,50 @@ test('deploy stores the key after the mint when the attestor takes no set before
   assert.equal(res.agentId, 7n);
 });
 
+test('deploy checks the key before anything is signed', async () => {
+  const { api, calls } = agentApi();
+  await assert.rejects(api.deploy({ ...DEPLOY, sandbox: { apiKey: 'sk-1\n' } }, { preflight: false }), /one line of printable characters/);
+  assert.deepEqual(calls, [], 'no deploy, no store');
+});
+
+test("deploy's store skips the read of a set the new agent cannot have yet", async () => {
+  const { api, setOpts } = agentApi();
+  await api.deploy(DEPLOY, { preflight: false });
+  assert.equal(setOpts[0].newAgent, true);
+  assert.equal(setOpts[0].push, false);
+});
+
+test("deploy wait 'running' goes straight to the container when the key is stored", async () => {
+  const { api, calls } = agentApi();
+  const res = await api.deploy(DEPLOY, { wait: 'running', preflight: false });
+  assert.deepEqual(calls.map((c) => c[0]), ['deploy', 'setModelKey', 'running']);
+  assert.equal(res.url, 'https://agent.example');
+});
+
+test('both waits of a deploy share one timeout', async () => {
+  const { api } = agentApi({ failSetOnce: true });
+  const budgets = [];
+  api.waitForMint = async (_seal, o) => { budgets.push(o.timeoutMs); await new Promise((r) => setTimeout(r, 40)); return 7n; };
+  api.waitForRunning = async (_seal, o) => { budgets.push(o.timeoutMs); return { agentId: 7n, url: 'https://agent.example' }; };
+  await api.deploy(DEPLOY, { wait: 'running', timeoutMs: 1_000, preflight: false });
+  assert.equal(budgets.length, 2, 'the mint is waited for: the key goes in after it');
+  assert.ok(budgets[0] <= 1_000);
+  assert.ok(budgets[1] <= budgets[0] - 30, `the second wait gets what is left (${budgets})`);
+});
+
+test('a deploy that waits checks the key was sealed to the agentSeal key the agent was minted with', async () => {
+  const sealedTo = `0x${'a5'.repeat(20)}`;
+  const ok = agentApi({ sealedTo });
+  ok.api.id = { getAgentSeal: async () => sealedTo.toUpperCase().replace('0X', '0x') };
+  assert.equal((await ok.api.deploy(DEPLOY, { wait: 'minted', preflight: false })).agentId, 7n);
+  const bad = agentApi({ sealedTo });
+  bad.api.id = { getAgentSeal: async () => `0x${'b6'.repeat(20)}` };
+  await assert.rejects(bad.api.deploy(DEPLOY, { wait: 'minted', preflight: false }), /sealed to 0xa5.*agentSeal on chain is 0xb6/);
+  const running = agentApi({ sealedTo });
+  running.api.id = { getAgentSeal: async () => `0x${'b6'.repeat(20)}` };
+  await assert.rejects(running.api.deploy(DEPLOY, { wait: 'running', preflight: false }), /agentSeal on chain/);
+});
+
 test('deploy without a key touches no set', async () => {
   const { api, calls } = agentApi();
   const res = await api.deploy({ sandbox: {} }, { preflight: false });
@@ -154,6 +201,18 @@ test('a sealed model key with no request copy reaches the container only through
   const failing = agentApi({ failSet: true });
   await assert.rejects(failing.api.start(SEAL, { sealedModelKey: bare }), /no credential sets/);
   assert.ok(!failing.calls.some((c) => c[0] === 'lifecycle'), 'nothing sent');
+});
+
+test('keepStoredModelKey with a sealed key that has no request copy is refused before anything is signed', async () => {
+  const { api, calls } = agentApi();
+  await assert.rejects(api.reset(SEAL, { sealedModelKey: { ...SEALED, secretEnv: undefined }, keepStoredModelKey: true }), /no request copy/);
+  assert.deepEqual(calls, []);
+});
+
+test('retry with the provider\'s key in the set may create a container', async () => {
+  const { api, calls } = agentApi({ stored: ['anthropic'] });
+  await api.retry(SEAL, { provider: 'anthropic' });
+  assert.equal(calls.at(-1)[1].keyInCredentials, true);
 });
 
 test('a sealed model key with a key, another provider or a request-only key is refused', async () => {

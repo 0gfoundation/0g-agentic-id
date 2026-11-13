@@ -24,10 +24,15 @@ use std::sync::Arc;
 pub(crate) const PROVISION_TIMEOUT: ChronoDuration = ChronoDuration::minutes(5);
 
 /// How long a deploy's container waits for the owner's credential set when
-/// the deploy says one follows (`await_credentials`): the SDK stores the
-/// model key there right after the deploy is accepted, which takes a few
-/// seconds, and a container created at once boots before it.
+/// the deploy says one follows (`await_credentials`), at the most: the SDK
+/// stores the model key there right after the deploy is accepted, which
+/// takes a few seconds, and a container created at once boots before it.
 pub(crate) const AWAIT_CREDENTIALS: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the container still waits once the mint is done. The worker
+/// runs one job at a time, so a set that never comes holds every other
+/// job for no longer than the mint plus this.
+pub(crate) const AFTER_MINT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -1173,27 +1178,86 @@ fn build_serve_url(
     )
 }
 
-/// Wait until the agent has a credential set for its current ownership, or
-/// `limit` passes; whether one came. A container created after it gets the
-/// set at its first boot. Without one it boots as before: the request half
-/// of the key (LEGACY(model-key)) still reaches it.
-async fn wait_for_credentials(ctx: &Ctx, seal_id: SealId, limit: std::time::Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + limit;
+/// The deploy's mint track, as its container's wait sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MintTrack {
+    Running,
+    Done,
+    Failed,
+}
+
+/// Why a deploy's container stopped waiting for the owner's credential set.
+#[derive(Debug, PartialEq, Eq)]
+enum CredentialWait {
+    /// A set for the current ownership is stored.
+    Stored,
+    /// The mint failed: there is no agent to create a container for.
+    MintFailed,
+    /// `grace` passed after the mint without a set.
+    AfterMint,
+    /// `cap` passed without a set.
+    Cap,
+}
+
+/// Wait until the agent has a credential set for its current ownership, the
+/// mint fails, `grace` passes after the mint is done, or `cap` passes. A
+/// container created after a set gets it at its first boot. Without one it
+/// boots as before: the request half of the key (LEGACY(model-key)) still
+/// reaches it.
+async fn wait_for_credentials(
+    ctx: &Ctx,
+    seal_id: SealId,
+    mut mint: tokio::sync::watch::Receiver<MintTrack>,
+    grace: std::time::Duration,
+    cap: std::time::Duration,
+) -> CredentialWait {
+    let cap_at = tokio::time::Instant::now() + cap;
+    let mut grace_at: Option<tokio::time::Instant> = None;
     tracing::info!(?seal_id, "container waits for the owner's credential set");
     loop {
         if credential_set_stored(ctx, seal_id).await {
             tracing::info!(?seal_id, "credential set stored; creating the container");
-            return true;
+            return CredentialWait::Stored;
+        }
+        let track = *mint.borrow_and_update();
+        if track == MintTrack::Failed {
+            tracing::info!(?seal_id, "the mint failed; no container is created");
+            return CredentialWait::MintFailed;
         }
         let now = tokio::time::Instant::now();
-        if now >= deadline {
+        if track == MintTrack::Done && grace_at.is_none() {
+            grace_at = Some(now + grace);
+        }
+        if grace_at.is_some_and(|at| now >= at && at <= cap_at) {
             tracing::warn!(
                 ?seal_id,
-                "no credential set within {limit:?}; creating the container without it"
+                "no credential set {grace:?} after the mint; creating the container without it"
             );
-            return false;
+            return CredentialWait::AfterMint;
         }
-        tokio::time::sleep((deadline - now).min(std::time::Duration::from_secs(1))).await;
+        if now >= cap_at {
+            tracing::warn!(
+                ?seal_id,
+                "no credential set within {cap:?}; creating the container without it"
+            );
+            return CredentialWait::Cap;
+        }
+        let until = grace_at.map_or(cap_at, |at| at.min(cap_at));
+        let tick = (until - now).min(std::time::Duration::from_secs(1));
+        if grace_at.is_none() {
+            // The mint's end wakes the wait at once. A track gone without a
+            // result answers at once too, so it is slept on like the rest.
+            tokio::select! {
+                _ = tokio::time::sleep(tick) => {}
+                changed = mint.changed() => {
+                    if changed.is_err() {
+                        tokio::time::sleep(tick).await;
+                    }
+                }
+            }
+        } else {
+            tokio::time::sleep(tick).await;
+        }
     }
 }
 
@@ -1319,12 +1383,32 @@ async fn handle_deploy(
     // entirely — the agent lands Offline (container_stage stays NotStarted),
     // brought online later via /start.
     let storage_fut = run_storage_track(ctx, seal_id, &artifacts);
-    let mint_fut = run_mint_track(ctx, seal_id, mint_params);
+    // The container's wait for the credential set ends with the mint.
+    let (mint_track, mint_seen) = tokio::sync::watch::channel(MintTrack::Running);
+    let mint_fut = async {
+        let res = run_mint_track(ctx, seal_id, mint_params).await;
+        mint_track.send_replace(if res.is_ok() {
+            MintTrack::Done
+        } else {
+            MintTrack::Failed
+        });
+        res
+    };
 
     let (storage_res, mint_res, container_res) = if let Some(env) = &sandbox_envelope {
         let container_fut = async {
             if await_credentials {
-                wait_for_credentials(ctx, seal_id, AWAIT_CREDENTIALS).await;
+                let waited = wait_for_credentials(
+                    ctx,
+                    seal_id,
+                    mint_seen.clone(),
+                    AFTER_MINT_GRACE,
+                    AWAIT_CREDENTIALS,
+                )
+                .await;
+                if waited == CredentialWait::MintFailed {
+                    anyhow::bail!("no container: the mint failed");
+                }
             }
             run_container_track(ctx, seal_id, env).await
         };
@@ -2745,56 +2829,196 @@ mod tests {
             .unwrap();
     }
 
+    const SECOND: std::time::Duration = std::time::Duration::from_secs(1);
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+    const CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// A mint track that ends as `end` after `after`, as handle_deploy's.
+    fn mint_ending(
+        after: Option<(std::time::Duration, MintTrack)>,
+    ) -> tokio::sync::watch::Receiver<MintTrack> {
+        let (track, seen) = tokio::sync::watch::channel(MintTrack::Running);
+        tokio::spawn(async move {
+            match after {
+                Some((after, end)) => {
+                    tokio::time::sleep(after).await;
+                    track.send_replace(end);
+                    // Kept until the wait is over, as the deploy's track is.
+                    tokio::time::sleep(CAP * 2).await;
+                }
+                None => tokio::time::sleep(CAP * 2).await,
+            }
+        });
+        seen
+    }
+
     /// A deploy's container waits for the owner's credential set: at once
-    /// when it is stored, until it is stored, and not past the limit; a set
+    /// when it is stored, until it is stored, and never past the cap; a set
     /// from an earlier ownership does not count.
     #[tokio::test(start_paused = true)]
     async fn the_container_waits_for_the_credential_set() {
         let t = make_test_ctx();
-        let limit = std::time::Duration::from_secs(60);
 
         let none = dummy_seal();
         let at = tokio::time::Instant::now();
-        assert!(
-            !wait_for_credentials(&t.ctx, none, limit).await,
-            "no set: gives up"
+        assert_eq!(
+            wait_for_credentials(&t.ctx, none, mint_ending(None), GRACE, CAP).await,
+            CredentialWait::Cap,
+            "no set and a mint still running: gives up"
         );
-        assert!(at.elapsed() >= limit, "and only at the limit");
+        assert!(at.elapsed() >= CAP, "and only at the cap");
 
         let stored = B256::repeat_byte(0x21);
         store_set(&t.ctx, stored).await;
         let at = tokio::time::Instant::now();
-        assert!(
-            wait_for_credentials(&t.ctx, stored, limit).await,
-            "a stored set"
+        assert_eq!(
+            wait_for_credentials(&t.ctx, stored, mint_ending(None), GRACE, CAP).await,
+            CredentialWait::Stored,
+            "a set stored before the mint ends"
         );
-        assert!(
-            at.elapsed() < std::time::Duration::from_secs(1),
-            "is taken at once"
-        );
+        assert!(at.elapsed() < SECOND, "is taken at once");
 
         let earlier = B256::repeat_byte(0x22);
         store_set(&t.ctx, earlier).await;
         t.ctx.credentials.set_epoch(earlier, 7).await.unwrap();
-        assert!(
-            !wait_for_credentials(&t.ctx, earlier, limit).await,
+        assert_eq!(
+            wait_for_credentials(&t.ctx, earlier, mint_ending(None), GRACE, CAP).await,
+            CredentialWait::Cap,
             "an earlier ownership's set is not"
         );
 
         let later = B256::repeat_byte(0x23);
         let ctx = t.ctx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tokio::time::sleep(3 * SECOND).await;
             store_set(&ctx, later).await;
         });
         let at = tokio::time::Instant::now();
-        assert!(
-            wait_for_credentials(&t.ctx, later, limit).await,
+        assert_eq!(
+            wait_for_credentials(&t.ctx, later, mint_ending(None), GRACE, CAP).await,
+            CredentialWait::Stored,
             "a set stored while waiting"
         );
+        assert!(at.elapsed() < 5 * SECOND, "is taken when it is stored");
+    }
+
+    /// The wait ends with the mint: `grace` after a mint that is done, at
+    /// once after one that failed; a set stored in the grace still counts.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_for_the_credential_set_ends_with_the_mint() {
+        let t = make_test_ctx();
+
+        let done = B256::repeat_byte(0x31);
+        let at = tokio::time::Instant::now();
+        assert_eq!(
+            wait_for_credentials(
+                &t.ctx,
+                done,
+                mint_ending(Some((3 * SECOND, MintTrack::Done))),
+                GRACE,
+                CAP
+            )
+            .await,
+            CredentialWait::AfterMint,
+            "no set after a mint that is done"
+        );
+        let waited = at.elapsed();
         assert!(
-            at.elapsed() < std::time::Duration::from_secs(5),
-            "is taken when it is stored"
+            waited >= 3 * SECOND + GRACE && waited < 5 * SECOND + GRACE,
+            "ends the grace after the mint, not at the cap ({waited:?})"
+        );
+
+        let failed = B256::repeat_byte(0x32);
+        let at = tokio::time::Instant::now();
+        assert_eq!(
+            wait_for_credentials(
+                &t.ctx,
+                failed,
+                mint_ending(Some((2 * SECOND, MintTrack::Failed))),
+                GRACE,
+                CAP
+            )
+            .await,
+            CredentialWait::MintFailed,
+            "a failed mint"
+        );
+        assert!(at.elapsed() < 3 * SECOND, "ends the wait at once");
+
+        let in_grace = B256::repeat_byte(0x33);
+        let ctx = t.ctx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(6 * SECOND).await;
+            store_set(&ctx, in_grace).await;
+        });
+        assert_eq!(
+            wait_for_credentials(
+                &t.ctx,
+                in_grace,
+                mint_ending(Some((2 * SECOND, MintTrack::Done))),
+                GRACE,
+                CAP
+            )
+            .await,
+            CredentialWait::Stored,
+            "a set stored in the grace"
+        );
+
+        let late_mint = B256::repeat_byte(0x34);
+        let at = tokio::time::Instant::now();
+        assert_eq!(
+            wait_for_credentials(
+                &t.ctx,
+                late_mint,
+                mint_ending(Some((55 * SECOND, MintTrack::Done))),
+                GRACE,
+                CAP
+            )
+            .await,
+            CredentialWait::Cap,
+            "a mint done late"
+        );
+        assert!(at.elapsed() < CAP + SECOND, "still ends at the cap");
+    }
+
+    /// With `await_credentials`, a deploy whose mint fails creates no
+    /// container at all.
+    #[tokio::test]
+    async fn deploy_waiting_for_credentials_skips_the_container_when_the_mint_fails() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::NotStarted,
+            StageStatus::NotStarted,
+            None,
+            None,
+        );
+        t.chain.register_fails.store(true, Ordering::SeqCst);
+        let res = handle_deploy(
+            &t.ctx,
+            seal,
+            Address::from([0x66; 20]),
+            default_test_i_data(),
+            "Sage".to_string(),
+            "DeFi helper".to_string(),
+            None,
+            Some(dummy_envelope("create")),
+            true,
+        )
+        .await;
+        assert!(res.is_err(), "the deploy fails with its mint");
+        assert_eq!(
+            t.sandbox.create_calls.load(Ordering::SeqCst),
+            0,
+            "no container is created"
+        );
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Failed { .. }),
+            "the container stage says why: {:?}",
+            d.container_stage
         );
     }
 

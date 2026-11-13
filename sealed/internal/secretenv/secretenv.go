@@ -27,11 +27,16 @@
 //
 // LEGACY(model-key): model keys come from the owner's credential set
 // (internal/credentials, modelkey.go). The key handed over with the
-// create/reset serves clients that send only that: the SDK and CLI from
-// before model keys in the set, the attestor's console, and integrators on
-// sealedSecretEnv. Once they are gone, delete this package; the compiler then
-// lists applySecretEnv, and the key handed over at create/reset (config
-// API_KEY / SEAL_SECRET_ENV, modelKeys.boot) goes with it.
+// create/reset serves images and clients from before that. It goes once no
+// client sends it any more (SDK and CLI releases until they stop, the
+// attestor's console until it stores keys in the set, integrators on
+// sealedSecretEnv) and the attestor stops relaying it: delete this package
+// and every piece marked LEGACY(model-key) (`git grep -n
+// 'LEGACY(model-key)'`). Deleting the package makes the compiler list
+// applySecretEnv; the marks find the rest of the key handed over at
+// create/reset (config API_KEY and InferenceCredential, modelKeys.boot and
+// the choices made from it, RuntimeContext.APIKey, the "deploy" source and
+// deploy_provider of GET /_seal/credentials).
 package secretenv
 
 import (

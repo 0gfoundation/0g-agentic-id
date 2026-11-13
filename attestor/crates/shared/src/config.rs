@@ -16,10 +16,16 @@ pub struct Framework {
 
 /// Capabilities of this release, attached to configured snapshots. Attestor and
 /// all advertised sealed runtimes are upgraded together; routes live in the registry.
+/// Advertised whether or not the request copy of a model key is enabled
+/// (`secret_env_enabled`): they describe the images, which take model keys
+/// from the credential set either way.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InferenceCapability {
     pub image: String,
     pub providers: Vec<String>,
+    /// The credential binding versions the image's sealed understands (2:
+    /// provider-bound, 3: route-bound), for a model key in the credential set
+    /// and in the request alike.
     pub secret_env_versions: Vec<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub formats: Vec<String>,
@@ -433,14 +439,7 @@ fn env_opt(key: &str) -> Option<String> {
 
 // The release deploys attestor and its configured sealed images together.
 // Only configured images are advertised; explicit unknown images remain unsupported.
-fn runtime_capabilities(
-    enabled: bool,
-    default_image: &str,
-    frameworks: &[Framework],
-) -> Vec<InferenceCapability> {
-    if !enabled {
-        return Vec::new();
-    }
+fn runtime_capabilities(default_image: &str, frameworks: &[Framework]) -> Vec<InferenceCapability> {
     let mut images: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     if !default_image.trim().is_empty() {
@@ -477,11 +476,7 @@ fn runtime_capabilities(
 
 impl Config {
     pub fn inference_capabilities(&self) -> Vec<InferenceCapability> {
-        runtime_capabilities(
-            self.secret_env_enabled,
-            &self.sandbox_snapshot,
-            &self.frameworks,
-        )
+        runtime_capabilities(&self.sandbox_snapshot, &self.frameworks)
     }
 }
 
@@ -569,7 +564,7 @@ mod tests {
         let frameworks = parse_frameworks(Some(
             "openclaw,hermes:hermes-new,prime-agent:prime-new,0g-harness:harness-new".into(),
         )).unwrap();
-        let caps = runtime_capabilities(true, "openclaw-new", &frameworks);
+        let caps = runtime_capabilities("openclaw-new", &frameworks);
         assert_eq!(caps.len(), 4);
         for capability in &caps {
             assert_eq!(capability.secret_env_versions, vec![1, 2, 3]);
@@ -581,7 +576,6 @@ mod tests {
             };
             assert_eq!(capability.formats, expected);
         }
-        assert!(runtime_capabilities(false, "openclaw-new", &frameworks).is_empty());
     }
 
     #[test]
@@ -589,7 +583,7 @@ mod tests {
         let frameworks = parse_frameworks(Some(
             "future:unknown-image,openclaw:shared,hermes:shared".into(),
         )).unwrap();
-        let caps = runtime_capabilities(true, "default", &frameworks);
+        let caps = runtime_capabilities("default", &frameworks);
         assert!(!caps.iter().any(|cap| cap.image == "unknown-image"));
         assert_eq!(
             caps.iter()

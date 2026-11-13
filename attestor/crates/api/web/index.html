@@ -2285,6 +2285,7 @@ window.toggleSecret = function (inputId, btnId) {
 // HKDF-SHA256 over ephemeralPub‖sharedPoint, AES-256-GCM, 16-byte nonce;
 // ephemeralPub(65) ‖ nonce(16) ‖ tag(16) ‖ ct). Only when /config
 // advertises the scheme; otherwise the legacy API_KEY shape is kept.
+// LEGACY(model-key): goes with keyEnvFor below.
 const SECRET_ENV_SCHEME = 'agent-seal-ecies-v1';
 
 function bytesToB64(bytes) {
@@ -3099,6 +3100,8 @@ window.submitDeploy = async function () {
     // This one-shot deploy signs before the agent (and its agentSeal key)
     // exists, so the key cannot be sealed here and the wallet prompt shows
     // it (issue #166). Restore/Reset seal it (keyEnvFor).
+    // LEGACY(model-key): the console sends the key with the request only
+    // (#234 moves it into the credential set).
     const env = apiKey ? { API_KEY: apiKey } : {};
     // `snapshot` (above) comes from attestor /config — operators bump
     // ATTESTOR_SANDBOX_SNAPSHOT / ATTESTOR_FRAMEWORKS to point new deploys

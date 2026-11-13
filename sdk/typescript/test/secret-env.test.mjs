@@ -268,6 +268,35 @@ test('one-shot non-compute deploy refuses before signing because the agent key d
   });
 });
 
+test('provider support follows the image capabilities, not the request-copy scheme', async () => {
+  const { secret_env_scheme: _scheme, ...noScheme } = BOUND_CONFIG;
+  await withAttestor({ config: noScheme }, async (a) => {
+    const { c, signed } = client(a.port);
+    // A key in the credential set may go to openai on this image.
+    await c.assertProviderSupported('openai', { sealId: SEAL_ID });
+    // The request copy of a non-compute key still needs the scheme.
+    await assert.rejects(c.lifecycle('reset', { sealId: SEAL_ID, provider: 'openai', apiKey: KEY }), refused('scheme_unsupported'));
+    assert.equal(signed.length, 0);
+    assert.equal(a.posts.length, 0);
+  });
+});
+
+test('retry with the key in the set signs a create envelope without a key in it', async () => {
+  await withAttestor({}, async (a) => {
+    const { c, signed } = client(a.port);
+    await c.retry({ sealId: SEAL_ID, provider: 'openai', keyInCredentials: true });
+    assert.equal(signed.length, 1);
+    const message = JSON.parse(signed[0]);
+    assert.equal(message.action, 'create');
+    assert.ok(!('env' in message.payload), 'no request copy');
+    assert.ok(a.posts.at(-1).body.sandbox_envelope);
+    // No key anywhere: the soft retry, nothing signed.
+    await c.retry({ sealId: SEAL_ID });
+    assert.equal(signed.length, 1);
+    assert.ok(!('sandbox_envelope' in a.posts.at(-1).body));
+  });
+});
+
 // ── 2. lifecycle calls seal the key ─────────────────────────────────────────
 
 for (const op of ['start', 'reset', 'retry']) {

@@ -38,16 +38,17 @@ type modelKeySource interface {
 type modelChoice struct {
 	doc        settings.Doc // the provider filled in when it was implied
 	credential inference.ProviderCredential
-	source     string // "credentials", "deploy" or "none"
+	source     string // "credentials", "deploy" (LEGACY(model-key)) or "none"
 	valueHash  string
 	issue      string
 	// deployProvider is the create/reset key's provider when it is usable.
+	// LEGACY(model-key).
 	deployProvider string
 }
 
 func (m *modelKeys) choose(doc settings.Doc) modelChoice {
 	c := m.chooseKey(doc)
-	if m.boot.APIKey != "" && !m.boot.Invalid {
+	if m.boot.APIKey != "" && !m.boot.Invalid { // LEGACY(model-key)
 		c.deployProvider = m.boot.Provider
 	}
 	return c
@@ -76,6 +77,8 @@ func (m *modelKeys) chooseKey(doc settings.Doc) modelChoice {
 			return modelChoice{doc: doc, credential: m.boot, source: "none", issue: issue}
 		}
 	}
+	// LEGACY(model-key): no key in the set: the one handed over at
+	// create/reset. Without it, a choice with no credential and source "none".
 	source := "deploy"
 	// A document with no provider is given no key (settings.ResolveForRegistry).
 	if doc.Provider == "" || m.boot.APIKey == "" {
