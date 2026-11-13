@@ -143,7 +143,9 @@ contract Deploy is Script {
         //    lists). AgenticID's implementation fixes its address. NOTE:
         //    post-deploy, its owner trusts the attestor(s) and the CloneGate
         //    below (addTrustedAttestor / bindTrustedAttestorApp) and lists the
-        //    image hashes (list(IMAGE, …)).
+        //    image hashes (list(IMAGE, …)), then hands the registry to the
+        //    Timelock with itself as guardian (HandOverTrustRegistry.s.sol;
+        //    the Timelock accepts through TrustRegistryCalls.s.sol).
         TrustRegistry trustImpl = new TrustRegistry();
         UpgradeableBeacon trustBeacon = new UpgradeableBeacon(address(trustImpl), address(timelock));
         BeaconProxy trustProxy = new BeaconProxy(

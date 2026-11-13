@@ -356,6 +356,8 @@ contract VerifiedFeedbackRegistry is
 
     /// @dev Shared v1 attest routine. `verifiedUri` is "" for the plain path
     ///      and the receipt-opened endpoint for attestFeedbackWithTask.
+    ///      LEGACY(v1), with _verifyServeProof and _serveProofHash: removed
+    ///      with the v1 entry points (IVerifiedFeedbackRegistry.attestFeedback).
     function _attest(
         uint256 agentId,
         uint64 feedbackIndex,
@@ -570,7 +572,7 @@ contract VerifiedFeedbackRegistry is
     ///      this is the single entrypoint that guarantees each ServeProof is
     ///      redeemed at most once here. The nonce-key derivation matches the
     ///      fork registry's; the signed digest does not since 1.2.0 (bound to
-    ///      this registry — `_serveProofDigest`).
+    ///      this registry — `_serveProofDigest`). LEGACY(v1): see _attest.
     function _verifyServeProof(ServeProof calldata proof) internal returns (address agentSeal) {
         _checkRedeemer(proof.submitter, proof.timestamp, proof.deadline);
         address identityRegistry = _getVerifiedFeedbackStorage().identityRegistry;
@@ -616,7 +618,8 @@ contract VerifiedFeedbackRegistry is
     ///      `submitter` makes it non-transferable. Fixed-width words only, so
     ///      abi.encode has no encoding ambiguity. Consensus-critical — the
     ///      sealed proxy and the SDK compute it independently (cross-impl
-    ///      known-answer vector in test/VerifiedFeedback.t.sol).
+    ///      known-answer vector in test/VerifiedFeedback.t.sol). LEGACY(v1):
+    ///      see _attest.
     function _serveProofHash(uint256 chainId, address identityRegistry, ServeProof calldata proof)
         internal pure returns (bytes32)
     {
@@ -640,7 +643,7 @@ contract VerifiedFeedbackRegistry is
     ///      with the chain id and is 9 words long, v2's with the tag and 14.
     ///      Consensus-critical: sealed (proxy.go serveProofHashV2), the SDK,
     ///      the attestor console and verify-agent.sh compute it too —
-    ///      known-answer vector in test/VerifiedFeedback.t.sol.
+    ///      known-answer vector in test/VersionedFeedback.t.sol.
     function _serveProofHashV2(uint256 chainId, address identityRegistry, VersionedServeProof calldata proof)
         internal pure returns (bytes32)
     {

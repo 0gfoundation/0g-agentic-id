@@ -135,6 +135,12 @@ interface IVerifiedFeedbackRegistry {
     ///      wallet, or the agent's agentSeal; the canonical entry exists for
     ///      msg.sender and its value is in range (|value| ≤ 1e9, ≤ 18
     ///      decimals); the entry is not already verified.
+    ///      LEGACY(v1): for images that sign ServeProof v1 (a proof without a
+    ///      version: the openclaw, hermes and prime-agent images, and 0g-harness
+    ///      outside the layered flow). Once every running image signs v2, this
+    ///      and attestFeedbackWithTask leave the ABI with
+    ///      FeedbackBatcher.giveFeedbackAndAttest — a minor bump, no storage
+    ///      change; v1 marks stay readable.
     function attestFeedback(uint256 agentId, uint64 feedbackIndex, ServeProof calldata proof) external;
 
     /// @notice Like {attestFeedback}, additionally opening the proof's
@@ -146,6 +152,7 @@ interface IVerifiedFeedbackRegistry {
     ///      outside the known set, the uri lacks a leading '/', or statusCode
     ///      is outside 100..999; VerifiedFeedbackTaskMismatch when the
     ///      recomputed hash differs from proof.taskHash.
+    ///      LEGACY(v1): see {attestFeedback}.
     function attestFeedbackWithTask(
         uint256 agentId,
         uint64 feedbackIndex,
@@ -194,6 +201,10 @@ interface IVerifiedFeedbackRegistry {
     ///         proof. CLAIMED, like getServeData's fields: check them against
     ///         the TrustRegistry's lists off chain. Reverts if the entry is
     ///         unverified.
+    /// @dev Zero hashes do not tell a v1 mark from a v2 one: a v2 proof may
+    ///      claim zero hashes too, and the registry does not refuse them.
+    ///      {VersionedFeedbackVerified}, emitted only for a versioned proof,
+    ///      tells the versions apart.
     function getServeLayers(uint256 agentId, address clientAddress, uint64 feedbackIndex)
         external view returns (bytes32 sealedHash, bytes32 harnessHash);
 

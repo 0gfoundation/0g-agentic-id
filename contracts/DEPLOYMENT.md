@@ -59,14 +59,16 @@ recreates the sandbox).
 
 | Role | Identity | Timelock-protected |
 |---|---|---|
-| Timelock | owner of every beacon; the only caller of `beacon.upgradeTo`. `minDelay` 1 day on mainnet (`Deploy.s.sol` enforces ≥ 86400 on chain 16661), 0 on testnet / dev | — |
-| Owner (`Ownable2StepUpgradeable` from AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0 and on TrustRegistry; `OwnableUpgradeable` before, and on the deprecated fork) | attestors and code lists (TrustRegistry; on AgenticID before 1.4.0) / verifier + TEE-oracle swap / pauser rotation / `setMaxProofAge` (raise-only within 2 hours–365 days in TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; the deployed fork stays unrestricted) | no — direct calls, effective immediately |
+| Timelock | owner of every beacon; the only caller of `beacon.upgradeTo`; from TrustRegistry 1.1.0 also the registry's owner. `minDelay` 1 day on mainnet (`Deploy.s.sol` enforces ≥ 86400 on chain 16661), 0 on testnet / dev | — |
+| Owner (`Ownable2StepUpgradeable` from AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; `OwnableUpgradeable` before, and on the deprecated fork) | verifier + TEE-oracle swap / pauser rotation / `setMaxProofAge` (raise-only within 2 hours–365 days in TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; the deployed fork stays unrestricted) / attestors and image list on AgenticID before 1.4.0 | no — direct calls, effective immediately |
+| TrustRegistry owner (`Ownable2StepUpgradeable`): the environment's Timelock from TrustRegistry 1.1.0's owner move (below; the governance key before it) | adds trust: `list`, `addTrustedAttestor`, `bindTrustedAttestorApp`, `requireInstanceBoundAttestors`, `setGuardian`; may remove it too | yes — each a scheduled Timelock operation, cancellable until it runs |
+| TrustRegistry guardian (1.1.0): the governance key — dev `0x2AB7…a0B3`, test `0x9C58…80Bb`, mainnet the vault | removes trust: `delist`, `removeTrustedAttestor`, one call or a `multicall` batch | no — direct calls, effective immediately |
 | Pauser | emergency switch | no (emergency path can't be delayed) |
 
 **Governance split (deliberate).** Privileged admin calls are **direct owner
 calls** — on mainnet the owner is a Fordefi MPC vault (§6.2m) — with no
-Timelock and no separate guardian role; only beacon upgrades go through the
-Timelock. From 1.2.0 the owner surface is hardened (audit FIND-12 / FIND-16):
+Timelock; beacon upgrades and, from TrustRegistry 1.1.0, every addition of
+trust go through the Timelock. From 1.2.0 the owner surface is hardened (audit FIND-12 / FIND-16):
 ownership is two-step — `transferOwnership(x)` only records `pendingOwner = x`
 (`OwnershipTransferStarted`), and ownership moves when `x` itself calls
 `acceptOwnership()`, so a mistyped or unreachable address can't strand the
@@ -81,6 +83,25 @@ above — on mainnet the vault's approval policy (§8) is what guards it.
 Testnet / dev deliberately stay lightweight (EOA owner,
 `minDelay` 0, §6.1 / §6.2); the one hard rule is that **no testnet key is ever
 reused on mainnet**.
+
+**TrustRegistry: adding trust waits, removing it does not.** The code lists
+decide what runs in a running container, not only what may start: listing a
+sealed version and delisting the one agents run moves each of those agents,
+within one heartbeat (5 minutes), to its owner's pick if listed, else to the
+version just listed — the `latest` — which then gets the agent key at its
+provision (sealed/LAYERS.md §3.1). So from TrustRegistry 1.1.0 the registry's
+owner is the environment's TimelockController: listing a version, trusting or
+binding an attestor, requiring instance binding and setting the guardian are
+scheduled Timelock operations (`script/TrustRegistryCalls.s.sol`) that run
+after `minDelay` — 1 day on mainnet, 0 on test / dev — and that a canceller
+(every proposer; on mainnet the vault) can cancel until then. Removing trust is
+immediate: the guardian, the environment's governance key, calls `delist` and
+`removeTrustedAttestor` directly, alone or batched through `multicall` (the
+owner can too). The owner moves in two steps: while the governance key still
+owns the registry it calls `setGuardian(key)` and `transferOwnership(timelock)`
+(`script/HandOverTrustRegistry.s.sol`, one `multicall`), and the Timelock
+then executes `acceptOwnership()` (`TrustRegistryCalls`); until it does, the
+key stays owner.
 
 ## 2. ERC-8004 binding + proof domain separation
 
@@ -306,7 +327,42 @@ the `msg.sender` of clone mints — without it every `cloneFrom` reverts), and
 `list(IMAGE, <sealed image hash>)` (else `image_hash not in
 validFrameworkHashes`); for 0g-harness loader images also
 `list(SEALED, <sealed program hash>)` and `list(HARNESS, <package hash>)`
-(sealed/LAYERS.md §10). `multicall` takes them in one transaction.
+(sealed/LAYERS.md §10). `multicall` takes them in one transaction. Then the
+owner hands the registry to the Timelock and becomes its guardian (§1):
+
+```bash
+export TRUST_REGISTRY=0x<proxy> TIMELOCK=0x<Timelock> GUARDIAN=$OWNER
+forge script script/HandOverTrustRegistry.s.sol --rpc-url <RPC> \
+  --private-key <OWNER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+# the Timelock accepts: schedule, then execute once minDelay has passed
+export CALLS=$(cast calldata "acceptOwnership()")
+MODE=schedule forge script script/TrustRegistryCalls.s.sol --rpc-url <RPC> \
+  --private-key <PROPOSER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+MODE=execute forge script script/TrustRegistryCalls.s.sol --rpc-url <RPC> \
+  --private-key <EXECUTOR_PK> --legacy --gas-price 5000000000 --broadcast --slow
+```
+
+An owner that signs outside forge (the mainnet vault) takes the calldata from
+`MODE=plan` of `HandOverTrustRegistry` and from a dry run of
+`TrustRegistryCalls` with `--sender <vault>` (no `--broadcast`).
+
+**Listing sealed and harness versions later.** Listing a version moves no
+running agent: one keeps its version while that stays listed, unless its owner
+picks another. Delisting one moves the agents that run it to their owner's
+pick, else to `latest`, the last one listed that is still listed; a new
+container also starts the harness on `latest` when its owner picked none
+(sealed/LAYERS.md §3.1, §5.3). So list versions oldest first: listing an older
+version again makes it `latest`. A version the image does not carry is
+downloaded from the `artifacts` release, so upload its file there before
+listing it.
+
+**Who lists and delists.** Once the Timelock owns the registry, a listing is a
+Timelock operation —
+`CALLS=$(cast calldata "list(bytes32,bytes32)" $(cast keccak sealed) <hash>)`
+through `script/TrustRegistryCalls.s.sol`, `MODE=schedule` and, once ready,
+`MODE=execute` (several calls: comma-separated in `CALLS`, one operation). A
+delisting is the guardian's direct call:
+`cast send <registry> "delist(bytes32,bytes32)" $(cast keccak sealed) <hash>`.
 
 ## 4. Upgrade
 
@@ -634,7 +690,9 @@ that version's beacon upgrade executed):
 > 1.4.0". Each environment has its own impls (dev
 > and test deployed separately on the same chain). The 1.2.0 / 1.1.0 impls
 > are solc 0.8.24 builds (optimizer runs 200, via-IR — the `foundry.toml` of
-> `27aef57`); AgenticID 1.3.0 and its library are built with the current
+> `27aef57`); AgenticID 1.3.0 and its library, and dev's 1.4.0 set
+> (AgenticID 1.4.0, TrustRegistry 1.0.0, VerifiedFeedbackRegistry 1.3.0,
+> FeedbackBatcher v5), are built with the current
 > settings (solc 0.8.38, runs 1, Cancun, `bytecode_hash = "none"`;
 > UPGRADING.md §1). Every impl and all three libraries are verified on
 > chainscan with the settings they were built with (the 1.3.0 impls with their
@@ -647,6 +705,16 @@ that version's beacon upgrade executed):
 
 Changelog:
 
+- **TrustRegistry 1.1.0 — source; no environment runs it yet** — a guardian,
+  so adding trust can wait for the Timelock while removing it does not (§1):
+  `guardian` appended to the namespaced struct (zero until set, no
+  reinitializer); `delist` and `removeTrustedAttestor` take the owner or the
+  guardian (`TrustRegistryNotOwnerOrGuardian` otherwise); `setGuardian` (owner,
+  event `GuardianSet`) and `guardian()`; everything else stays owner only.
+  Minor per UPGRADING.md: a beacon upgrade, then the owner move to the
+  Timelock (UPGRADING.md "TrustRegistry 1.1.0 and the owner move"). 5,905 B.
+  Rollback to 1.0.0 leaves `guardian` unread; removing trust is then the
+  owner's alone, through the Timelock once it owns the registry.
 - **AgenticID 1.4.0 + TrustRegistry 1.0.0 — dev beacon-upgraded 2026-11-12
   (upgrade block 65156470; §6.2)** — the trust
   decisions move to a new beacon-proxied `TrustRegistry` (sealed/LAYERS.md
@@ -668,7 +736,12 @@ Changelog:
   upgrade, every candidate reads the same): dev 2 bound attestors + 148 image
   hashes, test 2 + 16, mainnet 2 + 11, instance binding required on all three.
   Dev (2026-11-12) kept only the four images it serves (`IMAGES`, the
-  `pr229r2` set); `MODE=check` passed before and after the upgrade.
+  `pr229r2` set); `MODE=check` passed before the upgrade (every candidate
+  read the same on AgenticID 1.3.0 and the registry) and after it (AgenticID
+  read the registry; the kept hashes were listed, the dropped ones not). An
+  environment's `IMAGES` keeps every image its containers may boot again
+  (UPGRADING.md "AgenticID 1.4.0", step 0): a container on a dropped image
+  fails `/provision` at its next boot until its owner resets it.
 - **VerifiedFeedbackRegistry 1.3.0 — dev beacon-upgraded 2026-11-12 (upgrade
   block 65156596)** — versioned ServeProofs
   (ServeProof v2, the 0g-harness layered runtime): `attestVersionedFeedback`
@@ -1115,7 +1188,8 @@ Changelog:
     for: no single private key; whether a transaction needs more than one
     approver is a vault-policy setting, see Recommended below (owner decision:
     admin calls stay direct vault calls, no Timelock or guardian in front of
-    them).
+    them — except the TrustRegistry's additions of trust, which go through the
+    Timelock with the vault as guardian, §1).
   - **Done — upgrade delay:** Timelock `minDelay` 86400 (1 day, the chosen floor
     rather than the earlier "≥ 2 days"); `Deploy.s.sol` now defaults to and
     enforces ≥ 86400 on chain 16661. Executors stay open (`address(0)`) by

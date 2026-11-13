@@ -69,6 +69,9 @@ contract FeedbackBatcher {
     ///         An empty `task.method` skips the receipt opening (plain
     ///         attest); a non-empty one routes to attestFeedbackWithTask,
     ///         recording `task.uri` as the entry's TEE-verified endpoint.
+    /// @dev LEGACY(v1): for v1 proofs (IVerifiedFeedbackRegistry.attestFeedback).
+    ///      The batcher is immutable: dropping this path takes a new batcher,
+    ///      advertised and re-delegated to, once every running image signs v2.
     /// @return feedbackIndex The 1-based canonical index the entry landed at.
     function giveFeedbackAndAttest(
         uint256 agentId,

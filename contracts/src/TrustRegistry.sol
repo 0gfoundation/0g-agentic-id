@@ -16,6 +16,9 @@ error TrustRegistryAlreadyListed(bytes32 kind, bytes32 hash);
 /// @notice `hash` is not on the `kind` list.
 error TrustRegistryNotListed(bytes32 kind, bytes32 hash);
 
+/// @notice Only the owner or the guardian may remove trust.
+error TrustRegistryNotOwnerOrGuardian(address caller);
+
 /// @title TrustRegistry
 /// @notice The deployer's trust decisions — see {ITrustRegistry}. Two parts:
 ///           • attestors: which addresses may act for the platform (mint
@@ -27,18 +30,30 @@ error TrustRegistryNotListed(bytes32 kind, bytes32 hash);
 ///             harness package). A kind is just a key: another layer later is
 ///             another kind, with no contract change.
 ///
-/// @dev Owner calls are direct (not timelocked) and take effect immediately,
-///      like AgenticID's owner calls; only beacon upgrades go through the
-///      Timelock. `multicall` batches owner calls into one transaction (the
-///      list migration from AgenticID 1.3.0 is one).
+/// @dev Adding trust waits; removing it does not. The owner is the
+///      environment's TimelockController, so `list`, `addTrustedAttestor`,
+///      `bindTrustedAttestorApp`, `requireInstanceBoundAttestors` and
+///      `setGuardian` run only as scheduled Timelock operations, after the
+///      Timelock's delay and unless cancelled first. The guardian (a governance
+///      key) calls `delist` and `removeTrustedAttestor` directly, effective at
+///      once. `multicall` keeps the caller, so it batches the owner's calls,
+///      or the guardian's removals, into one transaction (the list migration
+///      from AgenticID 1.3.0 is one, made before the owner moves to the
+///      Timelock).
 contract TrustRegistry is ITrustRegistry, IAttestorAppBindingErrors, Ownable2StepUpgradeable, MulticallUpgradeable {
     using AttestorAppBindingLib for AttestorAppBinding;
 
     /// @notice Current implementation version. Bump on every upgrade.
-    /// @dev 1.0.0 — initial: the attestor list and app bindings moved from
+    /// @dev 1.1.0 — a guardian (beacon upgrade; `guardian` appended to the
+    ///      namespaced struct, zero until `setGuardian`, no reinitializer):
+    ///      `delist` and `removeTrustedAttestor` take the owner or the
+    ///      guardian (TrustRegistryNotOwnerOrGuardian otherwise); `setGuardian`
+    ///      (owner), `guardian()`, event GuardianSet. Everything else stays
+    ///      owner only.
+    ///      1.0.0 — initial: the attestor list and app bindings moved from
     ///      AgenticID 1.3.0 (same functions, events and errors), plus code
     ///      lists by kind.
-    string public constant VERSION = "1.0.0";
+    string public constant VERSION = "1.1.0";
 
     bytes32 public constant IMAGE = keccak256("image");
     bytes32 public constant SEALED = keccak256("sealed");
@@ -61,6 +76,8 @@ contract TrustRegistry is ITrustRegistry, IAttestorAppBindingErrors, Ownable2Ste
         mapping(address => AttestorAppBinding) attestorAppBindings;
         bool instanceBoundAttestorsRequired;
         mapping(bytes32 => CodeList) codeLists;
+        // 1.1.0: append only — every 1.0.0 field keeps its slot.
+        address guardian;
     }
 
     // keccak256(abi.encode(uint256(keccak256("0g.storage.TrustRegistry")) - 1)) & ~bytes32(uint256(0xff))
@@ -83,6 +100,26 @@ contract TrustRegistry is ITrustRegistry, IAttestorAppBindingErrors, Ownable2Ste
         __Multicall_init();
     }
 
+    /// @dev Removing trust: the owner or the guardian.
+    modifier onlyOwnerOrGuardian() {
+        if (msg.sender != owner() && msg.sender != _getTrustRegistryStorage().guardian) {
+            revert TrustRegistryNotOwnerOrGuardian(msg.sender);
+        }
+        _;
+    }
+
+    // ── Guardian ──────────────────────────────────────────────────────────────
+
+    function setGuardian(address guardian_) external onlyOwner {
+        TrustRegistryStorage storage $ = _getTrustRegistryStorage();
+        emit GuardianSet($.guardian, guardian_);
+        $.guardian = guardian_;
+    }
+
+    function guardian() external view returns (address) {
+        return _getTrustRegistryStorage().guardian;
+    }
+
     // ── Attestors ─────────────────────────────────────────────────────────────
 
     function addTrustedAttestor(address attestor) external onlyOwner {
@@ -90,7 +127,7 @@ contract TrustRegistry is ITrustRegistry, IAttestorAppBindingErrors, Ownable2Ste
         emit TrustedAttestorAdded(attestor);
     }
 
-    function removeTrustedAttestor(address attestor) external onlyOwner {
+    function removeTrustedAttestor(address attestor) external onlyOwnerOrGuardian {
         TrustRegistryStorage storage $ = _getTrustRegistryStorage();
         delete $.trustedAttestors[attestor];
         delete $.attestorAppBindings[attestor];
@@ -152,7 +189,7 @@ contract TrustRegistry is ITrustRegistry, IAttestorAppBindingErrors, Ownable2Ste
         emit Listed(kind, hash);
     }
 
-    function delist(bytes32 kind, bytes32 hash) external onlyOwner {
+    function delist(bytes32 kind, bytes32 hash) external onlyOwnerOrGuardian {
         CodeList storage l = _getTrustRegistryStorage().codeLists[kind];
         if (!l.listed[hash]) revert TrustRegistryNotListed(kind, hash);
         bytes32 before = l.prev[hash];

@@ -116,5 +116,8 @@ interface IAgenticID is IERC8004IdentityRegistry, IERC7857 {
 
     /// @notice Whether the image hash is on the TrustRegistry's image list.
     ///         Read off-chain by attestors.
+    /// @dev LEGACY(pre-1.4.0): a forward for readers of 1.3.0's ABI; leaving
+    ///      it out changes this interface's ERC-165 id (AgenticID's
+    ///      isValidFrameworkHash says when).
     function isValidFrameworkHash(bytes32 frameworkHash) external view returns (bool);
 }

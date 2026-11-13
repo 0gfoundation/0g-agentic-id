@@ -82,10 +82,10 @@ remappings = [
 `via_ir = true` 是必需的——`giveFeedback` 参数多会 stack too deep（细节见
 [`../QUIRKS.md`](../QUIRKS.md)）。
 CBOR 保持开启；`bytecode_hash = "none"` 不等于 `--no-metadata`。
-使用上述配置实测，runtime 分别为 AgenticID **23,788 字节**、TrustRegistry **5,524**、
+使用上述配置实测，runtime 分别为 AgenticID **23,788 字节**、TrustRegistry **5,905**、
 VerifiedFeedbackRegistry **12,902**、FeedbackBatcher **3,056**，均低于 24,576 字节的
 EIP-170 门槛。修改后应重新运行
-`forge build --sizes --skip test --skip script` 和 `forge test`，不要沿用旧的剩余空间估计。本轮验证通过 341 项测试，
+`forge build --sizes --skip test --skip script` 和 `forge test`，不要沿用旧的剩余空间估计。本轮验证通过 354 项测试，
 另有两个 fork 测试跳过。尺寸报告排除脚本和仅用于升级测试的 mock；全套测试中的
 `Eip170Size.t.sol` 另行检查所有生产部署合约。
 
@@ -98,6 +98,15 @@ EIP-170 门槛。修改后应重新运行
 `isValidFrameworkHash`（即镜像名单）、`trustedAttestorAppBinding`、
 `instanceBoundAttestorsRequired`——都转发到这里，`registerWithSeal` / `setAgentURI`
 的门禁也用这些读取。
+
+增加信任要等，撤销信任不用等。注册表的 owner 是本环境的 TimelockController（自
+TrustRegistry 1.1.0 的 owner 迁移起）：登记版本、信任或绑定 attestor、开启实例绑定、
+设置 guardian，都是排期的 Timelock 操作（`script/TrustRegistryCalls.s.sol`），过了
+`minDelay`（mainnet 1 天，test / dev 为 0）才执行，执行前可以取消。guardian 是本环境的
+治理密钥，可以立即撤销信任：`delist` 和 `removeTrustedAttestor`，单独调用或用
+`multicall` 批量。名单会作用到正在运行的 agent：把它们正在运行的 sealed 版本移出名单，
+它们会在一个心跳内换到 owner 选定的版本或最新登记的版本，那个版本随后拿到 agent 私钥——
+所以能登记什么要等过延时（[`DEPLOYMENT.md`](DEPLOYMENT.md) §1）。
 
 注册表地址固定在 AgenticID 的实现里（构造参数，由 `trustRegistry()` 读出），所以
 beacon 升级时所有信任读取一起切换；换注册表就是发新实现、走 Timelock。用
@@ -402,7 +411,7 @@ sybil 类问题，所以 `getVerifiedSummary` 要求调用方显式给出信任�
 - `getVerifiedSummary(agentId, clients[], tag1, tag2)` —— 聚合指定 client 的**已验证** canonical 条目（值实时从 canonical 读取；跳过 revoked，也跳过 1.2.0 之前盖章、超出值范围的条目；求和 + 计数，归一到固定 18 decimals；`clients` 必须非空——由调用方决定信谁）。仅限链下 `eth_call`。
 - `attestFeedbackWithTask(…, TaskReveal)` —— 额外开箱 proof 的 taskHash 承诺（方法 / 路径 / 正文**哈希** / 状态码——正文本身不上链）：合约重算哈希比对,把路径记为该条目的 **TEE 验证接口**。`getVerifiedEndpoint` 读回;`getVerifiedSummaryForEndpoint(agentId, clients[], uri)` 按接口聚合,不依赖 client 自报的 tag（`uri` 不能为空——`VerifiedFeedbackEndpointRequired`，1.2.0：未开箱的条目存的是 ""，空过滤条件恰好匹配所有接口未经证明的条目，FIND-09）。reveal 必须满足：method 在已知 HTTP 集合内、URI 以 `/` 开头、`statusCode` 在 **100..999**（恰好三位数——Go `net/http` 的输出范围），否则 revert `VerifiedFeedbackInvalidTaskReveal`。否则 packed 原像有歧义：一两位数的 status 能让 reveal 把正文哈希的字节挪进 URI，记下一个调用从未访问过的接口（审计 FIND-02，1.2.0 起强制）。
 - `getServeData(agentId, client, idx)` —— 该条 feedback 当时的 `dataHashes` + `frameworkHash`，**买家尽调入口**：和 `intelligentDatasOf(agentId)` 对比即可判断这份声誉挣到手之后 agent 的数据有没有变。
-- `getServeLayers(agentId, client, idx)` —— 带版本号的 proof 记下的 `sealedHash` 和 `harnessHash`（v1 的章返回零）；拿它们对照 TrustRegistry 的 sealed 名单和 harness 名单。
+- `getServeLayers(agentId, client, idx)` —— 带版本号的 proof 记下的 `sealedHash` 和 `harnessHash`（v1 的章返回零；v2 proof 也可能声明零值，只为带版本号的 proof 发出的 `VersionedFeedbackVerified` 事件才能区分两者）；拿它们对照 TrustRegistry 的 sealed 名单和 harness 名单。
 - 上述所有 view 也会计入该环境 1.2.0 升级区块（`DEPLOYMENT.md` §6）之前的章，而这些章没有 FIND-01 / FIND-02 保证（审计数据和验证接口都不可信）。view 不带区块过滤；只要切换后章的读方，按区块过滤 `FeedbackVerified` 日志。
 
 > **已废弃——已暂停**：先前的私有分叉（`AgenticIDReputationRegistry`，proof
@@ -571,10 +580,11 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
   TEEDataVerifier、VerifiedFeedbackRegistry 均为 `Ownable2Step`（1.2.0，审计
   FIND-16）：`transferOwnership(x)` 只设置 `pendingOwner`（事件
   `OwnershipTransferStarted`），`x` 调 `acceptOwnership()` 后 ownership 才转移。
-  owner 专属的管理操作——TrustRegistry 的 attestor 名单和代码名单、
-  `setVerifier` / `setTeeOracleAddress`、`setPauser`、`setMaxProofAge`（只能调大）——都是
-  直接调用，不走 timelock；只有 beacon 升级经过 Timelock（mainnet `minDelay`
-  1 天，testnet / dev 为 0）。这两个替换 setter 拒绝 `address(0)`
+  owner 专属的管理操作——`setVerifier` / `setTeeOracleAddress`、`setPauser`、
+  `setMaxProofAge`（只能调大）——都是直接调用，不走 timelock；beacon 升级经过
+  Timelock（mainnet `minDelay` 1 天，testnet / dev 为 0），TrustRegistry 上每一次增加
+  信任也经过 Timelock：它的 owner 是 Timelock，它的 guardian 立即撤销信任（§1“信任注册表”）。
+  这两个替换 setter 拒绝 `address(0)`
   （`AgenticIDZeroAddress` / `TEEDataVerifierZeroAddress`），并 emit
   `VerifierUpdated` / `TeeOracleUpdated`（旧值、新值），与 `PauserUpdated` 一致
   （FIND-12）。各环境的角色持有者见 [`DEPLOYMENT.md`](DEPLOYMENT.md) §1 / §6。
@@ -589,7 +599,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ## 9. 测试
 
-343 个 Foundry tests / 32 suites（341 通过，2 个 fork 测试未设 `FORK_RPC`
+356 个 Foundry tests / 33 suites（354 通过，2 个 fork 测试未设 `FORK_RPC`
 时跳过），`forge test` 全绿。覆盖每个 `external` / `public` 函数和每条文档化
 的 error 路径。
 
@@ -601,7 +611,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `Clone.t.sol` | 11 | iCloneFrom + 源保留 + 新 token 无 seal + Cloned vs ITransferred + 仿冒 token 兑现不了源 token 的 proof + 转让 proof 不能用来克隆 |
 | `TransferHook.t.sol` | 4 | `_update` 清 agentWallet / authorizedUsers，保留 seal/data/URI/metadata |
 | `VerifiedFeedback.t.sol` | 47 | attestFeedback ServeProof 验签 / canonical 条目绑定 / 防自评（owner、operator、收款钱包、agentSeal）/ 值范围 ±1e9、decimals ≤ 18（FIND-04）/ proof 时间戳（FIND-15）/ maxProofAge 只能调大，含 cleanup 重放场景（FIND-07）/ 对着 canonical mock 的 verified summary / task-receipt 开箱，含 statusCode 100..999 边界、status-0 错位切分伪造与空 endpoint 过滤（FIND-09）/ 注册表绑定 digest：旧 personal_sign、EIP-712 包装、其他 validator 的 proof 均被拒（且注册表绑定 proof 在已废弃分叉上被拒），外加跨实现 digest 已知答案向量（inner + 签名 digest + 旧格式），以及 sealed proxy 钉住的 taskHash 向量经 attestFeedbackWithTask 兑现 |
-| `VersionedFeedback.t.sol` | 12 | attestVersionedFeedback（ServeProof v2）：sealed 钉住的 v2 digest 已知答案向量（及同一组字段算出的 v1 向量）/ 记下 sealed 与 harness 哈希、两个事件都发出 / task reveal 与按接口的 summary / 只接受 version 2 / v1 与 v2 签名不会被当成对方验过 / 每个层字段都在签名范围内 / v1 的各项校验（agent、submitter、重放、已有章、防自评、暂停）/ v1 的章 getServeLayers 返回零 |
+| `VersionedFeedback.t.sol` | 13 | attestVersionedFeedback（ServeProof v2）：sealed 钉住的 v2 digest 已知答案向量（及同一组字段算出的 v1 向量），以及 model 含非 ASCII 字符的同一向量（按 UTF-8 哈希）/ 记下 sealed 与 harness 哈希、两个事件都发出 / task reveal 与按接口的 summary / 只接受 version 2 / v1 与 v2 签名不会被当成对方验过 / 每个层字段都在签名范围内 / v1 的各项校验（agent、submitter、重放、已有章、防自评、暂停）/ v1 的章 getServeLayers 返回零 |
 | `FeedbackBatcher.t.sol` | 11 | EIP-7702 委托批处理（7702 cheatcode）：v1 与带版本号 proof 的原子写+盖章、坏 proof 回滚、自调门禁 vs 直调/外人调用、已委托 EOA 仍能收 ETH / safeMint 的 NFT |
 | `Reputation.t.sol` | 24 | 已废弃分叉：giveFeedback ServeProof 验签（旧 personal_sign digest）+ revoke / appendResponse 全路径（含 inner hash 已知答案向量）|
 | `DataStorage.t.sol` | 13 | update / updateAt + 空 / 越界 / 非 owner |
@@ -610,15 +620,16 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `AgentURIAndMetadata.t.sol` | 9 | setAgentURI / setMetadata + 覆写 / nonexistent |
 | `VerifierAdmin.t.sol` | 11 | oracle 轮换（拒绝零地址、`TeeOracleUpdated`）/ pause（pauser 角色）/ maxProofAge（只能调大、initialize 范围）/ onlyOwner |
 | `AgenticIDAdmin.t.sol` | 14 | 由实现固定的信任注册表（拒绝零地址）/ 经它增删 attestor 和镜像哈希 / setVerifier（拒绝零地址、`VerifierUpdated`）/ onlyOwner / 暂停覆盖范围——URI（owner 与 attestor）、metadata、钱包、授权写入被拦，撤销与解绑钱包放行（FIND-11）|
-| `TrustRegistry.t.sol` | 15 | 代码名单：中间 / 头部 / 尾部移出与重新登记时的登记顺序和 `latest`，种类互相隔离，任意种类可用，零值 / 重复 / 未登记被拒，事件 / onlyOwner / 原子 `multicall` / initializer / 两步 ownership / beacon 升级前后的状态 |
+| `TrustRegistry.t.sol` | 21 | 代码名单：中间 / 头部 / 尾部移出与重新登记时的登记顺序和 `latest`，种类互相隔离，任意种类可用，零值 / 重复 / 未登记被拒，事件 / 增加信任仅限 owner / 原子 `multicall` / initializer / 两步 ownership / beacon 升级前后的状态；guardian（1.1.0）：只有 owner 能设置，可单独或用 `multicall` 撤销信任、不能增加信任，设为零即撤销；从冻结的 1.0.0 源码（`test/mocks/TrustRegistryV1_0_0.sol`，其接口在 `test/mocks/v1_0_0/`）升到 1.1.0 后名单、attestor、绑定和 owner 均保留，guardian 为零；owner 迁移到 1 天 Timelock，登记经排期 / 执行（延时前不能执行，可取消），guardian 立即移出名单；`HandOverTrustRegistry.s.sol` 的调用与拒绝条件，`TrustRegistryCalls.s.sol` 的调用检查 |
 | `AttestorAppBinding.t.sol` | 11 | TrustRegistry 上的 attestor app 实例绑定：仅 owner 可调，app 被回收再用 / owner 变更 / registry 调用失败或返回格式错误时拒绝，实例绑定模式单向开启，输入校验；AgenticID 的 mint 与 URI 门禁及转发的读取都跟随 TrustRegistry，它已停用的信任槽从不写入 |
 | `TwoStepOwnership.t.sol` | 6 | AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry：提议后 owner 不变、只有 pending owner 能接受、接受后权限转移；再次提议覆盖、`address(0)` 取消 |
 | `Upgradeable.t.sol` | 9 | Timelock 升级 beacon（非 Timelock 拒绝 / 延时前拒绝 / 延时后成功+state 保留）+ pauser 角色（非 pauser 拒绝 / 暂停阻断写路径 / view 正常 / 解锁 / setPauser 轮换）|
 | `CanonicalBinding.t.sol` | 10 | canonical 托管（token 由合约持有、本地转让后不动）/ 全局 agentId 计数器 / URI + metadata 的 canonical 可见性 / mint 时 agentWallet 清空 / agentId-0 sealId 哨兵 / clone 注册新 canonical id / 第三方 canonical agent 的 metadata、钱包 view 会 revert（FIND-14）|
 | `UpgradeReputation.t.sol` | 2 | 声誉 beacon 归 Timelock 所有 + feedback 存储在 beacon 升级后保留 |
 | `UpgradeVerifiedFeedback.t.sol` | 5 | VerifiedFeedbackRegistry 经 Timelock 从 1.1.0 升到 1.3.0（升级前 impl = `test/mocks/` 里冻结的 1.1.0 源码）：章 / 审计数据 / 接口 / 配置 / nonce 均保留，旧章读出的 sealed / harness 哈希为零；切换后旧格式 proof 被拒、注册表绑定 proof 通过；owner 保留，之后为两步转移；升级前盖章的超范围条目被 summary 跳过，不再让它 revert |
+| `UpgradeVerifiedFeedbackFrom1_2_0.t.sol` | 3 | VerifiedFeedbackRegistry 从 1.2.0 升到 1.3.0，即 test 与 mainnet 要走的升级（升级前 impl = 冻结的 1.2.0 源码 `test/mocks/VerifiedFeedbackRegistryV1_2_0.sol`）：namespace 固定字段、owner 槽和每个章的记录逐字不变，追加的层哈希读出为零；升级前签的 v1 proof 升级后仍能验过，之后 v2 proof 也能验过 |
 | `UpgradeGovernance.t.sol` | 7 | AgenticID + TEEDataVerifier 从冻结的 1.1.0 源码（及其在 `test/mocks/v1_1_0/` 的冻结基类）经 1 天 Timelock（仿 mainnet 的延时、owner 作 proposer、开放执行）分别升到 1.4.0 和 1.2.0，事先把白名单复制进一个 TrustRegistry：seal 绑定 / iData / URI / metadata / 白名单 / verifier / oracle / nonce 均保留；升级后两步 ownership、零地址校验与 seal 地址唯一性生效；1.1.0 格式的转让 proof 被拒、token 绑定的通过；只升级其中一个会让非 seal 转让全部失败；升级前的 seal 作为其源 agent 的克隆 seal 会被 CloneGate 拒绝 |
-| `UpgradeAgenticID.t.sol` | 7 | AgenticID 从冻结的 1.3.0 源码（`test/mocks/AgenticIDV1_3_0.sol`，其链接库和接口在 `test/mocks/v1_3_0/`）按 test / dev / mainnet 的形态升到 1.4.0：`script/TrustMigration.sol` 读入 1.3.0 的事件，只复制当前受信的内容（已绑定的 attestor 和 CloneGate、实例绑定模式、已登记的镜像哈希且保持顺序；不含已移除、不起作用或绑定已过时的 attestor），它的核对能发现遗漏；升级让所有信任读取一起切换，agent 和 seal 保留，新的信任变更只写进注册表；空注册表什么都不信任；回滚到 1.3.0 恢复它自己的名单 |
+| `UpgradeAgenticID.t.sol` | 12 | AgenticID 从冻结的 1.3.0 源码（`test/mocks/AgenticIDV1_3_0.sol`，其链接库和接口在 `test/mocks/v1_3_0/`）按 test / dev / mainnet 的形态升到 1.4.0：`script/TrustMigration.sol` 读入 1.3.0 的事件，只复制当前受信的内容（已绑定的 attestor 和 CloneGate、实例绑定模式、已登记的镜像哈希且保持顺序；不含已移除、不起作用或绑定已过时的 attestor）；它的核对能发现遗漏、保留集合之外的镜像哈希，以及——把注册表自己的日志也算作候选时——只在注册表上受信的 attestor；`IMAGES` 只保留列出的哈希，拒绝 AgenticID 没登记的哈希；`ScheduleUpgrade.s.sol` 拒绝读取另一个注册表、注册表没有代码或 owner 不符的实现；升级让所有信任读取一起切换，agent 和 seal 保留，新的信任变更只写进注册表；升级后的核对证明保留的哈希仍在名单上；空注册表什么都不信任；回滚到 1.3.0 恢复它自己的名单 |
 | `CloneGate.t.sol` | 21 | policy 模式克隆卫星合约：setCloneAuthorizer 门禁 / cloneFrom 正常路径 + 全部 revert（attestor、无/拒绝/自身 revert 的 authorizer、arity、sealId、复用源 seal、暂停）/ 转让时按 owner-at-set 失效 / lineage |
 | `StandardCloneAuthorizer.t.sol` | 10 | 官方按买家开关的克隆 policy：仅卖家可 grant/revoke、按 agent 隔离、转让后 grant 失效且收回后复活、经 gate 克隆 |
 | `Eip170Size.t.sol` | 1 | 每个上链 impl 都在 EIP-170 运行时字节码上限内 |

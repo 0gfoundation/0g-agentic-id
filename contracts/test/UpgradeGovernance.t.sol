@@ -32,7 +32,8 @@ import {
 /// @notice AgenticID 1.1.0 → 1.4.0 and TEEDataVerifier 1.1.0 → 1.2.0 across a
 ///         real BeaconProxy + UpgradeableBeacon + TimelockController upgrade,
 ///         starting from the frozen 1.1.0 sources (test/mocks/*V1_1_0.sol) —
-///         the code every environment runs today. The Timelock has 0G
+///         the governance and proof changes of 1.2.0 checked from the code
+///         every environment ran before it. The Timelock has 0G
 ///         mainnet's delay and role shape (DEPLOYMENT.md §6.2m): minDelay 1
 ///         day, the owner as sole proposer/canceller, open execution — with
 ///         admin = address(0) as Deploy.s.sol now produces on 0G mainnet
@@ -40,8 +41,9 @@ import {
 ///         role; DEPLOYMENT.md §8).
 ///
 ///         AgenticID 1.4.0 reads its trust from a TrustRegistry, so every
-///         AgenticID upgrade here first copies 1.1.0's lists into one
-///         (`_upgradeAgenticID`), the way UPGRADING.md moves them.
+///         AgenticID upgrade here first adds 1.1.0's attestor and image hash
+///         to one directly (`_upgradeAgenticID`). The migration UPGRADING.md
+///         runs, TrustMigration from 1.3.0's events, is UpgradeAgenticID.t.sol's.
 ///
 ///         Locks the 1.2.0 upgrade-safety claims:
 ///           - every pre-upgrade value survives (the Ownable2Step swap only

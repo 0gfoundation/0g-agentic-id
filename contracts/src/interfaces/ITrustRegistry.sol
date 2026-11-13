@@ -11,6 +11,12 @@ pragma solidity ^0.8.20;
 ///         (`isTrustedAttestor`, `isValidFrameworkHash`, …) forward here, and
 ///         `AgenticID.trustRegistry()` is how sealed, the loader, the attestor
 ///         and the SDK find this contract.
+///
+///         Adding trust and removing it have different keys. The owner — the
+///         environment's TimelockController — lists versions, trusts and binds
+///         attestors and sets the guardian, each a scheduled operation that
+///         can be cancelled before it runs. The guardian removes trust at
+///         once: `delist` and `removeTrustedAttestor` (the owner can too).
 interface ITrustRegistry {
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -26,13 +32,26 @@ interface ITrustRegistry {
     /// @notice `hash` left the `kind` list.
     event Delisted(bytes32 indexed kind, bytes32 indexed hash);
 
+    /// @notice The guardian changed (zero: none).
+    event GuardianSet(address indexed previous, address indexed guardian);
+
+    // ── Guardian ──────────────────────────────────────────────────────────────
+
+    /// @notice Owner only. The account that may remove trust at once
+    ///         (`delist`, `removeTrustedAttestor`) besides the owner; zero
+    ///         for none.
+    function setGuardian(address guardian) external;
+
+    function guardian() external view returns (address);
+
     // ── Attestors ─────────────────────────────────────────────────────────────
 
     /// @notice Trust an attestor that is not bound to an app instance. Such an
     ///         attestor stops being trusted once instance binding is required.
     function addTrustedAttestor(address attestor) external;
 
-    /// @notice Stop trusting an attestor and clear its app binding.
+    /// @notice Stop trusting an attestor and clear its app binding. The owner
+    ///         or the guardian.
     function removeTrustedAttestor(address attestor) external;
 
     /// @notice Trust an attestor bound to one live Tapp app instance: the
@@ -56,11 +75,12 @@ interface ITrustRegistry {
 
     // ── Code lists ────────────────────────────────────────────────────────────
 
-    /// @notice Add `hash` to the `kind` list, as its latest entry. Effective
-    ///         immediately.
+    /// @notice Add `hash` to the `kind` list, as its latest entry. Owner only;
+    ///         effective when the call runs.
     function list(bytes32 kind, bytes32 hash) external;
 
-    /// @notice Remove `hash` from the `kind` list. Effective immediately.
+    /// @notice Remove `hash` from the `kind` list. The owner or the guardian;
+    ///         effective when the call runs.
     function delist(bytes32 kind, bytes32 hash) external;
 
     function isListed(bytes32 kind, bytes32 hash) external view returns (bool);

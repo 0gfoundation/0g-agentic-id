@@ -15,9 +15,10 @@ interface IAgenticIDTrustRegistry {
     function trustRegistry() external view returns (address);
 }
 
-/// @notice Copy AgenticID's pre-1.4.0 trust lists into a TrustRegistry and
-///         check the copy — UPGRADING.md, "AgenticID 1.4.0". Run against the
-///         chain (`--rpc-url`); the logic is TrustMigration's.
+/// @notice Copy AgenticID 1.3.0's trust lists into a TrustRegistry and check
+///         the copy — UPGRADING.md, "AgenticID 1.4.0". Run against the chain
+///         (`--rpc-url`); the logic is TrustMigration's. LEGACY(pre-1.4.0):
+///         one-off — see TrustMigration.
 ///
 ///         Environment variables:
 ///           AGENTIC_ID      — the AgenticID proxy
@@ -34,36 +35,54 @@ interface IAgenticIDTrustRegistry {
 ///                             `multicall` calldata, for an owner that signs
 ///                             outside forge (the mainnet vault);
 ///                             apply: broadcast them as the TrustRegistry
-///                             owner (with --broadcast and the owner key);
-///                             check: compare every candidate's reads on both
-///                             contracts, and report whether AgenticID already
-///                             reads the registry;
+///                             owner (with --broadcast and the owner key), then
+///                             check;
+///                             check: before the upgrade, that the registry
+///                             holds exactly what the migration intends — every
+///                             candidate attestor (named by either contract's
+///                             events) reads the same on both contracts, and
+///                             the registry's image list is the kept set, no
+///                             more, no less; after the upgrade AgenticID reads
+///                             the registry, so comparing the two would compare
+///                             the registry with itself: the run then proves
+///                             only that AgenticID reads TRUST_REGISTRY and
+///                             that every kept image hash is listed;
 ///                             rehearse: on the fork only, never broadcast —
 ///                             deploy a TrustRegistry, apply the calls, check,
 ///                             and with AGENTIC_ID_BEACON set also upgrade the
 ///                             beacon to 1.4.0 (as its owner) and compare
 ///                             every candidate's reads before and after.
 ///           AGENTIC_ID_BEACON — AgenticID's beacon (rehearse only)
-///           FROM_BLOCK      — first block of AgenticID's events (default 0)
+///           FROM_BLOCK      — first block of the events read (default 0). 0
+///                             or AgenticID's deployment block, never later:
+///                             an attestor or image hash named only before it
+///                             would be neither copied nor checked. A non-zero
+///                             FROM_BLOCK is refused unless the range holds
+///                             AgenticID's deployment (its proxy's
+///                             BeaconUpgraded / Upgraded log).
 ///           TO_BLOCK        — last block (default: the latest)
 ///           LOG_CHUNK       — blocks per eth_getLogs; 0 = the whole range in
 ///                             one call (default 0; 0G's RPC accepts it)
 ///           BATCH           — owner calls per multicall (default 40)
 ///
-///         plan and apply expect AgenticID still on 1.3.0 (or 1.1.0) and a
-///         TrustRegistry with nothing in it yet; check runs any time. Lists
-///         must not change on AgenticID between plan/apply and the upgrade —
-///         run check again right before it.
+///         plan and apply expect AgenticID still on 1.3.0 and a TrustRegistry
+///         with nothing in it yet; check runs any time. Lists must not change
+///         on AgenticID between plan/apply and the upgrade — run check again
+///         right before it.
 contract MigrateTrust is Script {
+    bytes32 internal constant BEACON_UPGRADED = keccak256("BeaconUpgraded(address)");
+    bytes32 internal constant UPGRADED = keccak256("Upgraded(address)");
+
     function run() external {
         address agenticId = vm.envAddress("AGENTIC_ID");
         TrustRegistry registry = TrustRegistry(vm.envOr("TRUST_REGISTRY", address(0)));
         string memory mode = vm.envOr("MODE", string("plan"));
         bytes32[] memory keep = vm.envOr("IMAGES", ",", new bytes32[](0));
 
-        TrustMigration.Candidates memory c = _candidates(agenticId);
-        console2.log("candidates from AgenticID's events: attestors", c.attestors.length);
-        console2.log("                                    image hashes", c.images.length);
+        TrustMigration.Candidates memory c =
+            _candidates(agenticId, _is(mode, "rehearse") ? address(0) : address(registry));
+        console2.log("candidates from the events: attestors", c.attestors.length);
+        console2.log("                            image hashes", c.images.length);
         _reportDropped(agenticId, c, keep);
 
         if (_is(mode, "rehearse")) {
@@ -101,22 +120,51 @@ contract MigrateTrust is Script {
     }
 
     /// @dev Candidates in event order: additions first, so image hashes keep
-    ///      the order AgenticID first listed them.
-    function _candidates(address agenticId) internal returns (TrustMigration.Candidates memory c) {
+    ///      the order AgenticID first listed them; then the attestors the
+    ///      registry's own events name (zero `registry`: none), so an attestor
+    ///      trusted there but not on AgenticID is compared too.
+    function _candidates(address agenticId, address registry)
+        internal
+        returns (TrustMigration.Candidates memory c)
+    {
         uint256 from = vm.envOr("FROM_BLOCK", uint256(0));
         uint256 to = vm.envOr("TO_BLOCK", vm.getBlockNumber());
-        uint256 chunk = vm.envOr("LOG_CHUNK", uint256(0));
+        if (from != 0) {
+            require(
+                _logs(agenticId, BEACON_UPGRADED, from, to).length + _logs(agenticId, UPGRADED, from, to).length > 0,
+                "FROM_BLOCK is after AgenticID's deployment: use 0 or its deployment block"
+            );
+        }
         bytes32[5] memory sigs = TrustMigration.candidateTopics();
         // added, app-bound, hash added — then the removals.
         uint8[5] memory order = [0, 2, 3, 1, 4];
         for (uint256 k; k < order.length; ++k) {
-            bytes32[] memory topics = new bytes32[](1);
-            topics[0] = sigs[order[k]];
-            for (uint256 lo = from; lo <= to; lo = chunk == 0 ? to + 1 : lo + chunk) {
-                uint256 hi = chunk == 0 || lo + chunk - 1 > to ? to : lo + chunk - 1;
-                Vm.EthGetLogs[] memory logs = vm.eth_getLogs(lo, hi, agenticId, topics);
-                for (uint256 i; i < logs.length; ++i) TrustMigration.collect(c, logs[i].topics);
-            }
+            Vm.EthGetLogs[] memory logs = _logs(agenticId, sigs[order[k]], from, to);
+            for (uint256 i; i < logs.length; ++i) TrustMigration.collect(c, logs[i].topics);
+        }
+        if (registry == address(0)) return c;
+        for (uint256 k; k < 3; ++k) {
+            Vm.EthGetLogs[] memory logs = _logs(registry, sigs[k], from, to);
+            for (uint256 i; i < logs.length; ++i) TrustMigration.collect(c, logs[i].topics);
+        }
+    }
+
+    /// @dev `target`'s logs with first topic `topic` in [from, to], LOG_CHUNK
+    ///      blocks per call.
+    function _logs(address target, bytes32 topic, uint256 from, uint256 to)
+        internal
+        returns (Vm.EthGetLogs[] memory all)
+    {
+        uint256 chunk = vm.envOr("LOG_CHUNK", uint256(0));
+        bytes32[] memory topics = new bytes32[](1);
+        topics[0] = topic;
+        for (uint256 lo = from; lo <= to; lo = chunk == 0 ? to + 1 : lo + chunk) {
+            uint256 hi = chunk == 0 || lo + chunk - 1 > to ? to : lo + chunk - 1;
+            Vm.EthGetLogs[] memory part = vm.eth_getLogs(lo, hi, target, topics);
+            Vm.EthGetLogs[] memory joined = new Vm.EthGetLogs[](all.length + part.length);
+            for (uint256 i; i < all.length; ++i) joined[i] = all[i];
+            for (uint256 i; i < part.length; ++i) joined[all.length + i] = part[i];
+            all = joined;
         }
     }
 
@@ -174,19 +222,31 @@ contract MigrateTrust is Script {
         console2.log("rehearsed the upgrade: every candidate reads as intended; image hashes listed", n);
     }
 
+    /// @dev Before the upgrade, TrustMigration.check. After it AgenticID
+    ///      forwards to the registry, so only the forward and the kept image
+    ///      hashes are proven (TrustMigration.checkKept).
     function _check(
         address agenticId,
         TrustRegistry registry,
         TrustMigration.Candidates memory c,
         bytes32[] memory keep
     ) internal view {
-        (bool ok, string memory why) = TrustMigration.check(ILegacyTrust(agenticId), registry, c, keep);
-        console2.log(ok ? "check: every candidate reads as intended" : string.concat("check FAILED: ", why));
-        try IAgenticIDTrustRegistry(agenticId).trustRegistry() returns (address current) {
+        address current;
+        try IAgenticIDTrustRegistry(agenticId).trustRegistry() returns (address r) {
+            current = r;
+        } catch {}
+        bool ok;
+        string memory why;
+        if (current == address(0)) {
+            console2.log("AgenticID has no trustRegistry() yet (pre-1.4.0): comparing both contracts");
+            (ok, why) = TrustMigration.check(ILegacyTrust(agenticId), registry, c, keep);
+            console2.log(ok ? "check: the registry holds exactly what the migration intends" : string.concat("check FAILED: ", why));
+        } else {
             console2.log("AgenticID reads its trust from", current);
             require(current == address(registry), "AgenticID reads another TrustRegistry");
-        } catch {
-            console2.log("AgenticID has no trustRegistry() yet (pre-1.4.0)");
+            console2.log("after the upgrade AgenticID's reads are the registry's: checking the kept image hashes only");
+            (ok, why) = TrustMigration.checkKept(registry, keep);
+            console2.log(ok ? "check: every kept image hash is listed" : string.concat("check FAILED: ", why));
         }
         require(ok, why);
     }

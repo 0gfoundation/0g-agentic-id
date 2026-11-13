@@ -198,6 +198,39 @@ contract VersionedFeedbackTest is AgenticIDTestBase {
         );
     }
 
+    /// @dev The same inputs with a non-ASCII model, pinned by every copy: the
+    ///      model hashes as its UTF-8 bytes (e6a8a1 e59e8b 2d c3a9).
+    function test_serveProofDigestV2_utf8ModelVector() public {
+        VersionedDigestHarness h = new VersionedDigestHarness();
+        VersionedServeProof memory p = _vectorProof(unicode"模型-é");
+        bytes32 inner = h.exposedServeProofHashV2(16602, address(uint160(0xA9)), p);
+        assertEq(inner, 0x00dc0a9ba85191968c4bdcb00d11b4003216306420d80a6e68432fe01f24a977, "UTF-8 v2 proofHash drifted");
+        assertEq(
+            h.exposedServeProofDigest(address(uint160(0xB7)), inner),
+            0xcab300c137d0d07deb4e73c3e027db4ff63df5045e0a95767519cce28ffbd963,
+            "UTF-8 v2 signed digest drifted"
+        );
+    }
+
+    /// @dev The known-answer inputs, with `model`.
+    function _vectorProof(string memory model) internal pure returns (VersionedServeProof memory p) {
+        bytes32[] memory dataHashes = new bytes32[](2);
+        dataHashes[0] = bytes32(uint256(0x2222222222222222222222222222222222222222222222222222222222222222));
+        dataHashes[1] = bytes32(uint256(0x3333333333333333333333333333333333333333333333333333333333333333));
+        p.version = 2;
+        p.agentId = 42;
+        p.submitter = address(uint160(0xC1));
+        p.timestamp = 1700000000;
+        p.deadline = 1700003600;
+        p.taskHash = bytes32(0x1111111111111111111111111111111111111111111111111111111111111111);
+        p.dataHashes = dataHashes;
+        p.frameworkHash = bytes32(0x4444444444444444444444444444444444444444444444444444444444444444);
+        p.sealedHash = bytes32(0x5555555555555555555555555555555555555555555555555555555555555555);
+        p.harnessHash = bytes32(0x6666666666666666666666666666666666666666666666666666666666666666);
+        p.inferenceURL = "https://router.example/v1";
+        p.model = model;
+    }
+
     // ── Happy paths ───────────────────────────────────────────────────────────
 
     function test_attestVersioned_recordsTheLayersAndEmitsBothEvents() public {

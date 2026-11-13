@@ -13,6 +13,9 @@ upgradeable contract it runs — are owned by a single `TimelockController`, so 
 upgrade is a two-step `schedule → wait → execute`. A beacon upgrade keeps the proxy address and
 storage unchanged. (`FeedbackBatcher` and `StandardCloneAuthorizer` are
 immutable — replaced by redeploying, see [`DEPLOYMENT.md`](DEPLOYMENT.md).)
+The same Timelock owns the TrustRegistry from 1.1.0's owner move, so adding
+trust there is a Timelock operation too, while its guardian removes trust at
+once (DEPLOYMENT.md §1).
 
 ## 1. Version scheme (`major.minor.patch`)
 
@@ -57,6 +60,11 @@ AgenticID's struct, retired — never read or written by 1.4.0 — so every late
 field keeps its slot and a rollback to 1.3.0 finds 1.3.0's lists as they were.
 The ABI changes (list management leaves, `trustRegistry()` arrives), so it is
 minor.
+
+TrustRegistry `1.0.0 → 1.1.0` appends `guardian` to the registry's ERC-7201
+struct (zero until `setGuardian`, no reinitializer) and lets the guardian, as
+well as the owner, call `delist` and `removeTrustedAttestor`: minor. Its
+procedure, with the owner move to the Timelock, is below.
 
 Use the checked-in solc 0.8.38 / via-IR / optimizer-runs 1 / Cancun settings and
 `bytecode_hash = "none"`; compiler-version CBOR remains enabled. AgenticID's
@@ -128,6 +136,8 @@ forge create src/VerifiedFeedbackRegistry.sol:VerifiedFeedbackRegistry \
 export TIMELOCK=0x... BEACON=0x... NEW_IMPL=0x<from step 2>
 export PREDECESSOR=$(cast hash-zero) SALT=$(cast hash-zero)   # full 32-byte hex; Step 4 reuses both
 # optional: export DELAY=<seconds> — default = the Timelock's minDelay; for a set window, window start - now
+# AgenticID from 1.4.0: also export TRUST_REGISTRY and TRUST_REGISTRY_OWNER — the run refuses an
+#   implementation that reads another registry ("AgenticID 1.4.0" step 7)
 forge script script/ScheduleUpgrade.s.sol --rpc-url <RPC> \
   --private-key <PROPOSER_PK> --legacy --gas-price 5000000000 --broadcast --slow
 
@@ -164,56 +174,129 @@ AgenticID 1.4.0 reads every trust decision from a `TrustRegistry` fixed in its
 implementation, so the upgrade switches all of them at once: the registry must
 hold AgenticID's lists before the upgrade executes. AgenticID's lists are
 mappings, so `script/MigrateTrust.s.sol` takes the candidates from AgenticID's
-events and each one's current state from its views (`script/TrustMigration.sol`
-documents what is copied). Per environment — dev, then test, then mainnet:
+events (and the registry's, for attestors) and each one's current state from
+AgenticID's views (`script/TrustMigration.sol` documents what is copied and
+checked). `FROM_BLOCK` stays 0 or AgenticID's deployment block, never later —
+the script refuses a range that does not hold AgenticID's deployment. Per
+environment — dev, then test, then mainnet:
+
+0. Choose `IMAGES`, the image hashes the registry keeps: every image a
+   container of this environment may boot again, since the attestor checks the
+   image list at every `/provision` and a container on a dropped image fails it
+   at its next boot (a resume or a crash restart) until its owner resets it. The
+   attestor's Postgres has them:
+   `SELECT encode(container_image_hash, 'hex'), count(*) FROM deployments WHERE container_image_hash IS NOT NULL GROUP BY 1;`
+   Keep each one, or reset its agents onto a kept image first. Unset `IMAGES`
+   keeps every hash AgenticID lists.
 
 ```bash
 export AGENTIC_ID=0x<proxy> TIMELOCK=0x<the environment's Timelock>
+export IMAGES=0x<hash>,0x<hash>   # step 0; plan, apply and check take the same
 
-# 0. Rehearse on a fork, never broadcast: deploy, copy, check, upgrade (as the
+# 1. Rehearse on a fork, never broadcast: deploy, copy, check, upgrade (as the
 #    beacon owner), and compare every candidate's reads before and after.
 MODE=rehearse AGENTIC_ID_BEACON=0x<AgenticID beacon> \
   forge script script/MigrateTrust.s.sol --rpc-url <RPC>
 
-# 1. Deploy the TrustRegistry (impl + beacon owned by TIMELOCK + proxy; OWNER
-#    defaults to AgenticID's owner). Record the addresses in DEPLOYMENT.md §6.
+# 2. Deploy the TrustRegistry (impl + beacon owned by TIMELOCK + proxy; OWNER
+#    defaults to AgenticID's owner, the governance key). Record the addresses in
+#    DEPLOYMENT.md §6.
 forge script script/DeployTrustRegistry.s.sol --rpc-url <RPC> \
   --private-key <PK> --legacy --gas-price 5000000000 --broadcast --slow
-export TRUST_REGISTRY=0x<proxy from step 1>
+export TRUST_REGISTRY=0x<proxy from step 2>
 
-# 2. Copy the lists as the registry owner: apply broadcasts them (dev, test);
+# 3. Copy the lists as the registry owner: apply broadcasts them (dev, test);
 #    plan prints them as multicall calldata for the mainnet vault
 #    (to = TRUST_REGISTRY, value = 0; BATCH calls per tx, default 40).
 MODE=apply forge script script/MigrateTrust.s.sol --rpc-url <RPC> \
   --private-key <OWNER_PK> --legacy --gas-price 5000000000 --broadcast --slow
 MODE=plan forge script script/MigrateTrust.s.sol --rpc-url <RPC>
 
-# 3. Check: every candidate reads the same on AgenticID 1.3.0 and the registry.
+# 4. Check, before the upgrade: the registry holds exactly what the migration
+#    intends — every candidate attestor reads the same on AgenticID 1.3.0 and
+#    the registry, and the registry's image list is the kept set, no more.
 MODE=check forge script script/MigrateTrust.s.sol --rpc-url <RPC>
 ```
 
-4. In the same window, list the 0g-harness loader images' sealed program and
+5. In the same window, list the 0g-harness loader images' sealed program and
    harness package on the registry (`list(SEALED, …)`, `list(HARNESS, …)`;
    sealed/LAYERS.md §10): from the upgrade on the loader reads the sealed list
-   and does not run an unlisted sealed.
-5. Create the implementations — AgenticID with
+   and does not run an unlisted sealed. As the owner still, directly.
+6. Hand the registry to the Timelock (DEPLOYMENT.md §1, §3):
+   `HandOverTrustRegistry.s.sol` with `GUARDIAN` = the governance key (on
+   mainnet `MODE=plan`, submitted from the vault), then the Timelock's
+   `acceptOwnership()` through `TrustRegistryCalls.s.sol` (`MODE=schedule`,
+   `MODE=execute` once ready). From here on listings go through the Timelock and
+   the guardian delists.
+7. Create the implementations — AgenticID with
    `--constructor-args $TRUST_REGISTRY`, VerifiedFeedbackRegistry 1.3.0 — and
    schedule and execute both beacon upgrades (§2 Steps 3–4; on mainnet both
-   from the vault, executable one day later). Change no list on AgenticID
-   between step 3 and the execution; if one changed, make the same change on
-   the registry and run step 3 again.
-6. After execution: `MODE=check` again (it also confirms
-   `AgenticID.trustRegistry() == TRUST_REGISTRY`), `VERSION()` 1.4.0 / 1.3.0 on
-   the proxies, and a mint through the attestor (its signer and the CloneGate
-   are trusted through the registry now).
+   from the vault, executable one day later). For the AgenticID one export
+   `TRUST_REGISTRY_OWNER` = the registry's owner at that moment (the Timelock
+   once it has accepted): `ScheduleUpgrade` refuses an implementation that reads
+   another registry, a registry without code or under another owner — test's
+   implementation built with dev's registry, both on chain 16602, is what this
+   catches. The vault path checks the same before submitting:
+   `cast call $NEW_IMPL "trustRegistry()(address)"` equals `$TRUST_REGISTRY`,
+   `cast code $TRUST_REGISTRY` is not `0x`, and
+   `cast call $TRUST_REGISTRY "owner()(address)"` is the expected owner (or run
+   `ScheduleUpgrade` as a dry run with `--sender <vault>`). Change no list on
+   AgenticID between step 4 and the execution; if one changed, make the same
+   change on the registry and run step 4 again.
+8. After execution: `MODE=check` again — AgenticID now forwards to the
+   registry, so this run proves `AgenticID.trustRegistry() == TRUST_REGISTRY`
+   and that every kept image hash is listed, no longer the comparison —
+   `VERSION()` 1.4.0 / 1.3.0 on the proxies, and a mint through the attestor (its
+   signer and the CloneGate are trusted through the registry now).
 
 Rollback: point the AgenticID beacon at the 1.3.0 implementation again; 1.3.0's
-own lists come back as step 3 left them (trust changes made on the registry
+own lists come back as step 4 left them (trust changes made on the registry
 since do not carry back). VerifiedFeedbackRegistry 1.3.0 only adds the versioned
 entry point — v1 proofs keep verifying, so it is no hard cut. Deploy
 FeedbackBatcher v5 with it and advertise the new address (DEPLOYMENT.md §6, the
 attestor's `GET /config`). The release order around the contracts — SDK,
 console and `verify-agent.sh` before the attestor — is sealed/LAYERS.md §8.
+
+### TrustRegistry 1.1.0 and the owner move
+
+For an environment whose registry is 1.0.0 (dev): the beacon upgrade adds the
+guardian, then the registry moves from the governance key to the Timelock. The
+lists, attestors and bindings stay as they are.
+
+```bash
+export TIMELOCK=0x<the environment's Timelock> TRUST_REGISTRY=0x<proxy>
+
+# 1. Deploy the 1.1.0 implementation and upgrade the TrustRegistry beacon
+#    (§2 Steps 2–4; BEACON = the TrustRegistry beacon, owned by TIMELOCK).
+forge create src/TrustRegistry.sol:TrustRegistry \
+  --rpc-url <RPC> --private-key <PK> --legacy --gas-price 5000000000 --broadcast
+export BEACON=0x<TrustRegistry beacon> NEW_IMPL=0x<from above>
+forge script script/ScheduleUpgrade.s.sol --rpc-url <RPC> \
+  --private-key <PROPOSER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+forge script script/ExecuteUpgrade.s.sol --rpc-url <RPC> \
+  --private-key <EXECUTOR_PK> --legacy --gas-price 5000000000 --broadcast --slow
+cast call $TRUST_REGISTRY "VERSION()(string)" --rpc-url <RPC>     # 1.1.0
+cast call $TRUST_REGISTRY "guardian()(address)" --rpc-url <RPC>   # 0x0
+
+# 2. As the governance key, still the owner: guardian = itself, Timelock proposed.
+GUARDIAN=0x<governance key> forge script script/HandOverTrustRegistry.s.sol \
+  --rpc-url <RPC> --private-key <OWNER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+
+# 3. The Timelock accepts: schedule, then execute once minDelay has passed.
+export CALLS=$(cast calldata "acceptOwnership()")
+MODE=schedule forge script script/TrustRegistryCalls.s.sol --rpc-url <RPC> \
+  --private-key <PROPOSER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+MODE=execute forge script script/TrustRegistryCalls.s.sol --rpc-url <RPC> \
+  --private-key <EXECUTOR_PK> --legacy --gas-price 5000000000 --broadcast --slow
+cast call $TRUST_REGISTRY "owner()(address)" --rpc-url <RPC>      # the Timelock
+```
+
+A registry deployed from the 1.1.0 source (test, mainnet: steps 2 and 6 of
+"AgenticID 1.4.0" above) needs only steps 2–3. Rollback: the beacon back to
+1.0.0 leaves `guardian` unread, so removing trust is the owner's alone again —
+through the Timelock once it owns the registry; the governance key can take
+ownership back the same way (`transferOwnership` scheduled through the
+Timelock, `acceptOwnership` by the key).
 
 ## 3. Major upgrade (not in-place → redeploy + migrate)
 
@@ -236,8 +319,10 @@ When storage is incompatible or the protocol is redesigned, a beacon upgrade is
       in `test/StorageLayout.t.sol` (e.g. 1.2.0's `Ownable2Step` adds only
       `openzeppelin.storage.Ownable2Step`), and an upgrade test runs from a
       frozen copy of the deployed source (`test/mocks/*V1_1_0.sol`, whose
-      base contracts are frozen too, in `test/mocks/v1_1_0/`, and
-      `test/mocks/AgenticIDV1_3_0.sol` with `test/mocks/v1_3_0/` — change a
+      base contracts are frozen too, in `test/mocks/v1_1_0/`;
+      `test/mocks/AgenticIDV1_3_0.sol` with `test/mocks/v1_3_0/`;
+      `test/mocks/VerifiedFeedbackRegistryV1_2_0.sol`;
+      `test/mocks/TrustRegistryV1_0_0.sol` with `test/mocks/v1_0_0/` — change a
       src base and the fixture must not move)
 - [ ] `forge build --sizes --skip test --skip script`: every deployable passes EIP-170
       (`Eip170Size.t.sol`; AgenticID's current runtime is 23,788 bytes against
@@ -253,5 +338,7 @@ When storage is incompatible or the protocol is redesigned, a beacon upgrade is
 - [ ] AgenticID's implementation reads the environment's TrustRegistry
       (`trustRegistry()`); verification uses the pinned compiler, EVM,
       optimizer and bytecode-hash settings
+- [ ] TrustRegistry: `owner()` is the environment's Timelock and `guardian()`
+      its governance key (DEPLOYMENT.md §1)
 - [ ] `DEPLOYMENT.md`: update the impl address + VERSION in the relevant §6 env; append a §7 changelog entry
 - [ ] Upgrade both dev and test as needed to avoid version drift (current state in §6)

@@ -14,16 +14,21 @@ import {MainnetGovernance} from "./MainnetGovernance.sol";
 /// @notice Incremental deploy: add a TrustRegistry (impl + beacon + proxy) to an
 ///         EXISTING AgenticID environment, the first step of AgenticID's 1.4.0
 ///         upgrade (UPGRADING.md "AgenticID 1.4.0"). Fresh full-stack deploys
-///         use Deploy.s.sol, which already includes it.
+///         use Deploy.s.sol, which already includes it. LEGACY(pre-1.4.0):
+///         one-off per environment, deleted with MigrateTrust (see
+///         TrustMigration) and its case in DeployScript.t.sol.
 ///
 ///         Env vars: AGENTIC_ID (existing proxy), TIMELOCK (beacon owner; on 0G
 ///         mainnet (16661) it must have minDelay >= 86400), OWNER (the
-///         registry owner; default: AgenticID's owner, who holds the lists
-///         today).
+///         registry's first owner; default: AgenticID's owner, the governance
+///         key that holds the lists today).
 ///
-///         Next: script/MigrateTrust.s.sol copies AgenticID's lists into the
-///         proxy; the AgenticID 1.4.0 implementation is then created with the
-///         proxy's address as its constructor argument.
+///         Next, as OWNER: script/MigrateTrust.s.sol copies AgenticID's lists
+///         into the proxy; script/HandOverTrustRegistry.s.sol makes OWNER the
+///         guardian and proposes TIMELOCK as owner, and the Timelock accepts
+///         (script/TrustRegistryCalls.s.sol, CALLS = acceptOwnership()). The
+///         AgenticID 1.4.0 implementation is then created with the proxy's
+///         address as its constructor argument.
 contract DeployTrustRegistry is Script {
     function run() external returns (address impl, address beacon, address proxy) {
         address agenticId = vm.envAddress("AGENTIC_ID");
@@ -46,6 +51,6 @@ contract DeployTrustRegistry is Script {
         console2.log("TrustRegistry beacon:", beacon);
         console2.log("TrustRegistry proxy: ", proxy);
         console2.log("TrustRegistry owner: ", owner);
-        console2.log("NEXT: script/MigrateTrust.s.sol with TRUST_REGISTRY = the proxy");
+        console2.log("NEXT: script/MigrateTrust.s.sol, then script/HandOverTrustRegistry.s.sol, with TRUST_REGISTRY = the proxy");
     }
 }

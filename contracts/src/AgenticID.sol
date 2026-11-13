@@ -128,7 +128,9 @@ contract AgenticID is
     /// @dev The trust fields (trustedAttestors, validFrameworkHashes,
     ///      attestorAppBindings, instanceBoundAttestorsRequired) are retired
     ///      since 1.4.0: the TrustRegistry holds that state and nothing here
-    ///      reads or writes them. They stay so every later field keeps its slot.
+    ///      reads or writes them. Never remove, reorder or reuse them: every
+    ///      later field keeps its slot through them, and a rollback to 1.3.0
+    ///      reads 1.3.0's lists from them.
     /// @custom:storage-location erc7201:0g.storage.AgenticID
     struct AgenticIDStorage {
         mapping(uint256 => address) agentSeals;
@@ -651,10 +653,18 @@ contract AgenticID is
     }
 
     /// @notice Whether the image hash is on the TrustRegistry's image list.
+    /// @dev LEGACY(pre-1.4.0), with trustedAttestorAppBinding and
+    ///      instanceBoundAttestorsRequired below: forwards kept for readers
+    ///      written against 1.3.0's ABI (the attestor's provision check, the
+    ///      SDK). Removable once they read the TrustRegistry directly — an ABI
+    ///      change that also changes IAgenticID's ERC-165 id; no storage
+    ///      change. isTrustedAttestor is not legacy: it is the mint and URI
+    ///      gate, and CloneGate calls it.
     function isValidFrameworkHash(bytes32 frameworkHash) external view returns (bool) {
         return _trustRegistry.isListed(IMAGE, frameworkHash);
     }
 
+    /// @dev LEGACY(pre-1.4.0): see isValidFrameworkHash.
     function trustedAttestorAppBinding(address attestor)
         external
         view
@@ -663,6 +673,7 @@ contract AgenticID is
         return _trustRegistry.trustedAttestorAppBinding(attestor);
     }
 
+    /// @dev LEGACY(pre-1.4.0): see isValidFrameworkHash.
     function instanceBoundAttestorsRequired() external view returns (bool) {
         return _trustRegistry.instanceBoundAttestorsRequired();
     }
