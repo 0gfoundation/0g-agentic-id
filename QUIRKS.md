@@ -101,6 +101,28 @@ the plain not-found path. If it still times out,
 the tx has most likely landed anyway — confirm by reading on-chain state
 (balance / index / etc.), don't trust the receipt alone.
 
+### Only a revert means "this contract has no such function"
+
+Code that tells an AgenticID before 1.4.0 (no `trustRegistry()`) from a
+failed read must look at the error itself. The node answers a call to a
+function the contract lacks with HTTP 200 and `{"code":3,"message":"execution
+reverted","data":"0x"}`, and other failures with HTTP 200 too ("header not
+found" is `-32000`), and the clients blur them:
+
+- alloy's `TransportError::as_error_resp()` is `Some` for every JSON-RPC
+  error object, not only a revert. The attestor (`chain.rs`
+  `is_execution_revert`) takes code 3, or a message saying "execution
+  reverted", as the revert; anything else is a 503, which sealed retries.
+- viem wraps a node's internal error (`-32603`) in a
+  `ContractFunctionRevertedError` as well. The SDK (`viemErrors.ts`
+  `isContractRevert`) takes only `ExecutionRevertedError` (code 3 /
+  "execution reverted") or `ContractFunctionZeroDataError` (no code at the
+  address) as the contract's answer; a `-32603` throws.
+
+Treating any node error as "no registry" would tell a loader image to claim
+without its sealed hash, or refuse a claim that names one, on a passing RPC
+hiccup.
+
 ---
 
 ## Etherscan-compatible verifier (0G endpoint)
