@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"seal-verify/internal/sealmcp"
 	"seal-verify/internal/servicehost"
@@ -19,16 +20,24 @@ func (s *Server) SetServiceHost(m *servicehost.Manager) {
 func (s *Server) getServiceHost() *servicehost.Manager {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if !s.strictServices {
+		return nil
+	}
 	return s.serviceHost
 }
 
-// This gate follows the selected runtime, not only manager availability. A
-// failed service-host bootstrap must never reopen legacy loopback forwarding.
+const managedServicePrefix = "/api/mcp/"
+
+func managedServicePath(path string) bool {
+	return strings.HasPrefix(path, managedServicePrefix)
+}
+
+// Only the selected hosting adapter reserves the managed namespace. A failed
+// host bootstrap keeps that namespace closed, while legacy API routes remain.
 func (s *Server) isolatedServicePolicy() bool {
 	s.mu.RLock()
-	strict, host := s.strictServices, s.serviceHost
-	s.mu.RUnlock()
-	return host != nil || strict
+	defer s.mu.RUnlock()
+	return s.strictServices
 }
 
 // This handler is reachable only through the owner agent's socket. Published
@@ -111,7 +120,8 @@ func (s *Server) serviceHostTools() []sealmcp.Tool {
 		"network":                 map[string]any{"type": "string", "enum": []string{"none", "egress"}, "description": "Programs always have private networking. egress permits only public destinations in egress_hosts through a restricted Unix proxy."},
 		"egress_hosts":            map[string]any{"type": "array", "maxItems": 32, "items": str("Explicit allowed host:port, for example api.example:443. Private/loopback addresses remain blocked.")},
 		"memory_mb":               map[string]any{"type": "integer", "description": "Per-process virtual address-space limit, default 8192 MiB; 128..16384."},
-		"processes":               map[string]any{"type": "integer", "description": "Per-service UID process limit, default 64; 1..256."},
+		"resident_memory_mb":      map[string]any{"type": "integer", "description": "Hard memory limit for the whole process tree, default 256 MiB; 64..4096. Requires provider cgroup delegation."},
+		"processes":               map[string]any{"type": "integer", "description": "Hard process/thread limit for the whole process tree, plus a per-UID rlimit; default 64, 1..256."},
 		"request_timeout_seconds": map[string]any{"type": "integer", "description": "Whole isolated task-worker lifetime, default 300 seconds; 1..3600. Task workers never resume."},
 	}, "id", "command", "args", "files")
 	tools := []sealmcp.Tool{{Name: "seal_service_list", Description: "List hosted MCP services, versions, desired state and request admission status.", Schema: obj(map[string]any{}), Method: http.MethodGet, Path: "/service-host"}}

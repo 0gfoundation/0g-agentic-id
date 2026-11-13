@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"seal-verify/internal/inferproxy"
 )
 
 const MaxFiles = 512
@@ -48,15 +50,24 @@ type Manifest struct {
 	Worker *Program `json:"worker,omitempty"`
 	// Programs always have a private network namespace. egress grants only
 	// public destinations explicitly named in EgressHosts through a Unix proxy.
-	Network     string   `json:"network,omitempty"`
-	EgressHosts []string `json:"egress_hosts,omitempty"`
-	MemoryMB    int      `json:"memory_mb,omitempty"`
-	Processes   int      `json:"processes,omitempty"`
+	Network          string   `json:"network,omitempty"`
+	EgressHosts      []string `json:"egress_hosts,omitempty"`
+	MemoryMB         int      `json:"memory_mb,omitempty"`
+	ResidentMemoryMB int      `json:"resident_memory_mb,omitempty"`
+	Processes        int      `json:"processes,omitempty"`
+	// Optional, counted separately for every temporary worker. The model key
+	// stays in sealed; coordinators never receive this route.
+	InferenceBudget *inferproxy.TaskLimits `json:"inference_budget,omitempty"`
 	// Bounds temporary request/task workers, never the service coordinator.
 	RequestTimeoutSeconds int `json:"request_timeout_seconds,omitempty"`
 }
 
 func (m *Manifest) normalize() (string, error) {
+	if m.InferenceBudget != nil {
+		if err := m.InferenceBudget.Validate(); err != nil {
+			return "", err
+		}
+	}
 	if !validID.MatchString(m.ID) {
 		return "", fmt.Errorf("id: use a lowercase service name, up to 32 characters")
 	}
@@ -120,6 +131,12 @@ func (m *Manifest) normalize() (string, error) {
 	}
 	if m.Processes == 0 {
 		m.Processes = 64
+	}
+	if m.ResidentMemoryMB == 0 {
+		m.ResidentMemoryMB = 256
+	}
+	if m.ResidentMemoryMB < 64 || m.ResidentMemoryMB > 4096 {
+		return "", fmt.Errorf("resident_memory_mb must be 64..4096")
 	}
 	if m.MemoryMB < 128 || m.MemoryMB > 16384 || m.Processes < 1 || m.Processes > 256 {
 		return "", fmt.Errorf("resource limits out of range")

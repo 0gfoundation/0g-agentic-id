@@ -90,7 +90,16 @@ var allowedDirectCalls = map[string]struct {
 	count  int
 	reason string
 }{
+	"internal/servicehost/model.go Manager.startModel net.Listen":                   {1, "binds a worker-private Unix model socket inside a newly prepared reserved-UID run directory, exposing only the pinned model route and hard per-job request limits"},
+	"internal/servicehost/model.go Manager.startModel os.Chown":                     {1, "hands a fresh model proxy socket inode to its single reserved worker UID before untrusted code starts; root owns its parent"},
+	"internal/servicecgroup/pool_linux.go newAt os.ReadFile":                        {1, "production New passes only kernel-owned /proc/self/cgroup to establish the exact fixed supervisor membership; alternate paths are private test fixtures"},
+	"internal/servicecgroup/pool_linux.go newAt unix.Open":                          {1, "opens only the fixed /sys/fs/cgroup mount in production, with O_NOFOLLOW and verified root ownership plus cgroup2 filesystem before traversal"},
+	"internal/servicecgroup/pool_linux.go openBelow unix.Openat2":                   {1, "descriptor-relative cgroup access is contained with RESOLVE_BENEATH, NO_SYMLINKS, NO_MAGICLINKS and NO_XDEV; controls are verified root-owned and not group/other writable"},
+	"internal/servicecgroup/pool_linux.go systemKernel unix.Mkdirat":                {1, "creates only a fresh per-job cgroup under the pinned root-owned provider pool, using a validated sealed-generated key before exposing a migration FD"},
+	"internal/servicecgroup/pool_linux.go systemKernel unix.Unlinkat":               {1, "removes only that fd-relative job directory after cgroup.kill and kernel populated=0 acknowledgement, or an empty pre-launch failed setup"},
 	"cmd/service-launcher/main.go run syscall.Exec":                                 {1, "trusted image helper first drops supplementary groups, gid and uid to the bounded service identity, then execs the trusted bwrap binary; no service code executes as root"},
+	"cmd/service-launcher/main.go run os.WriteFile":                                 {1, "resets only the launcher's kernel-owned /proc/self/oom_score_adj to zero before dropping privilege, so jobs cannot inherit supervisor OOM exemption"},
+	"internal/servicehost/isolation.go checkServiceIdentityMaps os.ReadFile":        {1, "reads only kernel-owned /proc/self/uid_map and gid_map to reject unmapped reserved service identities; no caller-supplied path"},
 	"internal/servicehost/manager.go Manager.Publish os.MkdirTemp":                  {1, "stages a release under the root-owned versions directory; service code only sees the final read-only bind mount"},
 	"internal/servicehost/request.go taskTransport.RoundTrip os.MkdirTemp":          {1, "creates a task directory under sealed's root-owned programs/tasks parent; caller data is never written there"},
 	"internal/servicehost/request.go taskTransport.RoundTrip os.Chown":              {1, "hands a newly created run inode to one reserved worker UID before its sandbox starts; its parent is root-owned"},
@@ -119,6 +128,7 @@ var allowedDirectCalls = map[string]struct {
 // privsep.RootCommand, and the binaries (string literals) each may name.
 var rootCommands = map[string][]string{
 	"internal/servicehost.Manager.command":       {"prlimit"},
+	"internal/servicehost.ProbeIsolation":        {"sealed-service-launcher"},
 	"internal/dataplane.downloadTo":              {"0g-storage-client"},
 	"internal/framework/openclaw.installCommand": {"npm"},
 	"internal/framework/hermes.installHermes":    {"git", "uv"},

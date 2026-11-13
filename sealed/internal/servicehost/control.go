@@ -18,6 +18,7 @@ const InputHandleHeader = "X-Seal-Input-Handle"
 
 type pendingInput struct {
 	service string
+	version string
 	data    []byte
 }
 
@@ -25,9 +26,14 @@ type pendingInput struct {
 // admitted. The service receives an opaque one-use reference; only its chosen
 // worker receives plaintext. Completion/error/disconnect discards unused input.
 func (m *Manager) handoff(service string, data []byte) (string, func(), error) {
+	return m.handoffForVersion(service, "", data)
+}
+
+func (m *Manager) handoffForVersion(service, version string, data []byte) (string, func(), error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed || len(m.pendingInputs) >= MaxWorkers {
+	e := m.entries[service]
+	if m.closed || e == nil || !e.Desired || (version != "" && e.Version != version) || len(m.pendingInputs) >= MaxWorkers {
 		return "", nil, fmt.Errorf("private input admission unavailable")
 	}
 	var b [32]byte
@@ -35,7 +41,7 @@ func (m *Manager) handoff(service string, data []byte) (string, func(), error) {
 		return "", nil, err
 	}
 	h := hex.EncodeToString(b[:])
-	m.pendingInputs[h] = pendingInput{service, bytes.Clone(data)}
+	m.pendingInputs[h] = pendingInput{service: service, version: e.Version, data: bytes.Clone(data)}
 	var once sync.Once
 	return h, func() { once.Do(func() { m.mu.Lock(); delete(m.pendingInputs, h); m.mu.Unlock() }) }, nil
 }
@@ -48,7 +54,8 @@ func (m *Manager) spawnWithHandoff(service, key string, input []byte, handle str
 			return nil, nil
 		}
 		p, ok := m.pendingInputs[handle]
-		if !ok || p.service != service {
+		e := m.entries[service]
+		if !ok || p.service != service || e == nil || p.version != e.Version {
 			return nil, fmt.Errorf("private input is unavailable")
 		}
 		return p.data, nil

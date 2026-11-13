@@ -2,24 +2,24 @@ package servicehost
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"golang.org/x/sys/unix"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"seal-verify/internal/credproxy"
 	"seal-verify/internal/privsep"
+	"seal-verify/internal/servicecgroup"
 )
 
 type Status struct {
@@ -41,28 +41,37 @@ type entry struct {
 }
 
 type Manager struct {
-	mu            sync.Mutex
-	base          string
-	programs      string
-	binding       string
-	entries       map[string]*entry
-	closed        bool
-	workers       map[uint32]*worker
-	executions    map[string]*execution
-	executionKeys map[string]string
-	outputBytes   int
-	stopGC        chan struct{}
-	pendingInputs map[string]pendingInput
-	egressDial    func(context.Context, string, string) (net.Conn, error)
-	attestor      ExecutionAttestor
-	runtimeHash   string
+	mu                         sync.Mutex
+	base                       string
+	programs                   string
+	binding                    string
+	entries                    map[string]*entry
+	closed                     bool
+	workers                    map[uint32]*worker
+	executions                 map[string]*execution
+	executionKeys              map[string]string
+	outputBytes                int
+	stopGC                     chan struct{}
+	pendingInputs              map[string]pendingInput
+	egressDial                 func(context.Context, string, string) (net.Conn, error)
+	attestor                   ExecutionAttestor
+	runtime                    func(context.Context) (RuntimeLease, error)
+	model                      func(context.Context) (ModelRoute, error)
+	resources                  *servicecgroup.Pool
+	resourceErr                error
+	skipResourceLimitsForTests bool
 }
 
 // Options is trusted Go wiring, never owner-controlled manifest configuration.
 // A test may supply a dialer to a local model/facilitator fixture. Production
 // uses New, whose dialer always rejects private and loopback destinations.
 type Options struct {
-	EgressDial func(context.Context, string, string) (net.Conn, error)
+	EgressDial     func(context.Context, string, string) (net.Conn, error)
+	AcquireRuntime func(context.Context) (RuntimeLease, error)
+	ModelRoute     func(context.Context) (ModelRoute, error)
+	// Only Go test fixtures may bypass real aggregate limits. No HTTP, env or
+	// manifest field can enable this; production wiring always leaves it false.
+	SkipResourceLimitsForTests bool
 }
 
 // New binds durable service state to this container's owner and identity.
@@ -91,10 +100,13 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 		return nil, fmt.Errorf("service state must be root-owned 0700")
 	}
 	m := &Manager{base: base, binding: binding, entries: map[string]*entry{}, workers: map[uint32]*worker{}, executions: map[string]*execution{}, executionKeys: map[string]string{}, stopGC: make(chan struct{}), pendingInputs: map[string]pendingInput{}}
-	if b, err := privsep.ReadFile("/opt/0g-harness/base", 128); err == nil {
-		h := strings.TrimSpace(string(b))
-		if decoded, err := hex.DecodeString(h); err == nil && len(decoded) == 32 {
-			m.runtimeHash = h
+	m.runtime = opts.AcquireRuntime
+	m.model = opts.ModelRoute
+	m.skipResourceLimitsForTests = opts.SkipResourceLimitsForTests
+	if !opts.SkipResourceLimitsForTests {
+		m.resources, err = servicecgroup.New()
+		if err != nil {
+			m.resourceErr = fmt.Errorf("%w: %v", ErrIsolationUnavailable, err)
 		}
 	}
 	m.egressDial = opts.EgressDial
@@ -141,7 +153,7 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 			if m.entries[e.ID] != nil {
 				return nil, fmt.Errorf("duplicate saved service")
 			}
-			if e.Manifest.Worker != nil && (e.ControllerUID < 200000 || e.ControllerUID >= 200000+MaxServices) {
+			if e.Manifest.Worker != nil && (e.ControllerUID < coordinatorUIDBase || e.ControllerUID >= coordinatorUIDBase+MaxServices) {
 				return nil, fmt.Errorf("invalid saved coordinator identity")
 			}
 			if e.ControllerUID != 0 {
@@ -251,7 +263,7 @@ func (m *Manager) Publish(man Manifest) (Status, error) {
 	}
 	if man.Worker != nil {
 		if e.ControllerUID == 0 {
-			e.ControllerUID = 200000
+			e.ControllerUID = coordinatorUIDBase
 			used := map[uint32]bool{}
 			for _, prior := range m.entries {
 				used[prior.ControllerUID] = true
@@ -321,18 +333,23 @@ func (m *Manager) Start(id string) (Status, error) {
 	if e == nil {
 		return Status{}, fmt.Errorf("unknown service")
 	}
-	if e.Desired {
+	if e.Desired && (e.State == "running" || e.State == "starting" || e.State == "restarting") {
 		return e.Status, nil
 	}
+	previousDesired := e.Desired
 	e.Desired = true
 	e.Error = ""
 	if err := m.persistLocked(); err != nil {
-		e.Desired = false
+		e.Desired = previousDesired
 		return Status{}, err
+	}
+	if err := m.probeAdmission(context.Background()); err != nil {
+		setAdmissionFailure(e, err)
+		return e.Status, err
 	}
 	if e.Manifest.Worker != nil {
 		if err := m.startCoordinatorLocked(e); err != nil {
-			e.State, e.Error = "failed", "coordinator_start_failed"
+			setAdmissionFailure(e, err)
 			return e.Status, err
 		}
 		return e.Status, nil
@@ -341,7 +358,27 @@ func (m *Manager) Start(id string) (Status, error) {
 	return e.Status, nil
 }
 
-func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir string, coordinator bool) (*exec.Cmd, error) {
+func setAdmissionFailure(e *entry, err error) {
+	e.State, e.Error = "failed", err.Error()
+	if errors.Is(err, ErrIsolationUnavailable) {
+		e.State = "unsupported"
+	}
+}
+
+func (m *Manager) probeAdmission(ctx context.Context) error {
+	if m.resourceErr != nil {
+		return m.resourceErr
+	}
+	if !m.skipResourceLimitsForTests && m.runtime == nil {
+		return fmt.Errorf("%w: a verified listed Harness runtime callback is required", ErrIsolationUnavailable)
+	}
+	return ProbeIsolation(ctx)
+}
+
+func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir string, coordinator bool) (*isolatedCommand, error) {
+	if err := m.probeAdmission(ctx); err != nil {
+		return nil, err
+	}
 	bwrap, err := privsep.LookPath("bwrap")
 	if err != nil {
 		return nil, fmt.Errorf("isolation unavailable: %w", err)
@@ -354,45 +391,66 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 	if err != nil {
 		return nil, err
 	}
-	args := []string{fmt.Sprintf("--as=%d", int64(e.Manifest.MemoryMB)<<20), fmt.Sprintf("--nproc=%d", e.Manifest.Processes), "--nofile=256", "--fsize=67108864", "--", launcher, fmt.Sprint(uid), bwrap,
-		"--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try",
-		"--unshare-user",
-		"--cap-drop", "ALL", "--uid", fmt.Sprint(uid), "--gid", fmt.Sprint(uid),
-		"--clearenv", "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/work", "--setenv", "TMPDIR", "/tmp", "--setenv", "MCP_SOCKET", "/run/service.sock",
-		"--ro-bind", "/usr", "/usr", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/etc", "--dir", "/run",
-		"--ro-bind", filepath.Join(m.programs, e.ID, "versions", e.Version), "/app", "--bind", filepath.Join(taskDir, "run"), "/run", "--chdir", "/app"}
+	var resources *servicecgroup.Lease
+	if !m.skipResourceLimitsForTests {
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return nil, err
+		}
+		resources, err = m.resources.Acquire(fmt.Sprintf("%d-%x", uid, nonce), int64(e.Manifest.ResidentMemoryMB)<<20, e.Manifest.Processes)
+		if err != nil {
+			return nil, fmt.Errorf("%w: acquire process-tree resource limits: %v", ErrIsolationUnavailable, err)
+		}
+	}
+	resourceOwner := &isolatedCommand{resources: resources, release: func() {}}
+	transferred := false
+	defer func() {
+		if !transferred {
+			resourceOwner.beginCleanup()
+		}
+	}()
+	args := []string{fmt.Sprintf("--as=%d", int64(e.Manifest.MemoryMB)<<20), fmt.Sprintf("--nproc=%d", e.Manifest.Processes), "--core=0", "--nofile=256", "--fsize=67108864", "--", launcher}
+	if resources != nil {
+		args = append(args, "--cgroup-fd=3")
+	}
+	args = append(args, fmt.Sprint(uid), bwrap)
+	args = append(args, namespaceArguments(uid)...)
+	args = append(args, "--setenv", "MCP_SOCKET", "/run/service.sock", "--ro-bind", filepath.Join(m.programs, e.ID, "versions", e.Version), "/app", "--bind", filepath.Join(taskDir, "run"), "/run", "--chdir", "/app")
 	args = append(args, "--setenv", "SEAL_SERVICE_ID", e.ID, "--setenv", "SEAL_SERVICE_VERSION", e.Version)
 	if coordinator {
 		args = append(args, "--bind", filepath.Join(taskDir, "work"), "/work", "--setenv", "SEAL_EXEC_SOCKET", "/run/control.sock")
 	} else {
-		args = append(args, "--tmpfs", "/work")
+		args = append(args, "--size", fmt.Sprint(temporaryFilesystemBytes), "--tmpfs", "/work")
 	}
+	runtime, err := m.acquireRuntime(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			runtime.Release()
+		}
+	}()
 	var networkBootstrap string
-	// Only the immutable image-bundled package is shared, never owner state or
-	// a harness's writable diff. Read the base pointer without importing layers
-	// (layers already depends on framework and would introduce a cycle).
-	if m.runtimeHash != "" {
-		runtime := filepath.Join("/opt/0g-harness", m.runtimeHash)
-		args = append(args, "--ro-bind", runtime, runtime, "--setenv", "HARNESS_RUNTIME_ROOT", runtime)
-		networkBootstrap = filepath.Join(runtime, "src", "service-network.mjs")
+	if runtime.Dir != "" {
+		args = append(args, "--ro-bind", runtime.Dir, runtime.Dir, "--setenv", "HARNESS_RUNTIME_ROOT", runtime.Dir)
+		networkBootstrap = filepath.Join(runtime.Dir, "src", "service-network.mjs")
 	}
-	args = append(args, "--unshare-net")
 	if e.Manifest.Network == "egress" {
 		if err := m.startEgress(ctx, e.Manifest.EgressHosts, uid, filepath.Join(taskDir, "run", "egress.sock")); err != nil {
 			return nil, err
 		}
 		args = append(args, "--setenv", "SEAL_EGRESS_SOCKET", "/run/egress.sock")
 	}
-	for _, p := range []string{"/bin", "/sbin", "/lib", "/lib64"} {
-		if _, err := privsep.Lstat(p); err == nil {
-			args = append(args, "--ro-bind", p, p)
+	if !coordinator && e.Manifest.InferenceBudget != nil {
+		route, err := m.startModel(ctx, *e.Manifest.InferenceBudget, uid, filepath.Join(taskDir, "run", "model.sock"))
+		if err != nil {
+			return nil, err
 		}
+		args = append(args, "--setenv", "SEAL_MODEL_SOCKET", "/run/model.sock", "--setenv", "SEAL_MODEL_ID", route.Route.Model, "--setenv", "SEAL_MODEL_API", route.API)
 	}
-	for _, p := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/ssl/certs"} {
-		if _, err := privsep.Lstat(p); err == nil {
-			args = append(args, "--ro-bind", p, p)
-		}
-	}
+	args = append(args, imageSystemArguments()...)
 	keys := make([]string, 0, len(e.Manifest.Env))
 	for k := range e.Manifest.Env {
 		keys = append(keys, k)
@@ -401,8 +459,8 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 	for _, k := range keys {
 		args = append(args, "--setenv", k, e.Manifest.Env[k])
 	}
-	args = append(args, "--", interpreter)
-	if e.Manifest.Network == "egress" && e.Manifest.Command == "node" {
+	args = append(args, "--remount-ro", "/", "--", interpreter)
+	if (e.Manifest.Network == "egress" || (!coordinator && e.Manifest.InferenceBudget != nil)) && e.Manifest.Command == "node" {
 		if networkBootstrap == "" {
 			return nil, fmt.Errorf("immutable Node egress bridge unavailable")
 		}
@@ -415,7 +473,15 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 	if err != nil {
 		return nil, err
 	}
-	return cmd, nil
+	if resources != nil {
+		if err := privsep.AttachServiceCgroup(cmd, resources.ProcsFile()); err != nil {
+			return nil, err
+		}
+	}
+	ok = true
+	transferred = true
+	resourceOwner.Cmd, resourceOwner.runtimeHash, resourceOwner.release = cmd, runtime.Hash, runtime.Release
+	return resourceOwner, nil
 }
 
 func (m *Manager) Stop(id string) (Status, error) {
@@ -458,11 +524,16 @@ func (m *Manager) Stop(id string) (Status, error) {
 func (m *Manager) Resume() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	probeErr := m.probeAdmission(context.Background())
 	for _, e := range m.entries {
 		if e.Desired {
+			if probeErr != nil {
+				setAdmissionFailure(e, probeErr)
+				continue
+			}
 			if e.Manifest.Worker != nil {
 				if err := m.startCoordinatorLocked(e); err != nil {
-					e.State, e.Error = "failed", "coordinator_start_failed"
+					setAdmissionFailure(e, err)
 				}
 				continue
 			}
@@ -498,6 +569,14 @@ func (m *Manager) Close() {
 		case <-d:
 		case <-time.After(5 * time.Second):
 		}
+	}
+	if m.resources != nil {
+		go func() {
+			for _, done := range waits {
+				<-done
+			}
+			_ = m.resources.Close()
+		}()
 	}
 }
 

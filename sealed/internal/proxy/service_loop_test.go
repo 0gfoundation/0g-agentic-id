@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 
+	"seal-verify/internal/inferproxy"
 	"seal-verify/internal/servicehost"
 )
 
@@ -46,6 +47,9 @@ func TestPublicMCPTemporaryDSHLoop(t *testing.T) {
 	var mu sync.Mutex
 	var requests []string
 	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer sealed-model-fixture" {
+			t.Error("worker escaped pinned inference key")
+		}
 		b, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		requests = append(requests, string(b))
@@ -92,21 +96,23 @@ const {mountServiceModel,defineTool}=await import(pathToFileURL(process.env.HARN
 const model={provider:'loop-mock',id:'mock',baseURL:%q}
 export default {model,persona:'Use check_access to perform the task.',cwd:'/work',
  async configure(ctx,{runtimeInput}) {
-  process.env.SERVICE_MODEL_API_KEY='model-fixture-only'
   await mountServiceModel(ctx,model)
   ctx.tools.register(defineTool({name:'check_access',description:'Check access without disclosing credentials',parameters:{},
    output:{schema:{type:'boolean'},render:(_,v)=>[{type:'text',text:String(v)}]},execute:async()=>Boolean(runtimeInput.token)}))
  }}
 `, model.URL+"/v1")
-	host, err := servicehost.NewWithOptions(filepath.Join(t.TempDir(), "services"), "owner:identity", servicehost.Options{EgressDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, err := servicehost.NewWithOptions(filepath.Join(t.TempDir(), "services"), "owner:identity", servicehost.Options{AcquireRuntime: func(context.Context) (servicehost.RuntimeLease, error) {
+		return servicehost.RuntimeLease{Hash: strings.TrimSpace(string(base)), Dir: root, Release: func() {}}, nil
+	}, ModelRoute: func(context.Context) (servicehost.ModelRoute, error) {
+		return servicehost.ModelRoute{API: "openai-completions", Route: inferproxy.Route{Upstream: model.URL + "/v1", Model: "mock", Headers: map[string]string{"Authorization": "Bearer sealed-model-fixture"}}}, nil
+	}, EgressDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, model.Listener.Addr().String())
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer host.Close()
-	modelAddress := model.Listener.Addr().String()
-	if _, err := host.Publish(servicehost.Manifest{ID: "loop", Command: "node", Args: []string{"/app/loop-server.mjs"}, Network: "egress", EgressHosts: []string{modelAddress}, RequestTimeoutSeconds: 15,
+	if _, err := host.Publish(servicehost.Manifest{ID: "loop", Command: "node", Args: []string{"/app/loop-server.mjs"}, Network: "none", InferenceBudget: &inferproxy.TaskLimits{Calls: 2, InputBytes: 65536, OutputTokens: 512}, RequestTimeoutSeconds: 15,
 		Files: []servicehost.File{{Path: "loop-server.mjs", Data: base64.StdEncoding.EncodeToString(server)}, {Path: "agent-config.mjs", Data: base64.StdEncoding.EncodeToString([]byte(config))}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -114,6 +120,7 @@ export default {model,persona:'Use check_access to perform the task.',cwd:'/work
 		t.Fatal(err)
 	}
 	s, _ := armedProxy(t, "http://localhost", testValidator)
+	s.strictServices = true // This fixture selects the hosting adapter without bootstrapping it.
 	s.SetServiceHost(host)
 	front := httptest.NewServer(http.HandlerFunc(s.handleProxy))
 	defer front.Close()
@@ -125,6 +132,7 @@ export default {model,persona:'Use check_access to perform the task.',cwd:'/work
 	} {
 		req, _ := http.NewRequest("POST", front.URL+"/api/mcp/loop", strings.NewReader(body))
 		req.Header.Set(servicehost.RuntimeInputHeader, base64.StdEncoding.EncodeToString(input))
+		req.Header.Set(servicehost.ServiceVersionHeader, host.List()[0].Version)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {

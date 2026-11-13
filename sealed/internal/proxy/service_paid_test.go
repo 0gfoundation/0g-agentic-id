@@ -58,7 +58,9 @@ func TestPublicPaidMCPWithExecutionReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	stateDir := filepath.Join(t.TempDir(), "services")
-	host, err := servicehost.NewWithOptions(stateDir, "owner:identity", servicehost.Options{EgressDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, err := servicehost.NewWithOptions(stateDir, "owner:identity", servicehost.Options{AcquireRuntime: func(context.Context) (servicehost.RuntimeLease, error) {
+		return servicehost.RuntimeLease{Hash: runtimeHash, Dir: runtime, Release: func() {}}, nil
+	}, EgressDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, fixture.Address)
 	}})
 	if err != nil {
@@ -66,6 +68,7 @@ func TestPublicPaidMCPWithExecutionReceipt(t *testing.T) {
 	}
 	defer host.Close()
 	s, signer := armedProxy(t, "http://localhost", testValidator)
+	s.strictServices = true // This fixture selects the hosting adapter without bootstrapping it.
 	s.SetServiceHost(host)
 	front := httptest.NewServer(http.HandlerFunc(s.handleProxy))
 	defer front.Close()

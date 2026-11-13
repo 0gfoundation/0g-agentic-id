@@ -24,6 +24,10 @@ func root(t *testing.T) {
 	}
 }
 
+func newTestManager(base, binding string) (*Manager, error) {
+	return NewWithOptions(base, binding, Options{SkipResourceLimitsForTests: true})
+}
+
 func TestManifestBounds(t *testing.T) {
 	for _, p := range []string{"../key", "/root/key", "a/../../key", "a/./key", "a//key", "a\\key", "."} {
 		m := manifest("demo", "x")
@@ -47,7 +51,7 @@ func TestManifestBounds(t *testing.T) {
 func TestPublishBindingAndImmutableRelease(t *testing.T) {
 	root(t)
 	dir := filepath.Join(t.TempDir(), "services")
-	m, err := New(dir, "owner:identity")
+	m, err := newTestManager(dir, "owner:identity")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,17 +72,17 @@ func TestPublishBindingAndImmutableRelease(t *testing.T) {
 	if err != nil || string(b) != "v1" {
 		t.Fatalf("old version changed: %s %v", b, err)
 	}
-	reloaded, err := New(dir, "owner:identity")
+	reloaded, err := newTestManager(dir, "owner:identity")
 	if err != nil || reloaded.List()[0].Version != next.Version {
 		t.Fatalf("reload: %v", err)
 	}
-	if _, err := New(dir, "another-owner:identity"); err == nil {
+	if _, err := newTestManager(dir, "another-owner:identity"); err == nil {
 		t.Fatal("resumed another owner's services")
 	}
 	if err := os.Symlink(t.TempDir(), filepath.Join(dir, "link")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(filepath.Join(dir, "link"), "owner:identity"); err == nil {
+	if _, err := newTestManager(filepath.Join(dir, "link"), "owner:identity"); err == nil {
 		t.Fatal("followed symlink")
 	}
 }
@@ -89,7 +93,7 @@ func TestSandboxLifecycleAndIsolation(t *testing.T) {
 		t.Skip("set SEALED_SERVICE_TESTS=1 in a namespace-capable container")
 	}
 	t.Setenv("SERVICE_TEST_SECRET", "not-for-the-child")
-	m, err := New(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +117,7 @@ func TestSandboxLifecycleAndIsolation(t *testing.T) {
 	assertNoWorkers(m)
 	check := func(m *Manager, id string) {
 		t.Helper()
-		resp, err := m.HTTPClient(id).Do(taskRequest(context.Background(), id, 0))
+		resp, err := m.HTTPClient(id).Do(taskRequest(context.Background(), id, 0, testServiceVersion(m, id)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -137,7 +141,7 @@ func TestSandboxLifecycleAndIsolation(t *testing.T) {
 	if _, err = m.Stop("first"); err != nil {
 		t.Fatal(err)
 	}
-	resp, err := m.HTTPClient("first").Do(taskRequest(context.Background(), "first", 0))
+	resp, err := m.HTTPClient("first").Do(taskRequest(context.Background(), "first", 0, testServiceVersion(m, "first")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +152,7 @@ func TestSandboxLifecycleAndIsolation(t *testing.T) {
 	check(m, "second")
 	// Reboot restores admission only. Neither work nor processes survive.
 	m.Close()
-	restored, err := New(m.base, "owner:identity")
+	restored, err := newTestManager(m.base, "owner:identity")
 	if err != nil {
 		t.Fatal(err)
 	}

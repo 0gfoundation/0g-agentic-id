@@ -46,7 +46,7 @@ type ServiceEntry struct {
 // reservedPrefixes are platform-owned paths an agent service may not shadow.
 // Agent paths must already be under /api/, so this is belt-and-suspenders
 // against a future /api/-reserved path or a validation slip.
-var reservedPrefixes = []string{"/hello", "/healthz", "/log", "/_seal/", "/admin/", "/api/mcp/"}
+var reservedPrefixes = []string{"/hello", "/healthz", "/log", "/_seal/", "/admin/"}
 
 var validMethods = map[string]bool{
 	http.MethodGet: true, http.MethodPost: true, http.MethodPut: true,
@@ -58,6 +58,7 @@ var validMethods = map[string]bool{
 // zero leaves a field unbounded.
 type fieldLimits struct {
 	description, inputExample int
+	managedNamespace          bool
 }
 
 // validateServices checks the agent-supplied list as a whole. Any violation
@@ -80,6 +81,9 @@ func validateServices(in []ServiceEntry, limits fieldLimits) ([]ServiceEntry, er
 			if e.Path == p || strings.HasPrefix(e.Path, p) {
 				return nil, fmt.Errorf("services[%d].path %q is platform-reserved", i, e.Path)
 			}
+		}
+		if limits.managedNamespace && managedServicePath(e.Path) {
+			return nil, fmt.Errorf("services[%d].path %q belongs to isolated service hosting; use seal_service_publish", i, e.Path)
 		}
 		if seen[e.Path] {
 			return nil, fmt.Errorf("services[%d].path %q declared more than once", i, e.Path)
@@ -161,9 +165,15 @@ func (s *Server) getServices() []ServiceEntry {
 	host := s.serviceHost
 	s.mu.RUnlock()
 	if strict {
-		out = nil
+		kept := out[:0]
+		for _, e := range out {
+			if !managedServicePath(e.Path) {
+				kept = append(kept, e)
+			}
+		}
+		out = kept
 	}
-	if host != nil {
+	if strict && host != nil {
 		for _, svc := range host.List() {
 			out = append(out, ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description})
 		}
@@ -210,12 +220,12 @@ func (s *Server) helloServiceList() []report.Service {
 // request path (query string excluded by the caller). Exact match for now;
 // subpath/prefix routing is a later refinement.
 func (s *Server) matchService(path string) (ServiceEntry, bool) {
-	if host := s.getServiceHost(); host != nil {
-		if svc, ok := host.Match(path); ok {
-			return ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description}, true
+	if s.isolatedServicePolicy() && managedServicePath(path) {
+		if host := s.getServiceHost(); host != nil {
+			if svc, ok := host.Match(path); ok {
+				return ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description}, true
+			}
 		}
-	}
-	if s.isolatedServicePolicy() {
 		return ServiceEntry{}, false
 	}
 	s.mu.RLock()
@@ -240,10 +250,6 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{"services": s.getServices()})
 	case http.MethodPost:
-		if s.isolatedServicePolicy() {
-			writeSignError(w, http.StatusForbidden, "this runtime requires isolated service publication; use seal_service_publish")
-			return
-		}
 		var body struct {
 			Services []ServiceEntry `json:"services"`
 		}
@@ -251,7 +257,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 			writeSignError(w, http.StatusBadRequest, "decode body: "+err.Error())
 			return
 		}
-		var limits fieldLimits
+		limits := fieldLimits{managedNamespace: s.isolatedServicePolicy()}
 		if l, ok := s.getAdapter().(framework.ServiceFieldLimiter); ok {
 			limits.description, limits.inputExample = l.ServiceFieldLimits()
 		}

@@ -72,17 +72,17 @@ func TestHarnessServiceIngressFailsClosed(t *testing.T) {
 	s.strictServices = true // Selected harness, even when manager initialization failed.
 	s.fwRoutes = append(s.fwRoutes, framework.Route{Prefix: "/api/", Kind: "service"})
 	out := httptest.NewRecorder()
-	s.handleProxy(out, httptest.NewRequest("POST", "/api/x", nil))
+	s.handleProxy(out, httptest.NewRequest("POST", "/api/mcp/job", nil))
 	if out.Code != 503 || called {
 		t.Fatal("missing manager reopened unmanaged backend")
 	}
-	if len(s.getServices()) != 0 {
-		t.Fatal("discovery advertised unmanaged services")
+	if got := s.getServices(); len(got) != 1 || got[0].Path != "/api/x" {
+		t.Fatal("hosting failure hid legacy services")
 	}
 	out = httptest.NewRecorder()
-	s.handleServices(out, httptest.NewRequest("POST", "/services", strings.NewReader(`[]`)))
-	if out.Code != 403 {
-		t.Fatalf("legacy publication accepted: %d", out.Code)
+	s.handleProxy(out, httptest.NewRequest("POST", "/api/x", nil))
+	if out.Code != 200 || !called {
+		t.Fatal("hosting failure blocked an existing legacy service")
 	}
 }
 

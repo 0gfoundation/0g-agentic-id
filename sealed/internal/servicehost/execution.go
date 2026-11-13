@@ -16,13 +16,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"seal-verify/internal/inferproxy"
 	"seal-verify/internal/privsep"
 )
 
@@ -65,19 +65,22 @@ type ExecutionStatus struct {
 // IsolationProfile describes enforced mechanisms, not a claim that programs
 // have a separate kernel or that their business output is correct.
 type IsolationProfile struct {
-	Driver            string   `json:"driver"`
-	WorkerRuntimeHash string   `json:"worker_runtime_hash,omitempty"`
-	PrivatePID        bool     `json:"private_pid"`
-	PrivateMounts     bool     `json:"private_mounts"`
-	PrivateNetwork    bool     `json:"private_network"`
-	ReadOnlyCode      bool     `json:"readonly_code"`
-	TemporaryWork     bool     `json:"temporary_work"`
-	OwnerInterfaces   bool     `json:"owner_interfaces"`
-	Network           string   `json:"network"`
-	EgressHosts       []string `json:"egress_hosts,omitempty"`
-	VirtualMemoryMB   int      `json:"virtual_memory_mb"`
-	Processes         int      `json:"processes"`
-	TimeoutSeconds    int      `json:"timeout_seconds"`
+	Driver             string                 `json:"driver"`
+	WorkerRuntimeHash  string                 `json:"worker_runtime_hash,omitempty"`
+	PrivatePID         bool                   `json:"private_pid"`
+	PrivateMounts      bool                   `json:"private_mounts"`
+	PrivateNetwork     bool                   `json:"private_network"`
+	ReadOnlyCode       bool                   `json:"readonly_code"`
+	TemporaryWork      bool                   `json:"temporary_work"`
+	OwnerInterfaces    bool                   `json:"owner_interfaces"`
+	Network            string                 `json:"network"`
+	EgressHosts        []string               `json:"egress_hosts,omitempty"`
+	VirtualMemoryMB    int                    `json:"virtual_memory_mb"`
+	HardResourceLimits bool                   `json:"hard_resource_limits"`
+	ResidentMemoryMB   int                    `json:"resident_memory_mb"`
+	Processes          int                    `json:"processes"`
+	TimeoutSeconds     int                    `json:"timeout_seconds"`
+	InferenceBudget    *inferproxy.TaskLimits `json:"inference_budget,omitempty"`
 }
 
 type ExecutionAttestor func(ExecutionStatus, IsolationProfile) (string, error)
@@ -220,11 +223,11 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 	if len(m.executions) >= MaxExecutionRecords {
 		return ExecutionStatus{}, fmt.Errorf("execution record limit reached; acknowledge completed output")
 	}
-	uid := uint32(210000)
-	for m.workers[uid] != nil && uid < 210000+MaxWorkers {
+	uid := uint32(workerUIDBase)
+	for m.workers[uid] != nil && uid < workerUIDBase+MaxWorkers {
 		uid++
 	}
-	if uid == 210000+MaxWorkers {
+	if uid == workerUIDBase+MaxWorkers {
 		return ExecutionStatus{}, fmt.Errorf("worker limit reached")
 	}
 	var token [32]byte
@@ -249,8 +252,11 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 		InputHash: inputHash, State: "starting", StartedAt: now.UnixMilli(), Deadline: now.Add(time.Duration(entry.Manifest.RequestTimeoutSeconds) * time.Second).UnixMilli(), UID: uid,
 	}, done: make(chan struct{}), cancel: cancel}
 	e.Isolation = IsolationProfile{Driver: "bubblewrap-v1", PrivatePID: true, PrivateMounts: true, PrivateNetwork: true, ReadOnlyCode: true, TemporaryWork: true, OwnerInterfaces: false,
-		WorkerRuntimeHash: m.runtimeHash,
-		Network:           entry.Manifest.Network, EgressHosts: append([]string(nil), entry.Manifest.EgressHosts...), VirtualMemoryMB: entry.Manifest.MemoryMB, Processes: entry.Manifest.Processes, TimeoutSeconds: entry.Manifest.RequestTimeoutSeconds}
+		Network: entry.Manifest.Network, EgressHosts: append([]string(nil), entry.Manifest.EgressHosts...), VirtualMemoryMB: entry.Manifest.MemoryMB, Processes: entry.Manifest.Processes, TimeoutSeconds: entry.Manifest.RequestTimeoutSeconds}
+	if entry.Manifest.InferenceBudget != nil {
+		budget := *entry.Manifest.InferenceBudget
+		e.Isolation.InferenceBudget = &budget
+	}
 	// Reserve durably before spawning. If sealed crashes in the start window,
 	// the next boot reports interrupted and never silently re-executes input.
 	if err := m.persistExecutionLocked(e); err != nil {
@@ -265,6 +271,18 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 	m.workers[uid] = w
 	dir, cmd, err := m.prepareExecution(ctx, entry, uid, input, runtimeInput)
 	if err == nil {
+		e.Isolation.WorkerRuntimeHash = cmd.runtimeHash
+		if cmd.resources != nil {
+			e.Isolation.HardResourceLimits = true
+			e.Isolation.ResidentMemoryMB = int(cmd.resources.MemoryLimitBytes() >> 20)
+			e.Isolation.Processes = cmd.resources.PIDsLimit()
+		}
+		cmd.onCleanupFailure = func() {
+			m.mu.Lock()
+			e.failure, e.State, e.Reason = "resource_cleanup_failed", "quarantined", "resource_cleanup_failed"
+			_ = m.persistExecutionLocked(e)
+			m.mu.Unlock()
+		}
 		cmd.Stdout, cmd.Stderr = &executionOutput{manager: m, execution: e}, io.Discard
 		cmd.WaitDelay = 250 * time.Millisecond
 		err = cmd.Start()
@@ -274,11 +292,10 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 		if dir != "" {
 			_ = privsep.RemoveAll(dir)
 		}
-		delete(m.workers, uid)
 		e.State, e.Reason, e.FinishedAt = "failed", "start_failed", time.Now().UnixMilli()
 		_ = m.persistExecutionLocked(e)
-		close(e.done)
-		return e.ExecutionStatus, fmt.Errorf("start isolated execution")
+		m.finishFailedExecutionStart(e, cmd)
+		return e.ExecutionStatus, fmt.Errorf("start isolated execution: %w", err)
 	}
 	e.State = "running"
 	if err := m.persistExecutionLocked(e); err != nil {
@@ -291,7 +308,27 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 	return e.ExecutionStatus, nil
 }
 
-func (m *Manager) prepareExecution(ctx context.Context, source *entry, uid uint32, input, runtimeInput []byte) (string, *exec.Cmd, error) {
+// Called with m.mu held after Start failed. The allocation remains reserved
+// while cleanup cannot prove the cgroup empty, even though exec returned error.
+func (m *Manager) finishFailedExecutionStart(e *execution, cmd *isolatedCommand) {
+	if cmd != nil && !cmd.resourcesReleased() {
+		e.State, e.Reason = "quarantined", "resource_cleanup_failed"
+		go func() {
+			<-cmd.cleanupDone
+			m.mu.Lock()
+			delete(m.workers, e.UID)
+			e.State = "failed"
+			_ = m.persistExecutionLocked(e)
+			close(e.done)
+			m.mu.Unlock()
+		}()
+		return
+	}
+	delete(m.workers, e.UID)
+	close(e.done)
+}
+
+func (m *Manager) prepareExecution(ctx context.Context, source *entry, uid uint32, input, runtimeInput []byte) (string, *isolatedCommand, error) {
 	dir, err := os.MkdirTemp(filepath.Join(m.programs, taskDirName), "e-")
 	if err != nil {
 		return "", nil, err
@@ -342,7 +379,7 @@ func (o *executionOutput) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (m *Manager) waitExecution(ctx context.Context, e *execution, cmd *exec.Cmd, dir string) {
+func (m *Manager) waitExecution(ctx context.Context, e *execution, cmd *isolatedCommand, dir string) {
 	err := cmd.Wait()
 	cause := ctx.Err()
 	e.cancel()

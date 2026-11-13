@@ -26,6 +26,7 @@ import (
 // opt in to sharing the values with the published task program (including its
 // tools), never the resident owner harness. Standard MCP requests still work.
 const RuntimeInputHeader = "X-Seal-Runtime-Input"
+const ServiceVersionHeader = "X-Seal-Service-Version"
 const MaxRuntimeInput = 16 << 10
 const MaxWorkers = 32
 const taskDirName = ".tasks" // cannot collide with a valid published service id
@@ -50,6 +51,22 @@ func response(req *http.Request, code int, message string) *http.Response {
 	return &http.Response{StatusCode: code, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(message)), Request: req}
 }
 
+// Private input is consent to one audited immutable release, never whichever
+// code happens to be current by the time a request reaches this container.
+func checkPrivateInputVersion(req *http.Request, version string) (int, string) {
+	versions := req.Header.Values(ServiceVersionHeader)
+	if len(versions) == 0 && len(req.Header.Values(RuntimeInputHeader)) == 0 {
+		return 0, ""
+	}
+	if len(versions) != 1 || !runtimeDigest.MatchString(versions[0]) {
+		return http.StatusBadRequest, "runtime input requires one X-Seal-Service-Version release hash"
+	}
+	if versions[0] != version {
+		return http.StatusConflict, "service release changed; audit the current release before sending runtime input"
+	}
+	return 0, ""
+}
+
 func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	m := t.manager
 	m.mu.Lock()
@@ -60,6 +77,9 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	man, status := e.Manifest, e.Status
 	m.mu.Unlock()
+	if code, message := checkPrivateInputVersion(req, status.Version); code != 0 {
+		return response(req, code, message), nil
+	}
 	if man.Worker != nil {
 		return t.coordinatorRoundTrip(req)
 	}
@@ -89,6 +109,7 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Do not forward this header into the MCP server's HTTP handling or logs.
 	req = req.Clone(req.Context())
 	req.Header.Del(RuntimeInputHeader)
+	req.Header.Del(ServiceVersionHeader)
 	req.Header.Del(InputHandleHeader)
 	ctx, cancel := context.WithTimeout(req.Context(), time.Duration(man.RequestTimeoutSeconds)*time.Second)
 	w := &worker{service: t.id, cancel: cancel, done: make(chan struct{})}
@@ -100,11 +121,11 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		cancel()
 		return response(req, 503, "service unavailable"), nil
 	}
-	uid := uint32(210000)
-	for m.workers[uid] != nil && uid < 210000+MaxWorkers {
+	uid := uint32(workerUIDBase)
+	for m.workers[uid] != nil && uid < workerUIDBase+MaxWorkers {
 		uid++
 	}
-	if uid == 210000+MaxWorkers {
+	if uid == workerUIDBase+MaxWorkers {
 		m.mu.Unlock()
 		cancel()
 		return response(req, 503, "request worker limit reached"), nil
@@ -113,12 +134,16 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	m.mu.Unlock()
 	var dir string
 	var exited chan struct{}
+	var command *isolatedCommand
 	var once sync.Once
 	cleanup := func() {
 		once.Do(func() {
 			cancel()
 			if exited != nil {
 				<-exited
+			} else if command != nil {
+				command.beginCleanup()
+				<-command.cleanupDone
 			}
 			if dir != "" {
 				_ = privsep.RemoveAll(dir)
@@ -156,6 +181,7 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prepare request interpreter")
 	}
+	command = cmd
 	// os/exec creates an anonymous pipe; values never appear in argv, the
 	// published manifest, environment of a launcher, or a filesystem file.
 	cmd.Stdin = bytes.NewReader(input)

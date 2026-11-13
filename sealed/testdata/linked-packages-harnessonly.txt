@@ -399,6 +399,7 @@ golang.org/x/crypto/scrypt
 golang.org/x/crypto/sha3
 golang.org/x/exp/constraints
 golang.org/x/exp/rand
+golang.org/x/net/netutil
 golang.org/x/sync/errgroup
 golang.org/x/sync/semaphore
 golang.org/x/sys/cpu

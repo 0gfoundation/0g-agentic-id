@@ -740,7 +740,11 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 // ── Catch-all reverse proxy ─────────────────────────────────────────────────
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/api/") && s.isolatedServicePolicy() {
+	if managedServicePath(r.URL.Path) && s.isolatedServicePolicy() {
+		if _, audit := r.URL.Query()["sealed-release"]; audit {
+			s.handleServiceRelease(w, r)
+			return
+		}
 		host := s.getServiceHost()
 		if host == nil {
 			http.Error(w, "isolated service hosting unavailable", http.StatusServiceUnavailable)

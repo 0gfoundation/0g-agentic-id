@@ -18,7 +18,7 @@ func TestCoordinatorCompletionWaitsForStateCleanup(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	c := &coordinator{cancel: cancel, done: make(chan struct{}), cmd: cmd, server: &http.Server{}}
+	c := &coordinator{cancel: cancel, done: make(chan struct{}), cmd: &isolatedCommand{Cmd: cmd, release: func() {}}, server: &http.Server{}}
 	e := &entry{Status: Status{ID: "completion", State: "stopped"}, controller: c, generation: 2}
 	m := &Manager{stopGC: make(chan struct{})}
 	m.mu.Lock()

@@ -28,7 +28,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
   flags={'uid':os.getuid(),'private':token=='runtime-fixture-'+data['who'],
    'header':self.headers.get('X-Seal-Runtime-Input'),
    'fresh':not os.path.exists('/work/witness'),
-   'argv':token not in open('/proc/self/cmdline').read(),
+   'argv':token not in str(sys.argv),
+   'proc_private':os.listdir('/proc')==[],
    'env':token not in str(dict(os.environ)),
    'owner_home':os.path.exists('/home/agent'),'sign_socket':os.path.exists('/run/seal-sign.sock'),
    'sealed_state':os.path.exists('/var/lib/sealed'),'secret':os.environ.get('SERVICE_TEST_SECRET')}
@@ -49,7 +50,7 @@ func taskManager(t *testing.T, timeout int) *Manager {
 	if os.Getenv("SEALED_SERVICE_TESTS") != "1" {
 		t.Skip("set SEALED_SERVICE_TESTS=1 in a namespace-capable container")
 	}
-	m, err := New(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,12 +66,18 @@ func taskManager(t *testing.T, timeout int) *Manager {
 	return m
 }
 
-func taskRequest(ctx context.Context, who string, delay float64) *http.Request {
+func taskRequest(ctx context.Context, who string, delay float64, version string) *http.Request {
 	body, _ := json.Marshal(map[string]any{"who": who, "delay": delay})
 	r, _ := http.NewRequestWithContext(ctx, "POST", "http://localhost/mcp", bytes.NewReader(body))
 	input, _ := json.Marshal(map[string]string{"token": "runtime-fixture-" + who})
 	r.Header.Set(RuntimeInputHeader, base64.StdEncoding.EncodeToString(input))
+	r.Header.Set(ServiceVersionHeader, version)
 	return r
+}
+
+func testServiceVersion(m *Manager, id string) string {
+	s, _ := m.Match("/api/mcp/" + id)
+	return s.Version
 }
 
 func TestRequestPrivateInputAndConcurrentIsolation(t *testing.T) {
@@ -81,7 +88,7 @@ func TestRequestPrivateInputAndConcurrentIsolation(t *testing.T) {
 		wg.Add(1)
 		go func(who string) {
 			defer wg.Done()
-			resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), who, .4))
+			resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), who, .4, testServiceVersion(m, "task")))
 			if err != nil {
 				t.Error(err)
 				return
@@ -97,7 +104,7 @@ func TestRequestPrivateInputAndConcurrentIsolation(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			for _, k := range []string{"private", "fresh", "argv", "env"} {
+			for _, k := range []string{"private", "fresh", "argv", "env", "proc_private"} {
 				if flags[k] != true {
 					t.Errorf("%s failed: %s", k, b)
 				}
@@ -138,7 +145,7 @@ func TestRequestPrivateInputAndConcurrentIsolation(t *testing.T) {
 	if n != 0 {
 		t.Fatal("worker identity not released")
 	}
-	resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), "again", 0))
+	resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), "again", 0, testServiceVersion(m, "task")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +159,7 @@ func TestRequestPrivateInputAndConcurrentIsolation(t *testing.T) {
 func TestRequestCancellationDeadlineStopAndInputValidation(t *testing.T) {
 	m := taskManager(t, 1)
 	for _, input := range []string{"invalid", base64.StdEncoding.EncodeToString([]byte(`{"token":1}`)), base64.StdEncoding.EncodeToString([]byte(`null`)), strings.Repeat("A", 24000)} {
-		r := taskRequest(context.Background(), "invalid", 0)
+		r := taskRequest(context.Background(), "invalid", 0, testServiceVersion(m, "task"))
 		r.Header.Set(RuntimeInputHeader, input)
 		resp, err := m.HTTPClient("task").Do(r)
 		if err != nil {
@@ -169,7 +176,7 @@ func TestRequestCancellationDeadlineStopAndInputValidation(t *testing.T) {
 			defer cancel()
 			done := make(chan error, 1)
 			go func() {
-				resp, err := m.HTTPClient("task").Do(taskRequest(ctx, mode, 30))
+				resp, err := m.HTTPClient("task").Do(taskRequest(ctx, mode, 30, testServiceVersion(m, "task")))
 				if resp != nil {
 					resp.Body.Close()
 				}
@@ -216,7 +223,7 @@ func TestRequestCancellationDeadlineStopAndInputValidation(t *testing.T) {
 
 func TestFailedWorkerDoesNotBecomeSharedProcess(t *testing.T) {
 	m := taskManager(t, 5)
-	resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), "crash", 0))
+	resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), "crash", 0, testServiceVersion(m, "task")))
 	if resp != nil {
 		resp.Body.Close()
 	}
@@ -230,7 +237,7 @@ func TestFailedWorkerDoesNotBecomeSharedProcess(t *testing.T) {
 		t.Fatal("crashed worker retained its identity")
 	}
 	// The endpoint stays enabled; the next call gets a fresh working directory.
-	resp, err = m.HTTPClient("task").Do(taskRequest(context.Background(), "after-crash", 0))
+	resp, err = m.HTTPClient("task").Do(taskRequest(context.Background(), "after-crash", 0, testServiceVersion(m, "task")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +257,7 @@ func TestRequestLimitsAndStatelessProtocol(t *testing.T) {
 		}
 	}
 	root(t)
-	m, err := New(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +279,7 @@ func TestRequestLimitsAndStatelessProtocol(t *testing.T) {
 			t.Fatal("accepted a stateful protocol operation")
 		}
 	}
-	req := taskRequest(context.Background(), "no", 0)
+	req := taskRequest(context.Background(), "no", 0, testServiceVersion(m, "task"))
 	req.Header.Set("Mcp-Session-Id", "previous-session")
 	resp, err := m.HTTPClient("task").Do(req)
 	if err != nil {
@@ -286,7 +293,7 @@ func TestRequestLimitsAndStatelessProtocol(t *testing.T) {
 
 func TestWorkerCleanupDoesNotDeleteServiceNamedTasks(t *testing.T) {
 	root(t)
-	m, err := New(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +302,7 @@ func TestWorkerCleanupDoesNotDeleteServiceNamedTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.Close()
-	reopened, err := New(m.base, "owner:identity")
+	reopened, err := newTestManager(m.base, "owner:identity")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -25,7 +24,7 @@ type coordinator struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	server *http.Server
-	cmd    *exec.Cmd
+	cmd    *isolatedCommand
 }
 
 func (m *Manager) coordinatorDir(id string) string {
@@ -48,7 +47,7 @@ func (m *Manager) prepareCoordinatorWork(e *entry) error {
 }
 
 func (m *Manager) startCoordinatorLocked(e *entry) error {
-	if e.ControllerUID < 200000 || e.ControllerUID >= 200000+MaxServices {
+	if e.ControllerUID < coordinatorUIDBase || e.ControllerUID >= coordinatorUIDBase+MaxServices {
 		return fmt.Errorf("invalid coordinator identity")
 	}
 	if e.controller != nil {
@@ -94,14 +93,39 @@ func (m *Manager) startCoordinatorLocked(e *entry) error {
 	if err != nil {
 		cancel()
 		c.server.Close()
-		return fmt.Errorf("start isolated coordinator")
+		m.holdFailedCoordinator(e, c, cmd)
+		return fmt.Errorf("start isolated coordinator: %w", err)
 	}
 	c.cmd = cmd
+	cmd.onCleanupFailure = func() {
+		m.mu.Lock()
+		e.State, e.Error = "quarantined", "resource cleanup failed; identity and runtime remain pinned"
+		m.mu.Unlock()
+	}
 	e.generation++
 	gen := e.generation
 	e.controller, e.State, e.Error = c, "starting", ""
 	go m.superviseCoordinator(ctx, e, c, gen)
 	return nil
+}
+
+// Called with m.mu held. Stable service identities cannot be restarted or
+// handed to another process while the old cgroup remains unverified.
+func (m *Manager) holdFailedCoordinator(e *entry, c *coordinator, cmd *isolatedCommand) {
+	if cmd == nil || cmd.resourcesReleased() {
+		return
+	}
+	c.cmd = cmd
+	e.controller = c
+	go func() {
+		<-cmd.cleanupDone
+		m.mu.Lock()
+		if e.controller == c {
+			e.controller = nil
+		}
+		m.mu.Unlock()
+		close(c.done)
+	}()
 }
 
 func (m *Manager) superviseCoordinator(ctx context.Context, e *entry, c *coordinator, gen uint64) {
@@ -169,7 +193,7 @@ func (m *Manager) superviseCoordinator(ctx context.Context, e *entry, c *coordin
 	defer m.mu.Unlock()
 	if e.generation == gen && e.Desired && !m.closed {
 		if err := m.startCoordinatorLocked(e); err != nil {
-			e.State, e.Error = "failed", "coordinator_start_failed"
+			setAdmissionFailure(e, err)
 		}
 	}
 }
@@ -179,9 +203,16 @@ func (t *taskTransport) coordinatorRoundTrip(req *http.Request) (*http.Response,
 	m.mu.Lock()
 	e := m.entries[t.id]
 	ready := e != nil && e.Desired && e.State == "running" && !m.closed
+	version := ""
+	if e != nil {
+		version = e.Version
+	}
 	m.mu.Unlock()
 	if !ready {
 		return response(req, 503, "service unavailable"), nil
+	}
+	if code, message := checkPrivateInputVersion(req, version); code != 0 {
+		return response(req, code, message), nil
 	}
 	req = req.Clone(req.Context())
 	// Caller-controlled references are never trusted. A fresh reference is
@@ -189,6 +220,7 @@ func (t *taskTransport) coordinatorRoundTrip(req *http.Request) (*http.Response,
 	req.Header.Del(InputHandleHeader)
 	values := req.Header.Values(RuntimeInputHeader)
 	req.Header.Del(RuntimeInputHeader)
+	req.Header.Del(ServiceVersionHeader)
 	if len(values) > 0 {
 		if len(values) != 1 || len(values[0]) > base64.StdEncoding.EncodedLen(MaxRuntimeInput) {
 			return response(req, 400, "invalid runtime input"), nil
@@ -198,12 +230,19 @@ func (t *taskTransport) coordinatorRoundTrip(req *http.Request) (*http.Response,
 		if err != nil || len(input) > MaxRuntimeInput || json.Unmarshal(input, &fields) != nil || fields == nil {
 			return response(req, 400, "invalid runtime input"), nil
 		}
-		handle, cleanup, err := m.handoff(t.id, input)
+		handle, cleanup, err := m.handoffForVersion(t.id, version, input)
 		if err != nil {
 			return response(req, 503, "private input admission unavailable"), nil
 		}
 		defer cleanup()
 		req.Header.Set(InputHandleHeader, handle)
+	}
+	m.mu.Lock()
+	e = m.entries[t.id]
+	ready = e != nil && e.Desired && e.State == "running" && e.Version == version && !m.closed
+	m.mu.Unlock()
+	if !ready {
+		return response(req, 503, "service release admission changed"), nil
 	}
 	return Client(m.coordinatorSocket(t.id)).Transport.RoundTrip(req)
 }
