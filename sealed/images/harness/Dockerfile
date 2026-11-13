@@ -25,6 +25,14 @@
 #
 #   cd sealed && docker buildx build --pull --target harness-package --build-arg HARNESS_REF=… --output type=tar,dest=- -f images/harness/Dockerfile . | tar -xOf - out/0g-harness.tgz > 0g-harness.tgz
 #
+# A new official harness version needs no new image: build its package with
+# the same command, HARNESS_REF naming its commit (its version must pass the
+# whitelist check below), put it on the `artifacts` release and list its hash.
+# Agents take it by the version rule (sealed/LAYERS.md §5.3): the owner's
+# pick, or the newest listed one for a new container or once the running
+# version is delisted. HARNESS_REF in this file names the base package the
+# next image carries, the version a container falls back to.
+#
 # The composition is authored in the harness's code — NOT in a cordis.yml /
 # profile / bundle the agent can reach — so it rides the package hash and an
 # agent editing $DSH_HOME cannot change what mounts next boot.

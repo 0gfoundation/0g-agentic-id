@@ -38,7 +38,10 @@ adapter runs.
   image list). Under the layered flow sealed runs the package the version
   rule picks — the owner's pick while listed, else the one running, else the
   newest listed — each on the trust registry's harness list
-  (`../../LAYERS.md` §5); otherwise it runs `base`.
+  (`../../LAYERS.md` §5); otherwise it runs `base`. Other versions are built
+  by the same stage and fetched by hash from the `artifacts` release, so a new
+  harness version needs no new image; `base` is the version a container has
+  without fetching anything.
 - **Out of the agent's reach.** The composition is **not** a `cordis.yml`, a
   profile, or any `$DSH_HOME` patch layer, so an agent editing its own home
   cannot change what mounts next boot. This is the structural form of doctrine
