@@ -92,7 +92,6 @@ var allowedDirectCalls = map[string]struct {
 }{
 	"cmd/service-launcher/main.go run syscall.Exec":                        {1, "trusted image helper first drops supplementary groups, gid and uid to the bounded service identity, then execs the trusted bwrap binary; no service code executes as root"},
 	"internal/servicehost/manager.go Manager.Publish os.MkdirTemp":         {1, "stages a release under the root-owned versions directory; service code only sees the final read-only bind mount"},
-	"internal/servicehost/manager.go Manager.Publish os.Chown":             {1, "hands only the work/run directory inode to its unique service UID; the parent remains root-owned and the previous service has been stopped, so it cannot replace the directory"},
 	"internal/servicehost/request.go taskTransport.RoundTrip os.MkdirTemp": {1, "creates a task directory under sealed's root-owned programs/tasks parent; caller data is never written there"},
 	"internal/servicehost/request.go taskTransport.RoundTrip os.Chown":     {1, "hands a newly created run inode to one reserved worker UID before its sandbox starts; its parent is root-owned"},
 	"internal/framework/state.go OpenLog os.OpenFile":                      {1, "framework.StateDir/log is root-only and the file is opened O_NOFOLLOW (TestOpenLogRefusesALink)"},

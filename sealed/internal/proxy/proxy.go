@@ -794,13 +794,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		signed = true
 		upstream = svc.Backend
 		if host := s.getServiceHost(); host != nil {
-			if status, socket, ok := host.Match(r.URL.Path); ok {
+			if status, ok := host.Match(r.URL.Path); ok {
 				managedEndpoint = true
 				if status.State != "running" {
 					http.Error(w, "service is not ready", 503)
 					return
 				}
-				client = host.HTTPClient(status.ID, socket)
+				client = host.HTTPClient(status.ID)
 			}
 		}
 	} else if rt, ok := s.matchFrameworkRoute(r.URL.Path); ok {
@@ -837,7 +837,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Runtime input must never fall through to the owner harness or a shared
-	// user-registered backend. Managed daemons also reject it in their transport.
+	// user-registered backend. Only isolated managed workers may receive it.
 	if _, supplied := r.Header[servicehost.RuntimeInputHeader]; supplied && !managedEndpoint {
 		http.Error(w, "runtime input requires a managed request service", http.StatusBadRequest)
 		return

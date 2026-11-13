@@ -22,13 +22,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
  def log_message(self,*args): pass
  def do_POST(self):
   data=json.loads(self.rfile.read(int(self.headers.get('content-length',0))))
+  if data['who']=='crash': os._exit(1)
   time.sleep(data.get('delay',0))
   token=values.get('token','')
   flags={'uid':os.getuid(),'private':token=='runtime-fixture-'+data['who'],
    'header':self.headers.get('X-Seal-Runtime-Input'),
    'fresh':not os.path.exists('/work/witness'),
    'argv':token not in open('/proc/self/cmdline').read(),
-   'env':token not in str(dict(os.environ))}
+   'env':token not in str(dict(os.environ)),
+   'owner_home':os.path.exists('/home/agent'),'sign_socket':os.path.exists('/run/seal-sign.sock'),
+   'sealed_state':os.path.exists('/var/lib/sealed'),'secret':os.environ.get('SERVICE_TEST_SECRET')}
+  try:
+   open('/app/server.py','w');flags['readonly']=False
+  except OSError: flags['readonly']=True
   open('/work/witness','w').write(token)
   self.send_response(200);self.end_headers();self.wfile.write(json.dumps(flags).encode())
 class Server(http.server.HTTPServer):
@@ -49,7 +55,6 @@ func taskManager(t *testing.T, timeout int) *Manager {
 	}
 	t.Cleanup(m.Close)
 	man := manifest("task", requestFixture)
-	man.Mode = "request"
 	man.RequestTimeoutSeconds = timeout
 	if _, err := m.Publish(man); err != nil {
 		t.Fatal(err)
@@ -76,7 +81,7 @@ func TestRequestPrivateInputAndConcurrentIsolation(t *testing.T) {
 		wg.Add(1)
 		go func(who string) {
 			defer wg.Done()
-			resp, err := m.HTTPClient("task", "").Do(taskRequest(context.Background(), who, .4))
+			resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), who, .4))
 			if err != nil {
 				t.Error(err)
 				return
@@ -133,7 +138,7 @@ func TestRequestPrivateInputAndConcurrentIsolation(t *testing.T) {
 	if n != 0 {
 		t.Fatal("worker identity not released")
 	}
-	resp, err := m.HTTPClient("task", "").Do(taskRequest(context.Background(), "again", 0))
+	resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), "again", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +154,7 @@ func TestRequestCancellationDeadlineStopAndInputValidation(t *testing.T) {
 	for _, input := range []string{"invalid", base64.StdEncoding.EncodeToString([]byte(`{"token":1}`)), base64.StdEncoding.EncodeToString([]byte(`null`)), strings.Repeat("A", 24000)} {
 		r := taskRequest(context.Background(), "invalid", 0)
 		r.Header.Set(RuntimeInputHeader, input)
-		resp, err := m.HTTPClient("task", "").Do(r)
+		resp, err := m.HTTPClient("task").Do(r)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -164,7 +169,7 @@ func TestRequestCancellationDeadlineStopAndInputValidation(t *testing.T) {
 			defer cancel()
 			done := make(chan error, 1)
 			go func() {
-				resp, err := m.HTTPClient("task", "").Do(taskRequest(ctx, mode, 30))
+				resp, err := m.HTTPClient("task").Do(taskRequest(ctx, mode, 30))
 				if resp != nil {
 					resp.Body.Close()
 				}
@@ -209,12 +214,39 @@ func TestRequestCancellationDeadlineStopAndInputValidation(t *testing.T) {
 	}
 }
 
-func TestRequestManifestAndDaemonInputRefusal(t *testing.T) {
-	for _, update := range []func(*Manifest){func(m *Manifest) { m.Mode = "unknown" }, func(m *Manifest) { m.RequestTimeoutSeconds = 1 }, func(m *Manifest) { m.Mode = "request"; m.RequestTimeoutSeconds = 3601 }} {
+func TestFailedWorkerDoesNotBecomeSharedProcess(t *testing.T) {
+	m := taskManager(t, 5)
+	resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), "crash", 0))
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("crashed worker returned a successful exchange")
+	}
+	m.mu.Lock()
+	n := len(m.workers)
+	m.mu.Unlock()
+	if n != 0 {
+		t.Fatal("crashed worker retained its identity")
+	}
+	// The endpoint stays enabled; the next call gets a fresh working directory.
+	resp, err = m.HTTPClient("task").Do(taskRequest(context.Background(), "after-crash", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != 200 || !strings.Contains(string(b), `"fresh": true`) {
+		t.Fatalf("request after crash: %s %v", b, err)
+	}
+}
+
+func TestRequestLimitsAndStatelessProtocol(t *testing.T) {
+	for _, timeout := range []int{-1, 3601} {
 		man := manifest("bad", "x")
-		update(&man)
+		man.RequestTimeoutSeconds = timeout
 		if _, err := man.normalize(); err == nil {
-			t.Fatal("accepted invalid execution settings")
+			t.Fatal("accepted invalid request timeout")
 		}
 	}
 	root(t)
@@ -223,20 +255,32 @@ func TestRequestManifestAndDaemonInputRefusal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	man := manifest("daemon", "x")
-	if _, err := m.Publish(man); err != nil {
+	if _, err := m.Publish(manifest("task", "x")); err != nil {
 		t.Fatal(err)
 	}
-	m.mu.Lock()
-	m.entries[man.ID].Desired = true
-	m.mu.Unlock()
-	resp, err := m.HTTPClient(man.ID, "unused").Do(taskRequest(context.Background(), "no", 0))
+	if _, err := m.Start("task"); err != nil {
+		t.Fatal(err)
+	}
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		req, _ := http.NewRequest(method, "http://localhost/mcp", nil)
+		resp, err := m.HTTPClient("task").Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 405 || resp.Header.Get("Allow") != "POST" {
+			t.Fatal("accepted a stateful protocol operation")
+		}
+	}
+	req := taskRequest(context.Background(), "no", 0)
+	req.Header.Set("Mcp-Session-Id", "previous-session")
+	resp, err := m.HTTPClient("task").Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != 400 {
-		t.Fatal("input accepted by shared daemon")
+		t.Fatal("accepted session resumption")
 	}
 }
 

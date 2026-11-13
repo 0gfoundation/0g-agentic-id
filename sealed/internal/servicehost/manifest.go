@@ -41,10 +41,8 @@ type Manifest struct {
 	Network   string `json:"network,omitempty"`
 	MemoryMB  int    `json:"memory_mb,omitempty"`
 	Processes int    `json:"processes,omitempty"`
-	// request runs each stateless MCP POST in a fresh sandbox, including
-	// discovery. The default keeps the existing supervised service process.
-	Mode                  string `json:"mode,omitempty"`
-	RequestTimeoutSeconds int    `json:"request_timeout_seconds,omitempty"`
+	// Every MCP POST, including discovery, runs in a fresh sandbox.
+	RequestTimeoutSeconds int `json:"request_timeout_seconds,omitempty"`
 }
 
 func (m *Manifest) normalize() (string, error) {
@@ -67,18 +65,11 @@ func (m *Manifest) normalize() (string, error) {
 			return "", fmt.Errorf("env: reserved or invalid key %q", k)
 		}
 	}
-	if m.Mode != "" && m.Mode != "daemon" && m.Mode != "request" {
-		return "", fmt.Errorf("mode must be daemon or request")
+	if m.RequestTimeoutSeconds == 0 {
+		m.RequestTimeoutSeconds = 300
 	}
-	if m.Mode == "request" {
-		if m.RequestTimeoutSeconds == 0 {
-			m.RequestTimeoutSeconds = 300
-		}
-		if m.RequestTimeoutSeconds < 1 || m.RequestTimeoutSeconds > 3600 {
-			return "", fmt.Errorf("request_timeout_seconds must be 1..3600")
-		}
-	} else if m.RequestTimeoutSeconds != 0 {
-		return "", fmt.Errorf("request_timeout_seconds requires request mode")
+	if m.RequestTimeoutSeconds < 1 || m.RequestTimeoutSeconds > 3600 {
+		return "", fmt.Errorf("request_timeout_seconds must be 1..3600")
 	}
 	if m.Network == "" {
 		m.Network = "none"

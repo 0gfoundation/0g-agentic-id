@@ -207,7 +207,7 @@ func (s *Server) helloServiceList() []report.Service {
 // subpath/prefix routing is a later refinement.
 func (s *Server) matchService(path string) (ServiceEntry, bool) {
 	if host := s.getServiceHost(); host != nil {
-		if svc, _, ok := host.Match(path); ok {
+		if svc, ok := host.Match(path); ok {
 			return ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description}, true
 		}
 	}

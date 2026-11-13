@@ -10,7 +10,7 @@ continue to be defined by sealed.
 ## Publication contract
 
 Publish a manifest with `id`, `command`, `args`, `files` and optional
-`description`, `env`, `network`, `memory_mb`, `processes`, `mode` and
+`description`, `env`, `network`, `memory_mb`, `processes` and
 `request_timeout_seconds`. `env` is durable non-secret configuration. Each file has a
 relative `path` and standard-base64 `data`. Commands name an interpreter in
 the trusted image PATH, such as `node`; its code runs only after dropping
@@ -20,23 +20,23 @@ not unpacked. Dependency installation belongs to the unprivileged agent.
 
 The server listens on the Unix socket in `$MCP_SOCKET`, `/run/service.sock`.
 It receives the original public request path. Its public MCP endpoint is
-`<sandbox-url>/api/mcp/<id>`. `/hello` advertises it. A stopped or starting
-service returns 503; callers must poll `seal_service_list` for `running` and
-then test an actual MCP exchange. Daemon readiness means socket availability;
-request-mode readiness means admission is enabled. Neither asserts that every
-business operation has passed a health check.
+`<sandbox-url>/api/mcp/<id>`. `/hello` advertises it. Every MCP POST runs in
+a fresh isolated temporary process, including `initialize` and `tools/list`.
+Sealed keeps the endpoint available; no dedicated shared service process runs
+between requests. `start` enables admission and `stop` disables it and cancels
+active workers. A stopped service returns 503. `seal_service_list` reports
+`running` when admission is enabled; verify an actual MCP exchange to check
+business behavior.
 
-In default `mode:"daemon"`, `/app` is an immutable release, `/work` persists,
-and `/tmp` is temporary.
-Stop before publishing a new version. Publishing returns a SHA-256 version
+`/app` is an immutable release; `/work` and `/tmp` are private tmpfs for each
+request. Stop before publishing an update. Publishing returns a SHA-256 version
 over the normalized manifest; the latest eight source releases are retained.
-Republish an earlier bundle for rollback. Publishing does not overwrite work.
-The root-only registry is bound to the owner and sealed identity. Active
-services resume only after chain bootstrap validates that binding. Desired
-stopped state survives reboot. Crashes restart at a bounded rate; stop ends
-the process namespace and cancels pending restart. Owner transfer closes the
-manager, as well as the proxy's existing owner gate. Request mode resumes
-admission only, never an interrupted worker or its inputs.
+Republish an earlier bundle for rollback. The root-only registry is bound to
+the owner and sealed identity. After reboot, chain bootstrap must validate
+that binding before enabled endpoints resume admission. Stopped services stay
+stopped. Neither interrupted workers nor their input/work are resumed; failed
+workers are not restarted. Owner transfer closes the manager and cancels all
+workers, as well as locking the proxy's existing owner gate.
 
 There are at most 16 services and 512 files per release. A bundle decodes to at
 most 16 MiB; publication JSON is limited to 24 MiB and the aggregate durable
@@ -48,17 +48,18 @@ added to the public TCP listener.
 
 ## Isolation and limits
 
-Each service gets a unique host UID/GID in the reserved 200000–200015 range.
-The trusted `sealed-service-launcher` drops supplementary groups and identity
-before invoking bubblewrap. The service receives a PID, user, IPC and UTS
-namespace, a minimal environment, no capabilities, no-new-privs, and only the
-image runtime plus its own app/work/run mounts. Sealed state, the owner home,
-management/sign/reveal sockets and other services' work are not mounted.
-The immutable image-bundled Harness package is also mounted read-only when
-present, and named by `HARNESS_RUNTIME_ROOT`. The resident Harness's writable
-diff and state are not shared. Owner-authored source releases are root-writable and readable by the owner;
-credentials must not be included in them. Work/run directories are private
-to the service UID. Logs and registry remain in sealed's private state tree.
+Each active request gets a unique host UID/GID in the reserved 210000–210031
+range. The trusted `sealed-service-launcher` drops supplementary groups and
+identity before invoking bubblewrap. Each worker receives PID, user, IPC and
+UTS namespaces, a minimal environment, no capabilities, no-new-privs, and only
+the image runtime plus its own app/work/run mounts. Sealed state, the owner
+home, management/sign/reveal sockets and other workers' files are not mounted.
+The immutable image-bundled Harness package is mounted read-only when present,
+and named by `HARNESS_RUNTIME_ROOT`. The resident Harness's writable diff and
+state are not shared. Source releases are root-writable and owner-readable;
+credentials must not be included. The registry remains in sealed's private
+state tree. Worker stdout/stderr is discarded; `seal_service_logs` returns an
+empty log rather than exposing employer output to the owner.
 
 The image must support unprivileged user/mount namespaces; unavailable
 isolation fails startup rather than running the program without it. The
@@ -68,22 +69,17 @@ Harness image ships bubblewrap, util-linux and the trusted launcher.
 `network:"host"` explicitly grants the container network, including loopback;
 it does not provide tenant network isolation. Signing/credential sockets and
 proxy credentials are never inherited. Host-network services are trusted with
-that network access; even request mode does not isolate tenant networks.
+that network access; process isolation does not isolate host-network traffic.
 
 Limits are per-process virtual address space (default 8192 MiB, 128–16384),
-per-service UID process count (default 64, 1–256), 256 file descriptors and
-64 MiB per file. Daemon stdout/stderr retain only the latest 64 KiB; request
-worker output is discarded. These are rlimits,
-not aggregate CPU/memory/disk quotas; the enclosing sandbox still supplies its
-resource boundary. A service can handle many employers; each employer does not
-automatically receive its own process or filesystem boundary in daemon mode.
+per-worker UID process count (default 64, 1–256), 256 file descriptors and
+64 MiB per file. These are rlimits, not aggregate CPU/memory/disk quotas; the
+enclosing sandbox still supplies its resource boundary.
 
 ## Temporary task processes and direct runtime input
 
-Use `mode:"request"` for a stateless MCP server that runs one temporary task
-per HTTP POST. `start` enables requests without launching a shared process;
-each request launches a fresh UID/GID (210000–210031), PID/mount sandbox and
-private run directory. `/work` and `/tmp` are tmpfs; the immutable release is
+All hosted MCP services are stateless. Each HTTP POST launches a fresh
+UID/GID, PID/mount sandbox and private run directory. `/work` and `/tmp` are tmpfs; the immutable release is
 shared. There are at most 32 concurrent request workers across services.
 `request_timeout_seconds` bounds the whole lifetime (default 300, 1–3600).
 EOF, client cancellation, deadline, service stop and owner transfer terminate
@@ -98,8 +94,7 @@ must support custom HTTP headers. Ordinary MCP JSON-RPC remains unchanged.
 Malformed input is rejected before admission. The header is removed before
 backend HTTP handling; the decoded bytes reach only the selected program's
 anonymous stdin pipe, never command-line arguments or the resident owner
-Harness. A daemon service rejects this header instead of sharing caller
-credentials with its long-lived process.
+Harness.
 
 Sealed only transfers the input; it creates no employer credential entries,
 reveal approvals, renewal, writeback or persistence. The caller authorizes the
@@ -119,17 +114,19 @@ privileged MCP connections, shell, schedules or delegation is mounted by
 default. The model adapter/funding remains service policy; employer model
 API keys are not requested implicitly.
 
-Request mode is stateless: GET/DELETE and `Mcp-Session-Id` resume are rejected.
+Hosted services reject GET/DELETE and `Mcp-Session-Id` resume.
 The small loop server advertises tools only. It returns the result within the
 POST and does not implement asynchronous progress storage or client sampling.
-Use an owner-authored full MCP server for other negotiated capabilities.
+Do not advertise unsupported stateful or cross-request capabilities.
 
 ## MCP transport and attribution
 
-An MCP endpoint forwards POST, GET and DELETE to its backend, including MCP
-session/protocol headers and client responses to server requests. The backend
-may return 405 for optional methods. SSE is flushed immediately, with buffering
-disabled, so sampling and elicitation can complete while a tool call is open.
+Hosted endpoints accept stateless POST exchanges and flush SSE immediately.
+Existing externally registered MCP backends retain general POST/GET/DELETE
+forwarding, session/protocol headers and client responses to server requests.
+That general transport support does not add stateful sessions, sampling or
+elicitation to a fresh hosted worker. The bundled task server advertises tools
+only.
 
 Finite JSON responses retain ordinary ServeProof behavior. An SSE stream has
 no complete body to hash in its initial header; it is explicitly labeled
@@ -148,7 +145,7 @@ Sampling is model generation, not access to arbitrary employer credentials.
 Run the sealed root suites with and without the image's agent account, plus
 `SEALED_SERVICE_TESTS=1` in a namespace-capable Linux test container. The service
 tests exercise publication, identity binding, real UID/mount isolation,
-immutable code, crash restart, stop and reboot recovery. Proxy tests check
+immutable code, stop and admission-only reboot recovery. Proxy tests check
 live sampling-request SSE, session headers, DELETE and forged-proof removal.
 Request tests cover concurrent UIDs, private stdin input, absent argv/env/header
 copies, no credential/log persistence, fresh work and cancellation/deadline/stop

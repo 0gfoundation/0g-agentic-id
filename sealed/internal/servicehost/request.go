@@ -37,14 +37,13 @@ type worker struct {
 }
 
 type taskTransport struct {
-	manager    *Manager
-	id, socket string
+	manager *Manager
+	id      string
 }
 
-// HTTPClient must be used for managed endpoints: it rejects runtime input on
-// shared daemons and selects a fresh isolated process for request-mode services.
-func (m *Manager) HTTPClient(id, socket string) *http.Client {
-	return &http.Client{Transport: &taskTransport{m, id, socket}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+// HTTPClient selects a fresh isolated process for every managed MCP POST.
+func (m *Manager) HTTPClient(id string) *http.Client {
+	return &http.Client{Transport: &taskTransport{m, id}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
 func response(req *http.Request, code int, message string) *http.Response {
@@ -61,12 +60,6 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	man, status := e.Manifest, e.Status
 	m.mu.Unlock()
-	if man.Mode != "request" {
-		if _, exists := req.Header[RuntimeInputHeader]; exists {
-			return response(req, 400, "runtime input requires request mode"), nil
-		}
-		return Client(t.socket).Transport.RoundTrip(req)
-	}
 	if req.Method != http.MethodPost {
 		r := response(req, 405, "stateless request services accept POST only")
 		r.Header.Set("Allow", "POST")
@@ -154,9 +147,8 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err = os.Chown(run, int(uid), int(uid)); err != nil {
 		return nil, fmt.Errorf("prepare request sandbox")
 	}
-	status.UID = uid
-	job := &entry{Manifest: man, Status: status, taskDir: dir}
-	cmd, err := m.command(ctx, job)
+	job := &entry{Manifest: man, Status: status}
+	cmd, err := m.command(ctx, job, uid, dir)
 	if err != nil {
 		return nil, fmt.Errorf("prepare request interpreter")
 	}

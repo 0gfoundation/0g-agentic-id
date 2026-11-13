@@ -101,7 +101,7 @@ export default {model,persona:'Use check_access to perform the task.',cwd:'/work
 		t.Fatal(err)
 	}
 	defer host.Close()
-	if _, err := host.Publish(servicehost.Manifest{ID: "loop", Command: "node", Args: []string{"/app/loop-server.mjs"}, Mode: "request", Network: "host", RequestTimeoutSeconds: 15,
+	if _, err := host.Publish(servicehost.Manifest{ID: "loop", Command: "node", Args: []string{"/app/loop-server.mjs"}, Network: "host", RequestTimeoutSeconds: 15,
 		Files: []servicehost.File{{Path: "loop-server.mjs", Data: base64.StdEncoding.EncodeToString(server)}, {Path: "agent-config.mjs", Data: base64.StdEncoding.EncodeToString([]byte(config))}}}); err != nil {
 		t.Fatal(err)
 	}

@@ -98,11 +98,10 @@ func (s *Server) serviceHostTools() []sealmcp.Tool {
 		"network":                 map[string]any{"type": "string", "enum": []string{"none", "host"}, "description": "Default none. host explicitly grants the container network including loopback; no tenant network isolation."},
 		"memory_mb":               map[string]any{"type": "integer", "description": "Per-process virtual address-space limit, default 8192 MiB; 128..16384."},
 		"processes":               map[string]any{"type": "integer", "description": "Per-service UID process limit, default 64; 1..256."},
-		"mode":                    map[string]any{"type": "string", "enum": []string{"daemon", "request"}, "description": "Default daemon. request runs each stateless MCP POST in a fresh UID/sandbox with temporary work and caller runtime input over stdin; no task resume."},
-		"request_timeout_seconds": map[string]any{"type": "integer", "description": "Request mode only: whole worker lifetime, default 300 seconds; 1..3600."},
+		"request_timeout_seconds": map[string]any{"type": "integer", "description": "Whole isolated worker lifetime, default 300 seconds; 1..3600. Every MCP POST uses a fresh UID/sandbox; no task resume."},
 	}, "id", "command", "args", "files")
-	tools := []sealmcp.Tool{{Name: "seal_service_list", Description: "List hosted MCP services, versions, desired state, readiness and startup errors.", Schema: obj(map[string]any{}), Method: http.MethodGet, Path: "/service-host"}}
-	tools = append(tools, sealmcp.Tool{Name: "seal_service_publish", Description: "Publish a stopped service's immutable release. Files are base64. MCP server listens on Unix socket $MCP_SOCKET; /app is read-only, /work persists, /tmp is temporary. Stop before updating. No employer credential custody.", Schema: obj(map[string]any{"manifest": manifest}, "manifest"), Method: http.MethodPost, Path: "/service-host", Prepare: func(args map[string]any) (any, error) {
+	tools := []sealmcp.Tool{{Name: "seal_service_list", Description: "List hosted MCP services, versions, desired state and request admission status.", Schema: obj(map[string]any{}), Method: http.MethodGet, Path: "/service-host"}}
+	tools = append(tools, sealmcp.Tool{Name: "seal_service_publish", Description: "Publish a stopped service's immutable release. Files are base64. Every MCP POST runs in a fresh isolated process listening on $MCP_SOCKET; /app is read-only, /work and /tmp are temporary. Stop before updating. No employer credential custody.", Schema: obj(map[string]any{"manifest": manifest}, "manifest"), Method: http.MethodPost, Path: "/service-host", Prepare: func(args map[string]any) (any, error) {
 		if err := sealmcp.Allow(args, "manifest"); err != nil {
 			return nil, err
 		}
@@ -113,7 +112,7 @@ func (s *Server) serviceHostTools() []sealmcp.Tool {
 	}})
 	for _, action := range []string{"start", "stop", "logs"} {
 		a := action
-		tools = append(tools, sealmcp.Tool{Name: "seal_service_" + a, Description: map[string]string{"start": "Start a published MCP server. Poll seal_service_list until running; starting is not readiness.", "stop": "Stop this service and its descendants, and disable reboot/crash restart.", "logs": "Read the service's latest bounded stdout/stderr. Logs may contain caller data."}[a], Schema: obj(map[string]any{"id": str("Published service id.")}, "id"), Method: http.MethodPost, Path: "/service-host", Prepare: func(args map[string]any) (any, error) {
+		tools = append(tools, sealmcp.Tool{Name: "seal_service_" + a, Description: map[string]string{"start": "Enable requests to a published MCP service. Each POST starts a fresh isolated worker; running indicates admission, not business health.", "stop": "Disable new requests and terminate all active workers for this service. Remains stopped after reboot.", "logs": "Request-worker stdout/stderr is discarded; this returns an empty log."}[a], Schema: obj(map[string]any{"id": str("Published service id.")}, "id"), Method: http.MethodPost, Path: "/service-host", Prepare: func(args map[string]any) (any, error) {
 			if err := sealmcp.Allow(args, "id"); err != nil {
 				return nil, err
 			}

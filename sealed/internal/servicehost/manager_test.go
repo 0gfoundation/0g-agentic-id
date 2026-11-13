@@ -1,14 +1,13 @@
 package servicehost
 
 import (
+	"context"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func manifest(id, source string) Manifest {
@@ -84,37 +83,6 @@ func TestPublishBindingAndImmutableRelease(t *testing.T) {
 	}
 }
 
-const fixture = `import os, socket, http.server, json
-class Handler(http.server.BaseHTTPRequestHandler):
- def log_message(self,*a): pass
- def do_GET(self):
-  flags={"uid":os.getuid(),"owner_home":os.path.exists("/home/agent"),"sign_socket":os.path.exists("/run/seal-sign.sock"),"sealed_state":os.path.exists("/var/lib/sealed"),"other_work":os.path.exists("/work-other"),"secret":os.environ.get("SERVICE_TEST_SECRET")}
-  try:
-   open("/app/server.py","w");flags["readonly"]=False
-  except OSError: flags["readonly"]=True
-  open("/work/witness","w").write("persistent")
-  self.send_response(200);self.end_headers();self.wfile.write(json.dumps(flags).encode())
-class Server(http.server.HTTPServer):
- address_family=socket.AF_UNIX
- def server_bind(self): self.socket.bind(self.server_address);self.server_name="service";self.server_port=0
-Server(os.environ["MCP_SOCKET"],Handler).serve_forever()
-`
-
-func running(t *testing.T, m *Manager, id string) {
-	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		for _, s := range m.List() {
-			if s.ID == id && s.State == "running" {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	log, _ := m.Logs(id)
-	t.Fatalf("service never ready: %+v\n%s", m.List(), log)
-}
-
 func TestSandboxLifecycleAndIsolation(t *testing.T) {
 	root(t)
 	if os.Getenv("SEALED_SERVICE_TESTS") != "1" {
@@ -127,64 +95,58 @@ func TestSandboxLifecycleAndIsolation(t *testing.T) {
 	}
 	defer m.Close()
 	for _, id := range []string{"first", "second"} {
-		if _, err = m.Publish(manifest(id, fixture)); err != nil {
+		if _, err = m.Publish(manifest(id, requestFixture)); err != nil {
 			t.Fatal(err)
 		}
 		if _, err = m.Start(id); err != nil {
 			t.Fatal(err)
 		}
-		running(t, m, id)
 	}
-	if m.List()[0].UID == m.List()[1].UID {
-		t.Fatal("shared service identity")
-	}
-	client := Client(m.socket("first"))
-	defer client.CloseIdleConnections()
-	resp, err := client.Get("http://localhost/mcp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	for _, want := range []string{`"uid": 200000`, `"owner_home": false`, `"sign_socket": false`, `"sealed_state": false`, `"secret": null`, `"readonly": true`} {
-		if !strings.Contains(string(b), want) {
-			t.Fatalf("isolation missing %s: %s", want, b)
-		}
-	}
-	if _, err = m.Publish(manifest("first", "changed")); err == nil {
-		t.Fatal("updated a running service")
-	}
-	// Crash the supervisor. The PID namespace removes its descendants; a
-	// fresh socket becomes ready and the other service stays running.
-	m.mu.Lock()
-	pid := m.entries["first"].cmd.Process
-	oldgen := m.entries["first"].generation
-	m.mu.Unlock()
-	_ = pid.Kill()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
+	assertNoWorkers := func(m *Manager) {
+		t.Helper()
 		m.mu.Lock()
-		gen := m.entries["first"].generation
-		m.mu.Unlock()
-		if gen > oldgen {
-			break
+		defer m.mu.Unlock()
+		if len(m.workers) != 0 {
+			t.Fatal("service enablement or completed request left a worker running")
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
-	running(t, m, "first")
+	assertNoWorkers(m)
+	check := func(m *Manager, id string) {
+		t.Helper()
+		resp, err := m.HTTPClient(id).Do(taskRequest(context.Background(), id, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != 200 {
+			t.Fatalf("request: %s %v", b, err)
+		}
+		for _, want := range []string{`"owner_home": false`, `"sign_socket": false`, `"sealed_state": false`, `"secret": null`, `"readonly": true`, `"fresh": true`} {
+			if !strings.Contains(string(b), want) {
+				t.Fatalf("isolation missing %s: %s", want, b)
+			}
+		}
+		assertNoWorkers(m)
+	}
+	check(m, "first")
+	check(m, "second")
+	if _, err = m.Publish(manifest("first", "changed")); err == nil {
+		t.Fatal("updated an enabled service")
+	}
 	if _, err = m.Stop("first"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(2200 * time.Millisecond)
-	for _, s := range m.List() {
-		if s.ID == "first" && (s.State != "stopped" || s.Desired) {
-			t.Fatalf("resurrected: %+v", s)
-		}
-		if s.ID == "second" && s.State != "running" {
-			t.Fatal("stop affected another service")
-		}
+	resp, err := m.HTTPClient("first").Do(taskRequest(context.Background(), "first", 0))
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Reboot preserves desired state, not a stale PID/readiness claim.
+	resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Fatal("stopped service admitted a request")
+	}
+	check(m, "second")
+	// Reboot restores admission only. Neither work nor processes survive.
 	m.Close()
 	restored, err := New(m.base, "owner:identity")
 	if err != nil {
@@ -192,13 +154,17 @@ func TestSandboxLifecycleAndIsolation(t *testing.T) {
 	}
 	defer restored.Close()
 	restored.Resume()
-	running(t, restored, "second")
+	assertNoWorkers(restored)
 	for _, s := range restored.List() {
-		if s.ID == "first" && s.State != "stopped" {
-			t.Fatal("reboot restarted a stopped service")
+		if s.ID == "first" && (s.State != "stopped" || s.Desired) {
+			t.Fatal("reboot enabled a stopped service")
+		}
+		if s.ID == "second" && s.State != "running" {
+			t.Fatal("reboot did not restore admission")
 		}
 	}
-	if _, err = os.Stat(filepath.Join(m.programs, "first", "work", "witness")); err != nil {
-		t.Fatal(fmt.Errorf("work did not persist: %w", err))
+	check(restored, "second")
+	if _, err := os.Stat(filepath.Join(m.programs, "second", "work")); !os.IsNotExist(err) {
+		t.Fatal("service has a persistent working directory")
 	}
 }
