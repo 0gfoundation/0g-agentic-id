@@ -7,7 +7,7 @@
 
 ## 1. Architecture
 
-Every upgradeable contract (`AgenticID` / `TEEDataVerifier` /
+Every upgradeable contract (`AgenticID` / `TrustRegistry` / `TEEDataVerifier` /
 `VerifiedFeedbackRegistry` / `CloneGate` / the deprecated
 `AgenticIDReputationRegistry`) uses **BeaconProxy + UpgradeableBeacon +
 Implementation**. All beacons are
@@ -20,7 +20,11 @@ deploying a new one and re-delegating. `StandardCloneAuthorizer` is immutable
 which source owners opt into per agent via `CloneGate.setCloneAuthorizer`.
 
 `AgenticID` no longer reimplements ERC-8004 — it **custody-binds to the official
-ERC-8004 Identity Registry** (binding semantics in §2).
+ERC-8004 Identity Registry** (binding semantics in §2). Since AgenticID 1.4.0 the
+deployer's trust decisions — which attestors may mint and set URIs (with their
+Tapp app bindings) and which code may run an agent (image, sealed and harness
+lists) — live in `TrustRegistry`; AgenticID's implementation fixes the registry
+address and its trust reads forward there.
 Reputation is split (§2.1): feedback lives in the canonical ERC-8004
 Reputation Registry; `VerifiedFeedbackRegistry` stamps TEE verification marks
 (ServeProof, §2.2). The `AgenticIDReputationRegistry` fork is deprecated and
@@ -55,14 +59,16 @@ recreates the sandbox).
 
 | Role | Identity | Timelock-protected |
 |---|---|---|
-| Timelock | owner of every beacon; the only caller of `beacon.upgradeTo`. `minDelay` 1 day on mainnet (`Deploy.s.sol` enforces ≥ 86400 on chain 16661), 0 on testnet / dev | — |
-| Owner (`Ownable2StepUpgradeable` from AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; `OwnableUpgradeable` before, and on the deprecated fork) | attestor allowlist / framework-hash whitelist / verifier + TEE-oracle swap / pauser rotation / `setMaxProofAge` (raise-only within 2 hours–365 days in TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; the deployed fork stays unrestricted) | no — direct calls, effective immediately |
+| Timelock | owner of every beacon; the only caller of `beacon.upgradeTo`; from TrustRegistry 1.1.0 also the registry's owner. `minDelay` 1 day on mainnet (`Deploy.s.sol` enforces ≥ 86400 on chain 16661), 0 on testnet / dev | — |
+| Owner (`Ownable2StepUpgradeable` from AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; `OwnableUpgradeable` before, and on the deprecated fork) | verifier + TEE-oracle swap / pauser rotation / `setMaxProofAge` (raise-only within 2 hours–365 days in TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; the deployed fork stays unrestricted) / attestors and image list on AgenticID before 1.4.0 | no — direct calls, effective immediately |
+| TrustRegistry owner (`Ownable2StepUpgradeable`): the environment's Timelock from TrustRegistry 1.1.0's owner move (below; the governance key before it) | adds trust: `list`, `addTrustedAttestor`, `bindTrustedAttestorApp`, `requireInstanceBoundAttestors`, `setGuardian`; may remove it too | yes — each a scheduled Timelock operation, cancellable until it runs |
+| TrustRegistry guardian (1.1.0): the governance key — dev `0x2AB7…a0B3`, test `0x9C58…80Bb`, mainnet the vault | removes trust: `delist`, `removeTrustedAttestor`, one call or a `multicall` batch | no — direct calls, effective immediately |
 | Pauser | emergency switch | no (emergency path can't be delayed) |
 
 **Governance split (deliberate).** Privileged admin calls are **direct owner
 calls** — on mainnet the owner is a Fordefi MPC vault (§6.2m) — with no
-Timelock and no separate guardian role; only beacon upgrades go through the
-Timelock. From 1.2.0 the owner surface is hardened (audit FIND-12 / FIND-16):
+Timelock; beacon upgrades and, from TrustRegistry 1.1.0, every addition of
+trust go through the Timelock. From 1.2.0 the owner surface is hardened (audit FIND-12 / FIND-16):
 ownership is two-step — `transferOwnership(x)` only records `pendingOwner = x`
 (`OwnershipTransferStarted`), and ownership moves when `x` itself calls
 `acceptOwnership()`, so a mistyped or unreachable address can't strand the
@@ -77,6 +83,25 @@ above — on mainnet the vault's approval policy (§8) is what guards it.
 Testnet / dev deliberately stay lightweight (EOA owner,
 `minDelay` 0, §6.1 / §6.2); the one hard rule is that **no testnet key is ever
 reused on mainnet**.
+
+**TrustRegistry: adding trust waits, removing it does not.** The code lists
+decide what runs in a running container, not only what may start: listing a
+sealed version and delisting the one agents run moves each of those agents,
+within one heartbeat (5 minutes), to its owner's pick if listed, else to the
+version just listed — the `latest` — which then gets the agent key at its
+provision (sealed/LAYERS.md §3.1). So from TrustRegistry 1.1.0 the registry's
+owner is the environment's TimelockController: listing a version, trusting or
+binding an attestor, requiring instance binding and setting the guardian are
+scheduled Timelock operations (`script/TrustRegistryCalls.s.sol`) that run
+after `minDelay` — 1 day on mainnet, 0 on test / dev — and that a canceller
+(every proposer; on mainnet the vault) can cancel until then. Removing trust is
+immediate: the guardian, the environment's governance key, calls `delist` and
+`removeTrustedAttestor` directly, alone or batched through `multicall` (the
+owner can too). The owner moves in two steps: while the governance key still
+owns the registry it calls `setGuardian(key)` and `transferOwnership(timelock)`
+(`script/HandOverTrustRegistry.s.sol`, one `multicall`), and the Timelock
+then executes `acceptOwnership()` (`TrustRegistryCalls`); until it does, the
+key stays owner.
 
 ## 2. ERC-8004 binding + proof domain separation
 
@@ -238,12 +263,13 @@ registerWithSeal / iCloneFrom all start with an empty payment wallet (locked by 
 
 ## 3. Deploy
 
-`script/Deploy.s.sol` deploys all 15 contracts in one run (Timelock + 4 × (impl +
-beacon + proxy: TEEDataVerifier / AgenticID / VerifiedFeedbackRegistry / CloneGate)
-+ FeedbackBatcher + StandardCloneAuthorizer); verified-feedback/verifier/clone-gate
-bind to the freshly-minted AgenticID, AgenticID binds to `CANONICAL_8004`, and the
-verified-feedback registry anchors to `CANONICAL_8004_REPUTATION` (both chainId
-defaults):
+`script/Deploy.s.sol` deploys all 18 contracts in one run (Timelock + 5 × (impl +
+beacon + proxy: TEEDataVerifier / TrustRegistry / AgenticID /
+VerifiedFeedbackRegistry / CloneGate) + FeedbackBatcher + StandardCloneAuthorizer);
+the AgenticID implementation fixes the fresh TrustRegistry,
+verified-feedback/clone-gate bind to the freshly-minted AgenticID, AgenticID binds
+to `CANONICAL_8004`, and the verified-feedback registry anchors to
+`CANONICAL_8004_REPUTATION` (both chainId defaults):
 
 ```bash
 export OWNER=0x...
@@ -290,15 +316,53 @@ The delay, admin and role-set rules live in `script/MainnetGovernance.sol`
 (covered by `test/DeployScript.t.sol`); the incremental
 `DeployVerifiedFeedback.s.sol` / `DeployCloneGate.s.sol` apply its other half
 — on chain 16661 they refuse a `TIMELOCK` (the new beacon's owner) that is not
-a TimelockController with `minDelay ≥ 86400`. The run prints all 15 addresses
+a TimelockController with `minDelay ≥ 86400`. The run prints all 18 addresses
 — record them in §6.
 
-**Required post-deploy (fresh contract = empty allowlists):** the owner must
-`addTrustedAttestor(<attestor>)` (else mint reverts `AgenticIDNotTrustedAttestor`),
-`addTrustedAttestor(<CloneGate proxy>)` (the gate is the `msg.sender` of clone
-mints — without it every `cloneFrom` reverts), and
-`addValidFrameworkHash(<sealed image hash>)` (else `image_hash not in
-validFrameworkHashes`).
+**Required post-deploy (fresh TrustRegistry = empty lists):** the owner must, on
+the TrustRegistry, trust the attestor (`bindTrustedAttestorApp`, or
+`addTrustedAttestor` while instance binding is not required — else mint reverts
+`AgenticIDNotTrustedAttestor`) and the CloneGate proxy the same way (the gate is
+the `msg.sender` of clone mints — without it every `cloneFrom` reverts), and
+`list(IMAGE, <sealed image hash>)` (else `image_hash not in
+validFrameworkHashes`); for 0g-harness loader images also
+`list(SEALED, <sealed program hash>)` and `list(HARNESS, <package hash>)`
+(sealed/LAYERS.md §10). `multicall` takes them in one transaction. Then the
+owner hands the registry to the Timelock and becomes its guardian (§1):
+
+```bash
+export TRUST_REGISTRY=0x<proxy> TIMELOCK=0x<Timelock> GUARDIAN=$OWNER
+forge script script/HandOverTrustRegistry.s.sol --rpc-url <RPC> \
+  --private-key <OWNER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+# the Timelock accepts: schedule, then execute once minDelay has passed
+export CALLS=$(cast calldata "acceptOwnership()")
+MODE=schedule forge script script/TrustRegistryCalls.s.sol --rpc-url <RPC> \
+  --private-key <PROPOSER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+MODE=execute forge script script/TrustRegistryCalls.s.sol --rpc-url <RPC> \
+  --private-key <EXECUTOR_PK> --legacy --gas-price 5000000000 --broadcast --slow
+```
+
+An owner that signs outside forge (the mainnet vault) takes the calldata from
+`MODE=plan` of `HandOverTrustRegistry` and from a dry run of
+`TrustRegistryCalls` with `--sender <vault>` (no `--broadcast`).
+
+**Listing sealed and harness versions later.** Listing a version moves no
+running agent: one keeps its version while that stays listed, unless its owner
+picks another. Delisting one moves the agents that run it to their owner's
+pick, else to `latest`, the last one listed that is still listed; a new
+container also starts the harness on `latest` when its owner picked none
+(sealed/LAYERS.md §3.1, §5.3). So list versions oldest first: listing an older
+version again makes it `latest`. A version the image does not carry is
+downloaded from the `artifacts` release, so upload its file there before
+listing it.
+
+**Who lists and delists.** Once the Timelock owns the registry, a listing is a
+Timelock operation —
+`CALLS=$(cast calldata "list(bytes32,bytes32)" $(cast keccak sealed) <hash>)`
+through `script/TrustRegistryCalls.s.sol`, `MODE=schedule` and, once ready,
+`MODE=execute` (several calls: comma-separated in `CALLS`, one operation). A
+delisting is the guardian's direct call:
+`cast send <registry> "delist(bytes32,bytes32)" $(cast keccak sealed) <hash>`.
 
 ## 4. Upgrade
 
@@ -309,11 +373,13 @@ migrate. The upgrade mechanism is generic across every beacon-proxied contract,
 covered by `test/Upgradeable.t.sol` (AgenticID + TEEDataVerifier),
 `test/UpgradeReputation.t.sol` (the deprecated fork, incl. storage survival +
 post-upgrade behavior), `test/UpgradeVerifiedFeedback.t.sol`
-(VerifiedFeedbackRegistry 1.1.0 → 1.2.0: storage survival, the ServeProof
-format cut, two-step ownership) and `test/UpgradeGovernance.t.sol`
-(AgenticID + TEEDataVerifier 1.1.0 → 1.2.0 from frozen copies of the deployed
-1.1.0 source, through a mainnet-shaped 1-day Timelock: state survival,
-two-step ownership, the zero-address setter guards).
+(VerifiedFeedbackRegistry 1.1.0 → 1.3.0: storage survival, the ServeProof
+format cut, two-step ownership), `test/UpgradeGovernance.t.sol`
+(AgenticID 1.1.0 → 1.4.0 + TEEDataVerifier 1.1.0 → 1.2.0 from frozen copies of
+the deployed 1.1.0 source, through a mainnet-shaped 1-day Timelock: state
+survival, two-step ownership, the zero-address setter guards) and
+`test/UpgradeAgenticID.t.sol` (AgenticID 1.3.0 → 1.4.0 from the frozen 1.3.0
+source: the trust-list migration, the switch, rollback).
 
 ## 5. Verify
 
@@ -358,7 +424,9 @@ constructor argument. Browser
 > `beacon.implementation()`, pause flag and attestor binding in §6.1 / §6.2
 > was re-read on chain **2026-10-28**. Mainnet took the same versions in one
 > batch on **2026-11-02** (AgenticID straight from 1.1.0 to 1.3.0); §6.2m was
-> re-read on chain **2026-11-03**.
+> re-read on chain **2026-11-03**. Dev took AgenticID 1.4.0 with TrustRegistry
+> 1.0.0, VerifiedFeedbackRegistry 1.3.0 and FeedbackBatcher v5 on
+> **2026-11-12** (§6.2, read back on chain the same day).
 >
 > **Three canonical-bound environments run in parallel** — pick the set by env
 > (attestor `/config` values as of 2026-10-19):
@@ -458,28 +526,34 @@ Migration: 2026-10-19 07:54–08:01 UTC, blocks 60946923–60947793 (AgenticID
 
 | Contract | Address | VERSION |
 |---|---|---|
-| AgenticID proxy | `0x5BB50987521A3fb7Da6Cd6aCC0ad1061D975B24A` | **1.3.0** (instance-bound attestors — beacon-upgraded 2026-10-26; 1.2.0 on 2026-10-21; 1.1.0 audit on 2026-08-06; §7) |
-| AgenticID impl | `0x2faDD255A327d3bB47cE7d94eF4921Bce1623e6B` | links AttestorAppBindingLib `0xC6a9…a01E`. Previous: 1.2.0 `0x05cd3114a60fdbd183b0939f85d78e7227406135`, 1.1.0 `0x99484dd8…2F70` |
+| AgenticID proxy | `0x5BB50987521A3fb7Da6Cd6aCC0ad1061D975B24A` | **1.4.0** (trust read from the TrustRegistry below — beacon-upgraded 2026-11-12 03:00:53 UTC, upgrade block 65156470; 1.3.0 on 2026-10-26; 1.2.0 on 2026-10-21; 1.1.0 audit on 2026-08-06; §7) |
+| AgenticID impl | `0xFB13f0F3dBD30f55E9F1Da8C6733B02cD497E833` | fixes TrustRegistry `0x71b4…5b17` (`trustRegistry()`); no linked library. Previous: 1.3.0 `0x2faDD255A327d3bB47cE7d94eF4921Bce1623e6B` (links AttestorAppBindingLib `0xC6a9…a01E`), 1.2.0 `0x05cd3114a60fdbd183b0939f85d78e7227406135`, 1.1.0 `0x99484dd8…2F70` |
 | AgenticID beacon | `0x2c60DAF0c41A9FABB8Be1F452F1DD6AE0266F431` | |
-| AttestorAppBindingLib (linked library — stateless, no proxy) | `0xC6a9DcfAe6545c820A97f7a6A60DbC8ED791a01E` | deployed 2026-10-26 with the 1.3.0 impl |
+| AttestorAppBindingLib (linked library — stateless, no proxy) | `0xC6a9DcfAe6545c820A97f7a6A60DbC8ED791a01E` | deployed 2026-10-26 with the 1.3.0 impl; 1.4.0 links none |
+| TrustRegistry proxy | `0x71b4dae94C8201169F0F93cAF85aa953650c5b17` | **1.1.0** (guardian — beacon-upgraded 2026-11-13, schedule `0x85093819c81be61a394005b5a2b25bd1ae6b5811bbd35c754afdbc53309d1af9`, execute `0x51a90798c915299d4928f66d0c3990aa0ebff229d887a3e15029ccd24d647eb0`, block 65339219). Owner the Timelock below since block 65339465 (`HandOverTrustRegistry` multicall `0xe2a9ce2ec44632c168920bb400d5e583eca4daf640bd329e56565d24770f7f76`: guardian `0x2AB7…a0B3`, Timelock proposed; `acceptOwnership` scheduled `0xe1e24fff6e059b1d7e133e9f823830b2c0bab5e08a661bc9da2ef009b35cfb8d` and executed `0xa43e387df98cf8881e07b2743a4740aaa42a6568e2817096520f338e37a704f7`); guardian `0x2AB7…a0B3`. 1.0.0 deployed 2026-11-12 (`DeployTrustRegistry.s.sol`; owner `0x2AB7…a0B3` until the hand-over). Lists copied from AgenticID 1.3.0 by `MigrateTrust.s.sol` in one multicall (tx `0x9d6c5350b8abd9294356424472799f06fa6855fe1cf51c60e7b06643b02c7237`): the two bound attestors below, instance binding required, and the image list holding the four `pr229r2` images (openclaw `0x189913ef…5aca`, hermes `0xadc5e6d3…9ec4`, prime `0x9a6809bc…caca7`, 0g-harness `0xfb712f51…72f7`); the 148 other image hashes AgenticID listed were left behind. The sealed and harness lists started empty |
+| TrustRegistry impl | `0x85894c0e2CB73d6c5b21F213053447a5fF0E1329` | 1.1.0 (deploy `0x73f8f3c95817132c3923113687a0c507e6cbca24eb03a04a7e1e54970d93d896`, block 65339025; runtime bytecode equals the build of `contracts/` at `b300f33`). Previous: 1.0.0 `0xaA56808Eb309a60e0cb9f3B0393D5Cd0266A6c0C` |
+| TrustRegistry beacon | `0xe6B42aa9C2dD58B9C43d85E8CC02d486ACdf8534` | owned by the Timelock |
 | ReputationRegistry proxy (DEPRECATED — **paused** 2026-10-21: it still verifies the legacy ServeProof digest; §7) | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` | **1.2.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | ReputationRegistry impl | `0x2580630Ddce3b1836C8f5FF8D93134CdDd8661f3` | |
 | ReputationRegistry beacon | `0xd85172b48E824D8168E95f9D70E33091e5e1f9e2` | |
-| VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.2.0** (beacon-upgraded 2026-10-21, **upgrade block 61259384** — `FeedbackVerified` logs below it are pre-cut marks, §7). 1.1.0 (task-receipt opening) beacon-upgraded 2026-08-28; 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713` |
-| VerifiedFeedback impl | `0xcf37988CF9A89ad1115d7Cc0a535d7dA97b31218` | Previous: 1.1.0 `0x6d785265…b021`, 1.0.0 `0x471C5a09…13cfbd` |
+| VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.3.0** (versioned ServeProofs — beacon-upgraded 2026-11-12 03:01:55 UTC, upgrade block 65156596). 1.2.0 beacon-upgraded 2026-10-21, **upgrade block 61259384** — `FeedbackVerified` logs below it are pre-cut marks, §7. 1.1.0 (task-receipt opening) beacon-upgraded 2026-08-28; 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713` |
+| VerifiedFeedback impl | `0x59ceB32644B73C0318C74e55B1C934c294C37602` | Previous: 1.2.0 `0xcf37988CF9A89ad1115d7Cc0a535d7dA97b31218`, 1.1.0 `0x6d785265…b021`, 1.0.0 `0x471C5a09…13cfbd` |
 | VerifiedFeedback beacon | `0x9bBFCeB3e27837163a1E010E044296Da0DC34a0C` | |
 | CloneGate proxy | `0x1d4306e405bbcA5ab282C5104E7882aE6d122570` | **1.1.0** (beacon-upgraded 2026-10-21, §7). 1.0.0 deployed 2026-08-28 via `DeployCloneGate.s.sol`; policy-mode clone live-verified — allow + deny paths exact. 1.0.1 upgraded 2026-08-29 — arity diagnostic fix; storage intact, deny + arity paths re-probed live. A trusted attestor of AgenticID, bound to the attestor app (below) |
 | CloneGate impl | `0xEe1E0F4eE5d250e43394Bb1F91d23cbD06462888` | Previous: 1.0.1 `0xfCF587f3…354c` |
 | CloneGate beacon | `0xeD63552eEbe2480367C28b16F653c4181aB15e1A` | |
 | StandardCloneAuthorizer | `0x0663b7Abbdff1B451dDA292Ec9dd16a9DE34CA83` | official stock clone policy (immutable, no proxy; per-buyer switch keyed (agent, buyer); live-verified — agent 366 forked from 352 via CLI `clone 352` after `grant 352 <buyer>`) |
-| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x749A57eB4E647d43836C14585f3AF763Ae91A703` | v4, deployed 2026-08-31 (adds `onERC721Received` — a delegated wallet must stay a valid safeMint/safeTransfer receiver, else clone mints to it revert ERC721InvalidReceiver; supersedes v3 `0x91dE43…9577` and earlier); v3 added `receive()`; atomicity verified live (type-4 batch, bad-proof rollback). **Supersede consequence**: an EOA delegated to a superseded batcher keeps executing the OLD code until its next giveFeedback re-delegates (the SDK does so automatically on designator mismatch) — one more reason batcher fixes should land before an address is advertised beyond dev |
+| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x86e787b770Dc19b93682bbf19631e5C0Ae5904D5` | v5, deployed 2026-11-12 (tx `0x030ea0dfc2011896bb835d64720891c8af35c791ee0300746c97f0f91a5977a6`; adds `giveFeedbackAndAttestVersioned`; its runtime matches the source with the immutables masked). The dev attestor advertises it once its `ATTESTOR_FEEDBACK_BATCHER_ADDR` changes; until then v4 below |
+| FeedbackBatcher v4 | `0x749A57eB4E647d43836C14585f3AF763Ae91A703` | v4, deployed 2026-08-31 (adds `onERC721Received` — a delegated wallet must stay a valid safeMint/safeTransfer receiver, else clone mints to it revert ERC721InvalidReceiver; supersedes v3 `0x91dE43…9577` and earlier); v3 added `receive()`; atomicity verified live (type-4 batch, bad-proof rollback). **Supersede consequence**: an EOA delegated to a superseded batcher keeps executing the OLD code until its next giveFeedback re-delegates (the SDK does so automatically on designator mismatch) — one more reason batcher fixes should land before an address is advertised beyond dev |
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.2.0** (beacon-upgraded 2026-10-21; 1.1.0 audit on 2026-08-06; §7) |
 | TEEDataVerifier impl | `0x1bAf71F43644F02990d689027f8b0DEEB29Ba33c` | Previous: 1.1.0 `0x2509aE42…AF20` |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
-| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | `minDelay` 0; proposer + canceller + admin = `0x2AB7…a0B3` (admin also self; open execution) — migrated 2026-10-19 from `0x9C58…80Bb`, which renounced its roles (itself migrated 2026-10-12 from `0x7344…431b`); owns the five beacons |
-| owner / pauser (all contracts) + TEE oracle | `0x2AB7F05bA6560ef2B21Aa1b52FCc96DB51Cfa0B3` | migrated 2026-10-19 from `0x9C58…80Bb` (AgenticID `OwnershipTransferred` at block 60947194; window blocks 60946923–60947793), which was migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xB831…CEd7`, deployer/oracle history). TEEDataVerifier `teeOracleAddress()` = `0x2AB7…a0B3` too (2026-10-19) |
+| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | `minDelay` 0; proposer + canceller + admin = `0x2AB7…a0B3` (admin also self; open execution) — migrated 2026-10-19 from `0x9C58…80Bb`, which renounced its roles (itself migrated 2026-10-12 from `0x7344…431b`); owns the six beacons (the TrustRegistry's since 2026-11-12) and, since 2026-11-13, the TrustRegistry itself: dev's listings are Timelock operations (`TrustRegistryCalls.s.sol`, delay 0) |
+| owner / pauser (all contracts but the TrustRegistry, whose guardian it is) + TEE oracle | `0x2AB7F05bA6560ef2B21Aa1b52FCc96DB51Cfa0B3` | migrated 2026-10-19 from `0x9C58…80Bb` (AgenticID `OwnershipTransferred` at block 60947194; window blocks 60946923–60947793), which was migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xB831…CEd7`, deployer/oracle history). TEEDataVerifier `teeOracleAddress()` = `0x2AB7…a0B3` too (2026-10-19) |
 
-**Trusted attestors (AgenticID 1.3.0, read on chain 2026-10-28).**
+**Trusted attestors (AgenticID 1.3.0, read on chain 2026-10-28; since 2026-11-12
+held by the TrustRegistry, copied unchanged and read back through AgenticID
+1.4.0).**
 `instanceBoundAttestorsRequired()` = `true` since 2026-10-27 04:32 UTC (tx
 `0x133e54131fa6e9f29fd9e1fc3030b7590cc5adeea92e216da4621637bbc802ba`). Two
 addresses are bound, both to TappRegistry `0x2Ce8…65c9` (the same registry as
@@ -599,20 +673,26 @@ that version's beacon upgrade executed):
 
 | Contract | dev VERSION | test VERSION | mainnet VERSION |
 |---|---|---|---|
-| AgenticID | **1.3.0** (2026-10-26) | **1.3.0** (2026-10-27) | **1.3.0** (2026-11-02) |
+| AgenticID | **1.4.0** (2026-11-12) | **1.3.0** (2026-10-27) | **1.3.0** (2026-11-02) |
+| TrustRegistry | **1.0.0** (2026-11-12) | — (not deployed) | — (not deployed) |
 | TEEDataVerifier | **1.2.0** (2026-10-21) | **1.2.0** (2026-10-23) | **1.2.0** (2026-11-02) |
 | AgenticIDReputationRegistry (deprecated) | **1.2.0**, paused | **1.2.0**, paused | — (not deployed) |
-| VerifiedFeedbackRegistry | **1.2.0** (2026-10-21) | **1.2.0** (2026-10-23) | **1.2.0** (2026-11-02) |
+| VerifiedFeedbackRegistry | **1.3.0** (2026-11-12) | **1.2.0** (2026-10-23) | **1.2.0** (2026-11-02) |
 | CloneGate | **1.1.0** (2026-10-21) | **1.1.0** (2026-10-23) | **1.1.0** (2026-11-02) |
 
-> All three environments are at parity and run the source's versions: AgenticID
-> **1.3.0** (instance-bound attestors required on all three, §6.1 / §6.2 / §6.2m),
+> Test and mainnet are at parity: AgenticID
+> **1.3.0** (instance-bound attestors required on both, §6.1 / §6.2m),
 > TEEDataVerifier **1.2.0**, VerifiedFeedbackRegistry **1.2.0** and CloneGate
 > **1.1.0**. Mainnet moved to them on 2026-11-02, AgenticID straight from 1.1.0
-> (changelog entries below). Each environment has its own impls (dev
+> (changelog entries below). Dev runs the source's AgenticID **1.4.0**,
+> TrustRegistry **1.0.0**, VerifiedFeedbackRegistry **1.3.0** and FeedbackBatcher
+> v5 since 2026-11-12; test and mainnet follow by UPGRADING.md "AgenticID
+> 1.4.0". Each environment has its own impls (dev
 > and test deployed separately on the same chain). The 1.2.0 / 1.1.0 impls
 > are solc 0.8.24 builds (optimizer runs 200, via-IR — the `foundry.toml` of
-> `27aef57`); AgenticID 1.3.0 and its library are built with the current
+> `27aef57`); AgenticID 1.3.0 and its library, and dev's 1.4.0 set
+> (AgenticID 1.4.0, TrustRegistry 1.0.0, VerifiedFeedbackRegistry 1.3.0,
+> FeedbackBatcher v5), are built with the current
 > settings (solc 0.8.38, runs 1, Cancun, `bytecode_hash = "none"`;
 > UPGRADING.md §1). Every impl and all three libraries are verified on
 > chainscan with the settings they were built with (the 1.3.0 impls with their
@@ -625,6 +705,55 @@ that version's beacon upgrade executed):
 
 Changelog:
 
+- **TrustRegistry 1.1.0 — dev beacon-upgraded 2026-11-13 (upgrade block
+  65339219) and handed to the dev Timelock (block 65339465; §6.2)** — a guardian,
+  so adding trust can wait for the Timelock while removing it does not (§1):
+  `guardian` appended to the namespaced struct (zero until set, no
+  reinitializer); `delist` and `removeTrustedAttestor` take the owner or the
+  guardian (`TrustRegistryNotOwnerOrGuardian` otherwise); `setGuardian` (owner,
+  event `GuardianSet`) and `guardian()`; everything else stays owner only.
+  Minor per UPGRADING.md: a beacon upgrade, then the owner move to the
+  Timelock (UPGRADING.md "TrustRegistry 1.1.0 and the owner move"). 5,905 B.
+  Rollback to 1.0.0 leaves `guardian` unread; removing trust is then the
+  owner's alone, through the Timelock once it owns the registry.
+- **AgenticID 1.4.0 + TrustRegistry 1.0.0 — dev beacon-upgraded 2026-11-12
+  (upgrade block 65156470; §6.2)** — the trust
+  decisions move to a new beacon-proxied `TrustRegistry` (sealed/LAYERS.md
+  §10): the attestor list with its app bindings and instance mode — same
+  functions, events and errors as AgenticID 1.3.0 — plus code lists by kind
+  (`IMAGE`, which takes over `validFrameworkHashes`, `SEALED`, `HARNESS`; any
+  `bytes32` kind) with `list` / `delist` / `isListed` / `latest` / `listed`,
+  and `multicall` for owner batches. AgenticID 1.4.0 is a beacon upgrade with
+  no storage change: the four trust fields stay in place, retired (never read or
+  written again, so a rollback to 1.3.0 finds them as they were). Its
+  implementation takes the registry in the constructor (`trustRegistry()`), so
+  the upgrade switches every trust read at once; `isTrustedAttestor`,
+  `isValidFrameworkHash` (the image list), `trustedAttestorAppBinding` and
+  `instanceBoundAttestorsRequired` forward; the list-management functions and
+  their events leave AgenticID's ABI (the IAgenticID ERC-165 id changes); no
+  linked library (23,788 B). The lists must be in the registry before the
+  upgrade executes — `script/MigrateTrust.s.sol` (UPGRADING.md). Rehearsed on
+  forks of all three environments on 2026-11-11 (`MODE=rehearse`: copy, check,
+  upgrade, every candidate reads the same): dev 2 bound attestors + 148 image
+  hashes, test 2 + 16, mainnet 2 + 11, instance binding required on all three.
+  Dev (2026-11-12) kept only the four images it serves (`IMAGES`, the
+  `pr229r2` set); `MODE=check` passed before the upgrade (every candidate
+  read the same on AgenticID 1.3.0 and the registry) and after it (AgenticID
+  read the registry; the kept hashes were listed, the dropped ones not). An
+  environment's `IMAGES` keeps every image its containers may boot again
+  (UPGRADING.md "AgenticID 1.4.0", step 0): a container on a dropped image
+  fails `/provision` at its next boot until its owner resets it.
+- **VerifiedFeedbackRegistry 1.3.0 — dev beacon-upgraded 2026-11-12 (upgrade
+  block 65156596)** — versioned ServeProofs
+  (ServeProof v2, the 0g-harness layered runtime): `attestVersionedFeedback`
+  takes a `VersionedServeProof` (version 2 only, else
+  `VerifiedFeedbackUnsupportedVersion`) whose digest adds `sealedHash`,
+  `harnessHash`, `inferenceURL` and `model` behind a version tag, under v1's
+  wrap and checks, with an optional task reveal; `ServeData` gains trailing
+  `sealedHash` / `harnessHash` (append-safe); new `VersionedFeedbackVerified`
+  event and `getServeLayers` view. The v1 entry points, digest and events are
+  unchanged. **FeedbackBatcher v5 — dev 2026-11-12 (`0x86e7…04D5`)** — adds
+  `giveFeedbackAndAttestVersioned`; a new address, like every batcher change.
 - **AgenticID 1.3.0 — dev beacon-upgraded 2026-10-26, test 2026-10-27,
   mainnet 2026-11-02** — instance-bound trusted attestors (app identities,
   [`attestor/APP_IDENTITY.md`](../attestor/APP_IDENTITY.md)). Minor per
@@ -1060,7 +1189,8 @@ Changelog:
     for: no single private key; whether a transaction needs more than one
     approver is a vault-policy setting, see Recommended below (owner decision:
     admin calls stay direct vault calls, no Timelock or guardian in front of
-    them).
+    them — except the TrustRegistry's additions of trust, which go through the
+    Timelock with the vault as guardian, §1).
   - **Done — upgrade delay:** Timelock `minDelay` 86400 (1 day, the chosen floor
     rather than the earlier "≥ 2 days"); `Deploy.s.sol` now defaults to and
     enforces ≥ 86400 on chain 16661. Executors stay open (`address(0)`) by

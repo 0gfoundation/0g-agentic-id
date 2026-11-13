@@ -923,6 +923,29 @@ func Chmod(path string, perm fs.FileMode) error {
 	return nil
 }
 
+// Symlink creates a symbolic link at path holding target. The parent is
+// opened component by component without following links, an entry already
+// at path is an error, and target is stored as given, never resolved here.
+// Like every new entry, the link takes the owner of its directory.
+func Symlink(target, path string) error {
+	pfd, base, err := openParent("symlink", path)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(pfd)
+	if err := unix.Symlinkat(target, pfd, base); err != nil {
+		return pathErr("symlink", path, err)
+	}
+	var pst unix.Stat_t
+	if err := unix.Fstat(pfd, &pst); err != nil {
+		return pathErr("symlink", path, err)
+	}
+	if err := unix.Fchownat(pfd, base, int(pst.Uid), int(pst.Gid), unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return pathErr("symlink", path, err)
+	}
+	return nil
+}
+
 // Rename renames oldpath to newpath without following links: both parent
 // directories are opened component by component (a link in either path is
 // refused) and a link at oldpath is renamed itself. Like rename(2), an
@@ -1227,8 +1250,13 @@ func handoverProtected() []string {
 	if exe, err := os.Executable(); err == nil {
 		out = addPath(out, exe)
 	}
-	return out
+	return addPath(out, loaderPath)
 }
+
+// loaderPath is the loader that runs sealed in the layered 0g-harness image
+// (cmd/loader): PID 1 there, and root like sealed. Images without a loader
+// have no such file, and the entry then matches nothing that exists.
+const loaderPath = "/loader"
 
 // protectedTools are the commands sealed runs by name, as root
 // (RootCommand) or as the agent (AgentCommand, Sweep).

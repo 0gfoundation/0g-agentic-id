@@ -206,3 +206,25 @@ func TestWatcher_StopHaltsLoop(t *testing.T) {
 		t.Errorf("watcher kept polling after Stop: prev=%d post=%d", prev, post)
 	}
 }
+
+// Done closes only after Run has returned, so a caller that waits on it
+// knows no tick (and no OnDrift) is still running.
+func TestWatcher_DoneClosesAfterRunReturns(t *testing.T) {
+	a := &fakeAdapter{dims: []string{"config"}}
+	ag := state.New()
+	w := New(a, ag, Config{Interval: 3 * time.Millisecond})
+
+	select {
+	case <-w.Done():
+		t.Fatal("Done closed before Run started")
+	default:
+	}
+	go w.Run(context.Background())
+	time.Sleep(10 * time.Millisecond)
+	w.Stop()
+	select {
+	case <-w.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Done did not close after Stop")
+	}
+}

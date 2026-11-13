@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func svc(path, method, backend string) ServiceEntry {
 	return ServiceEntry{Path: path, Method: method, Backend: backend}
@@ -10,7 +13,7 @@ func TestValidateServices_valid(t *testing.T) {
 	out, err := validateServices([]ServiceEntry{
 		{Path: "/api/fortune", Method: "post", Backend: "http://127.0.0.1:9090", InputExample: `{"sign":"leo"}`},
 		{Path: "/api/summary", Method: "GET", Backend: "http://localhost:8181"},
-	})
+	}, fieldLimits{})
 	if err != nil {
 		t.Fatalf("expected valid, got %v", err)
 	}
@@ -38,7 +41,7 @@ func TestValidateServices_rejects(t *testing.T) {
 		{"empty backend", svc("/api/x", "POST", "")},
 	}
 	for _, c := range cases {
-		if _, err := validateServices([]ServiceEntry{c.entry}); err == nil {
+		if _, err := validateServices([]ServiceEntry{c.entry}, fieldLimits{}); err == nil {
 			t.Errorf("%s: expected rejection, got nil", c.name)
 		}
 	}
@@ -47,13 +50,13 @@ func TestValidateServices_rejects(t *testing.T) {
 func TestValidateServices_rejectsBadInputExample(t *testing.T) {
 	e := svc("/api/x", "POST", "http://127.0.0.1:9090")
 	e.InputExample = "{not json"
-	if _, err := validateServices([]ServiceEntry{e}); err == nil {
+	if _, err := validateServices([]ServiceEntry{e}, fieldLimits{}); err == nil {
 		t.Error("expected rejection for invalid input_example JSON")
 	}
 }
 
 func TestValidateServices_transport(t *testing.T) {
-	ok, err := validateServices([]ServiceEntry{{Path: "/api/mcp", Method: "POST", Backend: "http://127.0.0.1:9090", Transport: "mcp"}})
+	ok, err := validateServices([]ServiceEntry{{Path: "/api/mcp", Method: "POST", Backend: "http://127.0.0.1:9090", Transport: "mcp"}}, fieldLimits{})
 	if err != nil {
 		t.Fatalf("mcp transport on a POST route must be valid, got %v", err)
 	}
@@ -70,7 +73,7 @@ func TestValidateServices_transport(t *testing.T) {
 		{"case-sensitive: MCP is rejected too", ServiceEntry{Path: "/api/x", Method: "POST", Backend: "http://127.0.0.1:9090", Transport: "MCP"}},
 	}
 	for _, c := range cases {
-		if _, err := validateServices([]ServiceEntry{c.entry}); err == nil {
+		if _, err := validateServices([]ServiceEntry{c.entry}, fieldLimits{}); err == nil {
 			t.Errorf("%s: expected rejection, got nil", c.name)
 		}
 	}
@@ -80,7 +83,7 @@ func TestValidateServices_rejectsDuplicatePath(t *testing.T) {
 	_, err := validateServices([]ServiceEntry{
 		svc("/api/x", "POST", "http://127.0.0.1:9090"),
 		svc("/api/x", "GET", "http://127.0.0.1:9091"),
-	})
+	}, fieldLimits{})
 	if err == nil {
 		t.Error("expected rejection for duplicate path")
 	}
@@ -91,9 +94,30 @@ func TestValidateServices_allOrNothing(t *testing.T) {
 	_, err := validateServices([]ServiceEntry{
 		svc("/api/good", "POST", "http://127.0.0.1:9090"),
 		svc("/nope", "POST", "http://127.0.0.1:9091"),
-	})
+	}, fieldLimits{})
 	if err == nil {
 		t.Error("expected the whole batch rejected when one entry is invalid")
+	}
+}
+
+// Bounded fields (framework.ServiceFieldLimiter): an entry over a limit
+// rejects the batch; at the limit it passes; zero leaves a field unbounded.
+func TestValidateServices_fieldLimits(t *testing.T) {
+	e := svc("/api/x", "POST", "http://127.0.0.1:9090")
+	e.Description = strings.Repeat("d", 10)
+	e.InputExample = `"` + strings.Repeat("x", 8) + `"`
+	if _, err := validateServices([]ServiceEntry{e}, fieldLimits{description: 10, inputExample: 10}); err != nil {
+		t.Fatalf("at the limits: %v", err)
+	}
+	if _, err := validateServices([]ServiceEntry{e}, fieldLimits{description: 9}); err == nil {
+		t.Error("a description over its limit passed")
+	}
+	if _, err := validateServices([]ServiceEntry{e}, fieldLimits{inputExample: 9}); err == nil {
+		t.Error("an input example over its limit passed")
+	}
+	e.Description = strings.Repeat("d", 100000)
+	if _, err := validateServices([]ServiceEntry{e}, fieldLimits{}); err != nil {
+		t.Fatalf("unbounded: %v", err)
 	}
 }
 

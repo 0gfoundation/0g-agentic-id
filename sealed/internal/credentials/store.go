@@ -18,6 +18,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"seal-verify/internal/credproxy"
+	"sync/atomic"
 )
 
 // pendingTTL is how long an undecided request stays open; no decision in
@@ -158,6 +159,10 @@ type derived struct {
 type Store struct {
 	env Env
 	reg *credproxy.Registry
+
+	// revealTool turns on the reveal socket's MCP tool (tools.go), for a
+	// framework that mounts the runtime's tools.
+	revealTool atomic.Bool
 
 	auditMu     sync.Mutex
 	auditCounts map[string]*AuditRecord // counted records, by countKey

@@ -70,12 +70,25 @@ export interface ServeProof {
   taskHash: `0x${string}`;
   /** Hashes of the data involved in the service */
   dataHashes: `0x${string}`[];
-  /** Hash of the agent framework version */
+  /** Hash of the agent framework version: the image hash (base) */
   frameworkHash: `0x${string}`;
   /** agentSeal signature: EIP-191 version 0x00 (data with intended validator
    *  = the VerifiedFeedbackRegistry proxy) over the proof's abi.encode hash —
    *  see buildServeProofSigningHash. NOT personal_sign. */
   signature: `0x${string}`;
+  /** 2 for a versioned proof, which also signs the four fields below;
+   *  LEGACY(v1): absent for v1, what images before the layered runtime sign.
+   *  It picks the digest and the registry entry point (sealed/LAYERS.md §7). */
+  version?: number;
+  /** v2: sha256 of the sealed program the loader verified and ran. */
+  sealedHash?: `0x${string}`;
+  /** v2: sha256 of the official harness version running. */
+  harnessHash?: `0x${string}`;
+  /** v2: where sealed's inference proxy forwarded model calls; '' when the
+   *  framework dials its provider itself. */
+  inferenceURL?: string;
+  /** v2: the model name the inference proxy sent, the owner's setting. */
+  model?: string;
   /** The VerifiedFeedbackRegistry the sealed proxy signed this proof for, as
    *  echoed in the X-Agent-Proof envelope. Diagnostics only: unsigned, NOT part
    *  of the on-chain ServeProof tuple (the registry uses its own address), and
@@ -171,6 +184,17 @@ export interface ServeData {
   dataHashes: `0x${string}`[];
   /** Framework hash */
   frameworkHash: `0x${string}`;
+}
+
+/**
+ * The layers a verified entry's ServeProof named (v2): the sealed program and
+ * the official harness version. Zero hashes for an entry attested with a v1
+ * proof.
+ * @struct
+ */
+export interface ServeLayers {
+  sealedHash: `0x${string}`;
+  harnessHash: `0x${string}`;
 }
 
 /**
@@ -354,4 +378,39 @@ export interface GetSummaryParams {
   tag1?: string;
   /** Second tag filter. Default: no filter. */
   tag2?: string;
+}
+
+/**
+ * One record of what an agent's sign socket did: a signature it made, or a
+ * request a rule refused (`result: "refused"`, with `reason`). Which fields
+ * are set depends on `kind`. Read with `AgenticID.signatures`.
+ */
+export interface SignatureRecord {
+  /** Record number; pass the last one seen as `after` to read only newer ones. */
+  seq: number;
+  /** When, RFC 3339. */
+  ts: string;
+  kind: 'personal_sign' | 'typed_data' | 'transaction';
+  result: 'signed' | 'refused';
+  /** Why a rule refused it. */
+  reason?: string;
+  /** personal_sign: the EIP-191 hash, the message length in bytes, and its start when it is text. */
+  msg_hash?: string;
+  length?: number;
+  text?: string;
+  /** typed_data: the EIP-712 digest, the primary type and the domain fields set. */
+  digest?: string;
+  primary_type?: string;
+  domain?: { name?: string; version?: string; chain_id?: string; verifying_contract?: string };
+  /** transaction: what was signed. `create` marks a contract creation (no `to`). */
+  tx_hash?: string;
+  chain_id?: string;
+  to?: string;
+  create?: boolean;
+  /** Wei, decimal. */
+  value?: string;
+  nonce?: number;
+  /** The calldata's first four bytes, and its length in bytes. */
+  selector?: string;
+  data_len?: number;
 }

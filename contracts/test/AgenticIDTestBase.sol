@@ -7,6 +7,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 import {AgenticID} from "../src/AgenticID.sol";
+import {TrustRegistry} from "../src/TrustRegistry.sol";
 import {CanonicalIdentityRegistryMock} from "./mocks/CanonicalIdentityRegistryMock.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
@@ -24,6 +25,7 @@ import {
 ///      pre-whitelist revert path cleanly.
 abstract contract AgenticIDTestBase is Test {
     AgenticID internal agenticId;
+    TrustRegistry internal trustRegistry;
     CanonicalIdentityRegistryMock internal canonical;
     TEEDataVerifier internal verifier;
 
@@ -54,7 +56,9 @@ abstract contract AgenticIDTestBase is Test {
         canonical = new CanonicalIdentityRegistryMock();
         canonical.initialize();
 
-        AgenticID agenticIdImpl = new AgenticID();
+        trustRegistry = _deployTrustRegistry(owner);
+
+        AgenticID agenticIdImpl = new AgenticID(address(trustRegistry));
         ERC1967Proxy agenticIdProxy = new ERC1967Proxy(
             address(agenticIdImpl),
             abi.encodeCall(
@@ -65,9 +69,17 @@ abstract contract AgenticIDTestBase is Test {
         agenticId = AgenticID(address(agenticIdProxy));
     }
 
+    /// @dev A TrustRegistry proxy owned by `registryOwner`.
+    function _deployTrustRegistry(address registryOwner) internal returns (TrustRegistry) {
+        ERC1967Proxy proxy = new ERC1967Proxy(
+            address(new TrustRegistry()), abi.encodeCall(TrustRegistry.initialize, (registryOwner))
+        );
+        return TrustRegistry(address(proxy));
+    }
+
     function _whitelistAttestor() internal {
         vm.prank(owner);
-        agenticId.addTrustedAttestor(attestor);
+        trustRegistry.addTrustedAttestor(attestor);
     }
 
     // ── Signing primitives ────────────────────────────────────────────────────

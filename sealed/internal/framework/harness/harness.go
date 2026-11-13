@@ -62,19 +62,20 @@
 //	spawn.go        Start/Stop/probes + the harness lifecycle and the routes
 //	                it advertises
 //
-// The harness itself, with its platform plugins (seal-tools, seal-guard,
-// subagent-guard), lives in github.com/0gfoundation/0g-harness; the image
-// installs a pinned version of it (images/harness/Dockerfile).
+// The harness itself, with its platform plugins (seal-tools, which registers
+// the runtime's tools, and subagent-guard), lives in
+// github.com/0gfoundation/0g-harness; the image installs a pinned version of
+// it (images/harness/Dockerfile).
 package harness
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"sync"
 
 	"seal-verify/internal/framework"
+	"seal-verify/internal/inferproxy"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manifest"
 	"seal-verify/internal/privsep"
@@ -92,6 +93,18 @@ const frameworkName = "0g-harness"
 // agent on any chain carries it.
 const legacyFrameworkName = "dsh"
 
+// The optional interfaces of the layered runtime this adapter implements
+// (FRAMEWORK_ADAPTER.md §2.2).
+var (
+	_ framework.LayeredRuntime      = (*Adapter)(nil)
+	_ framework.UncommittedKeeper   = (*Adapter)(nil)
+	_ framework.PlaintextCommitter  = (*Adapter)(nil)
+	_ framework.BearerTranslator    = (*Adapter)(nil)
+	_ framework.ServiceFieldLimiter = (*Adapter)(nil)
+	_ framework.SigningRules        = (*Adapter)(nil)
+	_ framework.RuntimeTools        = (*Adapter)(nil)
+)
+
 // Adapter is the 0g-harness implementation of framework.Framework.
 type Adapter struct {
 	mu sync.RWMutex
@@ -99,13 +112,33 @@ type Adapter struct {
 	// binding is the composed framework-role state (name + pinned version).
 	binding frameworkBinding
 
-	// cmd is the running harness process (nil before first Start / after Stop).
-	cmd *exec.Cmd
+	// proc is the running harness process (nil before first Start / after
+	// Stop).
+	proc *harnessProc
 
-	// bridgeToken gates the harness's /v1/* surface; AuthResponse hands it to a
-	// verified owner. Minted once per container (memory-only), so a reset
-	// rotates it.
+	// pkgHash and pkgDir name the harness official version package Start
+	// runs (UseHarness, sealed/LAYERS.md §5). Unset, Start runs the image's
+	// global install (legacyHarnessEntry) and the hash is unknown.
+	pkgHash string
+	pkgDir  string
+	// runHash is the package the last spawned harness process runs.
+	runHash string
+
+	// infer is sealed's inference route (spawn.go, internal/inferproxy); nil
+	// until first needed. inferURL and inferModel are the endpoint it
+	// forwards to and the model it names, as of the last Start.
+	infer      *inferproxy.Server
+	inferURL   string
+	inferModel string
+
+	// bridgeToken gates the harness's /v1/* surface: the harness checks it on
+	// every request. It stays in sealed and the harness: the owner gets
+	// ownerToken instead (AuthResponse), and the proxy swaps one for the
+	// other on the way in (TranslateBearer), so nothing the harness runs ever
+	// sees the owner's token. Both are minted once per container
+	// (memory-only), so a reset rotates them.
 	bridgeToken string
+	ownerToken  string
 
 	// rendered is what RenderSettings last produced from the owner's settings
 	// document: the resolved pin Start boots on, plus the harness environment
@@ -283,6 +316,46 @@ func (a *Adapter) EvolutionFor(ctx context.Context, role string) ([]byte, error)
 	return nil, framework.ErrUnsupportedDim
 }
 
+// UseHarness makes the official version package unpacked at dir, whose
+// sha256 is hash, the one the next Start runs (framework.LayeredRuntime).
+// The running process is not touched: a restart (manager Reload) brings the
+// package in.
+func (a *Adapter) UseHarness(hash, dir string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pkgHash, a.pkgDir = hash, dir
+}
+
+// HarnessHash is the sha256 (64 hex) of the package the harness process
+// last started from, "" before the first Start or when it runs the image's
+// global install.
+func (a *Adapter) HarnessHash() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.runHash
+}
+
+// InferenceTarget is the endpoint sealed's inference route forwards the
+// harness's model calls to, and the model it names (framework.LayeredRuntime);
+// "" for the URL when the harness dials a provider sealed knows no endpoint
+// of.
+func (a *Adapter) InferenceTarget() (url, model string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.inferURL, a.inferModel
+}
+
+// CommitsPlaintext: every entry this agent commits carries a salted
+// commitment to its plaintext (framework.PlaintextCommitter).
+func (a *Adapter) CommitsPlaintext() bool { return true }
+
+// KeepsUncommitted: the persona and the skills are the agent's own writing,
+// so a boot keeps what it changed after its last commit
+// (framework.UncommittedKeeper). The framework binding is not.
+func (a *Adapter) KeepsUncommitted(role string) bool {
+	return role == "APPEND_SYSTEM.md" || role == "skills/"
+}
+
 // LoadEntry returns one manifest entry's plaintext. Must hash to exactly the
 // content_hash EvolutionFor declared for that path.
 func (a *Adapter) LoadEntry(ctx context.Context, role, path string) ([]byte, error) {
@@ -313,4 +386,9 @@ var (
 	// Transitional: recovers the pin from the retired "settings.yaml" role
 	// for agents minted before the settings channel (settings.go).
 	_ framework.LegacySettingsSeeder = (*Adapter)(nil)
+	_ framework.UncommittedKeeper    = (*Adapter)(nil)
+	_ framework.LayeredRuntime       = (*Adapter)(nil)
+	_ framework.BearerTranslator     = (*Adapter)(nil)
+	_ framework.ServiceFieldLimiter  = (*Adapter)(nil)
+	_ framework.PlaintextCommitter   = (*Adapter)(nil)
 )

@@ -129,6 +129,11 @@ func startCredentials(cfg *config.Bootstrap, res *chainBootstrapResult, agentSea
 		logger.Logf("FAIL credentials: %v", err)
 		return none, nil, nil
 	}
+	// The reveal socket's tool, for a framework that mounts the runtime's
+	// tools (the adapter is bound by now).
+	if sealedProxy.ServesRuntimeTools() {
+		store.ServeRevealTool()
+	}
 	if err := proxy.ServeAgentSocket(credRevealSockPath, "credential reveal", store.RevealHandler()); err != nil {
 		logger.Logf("FAIL credentials: %v", err)
 		return none, nil, nil

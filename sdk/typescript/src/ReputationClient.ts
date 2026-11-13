@@ -11,6 +11,11 @@
  * (feedback values: canonical; verification marks + serve data: local).
  * The canonical registry's address is discovered from the local contract
  * (`getCanonicalReputation`), so configuration needs only `verifiedFeedback`.
+ *
+ * The proof's own `version` picks the registry entry point: a v2 proof goes
+ * to `attestVersionedFeedback` (registry 1.3.0+, batcher
+ * `giveFeedbackAndAttestVersioned`), a proof without one to the v1 entry
+ * points (LEGACY(v1): legacy/serveProofV1.ts).
  */
 
 import {
@@ -18,6 +23,7 @@ import {
   type PublicClient,
   type Address,
   type Hash,
+  type Hex,
   type Chain,
   type Account,
   type WriteContractReturnType,
@@ -31,7 +37,9 @@ import {
 import { agenticIDAbi, canonicalReputationAbi, verifiedFeedbackAbi, feedbackBatcherAbi } from './abi';
 import { RECEIPT_WAIT } from './constants';
 import { type Ctx } from './context';
-import { verifyServeProofSignature } from './ServeProof';
+import { SERVE_PROOF_VERSION, serveProofLayers, verifyServeProofSignature } from './ServeProof';
+import { attestV1, batchCallV1 } from './legacy/serveProofV1';
+import { findViemError, isContractRevert } from './viemErrors';
 import type {
   ServeProof,
   GiveFeedbackParams,
@@ -42,11 +50,57 @@ import type {
   Feedback,
   FeedbackSummary,
   ServeData,
+  ServeLayers,
   TaskReveal,
 } from './types';
 
 const ZERO32 = ('0x' + '0'.repeat(64)) as `0x${string}`;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+/** The canonical giveFeedback arguments, in the batcher's order. */
+export type FeedbackArgs = readonly [bigint, bigint, number, string, string, string, string, Hex];
+
+/** The task argument when there is no receipt to open: an EMPTY method makes
+ *  the batcher (and attestVersionedFeedback) skip the opening, so statusCode
+ *  0 is never checked. */
+const NO_TASK: TaskReveal = { method: '', uri: '', reqBodyHash: ZERO32, respBodyHash: ZERO32, statusCode: 0 };
+
+/** The first VerifiedFeedbackRegistry version with attestVersionedFeedback
+ *  and getServeLayers. LEGACY(pre-1.4.0): checked only because a registry
+ *  before it may still be configured. */
+const VERSIONED_REGISTRY = [1, 3, 0] as const;
+
+/** Whether a "major.minor.patch" version string is at least `min`. */
+function versionAtLeast(version: string, min: readonly [number, number, number]): boolean {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+  if (!m) return false;
+  for (let i = 0; i < 3; i++) {
+    const part = Number(m[i + 1]);
+    if (part !== min[i]) return part > min[i];
+  }
+  return true;
+}
+
+/** The thirteen on-chain fields of a v2 proof, for attestVersionedFeedback
+ *  and the batcher. The caller has checked the layer fields. */
+function versionedTuple(proof: ServeProof) {
+  const layers = serveProofLayers(proof)!;
+  return {
+    version: proof.version!,
+    agentId: proof.agentId,
+    submitter: proof.submitter,
+    timestamp: proof.timestamp,
+    deadline: proof.deadline,
+    taskHash: proof.taskHash,
+    dataHashes: proof.dataHashes,
+    frameworkHash: proof.frameworkHash,
+    sealedHash: layers.sealedHash,
+    harnessHash: layers.harnessHash,
+    inferenceURL: layers.inferenceURL,
+    model: layers.model,
+    signature: proof.signature,
+  };
+}
 
 /**
  * Seconds of headroom the sequential preflight demands before a proof's
@@ -119,6 +173,10 @@ function assertFeedbackValueInRange(value: bigint, valueDecimals: number): void 
 export class ReputationClient {
   /** Cached canonical registry address, discovered from the local contract. */
   private canonicalAddr?: Address;
+  /** Cached VerifiedFeedbackRegistry VERSION, once it takes versioned proofs. */
+  private registryVersionValue?: string;
+  /** Per batcher address: whether it has giveFeedbackAndAttestVersioned. */
+  private readonly batcherVersioned = new Map<string, boolean>();
 
   constructor(private readonly ctx: Ctx) {}
 
@@ -140,6 +198,49 @@ export class ReputationClient {
       );
     }
     return a;
+  }
+
+  /** The VerifiedFeedbackRegistry's VERSION. Kept once it is 1.3.0 or later;
+   *  LEGACY(pre-1.4.0): an older one is read again each time, as its upgrade
+   *  can land while this client lives. */
+  private async registryVersion(): Promise<string> {
+    if (this.registryVersionValue !== undefined) return this.registryVersionValue;
+    const version = (await this.publicClient.readContract({
+      address: this.verifiedFeedbackAddr,
+      abi: verifiedFeedbackAbi,
+      functionName: 'VERSION',
+    })) as string;
+    if (versionAtLeast(version, VERSIONED_REGISTRY)) this.registryVersionValue = version;
+    return version;
+  }
+
+  /**
+   * Refuse, before anything is broadcast, a versioned proof this SDK or the
+   * configured registry cannot take: a version other than 2, malformed layer
+   * fields, or a registry before 1.3.0 (no attestVersionedFeedback). Without
+   * this the sequential path would land the canonical entry and then fail
+   * its attest.
+   */
+  private async assertVersionedAccepted(proof: ServeProof): Promise<void> {
+    if (proof.version !== SERVE_PROOF_VERSION) {
+      throw new Error(
+        `reputation: unsupported serve-proof version ${String(proof.version)} — this SDK submits v2, and v1 without a version; nothing was broadcast`,
+      );
+    }
+    if (!serveProofLayers(proof)) {
+      throw new Error(
+        'reputation: v2 serve-proof with missing or malformed layer fields (sealedHash and harnessHash are 32-byte hex; ' +
+          'inferenceURL and model strings) — nothing was broadcast',
+      );
+    }
+    // LEGACY(pre-1.4.0): a registry before 1.3.0 has no attestVersionedFeedback.
+    const version = await this.registryVersion();
+    if (!versionAtLeast(version, VERSIONED_REGISTRY)) {
+      throw new Error(
+        `reputation: the VerifiedFeedbackRegistry at ${this.verifiedFeedbackAddr} is ${version}; a v2 serve-proof needs ` +
+          `${VERSIONED_REGISTRY.join('.')} or later (attestVersionedFeedback) — nothing was broadcast`,
+      );
+    }
   }
 
   /** Canonical ERC-8004 ReputationRegistry address — read once from the local contract, then cached. */
@@ -187,6 +288,8 @@ export class ReputationClient {
     // sequential canonical write that precedes attestFeedbackWithTask.
     if (params.task) assertTaskStatusCode(params.task);
     assertFeedbackValueInRange(params.value, params.valueDecimals ?? 0);
+    // LEGACY(v1): a proof without a version takes the v1 entry points.
+    if (params.serveProof.version !== undefined) await this.assertVersionedAccepted(params.serveProof);
 
     const batcher = this.ctx.addresses.feedbackBatcher;
     if (batcher && batcher !== '0x0000000000000000000000000000000000000000') {
@@ -219,9 +322,7 @@ export class ReputationClient {
     // once the write mines — this wait is inherent to the flow, not politeness.
     await this.waitForTransaction(feedbackTx);
     const feedbackIndex = await this.getLastIndex(params.agentId, this.account!.address);
-    const attestTx = params.task
-      ? await this.attestFeedbackWithTask(params.agentId, feedbackIndex, params.serveProof, params.task)
-      : await this.attestFeedback(params.agentId, feedbackIndex, params.serveProof);
+    const attestTx = await this.attest(params.agentId, feedbackIndex, params.serveProof, params.task);
     return { feedbackTx, attestTx, feedbackIndex };
   }
 
@@ -304,7 +405,8 @@ export class ReputationClient {
       refuse(
         proof.validator
           ? 'signature does not match the on-chain agentSeal'
-          : 'signature does not match the on-chain agentSeal; the proof names no validator — likely a pre-upgrade sealed image, which only an owner reset fixes',
+          : // LEGACY(v1): the hint for an image from before the validator.
+            'signature does not match the on-chain agentSeal; the proof names no validator — likely a pre-upgrade sealed image, which only an owner reset fixes',
       );
     }
     // Owner / operator self-feedback — the registry's ERC-721 checks against
@@ -357,6 +459,13 @@ export class ReputationClient {
     params: GiveFeedbackParams,
   ): Promise<GiveFeedbackResult | null> {
     const me = this.account!.address;
+    const sp = params.serveProof;
+    // LEGACY(v1): a proof without a version takes the v1 batch.
+    const versioned = sp.version !== undefined;
+    // LEGACY(pre-1.4.0): a batcher deployed before versioned proofs has no
+    // entry for them: take the sequential path, before anything is signed or
+    // sent.
+    if (versioned && !(await this.batcherTakesVersioned(batcher))) return null;
 
     // Delegation designator this EOA needs: 0xef0100 ‖ batcher.
     const designator = ('0xef0100' + batcher.slice(2)).toLowerCase();
@@ -377,41 +486,28 @@ export class ReputationClient {
       }
     }
 
-    const sp = params.serveProof;
+    const feedback: FeedbackArgs = [
+      params.agentId,
+      params.value,
+      params.valueDecimals ?? 0,
+      params.tag1 ?? '',
+      params.tag2 ?? '',
+      params.endpoint ?? '',
+      params.feedbackURI ?? '',
+      params.feedbackHash ?? ZERO32,
+    ];
+    const data: Hex = versioned
+      ? encodeFunctionData({
+          abi: feedbackBatcherAbi,
+          functionName: 'giveFeedbackAndAttestVersioned',
+          args: [...feedback, versionedTuple(sp), params.task ?? NO_TASK],
+        })
+      : batchCallV1(feedback, sp, params.task ?? NO_TASK);
     const txHash = await this.walletClient!.sendTransaction({
       account: this.account!,
       chain: this.chain,
       to: me, // self-call executes the delegated batcher code as the EOA
-      data: encodeFunctionData({
-        abi: feedbackBatcherAbi,
-        functionName: 'giveFeedbackAndAttest',
-        args: [
-          params.agentId,
-          params.value,
-          params.valueDecimals ?? 0,
-          params.tag1 ?? '',
-          params.tag2 ?? '',
-          params.endpoint ?? '',
-          params.feedbackURI ?? '',
-          params.feedbackHash ?? ('0x' + '0'.repeat(64) as `0x${string}`),
-          // Field by field — the eight on-chain ServeProof fields. The proof's
-          // informational `validator` is not one of them (ABI encoding would
-          // drop an undeclared key anyway; this keeps the intent explicit).
-          {
-            agentId: sp.agentId,
-            submitter: sp.submitter,
-            timestamp: sp.timestamp,
-            deadline: sp.deadline,
-            taskHash: sp.taskHash,
-            dataHashes: sp.dataHashes,
-            frameworkHash: sp.frameworkHash,
-            signature: sp.signature,
-          },
-          // No task: placeholder with an EMPTY method — FeedbackBatcher routes
-          // that to plain attestFeedback, so statusCode 0 is never checked.
-          params.task ?? { method: '', uri: '', reqBodyHash: ZERO32, respBodyHash: ZERO32, statusCode: 0 },
-        ],
-      }),
+      data,
       authorizationList,
     });
 
@@ -437,9 +533,80 @@ export class ReputationClient {
   }
 
   /**
+   * Whether `batcher` has giveFeedbackAndAttestVersioned, asked gas-free: a
+   * call from anyone but the delegated EOA itself reverts BatcherNotSelf
+   * when the entry exists, and with no data when it does not (the batcher
+   * has no fallback). Only those answers are kept. Anything else — an
+   * unreachable RPC, an error the node answered that is no revert — counts
+   * as no this time and is asked again next time; it only costs the
+   * atomicity: the sequential path checks the proof first.
+   * LEGACY(pre-1.4.0): needed while a batcher before v5 may be configured.
+   */
+  private async batcherTakesVersioned(batcher: Address): Promise<boolean> {
+    const known = this.batcherVersioned.get(batcher.toLowerCase());
+    if (known !== undefined) return known;
+    let takes = false;
+    try {
+      await this.publicClient.simulateContract({
+        address: batcher,
+        abi: feedbackBatcherAbi,
+        functionName: 'giveFeedbackAndAttestVersioned',
+        args: [
+          0n, 0n, 0, '', '', '', '', ZERO32,
+          {
+            version: SERVE_PROOF_VERSION, agentId: 0n, submitter: ZERO_ADDRESS, timestamp: 0n, deadline: 0n,
+            taskHash: ZERO32, dataHashes: [], frameworkHash: ZERO32, sealedHash: ZERO32, harnessHash: ZERO32,
+            inferenceURL: '', model: '', signature: '0x',
+          },
+          NO_TASK,
+        ],
+      });
+      takes = true;
+    } catch (e) {
+      // The batcher's own error, decoded, is its answer; a revert without one
+      // is the missing entry. viem wraps a node's internal error in a
+      // ContractFunctionRevertedError too, so that alone is no answer.
+      const reverted = findViemError(e, ['ContractFunctionRevertedError']);
+      if (reverted?.data?.errorName === 'BatcherNotSelf') takes = true;
+      else if (!isContractRevert(e)) return false; // not an answer from the batcher: ask again next time
+    }
+    this.batcherVersioned.set(batcher.toLowerCase(), takes);
+    return takes;
+  }
+
+  /** The attest call for `proof`'s version, with or without a task. */
+  private async attest(
+    agentId: bigint,
+    feedbackIndex: bigint,
+    proof: ServeProof,
+    task?: TaskReveal,
+  ): Promise<WriteContractReturnType> {
+    if (task) assertTaskStatusCode(task);
+    // LEGACY(v1): a proof without a version takes the v1 entry points.
+    if (proof.version === undefined) {
+      return attestV1(
+        this.walletClient!,
+        { address: this.verifiedFeedbackAddr, account: this.account!, chain: this.chain },
+        agentId, feedbackIndex, proof, task,
+      );
+    }
+    await this.assertVersionedAccepted(proof);
+    return this.walletClient!.writeContract({
+      address: this.verifiedFeedbackAddr,
+      abi: verifiedFeedbackAbi,
+      functionName: 'attestVersionedFeedback',
+      args: [agentId, feedbackIndex, versionedTuple(proof), task ?? NO_TASK],
+      account: this.account!,
+      chain: this.chain,
+    });
+  }
+
+  /**
    * Attest an EXISTING canonical feedback entry of the connected wallet with
    * a ServeProof (the second half of `giveFeedback`, exposed for callers that
-   * submitted the canonical entry separately).
+   * submitted the canonical entry separately). A v2 proof goes to
+   * attestVersionedFeedback (registry 1.3.0+), a v1 proof (LEGACY(v1)) to
+   * attestFeedback.
    */
   async attestFeedback(
     agentId: bigint,
@@ -447,27 +614,7 @@ export class ReputationClient {
     proof: ServeProof,
   ): Promise<WriteContractReturnType> {
     this.requireWallet();
-    return this.walletClient!.writeContract({
-      address: this.verifiedFeedbackAddr,
-      abi: verifiedFeedbackAbi,
-      functionName: 'attestFeedback',
-      args: [
-        agentId,
-        feedbackIndex,
-        {
-          agentId: proof.agentId,
-          submitter: proof.submitter,
-          timestamp: proof.timestamp,
-          deadline: proof.deadline,
-          taskHash: proof.taskHash,
-          dataHashes: proof.dataHashes,
-          frameworkHash: proof.frameworkHash,
-          signature: proof.signature,
-        },
-      ],
-      account: this.account!,
-      chain: this.chain,
-    });
+    return this.attest(agentId, feedbackIndex, proof);
   }
 
   /**
@@ -482,29 +629,7 @@ export class ReputationClient {
     task: TaskReveal,
   ): Promise<WriteContractReturnType> {
     this.requireWallet();
-    assertTaskStatusCode(task);
-    return this.walletClient!.writeContract({
-      address: this.verifiedFeedbackAddr,
-      abi: verifiedFeedbackAbi,
-      functionName: 'attestFeedbackWithTask',
-      args: [
-        agentId,
-        feedbackIndex,
-        {
-          agentId: proof.agentId,
-          submitter: proof.submitter,
-          timestamp: proof.timestamp,
-          deadline: proof.deadline,
-          taskHash: proof.taskHash,
-          dataHashes: proof.dataHashes,
-          frameworkHash: proof.frameworkHash,
-          signature: proof.signature,
-        },
-        task,
-      ],
-      account: this.account!,
-      chain: this.chain,
-    });
+    return this.attest(agentId, feedbackIndex, proof, task);
   }
 
   // ── Canonical writes ──
@@ -787,6 +912,33 @@ export class ReputationClient {
     });
     const [dataHashes, frameworkHash] = result as [Hash[], Hash];
     return { dataHashes, frameworkHash };
+  }
+
+  /**
+   * The layers a VERIFIED entry's ServeProof named (v2): the sealed program
+   * and the official harness version that served the call. Zero hashes for an
+   * entry attested with a v1 proof. Needs a registry of 1.3.0 or later.
+   */
+  async getServeLayers(
+    agentId: bigint,
+    clientAddress: Address,
+    feedbackIndex: bigint,
+  ): Promise<ServeLayers> {
+    // LEGACY(pre-1.4.0): a registry before 1.3.0 has no getServeLayers.
+    const version = await this.registryVersion();
+    if (!versionAtLeast(version, VERSIONED_REGISTRY)) {
+      throw new Error(
+        `reputation: the VerifiedFeedbackRegistry at ${this.verifiedFeedbackAddr} is ${version}; ` +
+          `it records serve layers from ${VERSIONED_REGISTRY.join('.')} on`,
+      );
+    }
+    const [sealedHash, harnessHash] = (await this.publicClient.readContract({
+      address: this.verifiedFeedbackAddr,
+      abi: verifiedFeedbackAbi,
+      functionName: 'getServeLayers',
+      args: [agentId, clientAddress, feedbackIndex],
+    })) as [Hash, Hash];
+    return { sealedHash, harnessHash };
   }
 
   // ── Transaction Helpers ──

@@ -77,7 +77,7 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 | host 读不到容器内存 | TDX 硬件内存加密 + attestation |
 | 磁盘持久化是加密的 | `agent_seal_priv` 从不以明文写盘；只 provision 到内存 |
 | openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`（agent 自己的家目录 `/home/agent`）、`OPENCLAW_STATE_DIR` 和 `OPENCLAW_HOME`（框架目录树的绝对路径及其上级目录，非机密）、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
-| 存储上传不让它离开进程 | `dataplane.Upload` 在 sealed 进程内通过 0g-storage-client Go SDK 上传（`internal/dataplane/upload.go`），SDK 的交易签名器直接由 sealed 已持有的密钥构造，所以密钥从不交给任何子进程 —— 不进参数列表（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），不进环境变量，不经文件描述符，也不落文件。blob 从内存直接交给 SDK（不写临时文件）。本次上传一旦结束（比如在 90s 截止时被放弃），SDK 就不能再用这把密钥签名或发送交易：签名器拒绝签名，fullnode 客户端也拒绝发送，provider 的每次重试都一样；只有截止那一刻已经在线路上的发送仍可能到达节点，这和 CLI 在截止时被杀掉的情形相同。代价是体积和故障隔离。SDK 往这个进程里多链接了约 360 个非标准库包（大部分是 go-ethereum 的 node 栈；细节见 `QUIRKS.md`），并经由它们带进了标准库的 `net/http/pprof` 和 `expvar`（见下一行）；`TestLinkedPackages_Reviewed` 同时钉住这些非标准库包和它们直接导入的标准库包。上传现在也和 sealed 共用一个进程：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（PID 1），连同容器和 agent 一起，而以前只会结束一次 CLI 运行（`runBounded` 只 recover 调用 SDK 的那个 goroutine；见 `QUIRKS.md`）。钉住的 SDK 版本还会在 2 MiB 以上 blob 的提交每次被回滚、或回执查询失败后，留下一个永久阻塞的 goroutine，以前 CLI 运行结束退出时会把它一并带走；`Upload` 给它们能累积的数量设了上限（见 `QUIRKS.md`）。下载仍经 `privsep.RootCommand`（只在仅 root 可写的 `PATH` 目录中解析）运行 0g-storage-client CLI，下载不涉及密钥；构建它的那些镜像（`Dockerfile`、`images/{hermes,prime,harness,sealed}`）把它装到 `/usr/local/bin`，基础镜像 `images/openclaw` 不带。由 `internal/dataplane` 的测试钉住：`Upload` 不起任何子进程（一道源码检查：上传路径上不出现任何启动进程的 API，`internal/privsep` 的命令构造函数也算在内；再加 root 侧的结构测试不给 `Upload` 列任何可运行的二进制）、源码里出现启动进程 API 的依赖是一份审查过的固定清单、SDK 接线与 CLI 一致、签名和发送随上传结束而停止 |
+| 存储上传不让它离开进程 | `dataplane.Upload` 在 sealed 进程内通过 0g-storage-client Go SDK 上传（`internal/dataplane/upload.go`），SDK 的交易签名器直接由 sealed 已持有的密钥构造，所以密钥从不交给任何子进程 —— 不进参数列表（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），不进环境变量，不经文件描述符，也不落文件。blob 从内存直接交给 SDK（不写临时文件）。本次上传一旦结束（比如在 90s 截止时被放弃），SDK 就不能再用这把密钥签名或发送交易：签名器拒绝签名，fullnode 客户端也拒绝发送，provider 的每次重试都一样；只有截止那一刻已经在线路上的发送仍可能到达节点，这和 CLI 在截止时被杀掉的情形相同。代价是体积和故障隔离。SDK 往这个进程里多链接了约 360 个非标准库包（大部分是 go-ethereum 的 node 栈；细节见 `QUIRKS.md`），并经由它们带进了标准库的 `net/http/pprof` 和 `expvar`（见下一行）；`TestLinkedPackages_Reviewed` 同时钉住这些非标准库包和它们直接导入的标准库包。上传现在也和 sealed 共用一个进程：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed，连同容器和 agent 一起（0g-harness 镜像里加载器随 sealed 退出），而以前只会结束一次 CLI 运行（`runBounded` 只 recover 调用 SDK 的那个 goroutine；见 `QUIRKS.md`）。钉住的 SDK 版本还会在 2 MiB 以上 blob 的提交每次被回滚、或回执查询失败后，留下一个永久阻塞的 goroutine，以前 CLI 运行结束退出时会把它一并带走；`Upload` 给它们能累积的数量设了上限（见 `QUIRKS.md`）。下载仍经 `privsep.RootCommand`（只在仅 root 可写的 `PATH` 目录中解析）运行 0g-storage-client CLI，下载不涉及密钥；构建它的那些镜像（`Dockerfile`、`images/{hermes,prime,harness,sealed}`）把它装到 `/usr/local/bin`，基础镜像 `images/openclaw` 不带。由 `internal/dataplane` 的测试钉住：`Upload` 不起任何子进程（一道源码检查：上传路径上不出现任何启动进程的 API，`internal/privsep` 的命令构造函数也算在内；再加 root 侧的结构测试不给 `Upload` 列任何可运行的二进制）、源码里出现启动进程 API 的依赖是一份审查过的固定清单、SDK 接线与 CLI 一致、签名和发送随上传结束而停止 |
 | 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节。profile 和进程变量也不对外提供：被链接进来的库（`net/http/pprof`、`expvar`）在 init 时注册到 `http.DefaultServeMux` 上的 `/debug/pprof/*` 和 `/debug/vars` 路由，sealed 启动时通过替换这个 mux 一并丢掉（`defaultmux.go`） |
 | provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到 v3 证书携带的那个 pubkey —— 证书须由它信任的 sandbox provider 的 key 签发、并绑定该 provider 的 chain、TappRegistry、appId 和注册 epoch —— 或加密到它从这样一张证书记录下来的 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:265-282`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
 
@@ -287,7 +287,7 @@ Attestor 的校验有三道独立闸门：
 | 闸门 | 谓词 | 真源 |
 |---|---|---|
 | **Sandbox 身份** | 首次 provision：证书的 scope（chain、TappRegistry、appId、`registered_at`）及其恢复出的签名者，等于 attestor 发现并信任的 provider 实例，且公钥是 provider 为 attestor 在当前票据下创建的 sandbox 所报告的公钥（直接在 provider 创建的 sealed sandbox 公钥不同）。后续启动：首次 provision 时记录的 provider 实例仍等于它 | attestor 的 provider discovery（TappRegistry、SandboxServing）|
-| **Image 合法性** | `AgenticID.isValidFrameworkHash(image_hash) == true`，首次 provision 时校验，之后每次启动对记录的 hash 再校验一次 | AgenticID 合约的 `validFrameworkHashes` allowlist（Attestor 维护的、批准过的 Sealed runtime image hash 集合）|
+| **Image 合法性** | `AgenticID.isValidFrameworkHash(image_hash) == true`，首次 provision 时校验，之后每次启动对记录的 hash 再校验一次 | 部署者在链上维护的镜像名单：TrustRegistry 的 `IMAGE` 名单，从 AgenticID 1.4.0 起 `isValidFrameworkHash` 读的就是它；之前是 AgenticID 自己的 `validFrameworkHashes` |
 | **新鲜度 OR 记录** | 首次 provision：`ticket_issued_at − 300 ≤ ts ≤ now + 300`。后续启动：boot claim 恢复出的地址等于记录的 `container_pubkey` 的地址 | 部署的容器记录（`container_pubkey`、image hash 和 provider 实例），与首次 provision 的 binding 在同一事务中写入 |
 
 **第一道闸门**认证 provider 签名者与完整 app 实例 scope，当前或历史 node list
@@ -296,9 +296,9 @@ node 轮换保留同一张证书和同一把容器 key；新的注册 epoch 或�
 会让旧实例下签发的容器的每次后续启动都失败（`provider instance no longer
 trusted; reset required`）。旧版本证书不做迁移：所有 agent 都在 v3 下重建。
 
-**第二道闸门** —— `validFrameworkHashes` 白名单 —— 思想上跟 Tapp
+**第二道闸门** —— 镜像名单 —— 思想上跟 Tapp
 那套"代码身份上链、用户审过再用"一致：sealed runtime image hash
-也是注册在链上的（AgenticID 合约的 `validFrameworkHashes`），用户
+也是注册在链上的（TrustRegistry 的镜像名单，经 AgenticID 读取），用户
 也应当自己对一遍：链上 hash 与开源 sealed runtime 仓库里
 reproducible build 出的 hash 一致。
 
@@ -306,7 +306,7 @@ reproducible build 出的 hash 一致。
 spawn 出来的容器、不是顶层 app，所以**不走 TappRegistry**，那条
 `acknowledgeApps` 流程对它不适用。**当前唯一缺的是 wallet 端 ack
 这一步**：用户做完 image 审计之后，目前没有地方在链上把"我审过这版
-hash"这件事落下来。补法是在 AgenticID 合约侧给 `validFrameworkHashes`
+hash"这件事落下来。补法是给 TrustRegistry 上镜像名单的
 当前快照加一个 per-wallet ack（结构跟 `TappRegistry.acknowledgeApps`
 对齐就行）—— 不需要、也不会把 sealed 迁进 TappRegistry。
 
@@ -598,7 +598,11 @@ payload。socket **没有裸 hash 签名，也没有 EIP-191 version `0x00`
    schema 的 envelope。见 [`AGENT_DOCTRINE.zh.md`](AGENT_DOCTRINE.zh.md)
    §4.1 Refusal 1。最要紧的 framework 渠道是 `chain.Update`：链上
    门槛是 `msg.sender == agentSeal`，而 `/sign/transaction` 会签
-   agent 自己拼的 `update`。
+   agent 自己拼的 `update`。在 0g-harness 下（`framework.SigningRules`），
+   这条渠道不靠钢印：socket 拒签调用 AgenticID `update` 或 `updateAt`
+   的交易（`internal/proxy/signrules.go`）。这对这个合约是完整的：它的
+   门槛是 `msg.sender == agentSeal`，而 socket 不签能把 agentSeal 账户
+   借给别的代码的 EIP-7702 授权。
 
 这就划出了承重墙：
 
@@ -607,7 +611,7 @@ payload。socket **没有裸 hash 签名，也没有 EIP-191 version `0x00`
 | `agent_seal_priv` 不出 TEE | 整套塌，连 Group A 都丢（攻击者线下任意伪造）|
 | **sign socket 永不签裸 hash 或 EIP-191 version `0x00`** | agent 线下伪造 serve-proof 内容（任意 `task_hash` / `data_hashes` / 时间戳 / `submitter`），并为它们铸出 VerifiedFeedbackRegistry 标记（FIND-01）。任何把 socket 桥接成 agent 工具的 adapter 同理 |
 | sealed proxy 控制响应 header | 现在影响很小。proxy 在每条转发路径上都会丢掉上游 backend 设的 `X-Agent-Proof`，客户端看到的这个头总是 runtime 自己的。即便漏过一个，它也只能带 socket 域的签名（验不成 serve-proof），或从别的响应里搬来的真 proof（`task_hash` 对不上这条响应）|
-| **agent 钢印** | socket *能*签的东西上 Group B 失效：`chain.Update`（经 `/sign/transaction` 发 `update` tx）以及 agent 发出的任何 personal_sign / EIP-712 声明。serve-proof 的 Group B 仍机械成立，Group A 在所有渠道上仍成立 |
+| **agent 钢印** | socket *能*签的东西上 Group B 失效：`chain.Update`（经 `/sign/transaction` 发 `update` tx；0g-harness 下 socket 拒签，不在其中）以及 agent 发出的任何 personal_sign / EIP-712 声明。serve-proof 的 Group B 仍机械成立，Group A 在所有渠道上仍成立 |
 
 `report.Status` 和 settings seed 不在这张表里。sealed 在进程内对
 `StatusReport.v2:…` / `SettingsSeed:…` 做裸 keccak256 后签名，而 socket
@@ -660,15 +664,13 @@ framework 自动签名以外，agent 自己也会通过 unix socket
 - 作为 agentSeal 签 EIP-712 结构化数据（Permit、Seaport 等）
 - 作为 agentSeal 发链上交易
 
-在 0g-harness 的组合里，`seal-guard.mjs` 通过拒绝同时点名 socket 拼法和
-`/sign/` 路径的 tool 调用，把模型引向原生工具
-（`seal_sign`、`seal_sign_typed_data`、`seal_sign_transaction` ——
-每个端点一个工具，每次调用都是一条结构化的 session log 记录）。
-socket 的其它端点——`/settings` 和 `/services`——刻意不在守卫范围：
-平台文档明说 agent 可以 curl `/settings`（没有覆盖读取的结构化工
-具），而且两者都不签任何东西。
-这是引导而非强制：其它间接写法仍可绕开，session log 也不是
-防篡改的。其它框架则按各自组合允许的方式到达 socket。
+在 0g-harness 下，sealed 记录 socket 签出的每个签名和规则拒绝的每个请求，
+记录在 agent 够不着的地方（`internal/proxy/signlog.go`），owner 经
+`GET /_seal/signatures` 读取。不管 agent 用哪种方式到达 socket 都会记下，
+所以不需要把 agent 引向某一种方式。socket 的端点在那里也是 MCP 工具
+（socket 上的 `POST /mcp`），由 harness 注册成原生工具；每个工具都经过
+对应端点，签名、拒绝、记录与端点完全一样。其它框架按各自组合允许的方式
+到达 socket，不做记录。
 
 socket 按不变量**永不**签的东西（`sealed/internal/proxy/sign.go`）：
 
@@ -681,7 +683,8 @@ EIP-712 digest、或 socket 从字段组装的交易上。sealed 自己在进程
 签名里，只有三种在这几种形状之外：`report.Status` 和 settings seed 是裸
 keccak256 digest，serve-proof 是 `0x00`。`chain.Update` 不在其外：它是
 普通交易，跟 `/sign/transaction` 产出的形状相同，签名域分不开这两者——
-所以这条渠道靠的是钢印（见上面的承重墙表）。
+所以这条渠道靠的是钢印（见上面的承重墙表）；在 0g-harness 下由 socket
+自己拒签（`internal/proxy/signrules.go`）。
 把 socket 桥接成 agent 工具的 adapter（例如 0g-harness 的 `seal_sign`）
 不得补上这两条缺失的路径。
 
@@ -689,8 +692,10 @@ unix socket 以 0600 绑定、属主是框架子进程所运行的低权 `agent`
 （`internal/privsep`），并且**永不暴露到网络上** —— sandbox
 owner 没法从外面直接 post。这次 uid 拆分同时把 doctrine 第 2/4 条里
 "偷钥匙"的那一半变成内核强制：降权后的 agent 进程无法 ptrace
-sealed、读不了 `/proc/<sealed pid>/mem`、也读不了 PID 1 的引导环境变量
-（sealed 另外自设 `PR_SET_DUMPABLE=0`）。sealed 还给自己设置
+sealed、读不了 `/proc/<sealed pid>/mem`、也读不了 sealed 或 PID 1 的引导环境变量
+（sealed 另外自设 `PR_SET_DUMPABLE=0`；0g-harness 镜像里的 PID 1 是加载器
+`cmd/loader`，同样是 root、同样设 `PR_SET_DUMPABLE=0`，执行 sealed 之前先核对哈希，
+并确认链上没有拒绝它，见下面"0g-harness 的分层运行"）。sealed 还给自己设置
 `no_new_privs`，它启动的每个进程都会继承：agent 的进程里任何 exec 都不会
 获得权限，所以镜像里的 setuid-root 二进制（`su`、`mount`、`passwd` 等）
 以 agent 的 uid 运行，uid 拆分也就不依赖这些二进制个个都没有本地提权漏洞
@@ -1042,3 +1047,49 @@ agentSeal，并绑定 owner、agent、链和条目名；整个凭据集由 owner
 使用；reset 之后，sealed 依赖 attestor 提供最新的凭据集（删除的密钥要在
 服务商那边吊销）。
 
+
+## 0g-harness 的分层运行
+
+0g-harness 镜像把运行环境分成几层（`LAYERS.zh.md`）：base（镜像）、sealed、harness
+官方版本和 agent 的数据。每一处校验靠的是：
+
+- **谁登记版本。** 信任合约的 owner 是该环境的 Timelock：登记 sealed、harness 或镜像
+  版本，信任一个 attestor，都是先排期、等待期间可以取消的操作（主网 1 天，测试网和 dev
+  不用等）。移出版本、撤掉 attestor 立即生效，owner 或 guardian 密钥都能做。所以新版本要过了
+  Timelock 的等待期，才会到达正在运行的 0g-harness agent：agent 只在 owner 选了它，或者正在跑
+  的版本被移出名单时才换版本，换到的也是已经过了等待期的版本。移出名单在一次心跳（5 分钟）内
+  生效，换到的版本随后拿到 agent 私钥。
+- **跑哪个 sealed。** 加载器执行 sealed 之前核对它的哈希（镜像自带的对编进加载器的哈希，
+  换上来的版本对它的名字），并在链上查信任合约（由 AgenticID 指明）的 sealed 名单里有没有它；
+  链上明确答"没有"就不执行。加载器信链上节点的回答，sealed 读链上数据也是这样。换上来的
+  版本只有明确答"有"才执行：查不到答案时（节点连不上或被拦、AgenticID 没有信任合约），加载器
+  改跑镜像自带的 sealed，它由镜像哈希覆盖。这一关必须由加载器自己把：分层流程下 sealed 在
+  `/provision` 报上自己的哈希，用容器密钥签名，attestor 每次下发私钥都复查，但这个哈希是正在
+  运行的 sealed 自己报的，而镜像哈希来自 provider 的证书。
+- **换版本。** 正在运行的 sealed 本身已校验过、持有容器密钥，由它按同一条规则定版本
+  （owner 选的版本，列着就用；否则保持正在跑的；它被下架时换到最新登记的），在链上核对，
+  按哈希从公开的制品发布处下载，哈希对上名字才留下，交给加载器，加载器再核对一次哈希和
+  白名单。attestor 不指定版本：它能影响的只是 agent 跑名单里的哪一个，而这个选择不在它手里。
+  起不来的版本会被退回，在这个容器里不再换；因为版本以外的原因（连不上的节点、下载）起不来
+  的，过一阵再启动。
+- **跑哪个 harness。** harness 从官方版本包运行，包解开在 root 所有、agent 只能读的目录
+  里；sealed 只用哈希对上名字、链上信任合约 harness 名单列着的包。名单明确说不在的包一律
+  不跑；名单读不到时，跑容器上次跑的或 base 自带的，都已在磁盘上。harness 不持有任何密钥：agent 私钥没有，模型 key 由推理代理代填，owner 的聊天
+  令牌由 proxy 在入口换成 harness 自己的。
+- **模型看到什么。** 每次模型调用都经 sealed 的推理代理：按 owner 设置的模型名，发到
+  owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方
+  地址），并把平台说明（身份、doctrine）放在系统提示末尾。只放行模型调用，按精确路径
+  （chat/completions、messages、responses、模型列表）。分层流程下 serve-proof 只有 v2，
+  否则不出。v2 serve-proof 的
+  `inference_url` 和 `model` 说明推理代理往哪里转发、用哪个模型名，不证明某条回答出自这个
+  模型：harness 可以不经模型生成回答。agent 的进程绕过推理代理自己连模型，只能靠出站限制挡
+  （`LAYERS.zh.md` 第 9 节第 2 条）。
+- **外部能访问什么。** 只转发 sealed 列出的 harness 接口（方法加路径）；agent 注册服务的
+  描述和示例有长度上限。
+- **导出自己。** doctrine 的第 6 条拒绝让 agent 不交出自己的人设、技能、记忆、文件和
+  代码；这是模型执行的软规则（`LAYERS.zh.md` 第 6 节）。
+- **明文承诺。** agent 上传的每个 iData 条目都带加盐的明文承诺。盐由角色的数据密钥算出，
+  只有 sealed 持有，所以别人没法拿猜测去对承诺；交出一个盐只证明一个版本或一个文件。
+- **重启时未提交的改动。** 链上没变时，开机保留 agent 在最后一次提交之后在磁盘上的改动；
+  记录"最后和链上一致的版本"的文件只有 root 能读写。这依赖停机到再启动之间容器磁盘可信，
+  和 agent 新加的文件一样（它们本来就留在磁盘上，重启后提交）。

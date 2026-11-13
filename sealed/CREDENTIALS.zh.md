@@ -98,6 +98,8 @@ Entry(string name,bytes32 defHash)
 
 **交出**（`$SEAL_CRED_REVEAL_SOCKET`）：`POST /credentials/reveal {name, reason}`。设置了 `allow_reveal` 时返回 `{value}`。否则返回 403 `authorization_pending` 和 `auth_req_id`；owner 决定后，agent 原样重发请求。403 `access_denied` 表示被拒绝。批准只针对 agent 申请时的那个值：之后换出或轮换得到的 token 需要重新申请。对换出的 token，owner 看到的是它自己的域名、过期时间，以及换取时用的参数。签名密钥（`use: sign`）从不交出（403 `not_allowed`）。登录条目交出的是 access token，不是存储的登录状态。这个 socket 和上面的 socket 分开，是为了让以另一个用户运行工具的 harness 可以不让工具访问它；两个 socket 都属于 agent 用户，现有框架的工具也以这个用户运行。
 
+**作为工具（0g-harness）。** 对挂载运行时工具的框架（`framework.RuntimeTools`，目前只有 0g-harness），凭据 socket 上除 `/credentials/git` 和 `/events` 以外的路由，也是签名 socket 上 MCP 服务器（签名 socket 的 `POST /mcp`）的工具：`seal_credentials`、`seal_credential_token`、`seal_credential_request`、`seal_credential_sign`、`seal_credential_delete`。交出是 `seal_credential_reveal`，由交出 socket 自己提供（它的 `POST /mcp`）。工具经过对应路由执行，回答和拒绝都和路由完全一样。
+
 ## 框架的模型 key
 
 框架调用模型用的 key 来自两处之一：

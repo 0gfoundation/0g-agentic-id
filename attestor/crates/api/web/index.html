@@ -4836,20 +4836,27 @@ function fireProbe(sealIdHex) {
   }).catch(() => {/* silent — probe is best-effort */});
 }
 
-// Serve verification rendered as a 3-row checklist that animates one row at
+// Serve verification rendered as a 4-row checklist that animates one row at
 // a time so the user can see each cryptographic step resolve. Rows are
 // pre-declared so layout doesn't reflow as checks land:
 //   ⟳ Signer identity         — proof sig recovers to on-chain agent_seal
 //   ⟳ Response body integrity — recomputed taskHash matches envelope.task_hash
 //   ⟳ On-chain data hashes    — every envelope.data_hashes entry is on chain
+//   ⟳ Listed versions         — a v2 proof's image, sealed and harness are on
+//                               the trust registry's lists
 // Header format: `X-Agent-Proof: <sig>.<base64url(envelope_json)>`,
 // envelope = `{ agent_id, submitter, timestamp, deadline, task_hash,
 // data_hashes[], framework_hash, validator }` (`validator` is diagnostic only —
-// not part of the signed tuple). sig is over the ServeProof digest, see
-// serveProofSignedDigest.
+// not part of the signed tuple); a v2 envelope adds `{ version: 2,
+// sealed_hash, harness_hash, inference_url, model }`. sig is over the
+// ServeProof digest, see serveProofSignedDigest.
+// The envelope is UTF-8 JSON (a v2 model or inference URL is the owner's text
+// and may be non-ASCII); atob gives one character per byte, so the bytes are
+// decoded as UTF-8 here.
 function b64urlDecode(s) {
   const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
-  return atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
+  const bytes = atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
+  return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes, (c) => c.charCodeAt(0)));
 }
 
 // ServeProof signed digest — one of five copies of this consensus-critical
@@ -4857,10 +4864,17 @@ function b64urlDecode(s) {
 // ServeProof.ts, this, attestor/scripts/verify-agent.sh check 3b; see
 // AGENTS.md). Pinned by sdk/typescript/test/serveproof-copies.test.mjs, which
 // runs this function verbatim: validator 0x…B7 + the shared fixed tuple →
-// 0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b.
-// Inner proofHash = keccak256(abi.encode(chainId, identityRegistry,
-// submitter, agentId, timestamp, deadline, taskHash,
-// keccak256(abi.encodePacked(dataHashes)), frameworkHash)); the signed digest
+// 0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b (v1) and,
+// with the v2 layers, 0x50f91a86a4e744dddd29bc16e936ab717a8c54074458e4332c5f43661538df4e
+// (model "model-x") or 0xcab300c137d0d07deb4e73c3e027db4ff63df5045e0a95767519cce28ffbd963
+// (model "模型-é": a string's UTF-8 bytes are hashed).
+// The envelope's `version` picks the inner proofHash (sealed/LAYERS.md §7).
+// LEGACY(v1): v1 (no version; every image before the layered runtime):
+// keccak256(abi.encode(chainId, identityRegistry, submitter, agentId,
+// timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)),
+// frameworkHash)). v2: keccak256(abi.encode(keccak256("AgentDNA.ServeProof.v2"),
+// the same nine, sealedHash, harnessHash, keccak256(inferenceURL),
+// keccak256(model))). The signed digest
 // is EIP-191 version 0x00 ("data with intended validator"):
 // keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash), validator = the
 // VerifiedFeedbackRegistry proxy. Recover it RAW (ethers.recoverAddress) —
@@ -4869,13 +4883,64 @@ function b64urlDecode(s) {
 function serveProofSignedDigest(chainId, identityRegistry, validator, envelope) {
   const dh = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
   const dhHash = ethers.keccak256(dh.length ? ethers.concat(dh) : '0x');
-  const proofHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
-    ['uint256', 'address', 'address', 'uint256', 'uint256', 'uint256', 'bytes32', 'bytes32', 'bytes32'],
-    [BigInt(chainId), identityRegistry, envelope.submitter || ethers.ZeroAddress,
-     BigInt(envelope.agent_id), BigInt(envelope.timestamp), BigInt(envelope.deadline),
-     envelope.task_hash, dhHash, envelope.framework_hash],
-  ));
+  const types = ['uint256', 'address', 'address', 'uint256', 'uint256', 'uint256', 'bytes32', 'bytes32', 'bytes32'];
+  const fields = [BigInt(chainId), identityRegistry, envelope.submitter || ethers.ZeroAddress,
+    BigInt(envelope.agent_id), BigInt(envelope.timestamp), BigInt(envelope.deadline),
+    envelope.task_hash, dhHash, envelope.framework_hash];
+  const coder = ethers.AbiCoder.defaultAbiCoder();
+  let proofHash;
+  if (envelope.version === undefined) {
+    // LEGACY(v1): delete this branch once the images before the layered
+    // runtime are gone; an envelope without a version is then malformed.
+    proofHash = ethers.keccak256(coder.encode(types, fields));
+  } else if (envelope.version === 2) {
+    const text = (v, name) => {
+      if (typeof v !== 'string') throw new Error(`v2 proof without a string ${name}`);
+      return ethers.keccak256(ethers.toUtf8Bytes(v));
+    };
+    proofHash = ethers.keccak256(coder.encode(
+      ['bytes32', ...types, 'bytes32', 'bytes32', 'bytes32', 'bytes32'],
+      [ethers.id('AgentDNA.ServeProof.v2'), ...fields, envelope.sealed_hash, envelope.harness_hash,
+       text(envelope.inference_url, 'inference_url'), text(envelope.model, 'model')],
+    ));
+  } else {
+    throw new Error(`unsupported serve-proof version ${JSON.stringify(envelope.version)}`);
+  }
   return ethers.keccak256(ethers.concat(['0x1900', ethers.getAddress(validator), proofHash]));
+}
+
+// Whether the versions a v2 proof names are on the trust registry's lists
+// now (sealed/LAYERS.md §7) — the SDK's verifyProof `layersListed`: one row
+// per layer, the image (framework_hash), the sealed program and the official
+// harness, passed when its kind's list holds it. Throws when the lists
+// cannot be read, and says so when the chain has no trust registry.
+// Pinned by sdk/typescript/test/serveproof-copies.test.mjs.
+async function servedVersionsListed(provider, agenticID, envelope) {
+  const agentic = new ethers.Contract(agenticID, ['function trustRegistry() view returns (address)'], provider);
+  let registry;
+  try {
+    registry = await agentic.trustRegistry();
+  } catch (e) {
+    // ethers reports every failed eth_call as CALL_EXCEPTION. A revert
+    // carries revert data (0G sends "0x"), or the node's own error says so
+    // (code 3, "execution reverted"); anything else is a read that failed.
+    const rpc = e?.info?.error;
+    const reverted = (e?.code === 'CALL_EXCEPTION' && typeof e.data === 'string')
+      || (rpc && (rpc.code === 3 || /execution reverted/i.test(String(rpc.message))));
+    // LEGACY(pre-1.4.0): an AgenticID before 1.4.0 has no trustRegistry().
+    if (reverted) {
+      throw new Error('this chain has no trust registry (AgenticID before 1.4.0): the versions a v2 proof names cannot be checked');
+    }
+    throw e;
+  }
+  const lists = new ethers.Contract(registry, ['function isListed(bytes32 kind, bytes32 hash) view returns (bool)'], provider);
+  const named = [['image', envelope.framework_hash], ['sealed', envelope.sealed_hash], ['harness', envelope.harness_hash]];
+  const listed = await Promise.all(named.map(([kind, hash]) => lists.isListed(ethers.id(kind), hash)));
+  return named.map(([kind, hash], i) => ({
+    role: kind, hash: String(hash).toLowerCase(),
+    status: listed[i] ? 'passed' : 'failed',
+    note: listed[i] ? 'listed' : 'NOT listed',
+  }));
 }
 
 // The uri a ServeProof taskHash commits to: Go's r.URL.RequestURI() of the
@@ -5040,14 +5105,16 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
   const btn = $('#btnSayHi');
   if (!respEl || !btn) return;
 
-  // Three pre-declared rows; populated as each step lands.
+  // Four pre-declared rows; populated as each step lands.
   // status: pending | running | passed | failed | skipped
   // dims: optional sub-list of per-dim checks (used by the data row
-  //       to break out role-by-role results).
+  //       to break out role-by-role results, and by the versions row
+  //       layer by layer).
   const checks = [
     { key: 'identity', label: 'Signer identity',         detail: '', status: 'pending', dims: null },
     { key: 'body',     label: 'Response body integrity', detail: '', status: 'pending', dims: null },
     { key: 'data',     label: 'On-chain data hashes',    detail: '', status: 'pending', dims: null },
+    { key: 'versions', label: 'Listed versions',         detail: '', status: 'pending', dims: null },
   ];
   const ICONS = { pending: '·', running: '', passed: '✓', failed: '✗', skipped: '–' };
 
@@ -5216,9 +5283,10 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
 
     if (!expectedSealAddr || expectedSealAddr.toLowerCase() !== recovered.toLowerCase()) {
       const want = expectedSealAddr ? short(expectedSealAddr) : '(unknown)';
-      // No envelope.validator → a pre-validator sealed image signing the
-      // legacy personal_sign digest; only an owner /reset onto a current
-      // image fixes it (no fallback verification — the registry has none).
+      // LEGACY(v1): no envelope.validator → a pre-validator sealed image
+      // signing the legacy personal_sign digest; only an owner /reset onto a
+      // current image fixes it (no fallback verification — the registry has
+      // none).
       const legacy = envelope.validator ? '' : ' (no validator in envelope — legacy sealed image? reset the agent)';
       setRow('identity', 'failed', `signer ${sigInfo.short} ≠ on-chain ${want}${legacy}`);
       skipRest();
@@ -5227,7 +5295,11 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
         sigInfo, humanMsg);
       return;
     }
-    setRow('identity', 'passed', `signer ${sigInfo.short} = on-chain agent_seal`);
+    // A v2 proof also names what each layer ran (sealed/LAYERS.md §7).
+    const layers = envelope.version === 2
+      ? ` · v2: sealed ${short(String(envelope.sealed_hash))}, harness ${short(String(envelope.harness_hash))}`
+      : '';
+    setRow('identity', 'passed', `signer ${sigInfo.short} = on-chain agent_seal${layers}`);
 
     // ── Check 2: response body integrity ──
     setRow('body', 'running');
@@ -5250,7 +5322,7 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     const localTask = tasks.find((h) => h === claimedTask) || tasks[0];
     if (claimedTask !== localTask) {
       setRow('body', 'failed', `taskHash ${localTask.slice(0,10)}… ≠ envelope.task_hash`);
-      setRow('data', 'skipped');
+      skipRest();
       paint('failed', '✗', 'Body tampered',
         'Response transcript hash does not match the signed proof',
         sigInfo, humanMsg);
@@ -5307,6 +5379,7 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
         if (failedDims > 0) {
           setRow('data', 'failed',
             `${failedDims}/${dims.length} not on chain`, dims);
+          skipRest();
           paint('failed', '✗', 'Data hash mismatch',
             'Agent declared a data hash not present on chain',
             sigInfo, humanMsg);
@@ -5316,8 +5389,46 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
           `${dims.length}/${dims.length} on chain`, dims);
       } catch (e) {
         setRow('data', 'failed', e.message || String(e));
+        skipRest();
         paint('failed', '✗', 'On-chain verification failed', null, null, null);
         return;
+      }
+    }
+
+    // ── Check 4: listed versions ──
+    // A v2 proof names the image, the sealed program and the official
+    // harness that served the call; each must be on the trust registry's
+    // list for its kind now (sealed/LAYERS.md §7), so a version the deployer
+    // delisted since fails here, as in the SDK's verifyProof.
+    let versionsChecked = true;
+    if (envelope.version === undefined) {
+      // LEGACY(v1): a v1 proof names no versions.
+      setRow('versions', 'skipped', 'v1 proof: it names no versions');
+    } else {
+      setRow('versions', 'running');
+      paint('verifying', '', 'Checking the trust registry…', null, null, null);
+      await sleep(500);
+      const cfg = State.config;
+      if (!cfg?.chain_rpc || !cfg?.agentic_id_addr) {
+        versionsChecked = false;
+        setRow('versions', 'skipped', 'not checked: /config names no chain RPC');
+      } else {
+        try {
+          const dims = await servedVersionsListed(new ethers.JsonRpcProvider(cfg.chain_rpc), cfg.agentic_id_addr, envelope);
+          const unlisted = dims.filter(d => d.status === 'failed').length;
+          if (unlisted > 0) {
+            setRow('versions', 'failed', `${unlisted}/${dims.length} not on the trust registry's lists`, dims);
+            paint('failed', '✗', 'Unlisted version',
+              'The proof names a version the trust registry does not list',
+              sigInfo, humanMsg);
+            return;
+          }
+          setRow('versions', 'passed', `${dims.length}/${dims.length} on the trust registry's lists`, dims);
+        } catch (e) {
+          setRow('versions', 'failed', e.shortMessage || e.message || String(e));
+          paint('failed', '✗', 'On-chain verification failed', null, null, null);
+          return;
+        }
       }
     }
 
@@ -5327,7 +5438,9 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     // self-introduction (identity → checks → message → capabilities)
     // rather than a verification box followed by a separate catalog.
     paint('verified', '✓', 'Identity verified',
-      'All checks passed — this is a truly autonomous agent.',
+      versionsChecked
+        ? 'All checks passed — this is a truly autonomous agent.'
+        : 'Signature, body and data checks passed; the versions this proof names were not checked against the trust registry.',
       sigInfo, humanMsg, helloServices, url);
   } catch (e) {
     skipRest();

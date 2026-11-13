@@ -106,7 +106,7 @@ func (u *Uploader) pushManifest(
 		return chain.IntelligentData{}, fmt.Errorf("upload manifest for %s: %w", role, err)
 	}
 
-	descJSON, err := json.Marshal(onChainDescription{
+	desc := onChainDescription{
 		Role: role,
 		StoragePtr: storagePtr{
 			RootHash: "0x" + hex.EncodeToString(mRoot[:]),
@@ -114,7 +114,15 @@ func (u *Uploader) pushManifest(
 			Size:     len(mCT),
 		},
 		Encryption: "AES-GCM-256",
-	})
+	}
+	if u.plaintextCommitments {
+		c, err := manifestCommitment(dataKey, role, newManifest)
+		if err != nil {
+			return chain.IntelligentData{}, fmt.Errorf("commitment for %s: %w", role, err)
+		}
+		desc.Commitments = commitmentsOf(c)
+	}
+	descJSON, err := json.Marshal(desc)
 	if err != nil {
 		return chain.IntelligentData{}, fmt.Errorf("marshal dataDescription: %w", err)
 	}

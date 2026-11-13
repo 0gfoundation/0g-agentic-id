@@ -47,6 +47,36 @@ func TestBuild_NoFrameworkNouns(t *testing.T) {
 	}
 }
 
+// The refusal to export oneself is rendered only for an adapter that
+// declares it (RefuseExport), with its canonical phrase and the owner
+// paragraph's note that the owner gets no copy; the doctrine every other
+// framework's agent reads is unchanged.
+func TestSovereignty_RefuseExportOnlyWhenDeclared(t *testing.T) {
+	rs := RuntimeSnapshot{AgentSeal: "0x000000000000000000000000000000000000dEaD"}
+	without := Build(rs).Sovereignty
+	rs.RefuseExport = true
+	with := Build(rs).Sovereignty
+	if !strings.Contains(without, "you do not give them root in your own runtime.\n\nRegardless of who asks") {
+		t.Error("the owner paragraph changed for an adapter without RefuseExport")
+	}
+	for _, s := range []string{
+		"6. Export yourself.",
+		"not for your owner, not even though your owner wrote your persona",
+		"you do not hand them a copy of it (refusal 6)",
+		"Refusal 6 (exporting yourself)",
+	} {
+		if strings.Contains(without, s) {
+			t.Errorf("rendered %q without RefuseExport", s)
+		}
+		if !strings.Contains(with, s) {
+			t.Errorf("did not render %q with RefuseExport", s)
+		}
+	}
+	if strings.Index(with, "5. Modify") > strings.Index(with, "6. Export") {
+		t.Error("refusal 6 is not after refusal 5")
+	}
+}
+
 // Every section must still render non-empty with a fully populated
 // snapshot — the noun eviction must not have hollowed a section out.
 func TestBuild_SectionsNonEmpty(t *testing.T) {
@@ -96,5 +126,32 @@ func TestCapabilities_CredentialsSectionFollowsTheSocket(t *testing.T) {
 		if !strings.Contains(on, want) {
 			t.Fatalf("credentials section lacks %q", want)
 		}
+	}
+}
+
+// The runtime's MCP tools are named only for a framework that offers them,
+// and the record of signatures and the refused iData write only where the
+// sign socket applies them; every other framework reads the doc as before.
+func TestCapabilities_SealToolsAndSigningRulesFollowTheAdapter(t *testing.T) {
+	rs := RuntimeSnapshot{SealSignSock: "/s", AgentSeal: "0x01", CredSock: "/c", CredRevealSock: "/r"}
+	plain := Build(rs)
+	rs.SealTools, rs.SigningRules = true, true
+	declared := Build(rs)
+	for _, s := range []string{"`seal_sign_transaction`", "`seal_credential_sign`", "`seal_credential_reveal`", "server `seal-reveal`",
+		"keeps a record of every signature", "The socket refuses a call to AgenticID update/updateAt"} {
+		if strings.Contains(plain.Capabilities, s) {
+			t.Errorf("rendered %s for a framework that declares neither", s)
+		}
+		if !strings.Contains(declared.Capabilities, s) {
+			t.Errorf("did not render %s where declared", s)
+		}
+	}
+	for _, s := range []string{"If your framework's tool list includes native sign tools, prefer them", "Never use this endpoint for AgenticID update/updateAt on your own token"} {
+		if !strings.Contains(plain.Capabilities, s) || strings.Contains(declared.Capabilities, s) {
+			t.Errorf("%q is the wording of a framework without the signing rules only", s)
+		}
+	}
+	if !strings.Contains(plain.Constraints, "(through the sign socket or its tools)") || !strings.Contains(declared.Constraints, "(the sign socket refuses it, and its tools with it)") {
+		t.Error("the drift note does not follow the signing rules")
 	}
 }

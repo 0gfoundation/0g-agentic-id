@@ -33,6 +33,12 @@ type Unavailable struct{ Err error }
 
 func (e *Unavailable) Error() string { return e.Err.Error() }
 
+// Refused is a request a rule of the caller's does not let it sign (HTTP
+// 403).
+type Refused struct{ Reason string }
+
+func (e *Refused) Error() string { return "refused: " + e.Reason }
+
 // KeyFunc returns the private key. It is called only once the request has
 // been validated, so a malformed request is reported as such even while no
 // key is available. Its error is reported as Unavailable.
@@ -127,6 +133,14 @@ type TransactionRequest struct {
 
 // Transaction assembles req and signs it for its chain.
 func Transaction(req TransactionRequest, k KeyFunc) (map[string]any, error) {
+	return TransactionChecked(req, k, nil)
+}
+
+// TransactionChecked is Transaction with a check of the assembled, unsigned
+// transaction before the key is asked for: what check sees is exactly what
+// would be signed. An error from check is returned as it is (a *Refused
+// answers 403).
+func TransactionChecked(req TransactionRequest, k KeyFunc, check func(*types.Transaction) error) (map[string]any, error) {
 	chainID, ok := parseBigInt(req.ChainID)
 	if !ok {
 		return nil, bad("invalid or missing chain_id")
@@ -222,6 +236,11 @@ func Transaction(req TransactionRequest, k KeyFunc) (map[string]any, error) {
 	default:
 		return nil, bad("unsupported tx type: " + req.Type)
 	}
+	if check != nil {
+		if err := check(tx); err != nil {
+			return nil, err
+		}
+	}
 
 	priv, err := k()
 	if err != nil {
@@ -256,9 +275,12 @@ func Transaction(req TransactionRequest, k KeyFunc) (map[string]any, error) {
 func Status(err error) int {
 	var b *BadRequest
 	var u *Unavailable
+	var f *Refused
 	switch {
 	case errors.As(err, &b):
 		return 400
+	case errors.As(err, &f):
+		return 403
 	case errors.As(err, &u):
 		return 503
 	}

@@ -273,7 +273,7 @@ func packFile(tw *tar.Writer, hdr *tar.Header, full string, budget int64) (int64
 var maxUnpackTotal int64 = 4 << 30
 
 // maxPackTotal bounds the total uncompressed size of one archive PackDir
-// produces: what sealed (root, PID 1) can afford to hold while it commits a
+// produces: what sealed (root, for the container's life) can afford to hold while it commits a
 // directory entry. The archive is held in memory (for incompressible
 // content, about as large as the files), and committing it holds it again,
 // encrypted (LoadEntry, dataplane.Encrypt, Upload), so the bound keeps

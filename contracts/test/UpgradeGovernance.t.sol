@@ -29,15 +29,21 @@ import {
     TransferValidityProof
 } from "../src/interfaces/IERC7857DataVerifier.sol";
 
-/// @notice AgenticID 1.1.0 → 1.3.0 and TEEDataVerifier 1.1.0 → 1.2.0 across a
+/// @notice AgenticID 1.1.0 → 1.4.0 and TEEDataVerifier 1.1.0 → 1.2.0 across a
 ///         real BeaconProxy + UpgradeableBeacon + TimelockController upgrade,
 ///         starting from the frozen 1.1.0 sources (test/mocks/*V1_1_0.sol) —
-///         the code every environment runs today. The Timelock has 0G
+///         the governance and proof changes of 1.2.0 checked from the code
+///         every environment ran before it. The Timelock has 0G
 ///         mainnet's delay and role shape (DEPLOYMENT.md §6.2m): minDelay 1
 ///         day, the owner as sole proposer/canceller, open execution — with
 ///         admin = address(0) as Deploy.s.sol now produces on 0G mainnet
 ///         (on the existing mainnet Timelock the vault still holds the admin
 ///         role; DEPLOYMENT.md §8).
+///
+///         AgenticID 1.4.0 reads its trust from a TrustRegistry, so every
+///         AgenticID upgrade here first adds 1.1.0's attestor and image hash
+///         to one directly (`_upgradeAgenticID`). The migration UPGRADING.md
+///         runs, TrustMigration from 1.3.0's events, is UpgradeAgenticID.t.sol's.
 ///
 ///         Locks the 1.2.0 upgrade-safety claims:
 ///           - every pre-upgrade value survives (the Ownable2Step swap only
@@ -122,8 +128,8 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
     ///      the verifier's nonce store holds consumed entries).
     function _seedUnderOldImpls() internal {
         vm.startPrank(owner);
-        agenticId.addTrustedAttestor(attestor);
-        agenticId.addValidFrameworkHash(FRAMEWORK_HASH);
+        AgenticIDV1_1_0(address(agenticId)).addTrustedAttestor(attestor);
+        AgenticIDV1_1_0(address(agenticId)).addValidFrameworkHash(FRAMEWORK_HASH);
         vm.stopPrank();
 
         sealedHash = keccak256("sealed-agent-data");
@@ -209,6 +215,18 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         return keccak256(abi.encode(keccak256(bytes(tag)), address(agenticId), nonce));
     }
 
+    /// @dev The 1.4.0 upgrade: a TrustRegistry holding 1.1.0's lists (the
+    ///      attestor and the framework hash seeded above), then the beacon
+    ///      upgrade to an implementation that reads it.
+    function _upgradeAgenticID() internal {
+        trustRegistry = _deployTrustRegistry(owner);
+        vm.startPrank(owner);
+        trustRegistry.addTrustedAttestor(attestor);
+        trustRegistry.list(trustRegistry.IMAGE(), FRAMEWORK_HASH);
+        vm.stopPrank();
+        _upgrade(agenticIdBeacon, address(new AgenticID(address(trustRegistry))));
+    }
+
     /// @dev Mainnet-shaped upgrade: the owner schedules, the op is NOT ready
     ///      before minDelay, then any account executes (open execution).
     function _upgrade(UpgradeableBeacon beacon, address newImpl) internal {
@@ -226,15 +244,15 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         assertEq(beacon.implementation(), newImpl, "beacon points at the new impl");
     }
 
-    // ── AgenticID 1.1.0 → 1.3.0 ───────────────────────────────────────────────
+    // ── AgenticID 1.1.0 → 1.4.0 ───────────────────────────────────────────────
 
     function test_agenticID_upgrade_preservesState() public {
         assertEq(vm.load(address(agenticId), OWNABLE2STEP_SLOT), bytes32(0), "pending slot unused by 1.1.0");
         bytes32 ownerWord = vm.load(address(agenticId), OWNABLE_SLOT);
         assertEq(address(uint160(uint256(ownerWord))), owner, "owner lives in OZ's Ownable slot");
 
-        _upgrade(agenticIdBeacon, address(new AgenticID()));
-        assertEq(agenticId.VERSION(), "1.3.0", "post-upgrade VERSION");
+        _upgradeAgenticID();
+        assertEq(agenticId.VERSION(), "1.4.0", "post-upgrade VERSION");
 
         // Governance config.
         assertEq(vm.load(address(agenticId), OWNABLE_SLOT), ownerWord, "Ownable slot untouched");
@@ -244,8 +262,9 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         assertFalse(agenticId.paused(), "not paused");
         assertEq(address(agenticId.verifier()), address(verifier), "verifier preserved");
         assertEq(agenticId.canonical(), address(canonical), "canonical binding preserved");
-        assertTrue(agenticId.isTrustedAttestor(attestor), "attestor allowlist preserved");
-        assertTrue(agenticId.isValidFrameworkHash(FRAMEWORK_HASH), "framework hash preserved");
+        assertEq(agenticId.trustRegistry(), address(trustRegistry), "reads the trust registry");
+        assertTrue(agenticId.isTrustedAttestor(attestor), "attestor allowlist moved over");
+        assertTrue(agenticId.isValidFrameworkHash(FRAMEWORK_HASH), "framework hash moved over");
         assertEq(agenticId.name(), "AgenticID", "name preserved");
         assertEq(agenticId.symbol(), "AID", "symbol preserved");
 
@@ -295,7 +314,7 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         vm.expectRevert();
         agenticId.pendingOwner();
 
-        _upgrade(agenticIdBeacon, address(new AgenticID()));
+        _upgradeAgenticID();
 
         vm.prank(owner);
         agenticId.transferOwnership(newOwner);
@@ -327,7 +346,7 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         assertEq(address(agenticId.verifier()), address(0), "1.1.0 accepted a zero verifier");
         vm.revertToState(snap);
 
-        _upgrade(agenticIdBeacon, address(new AgenticID()));
+        _upgradeAgenticID();
 
         vm.prank(owner);
         vm.expectRevert(AgenticIDZeroAddress.selector);
@@ -353,7 +372,7 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         assertEq(verifier.VERSION(), "1.2.0", "post-upgrade VERSION");
         // Token-bound proofs change the AgenticID → verifier call: AgenticID
         // ships in the same window.
-        _upgrade(agenticIdBeacon, address(new AgenticID()));
+        _upgradeAgenticID();
 
         assertEq(verifier.owner(), owner, "owner preserved");
         assertEq(verifier.pendingOwner(), address(0), "no pending owner after upgrade");
@@ -389,7 +408,7 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         agenticId.iTransferFrom(buyer.addr, seller.addr, soldId, legacy);
 
         vm.revertToState(snap);
-        _upgrade(agenticIdBeacon, address(new AgenticID()));
+        _upgradeAgenticID();
         vm.expectRevert(bytes(""));
         _sell(soldId, soldHash, buyer.addr, seller, "ap-a", "op-a");
 
@@ -433,12 +452,12 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
     ///      derives every seal from a fresh sealId). CloneGate 1.1.0 still
     ///      refuses that seal for a clone of its own source.
     function test_legacySeal_cloneGateRejectsItAsTheCloneSeal() public {
-        _upgrade(agenticIdBeacon, address(new AgenticID()));
+        _upgradeAgenticID();
         CloneGate gate = CloneGate(address(new ERC1967Proxy(
             address(new CloneGate()), abi.encodeCall(CloneGate.initialize, (address(agenticId)))
         )));
         vm.prank(owner);
-        agenticId.addTrustedAttestor(address(gate));
+        trustRegistry.addTrustedAttestor(address(gate));
         AllowAllAuthorizer allow = new AllowAllAuthorizer();
         vm.prank(agentOwner);
         gate.setCloneAuthorizer(sealedId, address(allow));

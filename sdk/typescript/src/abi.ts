@@ -85,20 +85,13 @@ export const agenticIDAbi = [
     outputs: [{ name: '', type: 'bool' }],
   },
 
-  // ── Trusted Attestors ──
+  // ── Trust (held by the TrustRegistry since 1.4.0; these read through it) ──
   {
     type: 'function',
-    name: 'addTrustedAttestor',
-    stateMutability: 'nonpayable',
-    inputs: [{ name: 'attestor', type: 'address' }],
-    outputs: [],
-  },
-  {
-    type: 'function',
-    name: 'removeTrustedAttestor',
-    stateMutability: 'nonpayable',
-    inputs: [{ name: 'attestor', type: 'address' }],
-    outputs: [],
+    name: 'trustRegistry',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'address' }],
   },
   {
     type: 'function',
@@ -106,22 +99,6 @@ export const agenticIDAbi = [
     stateMutability: 'view',
     inputs: [{ name: 'attestor', type: 'address' }],
     outputs: [{ name: '', type: 'bool' }],
-  },
-
-  // ── Framework Hashes ──
-  {
-    type: 'function',
-    name: 'addValidFrameworkHash',
-    stateMutability: 'nonpayable',
-    inputs: [{ name: 'frameworkHash', type: 'bytes32' }],
-    outputs: [],
-  },
-  {
-    type: 'function',
-    name: 'removeValidFrameworkHash',
-    stateMutability: 'nonpayable',
-    inputs: [{ name: 'frameworkHash', type: 'bytes32' }],
-    outputs: [],
   },
   {
     type: 'function',
@@ -515,6 +492,49 @@ export const agenticIDAbi = [
 ] as const;
 
 /**
+ * TrustRegistry — the deployer's trust decisions, found through
+ * AgenticID.trustRegistry() (AgenticID 1.4.0+): trusted attestors, and code
+ * lists by kind — IMAGE (base images, formerly AgenticID's
+ * validFrameworkHashes), SEALED (sealed programs) and HARNESS (official
+ * harness versions). Each list keeps listing order; `latest` is the newest
+ * still listed. Read-only here: listing is the deployer's.
+ */
+export const trustRegistryAbi = [
+  { type: 'function', name: 'VERSION', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'string' }] },
+  { type: 'function', name: 'IMAGE', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bytes32' }] },
+  { type: 'function', name: 'SEALED', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bytes32' }] },
+  { type: 'function', name: 'HARNESS', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bytes32' }] },
+  {
+    type: 'function',
+    name: 'isListed',
+    stateMutability: 'view',
+    inputs: [{ name: 'kind', type: 'bytes32' }, { name: 'hash', type: 'bytes32' }],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    type: 'function',
+    name: 'latest',
+    stateMutability: 'view',
+    inputs: [{ name: 'kind', type: 'bytes32' }],
+    outputs: [{ name: '', type: 'bytes32' }],
+  },
+  {
+    type: 'function',
+    name: 'listed',
+    stateMutability: 'view',
+    inputs: [{ name: 'kind', type: 'bytes32' }],
+    outputs: [{ name: 'hashes', type: 'bytes32[]' }],
+  },
+  {
+    type: 'function',
+    name: 'isTrustedAttestor',
+    stateMutability: 'view',
+    inputs: [{ name: 'attestor', type: 'address' }],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+] as const;
+
+/**
  * Official canonical ERC-8004 ReputationRegistry (the fixed 0x8004B… singleton;
  * v2.0.0). Feedback STORAGE lives here — clients call `giveFeedback` directly,
  * so attribution is native msg.sender and every 8004 reader sees it. It has no
@@ -720,11 +740,38 @@ export const canonicalReputationAbi = [
   },
 ] as const;
 
+/** The VersionedServeProof struct (IVerifiedFeedbackRegistry.sol), in field order. */
+const VERSIONED_SERVE_PROOF = [
+  { name: 'version', type: 'uint16' },
+  { name: 'agentId', type: 'uint256' },
+  { name: 'submitter', type: 'address' },
+  { name: 'timestamp', type: 'uint256' },
+  { name: 'deadline', type: 'uint256' },
+  { name: 'taskHash', type: 'bytes32' },
+  { name: 'dataHashes', type: 'bytes32[]' },
+  { name: 'frameworkHash', type: 'bytes32' },
+  { name: 'sealedHash', type: 'bytes32' },
+  { name: 'harnessHash', type: 'bytes32' },
+  { name: 'inferenceURL', type: 'string' },
+  { name: 'model', type: 'string' },
+  { name: 'signature', type: 'bytes' },
+] as const;
+
+/** The TaskReveal struct, in field order. */
+const TASK_REVEAL = [
+  { name: 'method', type: 'string' },
+  { name: 'uri', type: 'string' },
+  { name: 'reqBodyHash', type: 'bytes32' },
+  { name: 'respBodyHash', type: 'bytes32' },
+  { name: 'statusCode', type: 'uint16' },
+] as const;
+
 /**
  * VerifiedFeedbackRegistry — the local TEE-verification layer over the
  * canonical ERC-8004 ReputationRegistry. `attestFeedback` marks a canonical
- * entry as backed by a ServeProof; the `getVerified*` reads expose the marks
- * so readers can intersect them with canonical entries.
+ * entry as backed by a ServeProof (`attestVersionedFeedback` for a proof that
+ * carries its version); the `getVerified*` reads expose the marks so readers
+ * can intersect them with canonical entries.
  */
 export const verifiedFeedbackAbi = [
   // Custom errors — so viem decodes reverts instead of showing a 4-byte selector.
@@ -758,8 +805,19 @@ export const verifiedFeedbackAbi = [
   {"type":"error","name":"VerifiedFeedbackValueOutOfRange","inputs":[{"name":"value","type":"int128"},{"name":"valueDecimals","type":"uint8"}]},
   {"type":"error","name":"VerifiedFeedbackEndpointRequired","inputs":[]},
   {"type":"error","name":"VerifiedFeedbackInvalidProofTimestamp","inputs":[]},
+  {"type":"error","name":"VerifiedFeedbackUnsupportedVersion","inputs":[{"name":"version","type":"uint16"}]},
+
+  {
+    type: 'function',
+    name: 'VERSION',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'string' }],
+  },
 
   // ── Attest ──
+  // LEGACY(v1): attestFeedback and attestFeedbackWithTask take v1 proofs
+  // (legacy/serveProofV1.ts); the registry keeps them.
   {
     type: 'function',
     name: 'attestFeedback',
@@ -807,6 +865,20 @@ export const verifiedFeedbackAbi = [
     ],
     outputs: [],
   },
+  // Versioned proofs (1.3.0+): the registry picks the digest by
+  // proof.version (2 only); an empty task.method skips the receipt opening.
+  {
+    type: 'function',
+    name: 'attestVersionedFeedback',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'feedbackIndex', type: 'uint64' },
+      { name: 'proof', type: 'tuple', components: VERSIONED_SERVE_PROOF },
+      { name: 'task', type: 'tuple', components: TASK_REVEAL },
+    ],
+    outputs: [],
+  },
 
   // ── Reads ──
   {
@@ -832,6 +904,21 @@ export const verifiedFeedbackAbi = [
     outputs: [
       { name: 'dataHashes', type: 'bytes32[]' },
       { name: 'frameworkHash', type: 'bytes32' },
+    ],
+  },
+  // 1.3.0+: the layers a v2 proof named; zero for a v1 entry.
+  {
+    type: 'function',
+    name: 'getServeLayers',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'clientAddress', type: 'address' },
+      { name: 'feedbackIndex', type: 'uint64' },
+    ],
+    outputs: [
+      { name: 'sealedHash', type: 'bytes32' },
+      { name: 'harnessHash', type: 'bytes32' },
     ],
   },
   {
@@ -931,6 +1018,21 @@ export const verifiedFeedbackAbi = [
       { name: 'uri', type: 'string', indexed: false },
     ],
   },
+  // Emitted after FeedbackVerified for a versioned proof.
+  {
+    type: 'event',
+    name: 'VersionedFeedbackVerified',
+    inputs: [
+      { name: 'agentId', type: 'uint256', indexed: true },
+      { name: 'clientAddress', type: 'address', indexed: true },
+      { name: 'feedbackIndex', type: 'uint64', indexed: true },
+      { name: 'version', type: 'uint16', indexed: false },
+      { name: 'sealedHash', type: 'bytes32', indexed: false },
+      { name: 'harnessHash', type: 'bytes32', indexed: false },
+      { name: 'inferenceURL', type: 'string', indexed: false },
+      { name: 'model', type: 'string', indexed: false },
+    ],
+  },
 ] as const;
 
 /**
@@ -941,6 +1043,7 @@ export const verifiedFeedbackAbi = [
  */
 export const feedbackBatcherAbi = [
   {"type":"error","name":"BatcherNotSelf","inputs":[]},
+  // LEGACY(v1): the batch for a v1 proof (legacy/serveProofV1.ts).
   {
     type: 'function',
     name: 'giveFeedbackAndAttest',
@@ -971,6 +1074,26 @@ export const feedbackBatcherAbi = [
         { name: 'respBodyHash', type: 'bytes32' },
         { name: 'statusCode', type: 'uint16' },
       ] },
+    ],
+    outputs: [{ name: 'feedbackIndex', type: 'uint64' }],
+  },
+  // giveFeedbackAndAttest for a versioned proof (VerifiedFeedbackRegistry
+  // 1.3.0+). Batchers deployed before it lack this entry.
+  {
+    type: 'function',
+    name: 'giveFeedbackAndAttestVersioned',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'value', type: 'int128' },
+      { name: 'valueDecimals', type: 'uint8' },
+      { name: 'tag1', type: 'string' },
+      { name: 'tag2', type: 'string' },
+      { name: 'endpoint', type: 'string' },
+      { name: 'feedbackURI', type: 'string' },
+      { name: 'feedbackHash', type: 'bytes32' },
+      { name: 'proof', type: 'tuple', components: VERSIONED_SERVE_PROOF },
+      { name: 'task', type: 'tuple', components: TASK_REVEAL },
     ],
     outputs: [{ name: 'feedbackIndex', type: 'uint64' }],
   },

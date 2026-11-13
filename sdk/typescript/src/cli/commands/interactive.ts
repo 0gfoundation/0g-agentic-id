@@ -20,7 +20,7 @@ import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentTaskInfo, AgentTaskStop, ChatMessage } from '../../AgentClient';
-import type { ServeProof, TaskReveal } from '../../types';
+import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
@@ -28,7 +28,7 @@ import { CliError, cancelled, isCancelled } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
-import { applyAssignments, assertModelPresent, assertOthersFitFramework, isHarnessFramework, parseAssignments, renderSettings } from '../settings';
+import { applyAssignments, assertModelPresent, assertOthersFitFramework, assertVersionsFitFramework, isHarnessFramework, parseAssignments, renderListedVersions, renderSettings } from '../settings';
 import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOwnerOp, ensureModelKey } from '../credentials';
 import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
@@ -40,7 +40,7 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -251,6 +251,22 @@ export function inFlightIds(rows: Array<{ id: string; status: string }>): string
 }
 
 /** A span of seconds, short: 12s, 4m, 3h, 2d. */
+/** One line for a record of the agent's sign socket (`/signatures`). */
+export function renderSignature(r: SignatureRecord): string {
+  let what: string;
+  if (r.kind === 'personal_sign') {
+    what = r.text !== undefined ? `message ${JSON.stringify(r.text)}` : `message of ${r.length ?? '?'} bytes`;
+  } else if (r.kind === 'typed_data') {
+    const d = r.domain ?? {};
+    what = `typed data ${r.primary_type ?? '?'}${d.name ? ` for ${d.name}` : ''}${d.verifying_contract ? ` at ${d.verifying_contract}` : ''}${d.chain_id ? ` on chain ${d.chain_id}` : ''}`;
+  } else {
+    const target = r.create ? 'a new contract' : r.to ?? '?';
+    what = `transaction to ${target}${r.selector ? ` (${r.selector})` : ''} on chain ${r.chain_id ?? '?'}, value ${r.value ?? '0'} wei, nonce ${r.nonce ?? '?'}`;
+  }
+  const id = r.tx_hash ?? r.digest ?? r.msg_hash ?? '';
+  return `#${r.seq} ${r.ts} ${r.result === 'refused' ? `REFUSED ${what}: ${r.reason ?? ''}` : `${what}${id ? ` ${id}` : ''}`}`;
+}
+
 function span(seconds: number): string {
   const s = Math.max(0, Math.round(seconds));
   if (s < 60) return `${s}s`;
@@ -444,7 +460,8 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/reset': ['pick'],
   '/cancel': ['all'],
   '/inbox': ['all'],
-  '/settings': ['provider=', 'model=', 'thinking=', 'others='],
+  '/settings': ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness='],
+  '/restart': ['harness', 'sealed'],
   '/cred': CRED_SUBS,
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
@@ -498,7 +515,7 @@ export function completeCred(words: string[], names: string[], providers: string
 // argument only; the rest is free-form" — right for prompts and amounts,
 // wrong for settings' k=v list, where the keys are a closed set the user
 // should never have to remember).
-const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others='];
+const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness='];
 const TAIL_ARGS: Record<string, string[]> = {
   'settings': SETTING_KEYS,  // L1: settings <agent> k=v k=v …
   '/settings': SETTING_KEYS, // L2: /settings k=v k=v …
@@ -1833,6 +1850,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           out(`note: the agent has committed new state since this interaction (a dataHash in the ticket is no longer current) — ` +
               `the ticket still redeems, and the rating records the version that served you\n`);
         }
+        if (v.layersListed === false) {
+          // The registry records a v2 proof's layers without checking the
+          // trust lists, so this is information, not a refusal.
+          out(`note: a version this interaction ran on is not on the trust registry's lists now — ` +
+              `the ticket still redeems, and the rating records the versions that served you\n`);
+        }
 
         if (!rawScore) rawScore = (await ask('score [1-5]: ')).trim();
         if (!/^-?\d+$/.test(rawScore)) { out('score must be an integer\n'); continue; }
@@ -1924,10 +1947,17 @@ let cachedClient: { key: string; ag: AgenticID } | null = null;
 async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null, ask?: (q: string) => Promise<string>): Promise<SettingsDoc | null> {
   const assignments = parseAssignments(args); // throws CliError on a bad key/level
   assertOthersFitFramework(assignments, framework);
+  assertVersionsFitFramework(assignments, framework);
   const { settings: current, version } = await ag.agent.getSettings(sealId);
   if (!assignments.length) {
     for (const l of renderSettings(current)) out(`  ${l}\n`);
     out('  change with: model=<id> · thinking=low|high|max · provider=<name> · others=\'<json>\' (quote it)\n');
+    // The versions a 0g-harness agent can be pinned to. Advisory: a chain
+    // without a trust registry, or an unreadable one, just shows nothing.
+    if (isHarnessFramework(framework)) {
+      const listed = await ag.agent.listedVersions().catch(() => null);
+      if (listed) for (const l of renderListedVersions(listed, current?.versions)) out(`  ${l}\n`);
+    }
     return current;
   }
   const next = applyAssignments(current, assignments);
@@ -2152,6 +2182,15 @@ async function showHello(ag: AgenticID, url: string, clientAddr?: `0x${string}`)
     ? `${JSON.stringify(valid.ok)}${valid.ok ? '' : ` (${valid.reasons.join('; ')})`}`
     : '(no proof header)';
   out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${proofLine}\n`);
+  // A v2 proof names what each layer ran (sealed/LAYERS.md §7); the header
+  // is the agent's, so every field goes through cleanCell. LEGACY(v1): a
+  // proof without a version names none.
+  if (proof?.version !== undefined) {
+    out(`sealed  : ${cleanCell(String(proof.sealedHash ?? '?'))}\nharness : ${cleanCell(String(proof.harnessHash ?? '?'))}\n`);
+    if (proof.model || proof.inferenceURL) {
+      out(`model   : ${cleanCell(proof.model || '—')}${proof.inferenceURL ? ` via ${cleanCell(proof.inferenceURL)}` : ''}\n`);
+    }
+  }
   if (banked) out(`ticket  : banked (GET /hello) — spend with \`rate\` within ~60 min\n`);
   if (body.services?.length) {
     out('services:\n');
@@ -2545,7 +2584,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /tasks /result /cancel /inbox /schedules /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /tasks /result /cancel /inbox /schedules /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -2565,7 +2604,9 @@ const L2_HELP_FULL = `session commands
                           model=… provider=… thinking=low|high|max
                           others=<json> merge into it and write it back
                           (owner-signed). Applies at the next boot — /reset
-                          applies it now
+                          applies it now. On 0g-harness, sealed=<hash>
+                          harness=<hash> pin the runtime's versions; bare
+                          /settings lists the ones the trust registry has
   /cred [sub …]           this agent's credentials — same as \`cred <id>\` in the
                           manager: bare lists, set <name> [k=v …], rm, connect,
                           disconnect,
@@ -2590,6 +2631,10 @@ const L2_HELP_FULL = `session commands
                           newest item), and the conversation goes on (unlike
                           /clear). One or more model calls; can take
                           minutes. 0g-harness, and openclaw 2026.7.1 or later
+  /restart harness|sealed restart one layer of the agent's runtime in place:
+                          the harness process (the conversation stays), or
+                          sealed itself (the agent is away for about one
+                          start); either picks up version changes. 0g-harness
   /tasks                  on 0g-harness: everything that runs or ran on the
                           agent — your turns, the turns it opened itself,
                           background commands and subagents — with who did
@@ -2621,6 +2666,7 @@ const L2_HELP_FULL = `session commands
   /schedules              the reminders the agent set for itself
                           (0g-harness)
   /agentlog [n]           agent process log, last n lines (owner-only)
+  /signatures [n]         what the agent signed as itself and what the runtime refused, last n (owner-only; 0g-harness)
   /startuplog [n]         sealed runtime startup log, last n lines
   /back  (or /unuse)      return to the manager
   /quit                   exit`;
@@ -2929,10 +2975,47 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         }
         continue;
       }
+      if (line === '/restart' || line.startsWith('/restart ')) {
+        // Restart one layer of a 0g-harness runtime in place: the harness
+        // process, or sealed itself (the loader starts it again). Either
+        // picks up the owner's version picks and the trust registry's lists.
+        const layer = line.split(/\s+/)[1];
+        if (layer !== 'harness' && layer !== 'sealed') { out('usage: /restart harness|sealed\n'); continue; }
+        if (!s.url) { out(`agent is ${s.phase} — nothing to restart; /start or /reset first\n`); continue; }
+        try {
+          const r = await s.ag.agent.restartRuntime(s.url, BigInt(s.agentId), layer, clientInstanceId);
+          out(`${cleanCell(r.note ?? `restarting ${layer}`)}\n`);
+        } catch (e) {
+          // restart is a seat-gated POST — a displaced 409 is a seat event
+          if (await routeTaskFailure(out, displacedSeat, e, '', 'retry /restart') !== 'raw') continue;
+          const msg = (e as Error).message;
+          const status = Number(msg.match(/^restartRuntime: HTTP (\d+):/)?.[1] ?? 0);
+          const why = cleanCell(msg.replace(/^restartRuntime: HTTP \d+: /, '').trim());
+          if (status === 404 || status === 501) out(`this agent cannot restart ${layer} in place${s.framework ? ` (${s.framework})` : ''}${status === 501 ? `: ${why}` : ''} — /stop then /start restarts the whole container\n`);
+          else if (status === 503) out(`not now: ${why} — try again in a moment\n`);
+          else out(`restart failed: ${msg}\n`);
+        }
+        continue;
+      }
       if (line === '/agentlog' || line.startsWith('/agentlog ')) {
         if (!s.client?.logs) { out(s.client ? '(logs unavailable — owner key needed)' : `agent is ${s.phase} — /start or /reset first`); out('\n'); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
         out(`${cleanStream(await s.client.logs({ tail: n }))}\n`); continue;
+      }
+      if (line === '/signatures' || line.startsWith('/signatures ')) {
+        if (!s.url) { try { await refreshSession(s); } catch { /* gate below reports */ } }
+        if (!s.url) { out(`no container yet (${s.phase}) — nothing to read; /start or /reset creates one\n`); continue; }
+        const n = Number(line.split(/\s+/)[1]) || 20;
+        try {
+          const recs = (await s.ag.agent.signatures(s.url, BigInt(s.agentId))).slice(-n);
+          out(recs.length ? `${recs.map(renderSignature).join('\n')}\n` : 'the agent has signed nothing as itself yet\n');
+        } catch (e) {
+          const msg = (e as Error).message;
+          out(/HTTP 404/.test(msg)
+            ? `this agent's runtime keeps no signature record${s.framework ? ` (${s.framework})` : ''} — only 0g-harness agents have one\n`
+            : `signatures: ${msg}\n`);
+        }
+        continue;
       }
       if (line === '/startuplog' || line.startsWith('/startuplog ')) {
         // The sealed runtime serves /log from early boot — mid-`deploying` is

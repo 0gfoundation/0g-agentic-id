@@ -24,9 +24,11 @@ import {IntelligentData} from "./IERC7857Metadata.sol";
 ///         private key never leaves TEE memory. agentSeal signs ServeProofs that
 ///         attest real service interactions, enabling sybil-resistant reputation.
 ///
-///         Seal registration is gated by the trustedAttestors whitelist. Attestors
-///         perform remote attestation off-chain and read the validFrameworkHashes
-///         registry to decide whether to provision the agentSeal private key.
+///         Seal registration is gated by the trusted attestors. Attestors perform
+///         remote attestation off-chain and read the image list to decide whether
+///         to provision the agentSeal private key. Both lists are the deployer's
+///         trust decisions and live in the TrustRegistry ({trustRegistry}); the
+///         reads here forward there.
 ///
 ///         sealId is a stable identifier for the TEE instance. agentSeal and sealId
 ///         are bound to an agentId exactly once and are immutable for the token's
@@ -48,12 +50,6 @@ interface IAgenticID is IERC8004IdentityRegistry, IERC7857 {
         address indexed agentSeal,
         bytes32 indexed sealId
     );
-
-    event TrustedAttestorAdded(address indexed attestor);
-    event TrustedAttestorRemoved(address indexed attestor);
-
-    event ValidFrameworkHashAdded(bytes32 indexed frameworkHash);
-    event ValidFrameworkHashRemoved(bytes32 indexed frameworkHash);
 
     // ── Registration ──────────────────────────────────────────────────────────
 
@@ -110,23 +106,18 @@ interface IAgenticID is IERC8004IdentityRegistry, IERC7857 {
     /// @dev Returns 0 if the sealId is not registered.
     function getAgentIdBySealId(bytes32 sealId) external view returns (uint256 agentId);
 
-    // ── Trusted attestors ─────────────────────────────────────────────────────
+    // ── Trust (held by the TrustRegistry) ─────────────────────────────────────
 
-    /// @notice Add an address to the trusted attestor whitelist.
-    function addTrustedAttestor(address attestor) external;
+    /// @notice The TrustRegistry this implementation reads its trust from.
+    function trustRegistry() external view returns (address);
 
-    /// @notice Remove an address from the trusted attestor whitelist.
-    function removeTrustedAttestor(address attestor) external;
-
+    /// @notice Forwards to the TrustRegistry.
     function isTrustedAttestor(address attestor) external view returns (bool);
 
-    // ── Valid framework hashes ────────────────────────────────────────────────
-
-    /// @notice Add a framework hash to the registry. Read off-chain by attestors.
-    function addValidFrameworkHash(bytes32 frameworkHash) external;
-
-    /// @notice Remove a framework hash from the registry.
-    function removeValidFrameworkHash(bytes32 frameworkHash) external;
-
+    /// @notice Whether the image hash is on the TrustRegistry's image list.
+    ///         Read off-chain by attestors.
+    /// @dev LEGACY(pre-1.4.0): a forward for readers of 1.3.0's ABI; leaving
+    ///      it out changes this interface's ERC-165 id (AgenticID's
+    ///      isValidFrameworkHash says when).
     function isValidFrameworkHash(bytes32 frameworkHash) external view returns (bool);
 }

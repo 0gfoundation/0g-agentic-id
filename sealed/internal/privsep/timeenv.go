@@ -23,7 +23,7 @@ import (
 // link-following open. sealed's environment is the container's, which the
 // deploy request sets, so TZ (or GOROOT) could name a file inside an agent
 // tree: root would read an agent-written file at every boot, and a FIFO
-// there would hang PID 1 before it serves anything. ScrubTimeEnv lets the
+// there would hang sealed before it serves anything. ScrubTimeEnv lets the
 // zone come only from a root-only zone file that parses — so Go's own read
 // succeeds and never reaches the $GOROOT fallback — and otherwise sets
 // TZ=UTC, which Go resolves without reading any file. (ZONEINFO is read only

@@ -37,12 +37,13 @@ import { requestKey, requestOnly, storeAfterMint } from './legacy/modelKey';
 import { sha256Hex, type SettingsDoc } from './Settings';
 import { SecretEnvRefusedError, type SecretEnvMode } from './secretEnv';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader, type TaskExchange } from './ServeSession';
+import { listedHashes, trustRegistryOf } from './TrustRegistry';
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
 import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
 import type {
   ServeProof, GiveFeedbackParams, GiveFeedbackResult, AppendResponseParams,
   ReadAllFeedbackParams, GetSummaryParams, Feedback, FeedbackSummary, ServeData,
-  TaskReveal,
+  ServeLayers, TaskReveal, SignatureRecord,
 } from './types';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -828,6 +829,88 @@ export class AgentApi {
     return (await r.json().catch(() => ({}))) as { note?: string };
   }
 
+  /**
+   * Restart one layer of a 0g-harness agent's runtime, in place: `harness`
+   * restarts the harness process (the conversation and the disk stay);
+   * `sealed` ends sealed, and the loader starts it again — the agent is away
+   * for about one start, the disk stays. Either applies the owner's version
+   * picks and the trust registry's lists as a start does (sealed/LAYERS.md
+   * §3). Owner-signed (tag `0GSealRestart`, the clear grammar, the body
+   * `{"layer": …}` bound by its digest). Answers 202 once the restart is
+   * under way. 501: the framework has no owner restart, or a `sealed`
+   * restart on an image without the loader; 503: sealed is still starting;
+   * 409: a replayed signature, or a displaced window when `instanceId` is
+   * passed (a restart is a driving action).
+   */
+  async restartRuntime(
+    base: string,
+    agentId: bigint,
+    layer: 'harness' | 'sealed',
+    instanceId?: string,
+  ): Promise<{ note?: string }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const body = JSON.stringify({ layer });
+    const digest = await sha256Hex(body);
+    const audience = new URL(base).origin;
+    const message = `0GSealRestart:${sealId}:${Math.floor(Date.now() / 1000)}:${digest}:${audience}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const r = await fetch(`${base}/_seal/restart`, {
+      method: 'POST',
+      headers: {
+        'X-Auth-Message': message,
+        'X-Auth-Signature': signature,
+        'content-type': 'application/json',
+        ...(instanceId ? { 'X-Client-Instance': instanceId } : {}),
+      },
+      body,
+    });
+    if (!r.ok) throw new Error(`restartRuntime: HTTP ${r.status}: ${plainText(await r.text())}`);
+    return (await r.json().catch(() => ({}))) as { note?: string };
+  }
+
+  /**
+   * The versions of the layered runtime (0g-harness) the trust registry
+   * lists, each list in listing order. An agent runs its owner's pick while
+   * it is listed — picked through the settings document's `versions` —
+   * otherwise keeps its running version while that stays listed, and
+   * otherwise moves to the last entry, the newest (sealed/LAYERS.md §10).
+   * LEGACY(pre-1.4.0): null when the chain has no trust registry (AgenticID
+   * before 1.4.0).
+   */
+  async listedVersions(): Promise<{ registry: Address; sealed: Hash[]; harness: Hash[] } | null> {
+    const registry = await trustRegistryOf(this.ctx.publicClient, this.ctx.addresses.agenticID);
+    // LEGACY(pre-1.4.0)
+    if (!registry) return null;
+    const [sealed, harness] = await Promise.all([
+      listedHashes(this.ctx.publicClient, registry, 'sealed'),
+      listedHashes(this.ctx.publicClient, registry, 'harness'),
+    ]);
+    return { registry, sealed, harness };
+  }
+
+  /**
+   * What the agent's sign socket signed, and what its rules refused, oldest
+   * first: one record per signature or refusal, with what identifies it (a
+   * message's hash and start, a typed-data digest and domain, a transaction's
+   * hash, chain, target, value, nonce and selector). The runtime keeps the
+   * last 1000 and keeps them across its restarts; it records every request,
+   * whichever way the agent reached the socket. Only a 0g-harness agent's
+   * runtime keeps the record; the other frameworks answer 404. `after` is a
+   * record number (`seq`): only newer records come back. Owner-signed (tag
+   * `0GSealSignatures`, the read-only grammar).
+   */
+  async signatures(base: string, agentId: bigint, opts?: { after?: number }): Promise<SignatureRecord[]> {
+    const { message, signature } = await this.signOwner('0GSealSignatures', base, agentId);
+    const query = opts?.after !== undefined ? `?after=${opts.after}` : '';
+    const r = await fetch(`${base}/_seal/signatures${query}`, {
+      headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!r.ok) throw new Error(`signatures: HTTP ${r.status}: ${plainText(await r.text())}`);
+    return (await r.json()) as SignatureRecord[];
+  }
+
   /** Sign `0GSealAuth` (audience-bound) and exchange it at `{base}/_seal/auth` for a token. */
   private async mintToken(base: string, agentId: bigint): Promise<string> {
     const { message, signature } = await this.signOwner('0GSealAuth', base, agentId);
@@ -1432,6 +1515,8 @@ export class ReputationApi {
   getVerifiedEndpoint(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<string> { return this.rep.getVerifiedEndpoint(agentId, client, feedbackIndex); }
   getVerifiedSummaryForEndpoint(agentId: bigint, uri: string, clients?: Address[]): Promise<FeedbackSummary> { return this.rep.getVerifiedSummaryForEndpoint(agentId, uri, clients); }
   getServeData(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<ServeData> { return this.rep.getServeData(agentId, client, feedbackIndex); }
+  /** The sealed program and official harness version a verified entry's v2 proof named; zero for a v1 entry (registry 1.3.0+). */
+  getServeLayers(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<ServeLayers> { return this.rep.getServeLayers(agentId, client, feedbackIndex); }
   waitForTransaction(txHash: Hash): Promise<TransactionReceipt> { return this.rep.waitForTransaction(txHash); }
 }
 

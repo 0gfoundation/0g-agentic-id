@@ -8,6 +8,22 @@
  *   proofHash = keccak256(abi.encode(<proof fields>))          (buildServeProofMessageHash)
  *   digest    = keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)  (buildServeProofSigningHash)
  *
+ * The proof's own `version` picks the preimage (sealed/LAYERS.md §7):
+ *
+ *   - v2 (`version: 2`, 0g-harness on the layered runtime) opens with
+ *     keccak256("AgentDNA.ServeProof.v2"), then v1's nine words, then what
+ *     each layer ran:
+ *       keccak256(abi.encode(tag, chainId, identityRegistry, submitter,
+ *         agentId, timestamp, deadline, taskHash,
+ *         keccak256(abi.encodePacked(dataHashes)), frameworkHash,
+ *         sealedHash, harnessHash,
+ *         keccak256(bytes(inferenceURL)), keccak256(bytes(model))))
+ *   - LEGACY(v1): v1 (no `version`, every image before it) is the nine words
+ *     alone — legacy/serveProofV1.ts.
+ *
+ * v1's preimage opens with the chain id and is 9 words long, v2's with the
+ * tag and 14, so a signature over either never verifies as the other.
+ *
  * The signed digest is EIP-191 version 0x00 ("data with intended validator",
  * OZ `MessageHashUtils.toDataWithIntendedValidatorHash`), where `validator` is
  * the VerifiedFeedbackRegistry proxy that redeems the proof. It is NOT
@@ -28,13 +44,22 @@ import {
   concat,
   isAddress,
   recoverAddress,
+  stringToBytes,
   type Address,
   type Hex,
   type Hash,
 } from 'viem';
 import type { ServeProof as ServeProofType } from './types';
+import { serveProofHashV1 } from './legacy/serveProofV1';
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+/** The ServeProof version this SDK signs and verifies; LEGACY(v1): a proof
+ *  without a version is v1 (legacy/serveProofV1.ts). */
+export const SERVE_PROOF_VERSION = 2;
+
+/** keccak256("AgentDNA.ServeProof.v2") — the first word of the v2 preimage. */
+export const SERVE_PROOF_V2_TAG: Hash = keccak256(stringToBytes('AgentDNA.ServeProof.v2'));
 
 /**
  * Parameters for building a ServeProof message hash (the inner `proofHash`).
@@ -57,8 +82,54 @@ export interface BuildServeProofHashParams {
   taskHash: Hash;
   /** Hashes of the data involved in the service */
   dataHashes: Hash[];
-  /** Hash of the agent framework version */
+  /** Hash of the agent framework version: the image hash (base) */
   frameworkHash: Hash;
+  /** 2 for a versioned proof, which then also needs the four fields below;
+   *  LEGACY(v1): absent for v1, the format of images before the layered
+   *  runtime. */
+  version?: number;
+  /** v2: sha256 of the sealed program the loader verified and ran */
+  sealedHash?: Hash;
+  /** v2: sha256 of the official harness version running */
+  harnessHash?: Hash;
+  /** v2: where sealed's inference proxy forwards model calls; '' when the
+   *  framework dials its provider itself */
+  inferenceURL?: string;
+  /** v2: the model name the inference proxy sends, the owner's setting */
+  model?: string;
+}
+
+/** What a v2 proof signs beyond v1: what each layer ran. */
+export interface ServeProofLayers {
+  sealedHash: Hash;
+  harnessHash: Hash;
+  inferenceURL: string;
+  model: string;
+}
+
+const BYTES32 = /^0x[0-9a-fA-F]{64}$/;
+
+/**
+ * A v2 proof's layer fields when they are well-formed (two 32-byte hashes,
+ * two strings), else null. The fields come from an untrusted header, and
+ * viem's `concat` checks no lengths, so a short hash would otherwise hash
+ * into a digest that matches nothing.
+ */
+export function serveProofLayers(p: {
+  sealedHash?: unknown;
+  harnessHash?: unknown;
+  inferenceURL?: unknown;
+  model?: unknown;
+}): ServeProofLayers | null {
+  if (typeof p.sealedHash !== 'string' || !BYTES32.test(p.sealedHash)) return null;
+  if (typeof p.harnessHash !== 'string' || !BYTES32.test(p.harnessHash)) return null;
+  if (typeof p.inferenceURL !== 'string' || typeof p.model !== 'string') return null;
+  return {
+    sealedHash: p.sealedHash as Hash,
+    harnessHash: p.harnessHash as Hash,
+    inferenceURL: p.inferenceURL,
+    model: p.model,
+  };
 }
 
 /**
@@ -72,44 +143,39 @@ export interface BuildServeProofSigningHashParams extends BuildServeProofHashPar
 }
 
 /**
- * Compute the ServeProof message hash exactly as the Solidity contract does.
+ * Compute the ServeProof message hash exactly as the registry does, picking
+ * the preimage by `params.version`: 2 → the v2 hash (the registry's
+ * `_serveProofHashV2`); absent → the v1 hash (`_serveProofHash`).
  *
- * Solidity:
- * ```solidity
- * bytes32 messageHash = keccak256(abi.encode(
- *     block.chainid,
- *     identityRegistry,   // verifyingContract
- *     submitter,
- *     agentId,
- *     timestamp,
- *     deadline,
- *     taskHash,
- *     keccak256(abi.encodePacked(dataHashes)),
- *     frameworkHash
- * ));
- * ```
- *
- * chainId + verifyingContract give cross-chain / cross-deployment separation;
- * submitter binds the proof to the single address allowed to redeem it.
- * This is the inner hash only — what gets signed is
- * {@link buildServeProofSigningHash}.
+ * chainId + verifyingContract (the identity registry the reputation contract
+ * is anchored to) give cross-chain / cross-deployment separation; submitter
+ * binds the proof to the single address allowed to redeem it. This is the
+ * inner hash only — what gets signed is {@link buildServeProofSigningHash}.
  *
  * @param params - The ServeProof hash parameters
  * @returns The keccak256 hash of the abi.encode payload
+ * @throws for a version other than 2, or a v2 proof whose layer fields are
+ *   missing or malformed
  */
 export function buildServeProofMessageHash(params: BuildServeProofHashParams): Hash {
+  // LEGACY(v1): a proof without a version.
+  if (params.version === undefined) return serveProofHashV1(params);
+  if (params.version !== SERVE_PROOF_VERSION) {
+    throw new Error(
+      `buildServeProofMessageHash: unsupported serve-proof version ${String(params.version)} (v2, or v1 without a version)`,
+    );
+  }
+  const layers = serveProofLayers(params);
+  if (!layers) {
+    throw new Error(
+      'buildServeProofMessageHash: a v2 proof needs sealedHash and harnessHash (32-byte hex) and inferenceURL and model (strings)',
+    );
+  }
   const { chainId, verifyingContract, submitter, agentId, timestamp, deadline, taskHash, dataHashes, frameworkHash } = params;
-
-  // Step 1: keccak256(abi.encodePacked(dataHashes)) — concatenate bytes32 values
-  const packedDataHashes: Hex = dataHashes.length > 0
-    ? concat(dataHashes as readonly Hex[])
-    : '0x';
-  const dataHashesHash = keccak256(packedDataHashes);
-
-  // Step 2: abi.encode(chainId, verifyingContract, submitter, agentId, timestamp,
-  // deadline, taskHash, dataHashesHash, frameworkHash). Each field is a static
-  // 32-byte word: uint256 = 32, address = 32 (left-padded), bytes32 = 32.
-  const encoded = concat([
+  const packedDataHashes: Hex = dataHashes.length > 0 ? concat(dataHashes as readonly Hex[]) : '0x';
+  // Every field is a static 32-byte word, so abi.encode is a concatenation.
+  return keccak256(concat([
+    SERVE_PROOF_V2_TAG,
     pad(toHex(chainId), { size: 32 }),
     pad(verifyingContract as Hex, { size: 32 }),
     pad(submitter as Hex, { size: 32 }),
@@ -117,12 +183,13 @@ export function buildServeProofMessageHash(params: BuildServeProofHashParams): H
     pad(toHex(timestamp), { size: 32 }),
     pad(toHex(deadline), { size: 32 }),
     pad(taskHash as Hex, { size: 32 }),
-    pad(dataHashesHash as Hex, { size: 32 }),
+    keccak256(packedDataHashes),
     pad(frameworkHash as Hex, { size: 32 }),
-  ]);
-
-  // Step 3: keccak256(encoded)
-  return keccak256(encoded);
+    layers.sealedHash,
+    layers.harnessHash,
+    keccak256(stringToBytes(layers.inferenceURL)),
+    keccak256(stringToBytes(layers.model)),
+  ]));
 }
 
 /** True for a well-formed (any case), non-zero 20-byte address. viem's
@@ -185,6 +252,9 @@ export function buildServeProof(
  * that produces the personal_sign (0x19 0x45) form, which the registry
  * rejects on purpose, and the proof fails `verifyServeProofSignature`.
  *
+ * Pass `version: 2` and the four layer fields for a v2 proof; without a
+ * version the proof is v1 (LEGACY(v1)).
+ *
  * @param params - The ServeProof parameters plus the validator (VerifiedFeedbackRegistry)
  * @param sign - A function that raw-signs the final digest (e.g. `account.sign`)
  * @returns The complete ServeProof with signature (and `validator`, informational)
@@ -218,11 +288,17 @@ export async function signServeProof(
     frameworkHash: params.frameworkHash,
     signature,
     validator: params.validator,
+    // buildServeProofSigningHash has checked these for a v2 proof.
+    // LEGACY(v1): a proof without a version carries no layers.
+    ...(params.version === undefined
+      ? {}
+      : { version: params.version, ...serveProofLayers(params)! }),
   };
 }
 
 /**
- * Verify that a ServeProof signature matches the expected agentSeal address.
+ * Verify that a ServeProof signature matches the expected agentSeal address,
+ * over the digest the proof's own `version` picks (2, or v1 without one).
  *
  * The digest is domain-bound, so the caller supplies the chain id, the
  * identity-registry (verifyingContract) the proof was issued against, and the
@@ -240,7 +316,8 @@ export async function signServeProof(
  * @param expectedSigner - The agentSeal address that should have signed
  * @param domain - The chainId + verifyingContract + validator the proof is bound to
  * @returns True if the signature is valid for the expected signer; false for a
- *   missing / malformed / zero validator or a non-canonical signature encoding
+ *   missing / malformed / zero validator, a non-canonical signature encoding,
+ *   an unsupported version, or a v2 proof with missing or malformed layer fields
  */
 export async function verifyServeProofSignature(
   proof: ServeProofType,
@@ -251,6 +328,12 @@ export async function verifyServeProofSignature(
   // legacy personal_sign digest.
   if (!isUsableValidator(domain?.validator)) return false;
   if (!isRegistryCanonicalSignature(proof.signature)) return false;
+  let layers: ServeProofLayers | null = null;
+  // LEGACY(v1): without a version the proof is checked as v1.
+  if (proof.version !== undefined) {
+    layers = proof.version === SERVE_PROOF_VERSION ? serveProofLayers(proof) : null;
+    if (!layers) return false;
+  }
   const signingHash = buildServeProofSigningHash({
     chainId: domain.chainId,
     verifyingContract: domain.verifyingContract,
@@ -262,6 +345,7 @@ export async function verifyServeProofSignature(
     taskHash: proof.taskHash,
     dataHashes: proof.dataHashes,
     frameworkHash: proof.frameworkHash,
+    ...(layers ? { version: proof.version, ...layers } : {}),
   });
   // A malformed signature (bad length / invalid v) is just a failed verification,
   // not an exception — a buyer verifying a hostile proof should get `false`.

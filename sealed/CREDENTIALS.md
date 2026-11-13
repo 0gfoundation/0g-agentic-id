@@ -98,6 +98,8 @@ Requests waiting for the owner are bounded: at most 32 at once (429 `too_many_re
 
 **Reveal** (`$SEAL_CRED_REVEAL_SOCKET`): `POST /credentials/reveal {name, reason}`. With `allow_reveal` it answers `{value}`. Otherwise 403 `authorization_pending` with an `auth_req_id`; the owner decides; the agent sends the same request again. 403 `access_denied` is a refusal. An approval is for the value the agent asked about: a token obtained or rotated after it is asked for again. For a derived token the owner is shown its own hosts and expiry and the parameters it was obtained with. A signing key (`use: sign`) is never revealed (403 `not_allowed`). A login entry reveals its access token, never its stored login state. The socket is separate from the one above so that a harness running its tools as another user could keep it from them; both belong to the agent user, which the tools of the shipped frameworks run as too.
 
+**As tools (0g-harness).** For a framework that mounts the runtime's tools (`framework.RuntimeTools`; 0g-harness only), the credential socket's routes but `/credentials/git` and `/events` are also MCP tools of the sign socket's server (`POST /mcp` on the sign socket): `seal_credentials`, `seal_credential_token`, `seal_credential_request`, `seal_credential_sign`, `seal_credential_delete`. Reveal is `seal_credential_reveal`, served by the reveal socket itself (`POST /mcp` there). A tool runs through its route, so it answers and refuses exactly as the route does.
+
 ## The framework's model key
 
 The key a framework calls its model with comes from one of two places:

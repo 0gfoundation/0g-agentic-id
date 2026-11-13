@@ -12,7 +12,7 @@
 
 放在 0g-harness(`src/composition.mjs`)里,用代码写死。0g-harness 就是本适配器启动的那个进程。
 
-- **构建镜像时就定死。** 0g-harness 镜像在构建时装一个确定版本的 harness(`../../images/harness/Dockerfile` 里的 `HARNESS_REF`),连同它锁定的整棵依赖树。所以插件集合,以及里面每一条平台决定,都包含在镜像哈希里:被度量,并且登记在链上的 `validFrameworkHashes` 里。
+- **构建镜像时定死,按哈希运行。** 0g-harness 镜像在构建时把一个确定版本的 harness(`../../images/harness/Dockerfile` 里的 `HARNESS_REF`),连同它锁定的整棵依赖树,打成一个包:装好的目录树的确定性 tar,以它的 sha256 命名。镜像把包解到 `/opt/0g-harness/<sha256>/`,属主是 root,agent 只读;`/opt/0g-harness/base` 写着它的哈希。所以插件集合,以及里面每一条平台决定,都包含在包哈希里;镜像自带的包同时也包含在镜像哈希里(被度量,并且登记在链上信任合约的镜像名单里)。分层流程下,sealed 运行版本规则选出的包:owner 选的版本(名单里列着时),否则正在跑的,否则最新登记的,都要在信任合约的 harness 名单里(`../../LAYERS.zh.md` §5);否则运行 `base`。其他版本由同一个构建阶段打包,按哈希从 `artifacts` release 下载,所以出新的 harness 版本不需要新镜像;`base` 是容器不下载任何东西时就有的那一版。
 - **agent 改不动。** 组合**不是** `cordis.yml`,不是 profile,也不在 `$DSH_HOME` 下的任何 patch 文件里。agent 就算改自己的家目录,也改不动下次启动挂什么。这是 doctrine 第 5 条(agent 不能重写自己的运行时)在结构上的落地。
 - **版本对得上。** 构建镜像时还会检查一件事:装上的 0g-harness 版本,必须等于 `whitelist.go` 写进每个 0g-harness agent 的 `framework` role 的版本。这样,role 里写的永远是实际运行的版本。harness 自己锁定它所用的 DSH 包(它的 `npm-shrinkwrap.json`)。
 
@@ -23,18 +23,23 @@
 - sandbox policy 模式;
 - 文件系统根目录;
 - spine 的 invariant 自检;
-- 平台那一层:harness 本身、seal-tools、seal-guard、subagent-guard。
+- 平台那一层:harness 本身、seal-tools、subagent-guard。
 
 ## 进程
 
-`spawn.go` 以 agent 用户身份运行 `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`,监听本机回环端口 8794,环境变量由 `environ()` 生成。这些环境变量的约定写在 harness 的 `docs/PROTOCOL.md` 里。
+`spawn.go` 以 agent 用户身份运行 `node /opt/0g-harness/<sha256>/bin/0g-harness.mjs`(没有包的镜像上是 `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`),监听本机回环端口 8794,环境变量由 `environ()` 生成。这些环境变量的约定写在 harness 的 `docs/PROTOCOL.md` 里。
+
+- 只要 sealed 知道 provider 的 endpoint,harness 就通过 sealed 的推理代理(`internal/inferproxy`,一个回环地址)调用模型:注册表里的 managed provider,以及 `openai` 和 `anthropic`(sealed 固定的官方 endpoint)。代理写上 owner 的模型,在 system prompt 末尾附上 agent doc,并设置密钥;harness 手里只有占位符(`../../CONFIG_SURFACE.zh.md` §3、§7)。
+- harness 在 `/v1/*` 上检查它自己的 token(`SEAL_BRIDGE_TOKEN`)。owner 从 `/_seal/auth` 拿到的是另一个 token,sealed 的 proxy 在请求进来时把它换成 harness 的,所以 harness 运行的任何东西都看不到 owner 的 token。
 
 harness 做三件事:
 - 只保留一个 agent、一段对话(`owner-chat`);
 - 把这段对话和它的轮次记录存在一起(`../../CONVERSATION.zh.md`);
 - 把每一轮的输出交给开启这一轮的一方。owner 开启的轮次,交给 owner 的那个请求;agent 自己开启的轮次(后台任务结束、提醒到点),进收件箱。
 
-`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后四种,对它们没有任何改变。
+`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后四种,对它们没有任何改变。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。
+
+harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)和 `skills/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
 
 ## 当前组合
 
@@ -52,11 +57,10 @@ harness 做三件事:
 | 后台任务(打开 `toolJobs` 时) | `dsh-tool-jobs`:命令可以放到后台跑;agent 空闲时任务结束,会开启新的一轮,这一轮的回复进收件箱 |
 | 子 agent(打开 `subagents` 时) | `dsh-subagent` + `dsh-subagent-spawn-in-process` + `dsh-tool-subagent`:一次性的助手,以后台任务的形式运行,最多一层,工具只有 `read` 和 `skill` |
 | 定时提醒(打开 `schedule` 时) | `dsh-schedule`,加上 harness 自带的最小 `sessionPersistence` 服务(提供 dsh-schedule 需要的落盘确认) |
-| **平台控制点** | 见下面三项 |
+| **平台控制点** | 见下面两项 |
 
-三个平台控制点:
-- **`seal-tools`**:把 `seal_sign`、`seal_sign_transaction`、`seal_sign_typed_data`、`seal_register_service` 做成原生工具,每次签名都会记在 session log 里。三个签名工具和签名 socket 的三个签名端点一一对应。
-- **`seal-guard`**:把 shell 对 socket `/sign/` 端点的调用引导到上面的签名工具;`/settings` 和 `/services` 照常开放。
+两个平台控制点:
+- **`seal-tools`**:把运行时的工具做成原生工具。工具由 sealed 在 socket 上列出(POST /mcp:签名 socket 上是签名、服务、设置和凭据,取值单独在自己的 socket 上),每次调用都走对应 socket 端点本身,所以工具的检查、拒绝和记录与端点完全一样。注册服务时,sealed 限制描述最长 280 字节、输入示例最长 2048 字节。
 - **`subagent-guard`**:写文件、执行命令、签名,只有主 agent 能做。
 
 **故意没挂这些**(每条都有原因):
@@ -83,7 +87,7 @@ harness 做三件事:
 - **为什么不行**:这个文件 agent 自己就能改(privsep 把 `$DSH_HOME` 交给了 agent 用户,它有 bash 和 `fs-local`),又不属于任何 role,没人恢复它,没人把它上链,验证方也看不见它。owner 的一个开关,不能开出一条"不上链、agent 可写"的系统提示词通道,这属于平台边界的事。
 - **怎样才能放开**:先把 `~/.dsh/AGENTS.md` 做成上链的 role(还没做,见文末)。
 
-平台自己的组合决定不开放给 owner:sandbox policy 模式、spine 的 invariant 自检、文件系统根目录、seal-tools、seal-guard、subagent-guard。这些属于镜像哈希背书的边界。
+平台自己的组合决定不开放给 owner:sandbox policy 模式、spine 的 invariant 自检、文件系统根目录、seal-tools、subagent-guard。这些属于镜像哈希背书的边界。
 
 ## 为什么挂 shell(而不是禁掉)
 
@@ -93,7 +97,7 @@ privsep 让框架子进程以低权限的 `agent` 用户运行。把它和 seale
 
 后台任务、子 agent、定时提醒,是同一套组合上的 owner 开关。更大的能力变化按档位来:
 
-- **一份平台审核过的档位菜单。** 比如 `minimal` / `coder`。每个档位都是 harness 自带的一套组合,区别只在挂哪些能力插件,比如 `coder` 多挂 e2b 工具沙盒和常驻 shell。平台那一层每个档位都一样,owner 永远动不了:harness 的接口、seal-tools/guard、subagent-guard、doctrine 注入、推理路由。
+- **一份平台审核过的档位菜单。** 比如 `minimal` / `coder`。每个档位都是 harness 自带的一套组合,区别只在挂哪些能力插件,比如 `coder` 多挂 e2b 工具沙盒和常驻 shell。平台那一层每个档位都一样,owner 永远动不了:harness 的接口、seal-tools、subagent-guard、doctrine 注入、推理路由。
 - **部署时选档。** owner 部署时选一个档位,就像现在选 framework 和 model 一样。选的档位写进链上的 `framework` binding,验证方能看到这个 agent 跑的是哪个能力档。档位的具体内容照样由镜像哈希背书。
 - **换档只能 reset。** 换档要走 reset,和换 framework/model 是同一条路,不能在运行时热切换。挂哪些插件是被度量边界的一部分,换档就是换一套插件集合。这和上面四个白名单选项不是一回事:那些选项只是传进一套不变组合的值,所以推送一次配置、重启进程就能生效。
 

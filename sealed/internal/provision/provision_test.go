@@ -57,6 +57,9 @@ func recoverClaim(t *testing.T, request provisionRequest) (common.Address, strin
 		t.Fatalf("boot_id %q", request.BootID)
 	}
 	canonical := bootMessage(strings.TrimPrefix(request.SealID, "0x"), request.BootGeneration, sha256.Sum256([]byte(request.BootTicket)), id, request.BootStartedAt)
+	if request.SealedHash != "" {
+		canonical = bootMessageV2(strings.TrimPrefix(request.SealID, "0x"), request.BootGeneration, sha256.Sum256([]byte(request.BootTicket)), id, request.BootStartedAt, strings.TrimPrefix(request.SealedHash, "0x"))
+	}
 	signature, err := hex.DecodeString(strings.TrimPrefix(request.ContainerSignature, "0x"))
 	if err != nil || len(signature) != 65 || (signature[64] != 27 && signature[64] != 28) {
 		t.Fatalf("container_signature %q", request.ContainerSignature)
@@ -73,9 +76,10 @@ func recoverClaim(t *testing.T, request provisionRequest) (common.Address, strin
 func TestBootRequestFixtures(t *testing.T) {
 	vector := loadCertificateVector(t)
 	for _, test := range []struct {
-		file  string
-		first bool
-	}{{"boot-v1-first.json", true}, {"boot-v1.json", false}} {
+		file    string
+		first   bool
+		layered bool
+	}{{"boot-v1-first.json", true, false}, {"boot-v1.json", false, false}, {"boot-v2.json", false, true}} {
 		t.Run(test.file, func(t *testing.T) {
 			fixture := loadBootFixture(t, test.file)
 			var fields map[string]json.RawMessage
@@ -85,6 +89,9 @@ func TestBootRequestFixtures(t *testing.T) {
 			want := []string{"boot_generation", "boot_id", "boot_started_at", "boot_ticket", "container_signature", "seal_id"}
 			if test.first {
 				want = append(want, "certificate")
+			}
+			if test.layered {
+				want = append(want, "sealed_hash")
 			}
 			if got := sortedKeys(fields); !reflect.DeepEqual(got, sortedStrings(want)) {
 				t.Fatalf("request fields %v, want %v", got, sortedStrings(want))
@@ -114,13 +121,14 @@ func TestBootRequestFixtures(t *testing.T) {
 
 			// The production encoder reproduces the fixture byte for byte
 			// (RFC 6979 signatures are deterministic).
-			boot := Boot{SealKey: vector.containerKey(t), Ticket: request.BootTicket, Certificate: vector.certificate(t), CertificateJSON: json.RawMessage(vector.Wire)}
+			boot := Boot{SealKey: vector.containerKey(t), Ticket: request.BootTicket, Certificate: vector.certificate(t), CertificateJSON: json.RawMessage(vector.Wire),
+				SealedHash: strings.TrimPrefix(request.SealedHash, "0x")}
 			boot.Certificate.SealID = strings.TrimPrefix(request.SealID, "0x")
 			key, _ := crypto.ToECDSA(boot.SealKey)
 			c := &claim{boot: boot, key: key, ticketHash: sha256.Sum256([]byte(request.BootTicket)), startedAt: request.BootStartedAt}
 			id, _ := hex.DecodeString(strings.TrimPrefix(request.BootID, "0x"))
 			copy(c.bootID[:], id)
-			built, err := c.request(authorization{Generation: request.BootGeneration, CertificateRequired: test.first})
+			built, err := c.request(authorization{Generation: request.BootGeneration, CertificateRequired: test.first, Layered: test.layered})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -300,6 +308,78 @@ func TestFirstProvisionForwardsCertificateVerbatim(t *testing.T) {
 	}
 }
 
+// Under the layered runtime the claim names the sealed program's hash and
+// signs it (ProvisionBoot.v2), and the result says the flow ran.
+func TestLayeredClaimReportsSealedHash(t *testing.T) {
+	vector := loadCertificateVector(t)
+	f := useFakeClock(t)
+	m, server := newMockAttestor(t, vector.containerKey(t),
+		[]answer{{200, authorization{Generation: 4, Layered: true}}}, []answer{{200, nil}})
+	boot := testBoot(t, server.URL, f.now)
+	boot.SealedHash = strings.Repeat("5a", 32)
+	result := FromAttestor(boot)
+	if result.AgentSealPriv == nil || !result.Layered {
+		t.Fatalf("layered boot: %+v", result)
+	}
+	request := m.sent[0]
+	if request.SealedHash != "0x"+boot.SealedHash {
+		t.Fatalf("sealed_hash %q", request.SealedHash)
+	}
+	signer, canonical := recoverClaim(t, request)
+	if signer.Hex() != vector.ContainerKey.Address || !strings.HasPrefix(canonical, "ProvisionBoot.v2:") || !strings.HasSuffix(canonical, ":"+boot.SealedHash) {
+		t.Fatalf("claim %q signed by %s", canonical, signer.Hex())
+	}
+}
+
+// The layered claim needs both sides: an attestor that declared it and a
+// sealed the loader started. Either alone leaves the v1 claim, without the
+// field an older attestor would refuse.
+func TestLayeredClaimNeedsBothSides(t *testing.T) {
+	vector := loadCertificateVector(t)
+	for _, test := range []struct {
+		name       string
+		declared   bool
+		sealedHash string
+	}{
+		{"attestor without the declaration", false, strings.Repeat("5a", 32)},
+		{"sealed not started by the loader", true, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := useFakeClock(t)
+			m, server := newMockAttestor(t, vector.containerKey(t),
+				[]answer{{200, authorization{Generation: 4, Layered: test.declared}}}, []answer{{200, nil}})
+			boot := testBoot(t, server.URL, f.now)
+			boot.SealedHash = test.sealedHash
+			result := FromAttestor(boot)
+			if result.AgentSealPriv == nil || result.Layered {
+				t.Fatalf("boot: %+v", result)
+			}
+			if _, ok := m.raw[0]["sealed_hash"]; ok {
+				t.Fatal("v1 claim carries sealed_hash")
+			}
+			if _, canonical := recoverClaim(t, m.sent[0]); !strings.HasPrefix(canonical, "ProvisionBoot.v1:") {
+				t.Fatalf("claim %q", canonical)
+			}
+		})
+	}
+}
+
+func TestFromAttestorRejectsMalformedSealedHash(t *testing.T) {
+	vector := loadCertificateVector(t)
+	f := useFakeClock(t)
+	m, server := newMockAttestor(t, vector.containerKey(t), []answer{{200, authorization{Generation: 4, Layered: true}}}, []answer{{200, nil}})
+	for _, bad := range []string{strings.Repeat("5A", 32), strings.Repeat("5a", 31), "0x" + strings.Repeat("5a", 32)} {
+		boot := testBoot(t, server.URL, f.now)
+		boot.SealedHash = bad
+		if result := FromAttestor(boot); result.AgentSealPriv != nil {
+			t.Fatalf("sealed hash %q accepted", bad)
+		}
+	}
+	if gets, posts := m.counts(); gets != 0 || posts != 0 {
+		t.Fatalf("contacted the attestor (%d GET, %d POST) with a malformed sealed hash", gets, posts)
+	}
+}
+
 func TestLaterBootOmitsCertificate(t *testing.T) {
 	vector := loadCertificateVector(t)
 	f := useFakeClock(t)
@@ -352,6 +432,9 @@ func TestProvisionRetryClassification(t *testing.T) {
 			result := FromAttestor(testBoot(t, server.URL, f.now))
 			if (result.AgentSealPriv != nil) != test.ok {
 				t.Fatalf("ok=%v, want %v", result.AgentSealPriv != nil, test.ok)
+			}
+			if result.Unanswered {
+				t.Fatal("a definitive answer read as no answer")
 			}
 			if gets, sent := m.counts(); gets != test.getsN || sent != test.postsN {
 				t.Fatalf("GETs %d POSTs %d, want %d and %d", gets, sent, test.getsN, test.postsN)
@@ -412,8 +495,14 @@ func TestProvisionBacksOffAndGivesUpTenMinutesAfterBoot(t *testing.T) {
 	// PID-1 started a minute before provisioning began.
 	started := f.now.Add(-time.Minute)
 	m, server := newMockAttestor(t, vector.containerKey(t), []answer{gen(1, true)}, []answer{{503, "busy"}})
-	if result := FromAttestor(testBoot(t, server.URL, started)); result.AgentSealPriv != nil {
+	result := FromAttestor(testBoot(t, server.URL, started))
+	if result.AgentSealPriv != nil {
 		t.Fatal("provisioned against an attestor that never answered")
+	}
+	// Giving up on "try again" answers is no answer: a cause outside the
+	// sealed version.
+	if !result.Unanswered {
+		t.Fatal("Unanswered not set when the window ran out")
 	}
 	// 1+2+4+8+16 = 31 s, then 30 s steps while one more still ends inside
 	// the 540 s left of the window: 31 + 16×30 = 511 s, and 541 s would not.
@@ -518,5 +607,27 @@ func TestProvisionLogsNoSecrets(t *testing.T) {
 	}
 	if !bounded {
 		t.Fatal("the 503 answer was not logged")
+	}
+}
+
+// A layered claim the attestor refuses still says the attestor runs the
+// layered flow, so the sealed it refused can hand over to the newest listed
+// version. A refusal from an attestor without the flow says nothing of it.
+func TestRefusedLayeredClaimKeepsTheDeclaration(t *testing.T) {
+	for _, declared := range []bool{true, false} {
+		vector := loadCertificateVector(t)
+		f := useFakeClock(t)
+		_, server := newMockAttestor(t, vector.containerKey(t),
+			[]answer{{200, authorization{Generation: 4, Layered: declared}}},
+			[]answer{{403, `{"error":"sealed_hash_not_listed"}`}})
+		boot := testBoot(t, server.URL, f.now)
+		boot.SealedHash = strings.Repeat("5a", 32)
+		result := FromAttestor(boot)
+		if result.AgentSealPriv != nil {
+			t.Fatalf("refused claim provisioned: %+v", result)
+		}
+		if result.Layered != declared {
+			t.Fatalf("declared %v: result.Layered %v", declared, result.Layered)
+		}
 	}
 }

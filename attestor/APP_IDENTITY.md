@@ -92,6 +92,10 @@ constraints. The owner then:
 4. Calls the one-way `requireInstanceBoundAttestors()`.
 5. Removes obsolete legacy whitelist entries.
 
+From AgenticID 1.4.0 these owner calls go to the TrustRegistry, which holds the
+attestor list, the bindings and the instance-binding mode; AgenticID keeps the
+read-only functions and answers them from it.
+
 AgenticID 1.3.0 retains the 1.2.0 governance and proof rules. Its fields are appended
 after the existing `agentSealBound` mapping in the ERC-7201 namespace, preserving
 that map's slot and lifetime seal-address bindings. Before step 4, old address-only

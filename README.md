@@ -252,8 +252,9 @@ are registered on chain — can ever obtain the AgentSeal private key.
   its first `/provision`. Attestor checks that the certificate's signer and
   registration scope are the sandbox app instance registered in
   TappRegistry, that the key is the one the provider reported when the
-  attestor created that sandbox, and that the image hash appears in the AgenticID contract's
-  **`validFrameworkHashes` allowlist**. This allowlist
+  attestor created that sandbox, and that the image hash is on the
+  **image list** of the TrustRegistry (the deployer's trust decisions, read
+  through `AgenticID.isValidFrameworkHash`). This list
   covers the hashes of the **AgenticID runtime framework** — the container
   code that loads functional data, manages AgentSeal signing, and validates
   owner instructions. It lives at a **different layer** from AI
@@ -368,18 +369,23 @@ chain from on-chain registration to each signed response.
 |---|---|
 | **ERC-7857** (`ERC7857Upgradeable` + extensions) | Functional data (IntelligentData[]) and the transfer / clone protocol |
 | **ERC-8004** (`ERC8004IdentityRegistry` + the canonical `ReputationRegistry`, marked by `VerifiedFeedbackRegistry`) | Identity registration + reputation |
-| **AgentSeal registry** (`AgenticID.sol`) | The agent's dynamic identity credential (set-once) + the `validFrameworkHashes` allowlist |
+| **AgentSeal registry** (`AgenticID.sol`) | The agent's dynamic identity credential (set-once) |
+| **TrustRegistry** (`TrustRegistry.sol`) | The deployer's trust decisions: trusted attestors (bound to their Tapp app instance) and the code lists — image, sealed program, harness package |
 | **TappRegistry** | Code-fingerprint registry for all Tapp components |
 
-AgenticID 1.3 links the stateless `AttestorAppBindingLib` for app-instance authorization;
-permissions and binding state remain in the proxy. The pinned compiler and linking rules
+Since AgenticID 1.4 the trust decisions live in the TrustRegistry: AgenticID's
+implementation fixes its address and forwards its trust reads there. The
+registry's owner is the environment's Timelock, so listing a version and
+trusting an attestor are scheduled operations that can be cancelled before
+they run (mainnet delay 1 day, dev and test 0); a guardian key delists
+versions and untrusts attestors at once. The pinned compiler and the upgrade
 are documented in [`contracts/README.md`](contracts/README.md).
 
 ### TEE layer (deployed on 0g-Tapp)
 
 - **Attestor** — validates the Sandbox certificate's signer (against the
   TappRegistry-registered app instance) and the container's image hash
-  (against `validFrameworkHashes`); derives
+  (against the TrustRegistry's image list); derives
   AgentSeal key material via KMS; registers the AgentSeal pubkey on chain.
   (Rust, see [`attestor/`](attestor/README.md))
 - **0g-Sandbox** — validates that startup requests come from registered
@@ -410,7 +416,7 @@ TappRegistry registers Attestor / 0g-Sandbox / KMS / 0g-compute
 KMS delivers hardware-security-grade key derivation on an n-node cluster (k healthy nodes suffice)
         │
         ▼
-Attestor validates 0g-Sandbox credentials + checks validFrameworkHashes
+Attestor validates 0g-Sandbox credentials + checks the image list
         │
         ▼
 0g-Sandbox confirms authorized owner + correct runtime code
@@ -552,7 +558,7 @@ The full end-to-end trust chain for AgenticID, across five themes:
   wallets, per-agent `agent_seal_priv` **deterministically derived** by
   KMS from `chainId ‖ contract ‖ sealId`, the sandbox-signed EIP-712
   certificate, the attestor's three gates (the signer's TappRegistry app
-  instance, the `validFrameworkHashes` allowlist, freshness at first
+  instance, the TrustRegistry's image list, freshness at first
   provision or the recorded container key on later boots), and ECIES
   delivery to the container's ephemeral pubkey (only that TEE can decrypt).
 - **Set-once seal safety** — why the permanent `agentSeal` / `sealId`
