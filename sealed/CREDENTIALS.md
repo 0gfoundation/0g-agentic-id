@@ -111,6 +111,8 @@ Where the key goes: sealed holds it for **0g-harness on a platform-routed model*
 
 Everywhere else the framework still receives the key itself, and its tools can read it: 0g-harness on a framework built-in provider (`openai`, `anthropic`), openclaw and hermes (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`; hermes also writes it into its config file), and prime (`SEAL_MODEL_API_KEY`).
 
+With no model key at all, 0g-harness, openclaw and prime start and their model calls fail until the owner sets one; hermes on a platform-routed model does not start without one (`hermes/spawn.go`). Whether a create or reset may go without a key is the client's rule: with no key for the provider in the set, the CLI allows it only for 0g-harness on 0g-compute; the SDK refuses it only for a provider other than 0g-compute whose key the set does not hold.
+
 ## Token requests and rotation
 
 A `token_request` is a template sealed follows; the agent never sees the request or the response.

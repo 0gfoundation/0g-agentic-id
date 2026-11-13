@@ -68,9 +68,9 @@ INTERACTIVE (default — no command)
                             ack                  acknowledge the TEE trust
                                                  root (implicit in deploy/
                                                  start/reset)
-                            login                guided setup: attestor URL,
-                                                 owner key, provider, inference key (Enter
-                                                 keeps current; keys echo *)
+                            login [provider]     guided setup: attestor URL,
+                                                 owner key, each provider's model
+                                                 key (Enter keeps current; keys echo *)
                             whoami · help · quit
   0g-agentdna <agent>    Shortcut: use that agent directly, then drop to
                           the manager REPL on /back.

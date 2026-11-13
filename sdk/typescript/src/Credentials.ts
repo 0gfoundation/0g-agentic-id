@@ -21,12 +21,13 @@
  * including that the signer is the agent's current on-chain owner.
  */
 import { plainText } from './AgentClient';
-import { getAddress, hashTypedData, hexToBytes, keccak256, recoverAddress, toBytes, type Address, type Hash, type Hex } from 'viem';
+import { getAddress, hashTypedData, hexToBytes, isAddress, keccak256, recoverAddress, toBytes, type Address, type Hash, type Hex } from 'viem';
 import type { Ctx } from './context';
 import { requireWallet } from './context';
-import { eciesEncrypt } from './secretEnv';
+import { eciesEncrypt, publicKeyToAddress } from './secretEnv';
 import { sha256Hex } from './Settings';
 import type { AttestorClient } from './AttestorClient';
+import { requestSecretEnv } from './legacy/modelKey';
 
 /** EIP-712 domain name and version shared with sealed and the attestor. */
 export const CREDENTIALS_DOMAIN_NAME = 'AgentDNA Credentials';
@@ -177,17 +178,42 @@ export function modelKeyName(provider: string): string {
   return `${MODEL_KEY_PREFIX}${provider}`;
 }
 
+/**
+ * A model key sealed to one agent for its owner by whoever holds the key
+ * (an integrator's server, {@link CredentialsApi.sealModelKey}). The owner
+ * stores it as it is ({@link CredentialsApi.setModelKey}) and never sees the
+ * key.
+ */
+export interface SealedModelKey {
+  v: 1;
+  sealId: Hash;
+  owner: Address;
+  provider: string;
+  /** The value as the credential set stores it: ECIES to the agent's agentSeal key, base64. */
+  value: string;
+  /** LEGACY(model-key): the same key as an older image reads it with the request (`SEAL_SECRET_ENV`); absent when the attestor does not seal request keys. */
+  secretEnv?: string;
+}
+
 /** Which model key the running agent's framework uses (`GET /_seal/credentials`). */
 export interface ModelKeyInUse {
   provider?: string;
-  /** `credentials`: an entry of the set; `deploy`: the key given at create/reset. */
+  /** `credentials`: an entry of the set; `deploy` (LEGACY(model-key)): the key given with the create/reset request. */
   source: 'credentials' | 'deploy' | 'none';
   /** The entry's value hash, when `source` is `credentials`. */
   value_hash?: string;
   /** Why the key the settings choose is not the one in use. */
   issue?: string;
-  /** The provider of the key given at create/reset, when it is usable: a switch to it needs no key in the set. */
+  /** LEGACY(model-key): the provider of the key given with the create/reset request, when it is usable: a switch to it needs no key in the set. */
   deploy_provider?: string;
+}
+
+/** {@link CredentialsApi.modelKeys}. */
+export interface ModelKeysView {
+  /** The providers the credential set holds a key for. */
+  stored: Array<{ provider: string; valueHash: string }>;
+  /** The key the running agent uses; null: not running; `unsupported`: an image from before model keys in the set. */
+  inUse: ModelKeyInUse | null | 'unsupported';
 }
 
 /**
@@ -299,6 +325,52 @@ export function inputOf(d: CredentialDefinition): CredentialInput {
 
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
 const PROVIDER_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+/** An entry to store: its value, or one sealed elsewhere (base64 ciphertext). */
+type EntryInput = CredentialInput & { sealedValue?: string };
+
+/** `model.<provider>`, for a provider id. */
+function modelKeyNameOf(provider: string): string {
+  const name = modelKeyName(provider);
+  if (!PROVIDER_RE.test(provider) || !NAME_RE.test(name)) throw new Error(`credentials: not a provider id: ${JSON.stringify(provider)}`);
+  return name;
+}
+
+/** A model key: one line of printable characters (sealed sends it in a header or writes it into the framework's config). */
+function checkModelKey(value: string): string {
+  if (!value || /[\u0000-\u001f\u007f]/.test(value)) throw new Error('credentials: a model key is one line of printable characters');
+  if (toBytes(value).length > MAX_VALUE_BYTES) throw new Error(`credentials: a model key is at most ${MAX_VALUE_BYTES} bytes`);
+  return value;
+}
+
+/**
+ * The checks {@link CredentialsApi.setModelKey} makes of a key and its
+ * provider before it reads or sends anything: a caller that stores a key
+ * after a request (`AgentApi.deploy`) runs them before the request. Throws.
+ */
+export function checkModelKeyInput(provider: string, value: string): void {
+  modelKeyNameOf(provider);
+  checkModelKey(value);
+}
+
+/** A sealed model key for this agent, provider and signer; its ciphertext. */
+function checkSealedModelKey(k: SealedModelKey, seal: Hash, provider: string, signer: Address): string {
+  if (k?.v !== 1 || typeof k.value !== 'string') throw new Error('credentials: not a sealed model key (sealModelKey)');
+  if (typeof k.sealId !== 'string' || k.sealId.toLowerCase() !== seal) throw new Error(`credentials: the sealed model key is for agent ${k.sealId}, not ${seal}`);
+  if (k.provider !== provider) throw new Error(`credentials: the sealed model key is for ${k.provider}, not ${provider}`);
+  if (!isAddress(k.owner) || getAddress(k.owner) !== getAddress(signer)) {
+    throw new Error(`credentials: the model key is sealed for ${k.owner}, not ${getAddress(signer)}; the agent would refuse it`);
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = fromB64(k.value);
+  } catch {
+    throw new Error('credentials: the sealed model key is not base64');
+  }
+  // Ciphertext of a value sealed holds (MAX_VALUE_BYTES) and its binding.
+  if (bytes.length === 0 || bytes.length > MAX_VALUE_BYTES + 1024) throw new Error('credentials: the sealed model key has no value or is too long');
+  return k.value;
+}
 
 /**
  * A stored set's place in order (ownership epoch, then version) and its
@@ -556,21 +628,85 @@ export class CredentialsApi {
    * is kept until the settings switch to it. The key is bound to the provider's
    * route in the registry version the attestor serves now, checked against
    * this agent's image first.
+   *
+   * `value` is the key, or the key sealed for this owner elsewhere
+   * ({@link sealModelKey}), stored as it is: the owner signs its ciphertext's
+   * hash and never has the key.
+   *
+   * The owner signs the read of the stored set, the new set and the write:
+   * three signatures, and a fourth for the push. `newAgent`: the agent was
+   * created a moment ago by this wallet (`AgentApi.deploy`) and has no set
+   * yet, so the read is skipped (two signatures); should one be stored by
+   * then, the write is refused as a conflict and made again after a read.
+   * `sealedTo`: the agentSeal address a key given in clear was sealed to.
    */
-  async setModelKey(sealId: Hash, provider: string, value: string, opts?: { agentUrl?: string }): Promise<{ version: number; valueHash: Hash; pushWarning?: string }> {
+  async setModelKey(
+    sealId: Hash,
+    provider: string,
+    value: string | SealedModelKey,
+    opts?: { agentUrl?: string; push?: boolean; newAgent?: boolean },
+  ): Promise<{ version: number; valueHash: Hash; pushWarning?: string; sealedTo?: Address }> {
     const seal = sealId.toLowerCase() as Hash;
-    const name = modelKeyName(provider);
-    if (!PROVIDER_RE.test(provider) || !NAME_RE.test(name)) throw new Error(`credentials: not a provider id: ${JSON.stringify(provider)}`);
-    // sealed sends it in a header or writes it into the framework's config.
-    if (!value || /[\u0000-\u001f\u007f]/.test(value)) throw new Error('credentials: a model key is one line of printable characters');
+    const name = modelKeyNameOf(provider);
+    const given = typeof value === 'string'
+      ? { value: checkModelKey(value) }
+      : { sealedValue: checkSealedModelKey(value, seal, provider, requireWallet(this.ctx).account.address) };
     const binding = await this.attestor.modelKeyBinding(provider, seal);
-    const cur = await this.get(seal);
-    const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
-    const entry: CredentialInput = { name, value, hosts: [], positions: [], use: 'model', inference: { provider, ...binding } };
-    const doc = await this.buildDocument(seal, [...others, entry], cur.version, cur);
-    const version = await this.store(seal, doc, cur.version);
-    const pushWarning = await this.push(seal, doc, opts?.agentUrl).then(() => undefined, (e: unknown) => String(e instanceof Error ? e.message : e));
-    return { version, valueHash: keccak256(fromB64(doc.values[name])), pushWarning };
+    const entry: EntryInput = { name, ...given, hosts: [], positions: [], use: 'model', inference: { provider, ...binding } };
+    // A key given in clear is sealed here, to the key the attestor names
+    // (checked against the chain once the agent is minted).
+    const sealing = given.value !== undefined ? await this.sealingKey(seal) : undefined;
+    const write = async (cur: Awaited<ReturnType<CredentialsApi['get']>>) => {
+      const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
+      const doc = await this.buildDocument(seal, [...others, entry], cur.version, cur, sealing);
+      return { doc, version: await this.store(seal, doc, cur.version) };
+    };
+    let written: Awaited<ReturnType<typeof write>>;
+    if (opts?.newAgent) {
+      try {
+        written = await write({ version: 0, ownerEpoch: 0, document: null, definitions: [] });
+      } catch (e) {
+        if (!(e instanceof CredentialsConflictError)) throw e;
+        written = await write(await this.get(seal));
+      }
+    } else {
+      written = await write(await this.get(seal));
+    }
+    const { doc, version } = written;
+    // `push: false`: a container about to be recreated takes it at its boot.
+    const pushWarning = opts?.push === false ? undefined
+      : await this.push(seal, doc, opts?.agentUrl).then(() => undefined, (e: unknown) => String(e instanceof Error ? e.message : e));
+    return { version, valueHash: keccak256(fromB64(doc.values[name])), pushWarning, ...(sealing ? { sealedTo: sealing.address } : {}) };
+  }
+
+  /**
+   * Seal a model key to one agent for its owner, signing nothing: for the
+   * integrator whose server holds the key while the owner signs in a browser
+   * (issue #166). The server calls this (a read-only client is enough: no
+   * wallet) and hands the owner only the result, which the owner stores with
+   * {@link setModelKey} or passes to `start` / `reset` / `retry` as
+   * `sealedModelKey`. The key never reaches the owner.
+   *
+   * The value is bound, as every value in the set, to `owner`, the agent, the
+   * chain and the entry `model.<provider>`; once the agent is minted, `owner`
+   * must be its on-chain owner (a {@link SecretEnvRefusedError} otherwise).
+   * LEGACY(model-key): `framework` / `sealedImage` matter only for the
+   * request copy older images read (`secretEnv`), and go with it.
+   */
+  async sealModelKey(
+    sealId: Hash,
+    opts: { owner: Address; apiKey: string; provider?: string; framework?: string; sealedImage?: string },
+  ): Promise<SealedModelKey> {
+    const seal = sealId.toLowerCase() as Hash;
+    const provider = opts.provider ?? '0g-compute';
+    const name = modelKeyNameOf(provider);
+    const apiKey = checkModelKey(opts.apiKey);
+    if (!isAddress(opts.owner)) throw new Error('credentials: sealModelKey: owner is not an address');
+    const owner = getAddress(opts.owner);
+    const pubkey = hexToBytes(await this.attestor.agentSealPubkeyFor(seal, owner, 'sealModelKey'));
+    const value = b64(eciesEncrypt(pubkey, toBytes(credentialPlaintext({ owner, sealId: seal, chainId: this.ctx.chain.id, name, value: apiKey }))));
+    const secretEnv = await requestSecretEnv(this.attestor, { sealId: seal, owner, apiKey, provider, framework: opts.framework, sealedImage: opts.sealedImage });
+    return { v: 1, sealId: seal, owner, provider, value, ...(secretEnv ? { secretEnv } : {}) };
   }
 
   /** Remove the agent's model key for one provider (see {@link setModelKey}). */
@@ -578,11 +714,61 @@ export class CredentialsApi {
     return this.remove(sealId, modelKeyName(provider), opts);
   }
 
+  /**
+   * The agent's model keys: the providers its credential set holds a key for,
+   * and which key the running agent uses. `inUse` is null when the agent
+   * cannot be asked (not running), `unsupported` when its image predates
+   * model keys in the set.
+   */
+  async modelKeys(sealId: Hash, opts?: { agentUrl?: string }): Promise<ModelKeysView> {
+    const cur = await this.get(sealId);
+    const stored = cur.definitions.filter((d) => d.inference).map((d) => ({ provider: d.inference!.provider, valueHash: d.value_hash }));
+    const loaded = await this.loaded(sealId, opts).catch(() => undefined);
+    return { stored, inUse: !loaded ? null : loaded.model ?? 'unsupported' };
+  }
+
+  /**
+   * Whether the agent has a model key for `provider`: one in its credential
+   * set, or (asked of the running agent; LEGACY(model-key)) the key handed
+   * over with the create/reset request being for that provider.
+   */
+  async hasModelKey(sealId: Hash, provider: string, opts?: { agentUrl?: string }): Promise<boolean> {
+    const view = await this.modelKeys(sealId, opts);
+    return view.stored.some((k) => k.provider === provider)
+      // LEGACY(model-key): the request copy the running container got.
+      || (!!view.inUse && view.inUse !== 'unsupported' && view.inUse.deploy_provider === provider);
+  }
+
+  /**
+   * After a boot: when the credential set holds a key for the provider the
+   * running agent uses and the agent does not run on it (it booted before the
+   * key was stored, or did not get the set at its boot), push the set again.
+   */
+  async resyncModelKey(sealId: Hash, opts?: { agentUrl?: string }): Promise<'in_sync' | 'pushed' | 'not_running' | 'unsupported'> {
+    const view = await this.modelKeys(sealId, opts);
+    if (view.inUse === null) return 'not_running';
+    if (view.inUse === 'unsupported') return 'unsupported';
+    const provider = view.inUse.provider;
+    if (!provider || !view.stored.some((k) => k.provider === provider) || view.inUse.source === 'credentials') return 'in_sync';
+    const cur = await this.get(sealId);
+    if (!cur.document) return 'in_sync';
+    await this.push(sealId.toLowerCase() as Hash, cur.document, opts?.agentUrl);
+    return 'pushed';
+  }
+
+  /** The agent's agentSeal key values are sealed to, checked as
+   *  `agentSealPubkey` checks it, with its address. */
+  private async sealingKey(seal: Hash): Promise<{ bytes: Uint8Array; address: Address }> {
+    const bytes = hexToBytes(await this.attestor.agentSealPubkey(seal));
+    return { bytes, address: publicKeyToAddress(bytes) };
+  }
+
   private async buildDocument(
     sealId: Hash,
-    entries: CredentialInput[],
+    entries: EntryInput[],
     baseVersion: number,
     current?: Awaited<ReturnType<CredentialsApi['get']>>,
+    sealing?: { bytes: Uint8Array; address: Address },
   ): Promise<CredentialDocument> {
     const { walletClient, account } = requireWallet(this.ctx);
     const seal = sealId.toLowerCase() as Hash;
@@ -590,7 +776,7 @@ export class CredentialsApi {
     if (cur.version !== baseVersion) throw new CredentialsConflictError(cur.version, cur.ownerEpoch);
     const names = new Set<string>();
     const needsSealing = entries.some((e) => e.value !== undefined);
-    const pubkey = needsSealing ? hexToBytes(await this.attestor.agentSealPubkey(seal)) : undefined;
+    const pubkey = needsSealing ? (sealing ?? (await this.sealingKey(seal))).bytes : undefined;
     const doc: CredentialDocument = {
       set: { seal_id: seal, owner_epoch: cur.ownerEpoch, version: baseVersion + 1, entries: [] },
       signature: '',
@@ -617,6 +803,9 @@ export class CredentialsApi {
       }
       if (e.value !== undefined) {
         ciphertext = eciesEncrypt(pubkey!, toBytes(credentialPlaintext({ owner: account.address, sealId: seal, chainId: this.ctx.chain.id, name: e.name, value: e.value })));
+      } else if (e.sealedValue !== undefined) {
+        // Sealed elsewhere for this owner (sealModelKey): stored as it is.
+        ciphertext = fromB64(e.sealedValue);
       } else {
         const stored = cur.document?.values[e.name];
         if (!stored) throw new Error(`credentials: ${e.name} has no stored value; pass value`);

@@ -31,10 +31,11 @@ import { RECEIPT_WAIT, ZERO_G_TESTNET, ZERO_G_MAINNET } from './constants';
 import { AgenticIDClient, type IntelligentDataResult } from './AgenticIDClient';
 import { ReputationClient } from './ReputationClient';
 import { SandboxClient } from './SandboxClient';
-import { AttestorClient, type CloneParams, type DeployParams, type DeployCloneResponse } from './AttestorClient';
-import { CredentialsApi } from './Credentials';
+import { AttestorClient, deployProvider, type CloneParams, type DeployParams, type DeployCloneResponse } from './AttestorClient';
+import { CredentialsApi, checkModelKeyInput, type SealedModelKey } from './Credentials';
+import { requestKey, requestOnly, storeAfterMint } from './legacy/modelKey';
 import { sha256Hex, type SettingsDoc } from './Settings';
-import type { SecretEnvMode } from './secretEnv';
+import { SecretEnvRefusedError, type SecretEnvMode } from './secretEnv';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader, type TaskExchange } from './ServeSession';
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
 import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
@@ -80,6 +81,34 @@ export const MIN_SANDBOX_BALANCE_WEI = 10n ** 17n;
 export type WaitLevel = 'minted' | 'running';
 
 /**
+ * Options of a start, reset or retry that creates a container. `apiKey` is
+ * the agent's model key for `provider`: stored in its credential set and,
+ * for older images, sent with the request (legacy/modelKey.ts).
+ */
+export interface ModelKeyLifecycleOpts {
+  /** The provider `apiKey` is for. Without one the key is the 0g-compute key
+   *  (`model.0g-compute`), whatever the agent's settings name: pass the
+   *  provider for any other provider's key. A `sealedModelKey` names its own. */
+  provider?: string;
+  framework?: string;
+  sealedImage?: string;
+  apiKey?: string;
+  /** The model key sealed for this owner on an integrator's server
+   *  (`credentials.sealModelKey`), in place of `apiKey`: stored in the set as
+   *  it is, so the signer never has the key. Its provider is the request's. */
+  sealedModelKey?: SealedModelKey;
+  /** LEGACY(model-key): `sealApiKey`'s output, sent with this request only
+   *  and never stored; use `sealedModelKey`. */
+  sealedSecretEnv?: string;
+  /** LEGACY(model-key): how `apiKey` travels with the request; see {@link SecretEnvMode}. */
+  secretEnv?: SecretEnvMode;
+  /** LEGACY(model-key): the credential set already holds the key: send it with the request only (older images). */
+  keepStoredModelKey?: boolean;
+  /** Told when the key could not be stored in the credential set (it still goes with the request). */
+  onWarn?: (warning: string) => void;
+}
+
+/**
  * Facade-normalized deploy/clone acceptance — camelCase like every other
  * SDK return (the attestor's wire JSON speaks snake_case; the mapping
  * happens here so callers never see mixed casing).
@@ -87,6 +116,10 @@ export type WaitLevel = 'minted' | 'running';
 export interface DeployAccepted {
   sealId: Hash;
   agentSealAddr: Address;
+  /** A key given went into the agent's credential set (`deploy`). False: an
+   *  attestor from before sets were taken before the mint; it goes in once
+   *  minted (a wait level, or the caller with `credentials.setModelKey`). */
+  modelKeyStored?: boolean;
 }
 /** deploy/clone result once the background mint is awaited (`wait: 'minted'`). */
 type MintedResponse = DeployAccepted & { agentId: bigint };
@@ -129,11 +162,88 @@ export class AgentApi {
   private readonly attestor: AttestorClient;
   private readonly infra: SandboxClient;
   private readonly ctx: Ctx;
-  constructor(ctx: Ctx, initialConfig?: import('./context').AttestorPublicConfig) {
+  private readonly credentials: CredentialsApi;
+  constructor(ctx: Ctx, initialConfig?: import('./context').AttestorPublicConfig, credentials?: CredentialsApi) {
     this.ctx = ctx;
     this.id = new AgenticIDClient(ctx);
     this.attestor = new AttestorClient(ctx, initialConfig);
     this.infra = new SandboxClient(ctx);
+    this.credentials = credentials ?? new CredentialsApi(ctx, this.attestor);
+  }
+
+  /**
+   * A model key given to start/reset/retry goes into the agent's credential
+   * set as `model.<provider>`, stored once every check of the request has
+   * passed and before it is sent (`beforeWrite`), so the new container boots
+   * with it. (It also rides the request for older images: legacy/modelKey.ts.)
+   *
+   * The provider is the request's (0g-compute when none is given), or the
+   * sealed key's. `keyInCredentials`: the set holds a key for the provider,
+   * or is about to, so a create without one in the request is not refused;
+   * the key a running container got with its own create does not count, as
+   * the new container will not have it.
+   */
+  private async modelKeyPlan(sealId: Hash, opts: ModelKeyLifecycleOpts): Promise<{ keyInCredentials: boolean; beforeWrite?: () => Promise<void> }> {
+    const sealed = opts.sealedModelKey;
+    if (sealed && opts.apiKey) throw new SecretEnvRefusedError('conflicting_inputs', 'pass apiKey or sealedModelKey, not both');
+    if (sealed && opts.provider && opts.provider !== sealed.provider) {
+      throw new SecretEnvRefusedError('conflicting_inputs', `the sealed model key is for ${sealed.provider}, not ${opts.provider}`);
+    }
+    const provider = sealed?.provider ?? opts.provider ?? '0g-compute';
+    const key = sealed ?? opts.apiKey;
+    if (key) {
+      if (requestOnly(opts)) {
+        // LEGACY(model-key): the key goes with the request only, so it needs
+        // a request copy.
+        if (sealed && !sealed.secretEnv) {
+          throw new SecretEnvRefusedError('conflicting_inputs', 'keepStoredModelKey sends the key with the request only, and this sealed model key has no request copy (secretEnv)');
+        }
+        return { keyInCredentials: false };
+      }
+      // A sealed key with no request copy reaches the container only through
+      // the set: storing it must not fail quietly.
+      const required = !!sealed && !sealed.secretEnv;
+      return { keyInCredentials: required, beforeWrite: async () => { await this.storeModelKey(sealId, provider, key, { onWarn: opts.onWarn, required }); } };
+    }
+    if (provider === '0g-compute') return { keyInCredentials: false };
+    const cur = await this.credentials.get(sealId).catch(() => undefined);
+    return { keyInCredentials: !!cur?.definitions.some((d) => d.inference?.provider === provider) };
+  }
+
+  /**
+   * Store a model key in the set; whether it went in. A refusal is reported,
+   * not thrown, when the key still goes with the request; `required`: thrown.
+   * `newAgent`: see {@link CredentialsApi.setModelKey}. `sealedTo` hears the
+   * agentSeal address a key given in clear was sealed to.
+   */
+  private async storeModelKey(
+    sealId: Hash,
+    provider: string,
+    key: string | SealedModelKey,
+    opts: { onWarn?: (warning: string) => void; required?: boolean; newAgent?: boolean; sealedTo?: (address: Address) => void } = {},
+  ): Promise<boolean> {
+    try {
+      const stored = await this.credentials.setModelKey(sealId, provider, key, { push: false, newAgent: opts.newAgent });
+      if (stored.sealedTo) opts.sealedTo?.(stored.sealedTo);
+      return true;
+    } catch (e) {
+      if (opts.required) throw e;
+      opts.onWarn?.(`the model key was not stored in the agent's credential set (${e instanceof Error ? e.message : String(e)}); this boot gets it with the request only`);
+      return false;
+    }
+  }
+
+  /** After a deploy's mint: the key stored before it was sealed to the agentSeal key now on chain. */
+  private async checkSealedTo(agentId: bigint, sealedTo: Address | undefined): Promise<void> {
+    if (!sealedTo) return;
+    const onChain = await this.id.getAgentSeal(agentId);
+    if (onChain.toLowerCase() !== sealedTo.toLowerCase()) {
+      throw new Error(
+        `deploy: the model key was sealed to ${sealedTo}, but agent ${agentId}'s agentSeal on chain is ${onChain}: ` +
+          'the attestor named another key than the one it minted with (a relaying proxy?). The agent cannot use the stored key; ' +
+          'set it again with credentials.setModelKey and replace the key at its provider',
+      );
+    }
   }
 
   /**
@@ -246,7 +356,13 @@ export class AgentApi {
    * Deploy a new agent. Async: returns `{ sealId, agentSealAddr }` once the
    * attestor accepts the job. Pass `wait: 'minted'` to also block on the
    * background mint (adds `agentId`) or `wait: 'running'` to also block on
-   * provision (adds the reachable `url`). See {@link WaitLevel}.
+   * provision (adds the reachable `url`); `timeoutMs` covers the whole wait.
+   * See {@link WaitLevel}.
+   *
+   * A model key (`sandbox.apiKey`) is checked before anything is signed and
+   * goes into the agent's credential set right after the attestor accepts
+   * the deploy (two owner signatures). With a wait level, the key is also
+   * checked to be sealed to the agentSeal key the agent was minted with.
    */
   deploy(params: DeployParams, opts: { wait: 'running' } & WaitMintOpts): Promise<RunningResponse>;
   deploy(params: DeployParams, opts: { wait: 'minted' } & WaitMintOpts): Promise<MintedResponse>;
@@ -258,13 +374,41 @@ export class AgentApi {
       );
     }
     if (opts?.preflight !== false) await this.preflightOwnerReady();
-    const accepted = acceptedOf(await this.attestor.deploy(params));
+    // The key goes into the credential set as the agent is created: the
+    // attestor takes the deploying owner's set before the mint, and holds
+    // the container until it is stored (`awaitCredentials`), so the first
+    // boot gets it. It is checked first, so a key the store would refuse
+    // fails before the deploy is signed. (It also rides the create request
+    // for older images: legacy/modelKey.ts.)
+    const key = params.sandbox?.apiKey;
+    const provider = deployProvider(params);
+    if (key) checkModelKeyInput(provider, key);
+    const created = acceptedOf(await this.attestor.deploy(key ? { ...params, awaitCredentials: true } : params));
+    let sealedTo: Address | undefined;
+    const store = (sealId: Hash) =>
+      this.storeModelKey(sealId, provider, key as string, { newAgent: true, sealedTo: (address) => { sealedTo = address; } });
+    const accepted: DeployAccepted = key ? { ...created, modelKeyStored: await store(created.sealId) } : created;
     if (!opts?.wait) return accepted;
     // 'minted'  → block on the on-chain mint only (agentId, no url yet).
-    // 'running' → also block on provision (container up + reachable url).
-    if (opts.wait === 'running') return { ...accepted, ...(await this.waitForRunning(accepted.sealId, opts)) };
-    const agentId = await this.waitForMint(accepted.sealId, opts);
-    return { ...accepted, agentId };
+    // 'running' → block on provision (container up + reachable url), and on
+    //             the mint before it only when the key goes in after the mint.
+    // One timeout covers both waits.
+    const deadline = Date.now() + (opts.timeoutMs ?? (opts.wait === 'running' ? 300_000 : 180_000));
+    const left = () => ({ ...opts, timeoutMs: Math.max(0, deadline - Date.now()) });
+    let agentId: bigint | undefined;
+    if (opts.wait === 'minted' || (key && !accepted.modelKeyStored)) {
+      agentId = await this.waitForMint(accepted.sealId, left());
+      if (key) await storeAfterMint(accepted, () => store(accepted.sealId));
+    }
+    if (opts.wait === 'running') {
+      const running = await this.waitForRunning(accepted.sealId, left());
+      await this.checkSealedTo(running.agentId, sealedTo);
+      if (key) await this.credentials.resyncModelKey(accepted.sealId, { agentUrl: running.url }).catch(() => undefined);
+      return { ...accepted, ...running };
+    }
+    const minted = agentId as bigint;
+    await this.checkSealedTo(minted, sealedTo);
+    return { ...accepted, agentId: minted };
   }
 
   /**
@@ -963,15 +1107,13 @@ export class AgentApi {
    *  - `start(sealId, sandboxId)` — resume a STOPPED container.
    *  - `start(sealId, { apiKey, sealedImage? })` — FIRST provision of a
    *    mint-only / never-provisioned agent (no sandbox yet): spins a fresh
-   *    container. `apiKey` is required in practice (the fresh container needs
-   *    the LLM key). The semantic counterpart to a sandbox-less `deploy` —
+   *    container. The semantic counterpart to a sandbox-less `deploy` —
    *    use this, not `reset` (which means "recreate an existing container").
-   *    The key is sealed to the agent when the attestor supports it, so the
-   *    wallet prompt shows ciphertext, not the key (`secretEnv`, default
-   *    `'auto'`; `'sealed'` refuses to send it in clear). When a server
-   *    supplies the key, pass its {@link sealApiKey} output as
-   *    `sealedSecretEnv` instead of `apiKey`, so the key never reaches the
-   *    signer at all.
+   *    `apiKey`, the model key, goes into the agent's credential set (see
+   *    {@link ModelKeyLifecycleOpts}); a set that holds one already needs
+   *    none. When a server supplies the key, pass its
+   *    `credentials.sealModelKey` output as `sealedModelKey` instead of
+   *    `apiKey`, so the key never reaches the signer at all.
    *
    * Both shapes, like {@link reset}, first store the default model
    * (`DEFAULT_PERSONA_INFERENCE`) as the agent's settings document when it
@@ -981,25 +1123,25 @@ export class AgentApi {
    * existing document is never replaced.
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
-  start(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void>;
-  start(sealId: Hash, arg?: string | { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
+  start(sealId: Hash, opts?: ModelKeyLifecycleOpts): Promise<void>;
+  async start(sealId: Hash, arg?: string | ModelKeyLifecycleOpts): Promise<void> {
     if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
+    const key = await this.modelKeyPlan(sealId, arg ?? {});
     // `framework` resolves the right sealed image for a first provision (a
     // mint-only hermes/prime agent otherwise boots the default snapshot) —
     // same resolution deploy/reset use. (review #154 opportunity)
-    return this.attestor.lifecycle('start', { sealId, provider: arg?.provider, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey, sealedSecretEnv: arg?.sealedSecretEnv, secretEnv: arg?.secretEnv });
+    return this.attestor.lifecycle('start', { sealId, provider: arg?.provider ?? arg?.sealedModelKey?.provider, framework: arg?.framework, sealedImage: arg?.sealedImage, ...requestKey(arg ?? {}), ...key });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
    * identity — a fresh boot that re-reads iData from chain and reselects
-   * the framework adapter from the binding. Owner-signed. `apiKey` is
-   * required in practice: without it the agent boots but cannot call
-   * its model. When the attestor advertises `secret_env_scheme`, the
-   * SDK seals the key to the agent's agentSeal key (only the TEE opens
-   * it) and the owner signs that ciphertext; otherwise it rides the
-   * signed envelope in clear (`secretEnv`, default `'auto'`; `'sealed'`
-   * refuses the clear path). The attestor keeps no reusable copy, which
-   * is WHY it must be passed again on every recreate.
+   * the framework adapter from the binding. Owner-signed. The new
+   * container takes its model key from the agent's credential set at boot:
+   * a key held there needs no `apiKey`. A given `apiKey` (or
+   * `sealedModelKey`) is stored there first, as for {@link start}.
+   * LEGACY(model-key): for older images it also rides the request, sealed
+   * to the agent's agentSeal key when the attestor advertises
+   * `secret_env_scheme`, else in clear (`secretEnv`).
    *
    * An agent with no settings document boots on the model pinned in its
    * minted persona, which leaves the chain at its first commit. So when the
@@ -1011,8 +1153,9 @@ export class AgentApi {
    * reset onto another `provider` until its settings name one: write them
    * with {@link setSettings} first.
    */
-  reset(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
-    return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
+  async reset(sealId: Hash, opts?: ModelKeyLifecycleOpts): Promise<void> {
+    const key = await this.modelKeyPlan(sealId, opts ?? {});
+    return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider ?? opts?.sealedModelKey?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, ...requestKey(opts ?? {}), ...key });
   }
 
   /**
@@ -1067,8 +1210,11 @@ export class AgentApi {
   async setSettings(
     sealId: Hash,
     settings: SettingsDoc,
-    opts: { baseVersion: number; onWarn?: (warning: string) => void },
+    opts: { baseVersion: number; onWarn?: (warning: string) => void; modelKey?: string },
   ): Promise<{ version: number }> {
+    // A provider switch takes the new provider's key with it: stored (and
+    // pushed to the running agent) first, so the agent can switch to it.
+    if (opts.modelKey) await this.credentials.setModelKey(sealId, settings.provider ?? '0g-compute', opts.modelKey);
     return this.attestor.setSettings({
       sealId,
       settings,
@@ -1078,6 +1224,10 @@ export class AgentApi {
   }
 
   /**
+   * LEGACY(model-key): use `credentials.sealModelKey`, whose key goes into
+   * the agent's credential set and reaches every boot; this one reaches only
+   * the request it is sent with.
+   *
    * Seal an inference key to one agent WITHOUT signing anything — for the
    * integrator whose server supplies the key while the agent's owner signs
    * in a browser. The server calls this (a read-only client is enough: no
@@ -1101,13 +1251,15 @@ export class AgentApi {
    * (storage upload, mint re-fetch, setAgentURI, …) against the same sealId,
    * where redeploying would orphan an already-minted agent.
    *
-   * Without opts it does idempotent stages only. Pass `apiKey` (and
-   * optionally `sealedImage`) to let it continue past those into container
-   * creation — like {@link reset}, the LLM key must be re-supplied (and is
-   * sealed the same way, see `secretEnv`).
+   * Without a model key it does idempotent stages only. With one (`apiKey`
+   * or `sealedModelKey`, stored in the credential set as with
+   * {@link reset}, or a `provider` whose key the set holds already) it may
+   * continue past those into container creation, optionally on
+   * `sealedImage`: the owner signs a create envelope.
    */
-  retry(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
-    return this.attestor.retry({ sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
+  async retry(sealId: Hash, opts?: ModelKeyLifecycleOpts): Promise<void> {
+    const key = await this.modelKeyPlan(sealId, opts ?? {});
+    return this.attestor.retry({ sealId, provider: opts?.provider ?? opts?.sealedModelKey?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, ...requestKey(opts ?? {}), ...key });
   }
 
   /**
@@ -1311,12 +1463,12 @@ export class AgenticID {
   constructor(config: AgenticIDConfig, initialConfig?: import('./context').AttestorPublicConfig) {
     const ctx = buildCtx(config);
     this.ctx = ctx;
-    this.agent = new AgentApi(ctx, initialConfig);
+    this.attestor = new AttestorClient(ctx, initialConfig);
+    this.credentials = new CredentialsApi(ctx, this.attestor);
+    this.agent = new AgentApi(ctx, initialConfig, this.credentials);
     this.reputation = new ReputationApi(ctx);
     this.infra = new SandboxClient(ctx);
-    this.attestor = new AttestorClient(ctx, initialConfig);
     this.admin = new AdminApi(this.attestor);
-    this.credentials = new CredentialsApi(ctx, this.attestor);
   }
 
   /**

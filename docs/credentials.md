@@ -100,13 +100,16 @@ The agent can ask for three things: a value handed over, a new credential (namin
 
 The key the agent calls its model with is kept in the credential set too, one entry per provider (`model.0g-compute`, `model.anthropic`, …).
 
+- **One key per provider, wherever you give it.** The key `login` keeps on your machine is the one every other step offers first: creating or resetting an agent, `cred <agent> set model`, and a `settings` switch to another provider each ask "use the X key saved on this machine?". Answer no and give a new key, and it replaces the one on your machine. A script that pipes a key in is asked nothing; the key it gives replaces the one on your machine.
 - **Who uses it.** sealed hands the key to the framework for its model calls. The entry is not in the agent's list of credentials and cannot be revealed. Whether the agent's tools can read the key depends on the framework, as for the key given at create/reset: 0g-harness on 0g-compute never gets it (sealed fills it in on the way out); openclaw, hermes, prime and 0g-harness on `openai`/`anthropic` receive the key itself, so their tools can read it.
 - **Which one.** The agent's settings choose the provider (`settings <agent> provider=…`), and sealed takes that provider's key; a key for another provider is only kept. With no provider in the settings, the one provider holding a key is used.
 - **Where it may go.** To the provider's address in the platform's provider list as it was when the key was set; a later change to the list does not move the key.
 - **Changing it.** `cred <agent> set model` takes effect at once: 0g-harness on 0g-compute switches without restarting; the other frameworks restart in a few seconds.
 - **Switching provider.** `settings <agent> provider=X model=…` asks for X's key when the set has none, stores it, then switches.
-- **Without one.** The key given at create/reset is used. When the set holds a key for the provider, a reset does not replace it: `cred <agent> set model` does.
-- **Removing the key in use.** The agent goes back to the key given at create/reset when that one is for the same provider; otherwise its framework stops until there is a key. It never keeps using a key you removed.
+- **Creating and resetting.** The key goes into the credential set like any other. While older images are still in use, it also travels with the create or reset request, which those images read; an image that reads the set uses the set's key. When the set already holds a key for the provider, a reset asks nothing and sends the key on your machine along for older images; with none on your machine it asks for it (Enter skips; a key given there also replaces the one in the set).
+- **A key an app supplies.** An app can pay for the agent's model with its own key without showing it to you: its server seals the key to the agent, and you store it in the credential set, signing only the sealed value. It then works like a key of your own.
+- **Without one.** With no key for the provider in the set, the CLI creates or resets a 0g-harness agent on 0g-compute without one: it runs, and its model calls fail until you set one. For any other framework or provider the CLI asks for a key. The SDK refuses a create without one only for a provider other than 0g-compute whose key the set does not hold; what each framework does without a key is in [sealed/CREDENTIALS.md](../sealed/CREDENTIALS.md).
+- **Removing the key in use.** You are asked first. While keys still travel with the create or reset request, the agent goes back to the key that came with it when that one is for the same provider; otherwise it cannot call its model until there is a key. It never keeps using a key you removed.
 
 ## Transfer
 

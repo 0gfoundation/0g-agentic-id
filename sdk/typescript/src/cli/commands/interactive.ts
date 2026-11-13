@@ -29,7 +29,8 @@ import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
 import { applyAssignments, assertModelPresent, assertOthersFitFramework, isHarnessFramework, parseAssignments, renderSettings } from '../settings';
-import { answerPending, credOp, credOwnerOp, ensureModelKey, resetModelKeyNote } from '../credentials';
+import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOwnerOp, ensureModelKey } from '../credentials';
+import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
@@ -392,9 +393,19 @@ export function makeInboxFeed(show: (text: string, shown: () => void) => void): 
 }
 
 let knownAgentIds: string[] = [];
-const rememberAgentIds = (rows: Array<{ agentId?: unknown }>): void => {
+// agentId → sealId, for completing what `cred <agent> …` last read.
+const knownSeals = new Map<string, string>();
+const rememberAgentIds = (rows: Array<{ agentId?: unknown; sealId?: string }>): void => {
   const ids = rows.map((r) => String(r.agentId ?? '')).filter((x) => x && x !== 'undefined');
   if (ids.length) knownAgentIds = [...new Set(ids)];
+  for (const r of rows) if (r.sealId && r.agentId !== undefined && r.agentId !== null) knownSeals.set(String(r.agentId), r.sealId);
+};
+// The session's agent, for `/cred …` completion.
+let sessionSealId: string | null = null;
+/** Entry names for completion: of `agent` (L1), or of the session's agent. */
+const credNamesFor = (agent?: string): string[] => {
+  const seal = agent === undefined ? sessionSealId : (agent.startsWith('0x') ? agent : knownSeals.get(agent));
+  return seal ? cachedCredNames(seal) : [];
 };
 const AGENT = (): string[] => knownAgentIds;
 
@@ -438,8 +449,50 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
 
-// L1 commands whose second word is a subcommand once the agent is named.
-const SUB_AFTER_AGENT: Record<string, string[]> = { cred: CRED_SUBS };
+const YES_NO = ['yes', 'no'];
+const CRED_VALUES: Record<string, () => string[]> = {
+  preset: () => Object.keys(CRED_PRESETS),
+  use: () => ['inject', 'token_only', 'sign'],
+  reveal: () => YES_NO,
+  writeback: () => YES_NO,
+  path: () => YES_NO,
+};
+
+/**
+ * Completes the words after `cred <agent>` or `/cred`: the subcommand, then
+ * an entry name (`model` included), then `k=v` options with their known
+ * values. `words` ends with the word being typed; `names` are the entries
+ * the last read of this agent's set returned.
+ */
+export function completeCred(words: string[], names: string[], providers: string[]): string[] {
+  const word = words[words.length - 1] ?? '';
+  const pick = (list: string[]) => list.filter((c) => c.startsWith(word));
+  if (words.length <= 1) return pick(CRED_SUBS);
+  const [sub, name] = words;
+  const isModel = name === 'model' || !!name?.startsWith('model.');
+  const providerArg = () => (word.startsWith('provider=') ? pick(providers.map((p) => `provider=${p}`)) : pick(['provider=']));
+  switch (sub) {
+    case 'set':
+      if (words.length === 2) return pick(['model ', ...names.filter((n) => !n.startsWith('model.')).map((n) => `${n} `)]);
+      if (isModel) return providerArg();
+      {
+        const eq = word.indexOf('=');
+        if (eq > 0 && CRED_VALUES[word.slice(0, eq)]) return pick(CRED_VALUES[word.slice(0, eq)]().map((v) => `${word.slice(0, eq)}=${v}`));
+        return pick([...CRED_KEYS].map((k) => `${k}=`));
+      }
+    case 'rm':
+      if (words.length === 2) return pick(['model ', ...names.filter((n) => !n.startsWith('model.')).map((n) => `${n} `)]);
+      return isModel ? providerArg() : [];
+    case 'reveal':
+      if (words.length === 2) return pick(names.filter((n) => !n.startsWith('model.')).map((n) => `${n} `));
+      return words.length === 3 ? pick(['on', 'off']) : [];
+    case 'connect':
+    case 'disconnect':
+      return words.length === 2 ? pick(names.filter((n) => !n.startsWith('model.')).map((n) => `${n} `)) : [];
+    default:
+      return [];
+  }
+}
 
 // Commands whose LATER arguments also complete (the generic rule is "first
 // argument only; the rest is free-form" — right for prompts and amounts,
@@ -478,7 +531,7 @@ export function completeTail(cmd: string, word: string, models: string[], provid
 // completer is a one-line adapter that hands it the mutable module state.
 export function completeLine(
   line: string,
-  state: { completions: string[]; args: Record<string, string[] | (() => string[])>; models: string[]; provider?: string; providerModels?: Record<string, string[]>; providers?: string[] },
+  state: { completions: string[]; args: Record<string, string[] | (() => string[])>; models: string[]; provider?: string; providerModels?: Record<string, string[]>; providers?: string[]; credNames?: (agent?: string) => string[] },
 ): [string[], string] {
   const sp = line.indexOf(' ');
   if (sp === -1) {
@@ -499,12 +552,16 @@ export function completeLine(
     const hits = completeTail(cmd, word, models, state.providers);
     return hits.length ? [hits, word] : [[], line];
   }
-  // `cred <agent> <sub>`: the second word is the subcommand, not another agent.
-  if (SUB_AFTER_AGENT[cmd] && rest.includes(' ')) {
-    if (rest.split(' ').length !== 2) return [[], line];
-    const subs = SUB_AFTER_AGENT[cmd];
-    const hits = subs.filter((c) => c.startsWith(word));
-    return [hits.length ? hits : subs, word];
+  // `cred <agent> …` / `/cred …`: the subcommand, then names and options.
+  if ((cmd === 'cred' && rest.includes(' ')) || cmd === '/cred') {
+    const words = rest.split(' ');
+    const agent = cmd === 'cred' ? words.shift() : undefined;
+    // `cred pending|notify|presets …` name no agent.
+    if (agent && ['pending', 'notify', 'presets'].includes(agent)) return [[], line];
+    const providers = state.providers ?? knownProviders.map((p) => p.id);
+    const hits = completeCred(words, state.credNames?.(agent) ?? [], providers);
+    if (words.length <= 1 && !hits.length) return [CRED_SUBS, word];
+    return [hits, word];
   }
   const cand = state.args[cmd];
   const list = typeof cand === 'function' ? cand() : (cand ?? []);
@@ -979,7 +1036,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     // so the candidate set is swapped by whichever REPL loop is active
     // (activeCompletions); empty line + Tab lists everything.
     completer: (line: string): [string[], string] =>
-      completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds }),
+      completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor }),
   });
   activeRl = rl;
   const ask = lineQueue(rl, () => !!process.stdin.isTTY);
@@ -1114,7 +1171,7 @@ const L1_HELP_FULL = `manager commands
                           much (more) to withdraw (time-locked)
   ack                     acknowledge the TEE trust root (deploy/start/reset
                           do this implicitly; re-run after an attestor upgrade)
-  login [provider]        setup: attestor URL, owner key, provider, inference key
+  login [provider]        setup: attestor URL, owner key, each provider's model key
                           (Enter keeps the current value; secrets echo *)
   whoami                  show attestor / wallet / api-key / ack status
   help                    this text
@@ -1194,6 +1251,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   for (;;) {
     activeCompletions = L1_WORDS;
     activeArgs = L1_ARGS;
+    sessionSealId = null;
     const line = (await ((ask as Ask).main ?? ask)(`\n0g-agentdna [${hostOf(ctx.env.attestorUrl)}]> `)).trim();
     // Bare Enter refreshes the account status — the L1 analog of L2's
     // bare-Enter agent refresh.
@@ -1205,32 +1263,55 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'help') { out(`${L1_HELP_FULL}\n`); continue; }
 
       if (cmd === 'login' || cmd === 'config') {
-        // Guided setup — attestor URL, owner key, provider, inference key. Enter
-        // keeps the current value; a typed value replaces it. Secrets masked.
-        const url = (await ask(`attestor URL [${ctx.env.attestorUrl ?? 'unset'}]: `)).trim();
-        if (url) { saveConfig({ attestorUrl: url.replace(/\/$/, '') }); ctx.env.attestorUrl = url.replace(/\/$/, ''); }
-
-        const hasKey = !!(ctx.env.privateKey ?? loadKey());
-        const key = (await askSecret(ask, `owner private key [${hasKey ? 'set — Enter to keep' : 'unset'}]: `)).trim();
-        if (key) {
-          // Cache what was SAVED, not what was typed — saveKey normalizes
-          // (0x prefix optional), and a raw un-prefixed value in ctx.env
-          // makes every later command see a "malformed" key until restart.
-          try { saveKey(key); ctx.env.privateKey = normalizeKey(key)!; ctx.env.privateKeySource = 'file'; }
-          catch (e) { out(`private key not saved: ${(e as Error).message}\n`); }
+        // Guided setup. The attestor URL is required; the owner key is
+        // needed to manage agents; model keys are optional (creating or
+        // resetting an agent asks for the one its provider needs, as do
+        // `cred set model` and a settings switch, cli/modelkey.ts). Enter
+        // keeps a value or skips an unset one; a typed value replaces it.
+        // Secrets masked. `login <provider>` asks that provider's key only.
+        const only = args[0];
+        if (!only) {
+          for (;;) {
+            const url = (await ask(`attestor URL (required) [${ctx.env.attestorUrl ?? 'unset'}]: `)).trim();
+            if (url) { saveConfig({ attestorUrl: url.replace(/\/$/, '') }); ctx.env.attestorUrl = url.replace(/\/$/, ''); break; }
+            if (ctx.env.attestorUrl) break;
+            out('every command needs the attestor URL\n');
+          }
+          const hasKey = !!(ctx.env.privateKey ?? loadKey());
+          const key = (await askSecret(ask, `owner private key (needed to manage your agents) [${hasKey ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
+          if (key) {
+            // Cache what was SAVED, not what was typed — saveKey normalizes
+            // (0x prefix optional), and a raw un-prefixed value in ctx.env
+            // makes every later command see a "malformed" key until restart.
+            try { saveKey(key); ctx.env.privateKey = normalizeKey(key)!; ctx.env.privateKeySource = 'file'; }
+            catch (e) { out(`private key not saved: ${(e as Error).message}\n`); }
+          }
         }
 
         if (ctx.env.attestorUrl) {
           const client = await buildClient(ctx.env);
           knownProviders = await client.agent.refreshProviders();
         } else { knownProviders = listInferenceProviders(); }
-        const selected = args[0] ?? await pickInferenceProvider(ask, loadConfig().inferenceProvider ?? '0g-compute');
-        if (!knownProviders.some((provider) => provider.id === selected)) throw new CliError('BAD_FLAG', `unknown inference provider: ${selected}`);
-        saveConfig({ inferenceProvider: selected });
-        const hasApi = !!configuredInferenceKey(selected);
-        const api = (await askSecret(ask, `${selected} API key [${hasApi ? 'set — Enter to keep' : 'unset'}]: `)).trim();
-        if (api) saveApiKey(selected, api);
+        if (only && !knownProviders.some((provider) => provider.id === only)) throw new CliError('BAD_FLAG', `unknown inference provider: ${only}`);
+        if (!only) out('model keys (optional: creating or resetting an agent asks for the one its provider needs)\n');
+        for (const id of only ? [only] : knownProviders.map((provider) => provider.id)) {
+          const has = !!configuredInferenceKey(id);
+          const api = (await askSecret(ask, `  ${id} key [${has ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
+          if (api) saveApiKey(id, api);
+        }
+        const withKey = knownProviders.map((provider) => provider.id).filter((id) => configuredInferenceKey(id));
+        let preferred = loadConfig().inferenceProvider ?? '0g-compute';
+        if (!only) {
+          // New agents default to a provider there is a key for.
+          if (withKey.length > 1) preferred = await pickInferenceProvider(ask, withKey.includes(preferred) ? preferred : withKey[0], withKey);
+          else if (withKey.length === 1) preferred = withKey[0];
+          saveConfig({ inferenceProvider: preferred });
+        }
         out(`saved to ${configPaths().dir} (credentials chmod 600)\n`);
+        out(`  attestor    ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+        out(`  owner key   ${ctx.env.privateKey ?? loadKey() ? 'set' : '(none — needed to manage your agents)'}\n`);
+        out(`  model keys  ${withKey.join(', ') || '(none — creating or resetting an agent asks for one)'}\n`);
+        out(`  new agents  ${preferred}\n`);
         // Re-seed the startup-time caches that were filled from the OLD
         // attestor or wallet: without this, Tab completion keeps offering the
         // previous environment's (or wallet's — listMyDeployments is
@@ -1461,16 +1542,17 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const plan = await resetInferencePlan(ag, row.sealId, await readDeploymentFacts(attestorUrl, row.sealId));
         const provider = plan.provider;
         await ag.agent.assertProviderSupported(provider, { sealId: row.sealId, framework });
-        const apiKey = await inferenceKey(ctx, ask, provider);
-        const keyNote = await resetModelKeyNote(ag, row.sealId, provider);
-        if (keyNote) out(`${keyNote}\n`);
+        const key = await resetModelKey(ag.credentials, row.sealId, provider, framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(ag, row.sealId, plan, out);
         out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
         const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
-        await ag.agent.reset(row.sealId, { provider, framework, apiKey });
+        await ag.agent.reset(row.sealId, { provider, framework, ...key, onWarn: (w) => out(`⚠ ${w}\n`) });
         const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
-        if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
+        if (r) {
+          await ag.credentials.resyncModelKey(row.sealId, { agentUrl: r.url }).catch(() => undefined);
+          out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
+        }
         continue;
       }
 
@@ -1859,7 +1941,7 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
   let pendingReset = false;
   if (providerChanged) {
     const provider = next.provider ?? '0g-compute';
-    const keyIO = ask ? credIO(ask) : { out: (l: string) => out(`${l}\n`), secret: async () => '', savedModelKey: (p: string) => configuredInferenceKey(p) };
+    const keyIO = ask ? credIO(ask) : { json: false, out: (l: string) => out(`${l}\n`), secret: async () => '' };
     if (await ensureModelKey(ag, sealId, provider, keyIO, serveBase ? { agentUrl: serveBase } : undefined) === 'unsupported') {
       requireConfiguredInferenceKey(provider);
       pendingReset = true;
@@ -2137,7 +2219,7 @@ function credIO(ask: (q: string) => Promise<string>) {
     json: false, out: (l: string) => out(`${l}\n`), secret: (p: string) => askSecret(ask, p),
     // The credential prompts' terminal reset: on a terminal only.
     raw: (s: string) => { if (process.stdout.isTTY) term(s); },
-    savedModelKey: (provider: string) => configuredInferenceKey(provider),
+    keyPrompt: keyPrompt(ask),
   };
 }
 
@@ -2214,8 +2296,8 @@ async function addressOf(key: `0x${string}`): Promise<string> {
 
 // ── deploy / attach (from the former chat command) ───────────────────────────
 
-async function pickInferenceProvider(ask: (q: string) => Promise<string>, preferred: string): Promise<string> {
-  const providers = knownProviders;
+async function pickInferenceProvider(ask: (q: string) => Promise<string>, preferred: string, among?: string[]): Promise<string> {
+  const providers = among ? knownProviders.filter((provider) => among.includes(provider.id)) : knownProviders;
   const fallback = Math.max(0, providers.findIndex((provider) => provider.id === preferred));
   out('providers:\n');
   providers.forEach((provider, index) => out(`  ${index}. ${provider.id} (${provider.name})${index === fallback ? ' (default)' : ''}\n`));
@@ -2225,17 +2307,11 @@ async function pickInferenceProvider(ask: (q: string) => Promise<string>, prefer
   return chosen.id;
 }
 
-async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<string>, provider = '0g-compute'): Promise<string> {
-  const configured = configuredInferenceKey(provider);
-  if (configured) return configured;
-  const typed = (await askSecret(ask, `${provider} inference API key (saved to credentials): `)).trim();
-  if (typed) { saveApiKey(provider, typed); return typed; }
-  // No key anywhere: deploying anyway would provision a container that 401s
-  // on every turn minutes later — fail HERE with the fix instead.
-  throw new CliError('INFERENCE_KEY_REQUIRED', `no API key registered for ${provider}`, {
-    remedy: `run login and register the ${provider} key`,
-  });
+/** The model key prompt of the REPL (cli/modelkey.ts). */
+function keyPrompt(ask: (q: string) => Promise<string>) {
+  return replKeyPrompt(ask, (p: string) => askSecret(ask, p), (l: string) => out(`${l}\n`));
 }
+
 
 /** Trust-root ack (once per owner) + a prepaid-balance gate that ASKS before
  *  spending: under 0.1 OG, report the shortfall and offer to deposit now.
@@ -2343,7 +2419,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   // container is actually provisioned, so skip both in mint-only mode.
   const provision = !(await ask('bring it online now (start a container)? [Y/n]: ')).trim().toLowerCase().startsWith('n');
 
-  const apiKey = provision ? await inferenceKey(ctx, ask, provider) : undefined;
+  const apiKey = provision ? (await pickModelKey(provider, keyPrompt(ask), { optional: mayGoKeyless(framework, provider) })) ?? undefined : undefined;
   if (provision && !(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
   out(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only, no container'}…\n`);
   const { deployment: dep, agentId } = await deployWithInference(ag, { name, framework, provider, model, provision, apiKey });
@@ -2354,6 +2430,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   out(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
   const r = await waitRunningInterruptible(irq, attestorUrl, dep.sealId, agentId);
   if (!r) return null; // Esc: the attestor keeps deploying — only the wait ends
+  if (apiKey) await ag.credentials.resyncModelKey(dep.sealId, { agentUrl: r.url }).catch(() => undefined);
   // Enter through attach so a fresh deploy gets the same entry card
   // (avatar / gas / status) as `use`; only the wizard knows the framework.
   const s = await attach(ag, attestorUrl, agentId, ask);
@@ -2640,6 +2717,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   for (;;) {
     activeCompletions = L2_WORDS;
     activeArgs = L2_ARGS;
+    sessionSealId = s.sealId;
     // While not connected (deploying/stopped/offline) the phase is in flux —
     // auto-refresh before every prompt, printing only when it moves (and
     // connecting the moment it reaches running). Once connected, skip: no
@@ -2780,16 +2858,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const plan = await resetInferencePlan(s.ag, s.sealId, await readDeploymentFacts(s.attestorUrl, s.sealId));
         const provider = plan.provider;
         await s.ag.agent.assertProviderSupported(provider, { sealId: s.sealId, framework: s.framework });
-        const apiKey = await inferenceKey(ctx, ask, provider);
-        const keyNote = await resetModelKeyNote(s.ag, s.sealId, provider);
-        if (keyNote) out(`${keyNote}\n`);
+        const key = await resetModelKey(s.ag.credentials, s.sealId, provider, s.framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(s.ag, s.sealId, plan, out);
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
         const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
-        await s.ag.agent.reset(s.sealId, { provider, framework: s.framework, apiKey });
+        await s.ag.agent.reset(s.sealId, { provider, framework: s.framework, ...key, onWarn: (w) => out(`⚠ ${w}\n`) });
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
         if (!r) continue;
+        await s.ag.credentials.resyncModelKey(s.sealId, { agentUrl: r.url }).catch(() => undefined);
         await connectSession(s, r.url);
         messages.length = 0; out(`back up at ${s.url}\n`); continue;
       }

@@ -76,20 +76,13 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	// silently reverted), it is losing these fields, and reading the key from
 	// it is what dialled a platform-routed endpoint keyless and 401'd live.
 	//
-	// Missing and platform-routed is fatal here rather than at the first turn:
-	// the 0G router answers an unauthenticated call with a 401, so the
-	// container would come up healthy, serve /hello, and fail every single
-	// chat with an error the owner cannot place.
+	// No key is a state the owner sees and fixes: the agent's credential view
+	// says no model key is in use, and `cred <agent> set model` applies one
+	// to the running agent. So the harness starts, and its model calls fail
+	// until then.
 	apiKey := rendered.resolved.APIKey
 	if apiKey == "" {
-		if ep := rendered.resolved.Endpoint; ep != nil {
-			return framework.StartResult{}, fmt.Errorf(
-				"harness.Start: the platform routes %s to %s but this boot has no inference key — the harness would dial it unauthenticated and 401 on the first turn (check API_KEY in the container's environment)", model, ep.BaseURL)
-		}
-		// A framework built-in supplies its own endpoint, and only its own
-		// provider knows whether that endpoint needs a key at all. Say so and
-		// keep booting.
-		logger.Logf("warn: harness.Start: no inference key for this boot; provider %q must serve %s unauthenticated or the first turn fails", provider, model)
+		logger.Logf("warn: harness.Start: no model key for %s on %s; model calls fail until the owner sets one (cred <agent> set model)", model, provider)
 	}
 
 	// The key stays in sealed when it can: the harness gets a placeholder and

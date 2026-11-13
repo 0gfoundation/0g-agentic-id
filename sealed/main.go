@@ -169,6 +169,7 @@ func main() {
 	sealedProxy := proxy.New(agent, cfg.PublicURL)
 	sealedProxy.Listen()
 	sealedProxy.ListenInternal(sealSignSockPath)
+	// LEGACY(model-key): the key handed over at create/reset.
 	if cfg.APIKey != "" {
 		logger.Logf("API_KEY (from env): <set, %d chars>", len(cfg.APIKey))
 	} else {
@@ -350,6 +351,8 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 // class (never a value), so the attestor and owner see why the agent
 // cannot call its model instead of a healthy "running". The ciphertext is
 // dropped from memory either way.
+//
+// LEGACY(model-key): the key handed over at create/reset (internal/secretenv).
 func applySecretEnv(cfg *config.Bootstrap, agentSealPriv []byte, res *chainBootstrapResult) {
 	if cfg.SecretEnv == "" {
 		return
@@ -661,7 +664,7 @@ func startAgent(
 	onFailed func(err error),
 	statusReports *statusReporter,
 ) error {
-	apiKey := cfg.APIKey
+	apiKey := cfg.APIKey // LEGACY(model-key): the key handed over at create/reset
 	publicURL := cfg.PublicURL
 	sealID := cfg.Attestation.SealID
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -795,12 +798,13 @@ func startAgent(
 	// PreStart hook on every spawn, and an owner push arriving on the proxy.
 	live := &liveSettings{doc: settingsDoc}
 	// The model key: the owner's for the settings' provider from the
-	// credential set, else the one handed over at create/reset (modelkey.go).
+	// credential set, else (LEGACY(model-key)) the one handed over at
+	// create/reset (modelkey.go).
 	keys := &modelKeys{boot: inference.ProviderCredential{Provider: inference.ZGComputeProvider, APIKey: apiKey}}
 	if credStore != nil {
 		keys.store = credStore
 	}
-	if cfg.InferenceCredential != nil {
+	if cfg.InferenceCredential != nil { // LEGACY(model-key)
 		keys.boot = *cfg.InferenceCredential
 	}
 	if res.client != nil && res.client.ChainID() != nil && res.client.ChainID().IsUint64() {
@@ -926,7 +930,7 @@ func startAgent(
 	})
 	if err := mgr.Start(context.Background(), manager.StartParams{
 		Runtime: framework.RuntimeContext{
-			APIKey:       apiKey,
+			APIKey:       apiKey, // LEGACY(model-key)
 			PublicURL:    publicURL,
 			SealSignSock: sealSignSockPath,
 			AgentSeal:    agentSealAddr,

@@ -180,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
         deployments,
         events,
         oss,
+        credentials: attestor_shared::credentials_repo::PostgresCredentialRepo::new(pool.clone()),
     };
 
     // background sweep task — four responsibilities, same 60s tick:
