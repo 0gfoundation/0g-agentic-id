@@ -182,22 +182,97 @@ func TestWriteServeProofV2_MalformedLayerHashNoProof(t *testing.T) {
 	}
 }
 
-// layersForProof: nothing set or not ok means v1; ok signs what the
-// provider names at that moment.
+// layersForProof: nothing set means v1; set and not ok means no proof at all
+// (never v1); ok signs what the provider names at that moment.
 func TestServerLayersForProof(t *testing.T) {
 	s := New(state.New(), "")
-	if s.layersForProof() != nil {
-		t.Fatal("layers without SetProofLayers")
+	if l, ok := s.layersForProof(); l != nil || !ok {
+		t.Fatalf("without SetProofLayers: %+v %v, want a v1 proof", l, ok)
 	}
-	ok := false
+	ready := false
 	want := ProofLayers{SealedHash: "0xs", HarnessHash: "0xh", InferenceURL: katInferenceURL, Model: katModel}
-	s.SetProofLayers(func() (ProofLayers, bool) { return want, ok })
-	if s.layersForProof() != nil {
-		t.Fatal("layers while not ok")
+	s.SetProofLayers(func() (ProofLayers, bool) { return want, ready })
+	if l, ok := s.layersForProof(); l != nil || ok {
+		t.Fatalf("while the layers are unknown: %+v %v, want no proof", l, ok)
 	}
-	ok = true
-	if l := s.layersForProof(); l == nil || *l != want {
-		t.Fatalf("layersForProof = %+v", l)
+	ready = true
+	if l, ok := s.layersForProof(); l == nil || !ok || *l != want {
+		t.Fatalf("layersForProof = %+v %v", l, ok)
+	}
+}
+
+// Under the layered runtime, a response while the layers are unknown goes
+// out without a proof: never a v1 one.
+func TestServeWithProof_NoV1UnderTheLayeredRuntime(t *testing.T) {
+	priv, _ := crypto.GenerateKey()
+	s := New(state.New(), "")
+	s.SetProofLayers(func() (ProofLayers, bool) { return ProofLayers{}, false })
+	rec := httptest.NewRecorder()
+	if err := s.serveWithProof(rec, httptest.NewRequest(http.MethodGet, "/hello", nil), crypto.FromECDSA(priv), nil, []byte("x"), nil, 200,
+		"30", "0x"+strings.Repeat("11", 32), "16602", "0x00000000000000000000000000000000000000A9", testValidator); err != nil {
+		t.Fatal(err)
+	}
+	if h := rec.Header().Get("X-Agent-Proof"); h != "" || rec.Body.String() != "x" {
+		t.Fatalf("proof %q, body %q: want the body without a proof", h, rec.Body.String())
+	}
+}
+
+// The v2 vector with a model name outside ASCII (sealed/LAYERS.md §7): the
+// strings are hashed as their UTF-8 bytes. The other ServeProof
+// implementations assert the same values (computed with cast, the procedure
+// above).
+const (
+	katModelUTF8       = "模型-é"
+	katModelUTF8Bytes  = "e6a8a1e59e8b2dc3a9"
+	katProofHashV2UTF8 = "00dc0a9ba85191968c4bdcb00d11b4003216306420d80a6e68432fe01f24a977"
+	katV0DigestV2UTF8  = "cab300c137d0d07deb4e73c3e027db4ff63df5045e0a95767519cce28ffbd963"
+)
+
+func TestServeProofDigestV2_NonASCIIModelVector(t *testing.T) {
+	if got := hex.EncodeToString([]byte(katModelUTF8)); got != katModelUTF8Bytes {
+		t.Fatalf("model bytes %s, want %s", got, katModelUTF8Bytes)
+	}
+	taskHash, _ := hexToBytes32("0x" + strings.Repeat("11", 32))
+	dh0, _ := hexToBytes32("0x" + strings.Repeat("22", 32))
+	dh1, _ := hexToBytes32("0x" + strings.Repeat("33", 32))
+	fwBytes, _ := hexToBytes32("0x" + strings.Repeat("44", 32))
+	sealedBytes, _ := hexToBytes32("0x" + strings.Repeat("55", 32))
+	harnessBytes, _ := hexToBytes32("0x" + strings.Repeat("66", 32))
+	proofHash := serveProofHashV2(big.NewInt(16602), addrWord("0x00000000000000000000000000000000000000A9"),
+		addrWord("0x00000000000000000000000000000000000000C1"), big.NewInt(42), 1700000000, 1700003600,
+		taskHash, append(append([]byte{}, dh0...), dh1...), fwBytes, sealedBytes, harnessBytes, katInferenceURL, katModelUTF8)
+	if got := hex.EncodeToString(proofHash); got != katProofHashV2UTF8 {
+		t.Fatalf("v2 serve-proof hash (non-ASCII model):\n got  0x%s\n want 0x%s", got, katProofHashV2UTF8)
+	}
+	validator, _ := parseValidator(testValidator)
+	if got := hex.EncodeToString(serveProofDigest(validator, proofHash)); got != katV0DigestV2UTF8 {
+		t.Fatalf("v2 serve-proof digest (non-ASCII model):\n got  0x%s\n want 0x%s", got, katV0DigestV2UTF8)
+	}
+}
+
+// The envelope carries such a model as raw UTF-8 (not \u escapes, not
+// Latin-1), so a verifier that decodes the base64 to bytes and the bytes as
+// UTF-8 gets the string that was hashed.
+func TestWriteServeProofV2_ModelGoesOutAsUTF8(t *testing.T) {
+	priv, _ := crypto.GenerateKey()
+	rec := httptest.NewRecorder()
+	layers := &ProofLayers{SealedHash: "0x" + strings.Repeat("55", 32), HarnessHash: "0x" + strings.Repeat("66", 32),
+		InferenceURL: katInferenceURL, Model: katModelUTF8}
+	if err := writeServeProofLayered(rec, httptest.NewRequest(http.MethodGet, "/hello", nil), crypto.FromECDSA(priv), nil, []byte("x"), nil, 200,
+		"30", "0x"+strings.Repeat("11", 32), "16602", "0x00000000000000000000000000000000000000A9", testValidator, layers); err != nil {
+		t.Fatal(err)
+	}
+	_, envB64, _ := strings.Cut(rec.Header().Get("X-Agent-Proof"), ".")
+	raw, err := base64.RawURLEncoding.DecodeString(envB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(hex.EncodeToString(raw), katModelUTF8Bytes) {
+		t.Fatalf("envelope %q does not carry the model's UTF-8 bytes", raw)
+	}
+	_, env := decodeProofHeaderV2(t, rec.Header().Get("X-Agent-Proof"))
+	if env.Model != katModelUTF8 {
+		t.Fatalf("model %q, want %q", env.Model, katModelUTF8)
 	}
 }
 

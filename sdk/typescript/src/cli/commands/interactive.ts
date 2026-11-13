@@ -28,8 +28,9 @@ import { CliError, cancelled, isCancelled } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
-import { applyAssignments, assertModelPresent, assertOthersFitFramework, isHarnessFramework, parseAssignments, renderSettings } from '../settings';
-import { answerPending, credOp, credOwnerOp } from '../credentials';
+import { applyAssignments, assertModelPresent, assertOthersFitFramework, assertVersionsFitFramework, isHarnessFramework, parseAssignments, renderListedVersions, renderSettings } from '../settings';
+import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOwnerOp, ensureModelKey } from '../credentials';
+import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
@@ -39,7 +40,7 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -408,9 +409,19 @@ export function makeInboxFeed(show: (text: string, shown: () => void) => void): 
 }
 
 let knownAgentIds: string[] = [];
-const rememberAgentIds = (rows: Array<{ agentId?: unknown }>): void => {
+// agentId → sealId, for completing what `cred <agent> …` last read.
+const knownSeals = new Map<string, string>();
+const rememberAgentIds = (rows: Array<{ agentId?: unknown; sealId?: string }>): void => {
   const ids = rows.map((r) => String(r.agentId ?? '')).filter((x) => x && x !== 'undefined');
   if (ids.length) knownAgentIds = [...new Set(ids)];
+  for (const r of rows) if (r.sealId && r.agentId !== undefined && r.agentId !== null) knownSeals.set(String(r.agentId), r.sealId);
+};
+// The session's agent, for `/cred …` completion.
+let sessionSealId: string | null = null;
+/** Entry names for completion: of `agent` (L1), or of the session's agent. */
+const credNamesFor = (agent?: string): string[] => {
+  const seal = agent === undefined ? sessionSealId : (agent.startsWith('0x') ? agent : knownSeals.get(agent));
+  return seal ? cachedCredNames(seal) : [];
 };
 const AGENT = (): string[] => knownAgentIds;
 
@@ -449,19 +460,62 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/reset': ['pick'],
   '/cancel': ['all'],
   '/inbox': ['all'],
-  '/settings': ['provider=', 'model=', 'thinking=', 'others='],
+  '/settings': ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness='],
+  '/restart': ['harness', 'sealed'],
   '/cred': CRED_SUBS,
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
 
-// L1 commands whose second word is a subcommand once the agent is named.
-const SUB_AFTER_AGENT: Record<string, string[]> = { cred: CRED_SUBS };
+const YES_NO = ['yes', 'no'];
+const CRED_VALUES: Record<string, () => string[]> = {
+  preset: () => Object.keys(CRED_PRESETS),
+  use: () => ['inject', 'token_only', 'sign'],
+  reveal: () => YES_NO,
+  writeback: () => YES_NO,
+  path: () => YES_NO,
+};
+
+/**
+ * Completes the words after `cred <agent>` or `/cred`: the subcommand, then
+ * an entry name (`model` included), then `k=v` options with their known
+ * values. `words` ends with the word being typed; `names` are the entries
+ * the last read of this agent's set returned.
+ */
+export function completeCred(words: string[], names: string[], providers: string[]): string[] {
+  const word = words[words.length - 1] ?? '';
+  const pick = (list: string[]) => list.filter((c) => c.startsWith(word));
+  if (words.length <= 1) return pick(CRED_SUBS);
+  const [sub, name] = words;
+  const isModel = name === 'model' || !!name?.startsWith('model.');
+  const providerArg = () => (word.startsWith('provider=') ? pick(providers.map((p) => `provider=${p}`)) : pick(['provider=']));
+  switch (sub) {
+    case 'set':
+      if (words.length === 2) return pick(['model ', ...names.filter((n) => !n.startsWith('model.')).map((n) => `${n} `)]);
+      if (isModel) return providerArg();
+      {
+        const eq = word.indexOf('=');
+        if (eq > 0 && CRED_VALUES[word.slice(0, eq)]) return pick(CRED_VALUES[word.slice(0, eq)]().map((v) => `${word.slice(0, eq)}=${v}`));
+        return pick([...CRED_KEYS].map((k) => `${k}=`));
+      }
+    case 'rm':
+      if (words.length === 2) return pick(['model ', ...names.filter((n) => !n.startsWith('model.')).map((n) => `${n} `)]);
+      return isModel ? providerArg() : [];
+    case 'reveal':
+      if (words.length === 2) return pick(names.filter((n) => !n.startsWith('model.')).map((n) => `${n} `));
+      return words.length === 3 ? pick(['on', 'off']) : [];
+    case 'connect':
+    case 'disconnect':
+      return words.length === 2 ? pick(names.filter((n) => !n.startsWith('model.')).map((n) => `${n} `)) : [];
+    default:
+      return [];
+  }
+}
 
 // Commands whose LATER arguments also complete (the generic rule is "first
 // argument only; the rest is free-form" — right for prompts and amounts,
 // wrong for settings' k=v list, where the keys are a closed set the user
 // should never have to remember).
-const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others='];
+const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness='];
 const TAIL_ARGS: Record<string, string[]> = {
   'settings': SETTING_KEYS,  // L1: settings <agent> k=v k=v …
   '/settings': SETTING_KEYS, // L2: /settings k=v k=v …
@@ -494,7 +548,7 @@ export function completeTail(cmd: string, word: string, models: string[], provid
 // completer is a one-line adapter that hands it the mutable module state.
 export function completeLine(
   line: string,
-  state: { completions: string[]; args: Record<string, string[] | (() => string[])>; models: string[]; provider?: string; providerModels?: Record<string, string[]>; providers?: string[] },
+  state: { completions: string[]; args: Record<string, string[] | (() => string[])>; models: string[]; provider?: string; providerModels?: Record<string, string[]>; providers?: string[]; credNames?: (agent?: string) => string[] },
 ): [string[], string] {
   const sp = line.indexOf(' ');
   if (sp === -1) {
@@ -515,12 +569,16 @@ export function completeLine(
     const hits = completeTail(cmd, word, models, state.providers);
     return hits.length ? [hits, word] : [[], line];
   }
-  // `cred <agent> <sub>`: the second word is the subcommand, not another agent.
-  if (SUB_AFTER_AGENT[cmd] && rest.includes(' ')) {
-    if (rest.split(' ').length !== 2) return [[], line];
-    const subs = SUB_AFTER_AGENT[cmd];
-    const hits = subs.filter((c) => c.startsWith(word));
-    return [hits.length ? hits : subs, word];
+  // `cred <agent> …` / `/cred …`: the subcommand, then names and options.
+  if ((cmd === 'cred' && rest.includes(' ')) || cmd === '/cred') {
+    const words = rest.split(' ');
+    const agent = cmd === 'cred' ? words.shift() : undefined;
+    // `cred pending|notify|presets …` name no agent.
+    if (agent && ['pending', 'notify', 'presets'].includes(agent)) return [[], line];
+    const providers = state.providers ?? knownProviders.map((p) => p.id);
+    const hits = completeCred(words, state.credNames?.(agent) ?? [], providers);
+    if (words.length <= 1 && !hits.length) return [CRED_SUBS, word];
+    return [hits, word];
   }
   const cand = state.args[cmd];
   const list = typeof cand === 'function' ? cand() : (cand ?? []);
@@ -995,7 +1053,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     // so the candidate set is swapped by whichever REPL loop is active
     // (activeCompletions); empty line + Tab lists everything.
     completer: (line: string): [string[], string] =>
-      completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds }),
+      completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor }),
   });
   activeRl = rl;
   const ask = lineQueue(rl, () => !!process.stdin.isTTY);
@@ -1130,7 +1188,7 @@ const L1_HELP_FULL = `manager commands
                           much (more) to withdraw (time-locked)
   ack                     acknowledge the TEE trust root (deploy/start/reset
                           do this implicitly; re-run after an attestor upgrade)
-  login [provider]        setup: attestor URL, owner key, provider, inference key
+  login [provider]        setup: attestor URL, owner key, each provider's model key
                           (Enter keeps the current value; secrets echo *)
   whoami                  show attestor / wallet / api-key / ack status
   help                    this text
@@ -1210,6 +1268,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   for (;;) {
     activeCompletions = L1_WORDS;
     activeArgs = L1_ARGS;
+    sessionSealId = null;
     const line = (await ((ask as Ask).main ?? ask)(`\n0g-agentdna [${hostOf(ctx.env.attestorUrl)}]> `)).trim();
     // Bare Enter refreshes the account status — the L1 analog of L2's
     // bare-Enter agent refresh.
@@ -1221,32 +1280,55 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'help') { out(`${L1_HELP_FULL}\n`); continue; }
 
       if (cmd === 'login' || cmd === 'config') {
-        // Guided setup — attestor URL, owner key, provider, inference key. Enter
-        // keeps the current value; a typed value replaces it. Secrets masked.
-        const url = (await ask(`attestor URL [${ctx.env.attestorUrl ?? 'unset'}]: `)).trim();
-        if (url) { saveConfig({ attestorUrl: url.replace(/\/$/, '') }); ctx.env.attestorUrl = url.replace(/\/$/, ''); }
-
-        const hasKey = !!(ctx.env.privateKey ?? loadKey());
-        const key = (await askSecret(ask, `owner private key [${hasKey ? 'set — Enter to keep' : 'unset'}]: `)).trim();
-        if (key) {
-          // Cache what was SAVED, not what was typed — saveKey normalizes
-          // (0x prefix optional), and a raw un-prefixed value in ctx.env
-          // makes every later command see a "malformed" key until restart.
-          try { saveKey(key); ctx.env.privateKey = normalizeKey(key)!; ctx.env.privateKeySource = 'file'; }
-          catch (e) { out(`private key not saved: ${(e as Error).message}\n`); }
+        // Guided setup. The attestor URL is required; the owner key is
+        // needed to manage agents; model keys are optional (creating or
+        // resetting an agent asks for the one its provider needs, as do
+        // `cred set model` and a settings switch, cli/modelkey.ts). Enter
+        // keeps a value or skips an unset one; a typed value replaces it.
+        // Secrets masked. `login <provider>` asks that provider's key only.
+        const only = args[0];
+        if (!only) {
+          for (;;) {
+            const url = (await ask(`attestor URL (required) [${ctx.env.attestorUrl ?? 'unset'}]: `)).trim();
+            if (url) { saveConfig({ attestorUrl: url.replace(/\/$/, '') }); ctx.env.attestorUrl = url.replace(/\/$/, ''); break; }
+            if (ctx.env.attestorUrl) break;
+            out('every command needs the attestor URL\n');
+          }
+          const hasKey = !!(ctx.env.privateKey ?? loadKey());
+          const key = (await askSecret(ask, `owner private key (needed to manage your agents) [${hasKey ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
+          if (key) {
+            // Cache what was SAVED, not what was typed — saveKey normalizes
+            // (0x prefix optional), and a raw un-prefixed value in ctx.env
+            // makes every later command see a "malformed" key until restart.
+            try { saveKey(key); ctx.env.privateKey = normalizeKey(key)!; ctx.env.privateKeySource = 'file'; }
+            catch (e) { out(`private key not saved: ${(e as Error).message}\n`); }
+          }
         }
 
         if (ctx.env.attestorUrl) {
           const client = await buildClient(ctx.env);
           knownProviders = await client.agent.refreshProviders();
         } else { knownProviders = listInferenceProviders(); }
-        const selected = args[0] ?? await pickInferenceProvider(ask, loadConfig().inferenceProvider ?? '0g-compute');
-        if (!knownProviders.some((provider) => provider.id === selected)) throw new CliError('BAD_FLAG', `unknown inference provider: ${selected}`);
-        saveConfig({ inferenceProvider: selected });
-        const hasApi = !!configuredInferenceKey(selected);
-        const api = (await askSecret(ask, `${selected} API key [${hasApi ? 'set — Enter to keep' : 'unset'}]: `)).trim();
-        if (api) saveApiKey(selected, api);
+        if (only && !knownProviders.some((provider) => provider.id === only)) throw new CliError('BAD_FLAG', `unknown inference provider: ${only}`);
+        if (!only) out('model keys (optional: creating or resetting an agent asks for the one its provider needs)\n');
+        for (const id of only ? [only] : knownProviders.map((provider) => provider.id)) {
+          const has = !!configuredInferenceKey(id);
+          const api = (await askSecret(ask, `  ${id} key [${has ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
+          if (api) saveApiKey(id, api);
+        }
+        const withKey = knownProviders.map((provider) => provider.id).filter((id) => configuredInferenceKey(id));
+        let preferred = loadConfig().inferenceProvider ?? '0g-compute';
+        if (!only) {
+          // New agents default to a provider there is a key for.
+          if (withKey.length > 1) preferred = await pickInferenceProvider(ask, withKey.includes(preferred) ? preferred : withKey[0], withKey);
+          else if (withKey.length === 1) preferred = withKey[0];
+          saveConfig({ inferenceProvider: preferred });
+        }
         out(`saved to ${configPaths().dir} (credentials chmod 600)\n`);
+        out(`  attestor    ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+        out(`  owner key   ${ctx.env.privateKey ?? loadKey() ? 'set' : '(none — needed to manage your agents)'}\n`);
+        out(`  model keys  ${withKey.join(', ') || '(none — creating or resetting an agent asks for one)'}\n`);
+        out(`  new agents  ${preferred}\n`);
         // Re-seed the startup-time caches that were filled from the OLD
         // attestor or wallet: without this, Tab completion keeps offering the
         // previous environment's (or wallet's — listMyDeployments is
@@ -1477,14 +1559,17 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const plan = await resetInferencePlan(ag, row.sealId, await readDeploymentFacts(attestorUrl, row.sealId));
         const provider = plan.provider;
         await ag.agent.assertProviderSupported(provider, { sealId: row.sealId, framework });
-        const apiKey = await inferenceKey(ctx, ask, provider);
+        const key = await resetModelKey(ag.credentials, row.sealId, provider, framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(ag, row.sealId, plan, out);
         out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
         const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
-        await ag.agent.reset(row.sealId, { provider, framework, apiKey });
+        await ag.agent.reset(row.sealId, { provider, framework, ...key, onWarn: (w) => out(`⚠ ${w}\n`) });
         const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
-        if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
+        if (r) {
+          await ag.credentials.resyncModelKey(row.sealId, { agentUrl: r.url }).catch(() => undefined);
+          out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
+        }
         continue;
       }
 
@@ -1518,7 +1603,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
-        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework);
+        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework, ask);
         continue;
       }
 
@@ -1530,7 +1615,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (await credOwnerOp(ag, args, credIO(ask))) continue;
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
-        await credInShell(irq, args[1] === 'connect', (io) => credOp(ag, row.sealId, args.slice(1), { ...credIO(ask), ...io }, row.phase === 'running' && row.url ? row.url : undefined));
+        await credInShell(irq, args.slice(1), (io) => credOp(ag, row.sealId, args.slice(1), { ...credIO(ask), ...io }, row.phase === 'running' && row.url ? row.url : undefined));
         continue;
       }
 
@@ -1765,6 +1850,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           out(`note: the agent has committed new state since this interaction (a dataHash in the ticket is no longer current) — ` +
               `the ticket still redeems, and the rating records the version that served you\n`);
         }
+        if (v.layersListed === false) {
+          // The registry records a v2 proof's layers without checking the
+          // trust lists, so this is information, not a refusal.
+          out(`note: a version this interaction ran on is not on the trust registry's lists now — ` +
+              `the ticket still redeems, and the rating records the versions that served you\n`);
+        }
 
         if (!rawScore) rawScore = (await ask('score [1-5]: ')).trim();
         if (!/^-?\d+$/.test(rawScore)) { out('score must be an integer\n'); continue; }
@@ -1853,13 +1944,20 @@ let cachedClient: { key: string; ag: AgenticID } | null = null;
  * Returns the document now in force (unchanged on a bare show), so a caller
  * like /think can report the level that actually landed.
  */
-async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null): Promise<SettingsDoc | null> {
+async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null, ask?: (q: string) => Promise<string>): Promise<SettingsDoc | null> {
   const assignments = parseAssignments(args); // throws CliError on a bad key/level
   assertOthersFitFramework(assignments, framework);
+  assertVersionsFitFramework(assignments, framework);
   const { settings: current, version } = await ag.agent.getSettings(sealId);
   if (!assignments.length) {
     for (const l of renderSettings(current)) out(`  ${l}\n`);
     out('  change with: model=<id> · thinking=low|high|max · provider=<name> · others=\'<json>\' (quote it)\n');
+    // The versions a 0g-harness agent can be pinned to. Advisory: a chain
+    // without a trust registry, or an unreadable one, just shows nothing.
+    if (isHarnessFramework(framework)) {
+      const listed = await ag.agent.listedVersions().catch(() => null);
+      if (listed) for (const l of renderListedVersions(listed, current?.versions)) out(`  ${l}\n`);
+    }
     return current;
   }
   const next = applyAssignments(current, assignments);
@@ -1867,7 +1965,18 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
   // last-known-good cannot cover — refuse before signing, and say so.
   assertModelPresent(next, current !== null);
   const providerChanged = changesProvider(current, next);
-  if (providerChanged) requireConfiguredInferenceKey(next.provider ?? '0g-compute');
+  // The agent takes the switch only with a key for the new provider in its
+  // credential set; an image from before model keys in the set takes it at
+  // a reset with the key.
+  let pendingReset = false;
+  if (providerChanged) {
+    const provider = next.provider ?? '0g-compute';
+    const keyIO = ask ? credIO(ask) : { json: false, out: (l: string) => out(`${l}\n`), secret: async () => '' };
+    if (await ensureModelKey(ag, sealId, provider, keyIO, serveBase ? { agentUrl: serveBase } : undefined) === 'unsupported') {
+      requireConfiguredInferenceKey(provider);
+      pendingReset = true;
+    }
+  }
   try {
     const { version: written } = await ag.agent.setSettings(sealId, next, {
       baseVersion: version,
@@ -1875,9 +1984,11 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
     });
     for (const l of renderSettings(next)) out(`  ${l}\n`);
     if (providerChanged) {
-      out(`written — version ${written}; provider change pending — run reset with the ${next.provider} key\n`);
       completionProvider = next.provider ?? '0g-compute';
       chatModelIds = providerModelIds[completionProvider] ?? [];
+    }
+    if (pendingReset) {
+      out(`written — version ${written}; provider change pending — run reset with the ${next.provider} key\n`);
       return next;
     }
     // Push to the running container so a change made mid-conversation takes
@@ -2071,6 +2182,15 @@ async function showHello(ag: AgenticID, url: string, clientAddr?: `0x${string}`)
     ? `${JSON.stringify(valid.ok)}${valid.ok ? '' : ` (${valid.reasons.join('; ')})`}`
     : '(no proof header)';
   out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${proofLine}\n`);
+  // A v2 proof names what each layer ran (sealed/LAYERS.md §7); the header
+  // is the agent's, so every field goes through cleanCell. LEGACY(v1): a
+  // proof without a version names none.
+  if (proof?.version !== undefined) {
+    out(`sealed  : ${cleanCell(String(proof.sealedHash ?? '?'))}\nharness : ${cleanCell(String(proof.harnessHash ?? '?'))}\n`);
+    if (proof.model || proof.inferenceURL) {
+      out(`model   : ${cleanCell(proof.model || '—')}${proof.inferenceURL ? ` via ${cleanCell(proof.inferenceURL)}` : ''}\n`);
+    }
+  }
   if (banked) out(`ticket  : banked (GET /hello) — spend with \`rate\` within ~60 min\n`);
   if (body.services?.length) {
     out('services:\n');
@@ -2114,16 +2234,19 @@ export async function ownerRouteUrl(ag: AgenticID, s: Session): Promise<string |
 }
 
 /**
- * Runs a `cred` operation in the shell. A connect waits for the login to
- * complete and says so, as the one-shot command does; Ctrl-C or Esc stops
- * the wait (the login goes on in the browser).
+ * Runs a `cred` operation (`sub` is its subcommand and arguments) in the
+ * shell. A connect waits for the login to complete and says so, as the
+ * one-shot command does, and `set model` for the agent to take the key;
+ * Ctrl-C or Esc stops the wait (the login goes on in the browser).
  */
-async function credInShell(irq: Interrupt, connect: boolean, run: (io: { wait?: boolean; signal?: AbortSignal }) => Promise<void>): Promise<void> {
-  if (!connect) return run({});
+async function credInShell(irq: Interrupt, sub: string[], run: (io: { wait?: boolean; signal?: AbortSignal }) => Promise<void>): Promise<void> {
+  const connect = sub[0] === 'connect';
+  const modelSet = sub[0] === 'set' && (sub[1] === 'model' || !!sub[1]?.startsWith('model.'));
+  if (!connect && !modelSet) return run({});
   const ac = new AbortController();
   irq.streaming = ac;
   try {
-    await run({ wait: true, signal: ac.signal });
+    await run({ ...(connect ? { wait: true } : {}), signal: ac.signal });
   } finally {
     irq.streaming = null;
   }
@@ -2135,6 +2258,7 @@ function credIO(ask: (q: string) => Promise<string>) {
     json: false, out: (l: string) => out(`${l}\n`), secret: (p: string) => askSecret(ask, p),
     // The credential prompts' terminal reset: on a terminal only.
     raw: (s: string) => { if (process.stdout.isTTY) term(s); },
+    keyPrompt: keyPrompt(ask),
   };
 }
 
@@ -2211,8 +2335,8 @@ async function addressOf(key: `0x${string}`): Promise<string> {
 
 // ── deploy / attach (from the former chat command) ───────────────────────────
 
-async function pickInferenceProvider(ask: (q: string) => Promise<string>, preferred: string): Promise<string> {
-  const providers = knownProviders;
+async function pickInferenceProvider(ask: (q: string) => Promise<string>, preferred: string, among?: string[]): Promise<string> {
+  const providers = among ? knownProviders.filter((provider) => among.includes(provider.id)) : knownProviders;
   const fallback = Math.max(0, providers.findIndex((provider) => provider.id === preferred));
   out('providers:\n');
   providers.forEach((provider, index) => out(`  ${index}. ${provider.id} (${provider.name})${index === fallback ? ' (default)' : ''}\n`));
@@ -2222,17 +2346,11 @@ async function pickInferenceProvider(ask: (q: string) => Promise<string>, prefer
   return chosen.id;
 }
 
-async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<string>, provider = '0g-compute'): Promise<string> {
-  const configured = configuredInferenceKey(provider);
-  if (configured) return configured;
-  const typed = (await askSecret(ask, `${provider} inference API key (saved to credentials): `)).trim();
-  if (typed) { saveApiKey(provider, typed); return typed; }
-  // No key anywhere: deploying anyway would provision a container that 401s
-  // on every turn minutes later — fail HERE with the fix instead.
-  throw new CliError('INFERENCE_KEY_REQUIRED', `no API key registered for ${provider}`, {
-    remedy: `run login and register the ${provider} key`,
-  });
+/** The model key prompt of the REPL (cli/modelkey.ts). */
+function keyPrompt(ask: (q: string) => Promise<string>) {
+  return replKeyPrompt(ask, (p: string) => askSecret(ask, p), (l: string) => out(`${l}\n`));
 }
+
 
 /** Trust-root ack (once per owner) + a prepaid-balance gate that ASKS before
  *  spending: under 0.1 OG, report the shortfall and offer to deposit now.
@@ -2340,7 +2458,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   // container is actually provisioned, so skip both in mint-only mode.
   const provision = !(await ask('bring it online now (start a container)? [Y/n]: ')).trim().toLowerCase().startsWith('n');
 
-  const apiKey = provision ? await inferenceKey(ctx, ask, provider) : undefined;
+  const apiKey = provision ? (await pickModelKey(provider, keyPrompt(ask), { optional: mayGoKeyless(framework, provider) })) ?? undefined : undefined;
   if (provision && !(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
   out(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only, no container'}…\n`);
   const { deployment: dep, agentId } = await deployWithInference(ag, { name, framework, provider, model, provision, apiKey });
@@ -2351,6 +2469,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   out(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
   const r = await waitRunningInterruptible(irq, attestorUrl, dep.sealId, agentId);
   if (!r) return null; // Esc: the attestor keeps deploying — only the wait ends
+  if (apiKey) await ag.credentials.resyncModelKey(dep.sealId, { agentUrl: r.url }).catch(() => undefined);
   // Enter through attach so a fresh deploy gets the same entry card
   // (avatar / gas / status) as `use`; only the wizard knows the framework.
   const s = await attach(ag, attestorUrl, agentId, ask);
@@ -2465,7 +2584,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /tasks /result /cancel /inbox /schedules /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /tasks /result /cancel /inbox /schedules /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -2485,7 +2604,9 @@ const L2_HELP_FULL = `session commands
                           model=… provider=… thinking=low|high|max
                           others=<json> merge into it and write it back
                           (owner-signed). Applies at the next boot — /reset
-                          applies it now
+                          applies it now. On 0g-harness, sealed=<hash>
+                          harness=<hash> pin the runtime's versions; bare
+                          /settings lists the ones the trust registry has
   /cred [sub …]           this agent's credentials — same as \`cred <id>\` in the
                           manager: bare lists, set <name> [k=v …], rm, connect,
                           disconnect,
@@ -2510,6 +2631,10 @@ const L2_HELP_FULL = `session commands
                           newest item), and the conversation goes on (unlike
                           /clear). One or more model calls; can take
                           minutes. 0g-harness, and openclaw 2026.7.1 or later
+  /restart harness|sealed restart one layer of the agent's runtime in place:
+                          the harness process (the conversation stays), or
+                          sealed itself (the agent is away for about one
+                          start); either picks up version changes. 0g-harness
   /tasks                  on 0g-harness: everything that runs or ran on the
                           agent — your turns, the turns it opened itself,
                           background commands and subagents — with who did
@@ -2638,6 +2763,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   for (;;) {
     activeCompletions = L2_WORDS;
     activeArgs = L2_ARGS;
+    sessionSealId = s.sealId;
     // While not connected (deploying/stopped/offline) the phase is in flux —
     // auto-refresh before every prompt, printing only when it moves (and
     // connecting the moment it reaches running). Once connected, skip: no
@@ -2778,14 +2904,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const plan = await resetInferencePlan(s.ag, s.sealId, await readDeploymentFacts(s.attestorUrl, s.sealId));
         const provider = plan.provider;
         await s.ag.agent.assertProviderSupported(provider, { sealId: s.sealId, framework: s.framework });
-        const apiKey = await inferenceKey(ctx, ask, provider);
+        const key = await resetModelKey(s.ag.credentials, s.sealId, provider, s.framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(s.ag, s.sealId, plan, out);
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
         const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
-        await s.ag.agent.reset(s.sealId, { provider, framework: s.framework, apiKey });
+        await s.ag.agent.reset(s.sealId, { provider, framework: s.framework, ...key, onWarn: (w) => out(`⚠ ${w}\n`) });
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
         if (!r) continue;
+        await s.ag.credentials.resyncModelKey(s.sealId, { agentUrl: r.url }).catch(() => undefined);
         await connectSession(s, r.url);
         messages.length = 0; out(`back up at ${s.url}\n`); continue;
       }
@@ -2848,6 +2975,28 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         }
         continue;
       }
+      if (line === '/restart' || line.startsWith('/restart ')) {
+        // Restart one layer of a 0g-harness runtime in place: the harness
+        // process, or sealed itself (the loader starts it again). Either
+        // picks up the owner's version picks and the trust registry's lists.
+        const layer = line.split(/\s+/)[1];
+        if (layer !== 'harness' && layer !== 'sealed') { out('usage: /restart harness|sealed\n'); continue; }
+        if (!s.url) { out(`agent is ${s.phase} — nothing to restart; /start or /reset first\n`); continue; }
+        try {
+          const r = await s.ag.agent.restartRuntime(s.url, BigInt(s.agentId), layer, clientInstanceId);
+          out(`${cleanCell(r.note ?? `restarting ${layer}`)}\n`);
+        } catch (e) {
+          // restart is a seat-gated POST — a displaced 409 is a seat event
+          if (await routeTaskFailure(out, displacedSeat, e, '', 'retry /restart') !== 'raw') continue;
+          const msg = (e as Error).message;
+          const status = Number(msg.match(/^restartRuntime: HTTP (\d+):/)?.[1] ?? 0);
+          const why = cleanCell(msg.replace(/^restartRuntime: HTTP \d+: /, '').trim());
+          if (status === 404 || status === 501) out(`this agent cannot restart ${layer} in place${s.framework ? ` (${s.framework})` : ''}${status === 501 ? `: ${why}` : ''} — /stop then /start restarts the whole container\n`);
+          else if (status === 503) out(`not now: ${why} — try again in a moment\n`);
+          else out(`restart failed: ${msg}\n`);
+        }
+        continue;
+      }
       if (line === '/agentlog' || line.startsWith('/agentlog ')) {
         if (!s.client?.logs) { out(s.client ? '(logs unavailable — owner key needed)' : `agent is ${s.phase} — /start or /reset first`); out('\n'); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
@@ -2886,14 +3035,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // Owner-signed in both directions, so it needs the wallet client and
         // not the session's (possibly keyless) one.
         const ag = await withWallet(ctx);
-        await settingsOp(ag, s.sealId, tokenize(line).slice(1), await ownerRouteUrl(ag, s), s.framework);
+        await settingsOp(ag, s.sealId, tokenize(line).slice(1), await ownerRouteUrl(ag, s), s.framework, ask);
         continue;
       }
       if (line === '/cred' || line.startsWith('/cred ')) {
         const args = tokenize(line).slice(1);
         const ag = await withWallet(ctx);
         const url = await ownerRouteUrl(ag, s);
-        await credInShell(irq, args[0] === 'connect', (io) => credOp(ag, s.sealId, args, { ...credIO(ask), ...io }, url));
+        await credInShell(irq, args, (io) => credOp(ag, s.sealId, args, { ...credIO(ask), ...io }, url));
         continue;
       }
       if (line === '/think' || line.startsWith('/think ')) {

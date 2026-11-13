@@ -85,3 +85,31 @@ func TestHarnessServiceIngressFailsClosed(t *testing.T) {
 		t.Fatalf("legacy publication accepted: %d", out.Code)
 	}
 }
+
+func TestExecutionReceiptWaitsForKnownLayerHashes(t *testing.T) {
+	s, _ := armedProxy(t, "http://localhost", testValidator)
+	code := 0
+	status := servicehost.ExecutionStatus{Service: "report", State: "exited", ExitCode: &code}
+	ready := false
+	layers := ProofLayers{SealedHash: "0x" + strings.Repeat("a", 64), HarnessHash: "0x" + strings.Repeat("b", 64)}
+	s.SetProofLayers(func() (ProofLayers, bool) { return layers, ready })
+	if token, err := s.signExecutionReceipt(status, servicehost.IsolationProfile{}); err == nil || token != "" {
+		t.Fatal("execution receipt omitted unavailable layer identity")
+	}
+	ready = true
+	token, err := s.signExecutionReceipt(status, servicehost.IsolationProfile{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.Split(token, ".")[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt executionReceipt
+	if err := json.Unmarshal(raw, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.SealedHash != layers.SealedHash || receipt.HarnessHash != layers.HarnessHash {
+		t.Fatal("execution receipt lost the ready layer identity")
+	}
+}

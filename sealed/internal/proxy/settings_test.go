@@ -28,7 +28,7 @@ func settingsServer(t *testing.T, owner string) (*Server, *settings.Doc) {
 	applied := &settings.Doc{}
 	s.SetSettings(
 		func() settings.Doc { return cur },
-		func(_ context.Context, d settings.Doc) error { *applied = d; cur = d; return nil },
+		func(_ context.Context, d settings.Doc) (bool, error) { *applied = d; cur = d; return true, nil },
 	)
 	s.SetSessionSettings(func(_ context.Context, d settings.Doc) error { *applied = d; return nil })
 	return s, applied
@@ -152,16 +152,38 @@ func TestSettingsPost_AppliesAValidDocument(t *testing.T) {
 	}
 }
 
+// A push the applier took without restarting the framework (only the
+// layered runtime's version picks changed) must not claim an interruption.
+func TestSettingsPost_NoRestartSaysSo(t *testing.T) {
+	sign, owner := mustKey(t)
+	s, _ := settingsServer(t, owner)
+	var got settings.Doc
+	s.SetSettings(func() settings.Doc { return got }, func(_ context.Context, d settings.Doc) (bool, error) { got = d; return false, nil })
+
+	body := `{"provider":"0g-compute","model":"glm-5.3","versions":{"harness":"0x` + strings.Repeat("ab", 32) + `"}}`
+	w := httptest.NewRecorder()
+	s.handleSettings(w, settingsReq(t, sign, body, sha256hex(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
+	}
+	if got.Versions == nil || got.Versions.Harness != "0x"+strings.Repeat("ab", 32) {
+		t.Fatalf("applied = %+v", got)
+	}
+	if strings.Contains(w.Body.String(), "interrupted") || !strings.Contains(w.Body.String(), "nothing was restarted") {
+		t.Fatalf("response %s — a push that restarted nothing must say so", w.Body.String())
+	}
+}
+
 func TestSettingsPost_ProviderSwitchRequiresResetAndKeepsLiveSettings(t *testing.T) {
 	sign, owner := mustKey(t)
 	s, _ := settingsServer(t, owner)
 	current := settings.Doc{Provider: "0g-compute", Model: "old-model"}
-	s.SetSettings(func() settings.Doc { return current }, func(ctx context.Context, doc settings.Doc) error {
+	s.SetSettings(func() settings.Doc { return current }, func(ctx context.Context, doc settings.Doc) (bool, error) {
 		if _, err := settings.ResolveForCredential(ctx, doc, inference.ProviderCredential{Provider: "0g-compute", APIKey: "sk-compute"}); err != nil {
-			return err
+			return false, err
 		}
 		current = doc
-		return nil
+		return true, nil
 	})
 	body := `{"provider":"openai","model":"new-model"}`
 	w := httptest.NewRecorder()

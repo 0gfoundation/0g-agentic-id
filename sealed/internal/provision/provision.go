@@ -14,11 +14,11 @@
 // Each POST is signed afresh with a later boot_started_at.
 //
 // "layered": true declares that the attestor runs the layered runtime
-// (sealed/LAYERS.md §8): it checks the sealed program's hash against
-// validSealedHashes before it hands out the key. Only then does a sealed the
-// loader started (Boot.SealedHash) report that hash, as sealed_hash, signed
-// into the claim (ProvisionBoot.v2). An attestor without the declaration
-// gets the v1 claim it knows, which has no such field.
+// (sealed/LAYERS.md §8): it checks the sealed program's hash against the
+// trust registry's sealed list before it hands out the key. Only then does a
+// sealed the loader started (Boot.SealedHash) report that hash, as
+// sealed_hash, signed into the claim (ProvisionBoot.v2). An attestor without
+// the declaration gets the v1 claim it knows, which has no such field.
 package provision
 
 import (
@@ -39,7 +39,6 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"seal-verify/internal/attestorhttp"
-	"seal-verify/internal/layers"
 	"seal-verify/internal/logger"
 )
 
@@ -104,22 +103,23 @@ type Result struct {
 	// or nil when there is none.
 	Credentials []byte
 	// Layered is true when this boot ran the layered flow: the attestor
-	// declared it and took the reported sealed hash.
+	// declared it and took the reported sealed hash. Set when provisioning
+	// failed too, when the attestor declared the flow to a sealed the loader
+	// started: a version it refuses (taken off the sealed list) can still
+	// switch to the newest listed one.
 	Layered bool
-	// Targets are the versions the attestor named for this agent in the
-	// answer that declared the layered flow, to a sealed the loader started
-	// (zero otherwise). Set when provisioning failed too: a version the
-	// attestor refuses (taken off validSealedHashes) can still switch to the
-	// one it names.
-	Targets layers.Targets
+	// Unanswered is true when provisioning failed without a definitive
+	// answer: the retry window ran out on an attestor that could not be
+	// reached or answered only "try again" (5xx, 429, 409). The cause is
+	// outside this sealed version.
+	Unanswered bool
 }
 
 // authorization is the GET /provision answer.
 type authorization struct {
-	Generation          int64          `json:"generation"`
-	CertificateRequired bool           `json:"certificate_required"`
-	Layered             bool           `json:"layered"`
-	Targets             layers.Targets `json:"targets"`
+	Generation          int64 `json:"generation"`
+	CertificateRequired bool  `json:"certificate_required"`
+	Layered             bool  `json:"layered"`
 }
 
 // provisionRequest is the POST /provision body.
@@ -177,8 +177,9 @@ type claim struct {
 	ticketHash [32]byte
 	// startedAt is the boot_started_at of the last signed POST.
 	startedAt int64
-	// targets are the versions the last layered authorization named.
-	targets layers.Targets
+	// declared is whether the last authorization declared the layered flow
+	// to this sealed.
+	declared bool
 }
 
 // FromAttestor runs Phase 1 and returns the decrypted payload. Transient
@@ -218,7 +219,7 @@ func FromAttestor(boot Boot) Result {
 	remaining := boot.Started.Add(retryWindow).Sub(clock.now())
 	if remaining <= 0 {
 		logger.Logf("FAIL provision: more than %s since boot", retryWindow)
-		return Result{}
+		return Result{Unanswered: true}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), remaining)
 	defer cancel()
@@ -238,8 +239,8 @@ func (c *claim) run() Result {
 	for attempt := 1; ; attempt++ {
 		if auth == nil {
 			found, outcome := c.discover()
-			if outcome == proceed && c.layered(found) {
-				c.targets = found.Targets
+			if outcome == proceed {
+				c.declared = c.layered(found)
 			}
 			switch {
 			case outcome == stop:
@@ -268,16 +269,18 @@ func (c *claim) run() Result {
 			}
 		}
 		if !c.wait(attempt, backoff) {
-			return c.failed()
+			r := c.failed()
+			r.Unanswered = true
+			return r
 		}
 		backoff = min(2*backoff, maxBackoff)
 	}
 }
 
 // failed is the result of a provisioning that did not succeed: no key, and
-// the versions the last layered authorization named.
+// whether the last authorization declared the layered flow.
 func (c *claim) failed() Result {
-	return Result{Targets: c.targets}
+	return Result{Layered: c.declared}
 }
 
 // wait sleeps backoff before the next attempt, or reports false when that
@@ -351,7 +354,7 @@ func (c *claim) provision(auth authorization) (Result, action) {
 	case proceed:
 		result, outcome := c.open(body)
 		if outcome == proceed && c.layered(auth) {
-			result.Layered, result.Targets = true, auth.Targets
+			result.Layered = true
 		}
 		return result, outcome
 	case stop:
@@ -364,15 +367,21 @@ func (c *claim) provision(auth authorization) (Result, action) {
 
 // layered reports whether a claim under auth runs the layered flow: the
 // attestor declared it and the loader named this program's hash.
+// LEGACY(v1): false only for an image without the loader, or an attestor
+// that does not declare the flow (a chain whose AgenticID names no trust
+// registry); legacy_v1.go.
 func (c *claim) layered(auth authorization) bool {
 	return auth.Layered && c.boot.SealedHash != ""
 }
 
 // request builds the POST body for auth, signed at c.startedAt.
 func (c *claim) request(auth authorization) (provisionRequest, error) {
-	message := bootMessage(c.boot.Certificate.SealID, auth.Generation, c.ticketHash, c.bootID[:], c.startedAt)
+	var message string
 	if c.layered(auth) {
 		message = bootMessageV2(c.boot.Certificate.SealID, auth.Generation, c.ticketHash, c.bootID[:], c.startedAt, c.boot.SealedHash)
+	} else {
+		// LEGACY(v1)
+		message = bootMessage(c.boot.Certificate.SealID, auth.Generation, c.ticketHash, c.bootID[:], c.startedAt)
 	}
 	signature, err := crypto.Sign(crypto.Keccak256([]byte(message)), c.key)
 	if err != nil {
@@ -483,12 +492,9 @@ func lowerHex(value string, size int) bool {
 	return err == nil && len(decoded) == size && hex.EncodeToString(decoded) == value
 }
 
-func bootMessage(seal string, generation int64, ticketHash [32]byte, bootID []byte, startedAt int64) string {
-	return fmt.Sprintf("ProvisionBoot.v1:0x%s:%d:%x:%x:%d", seal, generation, ticketHash, bootID, startedAt)
-}
-
-// bootMessageV2 is the layered claim: bootMessage's fields, then the sealed
-// hash (64 lowercase hex, no 0x).
+// bootMessageV2 is the layered claim: the seal, the generation, the boot
+// ticket's hash, the boot id and when the boot started, then the sealed hash
+// (64 lowercase hex, no 0x).
 func bootMessageV2(seal string, generation int64, ticketHash [32]byte, bootID []byte, startedAt int64, sealedHash string) string {
 	return fmt.Sprintf("ProvisionBoot.v2:0x%s:%d:%x:%x:%d:%s", seal, generation, ticketHash, bootID, startedAt, sealedHash)
 }

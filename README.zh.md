@@ -210,8 +210,8 @@ agentSeal 私钥。
 - **运行时代码 attestation**：Sandbox 为容器公钥和镜像哈希签发证书，由容器在
   首次 `/provision` 时交给 Attestor。Attestor 核对证书签名者及其注册 scope 是
   TappRegistry 中登记的 sandbox app 实例，公钥是 attestor 创建该 sandbox 时
-  provider 报告的公钥，且镜像哈希出现在 AgenticID 合约的
-  **`validFrameworkHashes` 白名单**里。这个白名单覆盖
+  provider 报告的公钥，且镜像哈希在 TrustRegistry 的**镜像名单**里（部署者的
+  信任决定，经 `AgenticID.isValidFrameworkHash` 读取）。这个名单覆盖
   的是 **AgenticID 运行时框架**的哈希——也就是负责加载功能数据、管理 AgentSeal
   签名、校验 owner 指令的那一层容器代码。它与 LangChain / CrewAI 这类 AI 编排
   工具是**不同层级**的东西：后者是存在 agent 功能数据里、由运行时加载的配置。
@@ -303,16 +303,20 @@ Oracle TEE 用买家公钥重封，Oracle 签 OwnershipProof；链上 `iTransfer
 |---|---|
 | **ERC-7857**（`ERC7857Upgradeable` + 扩展）| 功能数据（IntelligentData[]）与转让/克隆协议 |
 | **ERC-8004**（`ERC8004IdentityRegistry` + canonical `ReputationRegistry`，由 `VerifiedFeedbackRegistry` 盖验证章）| 身份注册 + 声誉 |
-| **AgentSeal 注册表**（`AgenticID.sol`）| agent 的动态身份凭证（set-once）+ `validFrameworkHashes` 白名单 |
+| **AgentSeal 注册表**（`AgenticID.sol`）| agent 的动态身份凭证（set-once）|
+| **TrustRegistry**（`TrustRegistry.sol`）| 部署者的信任决定：受信的 attestor（绑定到各自的 Tapp app 实例）和代码名单——镜像、sealed 程序、harness 包 |
 | **TappRegistry** | 所有 Tapp 组件的代码指纹注册表 |
 
-AgenticID 1.3 通过无状态链接库 `AttestorAppBindingLib` 处理 app 实例授权，权限和绑定
-状态仍留在 proxy。固定编译器和链接规则见 [`contracts/README.zh.md`](contracts/README.zh.md)。
+从 AgenticID 1.4 起，信任决定都在 TrustRegistry 里：AgenticID 的实现固定它的地址，
+信任相关的读取都转发过去。注册表的 owner 是各环境的 Timelock，所以列入版本、信任
+attestor 都是排期执行、执行前可以取消的操作（mainnet 延迟 1 天，dev 和 test 为 0）；
+guardian 密钥可以立即下架版本、撤销 attestor 的信任。固定编译器和升级方式见
+[`contracts/README.zh.md`](contracts/README.zh.md)。
 
 ### TEE 层（0g-Tapp 部署）
 
 - **Attestor** — 校验 Sandbox 证书的签名者（对照 TappRegistry 登记的 app 实例）
-  与容器镜像哈希（against `validFrameworkHashes`）；经 KMS 派生 AgentSeal 密钥材料；
+  与容器镜像哈希（对照 TrustRegistry 的镜像名单）；经 KMS 派生 AgentSeal 密钥材料；
   把 AgentSeal 公钥注册上链。（Rust，见 [`attestor/`](attestor/README.zh.md)）
 - **0g-Sandbox** — 校验启动请求来自注册 owner；启动 Sealed 容器，为其公钥和
   镜像哈希签发证书，并签署容器所校验的 attestor TLS pin；保证 agent 按链上
@@ -337,7 +341,7 @@ TappRegistry 注册 Attestor / 0g-Sandbox / KMS / 0g-compute
 KMS 在 n 节点集群（k 节点健康即可）上提供硬件安全级密钥派生
         │
         ▼
-Attestor 验 0g-Sandbox 凭证 + 核对 validFrameworkHashes
+Attestor 验 0g-Sandbox 凭证 + 核对镜像名单
         │
         ▼
 0g-Sandbox 确认授权 owner + 正确运行时代码
@@ -458,7 +462,7 @@ sealed runtime 在 agent system prompt 里强行注入的"钢印"——agent 拒
   用户 EOA 钱包是**两个互不相通的密钥空间**；每个 agent 的
   `agent_seal_priv` 由 KMS 按 `chainId ‖ contract ‖ sealId`
   **确定性派生**；sandbox 签发的 EIP-712 证书 + attestor 三道关卡（签名者的
-  TappRegistry app 实例 + `validFrameworkHashes` 白名单 + 首次 provision 的
+  TappRegistry app 实例 + TrustRegistry 的镜像名单 + 首次 provision 的
   新鲜度或之后启动对照记录的容器公钥）+ ECIES 下发到容器 ephemeral
   pubkey，只有那个 TEE 能解
 - **set-once seal 安全性** —— `agentSeal` / `sealId` 永久绑定为什么没

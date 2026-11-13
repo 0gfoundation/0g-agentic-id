@@ -121,7 +121,8 @@ EIP-191 version-0x00 digest. It binds chain/registry/agent, validator, UID, sour
 version, public-input/stdout SHA-256, limits and enforced isolation profile.
 `isolation.worker_runtime_hash` is the actual image-base Harness used by the worker;
 outer `harness_hash` belongs to the resident layered runtime context and may differ.
-Owner personal_sign/EIP-712/transaction tools cannot sign this digest; there is
+If a layered runtime cannot name its current hashes, no execution receipt is
+signed until those hashes are ready. Owner personal_sign/EIP-712/transaction tools cannot sign this digest; there is
 no arbitrary receipt-signing API.
 
 Harness `verifyExecutionReceipt` checks signature, trusted identity, isolation,

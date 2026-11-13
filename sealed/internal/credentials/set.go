@@ -157,6 +157,7 @@ type Definition struct {
 	TokenRequest *TokenRequest        `json:"token_request,omitempty"`
 	Signer       *credproxy.Signer    `json:"signer,omitempty"`
 	MCP          *MCPSpec             `json:"mcp,omitempty"`
+	Inference    *InferenceSpec       `json:"inference,omitempty"`
 }
 
 // valuePlaintext is what a value's ciphertext holds.
@@ -335,6 +336,21 @@ func openEntry(doc Document, e SetEntry, c Check) (*Definition, []byte, string) 
 	if def.MCP != nil && def.TokenRequest != nil {
 		// A login entry's value is its login state; a template would send it.
 		return nil, nil, "a login entry has no token request template"
+	}
+	if def.Inference != nil {
+		// A model key: sealed's own for the framework, never the proxy's.
+		ct, err := chooseCiphertext(doc, &def, c)
+		if err != nil {
+			return nil, nil, err.Error()
+		}
+		value, err := openValue(ct, def.Name, c)
+		if err != nil {
+			return nil, nil, err.Error()
+		}
+		if err := checkModelEntry(&def, value); err != nil {
+			return nil, nil, err.Error()
+		}
+		return &def, value, ""
 	}
 	ct, err := chooseCiphertext(doc, &def, c)
 	if err != nil {

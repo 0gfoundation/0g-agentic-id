@@ -45,7 +45,8 @@ const (
 
 	// legacyHarnessEntry is the entry script of an image that installed the
 	// harness globally instead of as a package; Start runs it when no
-	// package was set (UseHarness).
+	// package was set (UseHarness). LEGACY(v1): only images from before
+	// packages, which run their own older sealed.
 	legacyHarnessEntry = "/usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs"
 
 	// logName names the harness's stdout/stderr log under
@@ -88,17 +89,13 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	//
 	ep := modelEndpoint(rendered.resolved)
 
-	// Missing is fatal here rather than at the first turn: the 0G router and
-	// the native providers answer an unauthenticated call with a 401, so the
-	// container would come up healthy, serve /hello, and fail every single
-	// chat with an error the owner cannot place.
+	// No key is a state the owner sees and fixes: the agent's credential view
+	// says no model key is in use, and `cred <agent> set model` applies one
+	// to the running agent. So the harness starts, and its model calls fail
+	// until then.
 	apiKey := rendered.resolved.APIKey
 	if apiKey == "" {
-		if ep != nil {
-			return framework.StartResult{}, fmt.Errorf(
-				"harness.Start: %s is served at %s but this boot has no inference key — every turn would 401 (check API_KEY in the container's environment, or the owner's sealed key)", model, ep.BaseURL)
-		}
-		logger.Logf("warn: harness.Start: no inference key for this boot; provider %q must serve %s unauthenticated or the first turn fails", provider, model)
+		logger.Logf("warn: harness.Start: no model key for %s on %s; model calls fail until the owner sets one (cred <agent> set model)", model, provider)
 	}
 
 	// The key stays in sealed: the credential proxy fills it in on the
@@ -197,7 +194,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	}
 	cmd, err := spawnBridge(be, entry)
 	if err != nil {
-		return framework.StartResult{}, fmt.Errorf("harness.Start: %w", err)
+		return framework.StartResult{}, fmt.Errorf("harness.Start: %w: %w", framework.ErrHarnessDidNotStart, err)
 	}
 	proc := watchProc(cmd, entry)
 
@@ -213,8 +210,8 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	a.mu.Unlock()
 
 	addr := fmt.Sprintf("127.0.0.1:%d", bridgePort)
-	if err := waitForListen(ctx, addr, startTimeout); err != nil {
-		return framework.StartResult{}, fmt.Errorf("harness.Start: harness not listening: %w", err)
+	if err := waitForListen(ctx, addr, startTimeout, proc.done); err != nil {
+		return framework.StartResult{}, fmt.Errorf("harness.Start: %w: harness not listening: %w", framework.ErrHarnessDidNotStart, err)
 	}
 	return framework.StartResult{Upstream: "http://" + addr, PID: cmd.Process.Pid}, nil
 }
@@ -446,8 +443,9 @@ func randomTokenHex() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// waitForListen polls a TCP address until it accepts a connection.
-func waitForListen(ctx context.Context, addr string, timeout time.Duration) error {
+// waitForListen polls a TCP address until it accepts a connection, and gives
+// up as soon as exited closes (the process that was to listen is gone).
+func waitForListen(ctx context.Context, addr string, timeout time.Duration, exited <-chan struct{}) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -461,6 +459,8 @@ func waitForListen(ctx context.Context, addr string, timeout time.Duration) erro
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-exited:
+			return fmt.Errorf("the process exited before %s accepted connections", addr)
 		case <-time.After(500 * time.Millisecond):
 		}
 	}

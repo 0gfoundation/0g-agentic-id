@@ -8,8 +8,10 @@ package main
 // restores the second (framework.UncommittedKeeper, startAgent Phase A).
 //
 // The record is rewritten after every boot's restore and after every
-// confirmed commit (state.Agent.SetChainUploadHook). A reset starts a new
-// container without it, so its boot restores the chain version as before.
+// confirmed commit (state.Agent.SetChainUploadHook); a role the boot restores
+// from chain leaves it before the restore begins (forgetSynced). A reset
+// starts a new container without it, so its boot restores the chain version
+// as before.
 
 import (
 	"context"
@@ -66,6 +68,30 @@ func keepsUncommitted(rec syncedRecord, ok bool, sealID, owner, role, chainHash,
 	}
 	synced, has := rec.Roles[role]
 	return has && synced == chainHash && diskHash != "" && diskHash != chainHash
+}
+
+// forgetSynced writes rec without roles. A boot drops each role it restores
+// from chain before it restores it, so a boot that dies part-way through a
+// restore leaves the next one no record that would keep the partial copy:
+// that boot restores the role again.
+func forgetSynced(rec syncedRecord, roles []string) {
+	changed := false
+	for _, role := range roles {
+		if _, ok := rec.Roles[role]; ok {
+			delete(rec.Roles, role)
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	b, err := json.Marshal(&rec)
+	if err == nil {
+		err = framework.WriteState(syncedStateFile, b)
+	}
+	if err != nil {
+		logger.Logf("synced: write the record: %v", err)
+	}
 }
 
 // diskContentHash is the content hash the watcher would compute for role

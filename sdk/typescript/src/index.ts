@@ -27,7 +27,7 @@ if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
 
 // ── Facade + namespaces ──
 export { AgenticID as AgentDNA, AgenticID, AgentApi, AdminApi, ReputationApi } from './AgenticID';
-export type { ContainerStatus, DeployAccepted, WaitLevel } from './AgenticID';
+export type { ContainerStatus, DeployAccepted, WaitLevel, ModelKeyLifecycleOpts } from './AgenticID';
 export { makeAgentClient } from './AgentClient';
 export type {
   AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask,
@@ -64,8 +64,9 @@ export {
   sha256Hex,
   modelAdvisory,
   fetchRouterModelIds,
+  versionPicksProblem,
 } from './Settings';
-export type { SettingsDoc, ThinkingLevel } from './Settings';
+export type { SettingsDoc, ThinkingLevel, VersionPicks } from './Settings';
 export {
   CredentialsApi,
   CredentialsConflictError,
@@ -75,6 +76,8 @@ export {
   definitionOf,
   inputOf,
   credentialPlaintext,
+  modelKeyName,
+  MODEL_KEY_PREFIX,
   CREDENTIALS_DOMAIN_NAME,
   CREDENTIALS_DOMAIN_VERSION,
 } from './Credentials';
@@ -87,6 +90,11 @@ export type {
   CredentialPosition,
   TokenRequestTemplate,
   PendingCredentialRequest,
+  CredentialInference,
+  ModelKeyInUse,
+  ModelKeysView,
+  LoadedCredentials,
+  SealedModelKey,
 } from './Credentials';
 
 // ── Reputation: serve-proof transport + verification ──
@@ -108,8 +116,13 @@ export {
   buildServeProof,
   signServeProof,
   verifyServeProofSignature,
+  serveProofLayers,
+  SERVE_PROOF_VERSION,
+  SERVE_PROOF_V2_TAG,
 } from './ServeProof';
-export type { BuildServeProofHashParams, BuildServeProofSigningHashParams } from './ServeProof';
+export type { BuildServeProofHashParams, BuildServeProofSigningHashParams, ServeProofLayers } from './ServeProof';
+export { TRUST_KINDS, trustRegistryOf, isListed, listedHashes } from './TrustRegistry';
+export type { TrustKind } from './TrustRegistry';
 export { taskHashOf, requestUriOf, requestUriCandidates } from './taskHash';
 
 // ── Types ──
@@ -119,6 +132,7 @@ export type {
   Feedback,
   FeedbackSummary,
   ServeData,
+  ServeLayers,
   GiveFeedbackParams,
   GiveFeedbackResult,
   TaskReveal,
@@ -143,6 +157,7 @@ export type { ContractAddresses } from './constants';
 // ── ABIs (advanced usage) ──
 export {
   agenticIDAbi,
+  trustRegistryAbi,
   cloneGateAbi,
   standardCloneAuthorizerAbi,
   canonicalReputationAbi,

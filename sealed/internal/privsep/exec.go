@@ -254,6 +254,24 @@ func TempDir(pattern string) (string, error) {
 	return os.MkdirTemp(base, pattern)
 }
 
+// RemoveTempDirs removes what TempDir made with names starting with prefix
+// and a process that ended mid-way left behind. Only for a prefix whose
+// directories nothing is using now.
+func RemoveTempDirs(prefix string) {
+	entries, err := ReadDir(rootTmpDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		if err := RemoveAll(filepath.Join(rootTmpDir, e.Name())); err != nil {
+			logger.Logf("privsep: remove %s: %v", filepath.Join(rootTmpDir, e.Name()), err)
+		}
+	}
+}
+
 func resolveRoot(name string) (string, error) {
 	if !filepath.IsAbs(name) {
 		return LookPath(name)

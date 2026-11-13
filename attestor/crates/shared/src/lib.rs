@@ -16,6 +16,7 @@ pub mod identity;
 pub mod image_attestation;
 pub mod jobs;
 pub mod kms;
+pub mod legacy;
 pub mod mocks;
 pub mod nonce_submit;
 pub mod notify;

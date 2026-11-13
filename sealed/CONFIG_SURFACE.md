@@ -27,7 +27,7 @@ five did not exist at all in the world of §11.
 |---|---|---|
 | **Who may write it** — owner / agent / platform | Without it there is no basis to accept or reject a change | §5 — four writers, four different authorities |
 | **Persistence** — durable / this-boot-only / never stored | Conflating "not tracked" with "must never be tracked" is how a key reaches chain | §4 (one column) and §7 (the credential, which has none) |
-| **Effect** — hot / harness restart / container rebuild | This is what decides whether a change needs a reset | §8 — every accepted change restarts the framework process |
+| **Effect** — hot / harness restart / container rebuild | This is what decides whether a change needs a reset | §8 — every accepted change restarts the framework process, except one that changes only the version picks |
 | **Domain** — the legal values | Without it there is no validation, and an agent can write itself into a non-booting config | §2, `Doc.Validate` — deliberately thin, and §2 says why |
 | **Binding** — which file, which key, per framework | Where the value actually lands | §6, `RenderSettings` — the one step that stays per-framework |
 
@@ -42,8 +42,9 @@ vocabulary:
 | `model` | the model id, spelled the way that provider spells it |
 | `thinking` | the owner's reasoning-depth preference, one of `settings.Levels` = `{low, high, max}` (`settings.go:56`) |
 | `others` | everything beyond the three named settings: this framework's own knobs — `json.RawMessage`, opaque (`settings.go:45`). Formerly `framework`; a live drill showed owners read that name as "choose the framework", which is the one thing it cannot do (the framework binding is minted identity) — renamed |
+| `versions` | the layered runtime's version picks, `{sealed, harness}`, each a sha256 (`0x` + 64 hex). Only the 0g-harness image under the layered flow reads it, and a pick runs only while the trust registry lists it (LAYERS.md §10) |
 
-`framework` is opaque on purpose, and the opacity is load-bearing in three
+`others` is opaque on purpose, and the opacity is load-bearing in three
 places at once: the platform does not parse it, attestor does not know it
 exists, and the SDK mirrors it as an untyped member. Widening the vocabulary —
 a new knob for one framework — is therefore a change in ONE adapter, not a
@@ -67,7 +68,8 @@ nothing else.
   `framework/harness/spawn.go:65`) while the other two only warn and run modelless
   (`framework/openclaw/spawn.go:65`, `framework/hermes/spawn.go:300`);
 - `thinking` must be one of `Levels`, case-insensitively;
-- `framework` must be valid JSON, and nothing more.
+- `others` must be valid JSON, and nothing more;
+- each `versions` pick must be `0x` + 64 hex.
 
 A boot whose document fails `Validate` still starts where the adapter allows
 it, but sealed then reports `warning` (`owner settings unusable (…); write the
@@ -127,9 +129,12 @@ entries, so the registry the attestor serves cannot re-point them, and the
 route hash a sealed key is bound to stays the same. The harness's
 `SEAL_MODEL_BASE_URL` is the route's loopback address; the route puts the
 owner's model on every request, appends the agent doc to the system prompt
-and sets the key (`harness/spawn.go` `modelEndpoint`). Only a provider sealed
-knows no endpoint of is still dialled by the harness itself. The other three
-frameworks keep their own wiring for native providers.
+and sets the key (`harness/spawn.go` `modelEndpoint`). It forwards model calls
+only, by exact path under the route's base URL: POST `chat/completions`,
+`messages` and `responses`, GET `models`, each with or without a leading `/v1`
+(`inferproxy.endpoint`). Only a provider sealed knows no endpoint of is still
+dialled by the harness itself. The other three frameworks keep their own
+wiring for native providers.
 
 
 Additional managed providers use only their own catalog/static metadata and declared
@@ -472,9 +477,12 @@ route hash and accepted registry version/digest. The pinned historical registry
 is fetched and verified once on each boot, including stop/start;
 its route must match before rendering. Legacy plaintext/v1 keys are compute-only. An explicitly supplied
 ciphertext that fails validation refuses plaintext fallback and settings
-rendering, and records `secret_env_not_applied: <reason>`. A hot provider change
-with a different bound key returns HTTP 409 `CREDENTIAL_PROVIDER_MISMATCH`
-before changing the live document; reset supplies the new provider's key.
+rendering, and records `secret_env_not_applied: <reason>`. The credential
+set's model key for the settings' provider (`model.<provider>`, CREDENTIALS.md)
+takes the place of this key and is bound the same way. A hot provider change
+with no key for the new provider returns HTTP 409 `CREDENTIAL_PROVIDER_MISMATCH`
+before changing the live document; `cred <agent> set model provider=…` (or a
+reset with the key) supplies it.
 It still reaches each framework differently, and that is not tidiable — it is
 what each framework's client actually reads:
 
@@ -512,7 +520,10 @@ an encrypt story.
 
 ## 8. When a change takes effect
 
-Every accepted change restarts the framework process. There is no ladder:
+Every accepted change restarts the framework process, except one that changes
+only `versions` under the layered flow: it swaps the document in force and
+restarts nothing, and the version rule restarts only the layer it switches
+(`Doc.OnlyVersionsChanged`, LAYERS.md §3.1). Otherwise there is no ladder:
 
 - `manager.StartParams.PreStart` (`internal/manager/manager.go:122`) runs the
   render immediately before EVERY `adapter.Start` — the first one, a `Reload`,

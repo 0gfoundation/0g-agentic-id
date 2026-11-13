@@ -68,9 +68,9 @@ INTERACTIVE (default — no command)
                             ack                  acknowledge the TEE trust
                                                  root (implicit in deploy/
                                                  start/reset)
-                            login                guided setup: attestor URL,
-                                                 owner key, provider, inference key (Enter
-                                                 keeps current; keys echo *)
+                            login [provider]     guided setup: attestor URL,
+                                                 owner key, each provider's model
+                                                 key (Enter keeps current; keys echo *)
                             whoami · help · quit
   0g-agentdna <agent>    Shortcut: use that agent directly, then drop to
                           the manager REPL on /back.
@@ -103,7 +103,10 @@ COMMANDS
                    thinks with, and how hard); with key=value assignments,
                    change it. Keys: provider, model, thinking (low|high|max),
                    others (opaque JSON for that framework's own knobs —
-                   quote it: others='{"a": 1}'). Assignments merge into the
+                   quote it: others='{"a": 1}'), and on 0g-harness sealed and
+                   harness (a version's sha256 from the trust registry's
+                   lists, which a bare show prints; the agent runs a pick
+                   while it stays listed). Assignments merge into the
                    stored document; an empty value (thinking=) clears a field.
                    The document is the owner's, so BOTH reading and writing
                    are owner-signed and need AGENTIC_PRIVATE_KEY. A write is a

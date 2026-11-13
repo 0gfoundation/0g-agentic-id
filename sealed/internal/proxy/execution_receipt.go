@@ -42,7 +42,11 @@ func (s *Server) signExecutionReceipt(status servicehost.ExecutionStatus, isolat
 	status.Receipt = ""
 	status.OutputAvailable = false // availability is transient, not an execution fact
 	env := executionReceipt{Version: 1, ChainID: chainID, IdentityRegistry: identity, AgentID: agentID, Validator: v.Hex(), Execution: status, Isolation: isolation}
-	if layers := s.layersForProof(); layers != nil {
+	layers, ready := s.layersForProof()
+	if !ready {
+		return "", fmt.Errorf("execution runtime layers unavailable")
+	}
+	if layers != nil {
 		env.SealedHash, env.HarnessHash = layers.SealedHash, layers.HarnessHash
 	}
 	payload, err := json.Marshal(env)

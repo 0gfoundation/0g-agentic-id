@@ -307,3 +307,27 @@ func TestOwnerChangedStatus(t *testing.T) {
 		t.Fatalf("after the owner is back: %s %q", level, msg)
 	}
 }
+
+// A model key that cannot be used reports an error until a key renders,
+// whichever start path renders it.
+func TestModelKeyIssueStatus(t *testing.T) {
+	s := &runtimeStatus{level: "running"}
+	if !s.ModelKeyIssue("stopped over its model key") {
+		t.Fatal("setting the issue is a change")
+	}
+	if level, msg := s.Get(); level != "error" || msg != "stopped over its model key" {
+		t.Fatalf("got %s %q", level, msg)
+	}
+	// The restarts the supervisor gave up on failed over the key: the key says so.
+	s.SupervisorFailed("supervisor exhausted retries")
+	if _, msg := s.Get(); msg != "stopped over its model key" {
+		t.Fatalf("got %q", msg)
+	}
+	s.SupervisorRecovered()
+	if !s.ModelKeyIssue("") || s.ModelKeyIssue("") {
+		t.Fatal("clearing is a change once")
+	}
+	if level, _ := s.Get(); level != "running" {
+		t.Fatalf("got %s", level)
+	}
+}

@@ -22,7 +22,7 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 |---|---|---|
 | **谁能写** —— owner / agent / 平台 | 没有它就无从判断该不该接受这次修改 | §5 —— 四个写入方,四种不同的权威 |
 | **持久性** —— 持久 / 仅本次启动 / 从不存储 | 把"不追踪"和"绝不可追踪"混为一谈,密钥就是这样上链的 | §4(一个列)与 §7(凭据,它没有列) |
-| **生效方式** —— hot / 重启 harness / 重建容器 | 决定一次修改要不要 reset | §8 —— 任何被接受的修改都会重启框架进程 |
+| **生效方式** —— hot / 重启 harness / 重建容器 | 决定一次修改要不要 reset | §8 —— 任何被接受的修改都会重启框架进程,只改版本选择的除外 |
 | **值域** —— 合法取值 | 没有它就没有校验,agent 能把自己写进一个起不来的配置 | §2 的 `Doc.Validate` —— 刻意做得很薄,§2 说明了理由 |
 | **绑定** —— 落到哪个文件的哪个键(按框架) | 值最终写在哪 | §6 的 `RenderSettings` —— 唯一仍然按框架区分的一步 |
 
@@ -36,6 +36,7 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 | `model` | 模型 id,按该 provider 自己的拼法 |
 | `thinking` | owner 的推理深度偏好,取自 `settings.Levels` = `{low, high, max}`(`settings.go:56`) |
 | `others` | 三个具名设置之外的一切:该框架自己的旋钮 —— `json.RawMessage`,不透明(`settings.go:45`)。曾名 `framework`,真机演练里 owner 的第一反应是"能选框架?"——而这恰恰是它做不到的事(框架绑定是 mint 时的身份),故改名 |
+| `versions` | 分层运行时的版本选择 `{sealed, harness}`,各为一个 sha256(`0x` + 64 位十六进制)。只有分层流程下的 0g-harness 镜像读取它;选择只在信任注册表列着它时才运行(LAYERS.zh.md §10) |
 
 `others` 的不透明是刻意的,而且同时在三处承重:平台不解析它,attestor 根本不知道它
 存在,SDK 也只把它映射成一个无类型成员。于是**扩充词汇表 ——** 给某一个框架加一个旋钮
@@ -54,7 +55,8 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
   (`framework/prime/spawn.go:81`、`framework/harness/spawn.go:65`),另两家只告警然后无模型
   运行(`framework/openclaw/spawn.go:65`、`framework/hermes/spawn.go:300`);
 - `thinking` 必须属于 `Levels`,大小写不敏感;
-- `others` 必须是合法 JSON,仅此而已。
+- `others` 必须是合法 JSON,仅此而已;
+- `versions` 的每个选择必须是 `0x` + 64 位十六进制。
 
 文档未通过 `Validate` 的开机,在 adapter 允许时照样启动,但 sealed 此时上报 `warning`
 (`owner settings unusable (…); write the agent's settings (provider and model)`)而不是
@@ -102,8 +104,10 @@ managed provider 转发到 `Resolved.Endpoint`；`openai` 和 `anthropic` 转发
 `https://api.anthropic.com`，Anthropic 协议）。这两个不是注册表条目，attestor 提供的注册表
 改不了它们，已封存密钥绑定的路由哈希也不变。harness 的 `SEAL_MODEL_BASE_URL` 是代理的
 回环地址；代理给每个请求写上 owner 的模型、在 system prompt 末尾附上 agent doc，并设置
-密钥（`harness/spawn.go` `modelEndpoint`）。只有 sealed 不知道 endpoint 的 provider 仍由
-harness 自己拨。其他三个框架的 native provider 仍用框架自带接线。
+密钥（`harness/spawn.go` `modelEndpoint`）。它只转发模型调用，按代理基地址下的精确路径：
+POST `chat/completions`、`messages`、`responses`，GET `models`，前面带不带 `/v1` 都行
+（`inferproxy.endpoint`）。只有 sealed 不知道 endpoint 的 provider 仍由 harness 自己拨。
+其他三个框架的 native provider 仍用框架自带接线。
 
 
 新增 managed provider 只使用自己的目录、静态元数据及声明的默认协议，不继承
@@ -373,8 +377,10 @@ v2 明文绑定 provider ID；v3 还绑定 endpoint/协议的路由 hash，以�
 版本和摘要。每次启动（含 stop/start）读取并校验该历史版本，匹配路由后才渲染，
 不改用最新地址。旧明文/v1 密钥仅属于 compute。显式提供的密文校验失败时，
 拒绝回退到明文 key，拒绝渲染 settings，并记录 `secret_env_not_applied: <reason>`。
-热更新中 provider 与凭据不匹配时，在改动 live document 前返回 HTTP 409
-`CREDENTIAL_PROVIDER_MISMATCH`；通过 reset 注入新 provider 的 key。
+凭据集里设置所选那家的模型 key（`model.<provider>`，见 CREDENTIALS.zh.md）
+优先于这个 key，绑定方式相同。热更新切换 provider 而没有新那家的 key 时，在改动
+live document 前返回 HTTP 409 `CREDENTIAL_PROVIDER_MISMATCH`；用
+`cred <agent> set model provider=…`（或带 key 的 reset）补上。
 密钥到达各框架的方式依然不同，这是各框架
 客户端实际读取的地方:
 
@@ -405,7 +411,9 @@ pending 时持有 payload:claim 时清空,所有在执行前就判 job 失败的
 
 ## 8. 修改何时生效
 
-任何被接受的修改都会重启框架进程。没有阶梯:
+任何被接受的修改都会重启框架进程,只有一种例外:分层流程下只改 `versions` 的推送只替换生效的文档,
+不重启任何东西,由版本规则只重启它切换的那一层(`Doc.OnlyVersionsChanged`,LAYERS.zh.md §3.1)。
+除此之外没有阶梯:
 
 - `manager.StartParams.PreStart`(`internal/manager/manager.go:122`)在**每一次**
   `adapter.Start` 之前立刻跑渲染 —— 首次、`Reload`、崩溃重启一视同仁。`main.go` 把它

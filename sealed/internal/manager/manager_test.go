@@ -539,3 +539,182 @@ func TestArmState_ProofFieldsFromRuntime(t *testing.T) {
 	}
 	check("after Reload")
 }
+
+// A reload whose caller's context ends with the call (a settings push, a
+// model key) still leaves the new process supervised, by one liveness loop
+// however many reloads ran: a later crash is restarted, once.
+func TestReloadSupervisesBeyondTheCallersContext(t *testing.T) {
+	startCh := make(chan struct{}, 32)
+	a := &fakeAdapter{
+		startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+			startCh <- struct{}{}
+			return framework.StartResult{Upstream: "http://x"}, nil
+		},
+	}
+	m := New(a, state.New(), Config{
+		LivenessProbeInterval: 5 * time.Millisecond,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+	})
+	defer m.Stop(context.Background())
+	if err := m.Start(context.Background(), StartParams{}); err != nil {
+		t.Fatal(err)
+	}
+	<-startCh
+	for i := 0; i < 5; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		if err := m.Reload(ctx); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		<-startCh
+	}
+	time.Sleep(30 * time.Millisecond)
+	if n := m.liveLoops.Load(); n != 1 {
+		t.Fatalf("%d liveness loops after five reloads", n)
+	}
+	a.triggerExit(errors.New("crashed"))
+	select {
+	case <-startCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("a crash after a reload under an ended context was not restarted")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if n := len(startCh); n != 0 {
+		t.Fatalf("one crash restarted %d extra times", n)
+	}
+	if n := m.liveLoops.Load(); n != 1 {
+		t.Fatalf("%d liveness loops after the restart", n)
+	}
+}
+
+// A crash restarted reports the recovery.
+func TestRestartReportsRecovery(t *testing.T) {
+	startCh := make(chan struct{}, 4)
+	a := &fakeAdapter{startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+		startCh <- struct{}{}
+		return framework.StartResult{Upstream: "http://x"}, nil
+	}}
+	var recovered atomic.Int32
+	m := New(a, state.New(), Config{
+		LivenessProbeInterval: 1 * time.Hour,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+		OnRecovered:           func() { recovered.Add(1) },
+	})
+	defer m.Stop(context.Background())
+	if err := m.Start(context.Background(), StartParams{}); err != nil {
+		t.Fatal(err)
+	}
+	<-startCh
+	if recovered.Load() != 0 {
+		t.Fatal("the first start is not a recovery")
+	}
+	a.triggerExit(errors.New("crashed"))
+	<-startCh
+	time.Sleep(20 * time.Millisecond)
+	if recovered.Load() != 1 {
+		t.Fatalf("a restarted crash reported %d recoveries", recovered.Load())
+	}
+}
+
+// A reload asked for while the last restart attempt runs is not lost: the
+// restart tries once more, on what the reload asked for.
+func TestReloadDuringTheLastAttemptIsTried(t *testing.T) {
+	var fixed atomic.Bool
+	inLast := make(chan struct{})
+	release := make(chan struct{})
+	var starts atomic.Int32
+	a := &fakeAdapter{startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+		n := starts.Add(1)
+		switch {
+		case n == 1:
+			return framework.StartResult{Upstream: "http://x"}, nil
+		case n == 4: // the last of three attempts: the owner fixes it meanwhile
+			close(inLast)
+			<-release
+			return framework.StartResult{}, errors.New("still broken")
+		case fixed.Load():
+			return framework.StartResult{Upstream: "http://x"}, nil
+		default:
+			return framework.StartResult{}, errors.New("broken")
+		}
+	}}
+	var failed atomic.Int32
+	ag := state.New()
+	m := New(a, ag, Config{
+		LivenessProbeInterval: 1 * time.Hour,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+		OnFailed:              func(error) { failed.Add(1) },
+	})
+	defer m.Stop(context.Background())
+	var rendered atomic.Int32
+	if err := m.Start(context.Background(), StartParams{PreStart: func(context.Context) error {
+		rendered.Add(1)
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	a.triggerExit(errors.New("crashed"))
+	<-inLast
+	fixed.Store(true)
+	if err := m.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for ag.Phase() != state.PhaseRunning && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if ag.Phase() != state.PhaseRunning || failed.Load() != 0 || starts.Load() != 5 {
+		t.Fatalf("phase %v, failed %d, starts %d", ag.Phase(), failed.Load(), starts.Load())
+	}
+}
+
+// A reload asked for while a restart attempt starts, and that attempt
+// succeeds: the framework is started again on what the reload asked for.
+func TestReloadDuringASuccessfulAttemptIsApplied(t *testing.T) {
+	inAttempt := make(chan struct{})
+	release := make(chan struct{})
+	var starts atomic.Int32
+	a := &fakeAdapter{startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+		if starts.Add(1) == 2 { // the restart's first attempt
+			close(inAttempt)
+			<-release
+		}
+		return framework.StartResult{Upstream: "http://x"}, nil
+	}}
+	var version, rendered atomic.Int32
+	ag := state.New()
+	m := New(a, ag, Config{
+		LivenessProbeInterval: 1 * time.Hour,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+	})
+	defer m.Stop(context.Background())
+	if err := m.Start(context.Background(), StartParams{PreStart: func(context.Context) error {
+		rendered.Store(version.Load())
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	a.triggerExit(errors.New("crashed"))
+	<-inAttempt
+	version.Store(1)
+	if err := m.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for (ag.Phase() != state.PhaseRunning || starts.Load() < 3) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if ag.Phase() != state.PhaseRunning || rendered.Load() != 1 || starts.Load() != 3 {
+		t.Fatalf("phase %v, rendered version %d, starts %d", ag.Phase(), rendered.Load(), starts.Load())
+	}
+}

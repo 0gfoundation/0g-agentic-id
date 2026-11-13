@@ -17,10 +17,21 @@
 # /opt/0g-harness/<sha256>/ (root's, read-only to the agent) and names it in
 # /opt/0g-harness/base. sealed runs the harness from there, and under the
 # layered flow fetches other packages by hash into the same place. To publish
-# the package (the attestor's artifacts, validHarnessHashes), take it from the
-# stage:
+# the package (the `artifacts` release, the trust registry's harness list),
+# take it from the stage of the build that made the image, with the same
+# arguments (--pull included) so it comes from that build's cache: npm run
+# again, on another base, gives another package. Check that it hashes to
+# /opt/0g-harness/base.
 #
-#   cd sealed && docker build --target harness-package --output type=local,dest=out -f images/harness/Dockerfile .
+#   cd sealed && docker buildx build --pull --target harness-package --build-arg HARNESS_REF=… --output type=tar,dest=- -f images/harness/Dockerfile . | tar -xOf - out/0g-harness.tgz > 0g-harness.tgz
+#
+# A new official harness version needs no new image: build its package with
+# the same command, HARNESS_REF naming its commit (its version must pass the
+# whitelist check below), put it on the `artifacts` release and list its hash.
+# Agents take it by the version rule (sealed/LAYERS.md §5.3): the owner's
+# pick, or the newest listed one for a new container or once the running
+# version is delisted. HARNESS_REF in this file names the base package the
+# next image carries, the version a container falls back to.
 #
 # The composition is authored in the harness's code — NOT in a cordis.yml /
 # profile / bundle the agent can reach — so it rides the package hash and an
@@ -30,9 +41,17 @@
 #
 #   cd sealed && docker build -t 0g-sealed-harness:0.1.0 -f images/harness/Dockerfile .
 #
-# Release checklist: a new image hash must be added to on-chain
-# validFrameworkHashes or the attestor destroys the container right after
-# provision. The container does not check that the agent's framework matches
+# Release checklist: a new image hash must be on the trust registry's image
+# list (AgenticID's validFrameworkHashes before 1.4.0) or the attestor
+# destroys the container right after provision. Under the layered flow its
+# sealed hash (the build prints "loader pinned to bootstrap sha256") and its
+# package hash go on the sealed and harness lists before it boots, and both
+# files on the `artifacts` release (sealed/LAYERS.md). Hashes are listed
+# through the registry's owner, the environment's Timelock: a scheduled
+# operation that takes effect after its delay (one day on mainnet, none on
+# testnet and dev); delisting is immediate, by the owner or the guardian. The
+# container does not
+# check that the agent's framework matches
 # the image: an 0g-harness agent booted on an image without the harness fails
 # at framework start. The SDK picks the image by the agent's framework from
 # the attestor's GET /config frameworks[] (ATTESTOR_FRAMEWORKS).
@@ -96,7 +115,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -tags harnessonly -ldflags="-s -w" -o boot
 # fails the build.
 FROM debian:13-slim AS harness-package
 ARG NODE_VERSION=24.22.1
-ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/bfa7a6600b1543c8c87846d0fd38f4f1e4434f82
+ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/fba0a4429a288f086c7de36e78f0c7173ab19572
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils python3 make g++ \
  && rm -rf /var/lib/apt/lists/*

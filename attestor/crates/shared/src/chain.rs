@@ -89,6 +89,22 @@ sol!(
     }
 );
 
+// TrustRegistry (contracts/src/TrustRegistry.sol), found through AgenticID's
+// `trustRegistry()` — only the list read: the attestor checks the sealed
+// program a layered boot names against the sealed list.
+sol!(
+    #[sol(rpc)]
+    interface ITrustRegistry {
+        function isListed(bytes32 kind, bytes32 hash) external view returns (bool);
+    }
+);
+
+/// A trust-registry list kind: keccak256 of its name ("image", "sealed",
+/// "harness").
+pub fn trust_kind(name: &str) -> B256 {
+    alloy::primitives::keccak256(name.as_bytes())
+}
+
 // VerifiedFeedbackRegistry — only the anchor read the startup check makes
 // (`check_verified_feedback_anchor`). The attestor never writes to it.
 sol!(
@@ -261,7 +277,59 @@ where
     // tokio Mutex (not std) because the guard is held across an `.await`.
     submit_lock: tokio::sync::Mutex<()>,
     submit_pool: sqlx::PgPool,
+    /// AgenticID's `trustRegistry()` answer (`TRUST_REGISTRY_TTL`).
+    trust_registry_answer: AnswerCache<Option<Address>>,
     _t: PhantomData<T>,
+}
+
+/// How long `trust_registry` keeps the chain's answer. The address is fixed
+/// in the AgenticID implementation and changes only with a beacon upgrade,
+/// so `GET /provision`, which every boot calls, reads it from the chain at
+/// most once a minute.
+const TRUST_REGISTRY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One chain answer, kept for `ttl` after it was read. A read that failed is
+/// never kept, so the next caller asks the chain again.
+struct AnswerCache<V> {
+    ttl: std::time::Duration,
+    slot: std::sync::Mutex<Option<(std::time::Instant, V)>>,
+}
+
+impl<V: Clone> AnswerCache<V> {
+    fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The answer read less than `ttl` before `now`, if any.
+    fn get(&self, now: std::time::Instant) -> Option<V> {
+        match &*self.slot.lock().unwrap() {
+            Some((at, answer)) if now.saturating_duration_since(*at) < self.ttl => {
+                Some(answer.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn put(&self, now: std::time::Instant, answer: V) {
+        *self.slot.lock().unwrap() = Some((now, answer));
+    }
+}
+
+/// Whether the node answered that the call reverted: JSON-RPC error code 3,
+/// or an error whose message says "execution reverted" (nodes that use
+/// another code for it). Any other error object the node returns — a missing
+/// header, an internal error, a rate limit — says nothing about the contract.
+fn is_execution_revert(e: &alloy::transports::TransportError) -> bool {
+    e.as_error_resp().is_some_and(|resp| {
+        resp.code == 3
+            || resp
+                .message
+                .to_ascii_lowercase()
+                .contains("execution reverted")
+    })
 }
 
 impl<T, P> AlloyChain<T, P>
@@ -287,6 +355,7 @@ where
             max_fee_wei: max_fee_gwei as u128 * GWEI_TO_WEI,
             submit_lock: tokio::sync::Mutex::new(()),
             submit_pool,
+            trust_registry_answer: AnswerCache::new(TRUST_REGISTRY_TTL),
             _t: PhantomData,
         })
     }
@@ -579,6 +648,30 @@ where
         Ok(c.isTrustedAttestor(addr).call().await?._0)
     }
 
+    async fn trust_registry(&self) -> anyhow::Result<Option<Address>> {
+        if let Some(answer) = self.trust_registry_answer.get(std::time::Instant::now()) {
+            return Ok(answer);
+        }
+        let c = AgenticID::new(self.contract_addr, self.provider.clone());
+        let answer = match c.trustRegistry().call().await {
+            Ok(r) => (r._0 != Address::ZERO).then_some(r._0),
+            // LEGACY(pre-1.4.0): the contract refused the call, as an
+            // AgenticID without the function does (0G answers JSON-RPC code
+            // 3, "execution reverted"). Every other error, one the node
+            // answered included, stays an error, never "no registry".
+            Err(alloy::contract::Error::TransportError(e)) if is_execution_revert(&e) => None,
+            Err(e) => return Err(e.into()),
+        };
+        self.trust_registry_answer
+            .put(std::time::Instant::now(), answer);
+        Ok(answer)
+    }
+
+    async fn is_listed(&self, registry: Address, kind: B256, hash: B256) -> anyhow::Result<bool> {
+        let r = ITrustRegistry::new(registry, self.provider.clone());
+        Ok(r.isListed(kind, hash).call().await?._0)
+    }
+
     async fn identity_registry_of(&self, registry: Address) -> anyhow::Result<Address> {
         let code = self.provider.get_code_at(registry).await?;
         if code.is_empty() {
@@ -794,6 +887,134 @@ mod tests {
     fn decode_returns_none_for_unknown_selector() {
         let err = r#"execution reverted, data: "0xdeadbeef""#;
         assert!(decode_revert_data_in_error(err).is_none());
+    }
+
+    // ── trust_registry ─────────────────────────────────────────────────
+
+    #[test]
+    fn an_answer_is_kept_for_its_ttl() {
+        use std::time::Duration;
+        let cache = AnswerCache::new(Duration::from_secs(60));
+        let read_at = std::time::Instant::now();
+        assert_eq!(cache.get(read_at), None::<u8>);
+        cache.put(read_at, 7);
+        assert_eq!(cache.get(read_at + Duration::from_secs(59)), Some(7));
+        assert_eq!(cache.get(read_at + Duration::from_secs(60)), None);
+    }
+
+    /// A JSON-RPC endpoint that answers request n with `answers[n]` (its
+    /// `result` or `error` member) under the request's id; the URL, and how
+    /// many requests it served.
+    async fn jsonrpc_peer(
+        answers: Vec<serde_json::Value>,
+    ) -> (
+        reqwest::Url,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = served.clone();
+        let server = tokio::spawn(async move {
+            for answer in answers {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let (body_at, body_len) = loop {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map_or(0, |v| v.trim().parse().unwrap());
+                        break (end + 4, len);
+                    }
+                };
+                while bytes.len() < body_at + body_len {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[body_at..body_at + body_len]).unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut reply = serde_json::json!({"jsonrpc": "2.0", "id": request["id"]});
+                reply
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(answer.as_object().unwrap().clone());
+                let reply = reply.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (url, served, server)
+    }
+
+    fn chain_at(url: reqwest::Url) -> Arc<impl ChainClient> {
+        let transport = rpc_http_transport(url, std::time::Duration::from_secs(5)).unwrap();
+        let provider = alloy::providers::RootProvider::<_, Ethereum>::new(
+            alloy::rpc::client::RpcClient::new(transport, true),
+        );
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
+        AlloyChain::new(provider, AGENTIC_ID, Address::ZERO, 1, 2, None, pool)
+    }
+
+    /// AgenticID before 1.4.0 has no `trustRegistry()`: 0G answers the call
+    /// with code 3 (measured on Galileo). A revert, and only a revert, is "no
+    /// registry"; an error the node answered for another reason, or no
+    /// answer at all, is an error, and is not kept.
+    #[tokio::test]
+    async fn trust_registry_is_none_only_when_the_call_reverts() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (url, served, server) = jsonrpc_peer(vec![serde_json::json!({
+            "error": {"code": 3, "message": "execution reverted", "data": "0x"}
+        })])
+        .await;
+        let chain = chain_at(url);
+        assert_eq!(chain.trust_registry().await.unwrap(), None);
+        assert_eq!(chain.trust_registry().await.unwrap(), None);
+        assert_eq!(served.load(SeqCst), 1, "the answer is kept");
+        server.await.unwrap();
+
+        // A node that reports the revert under another code.
+        let (url, _, server) = jsonrpc_peer(vec![serde_json::json!({
+            "error": {"code": -32000, "message": "execution reverted"}
+        })])
+        .await;
+        assert_eq!(chain_at(url).trust_registry().await.unwrap(), None);
+        server.await.unwrap();
+
+        // No answer: nothing listens there.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        drop(closed);
+        assert!(chain_at(url).trust_registry().await.is_err());
+
+        let registry = Address::repeat_byte(0x77);
+        let (url, served, server) = jsonrpc_peer(vec![
+            serde_json::json!({"error": {"code": -32000, "message": "header not found"}}),
+            serde_json::json!({"error": {"code": -32603, "message": "internal error"}}),
+            serde_json::json!({"result": format!("0x{}", hex::encode(registry.into_word()))}),
+        ])
+        .await;
+        let chain = chain_at(url);
+        assert!(chain.trust_registry().await.is_err());
+        assert!(chain.trust_registry().await.is_err());
+        assert_eq!(chain.trust_registry().await.unwrap(), Some(registry));
+        assert_eq!(chain.trust_registry().await.unwrap(), Some(registry));
+        assert_eq!(served.load(SeqCst), 3, "errors are not kept; the answer is");
+        server.await.unwrap();
     }
 
     // ── check_verified_feedback_anchor ─────────────────────────────────

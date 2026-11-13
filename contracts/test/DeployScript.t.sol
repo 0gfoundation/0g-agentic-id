@@ -9,6 +9,8 @@ import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/Upgradeabl
 import {Deploy} from "../script/Deploy.s.sol";
 import {DeployVerifiedFeedback} from "../script/DeployVerifiedFeedback.s.sol";
 import {DeployCloneGate} from "../script/DeployCloneGate.s.sol";
+import {DeployTrustRegistry} from "../script/DeployTrustRegistry.s.sol";
+import {TrustRegistry} from "../src/TrustRegistry.sol";
 import {MainnetGovernance} from "../script/MainnetGovernance.sol";
 import {AgenticID} from "../src/AgenticID.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
@@ -197,7 +199,7 @@ contract DeployScriptTest is Test {
     function _assertGovernance(Deploy.Deployed memory d, address owner, uint256 delay, bool ownerIsAdmin)
         internal view
     {
-        assertLe(d.agenticIdImpl.code.length, 24576, "linked AgenticID implementation must fit EIP-170");
+        assertLe(d.agenticIdImpl.code.length, 24576, "AgenticID implementation must fit EIP-170");
         TimelockController t = TimelockController(payable(d.timelock));
         assertEq(t.getMinDelay(), delay, "minDelay");
 
@@ -213,7 +215,10 @@ contract DeployScriptTest is Test {
         assertEq(UpgradeableBeacon(d.verifierBeacon).owner(), d.timelock, "verifier beacon owner");
         assertEq(UpgradeableBeacon(d.verifiedFeedbackBeacon).owner(), d.timelock, "VF beacon owner");
         assertEq(UpgradeableBeacon(d.cloneGateBeacon).owner(), d.timelock, "CloneGate beacon owner");
+        assertEq(UpgradeableBeacon(d.trustRegistryBeacon).owner(), d.timelock, "TrustRegistry beacon owner");
 
+        assertEq(AgenticID(d.agenticId).trustRegistry(), d.trustRegistry, "AgenticID reads the fresh TrustRegistry");
+        assertEq(TrustRegistry(d.trustRegistry).owner(), owner, "TrustRegistry owner");
         assertEq(AgenticID(d.agenticId).owner(), owner, "AgenticID owner");
         assertEq(AgenticID(d.agenticId).pendingOwner(), address(0), "AgenticID pending");
         assertEq(TEEDataVerifier(d.verifier).owner(), owner, "verifier owner");
@@ -335,13 +340,15 @@ contract DeployScriptTest is Test {
         assertTrue(t.hasRole(t.DEFAULT_ADMIN_ROLE(), owner), "testnet: OWNER can grant roles");
     }
 
-    /// @dev DeployVerifiedFeedback.s.sol / DeployCloneGate.s.sol on chain 16661
-    ///      refuse a weak or code-less TIMELOCK and accept the >= 1-day one;
-    ///      off mainnet they accept any. Leaves the chain id at 16661.
+    /// @dev DeployVerifiedFeedback.s.sol / DeployCloneGate.s.sol /
+    ///      DeployTrustRegistry.s.sol on chain 16661 refuse a weak or code-less
+    ///      TIMELOCK and accept the >= 1-day one; off mainnet they accept any.
+    ///      Leaves the chain id at 16661.
     function _runIncrementalScripts(Deploy.Deployed memory d) internal {
         TimelockController weak = new TimelockController(3600, _list(address(this)), _list(address(0)), address(0));
         DeployVerifiedFeedback vfScript = new DeployVerifiedFeedback();
         DeployCloneGate cgScript = new DeployCloneGate();
+        DeployTrustRegistry trScript = new DeployTrustRegistry();
         vm.setEnv("AGENTIC_ID", vm.toString(d.agenticId));
 
         vm.setEnv("TIMELOCK", vm.toString(address(weak)));
@@ -349,25 +356,34 @@ contract DeployScriptTest is Test {
         vfScript.run();
         vm.expectRevert(WEAK_TIMELOCK);
         cgScript.run();
+        vm.expectRevert(WEAK_TIMELOCK);
+        trScript.run();
 
         vm.setEnv("TIMELOCK", vm.toString(makeAddr("not-a-timelock")));
         vm.expectRevert(CODELESS_TIMELOCK);
         vfScript.run();
         vm.expectRevert(CODELESS_TIMELOCK);
         cgScript.run();
+        vm.expectRevert(CODELESS_TIMELOCK);
+        trScript.run();
 
         vm.setEnv("TIMELOCK", vm.toString(d.timelock));
         (, address vfBeacon,,) = vfScript.run();
         (, address cgBeacon,) = cgScript.run();
+        (, address trBeacon, address trProxy) = trScript.run();
         assertEq(UpgradeableBeacon(vfBeacon).owner(), d.timelock, "mainnet: VF beacon owned by the 1-day Timelock");
         assertEq(UpgradeableBeacon(cgBeacon).owner(), d.timelock, "mainnet: CloneGate beacon owned by the 1-day Timelock");
+        assertEq(UpgradeableBeacon(trBeacon).owner(), d.timelock, "mainnet: TrustRegistry beacon owned by the 1-day Timelock");
+        assertEq(TrustRegistry(trProxy).owner(), AgenticID(d.agenticId).owner(), "TrustRegistry owner defaults to AgenticID's");
 
         vm.chainId(16602);
         vm.setEnv("TIMELOCK", vm.toString(address(weak)));
         (, vfBeacon,,) = vfScript.run();
         (, cgBeacon,) = cgScript.run();
+        (, trBeacon,) = trScript.run();
         assertEq(UpgradeableBeacon(vfBeacon).owner(), address(weak), "testnet: weak Timelock accepted");
         assertEq(UpgradeableBeacon(cgBeacon).owner(), address(weak), "testnet: weak Timelock accepted");
+        assertEq(UpgradeableBeacon(trBeacon).owner(), address(weak), "testnet: weak Timelock accepted");
         vm.chainId(16661);
     }
 }

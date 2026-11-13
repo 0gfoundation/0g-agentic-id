@@ -1514,7 +1514,7 @@ here release 0.7.2 *is* npm 0.84.1.
 
 **The install belongs in the image, and that has a security payoff.** Because
 the framework is provisioned at image build time, its bytes are covered by the
-image hash that goes into on-chain `validFrameworkHashes`. openclaw and hermes
+image hash that is listed on chain (the trust registry's image list). openclaw and hermes
 re-pin their version at first Start, so the framework those agents actually run
 is whatever the registry served at boot — outside the measurement. This adapter
 therefore installs nothing at runtime: Start verifies the installed version

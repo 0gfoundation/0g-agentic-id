@@ -433,6 +433,9 @@ func TestProvisionRetryClassification(t *testing.T) {
 			if (result.AgentSealPriv != nil) != test.ok {
 				t.Fatalf("ok=%v, want %v", result.AgentSealPriv != nil, test.ok)
 			}
+			if result.Unanswered {
+				t.Fatal("a definitive answer read as no answer")
+			}
 			if gets, sent := m.counts(); gets != test.getsN || sent != test.postsN {
 				t.Fatalf("GETs %d POSTs %d, want %d and %d", gets, sent, test.getsN, test.postsN)
 			}
@@ -492,8 +495,14 @@ func TestProvisionBacksOffAndGivesUpTenMinutesAfterBoot(t *testing.T) {
 	// PID-1 started a minute before provisioning began.
 	started := f.now.Add(-time.Minute)
 	m, server := newMockAttestor(t, vector.containerKey(t), []answer{gen(1, true)}, []answer{{503, "busy"}})
-	if result := FromAttestor(testBoot(t, server.URL, started)); result.AgentSealPriv != nil {
+	result := FromAttestor(testBoot(t, server.URL, started))
+	if result.AgentSealPriv != nil {
 		t.Fatal("provisioned against an attestor that never answered")
+	}
+	// Giving up on "try again" answers is no answer: a cause outside the
+	// sealed version.
+	if !result.Unanswered {
+		t.Fatal("Unanswered not set when the window ran out")
 	}
 	// 1+2+4+8+16 = 31 s, then 30 s steps while one more still ends inside
 	// the 540 s left of the window: 31 + 16×30 = 511 s, and 541 s would not.
@@ -601,23 +610,24 @@ func TestProvisionLogsNoSecrets(t *testing.T) {
 	}
 }
 
-// A layered claim the attestor refuses still returns the versions it named,
-// so the sealed it refused can hand over to the one it names.
-func TestRefusedLayeredClaimKeepsTheTargets(t *testing.T) {
-	vector := loadCertificateVector(t)
-	f := useFakeClock(t)
-	target := "0x" + strings.Repeat("7b", 32)
-	auth := authorization{Generation: 4, Layered: true}
-	auth.Targets.Sealed = target
-	_, server := newMockAttestor(t, vector.containerKey(t),
-		[]answer{{200, auth}}, []answer{{403, `{"error":"sealed_hash_not_listed"}`}})
-	boot := testBoot(t, server.URL, f.now)
-	boot.SealedHash = strings.Repeat("5a", 32)
-	result := FromAttestor(boot)
-	if result.AgentSealPriv != nil || result.Layered {
-		t.Fatalf("refused claim provisioned: %+v", result)
-	}
-	if result.Targets.Sealed != target {
-		t.Fatalf("targets %+v, want sealed %s", result.Targets, target)
+// A layered claim the attestor refuses still says the attestor runs the
+// layered flow, so the sealed it refused can hand over to the newest listed
+// version. A refusal from an attestor without the flow says nothing of it.
+func TestRefusedLayeredClaimKeepsTheDeclaration(t *testing.T) {
+	for _, declared := range []bool{true, false} {
+		vector := loadCertificateVector(t)
+		f := useFakeClock(t)
+		_, server := newMockAttestor(t, vector.containerKey(t),
+			[]answer{{200, authorization{Generation: 4, Layered: declared}}},
+			[]answer{{403, `{"error":"sealed_hash_not_listed"}`}})
+		boot := testBoot(t, server.URL, f.now)
+		boot.SealedHash = strings.Repeat("5a", 32)
+		result := FromAttestor(boot)
+		if result.AgentSealPriv != nil {
+			t.Fatalf("refused claim provisioned: %+v", result)
+		}
+		if result.Layered != declared {
+			t.Fatalf("declared %v: result.Layered %v", declared, result.Layered)
+		}
 	}
 }

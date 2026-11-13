@@ -284,6 +284,17 @@ where
 /// locations, proxy endpoints, the Go runtime's settings), and gives each
 /// framework only variables it names itself, so no other owner variable has
 /// a consumer.
+///
+/// LEGACY(model-key): model keys go into the agent's credential set, which
+/// reaches every boot through `/provision`. This is the copy sent with the
+/// create, for images that read only that. It goes in two steps: once every
+/// image reads model keys from the set, clients stop sending it; once no
+/// client sends it any more (SDK and CLI releases until then, this one
+/// included; this attestor's console until it stores keys in the set;
+/// integrators on `sealedSecretEnv`), empty this list, and
+/// `secret_env_scheme` in `GET /config` goes with it. Until then every
+/// create that carries it is logged ([`check_owner_env`]), which shows when
+/// none does.
 const OWNER_ENV_KEYS: [&str; 2] = ["API_KEY", "SEAL_SECRET_ENV"];
 
 /// Why an owner-signed create `env` is refused: it names a variable other
@@ -306,8 +317,29 @@ fn owner_env_refusal(env: &serde_json::Map<String, serde_json::Value>) -> Option
 pub fn check_owner_env(payload: &serde_json::Value) -> Result<(), String> {
     match payload.get("env") {
         None => Ok(()),
-        Some(serde_json::Value::Object(env)) => owner_env_refusal(env).map_or(Ok(()), Err),
+        Some(serde_json::Value::Object(env)) => {
+            owner_env_refusal(env).map_or(Ok(()), Err)?;
+            note_request_key(env);
+            Ok(())
+        }
         Some(_) => Err("canonical.payload.env must be a JSON object".into()),
+    }
+}
+
+/// LEGACY(model-key): log a create that carries the model key with the
+/// request, by variable name only, so the operator sees when no client sends
+/// it any more ([`OWNER_ENV_KEYS`]).
+fn note_request_key(env: &serde_json::Map<String, serde_json::Value>) {
+    let carried: Vec<&str> = OWNER_ENV_KEYS
+        .iter()
+        .copied()
+        .filter(|key| env.contains_key(*key))
+        .collect();
+    if !carried.is_empty() {
+        tracing::info!(
+            variables = ?carried,
+            "LEGACY(model-key): an owner's create carries the model key with the request"
+        );
     }
 }
 

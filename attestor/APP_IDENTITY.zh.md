@@ -74,6 +74,8 @@ AgenticID 链接无状态的 `AttestorAppBindingLib`；库没有 owner 或独立
 4. 调用单向开启的 `requireInstanceBoundAttestors()`。
 5. 移除废弃的旧地址白名单项。
 
+AgenticID 1.4.0 起，这些 owner 调用改在 TrustRegistry 上进行：attestor 名单、绑定和实例绑定模式都由它保存；AgenticID 保留只读函数，从它读取后回答。
+
 AgenticID 1.3.0 保留 1.2.0 的治理与 proof 规则。新字段追加在原 ERC-7201 namespace
 已有的 `agentSealBound` mapping 之后，保留它的槽位和终身 seal 地址绑定。
 步骤 4 之前保留旧白名单兼容，但生产 API/worker

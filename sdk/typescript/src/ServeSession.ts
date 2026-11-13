@@ -16,9 +16,12 @@
  *   X-Agent-Proof: 0x<65-byte sig hex>.<base64url(envelope JSON)>
  * envelope JSON = { agent_id, submitter, timestamp, deadline, task_hash,
  *                   data_hashes[], framework_hash, validator }
+ *   v2 adds        { version: 2, sealed_hash, harness_hash, inference_url, model }
  * `validator` (the VerifiedFeedbackRegistry the signature is bound to) is
  * diagnostics only — not part of the on-chain ServeProof tuple — and absent on
- * images that predate it.
+ * images that predate it. LEGACY(v1): a v1 envelope has no `version`.
+ * The envelope is UTF-8 JSON: a v2 `model` and `inference_url` are the
+ * owner's text and may be non-ASCII.
  */
 
 import {
@@ -30,7 +33,8 @@ import {
   type PublicClient,
 } from 'viem';
 import { agenticIDAbi } from './abi';
-import { verifyServeProofSignature } from './ServeProof';
+import { SERVE_PROOF_VERSION, serveProofLayers, verifyServeProofSignature } from './ServeProof';
+import { isListed, trustRegistryOf } from './TrustRegistry';
 import { taskHashOf, requestUriCandidates } from './taskHash';
 import { type Ctx } from './context';
 import type { ServeProof, TaskReveal } from './types';
@@ -46,27 +50,44 @@ interface RawEnvelope {
   data_hashes: `0x${string}`[];
   framework_hash: `0x${string}`;
   validator?: `0x${string}`;
+  // v2 (sealed/LAYERS.md §7)
+  version?: unknown;
+  sealed_hash?: unknown;
+  harness_hash?: unknown;
+  inference_url?: unknown;
+  model?: unknown;
 }
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as const;
 
+/** The envelope's JSON text: base64url → bytes → UTF-8. atob (and Buffer's
+ *  'binary') give one character per byte, which garbles any non-ASCII
+ *  character and so the digest of the string that carries it. */
 function b64urlDecode(s: string): string {
   const b64 = s.replace(/-/g, '+').replace(/_/g, '/');
   const g = globalThis as { atob?: (d: string) => string };
-  if (typeof g.atob === 'function') return g.atob(b64);
-  // Node fallback (envelope is ASCII, so binary === utf8 here).
-  return Buffer.from(b64, 'base64').toString('binary');
+  const bytes =
+    typeof g.atob === 'function'
+      ? Uint8Array.from(g.atob(b64), (c) => c.charCodeAt(0))
+      : Buffer.from(b64, 'base64');
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
 }
 
 /**
  * Parse an `X-Agent-Proof` header value into a ServeProof ready for
- * ReputationClient.giveFeedback.
+ * ReputationClient.giveFeedback. A v2 envelope keeps its version and layer
+ * fields as sent (strings only); whether they are well-formed and signed is
+ * for verification to say, so a version this SDK does not know still parses.
  */
 export function parseServeProofHeader(value: string): ServeProof {
   const dot = value.indexOf('.');
   if (dot < 0) throw new Error('malformed X-Agent-Proof header (missing ".")');
   const signature = value.slice(0, dot) as `0x${string}`;
   const env = JSON.parse(b64urlDecode(value.slice(dot + 1))) as RawEnvelope;
+  if (env.version !== undefined && typeof env.version !== 'number') {
+    throw new Error('malformed X-Agent-Proof header (version is not a number)');
+  }
+  const text = (v: unknown) => (typeof v === 'string' ? v : undefined);
   return {
     agentId: BigInt(env.agent_id),
     submitter: env.submitter ?? ZERO_ADDRESS,
@@ -78,6 +99,16 @@ export function parseServeProofHeader(value: string): ServeProof {
     signature,
     // Unsigned diagnostics from an untrusted header: keep only a string.
     ...(typeof env.validator === 'string' && env.validator ? { validator: env.validator } : {}),
+    // LEGACY(v1): an envelope without a version is a v1 proof.
+    ...(env.version === undefined
+      ? {}
+      : {
+          version: env.version,
+          sealedHash: text(env.sealed_hash) as `0x${string}` | undefined,
+          harnessHash: text(env.harness_hash) as `0x${string}` | undefined,
+          inferenceURL: text(env.inference_url),
+          model: text(env.model),
+        }),
   };
 }
 
@@ -247,6 +278,12 @@ export interface ProofVerification {
    *  (`signerMatches` is false too) — a configuration mismatch, not
    *  necessarily a bad proof. */
   registryMatches: boolean;
+  /** v2 proofs: whether the image (frameworkHash), the sealed program and the
+   *  official harness version the proof names are all on the trust
+   *  registry's lists now (sealed/LAYERS.md §7) — a version delisted since
+   *  the proof was signed fails. LEGACY(v1): null for a v1 proof, which names
+   *  no layers. Required for `ok` when not null. */
+  layersListed: boolean | null;
   /** null when no task was passed to verifyProof (the call means signer
    *  attribution only). With a task: whether the proof's taskHash equals
    *  the hash recomputed from that task — binding the proof to THIS
@@ -331,6 +368,17 @@ export class ServeSession {
     const notExpired = proof.deadline > BigInt(this.now() - this.clockSkew);
     if (!notExpired) reasons.push('proof deadline has passed');
 
+    // The proof's own version picks the digest: 2, or v1 without one
+    // (LEGACY(v1)). Anything else, or a v2 proof with missing or malformed
+    // layer fields, cannot be checked at all.
+    const versioned = proof.version !== undefined;
+    let unverifiable: string | null = null;
+    if (versioned && proof.version !== SERVE_PROOF_VERSION) {
+      unverifiable = `unsupported serve-proof version ${String(proof.version)} (this SDK verifies v2, and v1 without a version)`;
+    } else if (versioned && !serveProofLayers(proof)) {
+      unverifiable = 'v2 proof with missing or malformed layer fields (sealedHash and harnessHash are 32-byte hex; inferenceURL and model strings)';
+    }
+
     // The signature is bound to the registry that redeems it (EIP-191 v0x00
     // intended validator). Without one there is nothing to verify against;
     // when the envelope names another one, the signature cannot match ours.
@@ -339,7 +387,9 @@ export class ServeSession {
       isAddress(registry, { strict: false }) && registry.toLowerCase() !== ZERO_ADDRESS;
     let registryMatches = registryConfigured;
     let signerMatches = false;
-    if (!registryConfigured) {
+    if (unverifiable) {
+      reasons.push(unverifiable);
+    } else if (!registryConfigured) {
       reasons.push('no VerifiedFeedbackRegistry configured — cannot verify serve-proof');
     } else if (proof.validator && proof.validator.toLowerCase() !== registry.toLowerCase()) {
       registryMatches = false;
@@ -368,9 +418,18 @@ export class ServeSession {
         reasons.push(
           proof.validator
             ? 'signature does not match the on-chain agentSeal'
-            : 'signature does not match the on-chain agentSeal (the proof names no validator — likely a pre-upgrade sealed image)',
+            : // LEGACY(v1): the hint for an image from before the validator.
+              'signature does not match the on-chain agentSeal (the proof names no validator — likely a pre-upgrade sealed image)',
         );
       }
+    }
+
+    // v2: the base image, the sealed program and the official harness the
+    // proof names, against the trust registry's lists. LEGACY(v1): null for
+    // a proof without a version.
+    let layersListed: boolean | null = null;
+    if (versioned) {
+      layersListed = unverifiable ? false : await this.layersListed(proof, reasons);
     }
 
     // dataHashes ⊆ intelligentDatasOf(agentId)
@@ -409,13 +468,36 @@ export class ServeSession {
     }
 
     return {
-      ok: signerMatches && notExpired && dataOnChain && taskMatches !== false,
+      ok: signerMatches && notExpired && dataOnChain && layersListed !== false && taskMatches !== false,
       signerMatches,
       notExpired,
       dataOnChain,
       registryMatches,
+      layersListed,
       taskMatches,
       reasons,
     };
+  }
+
+  /** A v2 proof's image, sealed and harness hashes against the trust
+   *  registry's IMAGE, SEALED and HARNESS lists; each one missing is a
+   *  reason. */
+  private async layersListed(proof: ServeProof, reasons: string[]): Promise<boolean> {
+    const trust = await trustRegistryOf(this.publicClient, this.agenticID);
+    // LEGACY(pre-1.4.0): a chain whose AgenticID names no trust registry.
+    if (!trust) {
+      reasons.push('the chain has no trust registry (AgenticID before 1.4.0) — the layers a v2 proof names cannot be checked');
+      return false;
+    }
+    const layers = [
+      ['image', proof.frameworkHash],
+      ['sealed', proof.sealedHash!],
+      ['harness', proof.harnessHash!],
+    ] as const;
+    const listed = await Promise.all(layers.map(([kind, hash]) => isListed(this.publicClient, trust, kind, hash)));
+    layers.forEach(([kind, hash], i) => {
+      if (!listed[i]) reasons.push(`the ${kind} ${hash} is not on the trust registry's ${kind} list`);
+    });
+    return listed.every(Boolean);
   }
 }

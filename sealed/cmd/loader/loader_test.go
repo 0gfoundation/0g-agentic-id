@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -45,8 +47,42 @@ func TestMain(m *testing.M) {
 		ready()
 		time.Sleep(time.Minute)
 		os.Exit(0)
-	case "switch", "switch-fail":
+	case "switch", "switch-fail", "switch-transient", "switch-silent":
 		helperSwitch()
+	case "report":
+		// Writes which version it is and which it stands in for, then exits 7.
+		state := os.Getenv(stateEnv)
+		_ = os.WriteFile(filepath.Join(state, "report"), []byte(os.Getenv(sealedHashEnv)+" "+os.Getenv(insteadOfEnv)), 0o600)
+		os.Exit(7)
+	case "go-back":
+		// The image's version, standing in for another, asks to go back to
+		// it and waits to be stopped; the version gone back to exits 9.
+		state := os.Getenv(stateEnv)
+		if os.Getenv(sealedHashEnv) != os.Getenv(builtinEnv) {
+			os.Exit(9)
+		}
+		_ = os.WriteFile(filepath.Join(state, "request"), []byte(os.Getenv(insteadOfEnv)), 0o600)
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, syscall.SIGTERM)
+		ready()
+		<-c
+		os.Exit(0)
+	case "owner-restart":
+		// Exits for an owner restart more often than a crash is allowed to,
+		// then waits to be stopped.
+		state := os.Getenv(stateEnv)
+		_ = os.WriteFile(filepath.Join(state, "layered"), []byte("1"), 0o600)
+		runs := filepath.Join(state, "runs")
+		n, _ := strconv.Atoi(readTrim(runs))
+		_ = os.WriteFile(runs, []byte(strconv.Itoa(n+1)), 0o600)
+		if n+1 <= maxRestarts+2 {
+			os.Exit(restartRequestedExit)
+		}
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, syscall.SIGTERM)
+		ready()
+		<-c
+		os.Exit(0)
 	case "bad-request":
 		state := os.Getenv(stateEnv)
 		_ = os.WriteFile(filepath.Join(state, "request"), []byte(strings.Repeat("ab", 32)), 0o600)
@@ -78,13 +114,40 @@ func TestMain(m *testing.M) {
 // helperSwitch: the image's version stages a second version (this binary
 // with bytes appended, so another hash) and asks to switch, then waits to be
 // stopped; the second version confirms and exits 9, or, in switch-fail,
-// exits 75 without confirming. Run again after going back, the image's
-// version exits 4.
+// exits 75 without confirming; in switch-transient it exits
+// trialTransientExit on its first two starts (on every start with
+// LOADER_TEST_TRANSIENT_FOREVER), then confirms and waits to be stopped
+// (exit 3); in switch-silent it never confirms and exits 0 when stopped. Run
+// again after going back, the image's version exits 4.
 func helperSwitch() {
 	state := os.Getenv(stateEnv)
 	if os.Getenv(sealedHashEnv) != os.Getenv(builtinEnv) {
-		if os.Getenv(helperEnv) == "switch-fail" {
+		switch os.Getenv(helperEnv) {
+		case "switch-fail":
 			os.Exit(75)
+		case "switch-transient":
+			_ = os.WriteFile(filepath.Join(state, "layered"), []byte("1"), 0o600)
+			runs := filepath.Join(state, "runs")
+			n, _ := strconv.Atoi(readTrim(runs))
+			_ = os.WriteFile(runs, []byte(strconv.Itoa(n+1)), 0o600)
+			if n+1 <= 2 || os.Getenv("LOADER_TEST_TRANSIENT_FOREVER") != "" {
+				os.Exit(trialTransientExit)
+			}
+			if os.Getenv(trialEnv) != "1" {
+				os.Exit(8)
+			}
+			_ = os.WriteFile(filepath.Join(state, "confirmed"), []byte(os.Getenv(sealedHashEnv)), 0o600)
+			c := make(chan os.Signal, 1)
+			signal.Notify(c, syscall.SIGTERM)
+			ready()
+			<-c
+			os.Exit(3)
+		case "switch-silent":
+			_ = os.WriteFile(filepath.Join(state, "layered"), []byte("1"), 0o600)
+			c := make(chan os.Signal, 1)
+			signal.Notify(c, syscall.SIGTERM)
+			<-c
+			os.Exit(0)
 		}
 		if os.Getenv(trialEnv) != "1" {
 			os.Exit(8) // a switched-to version must start on trial
@@ -171,17 +234,22 @@ func helper(t *testing.T, mode string, grace time.Duration, withState bool) (*su
 	t.Setenv(builtinEnv, hash)
 	t.Setenv(sealedHashEnv, "")
 	t.Setenv(trialEnv, "")
+	t.Setenv(insteadOfEnv, "")
 	sigs := make(chan os.Signal, 4)
 	s := &supervisor{
-		builtin:   version{hash: hash, path: exe},
-		stdout:    io.Discard,
-		stderr:    io.Discard,
-		sigs:      sigs,
-		stopGrace: grace,
-		poll:      10 * time.Millisecond,
-		backoff:   func(int) time.Duration { return 0 },
-		window:    time.Minute,
-		logf:      t.Logf,
+		builtin:          version{hash: hash, path: exe},
+		allow:            listAll{},
+		stdout:           io.Discard,
+		stderr:           io.Discard,
+		sigs:             sigs,
+		stopGrace:        grace,
+		poll:             10 * time.Millisecond,
+		backoff:          func(int) time.Duration { return 0 },
+		window:           time.Minute,
+		trialLimit:       time.Minute,
+		transientLimit:   time.Hour,
+		transientBackoff: func(int) time.Duration { return 0 },
+		logf:             t.Logf,
 	}
 	if withState {
 		dir := filepath.Join(t.TempDir(), "loader")
@@ -192,6 +260,42 @@ func helper(t *testing.T, mode string, grace time.Duration, withState bool) (*su
 		t.Setenv(stateEnv, dir)
 	}
 	return s, sigs, readyFile
+}
+
+// listAll is a sealed list that lists every version.
+type listAll struct{}
+
+func (listAll) refuses(string) (bool, error) { return false, nil }
+
+// listFunc is a sealed list that answers with a function.
+type listFunc func(hash string) (bool, error)
+
+func (f listFunc) refuses(hash string) (bool, error) { return f(hash) }
+
+// unreadable is the answer of a list the loader cannot read.
+var errUnreadable = errors.New("rpc down")
+
+// stageCopy stages a copy of this test binary with suffix appended (so
+// another hash) as the recorded current version, confirmed.
+func stageCopy(t *testing.T, s *supervisor, suffix string) string {
+	t.Helper()
+	exe, _ := os.Executable()
+	b, _ := os.ReadFile(exe)
+	b = append(b, []byte(suffix)...)
+	sum := sha256.Sum256(b)
+	staged := hex.EncodeToString(sum[:])
+	if err := os.MkdirAll(filepath.Join(string(s.state), "sealed"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.state.staged(staged), b, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, v := range map[string]string{"current": staged, "confirmed": staged, "previous": ""} {
+		if err := s.state.write(name, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return staged
 }
 
 func runAsync(s *supervisor) <-chan int {
@@ -358,6 +462,192 @@ func TestRunGivesUpOnASealedThatKeepsExiting(t *testing.T) {
 	}
 	if got := s.state.read("runs"); got != strconv.Itoa(maxRestarts+1) {
 		t.Fatalf("sealed ran %s times, want %d", got, maxRestarts+1)
+	}
+}
+
+// The list cannot be read: the recorded version does not run, the image's
+// own runs in its place and is told which one that is, and nothing recorded
+// changes, so the next start tries the recorded version again.
+func TestRunStandsInForAVersionTheListCannotConfirm(t *testing.T) {
+	s, _, _ := helper(t, "report", time.Second, true)
+	staged := stageCopy(t, s, "\nstaged\n")
+	s.allow = listFunc(func(string) (bool, error) { return false, errUnreadable })
+	if code := waitCode(t, runAsync(s)); code != 7 {
+		t.Fatalf("exit code %d, want 7", code)
+	}
+	if got, want := s.state.read("report"), s.builtin.hash+" "+staged; got != want {
+		t.Fatalf("ran %q, want the image's own in place of the staged one %q", got, want)
+	}
+	if got := s.state.hash("current"); got != staged {
+		t.Fatalf("current %q, want the staged version still recorded", got)
+	}
+
+	// Readable again: the recorded version runs, standing in for nothing.
+	s.allow = listAll{}
+	if code := waitCode(t, runAsync(s)); code != 7 {
+		t.Fatalf("exit code %d, want 7", code)
+	}
+	if got := s.state.read("report"); got != staged {
+		t.Fatalf("ran %q, want %q standing in for nothing", got, staged)
+	}
+}
+
+// The image's own, standing in, asks to go back to the version it stands in
+// for once the list reads it as listed: the loader switches, and that version
+// keeps the version it had replaced.
+func TestRunGoesBackToTheVersionStoodInFor(t *testing.T) {
+	s, sigs, readyFile := helper(t, "go-back", 5*time.Second, true)
+	staged := stageCopy(t, s, "\nstaged\n")
+	older := strings.Repeat("ab", 32)
+	if err := s.state.write("previous", older); err != nil {
+		t.Fatal(err)
+	}
+	var readable atomic.Bool
+	s.allow = listFunc(func(h string) (bool, error) {
+		if !readable.Load() {
+			return false, errUnreadable
+		}
+		return false, nil
+	})
+	done := runAsync(s)
+	waitReady(t, readyFile)
+	readable.Store(true)
+	sigs <- syscall.SIGUSR1
+	if code := waitCode(t, done); code != 9 {
+		t.Fatalf("exit code %d, want 9 (the version gone back to)", code)
+	}
+	if got := s.state.hash("current"); got != staged {
+		t.Fatalf("current %q, want %q", got, staged)
+	}
+	if got := s.state.hash("previous"); got != older {
+		t.Fatalf("previous %q, want the one it had replaced %q", got, older)
+	}
+}
+
+// A switch the loader's own list read cannot confirm is refused; the running
+// sealed keeps running.
+func TestRunRefusesASwitchTheListCannotConfirm(t *testing.T) {
+	s, sigs, readyFile := helper(t, "switch", 5*time.Second, true)
+	s.allow = listFunc(func(h string) (bool, error) {
+		if h == s.builtin.hash {
+			return false, nil
+		}
+		return false, errUnreadable
+	})
+	done := runAsync(s)
+	waitReady(t, readyFile)
+	sigs <- syscall.SIGUSR1
+	time.Sleep(50 * time.Millisecond)
+	sigs <- syscall.SIGTERM
+	if code := waitCode(t, done); code != 0 {
+		t.Fatalf("exit code %d, want 0 (stopped, never switched)", code)
+	}
+	if got := s.state.hash("current"); got != "" {
+		t.Fatalf("current %q after a refused switch", got)
+	}
+}
+
+// The image's own is explicitly not listed and the others cannot be read:
+// the loader reads again later instead of giving up.
+func TestRunReadsAgainWhenOnlyTheUnreadableMayBeListed(t *testing.T) {
+	s, _, _ := helper(t, "report", time.Second, true)
+	staged := stageCopy(t, s, "\nstaged\n")
+	reads := 0
+	s.allow = listFunc(func(h string) (bool, error) {
+		reads++
+		if h == s.builtin.hash {
+			return true, nil
+		}
+		if reads < 4 {
+			return false, errUnreadable
+		}
+		return false, nil
+	})
+	if code := waitCode(t, runAsync(s)); code != 7 {
+		t.Fatalf("exit code %d, want 7", code)
+	}
+	if got := s.state.read("report"); got != staged {
+		t.Fatalf("ran %q, want the staged version once readable %q", got, staged)
+	}
+}
+
+// A version on trial that exits for a reason outside it is started again,
+// not marked failed, and is kept once it confirms.
+func TestRunRetriesATransientTrialFailure(t *testing.T) {
+	s, sigs, readyFile := helper(t, "switch-transient", 5*time.Second, true)
+	done := runAsync(s)
+	waitReady(t, readyFile)
+	sigs <- syscall.SIGUSR1
+	waitReady(t, readyFile)
+	sigs <- syscall.SIGTERM
+	if code := waitCode(t, done); code != 3 {
+		t.Fatalf("exit code %d, want 3 (the switched-to version, confirmed, stopped)", code)
+	}
+	next := s.state.hash("request")
+	if s.state.failed(next) || s.state.hash("current") != next || s.state.read("confirmed") != next {
+		t.Fatalf("failed %v, current %q, confirmed %q", s.state.failed(next), s.state.hash("current"), s.state.read("confirmed"))
+	}
+	if got := s.state.read("runs"); got != "3" {
+		t.Fatalf("the version ran %s times, want 3", got)
+	}
+}
+
+// ... until transientLimit: then the loader goes back, where the version to
+// go back to is listed.
+func TestRunGoesBackAfterTransientFailuresOutlastTheLimit(t *testing.T) {
+	s, sigs, readyFile := helper(t, "switch-transient", 5*time.Second, true)
+	t.Setenv("LOADER_TEST_TRANSIENT_FOREVER", "1")
+	s.transientLimit = 0
+	done := runAsync(s)
+	waitReady(t, readyFile)
+	sigs <- syscall.SIGUSR1
+	if code := waitCode(t, done); code != 4 {
+		t.Fatalf("exit code %d, want 4 (the image's version, run again after going back)", code)
+	}
+	if failed := s.state.hash("request"); !s.state.failed(failed) {
+		t.Fatalf("%s not recorded as failed", failed)
+	}
+	if got := s.state.hash("current"); got != s.builtin.hash {
+		t.Fatalf("current %q, want the image's version", got)
+	}
+}
+
+// A version on trial that has not confirmed within trialLimit is stopped and
+// gone back from.
+func TestRunStopsATrialThatDoesNotConfirm(t *testing.T) {
+	s, sigs, readyFile := helper(t, "switch-silent", 5*time.Second, true)
+	s.trialLimit = 200 * time.Millisecond
+	done := runAsync(s)
+	waitReady(t, readyFile)
+	sigs <- syscall.SIGUSR1
+	if code := waitCode(t, done); code != 4 {
+		t.Fatalf("exit code %d, want 4 (the image's version, run again after going back)", code)
+	}
+	if failed := s.state.hash("request"); !s.state.failed(failed) {
+		t.Fatalf("%s not recorded as failed", failed)
+	}
+}
+
+// A sealed that exits because its owner asked for a restart is started
+// again at once, however often.
+func TestRunRestartsOnRequestWithoutCounting(t *testing.T) {
+	s, sigs, readyFile := helper(t, "owner-restart", 5*time.Second, true)
+	done := runAsync(s)
+	waitReady(t, readyFile)
+	sigs <- syscall.SIGTERM
+	if code := waitCode(t, done); code != 0 {
+		t.Fatalf("exit code %d, want 0 (running after the restarts, stopped)", code)
+	}
+	if got := s.state.read("runs"); got != strconv.Itoa(maxRestarts+3) {
+		t.Fatalf("sealed ran %s times, want %d", got, maxRestarts+3)
+	}
+}
+
+func TestTransientRetryBackoff(t *testing.T) {
+	for n, want := range map[int]time.Duration{1: 30 * time.Second, 2: time.Minute, 3: 2 * time.Minute, 4: 4 * time.Minute, 5: 5 * time.Minute, 50: 5 * time.Minute} {
+		if got := transientRetryBackoff(n); got != want {
+			t.Errorf("transientRetryBackoff(%d) = %v, want %v", n, got, want)
+		}
 	}
 }
 

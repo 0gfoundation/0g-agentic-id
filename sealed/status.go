@@ -36,9 +36,10 @@ type runtimeStatus struct {
 	mu      sync.Mutex
 	level   string // "running" | "warning" | "error"
 	message string
-	// pinned is an owner-recoverable condition that no runtime event
-	// clears for the life of this boot (today: an owner-supplied sealed
-	// key that did not apply, so the agent cannot call its model). While
+	// pinned is an owner-recoverable condition for the life of this boot
+	// (today: an owner-supplied sealed key that did not apply, so the agent
+	// cannot call its model), cleared only once a model key from the
+	// credential set is in use. While
 	// the runtime itself is "running", it shows as a "warning" with this
 	// message, so a later drift success or heartbeat cannot report the
 	// agent healthy. A real warning or error still takes precedence.
@@ -48,6 +49,10 @@ type runtimeStatus struct {
 	// It shows like pinned, after it, until a settings push applies.
 	settingsIssue     string
 	supervisorFailure string
+	// modelKeyIssue is why the framework is stopped: the model key the
+	// settings choose cannot be used (modelkey.go). Cleared once a key
+	// renders, whichever start path rendered it.
+	modelKeyIssue string
 	// ownerChanged is set while the agent belongs to an owner other than the
 	// one this container was started for: the container no longer serves it.
 	ownerChanged string
@@ -59,6 +64,11 @@ var currentStatus = &runtimeStatus{level: "running"}
 func (s *runtimeStatus) effective() (string, string) {
 	if s.ownerChanged != "" {
 		return "error", s.ownerChanged
+	}
+	// Before a supervisor failure: the restarts it gave up on failed over
+	// the model key, and this says so.
+	if s.modelKeyIssue != "" {
+		return "error", s.modelKeyIssue
 	}
 	if s.supervisorFailure != "" {
 		return "error", s.supervisorFailure
@@ -93,11 +103,14 @@ func (s *runtimeStatus) Set(level, message string) string {
 }
 
 // Pin sets (or, with "", clears) the pinned warning described on
-// runtimeStatus. The message must carry no secret values.
-func (s *runtimeStatus) Pin(message string) {
+// runtimeStatus and reports whether it changed. The message must carry no
+// secret values.
+func (s *runtimeStatus) Pin(message string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	changed := s.pinned != message
 	s.pinned = message
+	return changed
 }
 
 // OwnerChanged sets (or, with "", clears) the owner-change error described
@@ -108,6 +121,39 @@ func (s *runtimeStatus) OwnerChanged(message string) string {
 	prev, _ := s.effective()
 	s.ownerChanged = message
 	return prev
+}
+
+// ModelKeyIssue sets (or, with "", clears) the model key error described on
+// runtimeStatus and reports whether it changed. The message must carry no
+// secret values.
+func (s *runtimeStatus) ModelKeyIssue(message string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := s.modelKeyIssue != message
+	s.modelKeyIssue = message
+	return changed
+}
+
+// statusReporter sends the effective status from one goroutine, reading it
+// when it sends: reports leave in order and the last one is current.
+type statusReporter struct{ nudge chan struct{} }
+
+func newStatusReporter(send func(level, message string)) *statusReporter {
+	r := &statusReporter{nudge: make(chan struct{}, 1)}
+	go func() {
+		for range r.nudge {
+			send(currentStatus.Get())
+		}
+	}()
+	return r
+}
+
+// Soon asks for a report; asks while one is pending fold into it.
+func (r *statusReporter) Soon() {
+	select {
+	case r.nudge <- struct{}{}:
+	default:
+	}
 }
 
 // SettingsIssue sets (or, with "", clears) the settings warning described
@@ -196,8 +242,10 @@ func (s *runtimeStatus) SupervisorFailed(message string) {
 	defer s.mu.Unlock()
 	s.supervisorFailure = message
 }
-func (s *runtimeStatus) SupervisorRecovered() {
+func (s *runtimeStatus) SupervisorRecovered() (changed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	changed = s.supervisorFailure != ""
 	s.supervisorFailure = ""
+	return changed
 }

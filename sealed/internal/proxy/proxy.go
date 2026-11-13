@@ -29,10 +29,11 @@
 // streamed (SSE) responses are never signed, nor is anything else. The
 // header is runtime-owned: an X-Agent-Proof set by an upstream backend is
 // dropped on every relay path, so the only one a client ever sees is the one
-// writeServeProof attached. The signature is EIP-191 version 0x00 bound to the
-// VerifiedFeedbackRegistry (see writeServeProof) — not a personal_sign, so
-// there is no verifyMessage-style check: verifiers rebuild the ServeProof hash
-// from the envelope plus their configured deployment and recover the digest.
+// writeServeProofLayered attached. The signature is EIP-191 version 0x00
+// bound to the VerifiedFeedbackRegistry (see writeServeProofLayered) — not a
+// personal_sign, so there is no verifyMessage-style check: verifiers rebuild
+// the ServeProof hash from the envelope plus their configured deployment and
+// recover the digest.
 package proxy
 
 import (
@@ -101,6 +102,8 @@ type Server struct {
 	// compact backs POST /_seal/compact (compact.go): its applier plus the
 	// single-flight and replay guards, under their own lock.
 	compact compactState
+	// restart is /_seal/restart (ownerrestart.go).
+	restart ownerRestart
 
 	// Stateful-door conversation binding (framework.ConversationSession),
 	// wired by main.go only for adapters that hold the conversation
@@ -150,9 +153,10 @@ type Server struct {
 // chain. main.go supplies one backed by the bootstrap chain client.
 type OwnerResolver func(ctx context.Context) (string, error)
 
-// SetProofLayers makes every serve-proof signed while f reports ok a v2
-// proof (sealed/LAYERS.md §7), signing what f names at that moment. main.go
-// sets it only under the layered runtime; otherwise proofs stay v1.
+// SetProofLayers makes every serve-proof a v2 proof (sealed/LAYERS.md §7),
+// signing what f names at that moment; while f does not report ok, nothing
+// is signed. main.go sets it under the layered runtime only, before the agent
+// starts; otherwise proofs stay v1.
 func (s *Server) SetProofLayers(f func() (ProofLayers, bool)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -160,19 +164,32 @@ func (s *Server) SetProofLayers(f func() (ProofLayers, bool)) {
 }
 
 // layersForProof is what the next serve-proof signs beyond v1: nil for a v1
-// proof.
-func (s *Server) layersForProof() *ProofLayers {
+// proof (no SetProofLayers: LEGACY(v1)). ok is false while the layered runtime
+// cannot name its layers: then no proof is signed, never a v1 one.
+func (s *Server) layersForProof() (*ProofLayers, bool) {
 	s.mu.RLock()
 	f := s.proofLayers
 	s.mu.RUnlock()
 	if f == nil {
-		return nil
+		return nil, true
 	}
 	l, ok := f()
 	if !ok {
+		return nil, false
+	}
+	return &l, true
+}
+
+// serveWithProof writes body with the serve-proof this server signs now: v2
+// under the layered runtime, none while its layers are not known, v1 without
+// it (layersForProof).
+func (s *Server) serveWithProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr, validator string) error {
+	layers, ok := s.layersForProof()
+	if !ok {
+		writeWithoutProof(w, body, statusCode)
 		return nil
 	}
-	return &l
+	return writeServeProofLayered(w, r, priv, reqBody, body, dataHashes, statusCode, agentID, frameworkHash, chainID, identityAddr, validator, layers)
 }
 
 // SetLiveOwner installs the resolver. Safe to call before or after Listen.
@@ -353,6 +370,7 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/claim", s.handleClaim)
 	mux.HandleFunc("/_seal/clear", s.handleClear)
 	mux.HandleFunc("/_seal/compact", s.handleCompact)
+	mux.HandleFunc("/_seal/restart", s.handleOwnerRestart)
 	mux.HandleFunc("/_seal/credentials", s.handleCredentials)
 	mux.HandleFunc("/_seal/credentials/pending", s.handleCredentialPending)
 	mux.HandleFunc("/_seal/credentials/decide", s.handleCredentialDecide)
@@ -491,7 +509,7 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	// like a service's own response, before the proof covers them.
 	body = s.scrubBytes(body)
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProofLayered(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator, s.layersForProof()); err != nil {
+	if err := s.serveWithProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -714,7 +732,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProofLayered(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator, s.layersForProof()); err != nil {
+	if err := s.serveWithProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -972,7 +990,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(k, "Access-Control-") {
 			continue
 		}
-		// X-Agent-Proof is runtime-owned: only writeServeProof attaches it.
+		// X-Agent-Proof is runtime-owned: only writeServeProofLayered attaches it.
 		if isAgentProofHeader(k) {
 			continue
 		}
@@ -989,7 +1007,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(respBody)
 		return
 	}
-	if err := writeServeProofLayered(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash, chainID, identityAddr, validator, s.layersForProof()); err != nil {
+	if err := s.serveWithProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -1284,11 +1302,11 @@ type serveProofV2 struct {
 // address that will redeem the serve-proof (bound into the signature).
 const clientAddressHeader = "X-Client-Address"
 
-// agentProofHeader carries the serve-proof. It is runtime-owned: writeServeProof
-// is the only place that sets it, and every path relaying an upstream response
-// (buffered, streamed, WebSocket upgrade — header and trailer) drops an
-// upstream-supplied copy, so a backend cannot put a header of its own choosing
-// under the runtime's name.
+// agentProofHeader carries the serve-proof. It is runtime-owned:
+// writeServeProofLayered is the only place that sets it, and every path
+// relaying an upstream response (buffered, streamed, WebSocket upgrade —
+// header and trailer) drops an upstream-supplied copy, so a backend cannot put
+// a header of its own choosing under the runtime's name.
 const agentProofHeader = "X-Agent-Proof"
 
 // isAgentProofHeader reports whether a response header key names
@@ -1298,33 +1316,28 @@ func isAgentProofHeader(k string) bool {
 	return strings.EqualFold(k, agentProofHeader) || strings.EqualFold(k, "X-Agent-Proof-Mode")
 }
 
-// writeServeProof signs the contract-shaped envelope with agent_seal_priv and
-// emits a single header packing the signature and base64-url envelope JSON:
+// writeServeProofLayered signs the contract-shaped envelope with
+// agent_seal_priv and emits a single header packing the signature and
+// base64-url envelope JSON:
 //
 //	X-Agent-Proof: 0x<65-byte sig hex>.<base64-url-encoded envelope JSON>
 //
-// The signed digest is serveProofDigest(validator, serveProofHash(...)) —
-// exactly what VerifiedFeedbackRegistry._verifyServeProof checks. chainId +
-// identityRegistry give cross-chain / cross-deployment separation; submitter
-// (declared by the client in X-Client-Address) binds the proof to one
-// redeemer; validator (the registry proxy) binds the signature to the one
-// contract that redeems it, in a signing domain the sign socket never
-// produces (see sign.go).
+// The signed digest is serveProofDigest(validator, serveProofHashV2(...)) —
+// exactly what VerifiedFeedbackRegistry checks — for a v2 proof (layers not
+// nil), and the v1 hash (legacy_v1.go) otherwise. chainId + identityRegistry
+// give cross-chain / cross-deployment separation; submitter (declared by the
+// client in X-Client-Address) binds the proof to one redeemer; validator (the
+// registry proxy) binds the signature to the one contract that redeems it, in
+// a signing domain the sign socket never produces (see sign.go).
 //
 // When the agent has no on-chain identity yet (agentID/frameworkHash/chainID
 // empty, e.g. local dev without a chain), or no usable validator
 // (VERIFIED_FEEDBACK_ADDR unset, malformed, zero, or not anchored to
-// AGENTIC_ID_ADDR — see main.anchorValidator), the body is written
-// without a proof header — a reputation proof would be meaningless, and there
-// is deliberately no fallback to the legacy personal_sign wrap.
-func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr, validator string) error {
-	return writeServeProofLayered(w, r, priv, reqBody, body, dataHashes, statusCode, agentID, frameworkHash, chainID, identityAddr, validator, nil)
-}
-
-// writeServeProofLayered is writeServeProof that signs a v2 proof when
-// layers is not nil (serveProofHashV2, the same EIP-191 version 0x00 wrap).
-// A v2 proof whose sealed or harness hash is not a 32-byte hex value is not
-// signed at all: the body goes out without a proof, as with no identity.
+// AGENTIC_ID_ADDR — see main.anchorValidator), the body is written without a
+// proof header — a reputation proof would be meaningless, and there is
+// deliberately no fallback to the legacy personal_sign wrap. A v2 proof whose
+// sealed or harness hash is not a 32-byte hex value is not signed at all
+// either.
 func writeServeProofLayered(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr, validator string, layers *ProofLayers) error {
 	agentIDBig, ok := new(big.Int).SetString(agentID, 10)
 	chainIDBig, chainOK := new(big.Int).SetString(chainID, 10)
@@ -1339,14 +1352,8 @@ func writeServeProofLayered(w http.ResponseWriter, r *http.Request, priv, reqBod
 		layersOK = sErr == nil && hErr == nil
 	}
 	if !ok || !chainOK || fwErr != nil || agentIDBig.Sign() == 0 || !validatorOK || !layersOK {
-		// No on-chain identity (or nothing to bind the proof to) — serve the
-		// body without a serve-proof, and without any X-Agent-Proof a caller
-		// may have left on w.
-		w.Header().Del(agentProofHeader)
-		w.Header().Del("Content-Length")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
-		w.WriteHeader(statusCode)
-		_, _ = w.Write(body)
+		// No on-chain identity (or nothing to bind the proof to).
+		writeWithoutProof(w, body, statusCode)
 		return nil
 	}
 
@@ -1405,6 +1412,7 @@ func writeServeProofLayered(w http.ResponseWriter, r *http.Request, priv, reqBod
 		err       error
 	)
 	if layers == nil {
+		// LEGACY(v1)
 		proofJSON, err = json.Marshal(env)
 		proofHash = serveProofHash(chainIDBig, addrWord(identityAddr), submitterWord,
 			agentIDBig, now, deadline, taskHash, packed, fwBytes)
@@ -1446,28 +1454,14 @@ func writeServeProofLayered(w http.ResponseWriter, r *http.Request, priv, reqBod
 	return nil
 }
 
-// serveProofHash is the inner ServeProof hash, keccak256(abi.encode(chainId,
-// identityRegistry, submitter, agentId, timestamp, deadline, taskHash,
-// keccak256(abi.encodePacked(dataHashes)), frameworkHash)). Every field is a
-// static 32-byte word, so abi.encode is a plain concatenation. identityRegistry
-// and submitter are abi address words (addrWord); dataHashesPacked is
-// abi.encodePacked(bytes32[]) — the on-chain roots back to back.
-//
-// Consensus-critical: byte-identical to VerifiedFeedbackRegistry, the SDK
-// (sdk/typescript/src/ServeProof.ts), the attestor console's say-hi check and
-// attestor/scripts/verify-agent.sh check 3b (the five copies in AGENTS.md).
-func serveProofHash(chainID *big.Int, identityRegistry, submitter []byte, agentID *big.Int, timestamp, deadline int64, taskHash, dataHashesPacked, frameworkHash []byte) []byte {
-	return crypto.Keccak256(bytes.Join([][]byte{
-		word256(chainID),
-		identityRegistry,
-		submitter,
-		word256(agentID),
-		word256(big.NewInt(timestamp)),
-		word256(big.NewInt(deadline)),
-		taskHash,
-		crypto.Keccak256(dataHashesPacked),
-		frameworkHash,
-	}, nil))
+// writeWithoutProof writes body with no serve-proof, and without any
+// X-Agent-Proof a caller may have left on w.
+func writeWithoutProof(w http.ResponseWriter, body []byte, statusCode int) {
+	w.Header().Del(agentProofHeader)
+	w.Header().Del("Content-Length")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	w.WriteHeader(statusCode)
+	_, _ = w.Write(body)
 }
 
 // serveProofV2Tag opens the v2 ServeProof preimage:

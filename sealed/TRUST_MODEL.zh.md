@@ -287,7 +287,7 @@ Attestor 的校验有三道独立闸门：
 | 闸门 | 谓词 | 真源 |
 |---|---|---|
 | **Sandbox 身份** | 首次 provision：证书的 scope（chain、TappRegistry、appId、`registered_at`）及其恢复出的签名者，等于 attestor 发现并信任的 provider 实例，且公钥是 provider 为 attestor 在当前票据下创建的 sandbox 所报告的公钥（直接在 provider 创建的 sealed sandbox 公钥不同）。后续启动：首次 provision 时记录的 provider 实例仍等于它 | attestor 的 provider discovery（TappRegistry、SandboxServing）|
-| **Image 合法性** | `AgenticID.isValidFrameworkHash(image_hash) == true`，首次 provision 时校验，之后每次启动对记录的 hash 再校验一次 | AgenticID 合约的 `validFrameworkHashes` allowlist（Attestor 维护的、批准过的 Sealed runtime image hash 集合）|
+| **Image 合法性** | `AgenticID.isValidFrameworkHash(image_hash) == true`，首次 provision 时校验，之后每次启动对记录的 hash 再校验一次 | 部署者在链上维护的镜像名单：TrustRegistry 的 `IMAGE` 名单，从 AgenticID 1.4.0 起 `isValidFrameworkHash` 读的就是它；之前是 AgenticID 自己的 `validFrameworkHashes` |
 | **新鲜度 OR 记录** | 首次 provision：`ticket_issued_at − 300 ≤ ts ≤ now + 300`。后续启动：boot claim 恢复出的地址等于记录的 `container_pubkey` 的地址 | 部署的容器记录（`container_pubkey`、image hash 和 provider 实例），与首次 provision 的 binding 在同一事务中写入 |
 
 **第一道闸门**认证 provider 签名者与完整 app 实例 scope，当前或历史 node list
@@ -296,9 +296,9 @@ node 轮换保留同一张证书和同一把容器 key；新的注册 epoch 或�
 会让旧实例下签发的容器的每次后续启动都失败（`provider instance no longer
 trusted; reset required`）。旧版本证书不做迁移：所有 agent 都在 v3 下重建。
 
-**第二道闸门** —— `validFrameworkHashes` 白名单 —— 思想上跟 Tapp
+**第二道闸门** —— 镜像名单 —— 思想上跟 Tapp
 那套"代码身份上链、用户审过再用"一致：sealed runtime image hash
-也是注册在链上的（AgenticID 合约的 `validFrameworkHashes`），用户
+也是注册在链上的（TrustRegistry 的镜像名单，经 AgenticID 读取），用户
 也应当自己对一遍：链上 hash 与开源 sealed runtime 仓库里
 reproducible build 出的 hash 一致。
 
@@ -306,7 +306,7 @@ reproducible build 出的 hash 一致。
 spawn 出来的容器、不是顶层 app，所以**不走 TappRegistry**，那条
 `acknowledgeApps` 流程对它不适用。**当前唯一缺的是 wallet 端 ack
 这一步**：用户做完 image 审计之后，目前没有地方在链上把"我审过这版
-hash"这件事落下来。补法是在 AgenticID 合约侧给 `validFrameworkHashes`
+hash"这件事落下来。补法是给 TrustRegistry 上镜像名单的
 当前快照加一个 per-wallet ack（结构跟 `TappRegistry.acknowledgeApps`
 对齐就行）—— 不需要、也不会把 sealed 迁进 TappRegistry。
 
@@ -1053,21 +1053,34 @@ agentSeal，并绑定 owner、agent、链和条目名；整个凭据集由 owner
 0g-harness 镜像把运行环境分成几层（`LAYERS.zh.md`）：base（镜像）、sealed、harness
 官方版本和 agent 的数据。每一处校验靠的是：
 
+- **谁登记版本。** 信任合约的 owner 是该环境的 Timelock：登记 sealed、harness 或镜像
+  版本，信任一个 attestor，都是先排期、等待期间可以取消的操作（主网 1 天，测试网和 dev
+  不用等）。移出版本、撤掉 attestor 立即生效，owner 或 guardian 密钥都能做。所以新版本要过了
+  Timelock 的等待期，才会到达正在运行的 0g-harness agent：agent 只在 owner 选了它，或者正在跑
+  的版本被移出名单时才换版本，换到的也是已经过了等待期的版本。移出名单在一次心跳（5 分钟）内
+  生效，换到的版本随后拿到 agent 私钥。
 - **跑哪个 sealed。** 加载器执行 sealed 之前核对它的哈希（镜像自带的对编进加载器的哈希，
-  换上来的版本对它的名字），并在链上查 AgenticID 的 `validSealedHashes` 里有没有它；链上
-  明确答"没有"就不执行。加载器信链上节点的回答，sealed 读链上数据也是这样；查不到答案时
-  照常执行，而 attestor 下发私钥前查的是同一个白名单，不在的版本拿不到私钥。分层流程下
-  sealed 在 `/provision` 报上自己的哈希，用容器密钥签名，attestor 每次下发私钥都复查。
-- **换版本。** 正在运行的 sealed 本身已校验过、持有容器密钥，由它在链上核对目标版本，
-  经固定的 TLS 从 attestor 下载，哈希对上名字才留下，交给加载器，加载器再核对一次。
-  起不来的版本会被退回，在这个容器里不再换。
+  换上来的版本对它的名字），并在链上查信任合约（由 AgenticID 指明）的 sealed 名单里有没有它；
+  链上明确答"没有"就不执行。加载器信链上节点的回答，sealed 读链上数据也是这样。换上来的
+  版本只有明确答"有"才执行：查不到答案时（节点连不上或被拦、AgenticID 没有信任合约），加载器
+  改跑镜像自带的 sealed，它由镜像哈希覆盖。这一关必须由加载器自己把：分层流程下 sealed 在
+  `/provision` 报上自己的哈希，用容器密钥签名，attestor 每次下发私钥都复查，但这个哈希是正在
+  运行的 sealed 自己报的，而镜像哈希来自 provider 的证书。
+- **换版本。** 正在运行的 sealed 本身已校验过、持有容器密钥，由它按同一条规则定版本
+  （owner 选的版本，列着就用；否则保持正在跑的；它被下架时换到最新登记的），在链上核对，
+  按哈希从公开的制品发布处下载，哈希对上名字才留下，交给加载器，加载器再核对一次哈希和
+  白名单。attestor 不指定版本：它能影响的只是 agent 跑名单里的哪一个，而这个选择不在它手里。
+  起不来的版本会被退回，在这个容器里不再换；因为版本以外的原因（连不上的节点、下载）起不来
+  的，过一阵再启动。
 - **跑哪个 harness。** harness 从官方版本包运行，包解开在 root 所有、agent 只能读的目录
-  里；sealed 只用哈希对上名字、链上 `validHarnessHashes` 列着的包（确认不了时，只跑容器里
-  已有的）。harness 不持有任何密钥：agent 私钥没有，模型 key 由推理代理代填，owner 的聊天
+  里；sealed 只用哈希对上名字、链上信任合约 harness 名单列着的包。名单明确说不在的包一律
+  不跑；名单读不到时，跑容器上次跑的或 base 自带的，都已在磁盘上。harness 不持有任何密钥：agent 私钥没有，模型 key 由推理代理代填，owner 的聊天
   令牌由 proxy 在入口换成 harness 自己的。
 - **模型看到什么。** 每次模型调用都经 sealed 的推理代理：按 owner 设置的模型名，发到
   owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方
-  地址），并把平台说明（身份、doctrine）放在系统提示末尾。v2 serve-proof 的
+  地址），并把平台说明（身份、doctrine）放在系统提示末尾。只放行模型调用，按精确路径
+  （chat/completions、messages、responses、模型列表）。分层流程下 serve-proof 只有 v2，
+  否则不出。v2 serve-proof 的
   `inference_url` 和 `model` 说明推理代理往哪里转发、用哪个模型名，不证明某条回答出自这个
   模型：harness 可以不经模型生成回答。agent 的进程绕过推理代理自己连模型，只能靠出站限制挡
   （`LAYERS.zh.md` 第 9 节第 2 条）。

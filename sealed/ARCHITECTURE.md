@@ -152,22 +152,30 @@ In the 0g-harness image PID 1 is not sealed but the loader (`cmd/loader`).
 Before it runs any sealed it checks the hash (`/bootstrap`, the image's own,
 against the sha256 compiled in when the image is built,
 `-X main.expectedSealedHash`, `images/harness/Dockerfile`; a switched-to
-version against its name), then sends one `eth_call` to `CHAIN_RPC_URL` for
-AgenticID's `isValidSealedHash`: a version the chain says is not listed does
-not run (`allowlist.go`). It starts sealed as its child with the environment
-unchanged plus `SEALED_HASH` (the hash it checked) and `SEALED_TRIAL` (on
-trial), forwards SIGTERM, SIGINT, SIGQUIT and SIGHUP, kills sealed if it has
-not exited 2 min after a stop signal, and reaps every orphan. Without the
-layered flow it exits with sealed's status when sealed exits, so a sealed exit
-still ends the container. Under the layered flow (`LAYERS.md` §3, §3.1) it
-also switches sealed versions when sealed asks (SIGUSR1): it starts the new
-version on trial, goes back to the old one if the new one exits before
-confirming it came up, and ends what the old sealed left behind before the
-switch; and it restarts a sealed that exits on its own, at most 5 times in
-10 minutes. Its state directory is `/var/lib/loader`, which only root can
-enter. Like sealed it is root, non-dumpable and sets `no_new_privs`, and it
-links only the standard library and `golang.org/x/sys`
-(`TestLinkedPackages`). The other images keep sealed as PID 1.
+version against its name), then sends `eth_call`s to `CHAIN_RPC_URL`,
+AgenticID's `trustRegistry()` and the trust registry's `isListed(SEALED,
+hash)`: a version the chain says is not listed does not run, and a
+switched-to version runs only when the chain says it is listed; when no answer
+can be had the image's own runs in its place (`allowlist.go`,
+`supervise.go`). It starts sealed as its child with the environment unchanged
+plus `SEALED_HASH` (the hash it checked), `SEALED_TRIAL` (on trial) and
+`SEALED_INSTEAD_OF` (the version the image's own runs in place of), forwards
+SIGTERM, SIGINT, SIGQUIT and SIGHUP, kills sealed if it has not exited 2 min
+after a stop signal, and reaps every orphan. Without the layered flow it exits
+with sealed's status when sealed exits, so a sealed exit still ends the
+container. Under the layered flow (`LAYERS.md` §3, §3.1) it also switches
+sealed versions when sealed asks (SIGUSR1) and the chain lists the new one: it
+starts the new version on trial, goes back to the old one if the new one exits
+before confirming it came up or has not confirmed within 20 minutes, and ends
+what the old sealed left behind before the switch. It restarts a sealed that
+exits on its own at most 5 times in 10 minutes; exit code 76 (an owner restart
+of sealed) restarts at once and is not counted, and exit code 69 (a boot that
+failed for a reason outside the version) restarts the same version after 30 s,
+doubling up to 5 min, without counting it against the version. Its state
+directory is `/var/lib/loader`, which only root can enter. Like sealed it is
+root, non-dumpable and sets `no_new_privs`, and it links only the standard
+library and `golang.org/x/sys` (`TestLinkedPackages`). The other images keep
+sealed as PID 1.
 
 A sealed that is not PID 1 handles SIGTERM and SIGINT (`shutdown.go`): it
 stops the watcher, stops the framework (which nothing restarts afterwards),
@@ -195,7 +203,8 @@ proxy fills the key, so the harness holds a placeholder. The token the owner
 gets from `/_seal/auth` is not the one the harness checks; the proxy checks it
 at the entry and swaps it. The harness's routes are listed one by one
 (`framework.Route.Endpoints`), and it can ask over the sign socket to be
-restarted (`POST /harness/restart`). The sign socket refuses a transaction to
+restarted (`POST /harness/restart`); the owner restarts the harness or sealed
+with `POST /_seal/restart` (`ownerrestart.go`). The sign socket refuses a transaction to
 AgenticID `update` or `updateAt` and records every signature and refusal for
 the owner (`/_seal/signatures`), and the sockets serve their endpoints as MCP
 tools (`POST /mcp`, `internal/sealmcp`), which the harness registers as native
@@ -203,8 +212,10 @@ tools; both are adapter-declared (`framework.SigningRules`,
 `framework.RuntimeTools`), and only 0g-harness declares them. Every iData entry it uploads carries a
 salted plaintext commitment (`internal/uploader/commitments.go`). Once the
 attestor declares the layered flow, sealed reports its own hash, signs
-ServeProof v2, and switches the harness and sealed to the versions the
-attestor targets (`layered.go`). The full design is in `LAYERS.md`.
+ServeProof v2, and at boot, after every settings push and at every heartbeat
+picks the harness and sealed versions by one rule: the owner's pick in the
+settings document's `versions` while the trust registry lists it, else the
+version running, else — that one delisted — the newest listed (`layered.go`). The full design is in `LAYERS.md`.
 
 ### Why the settings document comes down `/provision`
 
@@ -637,6 +648,7 @@ container's `:8080`.
 | `/_seal/credentials*`, `/_seal/oauth/callback` | **owner's wallet**; the callback is the owner's browser | the owner's credentials for the agent: load a signed set, list it, decide requests, read the audit log, start an MCP login; the callback completes one. Served with the credential proxy, its sockets and its CA ([CREDENTIALS.md](CREDENTIALS.md)) |
 | `/_seal/signatures` | **owner's wallet** | 0g-harness only (`framework.SigningRules`; 404 for the other frameworks): what the sign socket signed and refused (tag `0GSealSignatures`, `?after=<seq>`), one record per signature or refusal with what identifies it (a message's hash and start, a typed-data digest and domain, a transaction's hash, chain, target, value, nonce and selector), the last 1000, kept across restarts of sealed (`internal/proxy/signlog.go`) |
 | `/_seal/compact` | **owner's wallet** | run the framework's own compaction on that conversation now, no restart (tag `0GSealCompact`, seat-gated): one at a time, a signed message accepted once, never overlapping a synthesized-door turn — each refusal a 409; 501 when the adapter cannot trigger the framework's compaction — no `SessionCompactor`, or an installed version without what it drives (openclaw before 2026.7.1 has no `sessions compact` CLI command) (`internal/proxy/compact.go`, `CONVERSATION.md`) |
+| `/_seal/restart` | **owner's wallet** | restart the harness (`{"layer":"harness"}`) or sealed itself (`{"layer":"sealed"}`; the loader starts it again) — tag `0GSealRestart`, seat-gated, a signed message accepted once, 202 before the restart. Only for adapters that run a harness package (0g-harness); a sealed restart also needs the layered flow and this boot confirmed as up (503 while starting); 501 elsewhere (`internal/proxy/ownerrestart.go`, `ownerrestart.go`) |
 | `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth; responses never proof-signed — the owner↔agent steering channel); every undeclared path 404s — there is no catch-all relay |
 | `/api/*` | external callers | agent-registered services (exact path, registered over the sign socket's `/services`), reverse-proxied to the agent's loopback backend; responses buffered and proof-signed (`X-Agent-Proof`), even when the backend emits SSE |
 | `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, 0g-harness), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |

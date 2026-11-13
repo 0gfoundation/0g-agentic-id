@@ -88,6 +88,9 @@ type Bootstrap struct {
 	ProviderSigner common.Address
 
 	// Optional pipeline knobs
+	// APIKey is the create/reset model key, in clear (API_KEY) or opened from
+	// SecretEnv, and InferenceCredential its binding. LEGACY(model-key): see
+	// internal/secretenv.
 	APIKey              string
 	InferenceCredential *inference.ProviderCredential
 	StatusBinding       *report.Binding
@@ -109,6 +112,7 @@ type Bootstrap struct {
 	// be opened only after Phase 1 (it is sealed to agentSeal_priv) and is
 	// bound to the on-chain owner, so main opens it after Phase 2 and
 	// overwrites APIKey with the result (internal/secretenv).
+	// LEGACY(model-key).
 	SecretEnv string
 
 	// Framework is the raw AGENT_FRAMEWORK env value (may be empty). The
@@ -133,6 +137,11 @@ type Bootstrap struct {
 	// back to the previous one if it exits before it has come up
 	// (layers.go).
 	Trial bool
+	// InsteadOf is SEALED_INSTEAD_OF: the version this program (the image's
+	// own sealed) runs in place of, because the loader could not read the
+	// sealed list as it started; 64 lowercase hex, "" when it runs in place
+	// of nothing (or the value is malformed).
+	InsteadOf string
 }
 
 // Load reads env vars and runs the certificate self-check (Phase 0). Returns
@@ -187,7 +196,18 @@ func Load() (*Bootstrap, error) {
 		PublicURL:            composePublicURL(),
 		SealedHash:           os.Getenv("SEALED_HASH"),
 		Trial:                os.Getenv("SEALED_TRIAL") == "1",
+		InsteadOf:            versionHash(os.Getenv("SEALED_INSTEAD_OF")),
 	}, nil
+}
+
+// versionHash is s when it is a version hash as the loader writes one, 64
+// lowercase hex, else "".
+func versionHash(s string) string {
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 || hex.EncodeToString(b) != s {
+		return ""
+	}
+	return s
 }
 
 // AttestorAnchor is what the attestor TLS statement must be signed under:

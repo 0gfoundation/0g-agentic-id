@@ -95,6 +95,7 @@ release 前持久保存。release 后元数据/去重保留至 GC。wait 超时�
 `0G.SealedExecution.v1` 证明，绑定 chain/registry/agent、validator、UID、源码版本、
 公开输入/stdout SHA-256、限额和实际隔离配置。isolation.worker_runtime_hash 是
 worker 真正使用的镜像基础 Harness；外层 harness_hash 属于常驻分层 runtime，可能不同。
+分层运行时还无法确定当前 hash 时不签执行证明，等待版本身份就绪。
 owner 的 personal_sign/EIP-712/交易工具不能签这个摘要，没有任意内容的证明签名 API。
 
 Harness `verifyExecutionReceipt` 校验签名、可信身份、隔离、公开输入及完整 stdout，

@@ -68,11 +68,16 @@ async fn load(state: &AppState, seal_id: SealId) -> ApiResult<Deployment> {
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))
 }
 
-/// The agent's owner right now, from the chain (never the indexed column).
+/// The agent's owner: the live on-chain owner once minted (never the indexed
+/// column). Before the mint, the owner its deployment row records — the
+/// address the mint goes to (for a clone, the target owner) — so a key can
+/// go into the set as the agent is created. That set stays good after the mint
+/// (the mint starts no new credential epoch, indexer `watcher.rs`), and sealed
+/// checks its signer against the chain again before it loads it.
 async fn live_owner(state: &AppState, d: &Deployment) -> ApiResult<Address> {
-    let agent_id = d
-        .agent_id
-        .ok_or_else(|| ApiError::conflict("the agent is not minted yet"))?;
+    let Some(agent_id) = d.agent_id else {
+        return Ok(d.owner);
+    };
     state
         .chain
         .owner_of(agent_id)
@@ -555,6 +560,11 @@ mod tests {
     }
 
     fn setup() -> Setup {
+        setup_with(Some(alloy::primitives::U256::from(7u64)))
+    }
+
+    /// `setup`, with the agent minted (`Some`) or not yet (`None`).
+    fn setup_with(agent_id: Option<alloy::primitives::U256>) -> Setup {
         let owner = PrivateKeySigner::random();
         let agent_seal = PrivateKeySigner::random();
         let repo = Arc::new(InMemoryDeploymentRepo::new());
@@ -564,7 +574,7 @@ mod tests {
             seal_id,
             agent_seal_addr: agent_seal.address(),
             owner: owner.address(),
-            agent_id: Some(alloy::primitives::U256::from(7u64)),
+            agent_id,
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
@@ -745,6 +755,35 @@ mod tests {
         .unwrap();
         assert_eq!(read.0["version"], 1);
         assert_eq!(read.0["document"]["set"]["entries"][0]["name"], "gcp");
+    }
+
+    /// Before the mint the deployment row's owner writes the set (a key given
+    /// as the agent is created); anyone else is refused, as after it.
+    #[tokio::test]
+    async fn the_deploying_owner_writes_the_set_before_the_mint() {
+        let s = setup_with(None);
+        let (status, resp) = write(&s, &s.owner, 0, &document(&s, &s.owner, 1, 0, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            (status, resp.0["version"].as_i64()),
+            (StatusCode::OK, Some(1))
+        );
+        let stranger = PrivateKeySigner::random();
+        assert!(
+            write(&s, &stranger, 1, &document(&s, &stranger, 2, 0, false))
+                .await
+                .is_err(),
+            "not the deploying owner"
+        );
+        // The chain is not asked: it would name nobody yet.
+        s.chain.set_owner_of(stranger.address());
+        assert!(
+            write(&s, &stranger, 1, &document(&s, &stranger, 2, 0, false))
+                .await
+                .is_err(),
+            "the row decides before the mint"
+        );
     }
 
     #[tokio::test]
