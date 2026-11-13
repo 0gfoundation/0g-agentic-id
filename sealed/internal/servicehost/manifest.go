@@ -7,9 +7,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -28,6 +30,12 @@ type File struct {
 	Data string `json:"data"` // standard base64
 }
 
+// Program selects code from the immutable service release, never a host path.
+type Program struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+}
+
 type Manifest struct {
 	ID          string            `json:"id"`
 	Command     string            `json:"command"` // trusted image interpreter, e.g. node
@@ -35,13 +43,16 @@ type Manifest struct {
 	Env         map[string]string `json:"env,omitempty"`
 	Files       []File            `json:"files"`
 	Description string            `json:"description,omitempty"`
-	// Network is "none" (default) or "host". Host is an explicit grant of
-	// the container's network, including loopback; it is NOT tenant network
-	// isolation. No credential proxy variables or sockets are inherited.
-	Network   string `json:"network,omitempty"`
-	MemoryMB  int    `json:"memory_mb,omitempty"`
-	Processes int    `json:"processes,omitempty"`
-	// Every MCP POST, including discovery, runs in a fresh sandbox.
+	// Worker is the separately isolated program a service may execute. The
+	// service controls business workflow; sealed only manages its processes.
+	Worker *Program `json:"worker,omitempty"`
+	// Programs always have a private network namespace. egress grants only
+	// public destinations explicitly named in EgressHosts through a Unix proxy.
+	Network     string   `json:"network,omitempty"`
+	EgressHosts []string `json:"egress_hosts,omitempty"`
+	MemoryMB    int      `json:"memory_mb,omitempty"`
+	Processes   int      `json:"processes,omitempty"`
+	// Bounds temporary request/task workers, never the service coordinator.
 	RequestTimeoutSeconds int `json:"request_timeout_seconds,omitempty"`
 }
 
@@ -60,6 +71,16 @@ func (m *Manifest) normalize() (string, error) {
 			return "", fmt.Errorf("invalid argument")
 		}
 	}
+	if m.Worker != nil {
+		if m.Worker.Command == "" || strings.ContainsAny(m.Worker.Command, "/\\\x00") || len(m.Worker.Command) > 64 || len(m.Worker.Args) > 64 {
+			return "", fmt.Errorf("worker: name a trusted image interpreter")
+		}
+		for _, a := range m.Worker.Args {
+			if len(a) > 8192 || strings.ContainsRune(a, 0) {
+				return "", fmt.Errorf("invalid worker argument")
+			}
+		}
+	}
 	for k, v := range m.Env {
 		if !validEnv.MatchString(k) || len(v) > 8192 || strings.ContainsRune(v, 0) || k == "PATH" || k == "HOME" || k == "TMPDIR" || k == "MCP_SOCKET" || k == "HARNESS_RUNTIME_ROOT" || strings.HasPrefix(k, "SEAL_") || strings.HasPrefix(k, "LD_") {
 			return "", fmt.Errorf("env: reserved or invalid key %q", k)
@@ -74,9 +95,26 @@ func (m *Manifest) normalize() (string, error) {
 	if m.Network == "" {
 		m.Network = "none"
 	}
-	if m.Network != "none" && m.Network != "host" {
-		return "", fmt.Errorf("network must be none or host")
+	if m.Network != "none" && m.Network != "egress" {
+		return "", fmt.Errorf("network must be none or egress")
 	}
+	if len(m.EgressHosts) > 32 || (m.Network == "none" && len(m.EgressHosts) != 0) || (m.Network == "egress" && len(m.EgressHosts) == 0) {
+		return "", fmt.Errorf("egress requires 1..32 explicit host:port destinations")
+	}
+	for i, addr := range m.EgressHosts {
+		h, p, err := net.SplitHostPort(addr)
+		n, perr := strconv.Atoi(p)
+		if err != nil || perr != nil || n < 1 || n > 65535 || h == "" || strings.ContainsAny(h, "\\/@?#%\x00\r\n\t ") {
+			return "", fmt.Errorf("egress_hosts: use explicit host:port destinations")
+		}
+		for _, c := range h {
+			if c > 127 {
+				return "", fmt.Errorf("egress_hosts: use ASCII DNS names")
+			}
+		}
+		m.EgressHosts[i] = net.JoinHostPort(strings.TrimSuffix(strings.ToLower(h), "."), strconv.Itoa(n))
+	}
+	sort.Strings(m.EgressHosts)
 	if m.MemoryMB == 0 {
 		m.MemoryMB = 8192
 	}

@@ -154,11 +154,15 @@ func validateLoopbackBackend(backend string) error {
 
 // getServices returns a copy of the current agent-registered services.
 func (s *Server) getServices() []ServiceEntry {
+	strict := s.isolatedServicePolicy()
 	s.mu.RLock()
 	out := make([]ServiceEntry, len(s.services))
 	copy(out, s.services)
 	host := s.serviceHost
 	s.mu.RUnlock()
+	if strict {
+		out = nil
+	}
 	if host != nil {
 		for _, svc := range host.List() {
 			out = append(out, ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description})
@@ -211,6 +215,9 @@ func (s *Server) matchService(path string) (ServiceEntry, bool) {
 			return ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description}, true
 		}
 	}
+	if s.isolatedServicePolicy() {
+		return ServiceEntry{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, e := range s.services {
@@ -233,6 +240,10 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{"services": s.getServices()})
 	case http.MethodPost:
+		if s.isolatedServicePolicy() {
+			writeSignError(w, http.StatusForbidden, "this runtime requires isolated service publication; use seal_service_publish")
+			return
+		}
 		var body struct {
 			Services []ServiceEntry `json:"services"`
 		}

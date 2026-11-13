@@ -1,118 +1,129 @@
 # 托管 MCP 服务
 
-owner Harness 连接签名 socket 上 sealed 的私有 MCP server，发现
-`seal_service_publish`、`seal_service_start`、`seal_service_stop`、
-`seal_service_list` 和 `seal_service_logs`。配套的 0g-harness 改动使用 DSH
-原生 MCP 客户端，内置 `publish-mcp-service` skill 负责编写和发布工作流。
-原有签名和凭证工具仍由 sealed 定义。
+owner Harness 用 DSH 原生 MCP 客户端发现 sealed 私有 sign socket 上的
+`seal_service_publish/start/stop/list/logs`。配套 `publish-mcp-service` skill
+负责应用流程；sealed 只提供进程原语，不管理雇主账号、业务任务或付款。
 
-## 发布契约
+## 发布
 
-发布 manifest：必填 `id`、`command`、`args`、`files`，可选 `description`、
-`env`、`network`、`memory_mb`、`processes`、`request_timeout_seconds`。
-`env` 是持久化的非敏感配置。文件包含相对 `path` 和标准 base64
-`data`。命令指定可信镜像 PATH 中的解释器，例如 `node`；服务代码只在降权并
-进入沙箱后运行。参数通常指定 `/app/server.mjs`。文件是普通只读源码和依赖，
-运行时不解压归档、不接收链接。依赖安装由低权限 agent 完成。
+manifest 必填 `id`、`command`、`args`、`files`；可选 `worker`、`description`、
+`env`、`network`、`egress_hosts`、`memory_mb`、`processes`、
+`request_timeout_seconds`。文件是 `{path,data}`，即相对路径和标准 base64。
+`env` 是持久保存的**公开配置**。command 指定镜像中的可信解释器，例如 node；代码只在
+降权后执行。源码和依赖以普通只读文件挂载到 `/app`；root 不解压、不处理符号链接、不安装包。
 
-服务监听 `$MCP_SOCKET`，即 `/run/service.sock` 的 Unix socket，收到原始公共
-请求路径。公共 MCP 地址是 `<sandbox-url>/api/mcp/<id>`，由 `/hello` 公布。
-每个 MCP HTTP POST 都在全新的隔离临时进程中处理，包括 `initialize` 和 `tools/list`。
-sealed 保持服务入口可用，请求之间没有专属共享服务进程。`start` 开启接收请求；
-`stop` 关闭接收并取消现有 worker。停止的服务返回 503。`seal_service_list` 的
-`running` 表示允许接收请求，业务是否可用仍须用真实 MCP 调用验证。
+程序监听 `$MCP_SOCKET`（`/run/service.sock`），公开入口是
+`<sandbox-url>/api/mcp/<id>`，由 `/hello` 宣告，保留原始请求路径。沿用现有公网
+8080，不新增端口或管理入口。
 
-`/app` 是不可变发布版本，`/work` 和 `/tmp` 是每次请求私有的 tmpfs。更新前先停止服务。
-发布返回规范化 manifest 的 SHA-256 版本，保留最近八个源码版本；重新发布旧 bundle
-即可回滚。仅 root 可读的注册表绑定 owner 与 sealed 身份；链上启动流程验证绑定后
-才恢复已启用入口。停止状态跨重启保留。中断的 worker、输入和工作目录均不恢复，
-失败的 worker 不自动重启。owner 转移时关闭服务管理器、取消全部 worker，
-同时沿用代理已有的 owner 锁定规则。
+简单无状态服务不填 `worker`，每个 POST 启动临时沙箱。异步任务声明
+`worker:{command,args}`：sealed 启动**隔离的服务进程**处理 MCP，带服务私有、持久化的
+`/work` 和仅限该服务的进程控制 socket；每个任务再启动**独立临时 worker**，用 tmpfs
+`/work`、`/tmp`。服务进程属于应用代码，拿不到 owner Harness、签名或凭证权限。
+worker 不继承控制 socket，不能选择跳过隔离；执行证明将结果绑定到真实的临时 worker。
 
-最多 16 个服务，每版最多 512 个文件。bundle 解码后最多 16 MiB，发布 JSON
-最多 24 MiB，持久化注册表合计最多 8 MiB。内部 MCP 请求上限为 1 MiB；更大的
-bundle 可由 owner 将 `{action:"publish",manifest:...}` 写入本地 JSON 文件，
-经同一私有 socket POST `/service-host`。GET `/service-host` 列出服务；POST
-的 `start`、`stop`、`logs` 动作接收 `id`。公共 TCP 监听器不增加管理入口。
+start 开放请求并启动声明的服务进程；轮询 list 到 running 后仍须验证实际 MCP 行为，
+这不是业务健康检查。stop 关闭请求并终止服务进程和 worker，更新前必须 stop。
+version 是规范化 manifest 的 SHA-256，可在验证结果时固定。保留八个源码版本，回滚时
+重新发布旧 bundle。
 
-## 隔离与限制
+root registry 绑定 owner/identity，链上启动校验通过后才恢复已开启的服务。
+服务进程可重启并读取自己的业务数据库；**任务进程、私有输入和 tmpfs 不恢复**。
+中断执行只报告、不自动重跑。owner 转移永久关闭 manager 及原有 owner gate。
+stop/start 保留应用 `/work`，但它不是 iData、上链数据或跨沙箱备份。
 
-每个活跃请求分配保留范围 210000–210031 中的独立宿主 UID/GID。可信的
-`sealed-service-launcher` 在调用 bubblewrap 前清除附加组并降权。每个 worker 使用
-独立的 PID、user、IPC、UTS 命名空间、最小环境、零 capabilities、no-new-privs，
-仅挂载镜像运行时和自身 app/work/run。sealed 状态、owner home、管理/签名/reveal
-socket、其他 worker 的文件均不挂载。存在时，镜像自带的不可变 Harness 包以只读方式
-挂载，并通过 `HARNESS_RUNTIME_ROOT` 指定；不共享常驻 Harness 的可写 diff 或状态。
-源码版本仅 root 可写、owner 可读，不得打包凭证；注册表保存在 sealed 私有状态目录。
-worker 的 stdout/stderr 直接丢弃，`seal_service_logs` 返回空日志，避免向 owner 暴露
-雇主输出。
+限制：16 个服务，每版 512 文件、解码后 16 MiB，发布 JSON 24 MiB，registry 8 MiB。
+内部 MCP 请求上限 1 MiB；更大 manifest 可从本地 JSON 文件经 `$SEAL_SIGN_SOCK`
+向 `/service-host` POST `{action:"publish",manifest:...}`。GET 列表，
+start/stop/logs 接收 id。不公开管理接口。logs 为空：服务/请求进程 stdout/stderr 丢弃，
+任务 stdout 只私下交给所属应用，不成为 owner 可读日志。
 
-镜像运行环境须支持非特权 user/mount 命名空间。隔离不可用时启动失败，不降级为
-无隔离执行。Harness 镜像携带 bubblewrap、util-linux 和可信启动器。
+## 隔离与网络
 
-默认 `network:"none"` 创建私有网络命名空间。`network:"host"` 明确授予容器
-网络访问，包括 loopback；它不提供租户网络隔离。服务不继承签名/凭证 socket
-或代理凭证。host 网络服务被信任具有该网络权限；进程隔离不隔离共享的 host 网络流量。
+服务进程用宿主 UID 200000–200015；活跃临时 worker 使用不同 UID 210000–210031，
+所有服务合计最多 32 个。可信 launcher 清除附加组并切换 UID/GID 后才启动 bubblewrap。
+程序有独立 PID、mount、user、IPC、UTS、**network** namespace，无 capabilities，
+启用 no-new-privs。只挂载镜像运行时、不可变源码和自己的 work/run；owner 家目录/状态、
+sealed 状态、sign/reveal socket、其他 worker 文件均不可见。镜像基础 Harness 只读
+挂载为 `$HARNESS_RUNTIME_ROOT`，不共享常驻 Harness 的可写差分和对话。
+namespace 不可用就拒绝运行。
 
-限制包括：每进程虚拟地址空间（默认 8192 MiB，范围 128–16384）、每 worker UID
-进程数（默认 64，范围 1–256）、256 个文件描述符、单文件 64 MiB。这些是 rlimit，
-不是 CPU/内存/磁盘总量配额；总资源边界仍由外层 sandbox 提供。
+默认 `network:"none"`；`network:"egress"` 必须指定 1–32 个 `host:port`
+格式的 egress_hosts。私有 Unix HTTP/CONNECT 代理只允许这些目标，并拒绝私网、
+loopback、link-local、metadata IP，包括 DNS 解析结果。不能使用宿主网络。
+Node 自动加载镜像代理引导（Node >=24.14）；其他语言需明确支持 Unix 代理。
+不使用代理的代码没有对外路由，也不继承 owner 凭证代理。
 
-## 临时任务进程与直接运行时注入
+rlimit 限虚拟地址空间（默认 8192 MiB，128–16384）、每 UID 进程数（默认 64，
+1–256）、256 描述符、单文件 64 MiB。这不是总 CPU、RSS、磁盘配额，外围限制仍由沙箱
+提供。worker 在 EOF、terminate、超时（默认 300 秒，1–3600）、stop 或转移时结束。
+断线会终止单次请求 worker；异步任务不随提交它的 HTTP 连接结束，继续由服务进程管理。
 
-所有托管 MCP 服务均为无状态服务。每个 HTTP POST 创建独立 UID/GID、
-PID/挂载沙箱和私有 run 目录。`/work` 与 `/tmp` 使用 tmpfs，共享的仅是不可变源码。
-所有服务合计最多同时运行 32 个请求 worker。`request_timeout_seconds` 限制整个
-生命周期（默认 300 秒，范围 1–3600）。EOF、客户端取消、超时、停止服务或 owner
-转移都会结束进程命名空间，释放挂载和 UID。worker 崩溃不重启；开机在 loader
-清除遗留进程后清理上次的 run 目录。
+0g-harness/dsh 的公开 `/api/*` 必须匹配托管服务。旧 loopback 发布被拒绝，
+service-host 初始化失败时也不能回退，framework 路由不能重新打开入口。
+其他适配器保持旧行为。provider 可以在创建沙箱时另配端口，服务发布本身不授予此权限。
 
-调用者可以通过可选 HTTP 头 `X-Seal-Runtime-Input`，直接向自己的 worker 注入
-JSON 字符串映射：使用标准 base64，解码后最多 16 KiB。应通过 HTTPS 发送，并避免
-客户端或代理记录此请求头。这是 sealed 扩展，不是 MCP 凭据或 sampling 机制；客户端
-需要支持自定义 HTTP 头，普通 MCP JSON-RPC 保持原样。格式错误的输入在接收执行前
-拒绝。该头在进入后端 HTTP handler 前移除；解码后的字节只进入选定程序的匿名 stdin
-管道，不进入命令行参数或 owner 常驻 Harness。
+## 私有输入和进程控制
 
-sealed 只转交输入，不创建雇主凭据条目、reveal 审批、续期、写回或持久化记录。
-调用者授权任务程序读取明文；仍需要信任服务代码，因为拿到明文的程序可以将其泄露。
-OS 隔离的是不同进程，不是程序与它自己的输入。私有输入不会自动进入模型消息；程序
-应把值直接提供给工具执行层，不得返回或记录它们。sealed 的 owner 凭据遮盖器不会
-登记或遮盖这种临时输入。现有 ServeProof 覆盖方法、URI 和请求/响应体，不覆盖此私有头。
+调用者明确同意程序读取明文时，可经 HTTPS 发送
+`X-Seal-Runtime-Input: base64(JSON string map)`，解码后最多 16 KiB。
+这是 sealed 扩展，不是 MCP sampling/OAuth，不能记入 HTTP 日志。应用处理请求前删除
+私有 header 和调用者伪造的交接引用。单次请求服务从匿名 stdin 读 map；服务进程只拿
+一次性随机引用，必须在响应前启动选中的 worker。只有该 worker 从 stdin 收到与公开
+输入分别分帧的私有 map；未使用引用随请求结束清理。
 
-配套 Harness 提供 `runServiceAgent`、`readRuntimeInput`、`serveServiceMcp` 和
-`skills/publish-mcp-service/loop-server.mjs`。owner 在 `agent-config.mjs` 中定义人设、
-技能目录、模型 adapter 和明确的工具集合。每次调用创建全新 DSH 会话，默认不挂载
-owner 记忆、特权 MCP 连接、shell、定时任务或委派。模型 adapter 与付费方式属于服务
-策略，不会隐式要求雇主提供模型 API key。
+不增加雇主 vault、reveal 审批、续期/writeback、私有输入持久化。值不经过 owner 常驻
+Harness，不自动进模型消息，不注册到 owner credential scrubber。任务代码可能泄露
+自己读取的内容，调用者必须信任代码；隔离不能向代码作者隐藏输入。ServeProof 不绑定此 header。
 
-托管服务拒绝 GET/DELETE 及通过 `Mcp-Session-Id` 恢复会话。小型 loop
-server 只声明 tools，在 POST 内返回结果，不提供异步进度存储或客户端 sampling。
-不要声明尚未实现的有状态或跨请求协商能力。
+只有服务进程拿到 `$SEAL_EXEC_SOCKET`：向私有 `/executions` POST
+`spawn/get/find/wait/terminate/release`。sealed 固定 service scope。spawn 接收
+key、base64 公开 input、可选 input_handle，状态用随机 handle 查询。key 格式
+`<unix-ms>-<16..48 random URL-safe characters>`。同 key/输入/代码的并发重试
+只返回一次执行，修改输入/代码冲突。find 只读找回丢失回执，不启动任何进程。
+十分钟前的 key 即使已 GC，也不能启动新执行。
 
-## MCP 转发与归属证明
+公开输入上限 512 KiB，stdout 每次 1 MiB、全局 32 MiB，每次读最多 64 KiB。
+记录最多 1024 条，退出十分钟后回收。输出仅内存保存，sealed 重启会丢失；应用必须在
+release 前持久保存。release 后元数据/去重保留至 GC。wait 超时不取消执行。
+元数据只含 hash、版本、UID、时间、退出事实、证明，不含输入/stdout，也不定义雇主归属、
+业务进度或付款状态。
 
-托管入口接受无状态 POST 交换，SSE 立即刷新。现有外部注册的 MCP 后端仍支持
-POST/GET/DELETE 转发、MCP 会话/协议头及客户端对服务端请求的响应。这些通用转发
-能力不会让每次新建的托管 worker 自动获得有状态会话、sampling 或 elicitation；
-附带的任务 server 只声明 tools。
+## 执行证明与 HTTP 归属
 
-有限 JSON 响应沿用 ServeProof。SSE 初始响应头发出时没有完整响应体可哈希，
-因此明确标记 `X-Agent-Proof-Mode: stream-unsigned`，不附带 `X-Agent-Proof`。
-上游自带证明头会被移除；签名的 `/hello` 仍提供身份与发现。这里不修改任何
-ServeProof 摘要，也不声称未结束的流已有完整交互证明或付款交付保证。
+成功任务获得 agentSeal 在独立 EIP-191 version-0x00 域下签署的
+`0G.SealedExecution.v1` 证明，绑定 chain/registry/agent、validator、UID、源码版本、
+公开输入/stdout SHA-256、限额和实际隔离配置。isolation.worker_runtime_hash 是
+worker 真正使用的镜像基础 Harness；外层 harness_hash 属于常驻分层 runtime，可能不同。
+owner 的 personal_sign/EIP-712/交易工具不能签这个摘要，没有任意内容的证明签名 API。
 
-业务工具、模型选择、sampling、进度查询、鉴权和收费由 owner 的服务实现。雇主
-凭据直接注入任务进程，不采用 sealed 托管或 owner reveal 审批。sampling 是模型生成，
-不代表取得雇主任意凭证的访问权限。
+Harness `verifyExecutionReceipt` 校验签名、可信身份、隔离、公开输入及完整 stdout，
+再从这个 stdout 解析结果。信任锚应来自验证过的 AgenticID/TEE 连接，不能仅信证明自报
+地址；需要时固定源码/runtime hash。它证明机制和字节，不保证业务正确性、私有输入、付款
+或独立内核，不是 feedback registry ServeProof 或上链交易。已有 ServeProof 摘要不变。
+有限 JSON 保留普通 HTTP proof，MCP SSE 标记 stream-unsigned 即时转发，删除上游伪造证明。
+
+## 应用流程与 x402
+
+Harness 提供 servePaidService、ExecutionClient、runServiceWorker、钱包访问 token、
+买方 fetch 和执行证明校验。普通 MCP 工具 submit/status/result/cancel 按钱包鉴权，
+保存结果/进度并保证幂等。worker 可运行业务代码或新 DSH loop，不依赖 MCP Tasks、
+sampling，也不强制雇主交模型 API key。
+
+模板验证 exact EVM EIP-3009 付款授权，执行隔离任务，**先持久保存结果再结算**，通过
+外部 facilitator 结算，用 RPC 独立核对直接调用 token 的交易后开放结果。重试复用原授权；
+结算未知时暂不交付，按 payer/nonce 链上对账，不自动另授权扣款。
+定价、鉴权、付款/结果、facilitator 设置均属应用；sealed 不增加钱包、托管或 x402 API。
+接入见配套 Harness 的 skills/publish-mcp-service/paid-service.md。
+
+x402 **不是付款和交付的跨系统原子公平交换**。保存结果让丢失响应可在沙箱及存储仍可用时
+重试；扣款后存储整体丢失仍需应用恢复/退款政策，执行证明和 HTTP proof 都不能消除此限制。
 
 ## 验证
 
-在 Linux/root 环境分别以无 agent 用户、有 agent 用户运行 sealed 测试；在支持
-命名空间的容器中设置 `SEALED_SERVICE_TESTS=1`。服务测试覆盖发布、身份绑定、
-真实 UID/挂载隔离、源码不可写、停止和开机仅恢复接收请求；代理测试覆盖实时
-sampling 请求 SSE、会话头、DELETE 和伪造证明头清除。
-request 测试覆盖并发 UID、私有 stdin 输入、不进入 argv/env/后端头、不持久化凭据
-或日志、全新工作目录，以及取消/超时/停止后的清理。设置 `SEALED_LOOP_TESTS=1`
-进一步验证公共 MCP → 真实隔离 Node/DSH loop → 原生工具 → 带归属证明结果；
-Linux 测试容器需挂载 `/opt/0g-harness/<hash>` 下的配套包、`base` 指针和镜像 Node。
+以 root 分别在没有/有 agent 用户时运行，设置 SEALED_PRIVSEP_TESTS=1。
+SEALED_SERVICE_TESTS=1 测真实 namespace、UID、stdin、去重、限额、取消和回收。
+SEALED_LOOP_TESTS=1 加测公开 DSH/tool 链路和完整收费 MCP 链路：真实 SDK/签名、钱包
+隔离、并发重试、私有 stdin、进度、取消、证明校验/拒绝篡改及结算响应丢失。
+链和 facilitator 为本地模拟，不花资金、不证明已真实部署。特权 Linux 测试容器需挂载
+配套源码 checkout（包括 test/helpers）到 /opt/0g-harness/<hash>，以及 base 指针和 Node。

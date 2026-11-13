@@ -78,12 +78,13 @@ type Server struct {
 	// chain scan is in flight). Until SetAdapter runs, adapter-backed
 	// endpoints degrade: /_seal/auth 503s, /hello omits services,
 	// /log/agent reports unavailable.
-	mu           sync.RWMutex
-	adapter      framework.Framework
-	agentLogPath string         // adapter's subprocess log file; empty renders "not available"
-	services     []ServiceEntry // agent-registered external services (see services.go); nil until first POST /services
-	serviceHost  *servicehost.Manager
-	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ every framework path 404s
+	mu             sync.RWMutex
+	adapter        framework.Framework
+	agentLogPath   string         // adapter's subprocess log file; empty renders "not available"
+	services       []ServiceEntry // agent-registered external services (see services.go); nil until first POST /services
+	serviceHost    *servicehost.Manager
+	strictServices bool
+	fwRoutes       []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ every framework path 404s
 
 	// synth backs the synthesized /v1/responses surface (responses.go) for
 	// adapters that don't serve one natively.
@@ -218,6 +219,7 @@ func (s *Server) SetAdapter(fw framework.Framework) {
 	s.adapter = fw
 	s.agentLogPath = agentLogPath
 	s.fwRoutes = fwRoutes
+	s.strictServices = fw.Name() == "0g-harness" || fw.Name() == "dsh"
 	s.mu.Unlock()
 	if len(fwRoutes) == 0 {
 		logger.Logf("proxy: adapter %q declares no routes; only agent /api/* services are reachable (all other paths 404)", fw.Name())
@@ -720,6 +722,17 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 // ── Catch-all reverse proxy ─────────────────────────────────────────────────
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") && s.isolatedServicePolicy() {
+		host := s.getServiceHost()
+		if host == nil {
+			http.Error(w, "isolated service hosting unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if _, ok := host.Match(r.URL.Path); !ok {
+			http.NotFound(w, r)
+			return
+		}
+	}
 	priv, upstream, _, _, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
 	chainID, identityAddr, validator := s.agent.ProofDomain()

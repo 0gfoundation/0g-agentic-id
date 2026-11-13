@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -96,12 +98,15 @@ export default {model,persona:'Use check_access to perform the task.',cwd:'/work
    output:{schema:{type:'boolean'},render:(_,v)=>[{type:'text',text:String(v)}]},execute:async()=>Boolean(runtimeInput.token)}))
  }}
 `, model.URL+"/v1")
-	host, err := servicehost.New(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	host, err := servicehost.NewWithOptions(filepath.Join(t.TempDir(), "services"), "owner:identity", servicehost.Options{EgressDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, model.Listener.Addr().String())
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer host.Close()
-	if _, err := host.Publish(servicehost.Manifest{ID: "loop", Command: "node", Args: []string{"/app/loop-server.mjs"}, Network: "host", RequestTimeoutSeconds: 15,
+	modelAddress := model.Listener.Addr().String()
+	if _, err := host.Publish(servicehost.Manifest{ID: "loop", Command: "node", Args: []string{"/app/loop-server.mjs"}, Network: "egress", EgressHosts: []string{modelAddress}, RequestTimeoutSeconds: 15,
 		Files: []servicehost.File{{Path: "loop-server.mjs", Data: base64.StdEncoding.EncodeToString(server)}, {Path: "agent-config.mjs", Data: base64.StdEncoding.EncodeToString([]byte(config))}}}); err != nil {
 		t.Fatal(err)
 	}

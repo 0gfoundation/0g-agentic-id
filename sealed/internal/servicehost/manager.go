@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"seal-verify/internal/credproxy"
 	"seal-verify/internal/privsep"
 )
 
@@ -34,22 +35,44 @@ type Status struct {
 type entry struct {
 	Manifest Manifest `json:"manifest"`
 	Status
+	ControllerUID uint32 `json:"controller_uid,omitempty"`
+	controller    *coordinator
+	generation    uint64
 }
 
 type Manager struct {
-	mu       sync.Mutex
-	base     string
-	programs string
-	binding  string
-	entries  map[string]*entry
-	closed   bool
-	workers  map[uint32]*worker
+	mu            sync.Mutex
+	base          string
+	programs      string
+	binding       string
+	entries       map[string]*entry
+	closed        bool
+	workers       map[uint32]*worker
+	executions    map[string]*execution
+	executionKeys map[string]string
+	outputBytes   int
+	stopGC        chan struct{}
+	pendingInputs map[string]pendingInput
+	egressDial    func(context.Context, string, string) (net.Conn, error)
+	attestor      ExecutionAttestor
+	runtimeHash   string
+}
+
+// Options is trusted Go wiring, never owner-controlled manifest configuration.
+// A test may supply a dialer to a local model/facilitator fixture. Production
+// uses New, whose dialer always rejects private and loopback destinations.
+type Options struct {
+	EgressDial func(context.Context, string, string) (net.Conn, error)
 }
 
 // New binds durable service state to this container's owner and identity.
 // A reset with another binding cannot resume programs from the old owner.
 // base must be a sealed-owned directory, never a path supplied by a tool.
 func New(base, binding string) (*Manager, error) {
+	return NewWithOptions(base, binding, Options{})
+}
+
+func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 	if os.Geteuid() != 0 {
 		return nil, fmt.Errorf("service hosting requires sealed root privilege separation")
 	}
@@ -67,7 +90,17 @@ func New(base, binding string) (*Manager, error) {
 	if st.Uid != 0 || st.Mode&077 != 0 {
 		return nil, fmt.Errorf("service state must be root-owned 0700")
 	}
-	m := &Manager{base: base, binding: binding, entries: map[string]*entry{}, workers: map[uint32]*worker{}}
+	m := &Manager{base: base, binding: binding, entries: map[string]*entry{}, workers: map[uint32]*worker{}, executions: map[string]*execution{}, executionKeys: map[string]string{}, stopGC: make(chan struct{}), pendingInputs: map[string]pendingInput{}}
+	if b, err := privsep.ReadFile("/opt/0g-harness/base", 128); err == nil {
+		h := strings.TrimSpace(string(b))
+		if decoded, err := hex.DecodeString(h); err == nil && len(decoded) == 32 {
+			m.runtimeHash = h
+		}
+	}
+	m.egressDial = opts.EgressDial
+	if m.egressDial == nil {
+		m.egressDial = credproxy.SafeDial
+	}
 	// Only immutable owner-authored source is shared; requests have private temporary state.
 	programID := sha256.Sum256([]byte(base))
 	m.programs = fmt.Sprintf("/var/lib/sealed-service-programs/%x", programID[:8])
@@ -108,12 +141,26 @@ func New(base, binding string) (*Manager, error) {
 			if m.entries[e.ID] != nil {
 				return nil, fmt.Errorf("duplicate saved service")
 			}
+			if e.Manifest.Worker != nil && (e.ControllerUID < 200000 || e.ControllerUID >= 200000+MaxServices) {
+				return nil, fmt.Errorf("invalid saved coordinator identity")
+			}
+			if e.ControllerUID != 0 {
+				for _, prior := range m.entries {
+					if prior.ControllerUID == e.ControllerUID {
+						return nil, fmt.Errorf("duplicate coordinator identity")
+					}
+				}
+			}
 			e.Path = "/api/mcp/" + e.ID
 			e.State = "stopped"
 			e.Error = ""
 			m.entries[e.ID] = e
 		}
 	}
+	if err := m.restoreExecutions(); err != nil {
+		return nil, err
+	}
+	go m.collectExecutions()
 	return m, nil
 }
 
@@ -199,6 +246,24 @@ func (m *Manager) Publish(man Manifest) (Status, error) {
 		return Status{}, err
 	}
 	e := &entry{Manifest: man, Status: Status{ID: man.ID, Version: v, Path: "/api/mcp/" + man.ID, Description: man.Description, State: "stopped"}}
+	if old != nil {
+		e.ControllerUID = old.ControllerUID
+	}
+	if man.Worker != nil {
+		if e.ControllerUID == 0 {
+			e.ControllerUID = 200000
+			used := map[uint32]bool{}
+			for _, prior := range m.entries {
+				used[prior.ControllerUID] = true
+			}
+			for used[e.ControllerUID] {
+				e.ControllerUID++
+			}
+		}
+		if err := m.prepareCoordinatorWork(e); err != nil {
+			return Status{}, err
+		}
+	}
 	m.entries[man.ID] = e
 	if err := m.persistLocked(); err != nil {
 		if old == nil {
@@ -243,8 +308,9 @@ func (m *Manager) List() []Status {
 	return out
 }
 
-// Start enables request admission without creating a shared service process.
-// Running means requests may be admitted, not that business code is healthy.
+// Start enables a published endpoint. A program with a worker entrypoint runs
+// a separately isolated service coordinator; business execution uses fresh
+// worker identities. Plain one-shot MCP programs retain request isolation.
 func (m *Manager) Start(id string) (Status, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -264,11 +330,18 @@ func (m *Manager) Start(id string) (Status, error) {
 		e.Desired = false
 		return Status{}, err
 	}
+	if e.Manifest.Worker != nil {
+		if err := m.startCoordinatorLocked(e); err != nil {
+			e.State, e.Error = "failed", "coordinator_start_failed"
+			return e.Status, err
+		}
+		return e.Status, nil
+	}
 	e.State = "running"
 	return e.Status, nil
 }
 
-func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir string) (*exec.Cmd, error) {
+func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir string, coordinator bool) (*exec.Cmd, error) {
 	bwrap, err := privsep.LookPath("bwrap")
 	if err != nil {
 		return nil, fmt.Errorf("isolation unavailable: %w", err)
@@ -288,19 +361,27 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 		"--clearenv", "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/work", "--setenv", "TMPDIR", "/tmp", "--setenv", "MCP_SOCKET", "/run/service.sock",
 		"--ro-bind", "/usr", "/usr", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/etc", "--dir", "/run",
 		"--ro-bind", filepath.Join(m.programs, e.ID, "versions", e.Version), "/app", "--bind", filepath.Join(taskDir, "run"), "/run", "--chdir", "/app"}
-	args = append(args, "--tmpfs", "/work")
+	args = append(args, "--setenv", "SEAL_SERVICE_ID", e.ID, "--setenv", "SEAL_SERVICE_VERSION", e.Version)
+	if coordinator {
+		args = append(args, "--bind", filepath.Join(taskDir, "work"), "/work", "--setenv", "SEAL_EXEC_SOCKET", "/run/control.sock")
+	} else {
+		args = append(args, "--tmpfs", "/work")
+	}
+	var networkBootstrap string
 	// Only the immutable image-bundled package is shared, never owner state or
 	// a harness's writable diff. Read the base pointer without importing layers
 	// (layers already depends on framework and would introduce a cycle).
-	if b, err := privsep.ReadFile("/opt/0g-harness/base", 128); err == nil {
-		h := strings.TrimSpace(string(b))
-		if decoded, err := hex.DecodeString(h); err == nil && len(decoded) == 32 {
-			runtime := filepath.Join("/opt/0g-harness", h)
-			args = append(args, "--ro-bind", runtime, runtime, "--setenv", "HARNESS_RUNTIME_ROOT", runtime)
-		}
+	if m.runtimeHash != "" {
+		runtime := filepath.Join("/opt/0g-harness", m.runtimeHash)
+		args = append(args, "--ro-bind", runtime, runtime, "--setenv", "HARNESS_RUNTIME_ROOT", runtime)
+		networkBootstrap = filepath.Join(runtime, "src", "service-network.mjs")
 	}
-	if e.Manifest.Network == "none" {
-		args = append(args, "--unshare-net")
+	args = append(args, "--unshare-net")
+	if e.Manifest.Network == "egress" {
+		if err := m.startEgress(ctx, e.Manifest.EgressHosts, uid, filepath.Join(taskDir, "run", "egress.sock")); err != nil {
+			return nil, err
+		}
+		args = append(args, "--setenv", "SEAL_EGRESS_SOCKET", "/run/egress.sock")
 	}
 	for _, p := range []string{"/bin", "/sbin", "/lib", "/lib64"} {
 		if _, err := privsep.Lstat(p); err == nil {
@@ -321,6 +402,12 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 		args = append(args, "--setenv", k, e.Manifest.Env[k])
 	}
 	args = append(args, "--", interpreter)
+	if e.Manifest.Network == "egress" && e.Manifest.Command == "node" {
+		if networkBootstrap == "" {
+			return nil, fmt.Errorf("immutable Node egress bridge unavailable")
+		}
+		args = append(args, "--import", networkBootstrap)
+	}
 	args = append(args, e.Manifest.Args...)
 	// Only the trusted image's resource limiter and sandbox launcher execute
 	// as root. bwrap drops all capabilities before the service interpreter.
@@ -346,6 +433,11 @@ func (m *Manager) Stop(id string) (Status, error) {
 		return Status{}, err
 	}
 	var taskWaits []chan struct{}
+	e.generation++
+	if e.controller != nil {
+		e.controller.cancel()
+		taskWaits = append(taskWaits, e.controller.done)
+	}
 	for _, w := range m.workers {
 		if w.service == id {
 			w.cancel()
@@ -368,6 +460,12 @@ func (m *Manager) Resume() {
 	defer m.mu.Unlock()
 	for _, e := range m.entries {
 		if e.Desired {
+			if e.Manifest.Worker != nil {
+				if err := m.startCoordinatorLocked(e); err != nil {
+					e.State, e.Error = "failed", "coordinator_start_failed"
+				}
+				continue
+			}
 			e.State = "running"
 		}
 	}
@@ -377,6 +475,9 @@ func (m *Manager) Resume() {
 // transfer permanently closes this manager; a normal reboot may resume it.
 func (m *Manager) Close() {
 	m.mu.Lock()
+	if !m.closed {
+		close(m.stopGC)
+	}
 	m.closed = true
 	var waits []chan struct{}
 	for _, w := range m.workers {
@@ -384,6 +485,11 @@ func (m *Manager) Close() {
 		waits = append(waits, w.done)
 	}
 	for _, e := range m.entries {
+		e.generation++
+		if e.controller != nil {
+			e.controller.cancel()
+			waits = append(waits, e.controller.done)
+		}
 		e.State = "stopped"
 	}
 	m.mu.Unlock()

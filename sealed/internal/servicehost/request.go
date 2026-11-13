@@ -60,6 +60,9 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	man, status := e.Manifest, e.Status
 	m.mu.Unlock()
+	if man.Worker != nil {
+		return t.coordinatorRoundTrip(req)
+	}
 	if req.Method != http.MethodPost {
 		r := response(req, 405, "stateless request services accept POST only")
 		r.Header.Set("Allow", "POST")
@@ -86,6 +89,7 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Do not forward this header into the MCP server's HTTP handling or logs.
 	req = req.Clone(req.Context())
 	req.Header.Del(RuntimeInputHeader)
+	req.Header.Del(InputHandleHeader)
 	ctx, cancel := context.WithTimeout(req.Context(), time.Duration(man.RequestTimeoutSeconds)*time.Second)
 	w := &worker{service: t.id, cancel: cancel, done: make(chan struct{})}
 	m.mu.Lock()
@@ -148,7 +152,7 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("prepare request sandbox")
 	}
 	job := &entry{Manifest: man, Status: status}
-	cmd, err := m.command(ctx, job, uid, dir)
+	cmd, err := m.command(ctx, job, uid, dir, false)
 	if err != nil {
 		return nil, fmt.Errorf("prepare request interpreter")
 	}

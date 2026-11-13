@@ -9,6 +9,9 @@ import (
 )
 
 func (s *Server) SetServiceHost(m *servicehost.Manager) {
+	if m != nil {
+		m.SetExecutionAttestor(s.signExecutionReceipt)
+	}
 	s.mu.Lock()
 	s.serviceHost = m
 	s.mu.Unlock()
@@ -17,6 +20,15 @@ func (s *Server) getServiceHost() *servicehost.Manager {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.serviceHost
+}
+
+// This gate follows the selected runtime, not only manager availability. A
+// failed service-host bootstrap must never reopen legacy loopback forwarding.
+func (s *Server) isolatedServicePolicy() bool {
+	s.mu.RLock()
+	strict, host := s.strictServices, s.serviceHost
+	s.mu.RUnlock()
+	return host != nil || strict
 }
 
 // This handler is reachable only through the owner agent's socket. Published
@@ -95,13 +107,15 @@ func (s *Server) serviceHostTools() []sealmcp.Tool {
 		"files":                   map[string]any{"type": "array", "items": obj(map[string]any{"path": str("Relative release file path."), "data": str("Standard base64 file bytes.")}, "path", "data")},
 		"description":             str("Short public service description."),
 		"env":                     map[string]any{"type": "object", "additionalProperties": true, "description": "Non-secret program configuration; string values. Never put credentials in tool arguments."},
-		"network":                 map[string]any{"type": "string", "enum": []string{"none", "host"}, "description": "Default none. host explicitly grants the container network including loopback; no tenant network isolation."},
+		"worker":                  obj(map[string]any{"command": str("Trusted image interpreter for isolated task execution."), "args": map[string]any{"type": "array", "items": str("Worker interpreter argument.")}}, "command", "args"),
+		"network":                 map[string]any{"type": "string", "enum": []string{"none", "egress"}, "description": "Programs always have private networking. egress permits only public destinations in egress_hosts through a restricted Unix proxy."},
+		"egress_hosts":            map[string]any{"type": "array", "maxItems": 32, "items": str("Explicit allowed host:port, for example api.example:443. Private/loopback addresses remain blocked.")},
 		"memory_mb":               map[string]any{"type": "integer", "description": "Per-process virtual address-space limit, default 8192 MiB; 128..16384."},
 		"processes":               map[string]any{"type": "integer", "description": "Per-service UID process limit, default 64; 1..256."},
-		"request_timeout_seconds": map[string]any{"type": "integer", "description": "Whole isolated worker lifetime, default 300 seconds; 1..3600. Every MCP POST uses a fresh UID/sandbox; no task resume."},
+		"request_timeout_seconds": map[string]any{"type": "integer", "description": "Whole isolated task-worker lifetime, default 300 seconds; 1..3600. Task workers never resume."},
 	}, "id", "command", "args", "files")
 	tools := []sealmcp.Tool{{Name: "seal_service_list", Description: "List hosted MCP services, versions, desired state and request admission status.", Schema: obj(map[string]any{}), Method: http.MethodGet, Path: "/service-host"}}
-	tools = append(tools, sealmcp.Tool{Name: "seal_service_publish", Description: "Publish a stopped service's immutable release. Files are base64. Every MCP POST runs in a fresh isolated process listening on $MCP_SOCKET; /app is read-only, /work and /tmp are temporary. Stop before updating. No employer credential custody.", Schema: obj(map[string]any{"manifest": manifest}, "manifest"), Method: http.MethodPost, Path: "/service-host", Prepare: func(args map[string]any) (any, error) {
+	tools = append(tools, sealmcp.Tool{Name: "seal_service_publish", Description: "Publish a stopped service's immutable release. Files are base64. Without worker, each POST starts an isolated temporary server. With worker, an isolated coordinator handles MCP and starts only separately isolated temporary task processes through its service-scoped control socket. /app is read-only; only coordinator /work is durable. Stop before updating. No employer credential custody.", Schema: obj(map[string]any{"manifest": manifest}, "manifest"), Method: http.MethodPost, Path: "/service-host", Prepare: func(args map[string]any) (any, error) {
 		if err := sealmcp.Allow(args, "manifest"); err != nil {
 			return nil, err
 		}
@@ -112,7 +126,7 @@ func (s *Server) serviceHostTools() []sealmcp.Tool {
 	}})
 	for _, action := range []string{"start", "stop", "logs"} {
 		a := action
-		tools = append(tools, sealmcp.Tool{Name: "seal_service_" + a, Description: map[string]string{"start": "Enable requests to a published MCP service. Each POST starts a fresh isolated worker; running indicates admission, not business health.", "stop": "Disable new requests and terminate all active workers for this service. Remains stopped after reboot.", "logs": "Request-worker stdout/stderr is discarded; this returns an empty log."}[a], Schema: obj(map[string]any{"id": str("Published service id.")}, "id"), Method: http.MethodPost, Path: "/service-host", Prepare: func(args map[string]any) (any, error) {
+		tools = append(tools, sealmcp.Tool{Name: "seal_service_" + a, Description: map[string]string{"start": "Enable a published MCP service. With worker, start its isolated coordinator; each task runs in a separate temporary process. Otherwise each POST starts a temporary server. Verify real business health.", "stop": "Disable new requests and terminate the coordinator and all active workers for this service. Remains stopped after reboot.", "logs": "Request-worker stdout/stderr is discarded; this returns an empty log."}[a], Schema: obj(map[string]any{"id": str("Published service id.")}, "id"), Method: http.MethodPost, Path: "/service-host", Prepare: func(args map[string]any) (any, error) {
 			if err := sealmcp.Allow(args, "id"); err != nil {
 				return nil, err
 			}
