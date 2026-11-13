@@ -19,6 +19,7 @@ func testPolicy() Policy {
 		Env:        []string{"HOME=/var/lib/svc/t/work", "MCP_SOCKET=/var/lib/svc/t/run/service.sock"},
 		Program:    "/usr/bin/python3",
 		Args:       []string{"server.py", "--flag=x"},
+		Limits:     Limits{AddressSpace: 8 << 30, Processes: 64, Files: 256, FileSize: 64 << 20},
 	}
 }
 

@@ -425,9 +425,9 @@ const (
 )
 
 // command builds the confined launch of one service process (servicesandbox):
-// prlimit sets the rlimits, then the trusted launcher confines itself to the
-// identity and execs the interpreter. It owns lease from here: released on
-// failure, otherwise once the identity has been reaped.
+// the trusted launcher confines itself to the identity, sets the rlimits and
+// execs the interpreter. It owns lease from here: released on failure,
+// otherwise once the identity has been reaped.
 func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir string, kind commandKind, lease RuntimeLease) (_ *isolatedCommand, err error) {
 	defer func() {
 		if err != nil && lease.Release != nil {
@@ -444,10 +444,6 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 	}
 	if !withinAny(interpreter, sys.readExec) {
 		return nil, fmt.Errorf("interpreter %s is outside the image's system directories", e.Manifest.Command)
-	}
-	launcher, err := privsep.LookPath("sealed-service-launcher")
-	if err != nil {
-		return nil, err
 	}
 	program := filepath.Join(m.programs, e.ID, "versions", e.Version)
 	run := filepath.Join(taskDir, "run")
@@ -519,14 +515,13 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 		p.Args = append(p.Args, "--import", networkBootstrap)
 	}
 	p.Args = append(p.Args, e.Manifest.Args...)
+	p.Limits = servicesandbox.Limits{AddressSpace: uint64(e.Manifest.MemoryMB) << 20, Processes: uint64(e.Manifest.Processes), Files: 256, FileSize: 64 << 20}
 	if err = p.Validate(); err != nil {
 		return nil, err
 	}
-	args := []string{fmt.Sprintf("--as=%d", int64(e.Manifest.MemoryMB)<<20), fmt.Sprintf("--nproc=%d", e.Manifest.Processes), "--core=0", "--nofile=256", "--fsize=67108864", "--", launcher}
-	args = append(args, p.LauncherArgs()...)
-	// Only the trusted image's resource limiter and launcher execute as root;
-	// the launcher drops to the service identity before the interpreter runs.
-	cmd, err := privsep.RootCommand(ctx, "prlimit", args...)
+	// Only the trusted launcher executes as root; it drops to the service
+	// identity, then sets the rlimits, before the interpreter runs.
+	cmd, err := privsep.RootCommand(ctx, "sealed-service-launcher", p.LauncherArgs()...)
 	if err != nil {
 		return nil, err
 	}

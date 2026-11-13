@@ -1,8 +1,7 @@
 // Package servicesandbox confines one hosted service process inside the
 // sandbox with no namespaces, no capability beyond the provider's six and no
-// provider change: a service identity of its own, rlimits applied by prlimit
-// before the launcher, oom_score_adj 1000, a Landlock domain and a seccomp
-// filter. Landlock lets the process read only the system, its program and its
+// provider change: a service identity of its own, rlimits set once it has left
+// root, oom_score_adj 1000, a Landlock domain and a seccomp filter. Landlock lets the process read only the system, its program and its
 // runtime, write only its private directories, and keeps its abstract Unix
 // sockets and signals inside its own domain; it also refuses TCP. The seccomp
 // filter refuses inet, netlink and packet sockets and io_uring, so the only
@@ -44,6 +43,19 @@ type Policy struct {
 	Env       []string
 	Program   string
 	Args      []string
+	// Limits are set after the identity drop: inside a user namespace (Sysbox)
+	// the container's root is not exempt from RLIMIT_NPROC, which would count
+	// every root process of the runner against the launcher's own threads.
+	Limits Limits
+}
+
+// Limits are the rlimits of the service process; zero leaves one unchanged.
+// Core files are always disabled.
+type Limits struct {
+	AddressSpace uint64 // bytes
+	Processes    uint64 // processes and threads of the identity
+	Files        uint64 // open descriptors
+	FileSize     uint64 // bytes per file
 }
 
 var validEnvEntry = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}=`)
@@ -85,6 +97,11 @@ func (p Policy) Validate() error {
 // builds it; service input never reaches argv (it arrives on stdin).
 func (p Policy) LauncherArgs() []string {
 	args := []string{"run", "--uid=" + strconv.FormatUint(uint64(p.UID), 10)}
+	for flag, v := range map[string]uint64{"--as": p.Limits.AddressSpace, "--nproc": p.Limits.Processes, "--nofile": p.Limits.Files, "--fsize": p.Limits.FileSize} {
+		if v != 0 {
+			args = append(args, flag+"="+strconv.FormatUint(v, 10))
+		}
+	}
 	add := func(flag string, values []string) {
 		for _, v := range values {
 			args = append(args, flag+"="+v)
@@ -124,6 +141,12 @@ func ParseRun(args []string) (Policy, error) {
 				return Policy{}, fmt.Errorf("invalid uid")
 			}
 			p.UID = uint32(n)
+		case "--as", "--nproc", "--nofile", "--fsize":
+			n, err := strconv.ParseUint(value, 10, 64)
+			if err != nil || n == 0 {
+				return Policy{}, fmt.Errorf("invalid %s", flag)
+			}
+			*map[string]*uint64{"--as": &p.Limits.AddressSpace, "--nproc": &p.Limits.Processes, "--nofile": &p.Limits.Files, "--fsize": &p.Limits.FileSize}[flag] = n
 		case "--rx":
 			p.ReadExec = append(p.ReadExec, value)
 		case "--ro":

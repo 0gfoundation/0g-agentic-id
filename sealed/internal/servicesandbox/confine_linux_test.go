@@ -183,7 +183,13 @@ func TestConfinedProcess(t *testing.T) {
 		t.Skip("python3 required for the checks")
 	}
 	python, _ = filepath.EvalSymlinks(python)
-	base := t.TempDir()
+	// t.TempDir's parent is private to root; the identity must traverse to
+	// its directories, as it does to sealed's world-traversable task parent.
+	base, err := os.MkdirTemp("", "servicesandbox-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(base)
 	if err := os.Chmod(base, 0755); err != nil {
 		t.Fatal(err)
 	}

@@ -198,6 +198,30 @@ func dropTo(uid uint32) error {
 	return nil
 }
 
+// applyLimits lowers the rlimits after the identity drop (lowering needs no
+// privilege). RLIMIT_NPROC then counts only this identity's processes.
+func applyLimits(l Limits) error {
+	set := func(resource int, v uint64) error {
+		if v == 0 {
+			return nil
+		}
+		return unix.Setrlimit(resource, &unix.Rlimit{Cur: v, Max: v})
+	}
+	if err := unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{}); err != nil {
+		return fmt.Errorf("rlimit core: %w", err)
+	}
+	for _, r := range []struct {
+		resource int
+		value    uint64
+		name     string
+	}{{unix.RLIMIT_AS, l.AddressSpace, "as"}, {unix.RLIMIT_NPROC, l.Processes, "nproc"}, {unix.RLIMIT_NOFILE, l.Files, "nofile"}, {unix.RLIMIT_FSIZE, l.FileSize, "fsize"}} {
+		if err := set(r.resource, r.value); err != nil {
+			return fmt.Errorf("rlimit %s: %w", r.name, err)
+		}
+	}
+	return nil
+}
+
 // confine applies the whole policy to the calling thread and process. The
 // caller must have locked the goroutine to its OS thread: no_new_privs,
 // Landlock and seccomp attach to the thread that later calls execve.
@@ -224,6 +248,9 @@ func confine(p Policy) error {
 	}
 	defer unix.Close(r.fd)
 	if err := dropTo(p.UID); err != nil {
+		return err
+	}
+	if err := applyLimits(p.Limits); err != nil {
 		return err
 	}
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {

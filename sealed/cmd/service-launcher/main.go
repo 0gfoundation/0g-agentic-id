@@ -6,7 +6,7 @@
 //	probe check that this kernel and container enforce that confinement
 //	reap  kill every process of one service identity
 //
-// sealed starts it through prlimit, which has already set the rlimits.
+// sealed starts it as root; run sets the rlimits only after leaving root.
 package main
 
 import (

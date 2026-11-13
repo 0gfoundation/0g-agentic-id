@@ -141,7 +141,7 @@ var allowedDirectCalls = map[string]struct {
 // rootCommands is everything root executes: the functions that may call
 // privsep.RootCommand, and the binaries (string literals) each may name.
 var rootCommands = map[string][]string{
-	"internal/servicehost.Manager.command":       {"prlimit"},
+	"internal/servicehost.Manager.command":       {"sealed-service-launcher"},
 	"internal/servicehost.ProbeIsolation":        {"sealed-service-launcher"},
 	"internal/servicehost.reapIdentity":          {"sealed-service-launcher"},
 	"internal/dataplane.downloadTo":              {"0g-storage-client"},

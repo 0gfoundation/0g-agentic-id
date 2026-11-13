@@ -9,7 +9,7 @@ capability beyond the provider's six and no change to the provider:
 | Mechanism | What it enforces |
 | --- | --- |
 | Service identity | A UID/GID of its own, drawn at random from 20000–64999; no supplementary groups; no-new-privs |
-| rlimits (prlimit) | Virtual memory, processes and threads per identity (`RLIMIT_NPROC`), 256 descriptors, 64 MiB per file, no core files |
+| rlimits | Virtual memory, processes and threads per identity (`RLIMIT_NPROC`), 256 descriptors, 64 MiB per file, no core files; set by the launcher after it leaves root |
 | Landlock (ABI 6 or later) | Read/execute only the image's system directories, the release and the leased runtime; read three `/etc` entries; harmless `/dev` nodes; sockets only in the private run directory; write only the private `$HOME` and `$TMPDIR`; no `/proc`; no TCP bind/connect; abstract Unix sockets and signals scoped to the process's own domain |
 | seccomp filter | No inet, netlink or packet socket; no io_uring |
 | `oom_score_adj` 1000 | The kernel's OOM killer takes service processes before sealed or the owner Harness; Landlock keeps them from lowering it |
@@ -42,6 +42,12 @@ removed every process of it, including ones in their own session re-parented to
 init. Between two containers, the count for one UID was shared (11 processes in
 one left the other unable to fork under a limit of 8), and `kill(-1)` did not cross
 containers. Hence identities are random, not fixed slots.
+
+The container's root is not exempt from `RLIMIT_NPROC` there either (it is not
+the initial user namespace's root), and its count covers every root process of
+the runner: with the limit set before the launcher left root, the launcher could
+not start a thread (`failed to create new OS thread`, EAGAIN, 2026-11-14). The
+launcher therefore sets every rlimit after the identity drop.
 
 The probe and its results: 0g-tapp-ops `deploy/dev/landlock-probe-20261113/` and
 `deployments/sandbox.md` (2026-11-13 15:55).

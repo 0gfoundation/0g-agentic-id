@@ -9,7 +9,7 @@ sealed 在 agent 自己的沙箱里运行每个托管服务进程（`internal/se
 | 机制 | 限制内容 |
 | --- | --- |
 | 服务身份 | 独立的 UID/GID，从 20000–64999 随机抽取；无附加组；no-new-privs |
-| rlimit（prlimit） | 虚拟内存、每个身份的进程和线程数（`RLIMIT_NPROC`）、256 描述符、单文件 64 MiB、不生成 core |
+| rlimit | 虚拟内存、每个身份的进程和线程数（`RLIMIT_NPROC`）、256 描述符、单文件 64 MiB、不生成 core；由 launcher 离开 root 之后设置 |
 | Landlock（ABI 6 及以上） | 只读/执行镜像系统目录、版本目录和租用的运行包；读三个 `/etc` 条目；无害的 `/dev` 节点；只在私有 run 目录建 socket；只写私有 `$HOME` 和 `$TMPDIR`；`/proc` 不可读；TCP bind/connect 被拒；抽象 Unix socket 和信号限于自身域 |
 | seccomp 过滤器 | 不能建 inet、netlink、packet socket；不能用 io_uring |
 | `oom_score_adj` 1000 | 内核 OOM 先杀服务进程，再轮到 sealed 或 owner Harness；Landlock 使其无法调低 |
@@ -35,6 +35,11 @@ sealed 在 agent 自己的沙箱里运行每个托管服务进程（`internal/se
 到上限即不能再 fork；以该身份执行 `kill(-1, SIGKILL)` 能清掉它的全部进程，包括开了新会话、
 已挂到 init 下的进程。两个容器之间，同一 UID 的计数是合并的（一个容器里有 11 个进程时，另一个
 在上限 8 下一个也开不出来），而 `kill(-1)` 不会跨容器。所以身份是随机抽取，不用固定编号。
+
+容器里的 root 在那里同样不豁免 `RLIMIT_NPROC`（它不是初始用户命名空间的 root），而且计数覆盖
+整个 runner 的所有 root 进程：在 launcher 离开 root 之前设上限时，launcher 开不出新线程
+（`failed to create new OS thread`，EAGAIN，2026-11-14）。所以 launcher 在切换身份之后才设置
+全部 rlimit。
 
 探测程序和结果：0g-tapp-ops 的 `deploy/dev/landlock-probe-20261113/` 和
 `deployments/sandbox.md`（2026-11-13 15:55）。
