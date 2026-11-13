@@ -124,6 +124,56 @@ func HarnessFailed(hash string) bool {
 	return err == nil
 }
 
+// PrunePackages removes the unpacked packages none of keep names (base's is
+// always kept), and what an install cut off left behind
+// (CleanCutOffInstalls). Only while no install runs.
+func PrunePackages(keep ...string) {
+	defer CleanCutOffInstalls()
+	kept := map[string]bool{}
+	if base, err := BaseHarness(); err == nil {
+		kept[base] = true
+	}
+	for _, h := range keep {
+		if p, ok := ParseHash(h); ok {
+			kept[p] = true
+		}
+	}
+	entries, err := privsep.ReadDir(PackagesDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if _, isPackage := ParseHash(name); !isPackage || name != strings.ToLower(name) || kept[name] {
+			continue
+		}
+		if err := privsep.RemoveAll(filepath.Join(PackagesDir, name)); err != nil {
+			logger.Logf("layers: remove %s: %v", filepath.Join(PackagesDir, name), err)
+			continue
+		}
+		logger.Logf("layers: removed %s, which nothing here runs", filepath.Join(PackagesDir, name))
+	}
+}
+
+// harnessTempPrefix names InstallHarness's temporary directories.
+const harnessTempPrefix = "harness-"
+
+// CleanCutOffInstalls removes what an install a stop or a crash cut off left
+// behind: stage directories under PackagesDir and the downloads' temporary
+// directories. Only while no install runs (at boot).
+func CleanCutOffInstalls() {
+	if entries, err := privsep.ReadDir(PackagesDir); err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".install-") {
+				if err := privsep.RemoveAll(filepath.Join(PackagesDir, e.Name())); err != nil {
+					logger.Logf("layers: remove %s: %v", filepath.Join(PackagesDir, e.Name()), err)
+				}
+			}
+		}
+	}
+	privsep.RemoveTempDirs(harnessTempPrefix)
+}
+
 // InstallHarness unpacks the package read from r into HarnessDir(hash). r
 // must fail at its end unless the package hashes to hash (FetchArtifact,
 // VerifyingReader): the package is first written whole to a root-only
@@ -134,7 +184,7 @@ func InstallHarness(r io.Reader, hash string) error {
 	if HarnessInstalled(hash) {
 		return nil
 	}
-	tmp, err := privsep.TempDir("harness-")
+	tmp, err := privsep.TempDir(harnessTempPrefix)
 	if err != nil {
 		return err
 	}

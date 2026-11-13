@@ -11,10 +11,10 @@
 //     request to switch, the confirmation that a new version came up
 //     (sealed.go).
 //
-// The loader (cmd/loader) links only the standard library, so the names it
-// shares with this package (the environment variables, the files under
-// LoaderDir, the trial exit code) are written out on both sides. Keep the
-// two in step.
+// The loader (cmd/loader) links the standard library and
+// golang.org/x/sys/unix only, not this package, so the names it shares with
+// this package (the environment variables, the files under LoaderDir, the
+// exit codes) are written out on both sides. Keep the two in step.
 package layers
 
 import (

@@ -341,3 +341,38 @@ func TestLoaderHandOver(t *testing.T) {
 		t.Fatal("not failed after the loader said so")
 	}
 }
+
+// A staged program is found again by its hash; a partial file a cut-off
+// staging left goes at the next boot, and Layered says whether the loader was
+// told about the layered flow.
+func TestStagedAndCutOffStaging(t *testing.T) {
+	old := LoaderDir
+	LoaderDir = filepath.Join(t.TempDir(), "loader")
+	t.Cleanup(func() { LoaderDir = old })
+
+	program := []byte("sealed v2")
+	h := sum(program)
+	if SealedStaged(h) || Layered() {
+		t.Fatal("staged or layered before anything was written")
+	}
+	if err := StageSealed(VerifyingReader(io.NopCloser(bytes.NewReader(program)), h), h); err != nil {
+		t.Fatal(err)
+	}
+	if !SealedStaged(h) {
+		t.Fatal("a staged program not found")
+	}
+	partial := filepath.Join(LoaderDir, "sealed", "."+h+".sealed-tmp-0123")
+	if err := os.WriteFile(partial, []byte("sea"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	CleanCutOffStaging()
+	if _, err := os.Lstat(partial); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("partial staging kept: %v", err)
+	}
+	if !SealedStaged(h) {
+		t.Fatal("the staged program went with it")
+	}
+	if err := MarkLayered(); err != nil || !Layered() {
+		t.Fatalf("Layered after MarkLayered: %v", err)
+	}
+}

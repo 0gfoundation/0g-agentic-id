@@ -129,7 +129,8 @@ func main() {
 	privsep.Harden()
 	// Under the loader (cmd/loader) sealed is not PID 1, and a stop signal
 	// gets a graceful stop: the agent is stopped before sealed exits
-	// (shutdown.go). As PID 1 nothing changes.
+	// (shutdown.go). As PID 1 nothing changes (LEGACY(v1): images without
+	// the loader).
 	if os.Getpid() != 1 {
 		stopSigs := make(chan os.Signal, 2)
 		signal.Notify(stopSigs, syscall.SIGTERM, syscall.SIGINT)
@@ -239,10 +240,14 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	if agentSealPriv == nil {
 		// A version the attestor no longer provisions (taken off the sealed
 		// list) still hands over to the newest listed one.
-		if prov.Layered && switchAfterRefusal(cfg) {
-			return
+		if prov.Layered {
+			switchAfterRefusal(cfg)
 		}
-		failTrial(cfg, "provisioning")
+		var cause error = errors.New("the attestor did not provision this boot")
+		if prov.Unanswered {
+			cause = transient(errors.New("the attestor gave no answer within the provision window"))
+		}
+		failTrial(cfg, "provisioning", cause)
 		return
 	}
 	cfg.StatusBinding = report.NewBinding(prov.StatusToken)
@@ -269,7 +274,8 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	if err != nil {
 		logger.Logf("FAIL bootstrap: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "bootstrap: "+err.Error(), cfg.StatusBinding)
-		failTrial(cfg, "chain bootstrap")
+		// The chain and storage reads are outside this sealed version.
+		failTrial(cfg, "chain bootstrap", transient(err))
 		return
 	}
 
@@ -287,15 +293,17 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	if err != nil {
 		logger.Logf("FAIL framework resolve: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "framework resolve: "+err.Error(), cfg.StatusBinding)
-		failTrial(cfg, "framework resolve")
+		failTrial(cfg, "framework resolve", err)
 		return
 	}
 	sealedProxy.SetAdapter(adapter)
 
 	// The layered runtime (layered.go): when the rule picks a sealed version
-	// other than this program (the owner's pick, or the newest listed one
-	// once this one is delisted), it is handed to the loader before the agent
-	// starts; the harness starts on the package the rule picks.
+	// other than this program (the owner's pick, the newest listed one once
+	// this one is delisted, or the one this program runs in place of), it is
+	// handed to the loader before the agent starts; when the loader does not
+	// switch, the boot carries on with this version. The harness starts on
+	// the package the rule picks.
 	var lr *layeredRuntime
 	var picks settings.Versions
 	if prov.Layered {
@@ -304,18 +312,27 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		}
 		lr = newLayeredRuntime(cfg, res.client)
 		ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
-		if target, ok := lr.target(ctx, kindSealed, picks.Sealed, cfg.SealedHash); ok && lr.switchSealed(ctx, target) {
-			cancel()
-			return
+		if target, ok := lr.sealedTarget(ctx, picks.Sealed); ok && lr.switchSealed(ctx, target) {
+			lr.awaitHandOver()
 		}
 		cancel()
 	}
 	if h, ok := any(adapter).(framework.LayeredRuntime); ok {
+		// LEGACY(pre-1.4.0): without the layered flow, base's package.
 		hash, dir := baseHarness()
 		if lr != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
-			hash, dir = lr.chooseHarness(ctx, picks.Harness, hash)
+			hash, dir, err = lr.chooseHarness(ctx, picks.Harness, hash)
 			cancel()
+			if err != nil {
+				logger.Logf("FAIL harness: %v", err)
+				report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "harness: "+err.Error(), cfg.StatusBinding)
+				failTrial(cfg, "harness choice", err)
+				if isTransient(err) {
+					exitForRetry("harness choice", err)
+				}
+				return
+			}
 		}
 		h.UseHarness(hash, dir)
 	}
@@ -372,8 +389,9 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		// not read "running" past it.
 		currentStatus.SupervisorFailed(err.Error())
 		statusReports.Soon()
-		// A version on trial goes back to the previous one, which reports.
-		failTrial(cfg, "agent start")
+		// A version on trial goes back to the previous one, which reports;
+		// or, failing for a reason outside it, starts again later.
+		failTrial(cfg, "agent start", err)
 		return
 	}
 	logger.Logf("OK   agent ready (upstream listening, agentState armed, supervisor active)")
@@ -384,6 +402,11 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, msg, cfg.StatusBinding)
 	confirmTrial(cfg)
 	sealedSettled.Store(true)
+	if lr != nil {
+		// Versions nothing here runs any more, and what a cut-off download
+		// left, go (layered.go).
+		lr.prune()
+	}
 }
 
 // applySecretEnv opens SEAL_SECRET_ENV (issue #166) and makes its inference
@@ -772,6 +795,12 @@ func startAgent(
 	}
 
 	// Phase A
+	type restoreRole struct {
+		role                            framework.RoleSpec
+		entry                           *decryptedEntry
+		contentHashForSeed, dataHashHex string
+	}
+	var restores []restoreRole
 	for _, r := range roles {
 		entry := findEntry(res.entries, r.Name)
 		if entry == nil {
@@ -803,6 +832,18 @@ func startAgent(
 				continue
 			}
 		}
+		restores = append(restores, restoreRole{role: r, entry: entry, contentHashForSeed: contentHashForSeed, dataHashHex: dataHashHex})
+	}
+	// What is restored from chain leaves the record first (synced.go).
+	if keeper != nil && havePrevSynced {
+		names := make([]string, len(restores))
+		for i, x := range restores {
+			names[i] = x.role.Name
+		}
+		forgetSynced(prevSynced, names)
+	}
+	for _, x := range restores {
+		r, entry := x.role, x.entry
 		if err := adapter.Restore(ctx, r.Name, entry.Plaintext); err != nil {
 			return fmt.Errorf("restore %s: %w", r.Name, err)
 		}
@@ -811,7 +852,7 @@ func startAgent(
 				return fmt.Errorf("restore manifest entries for %s: %w", r.Name, err)
 			}
 		}
-		agent.SeedChainSnapshot(r.Name, contentHashForSeed, dataHashHex)
+		agent.SeedChainSnapshot(r.Name, x.contentHashForSeed, x.dataHashHex)
 	}
 
 	// Phase B
@@ -1009,7 +1050,22 @@ func startAgent(
 			}
 		},
 	})
-	if err := mgr.Start(context.Background(), manager.StartParams{
+	// Under the layered flow every serve-proof is v2 from the first one: its
+	// layers are set before the agent starts, and until the harness has
+	// started nothing is signed (proxy.SetProofLayers).
+	harness, isLayeredRuntime := any(adapter).(framework.LayeredRuntime)
+	if isLayeredRuntime && lr != nil {
+		sealedHash := cfg.SealedHash
+		sealedProxy.SetProofLayers(func() (proxy.ProofLayers, bool) {
+			h := harness.HarnessHash()
+			if h == "" {
+				return proxy.ProofLayers{}, false
+			}
+			url, model := harness.InferenceTarget()
+			return proxy.ProofLayers{SealedHash: "0x" + sealedHash, HarnessHash: "0x" + h, InferenceURL: url, Model: model}, true
+		})
+	}
+	startParams := manager.StartParams{
 		Runtime: framework.RuntimeContext{
 			APIKey:       apiKey,
 			PublicURL:    publicURL,
@@ -1061,7 +1117,18 @@ func startAgent(
 			}
 			return renderSettings(ctx, live.get())
 		},
-	}); err != nil {
+	}
+	start := func() error { return mgr.Start(context.Background(), startParams) }
+	if isLayeredRuntime && lr != nil {
+		// A package chosen at boot that does not start gives way to the next
+		// version (layered.go).
+		fctx, fcancel := context.WithTimeout(context.Background(), applyTimeout)
+		err = lr.startFirst(fctx, harness, start, func(ctx context.Context) { _ = adapter.Stop(ctx, 10*time.Second) })
+		fcancel()
+	} else {
+		err = start()
+	}
+	if err != nil {
 		return err
 	}
 	markInUse()
@@ -1074,21 +1141,9 @@ func startAgent(
 
 	// A framework that runs from a package can ask to be restarted over the
 	// sign socket, and its owner over /_seal/restart (ownerrestart.go); under
-	// the layered flow its package hash goes into every serve-proof (v2), and
-	// the owner's version picks apply (layered.go).
-	if harness, ok := any(adapter).(framework.LayeredRuntime); ok {
+	// the layered flow the owner's version picks apply (layered.go).
+	if isLayeredRuntime {
 		sealedProxy.SetHarnessRestart(mgr.Reload)
-		if lr != nil {
-			sealedHash := cfg.SealedHash
-			sealedProxy.SetProofLayers(func() (proxy.ProofLayers, bool) {
-				h := harness.HarnessHash()
-				if h == "" {
-					return proxy.ProofLayers{}, false
-				}
-				url, model := harness.InferenceTarget()
-				return proxy.ProofLayers{SealedHash: "0x" + sealedHash, HarnessHash: "0x" + h, InferenceURL: url, Model: model}, true
-			})
-		}
 	}
 	if lr != nil {
 		lr.started(adapter, mgr, func() settings.Versions {
@@ -1098,7 +1153,10 @@ func startAgent(
 			return settings.Versions{}
 		})
 	}
-	if _, ok := any(adapter).(framework.LayeredRuntime); ok {
+	if isLayeredRuntime {
+		// The requests used are kept on disk: the sealed a restart starts
+		// refuses them too.
+		sealedProxy.SetOwnerRestartRecord(framework.StatePath(ownerRestartsFile))
 		sealedProxy.SetOwnerRestart(ownerRestarter(mgr, lr))
 	}
 
@@ -1667,7 +1725,8 @@ func restoreManifestEntries(
 		}
 		ct, err := dataplane.Download(ctx, rootHex, indexer)
 		if err != nil {
-			return fmt.Errorf("download entry %q: %w", entry.Path, err)
+			// Storage is outside this sealed version (layered.go).
+			return transient(fmt.Errorf("download entry %q: %w", entry.Path, err))
 		}
 		pt, err := dataplane.Decrypt(ct, dataKey)
 		if err != nil {

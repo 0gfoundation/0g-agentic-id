@@ -12,8 +12,10 @@
 //     sent: the key, or the placeholder the credential proxy fills on its
 //     way out (then Upstream is the credential proxy's form of the route).
 //
-// Only model calls pass: POST chat/completions, messages and responses, and
-// GET models. Responses stream back as they arrive.
+// Only model calls pass, by their exact paths under the route's base URL:
+// POST chat/completions, messages and responses, and GET models, each with
+// or without a leading /v1 (an OpenAI-wire client's base URL ends in /v1, an
+// Anthropic-wire one's does not). Responses stream back as they arrive.
 package inferproxy
 
 import (
@@ -99,17 +101,24 @@ func (s *Server) current() *Route {
 	return s.route
 }
 
-// endpoint names the model call a request path is, "" for anything else.
+// endpoints are the model calls the proxy forwards: method and exact path
+// under the route's base URL, to the kind Rewrite takes.
+var endpoints = map[string]string{
+	"POST /chat/completions": "chat",
+	"POST /messages":         "messages",
+	"POST /responses":        "responses",
+	"GET /models":            "models",
+}
+
+// endpoint names the model call a request path is, "" for anything else:
+// one of endpoints, with or without a leading /v1. A path that only ends like
+// one (an Assistants API /threads/<id>/messages, say) is not a model call.
 func endpoint(method, path string) string {
-	switch {
-	case method == http.MethodPost && strings.HasSuffix(path, "/chat/completions"):
-		return "chat"
-	case method == http.MethodPost && strings.HasSuffix(path, "/messages"):
-		return "messages"
-	case method == http.MethodPost && strings.HasSuffix(path, "/responses"):
-		return "responses"
-	case method == http.MethodGet && strings.HasSuffix(path, "/models"):
-		return "models"
+	if kind, ok := endpoints[method+" "+path]; ok {
+		return kind
+	}
+	if rest, ok := strings.CutPrefix(path, "/v1"); ok {
+		return endpoints[method+" "+rest]
 	}
 	return ""
 }

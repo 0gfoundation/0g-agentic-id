@@ -324,10 +324,13 @@ type RuntimeTools interface {
 // only 0g-harness). sealed tells the adapter which unpacked package to run;
 // under the layered flow it also switches packages as the attestor targets
 // them and signs serve-proofs v2, which name the package's hash.
+//
+// Start wraps ErrHarnessDidNotStart when the package's process exited or
+// never listened.
 type LayeredRuntime interface {
 	// UseHarness makes the package unpacked at dir, whose sha256 is hash
 	// (64 lowercase hex), the one the next Start runs. "" for both runs the
-	// framework the image installed without a package.
+	// framework the image installed without a package (LEGACY(v1)).
 	UseHarness(hash, dir string)
 	// HarnessHash is the hash of the package the running process started
 	// from, "" before the first Start or without a package.
@@ -337,6 +340,12 @@ type LayeredRuntime interface {
 	// Start; "" for the URL when the framework dials a provider itself.
 	InferenceTarget() (url, model string)
 }
+
+// ErrHarnessDidNotStart is wrapped by a LayeredRuntime adapter's Start error
+// when the package's process exited or never listened: the package is at
+// fault, not the settings, the key or sealed, so a boot records it as failed
+// and starts the next version.
+var ErrHarnessDidNotStart = fmt.Errorf("framework: the harness package did not start")
 
 // Route is one path prefix a framework exposes through the sealed proxy.
 //

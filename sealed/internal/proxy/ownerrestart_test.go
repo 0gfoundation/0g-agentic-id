@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +55,35 @@ func TestOwnerRestart_RunsTheLayerOnce(t *testing.T) {
 	s.handleOwnerRestart(w, restartReq(t, sign, "0GSealRestart", `{"layer":"sealed"}`, ""))
 	if w.Code != http.StatusAccepted || len(layers) != 2 || layers[1] != "sealed" {
 		t.Fatalf("sealed: HTTP %d, layers %v", w.Code, layers)
+	}
+}
+
+// The sealed a restart starts refuses the request that restarted the one
+// before it: the requests used are kept on disk.
+func TestOwnerRestart_ReplayAfterARestartIsRefused(t *testing.T) {
+	record := filepath.Join(t.TempDir(), "owner-restarts.json")
+	s, sign := occupancyServer(t)
+	s.SetOwnerRestartRecord(record)
+	runs := 0
+	s.SetOwnerRestart(func(string) error { runs++; return nil })
+	req := restartReq(t, sign, "0GSealRestart", `{"layer":"sealed"}`, "")
+	w := httptest.NewRecorder()
+	s.handleOwnerRestart(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("restart: HTTP %d: %s", w.Code, w.Body.String())
+	}
+
+	// The next sealed: a new server, the same agent and record.
+	next := &Server{agent: s.agent}
+	next.SetOwnerRestartRecord(record)
+	next.SetOwnerRestart(func(string) error { runs++; return nil })
+	again := restartReq(t, sign, "0GSealRestart", `{"layer":"sealed"}`, "")
+	again.Header.Set("X-Auth-Message", req.Header.Get("X-Auth-Message"))
+	again.Header.Set("X-Auth-Signature", req.Header.Get("X-Auth-Signature"))
+	w = httptest.NewRecorder()
+	next.handleOwnerRestart(w, again)
+	if w.Code != http.StatusConflict || runs != 1 {
+		t.Fatalf("replay after a restart: HTTP %d, applier ran %d times", w.Code, runs)
 	}
 }
 

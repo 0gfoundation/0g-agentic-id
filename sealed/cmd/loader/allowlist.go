@@ -1,16 +1,18 @@
 package main
 
 // The sealed list on chain, read by the loader before it runs a sealed
-// version, with the standard library alone: JSON-RPC eth_calls to
+// version, with the standard library's HTTP client: JSON-RPC eth_calls to
 // CHAIN_RPC_URL, the endpoint sealed itself reads the chain through. First
 // AgenticID.trustRegistry() names the trust registry, then its
 // isListed(SEALED, hash) answers (sealed/LAYERS.md §2, §10).
 //
-// Only an explicit "not listed" keeps a version from running. An answer the
-// loader cannot get (the endpoint unreachable, an AgenticID that names no
-// trust registry yet, which is what one before 1.4.0 is) runs the version:
-// the attestor checks the same list before it hands out the agent key, so a
-// version it refuses gets no key either way.
+// A staged version (one sealed downloaded) runs only on the chain's explicit
+// "listed". When no answer can be had (the endpoint unreachable, any JSON-RPC
+// error, an AgenticID that names no trust registry, which is what one before
+// 1.4.0 is) the loader runs the image's own sealed instead (supervise.go):
+// the image hash, which the attestor checks from the container certificate,
+// covers that one, while a staged version's hash reaches the attestor only as
+// the running sealed reports it.
 
 import (
 	"bytes"
@@ -22,6 +24,14 @@ import (
 	"strings"
 	"time"
 )
+
+// sealedList is the chain's sealed list as the loader reads it: *allowlist,
+// or a stand-in in tests.
+type sealedList interface {
+	// refuses reports whether the chain says hash is not listed. err is set
+	// when no answer could be had; refuses is then false.
+	refuses(hash string) (refuses bool, err error)
+}
 
 const (
 	// trustRegistrySelector is keccak256("trustRegistry()")[:4].
@@ -49,7 +59,7 @@ type allowlist struct {
 }
 
 // newAllowlist is the allowlist behind AgenticID at contract, read through
-// rpc, or nil when either is unset (nothing is checked).
+// rpc, or nil when either is unset: then no answer can be had.
 func newAllowlist(rpc, contract string) *allowlist {
 	if rpc == "" || contract == "" {
 		return nil
@@ -61,7 +71,7 @@ func newAllowlist(rpc, contract string) *allowlist {
 // when no answer could be had; refuses is then false.
 func (a *allowlist) refuses(hash string) (refuses bool, err error) {
 	if a == nil {
-		return false, nil
+		return false, fmt.Errorf("%s or %s is unset: the sealed list cannot be read", chainRPCEnv, contractEnv)
 	}
 	b, err := hex.DecodeString(hash)
 	if err != nil || len(b) != 32 {
@@ -72,6 +82,8 @@ func (a *allowlist) refuses(hash string) (refuses bool, err error) {
 		return false, fmt.Errorf("trustRegistry(): %w", err)
 	}
 	if !zero(word[:12]) || zero(word[12:]) {
+		// LEGACY(pre-1.4.0): an AgenticID before 1.4.0 reverts above or
+		// names none here; either is no answer.
 		return false, fmt.Errorf("trustRegistry() names no trust registry")
 	}
 	registry := "0x" + hex.EncodeToString(word[12:])

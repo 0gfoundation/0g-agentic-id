@@ -154,20 +154,28 @@ against the sha256 compiled in when the image is built,
 `-X main.expectedSealedHash`, `images/harness/Dockerfile`; a switched-to
 version against its name), then sends `eth_call`s to `CHAIN_RPC_URL`,
 AgenticID's `trustRegistry()` and the trust registry's `isListed(SEALED,
-hash)`: a version the chain says is not listed does not run (`allowlist.go`). It starts sealed as its child with the environment
-unchanged plus `SEALED_HASH` (the hash it checked) and `SEALED_TRIAL` (on
-trial), forwards SIGTERM, SIGINT, SIGQUIT and SIGHUP, kills sealed if it has
-not exited 2 min after a stop signal, and reaps every orphan. Without the
-layered flow it exits with sealed's status when sealed exits, so a sealed exit
-still ends the container. Under the layered flow (`LAYERS.md` §3, §3.1) it
-also switches sealed versions when sealed asks (SIGUSR1): it starts the new
-version on trial, goes back to the old one if the new one exits before
-confirming it came up, and ends what the old sealed left behind before the
-switch; and it restarts a sealed that exits on its own (an owner restart of
-sealed is one), at most 5 times in 10 minutes. Its state directory is `/var/lib/loader`, which only root can
-enter. Like sealed it is root, non-dumpable and sets `no_new_privs`, and it
-links only the standard library and `golang.org/x/sys`
-(`TestLinkedPackages`). The other images keep sealed as PID 1.
+hash)`: a version the chain says is not listed does not run, and a
+switched-to version runs only when the chain says it is listed; when no answer
+can be had the image's own runs in its place (`allowlist.go`,
+`supervise.go`). It starts sealed as its child with the environment unchanged
+plus `SEALED_HASH` (the hash it checked), `SEALED_TRIAL` (on trial) and
+`SEALED_INSTEAD_OF` (the version the image's own runs in place of), forwards
+SIGTERM, SIGINT, SIGQUIT and SIGHUP, kills sealed if it has not exited 2 min
+after a stop signal, and reaps every orphan. Without the layered flow it exits
+with sealed's status when sealed exits, so a sealed exit still ends the
+container. Under the layered flow (`LAYERS.md` §3, §3.1) it also switches
+sealed versions when sealed asks (SIGUSR1) and the chain lists the new one: it
+starts the new version on trial, goes back to the old one if the new one exits
+before confirming it came up or has not confirmed within 20 minutes, and ends
+what the old sealed left behind before the switch. It restarts a sealed that
+exits on its own at most 5 times in 10 minutes; exit code 76 (an owner restart
+of sealed) restarts at once and is not counted, and exit code 69 (a boot that
+failed for a reason outside the version) restarts the same version after 30 s,
+doubling up to 5 min, without counting it against the version. Its state
+directory is `/var/lib/loader`, which only root can enter. Like sealed it is
+root, non-dumpable and sets `no_new_privs`, and it links only the standard
+library and `golang.org/x/sys` (`TestLinkedPackages`). The other images keep
+sealed as PID 1.
 
 A sealed that is not PID 1 handles SIGTERM and SIGINT (`shutdown.go`): it
 stops the watcher, stops the framework (which nothing restarts afterwards),

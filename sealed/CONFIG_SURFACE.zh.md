@@ -104,8 +104,10 @@ managed provider 转发到 `Resolved.Endpoint`；`openai` 和 `anthropic` 转发
 `https://api.anthropic.com`，Anthropic 协议）。这两个不是注册表条目，attestor 提供的注册表
 改不了它们，已封存密钥绑定的路由哈希也不变。harness 的 `SEAL_MODEL_BASE_URL` 是代理的
 回环地址；代理给每个请求写上 owner 的模型、在 system prompt 末尾附上 agent doc，并设置
-密钥（`harness/spawn.go` `modelEndpoint`）。只有 sealed 不知道 endpoint 的 provider 仍由
-harness 自己拨。其他三个框架的 native provider 仍用框架自带接线。
+密钥（`harness/spawn.go` `modelEndpoint`）。它只转发模型调用，按代理基地址下的精确路径：
+POST `chat/completions`、`messages`、`responses`，GET `models`，前面带不带 `/v1` 都行
+（`inferproxy.endpoint`）。只有 sealed 不知道 endpoint 的 provider 仍由 harness 自己拨。
+其他三个框架的 native provider 仍用框架自带接线。
 
 
 新增 managed provider 只使用自己的目录、静态元数据及声明的默认协议，不继承

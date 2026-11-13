@@ -230,6 +230,9 @@ func (m *Manager) Stop(ctx context.Context) {
 // under way has finished.
 const stopPollInterval = 50 * time.Millisecond
 
+// ErrStopped is Reload's answer once Stop has run: nothing is started again.
+var ErrStopped = errors.New("manager: stopped")
+
 // Reload stops the running agent and re-spawns it. Used by the watcher
 // when a framework dim drift requires the binary on disk to actually
 // take effect (Node modules already loaded in memory don't get swapped
@@ -237,7 +240,7 @@ const stopPollInterval = 50 * time.Millisecond
 // the StartParams captured at the initial Start.
 //
 // Concurrent Reload + auto-restart attempts coalesce on inFlight (same
-// guard as restart()).
+// guard as restart()). After Stop it does nothing: skipped, or ErrStopped.
 func (m *Manager) Reload(ctx context.Context) error {
 	if !m.inFlight.CompareAndSwap(false, true) {
 		logger.Logf("manager: reload requested while another (re-)start is in flight, or after Stop; skipping (a restart under way starts again on it)")
@@ -247,7 +250,7 @@ func (m *Manager) Reload(ctx context.Context) error {
 	defer m.inFlight.Store(false)
 	select {
 	case <-m.stopCh:
-		return errors.New("manager: stopped")
+		return ErrStopped
 	default:
 	}
 

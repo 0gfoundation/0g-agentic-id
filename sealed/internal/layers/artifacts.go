@@ -9,9 +9,13 @@ import (
 	"hash"
 	"io"
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"seal-verify/internal/attestorhttp"
+	"seal-verify/internal/framework"
+	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
 )
 
 // MaxArtifactBytes bounds one artifact download (a sealed program or a
@@ -40,14 +44,46 @@ var artifactClient = &http.Client{Timeout: artifactTimeout}
 // artifact's name.
 var ErrHashMismatch = errors.New("the artifact does not hash to its name")
 
+// mismatchDir, under framework.StateDir, holds one empty file per artifact
+// whose download did not hash to its name in this container: it is not
+// downloaded again here.
+const mismatchDir = "artifact-mismatch"
+
+// NoteArtifactError records an artifact whose download failed with err,
+// when err is ErrHashMismatch.
+func NoteArtifactError(hash string, err error) {
+	if !errors.Is(err, ErrHashMismatch) || !isArtifactName(hash) {
+		return
+	}
+	dir, serr := framework.StateSubdir(mismatchDir)
+	if serr == nil {
+		serr = privsep.WriteFile(filepath.Join(dir, hash), nil, 0o600)
+	}
+	if serr != nil {
+		logger.Logf("layers: record that artifact %s did not hash to its name: %v", hash, serr)
+	}
+}
+
+// artifactMismatched reports whether the artifact hash did not hash to its
+// name before in this container.
+func artifactMismatched(hash string) bool {
+	_, err := privsep.Lstat(filepath.Join(framework.StateDir, mismatchDir, hash))
+	return err == nil
+}
+
 // FetchArtifact opens the artifact named by hash (64 lowercase hex),
 // ArtifactsURL/<hash>. The returned reader yields at most MaxArtifactBytes
 // and, at its end, fails with ErrHashMismatch unless what it yielded hashes
 // to hash: a caller that reads it to io.EOF has the verified bytes, and must
-// discard them on any error.
+// discard them on any error (and pass that error to NoteArtifactError). An
+// artifact that did not hash to its name before in this container is not
+// downloaded again.
 func FetchArtifact(ctx context.Context, hash string) (io.ReadCloser, error) {
 	if !isArtifactName(hash) {
 		return nil, fmt.Errorf("artifact name %q is not a sha256 (64 lowercase hex)", hash)
+	}
+	if artifactMismatched(hash) {
+		return nil, fmt.Errorf("download artifact %s: %w earlier in this container; not downloading it again", hash, ErrHashMismatch)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ArtifactsURL+"/"+hash, nil)
 	if err != nil {

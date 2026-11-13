@@ -129,9 +129,12 @@ entries, so the registry the attestor serves cannot re-point them, and the
 route hash a sealed key is bound to stays the same. The harness's
 `SEAL_MODEL_BASE_URL` is the route's loopback address; the route puts the
 owner's model on every request, appends the agent doc to the system prompt
-and sets the key (`harness/spawn.go` `modelEndpoint`). Only a provider sealed
-knows no endpoint of is still dialled by the harness itself. The other three
-frameworks keep their own wiring for native providers.
+and sets the key (`harness/spawn.go` `modelEndpoint`). It forwards model calls
+only, by exact path under the route's base URL: POST `chat/completions`,
+`messages` and `responses`, GET `models`, each with or without a leading `/v1`
+(`inferproxy.endpoint`). Only a provider sealed knows no endpoint of is still
+dialled by the harness itself. The other three frameworks keep their own
+wiring for native providers.
 
 
 Additional managed providers use only their own catalog/static metadata and declared

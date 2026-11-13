@@ -121,3 +121,30 @@ func TestDiskContentHash(t *testing.T) {
 		t.Fatalf("diskContentHash on a read error = %q, want \"\"", got)
 	}
 }
+
+// A role a boot restores from chain leaves the record before the restore
+// begins: a boot that dies part-way keeps nothing of it.
+func TestForgetSyncedDropsTheRolesRestored(t *testing.T) {
+	old := framework.StateDir
+	framework.StateDir = t.TempDir()
+	defer func() { framework.StateDir = old }()
+
+	s := newSyncedStore("0xseal", "0xowner")
+	s.setAll(map[string]string{"APPEND_SYSTEM.md": "aaaa", "skills/": "bbbb"})
+	rec, ok := loadSynced()
+	if !ok {
+		t.Fatal("no record")
+	}
+	forgetSynced(rec, []string{"skills/"})
+	rec, ok = loadSynced()
+	if !ok || rec.Roles["APPEND_SYSTEM.md"] != "aaaa" {
+		t.Fatalf("record %+v", rec)
+	}
+	if _, has := rec.Roles["skills/"]; has {
+		t.Fatalf("restored role still recorded: %+v", rec)
+	}
+	// So the next boot does not keep a partial skills/ copy.
+	if keepsUncommitted(rec, ok, "0xseal", "0xowner", "skills/", "bbbb", "partial") {
+		t.Fatal("a role being restored would be kept")
+	}
+}

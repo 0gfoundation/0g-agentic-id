@@ -45,7 +45,8 @@ const (
 
 	// legacyHarnessEntry is the entry script of an image that installed the
 	// harness globally instead of as a package; Start runs it when no
-	// package was set (UseHarness).
+	// package was set (UseHarness). LEGACY(v1): only images from before
+	// packages, which run their own older sealed.
 	legacyHarnessEntry = "/usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs"
 
 	// logName names the harness's stdout/stderr log under
@@ -197,7 +198,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	}
 	cmd, err := spawnBridge(be, entry)
 	if err != nil {
-		return framework.StartResult{}, fmt.Errorf("harness.Start: %w", err)
+		return framework.StartResult{}, fmt.Errorf("harness.Start: %w: %w", framework.ErrHarnessDidNotStart, err)
 	}
 	proc := watchProc(cmd, entry)
 
@@ -213,8 +214,8 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	a.mu.Unlock()
 
 	addr := fmt.Sprintf("127.0.0.1:%d", bridgePort)
-	if err := waitForListen(ctx, addr, startTimeout); err != nil {
-		return framework.StartResult{}, fmt.Errorf("harness.Start: harness not listening: %w", err)
+	if err := waitForListen(ctx, addr, startTimeout, proc.done); err != nil {
+		return framework.StartResult{}, fmt.Errorf("harness.Start: %w: harness not listening: %w", framework.ErrHarnessDidNotStart, err)
 	}
 	return framework.StartResult{Upstream: "http://" + addr, PID: cmd.Process.Pid}, nil
 }
@@ -446,8 +447,9 @@ func randomTokenHex() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// waitForListen polls a TCP address until it accepts a connection.
-func waitForListen(ctx context.Context, addr string, timeout time.Duration) error {
+// waitForListen polls a TCP address until it accepts a connection, and gives
+// up as soon as exited closes (the process that was to listen is gone).
+func waitForListen(ctx context.Context, addr string, timeout time.Duration, exited <-chan struct{}) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -461,6 +463,8 @@ func waitForListen(ctx context.Context, addr string, timeout time.Duration) erro
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-exited:
+			return fmt.Errorf("the process exited before %s accepted connections", addr)
 		case <-time.After(500 * time.Millisecond):
 		}
 	}

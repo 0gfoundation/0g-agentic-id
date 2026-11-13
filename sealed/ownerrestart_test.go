@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"seal-verify/internal/layers"
 	"seal-verify/internal/proxy"
 )
 
@@ -42,8 +43,8 @@ func TestOwnerRestarterSealedRefusals(t *testing.T) {
 	}
 }
 
-// Once up, a sealed restart runs the stop hooks, then exits 0 for the loader
-// to start sealed again.
+// Once up, a sealed restart runs the stop hooks, then exits with
+// RestartRequestedExit for the loader to start sealed again at once.
 func TestOwnerRestarterSealedStopsThenExits(t *testing.T) {
 	oldExit, oldGrace, oldHooks := exitSealed, restartGrace, sealedStop.hooks
 	exited := make(chan int, 1)
@@ -62,7 +63,7 @@ func TestOwnerRestarterSealedStopsThenExits(t *testing.T) {
 	}
 	select {
 	case code := <-exited:
-		if code != 0 || !stopped {
+		if code != layers.RestartRequestedExit || !stopped {
 			t.Fatalf("exit %d, stop hooks ran: %v", code, stopped)
 		}
 	case <-time.After(5 * time.Second):

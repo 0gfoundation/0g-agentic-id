@@ -8,16 +8,20 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"seal-verify/internal/config"
 	"seal-verify/internal/framework"
 	"seal-verify/internal/layers"
+	"seal-verify/internal/manager"
 	"seal-verify/internal/settings"
 )
 
@@ -97,15 +101,17 @@ type nopCloser struct{ *bytes.Reader }
 func (nopCloser) Close() error { return nil }
 
 // fakeLists is a trust registry holding what it lists; latest names each
-// kind's newest listed hash.
+// kind's newest listed hash. unreadable fails every read, unreadableFor the
+// reads of the hashes it holds.
 type fakeLists struct {
 	sealed, harness             map[string]bool
 	latestSealed, latestHarness string
 	unreadable                  bool
+	unreadableFor               map[string]bool
 }
 
 func (f fakeLists) Listed(_ context.Context, kind, h [32]byte) (bool, error) {
-	if f.unreadable {
+	if f.unreadable || f.unreadableFor[hex.EncodeToString(h[:])] {
 		return false, errors.New("rpc down")
 	}
 	if kind == kindSealed {
@@ -134,12 +140,13 @@ func TestChooseHarnessTakesTheListedPick(t *testing.T) {
 	target := env.serve(testPackage(t, "target"))
 	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true, target: true}, latestHarness: base}}
 
-	hash, dir := l.chooseHarness(context.Background(), "0x"+target, base)
-	if hash != target || dir != layers.HarnessDir(target) || !layers.HarnessInstalled(target) {
-		t.Fatalf("chose %s at %s", hash, dir)
+	hash, dir, err := l.chooseHarness(context.Background(), "0x"+target, base)
+	if err != nil || hash != target || dir != layers.HarnessDir(target) || !layers.HarnessInstalled(target) {
+		t.Fatalf("chose %s at %s (%v)", hash, dir, err)
 	}
-	if got := layers.LoadHarnessSelection(); got.Current != target {
-		t.Fatalf("selection %+v", got)
+	// Recorded only once it came up (startFirst).
+	if got := layers.LoadHarnessSelection(); got.Current != "" {
+		t.Fatalf("selection %+v before the package came up", got)
 	}
 }
 
@@ -149,8 +156,8 @@ func TestChooseHarnessSkipsWhatIsNotListed(t *testing.T) {
 	target := env.serve(testPackage(t, "target"))
 	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true}}}
 
-	if hash, _ := l.chooseHarness(context.Background(), "0x"+target, base); hash != base {
-		t.Fatalf("chose %s, want base %s", hash, base)
+	if hash, _, err := l.chooseHarness(context.Background(), "0x"+target, base); hash != base || err != nil {
+		t.Fatalf("chose %s (%v), want base %s", hash, err, base)
 	}
 	if layers.HarnessInstalled(target) {
 		t.Fatal("an unlisted pick was installed")
@@ -163,8 +170,8 @@ func TestChooseHarnessFreshContainerTakesTheNewestListed(t *testing.T) {
 	base := env.installBase(t, testPackage(t, "base"))
 	newest := env.serve(testPackage(t, "newest"))
 	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true, newest: true}, latestHarness: newest}}
-	if hash, _ := l.chooseHarness(context.Background(), "", base); hash != newest {
-		t.Fatalf("chose %s, want the newest listed %s", hash, newest)
+	if hash, _, err := l.chooseHarness(context.Background(), "", base); hash != newest || err != nil {
+		t.Fatalf("chose %s (%v), want the newest listed %s", hash, err, newest)
 	}
 }
 
@@ -173,8 +180,8 @@ func TestChooseHarnessUnconfirmedRunsWhatIsInstalled(t *testing.T) {
 	env := newLayeredEnv(t)
 	base := env.installBase(t, testPackage(t, "base"))
 	l := &layeredRuntime{}
-	if hash, _ := l.chooseHarness(context.Background(), "0x"+env.serve(testPackage(t, "target")), base); hash != base {
-		t.Fatalf("chose %s, want base %s", hash, base)
+	if hash, _, err := l.chooseHarness(context.Background(), "0x"+env.serve(testPackage(t, "target")), base); hash != base || err != nil {
+		t.Fatalf("chose %s (%v), want base %s", hash, err, base)
 	}
 }
 
@@ -319,8 +326,8 @@ func TestRecheckHandsOverToThePickedSealed(t *testing.T) {
 	l, asked, _, target, program := sealedFixture(t)
 	l.picks = picksOf(settings.Versions{Sealed: "0x" + target})
 	l.recheck()
-	if len(*asked) != 1 || (*asked)[0] != target || !l.handedOver {
-		t.Fatalf("asked %v, handed over %v", *asked, l.handedOver)
+	if len(*asked) != 1 || (*asked)[0] != target || !l.handedOver.Load() {
+		t.Fatalf("asked %v, handed over %v", *asked, l.handedOver.Load())
 	}
 	if b, err := os.ReadFile(layers.StagedSealedPath(target)); err != nil || !bytes.Equal(b, program) {
 		t.Fatalf("staged %q, %v", b, err)
@@ -368,5 +375,275 @@ func TestSwitchSealedSkips(t *testing.T) {
 	}
 	if l.switchSealed(context.Background(), target) {
 		t.Fatal("switched to a version the loader went back from")
+	}
+}
+
+// A package the list explicitly does not hold never starts, not even base's
+// or the one this container ran last.
+func TestChooseHarnessNeverStartsAnUnlistedOne(t *testing.T) {
+	env := newLayeredEnv(t)
+	base := env.installBase(t, testPackage(t, "base"))
+	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{}}}
+	if hash, _, err := l.chooseHarness(context.Background(), "", base); !errors.Is(err, errNoListedHarness) || isTransient(err) {
+		t.Fatalf("chose %q (%v), want errNoListedHarness", hash, err)
+	}
+}
+
+// The list cannot be read for the pick, and says base is not listed: nothing
+// starts now, and the error is transient (the boot is tried again later).
+func TestChooseHarnessDoesNotFallBackToADelistedBase(t *testing.T) {
+	env := newLayeredEnv(t)
+	base := env.installBase(t, testPackage(t, "base"))
+	pick := env.serve(testPackage(t, "pick"))
+	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{}, unreadableFor: map[string]bool{pick: true}}}
+	if hash, _, err := l.chooseHarness(context.Background(), "0x"+pick, base); err == nil || !isTransient(err) {
+		t.Fatalf("chose %q (%v), want a transient error", hash, err)
+	}
+}
+
+// Listed packages that do not install are tried again, then the error is
+// transient; a delisted base is not started meanwhile.
+func TestChooseHarnessRetriesInstallsThenGivesUp(t *testing.T) {
+	env := newLayeredEnv(t)
+	base := env.installBase(t, testPackage(t, "base"))
+	missing := hexSum([]byte("not served"))
+	old := harnessInstallBackoff
+	harnessInstallBackoff = time.Millisecond
+	t.Cleanup(func() { harnessInstallBackoff = old })
+	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{missing: true}, latestHarness: missing}}
+	if hash, _, err := l.chooseHarness(context.Background(), "", base); err == nil || !isTransient(err) {
+		t.Fatalf("chose %q (%v), want a transient error", hash, err)
+	}
+}
+
+// startFirst: a package chosen at boot that does not start is recorded as
+// failed and the next one starts; the choice is recorded once up.
+func TestStartFirstFallsBackWhenThePackageDoesNotStart(t *testing.T) {
+	env := newLayeredEnv(t)
+	base := env.installBase(t, testPackage(t, "base"))
+	target := env.serve(testPackage(t, "target"))
+	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true, target: true}, latestHarness: target}}
+	hash, dir, err := l.chooseHarness(context.Background(), "", base)
+	if err != nil || hash != target {
+		t.Fatalf("chose %s (%v)", hash, err)
+	}
+	h := &fakeHarness{}
+	h.UseHarness(hash, dir)
+	starts, stops := 0, 0
+	start := func() error {
+		starts++
+		if h.next == target {
+			return fmt.Errorf("harness.Start: %w: exited", framework.ErrHarnessDidNotStart)
+		}
+		h.running = h.next
+		return nil
+	}
+	if err := l.startFirst(context.Background(), h, start, func(context.Context) { stops++ }); err != nil {
+		t.Fatal(err)
+	}
+	if h.running != base || starts != 2 || stops != 1 {
+		t.Fatalf("running %s after %d starts, %d stops", h.running, starts, stops)
+	}
+	if !layers.HarnessFailed(target) {
+		t.Fatal("the package that did not start was not recorded")
+	}
+	if got := layers.LoadHarnessSelection(); got.Current != base {
+		t.Fatalf("selection %+v, want base once it came up", got)
+	}
+}
+
+// Base's package failing fails the start; another kind of failure (the
+// settings, the key) is not the package's, and nothing is recorded.
+func TestStartFirstFailsWhenBaseOrSomethingElseFails(t *testing.T) {
+	env := newLayeredEnv(t)
+	base := env.installBase(t, testPackage(t, "base"))
+	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true}, latestHarness: base}}
+	if hash, _, err := l.chooseHarness(context.Background(), "", base); err != nil || hash != base {
+		t.Fatalf("chose %s (%v)", hash, err)
+	}
+	h := &fakeHarness{}
+	didNotStart := fmt.Errorf("%w: exited", framework.ErrHarnessDidNotStart)
+	if err := l.startFirst(context.Background(), h, func() error { return didNotStart }, func(context.Context) {}); !errors.Is(err, didNotStart) {
+		t.Fatalf("err %v", err)
+	}
+	if layers.HarnessFailed(base) {
+		t.Fatal("base recorded as failed")
+	}
+
+	target := env.serve(testPackage(t, "target"))
+	l = &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true, target: true}, latestHarness: target}}
+	if hash, _, err := l.chooseHarness(context.Background(), "", base); err != nil || hash != target {
+		t.Fatalf("chose %s (%v)", hash, err)
+	}
+	other := errors.New("no inference key")
+	if err := l.startFirst(context.Background(), h, func() error { return other }, func(context.Context) {}); !errors.Is(err, other) {
+		t.Fatalf("err %v", err)
+	}
+	if layers.HarnessFailed(target) {
+		t.Fatal("a package recorded as failed for a failure that is not its own")
+	}
+}
+
+// A harness restart that did not happen (the agent stopping) records
+// nothing against the package.
+func TestSwitchHarnessNotRestartedRecordsNothing(t *testing.T) {
+	l, h, base, target := switchFixture(t, false)
+	l.mgr = stoppedReloader{}
+	l.picks = picksOf(settings.Versions{Harness: "0x" + target})
+	l.recheck()
+	if layers.HarnessFailed(target) {
+		t.Fatal("a package recorded as failed because the agent was stopping")
+	}
+	if h.next != base {
+		t.Fatalf("next %s, want base %s back", h.next, base)
+	}
+}
+
+type stoppedReloader struct{}
+
+func (stoppedReloader) Reload(context.Context) error { return manager.ErrStopped }
+
+// The image's own sealed, run in place of another version, applies the rule
+// as that version would, and goes back to it once the list confirms it.
+func TestSealedTargetInPlaceOfAnother(t *testing.T) {
+	newLayeredEnv(t)
+	own, other, pick, newest := strings.Repeat("aa", 32), strings.Repeat("bb", 32), strings.Repeat("cc", 32), strings.Repeat("dd", 32)
+	l := &layeredRuntime{sealedHash: own, insteadOf: other,
+		lists: fakeLists{sealed: map[string]bool{own: true, other: true, pick: true, newest: true}, latestSealed: newest}}
+	if got, ok := l.sealedTarget(context.Background(), ""); !ok || got != other {
+		t.Fatalf("target %q %v, want back to %s", got, ok, other)
+	}
+	if got, ok := l.sealedTarget(context.Background(), "0x"+pick); !ok || got != pick {
+		t.Fatalf("target %q %v, want the pick %s", got, ok, pick)
+	}
+	// The one stood in for is delisted: the newest listed, as it would move.
+	l.lists = fakeLists{sealed: map[string]bool{own: true, newest: true}, latestSealed: newest}
+	if got, ok := l.sealedTarget(context.Background(), ""); !ok || got != newest {
+		t.Fatalf("target %q %v, want the newest listed %s", got, ok, newest)
+	}
+	// Still unreadable: stay.
+	l.lists = fakeLists{unreadable: true}
+	if got, ok := l.sealedTarget(context.Background(), ""); ok {
+		t.Fatalf("target %q while the list is unreadable", got)
+	}
+}
+
+// A switch to a version staged already takes it from the loader's directory,
+// without a download.
+func TestSwitchSealedUsesTheStagedProgram(t *testing.T) {
+	newLayeredEnv(t)
+	program := []byte("sealed v2")
+	target := hexSum(program)
+	if err := os.MkdirAll(filepath.Join(layers.LoaderDir, "sealed"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(layers.StagedSealedPath(target), program, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	asked := ""
+	requestSealedSwitch = func(h string) error { asked = h; return nil }
+	l := &layeredRuntime{sealedHash: strings.Repeat("aa", 32), lists: fakeLists{sealed: map[string]bool{target: true}}}
+	if !l.switchSealed(context.Background(), target) || asked != target {
+		t.Fatalf("asked %q", asked)
+	}
+}
+
+// A switch request the loader does not act on lapses: the sealed carries on.
+func TestHandOverLapses(t *testing.T) {
+	env := newLayeredEnv(t)
+	target := env.serve([]byte("sealed v2"))
+	requestSealedSwitch = func(string) error { return nil }
+	old := handOverTimeout
+	handOverTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { handOverTimeout = old })
+	l := &layeredRuntime{sealedHash: strings.Repeat("aa", 32), lists: fakeLists{sealed: map[string]bool{target: true}}}
+	if !l.switchSealed(context.Background(), target) || !l.handedOver.Load() {
+		t.Fatal("did not hand over")
+	}
+	start := time.Now()
+	l.awaitHandOver()
+	if l.handedOver.Load() || time.Since(start) > 5*time.Second {
+		t.Fatalf("handed over %v after %v", l.handedOver.Load(), time.Since(start))
+	}
+}
+
+// An artifact that did not hash to its name is not downloaded again in this
+// container.
+func TestArtifactMismatchIsRemembered(t *testing.T) {
+	env := newLayeredEnv(t)
+	name := hexSum([]byte("the real package"))
+	env.artifacts[name] = []byte("something else")
+	l := &layeredRuntime{}
+	if err := l.installHarness(context.Background(), name); !errors.Is(err, layers.ErrHashMismatch) {
+		t.Fatalf("install: %v, want a hash mismatch", err)
+	}
+	delete(env.artifacts, name) // a second download would now 404
+	if err := l.installHarness(context.Background(), name); !errors.Is(err, layers.ErrHashMismatch) {
+		t.Fatalf("second install: %v, want the remembered mismatch", err)
+	}
+}
+
+// Pruning keeps base's package, the running one, the selection and the
+// owner's pick, the staged sealed versions the loader names and this one; it
+// removes the rest, and what a cut-off install left.
+func TestPruneRemovesWhatNothingRuns(t *testing.T) {
+	env := newLayeredEnv(t)
+	base := env.installBase(t, testPackage(t, "base"))
+	keep, old := testPackage(t, "keep"), testPackage(t, "old")
+	for _, p := range [][]byte{keep, old} {
+		if err := layers.InstallHarness(layers.VerifyingReader(nopCloser{bytes.NewReader(p)}, hexSum(p)), hexSum(p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stale := filepath.Join(layers.PackagesDir, ".install-x")
+	if err := os.MkdirAll(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	own, current, gone := strings.Repeat("aa", 32), strings.Repeat("bb", 32), strings.Repeat("cc", 32)
+	if err := os.MkdirAll(filepath.Join(layers.LoaderDir, "sealed"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{own, current, gone} {
+		if err := os.WriteFile(layers.StagedSealedPath(h), []byte(h), 0o500); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(layers.LoaderDir, "current"), []byte(current), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := &fakeHarness{running: base}
+	l := &layeredRuntime{sealedHash: own, harness: h, picks: picksOf(settings.Versions{Harness: "0x" + hexSum(keep)})}
+	l.prune()
+	for _, p := range []string{base, hexSum(keep)} {
+		if !layers.HarnessInstalled(p) {
+			t.Fatalf("package %s removed", p)
+		}
+	}
+	if layers.HarnessInstalled(hexSum(old)) {
+		t.Fatal("an old package kept")
+	}
+	if _, err := os.Stat(stale); err == nil {
+		t.Fatal("a cut-off install kept")
+	}
+	for h, want := range map[string]bool{own: true, current: true, gone: false} {
+		if _, err := os.Stat(layers.StagedSealedPath(h)); (err == nil) != want {
+			t.Fatalf("staged %s present=%v, want %v", h, err == nil, want)
+		}
+	}
+}
+
+// failTrial: a cause outside the version is TrialTransientExit, any other
+// TrialFailedExit; a sealed not on trial does not exit.
+func TestFailTrialExitCodes(t *testing.T) {
+	old := exitSealedProcess
+	t.Cleanup(func() { exitSealedProcess = old })
+	var codes []int
+	exitSealedProcess = func(code int) { codes = append(codes, code) }
+	trial := &config.Bootstrap{Trial: true}
+	failTrial(trial, "chain bootstrap", transient(errors.New("rpc down")))
+	failTrial(trial, "framework resolve", errors.New("no such framework"))
+	failTrial(&config.Bootstrap{}, "agent start", errors.New("x"))
+	if want := []int{layers.TrialTransientExit, layers.TrialFailedExit}; !reflect.DeepEqual(codes, want) {
+		t.Fatalf("exit codes %v, want %v", codes, want)
 	}
 }

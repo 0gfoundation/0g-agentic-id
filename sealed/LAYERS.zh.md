@@ -60,7 +60,7 @@
 3. sealed 向 attestor 申请 agent 身份私钥时报上 sealed 哈希，base 哈希在证书里。attestor 确认 base 和 sealed 分别在信任合约的镜像名单和 sealed 名单里才下发。以后每次 provision 都复查，移出白名单的版本拿不到私钥。
 4. sealed 按哈希取 harness 官方版本，确认它在 harness 名单里，再套上 iData 里的 diff，用 agent 用户运行。harness 拿不到任何密钥，所以 attestor 下发私钥时不查 harness，diff 也不设白名单，只记录。harness 能用签名 socket，但能签什么由签名策略决定。
 
-加载器只链接标准库：它查白名单是向 `CHAIN_RPC_URL` 发 `eth_call`，先读 AgenticID 的 `trustRegistry()` 得到信任合约的地址，再读信任合约的 `isListed`，和 sealed 读链上数据经的是同一个节点。链上明确答"不在"的版本不执行，加载器依次换成它换下来的版本、base 自带的版本；都不在，就什么都不执行，只能重建容器。查不到答案时（节点连不上，或者 AgenticID 还没有指向信任合约）照常执行：attestor 下发私钥前查的是同一个白名单，不在的版本拿不到私钥，provision 被拒后它换到名单里最新登记的版本（3.1）。
+加载器只链接标准库和 `golang.org/x/sys/unix`：它查白名单是向 `CHAIN_RPC_URL` 发 `eth_call`，先读 AgenticID 的 `trustRegistry()` 得到信任合约的地址，再读信任合约的 `isListed`，和 sealed 读链上数据经的是同一个节点。链上明确答"不在"的版本不执行，加载器依次换成它换下来的版本、base 自带的版本；都不在，就什么都不执行，只能重建容器。sealed 下载来的版本，只有链上明确答"在"才执行。查不到答案时（节点连不上、节点报错，或者 AgenticID 没有指向信任合约），加载器改跑 base 自带的版本：它由镜像哈希覆盖，attestor 从证书里核对镜像哈希；而下载来的版本的哈希，attestor 只能听正在运行的 sealed 自己报。加载器仍记着原来的版本，并把它告诉改跑的 sealed（`SEALED_INSTEAD_OF`），名单读得到、确认它还在之后，sealed 换回去（3.1）。
 
 换版本时下载新版的是正在运行的 sealed：它在链上确认目标版本在白名单里，按哈希从公开的制品发布处下载，哈希对上名字才交给加载器。
 
@@ -73,9 +73,9 @@
 
 加载器（`sealed/cmd/loader`）只做四件事：
 1. 启动后先加固自己：不可 dump，设置 `no_new_privs`，和 sealed 一样。
-2. 保管容器密钥、证书和创建时注入的其他环境变量：留在自己的环境里，每次启动 sealed 都原样传下去，另加 `SEALED_HASH`（它核对过的哈希）和 `SEALED_TRIAL`（试运行）。原地换 sealed 时容器不重启，平台不会再注入一次。加载器是 root、不可 dump，别的用户读不到它的 `/proc/1/environ`。
-3. 核对哈希、在链上确认在白名单里之后启动 sealed：上次换到的版本，或者 base 自带的版本（第 2 节）。换上来的版本由 sealed 放进加载器的状态目录（`/var/lib/loader`，只有 root 能进）。
-4. 守着 sealed：转发停止信号，回收孤儿进程；sealed 请求换版本时，再核对一次新版本的哈希，停掉旧 sealed，清掉它留下的进程，以试运行方式启动新版本；新版本没确认起来就退出时，换回原来的版本，并记下这个版本不再换；分层流程下 sealed 自己退出就重启它，10 分钟内最多 5 次。
+2. 保管容器密钥、证书和创建时注入的其他环境变量：留在自己的环境里，每次启动 sealed 都原样传下去，另加 `SEALED_HASH`（它核对过的哈希）、`SEALED_TRIAL`（试运行）和 `SEALED_INSTEAD_OF`（base 自带的 sealed 是替哪个版本跑的，第 2 节）。原地换 sealed 时容器不重启，平台不会再注入一次。加载器是 root、不可 dump，别的用户读不到它的 `/proc/1/environ`。
+3. 核对哈希、在链上确认在白名单里之后启动 sealed：上次换到的版本，或者 base 自带的版本；名单读不到时，也由 base 自带的版本替换上来的版本跑（第 2 节）。换上来的版本由 sealed 放进加载器的状态目录（`/var/lib/loader`，只有 root 能进）。
+4. 守着 sealed：转发停止信号，回收孤儿进程；sealed 请求换版本时，再核对一次新版本的哈希和白名单，停掉旧 sealed，清掉它留下的进程，以试运行方式启动新版本；新版本没确认起来就退出，或者启动 20 分钟后还没确认时，换回原来的版本，并记下这个版本不再换。因为版本以外的原因起不来的那次启动，以单独的退出码退出（3.1），加载器过一阵再启动同一个版本。分层流程下 sealed 自己退出就重启它，10 分钟内最多 5 次；因为 owner 要求重启而退出的，立即再启动，不计次数。
 
 重启分四级，从重到轻。重的一级包含轻的：重建或重启容器后，加载器、sealed、harness 依次启动；重启 sealed 连带重启 harness。
 
@@ -92,14 +92,14 @@ owner 可以直接重启 harness 或 sealed（`POST /_seal/restart`，第 10 节
 
 ### 3.1 原地更新 sealed
 
-1. **发布**：项目方编出新版 sealed，以哈希命名发布到制品发布处（第 10 节）。部署者（合约 owner）把哈希登记进信任合约的 sealed 名单，立即生效。
+1. **发布**：项目方编出新版 sealed，以哈希命名发布到制品发布处（第 10 节）。部署者把哈希登记进信任合约的 sealed 名单：由信任合约的 owner 发起的 Timelock 操作，先排期，等待期间可以取消（主网一天，测试网和 dev 不用等）。移出名单立即生效，owner 或 guardian 密钥都能移。
 2. **触发**：owner 在设置里选版本（第 10 节的设置文档）。旧版还在白名单里时，换不换由 owner 决定：owner 推送设置后，sealed 立即换。部署者把旧版移出白名单，就是必须更新：sealed 在开机时和每次心跳（5 分钟）时查自己还在不在名单里，不在就换到 owner 选的版本；owner 没选，或者选的也不在名单里，就换到名单里最新登记的版本（信任合约的 `latest`）。
 3. **下载校验**：sealed 在链上确认目标版本在 sealed 名单里，按哈希从制品发布处下载，哈希对上才放进加载器的状态目录，再请求加载器切换。
-4. **交接**：加载器再核对一次哈希，在链上再查一次白名单，通知旧 sealed 退出。旧 sealed 停掉 harness 后退出，加载器清掉它留下的进程。最后一次提交之后的改动留在磁盘上，新 sealed 启动时保留并提交（第 3 节）。
+4. **交接**：加载器再核对一次哈希，在链上再查一次白名单，通知旧 sealed 退出。旧 sealed 停掉 harness 后退出，加载器清掉它留下的进程。最后一次提交之后的改动留在磁盘上，新 sealed 启动时保留并提交（第 3 节）。已经放在加载器目录里的版本不再下载。加载器两分钟内没有动作时（比如它自己读名单失败），旧 sealed 接着跑自己的版本。
 5. **启动新版**：加载器以试运行方式启动新 sealed，交给它容器密钥和创建时的环境变量。
 6. **重新 provision**：新 sealed 用同一个容器密钥向 attestor 申请身份私钥，报上新的 sealed 哈希。attestor 确认 base 和 sealed 都在白名单里，重新下发。
 7. **恢复**：新 sealed 从链上恢复 iData，启动 harness，上报状态，然后向加载器确认已起来。ServeProof 里的 sealed 哈希随之更新。
-8. **回退**：新版没确认起来就退出时（起不来、provision 被拒），加载器换回原来的版本，并记下新版在这个容器里不再换。原来的版本也已移出白名单时，它的 provision 被拒，换到名单里最新登记的版本；没有可用的版本，只能重建容器。
+8. **回退**：新版没确认起来就退出时（起不来、provision 被拒），或者启动 20 分钟后还没确认时，加载器换回原来的版本，并记下新版在这个容器里不再换。原来的版本也已移出白名单时，它的 provision 被拒，换到名单里最新登记的版本；没有可用的版本，只能重建容器。因为版本以外的原因起不来（provision 时限内 attestor 没有答复、读链或下载存储失败）不算回退：sealed 以单独的退出码退出，加载器过一阵（30 秒起，加倍到 5 分钟）再启动同一个版本；这样连续失败一小时后才换回去，而且只换回仍在名单里的版本。
 
 更新期间 8080 暂停服务，时长等于 sealed 正常启动一次。
 
@@ -121,7 +121,7 @@ owner 可以直接重启 harness 或 sealed（`POST /_seal/restart`，第 10 节
 ### 4.2 中立代理
 
 1. **入口**：外部只能连 8080。sealed 只转发清单里的 harness 路由和方法。清单写在 sealed 的 adapter 里，harness 不能自己加。对外服务的响应签 ServeProof。
-2. **推理**：harness 只能经 sealed 调模型。sealed 代填 key，只转发到 owner 设置的路由，模型名也按 owner 的设置，并在每个模型请求里放入平台说明和 doctrine。harness 改了自己的代码，也去不掉这两样。
+2. **推理**：harness 只能经 sealed 调模型。sealed 代填 key，只转发到 owner 设置的路由，模型名也按 owner 的设置，并在每个模型请求里放入平台说明和 doctrine。harness 改了自己的代码，也去不掉这两样。只放行模型调用，按路由下的精确路径：`chat/completions`、`messages`、`responses` 和模型列表。
 3. **出站**：harness 除调模型以外的外发请求，比如搜网页、调第三方 API、装依赖，也经过 sealed，由 sealed 代填凭证、按白名单放行。这一条依赖网络层能拦住 harness 绕过 sealed 直连外网（见第 9 节）。
 4. **签名**：签名 socket 只签三种格式：personal_sign、EIP-712 和交易；不签任意哈希，也签不了 ServeProof 所在的那一类。三种格式之内，它拒签发往 AgenticID `update` 或 `updateAt` 的交易（iData 由 drift watcher 提交），并把签出的每个签名和拒绝的每个请求记下来给 owner 看。其余能签什么，由签名策略决定（第 9 节第 4 条）。
 
@@ -154,7 +154,7 @@ harness 里同类的插件可以保留，但只算方便，不算边界。
 ### 5.2 启动
 
 1. sealed 只启动已经提交上链的版本：按哈希取官方版本包并确认它在白名单里，套上 diff。官方版本包里依赖齐全；diff 改了锁文件时，只补装变化的依赖，从 npm 下载并按完整性哈希校验，安装以 agent 用户执行。base 不带编译工具链：diff 引入的依赖如果要编译原生模块，装不上，按 5.3 回退；纯 JS 的依赖不受影响。
-2. 装好的版本放进 agent 改不了的只读目录（root 所有，agent 只能读和执行），留在本地，之后重启不用再装；重建容器后磁盘清空，要重新装。sealed 用 agent 用户从这里启动 harness，环境变量里没有模型 key、owner 的令牌或其他密钥：模型 key 由推理代理代填，harness 校验的令牌不是 owner 拿到的那个（4.3）。sealed 记着这个容器在跑哪个官方版本，容器重启后接着跑它。
+2. 装好的版本放进 agent 改不了的只读目录（root 所有，agent 只能读和执行），留在本地，之后重启不用再装；重建容器后磁盘清空，要重新装。这里已经不跑的版本（不是 base 自带的、正在跑的、这个容器最近跑的两个，也不是 owner 选的）会被删掉；下载内容和哈希对不上的版本，这个容器里不再下载。sealed 用 agent 用户从这里启动 harness，环境变量里没有模型 key、owner 的令牌或其他密钥：模型 key 由推理代理代填，harness 校验的令牌不是 owner 拿到的那个（4.3）。sealed 记着这个容器在跑哪个官方版本，容器重启后接着跑它。
 3. harness 和 agent 运行的命令是同一个用户，sealed 从外面确认不了端口后面就是自己启动的那个进程。要做到这一点，得由 sealed 创建监听 socket 交给 harness（harness 要支持从传入的描述符监听），并让 harness 和 agent 运行的命令分开用户。第一步不做。
 4. sealed 把官方版本哈希写进 ServeProof；diff 作为 iData 条目，照常经 `dataHashes` 进去（第 7 节）。
 
@@ -162,8 +162,8 @@ harness 里同类的插件可以保留，但只算方便，不算边界。
 
 1. 工作目录变了，30 秒检测器算出新的 diff，像对其他角色一样提交上链。
 2. 新版本在 harness 下次重启时生效。harness 可以经签名 socket 请求重启（`POST /harness/restart`），sealed 回复后按 5.2 重启它。重启不动磁盘，还没提交的改动由检测器照常提交。
-3. 新版本起不来、健康检查不通过时，sealed 回退到本地保留的上一个能跑的版本，并记下新版本在这个容器里不再换。新容器里没有这份时，回退到 base 自带的官方版本，不带 diff。
-4. 官方版本的更新规则和 sealed 一样（3.1）：owner 在设置里选版本，旧版还在白名单里时由 owner 决定换不换；部署者把旧版移出白名单，就换到 owner 选的版本，owner 没选或选的也不在名单里，就换到最新登记的官方版本。开机时 sealed 依次看 owner 选的版本、这个容器上次跑的版本、名单里最新登记的版本、base 自带的版本，用第一个在白名单里、装得上的；一个都确认不了时（链上读不到），跑这个容器已有的版本并记日志。换的时候 sealed 把 diff 套到新版本上；套不上时，角色改成新的官方版本、diff 为空并提交，原来的 diff 留在链上历史里。
+3. 新版本起不来、健康检查不通过时，sealed 记下它在这个容器里不再用，改跑另一个：换版本时是之前在跑、本地保留的版本；开机时是第 4 条顺序里的下一个，base 自带的排最后。没能重启（比如 agent 正在停止）不算哪个版本失败。新容器里没有本地那份时，回退到 base 自带的官方版本，不带 diff。
+4. 官方版本的更新规则和 sealed 一样（3.1）：owner 在设置里选版本，旧版还在白名单里时由 owner 决定换不换；部署者把旧版移出白名单，就换到 owner 选的版本，owner 没选或选的也不在名单里，就换到最新登记的官方版本。开机时 sealed 依次看 owner 选的版本、这个容器上次跑的版本、名单里最新登记的版本、base 自带的版本，用第一个在白名单里、装得上的；名单明确说不在的版本一律不跑。这个容器上次跑的版本或 base 自带的版本读不到名单答案时，跑它（已在磁盘上）并记日志。名单里有版本但一个都装不上时（制品发布处连不上），sealed 再试几分钟，然后退出，由加载器过一阵再启动。换的时候 sealed 把 diff 套到新版本上；套不上时，角色改成新的官方版本、diff 为空并提交，原来的 diff 留在链上历史里。
 
 ## 6. 不能直接导出
 
@@ -203,7 +203,7 @@ owner 怎么都拿不到的，是 agent 身份私钥和数据密钥：owner 不�
 
 ## 7. ServeProof
 
-0g-harness 的 agent 签 ServeProof v2，其他三个框架照旧签 v1。v2 在 v1 的字段之外，把各层分开放：
+0g-harness 的 agent 签 ServeProof v2，其他三个框架照旧签 v1。分层流程下，0g-harness 的 agent 只签 v2，否则不签：harness 还没启动时没有可写的层，就不出证明。v2 在 v1 的字段之外，把各层分开放：
 
 | 字段 | 内容 |
 |---|---|
@@ -227,8 +227,8 @@ owner 怎么都拿不到的，是 agent 身份私钥和数据密钥：owner 不�
   ```
 
   每一项都是 32 字节，abi.encode 就是依次拼接；签名方式和 v1 相同（EIP-191 0x00，绑定注册合约地址）。v1 的原像以 chainId 开头、共 9 个字，v2 以版本标记开头、共 14 个字。
-- `X-Agent-Proof` 里 v2 的信封在 v1 字段之后加 `version`（2）、`sealed_hash`、`harness_hash`、`inference_url`、`model`；v1 信封没有 `version`。验证方按 `version` 选摘要。框架自带接线的 provider 没有经 sealed 的推理地址，`inference_url` 为空串。
-- 已知答案向量：v1 向量的输入，加 sealedHash 0x55…55、harnessHash 0x66…66、inferenceURL `https://router.example/v1`、model `model-x`，得 proofHashV2 `0xdac99843c8993224fa49be6989ea6cb8fc3c5190e2d2e8be132e9d073ba73a73`，绑定 0x…B7 后的摘要 `0x50f91a86a4e744dddd29bc16e936ab717a8c54074458e4332c5f43661538df4e`（`sealed/internal/proxy/serveproof_v2_test.go`）。
+- `X-Agent-Proof` 里 v2 的信封在 v1 字段之后加 `version`（2）、`sealed_hash`、`harness_hash`、`inference_url`、`model`；v1 信封没有 `version`。验证方按 `version` 选摘要。框架自带接线的 provider 没有经 sealed 的推理地址，`inference_url` 为空串。`inference_url` 和 `model` 按 UTF-8 字节计算哈希，在信封的 JSON 里也是原样的 UTF-8：验证方先把 base64 解成字节，再按 UTF-8 解成文字。
+- 已知答案向量：v1 向量的输入，加 sealedHash 0x55…55、harnessHash 0x66…66、inferenceURL `https://router.example/v1`、model `model-x`，得 proofHashV2 `0xdac99843c8993224fa49be6989ea6cb8fc3c5190e2d2e8be132e9d073ba73a73`，绑定 0x…B7 后的摘要 `0x50f91a86a4e744dddd29bc16e936ab717a8c54074458e4332c5f43661538df4e`（`sealed/internal/proxy/serveproof_v2_test.go`）。model 换成 `模型-é`（UTF-8 为 `e6a8a1e59e8b2dc3a9`）时，proofHashV2 为 `0x00dc0a9ba85191968c4bdcb00d11b4003216306420d80a6e68432fe01f24a977`，摘要为 `0xcab300c137d0d07deb4e73c3e027db4ff63df5045e0a95767519cce28ffbd963`。
 - 注册合约加一个带版本号的入口：证明结构里有 `version`，合约按它选摘要，目前只接受 2；验签后把这几项和 feedback 一起记下，推理地址和模型名写进事件。v1 的两个入口（`attestFeedback`、`attestFeedbackWithTask`）不变。
 - 验证方逐项核对：
   - base、sealed 和 harness 官方版本，分别对信任合约里的镜像、sealed、harness 名单；
@@ -275,7 +275,7 @@ salt(root) = HMAC-SHA256(数据密钥, "AgentDNA.Commitment.v1" ‖ 0x00 ‖ 角
 1. **拆开 base 和 sealed，上 ServeProof v2**：
    - 加载器、信任合约（第 10 节）、attestor 两层校验、sealed 原地更新（3.1）、停机和重启时保留未提交的改动（第 3 节）；
    - ServeProof v2 的五份实现、注册合约带版本号的入口和测试向量；
-   - 信任合约是新部署的，它的 sealed 和 harness 名单只放 0g-harness 用的版本。AgenticID 和注册合约各升级一次，一起走 Timelock：主网等 1 天，测试网和 dev 不用等。之后登记新版本由部署者直接调用信任合约，立即生效。
+   - 信任合约是新部署的，它的 sealed 和 harness 名单只放 0g-harness 用的版本。AgenticID 和注册合约各升级一次，一起走 Timelock：主网等 1 天，测试网和 dev 不用等。之后登记新版本，也是由信任合约的 owner 发起的 Timelock 操作，先排期，等待期间可以取消；移出名单立即生效，owner 或 guardian 密钥都能移。
 2. **官方版本 harness，动态加载**：
    - 项目方打包官方版本，sealed 按哈希取、对白名单，更新规则同 sealed；
    - 从只读目录运行、经签名 socket 请求重启、回退；
@@ -286,7 +286,7 @@ salt(root) = HMAC-SHA256(数据密钥, "AgentDNA.Commitment.v1" ‖ 0x00 ‖ 角
 ### 兼容现有 0g-harness 镜像
 
 - 现有镜像照常运行：镜像名单整体搬进信任合约，它们的哈希照常有效；不报 sealed 哈希的容器，attestor 走原来的 provision 流程；它们照旧签 ServeProof v1。
-- 老流程的代码在 attestor、SDK、控制台和 `verify-agent.sh` 里各集中在一处，按数据分流：带 sealed 哈希的开机请求、带 `version` 的证明走新流程，其余走老流程。老镜像全部下线后，这几处整块删掉；合约里 v1 的入口保留。
+- 老流程的代码在 attestor、SDK、控制台和 `verify-agent.sh` 里各集中在一处，按数据分流：带 sealed 哈希的开机请求、带 `version` 的证明走新流程，其余走老流程。老镜像全部下线后，这几处整块删掉；合约里 v1 的入口保留。sealed 里 v1 证明和 v1 开机声明放在 `legacy_v1.go`（proxy 和 provision 两个包），其余为它们保留的分支都标了 `LEGACY(v1)`；为 AgenticID 没有指向信任合约的链保留的分支标了 `LEGACY(pre-1.4.0)`。
 - 发布顺序：先合约（信任合约，以及同一批升级的 AgenticID 和注册合约），再 SDK、控制台和 `verify-agent.sh`，最后 attestor。新版 attestor 一运行就声明 `layered`，带加载器的镜像随即开始签 v2，验证方要先能验。
 - iData 两个方向都能读：新 sealed 读旧条目，没有明文承诺的在下次上传时补上；旧 sealed 解析条目描述时忽略多出来的字段，agent 退回旧镜像也能恢复。
 - SDK、attestor 控制台和 `verify-agent.sh` 按证明自己的版本选 v1 或 v2 来验，不按框架判断：迁移期间，同是 0g-harness 的 agent，两种证明都会有。
@@ -298,7 +298,7 @@ salt(root) = HMAC-SHA256(数据密钥, "AgentDNA.Commitment.v1" ‖ 0x00 ‖ 角
 镜像侧可以先于 attestor、合约和 SDK 上线，换掉现在的 0g-harness 镜像。第一步里 sealed 一侧的部分都已写进新镜像：加载器的核对、换版本、试运行、回退和重启（第 3 节、3.1）；官方版本包的下载、校验、解开、切换和回退（5.2、5.3）；上报 sealed 哈希和 ServeProof v2（第 7 节）；停机和重启时保留未提交的改动（第 3 节）；上传时写明文承诺（7.1）。
 
 这些都要 attestor 在 `GET /provision` 的回答里声明支持新流程（`"layered": true`，第 10 节）才生效。在那之前新镜像以兼容方式运行：
-- 加载器只运行镜像里自带的那个 sealed：它的 sha256 在编镜像时编进加载器，对不上就不运行；sealed 退出时加载器随之退出，和 sealed 作为 PID 1 时一样；
+- 加载器只运行镜像里自带的那个 sealed：它的 sha256 在编镜像时编进加载器，对不上就不运行。之前在分层流程下跑过别的版本的容器也是这样：没有信任合约可答，下载来的版本不运行（第 2 节）。从没跑过分层流程的容器里，sealed 退出时加载器随之退出，和 sealed 作为 PID 1 时一样；
 - sealed 不上报 sealed 哈希（旧 attestor 会拒收），照旧签 ServeProof v1；sealed 和 harness 都在镜像里，镜像哈希仍然覆盖全部；
 - harness 只跑镜像里自带的官方版本；
 - 停机和重启照样保留未提交的改动：这不依赖 attestor。
@@ -306,7 +306,7 @@ salt(root) = HMAC-SHA256(数据密钥, "AgentDNA.Commitment.v1" ‖ 0x00 ‖ 角
 ### 中立代理：可以单独发布
 
 harness 只跑官方版本，原来写在 harness 里的规则都还在，所以中立代理不必和第一步同一个版本发布：
-- 推理代理覆盖所有 provider：sealed 在本机回环端口开推理代理，作为 harness 的模型地址；每个请求按 owner 设置的模型名转发到 owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方地址，第 7 节），key 由凭证代理在出去时代填，harness 拿到的 key 是个占位值；只放行对话、消息和模型列表这几类调用；
+- 推理代理覆盖所有 provider：sealed 在本机回环端口开推理代理，作为 harness 的模型地址；每个请求按 owner 设置的模型名转发到 owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方地址，第 7 节），key 由凭证代理在出去时代填，harness 拿到的 key 是个占位值；只放行 chat/completions、messages、responses 和模型列表这几类调用，按精确路径；
 - doctrine 由推理代理注入：平台说明（含 doctrine）放在每个模型请求的系统提示末尾，sealed 不再给 0g-harness 写 `/run` 下的平台说明文件；
 - 令牌不交给 harness：owner 经 `/_seal/auth` 拿到的令牌和 harness 校验的令牌是两个，proxy 在入口核对 owner 的令牌，换成 harness 的再转发；
 - 0g-harness 的路由逐条列出：方法加路径，按 harness 协议第 1 版，清单以外的请求返回 404；
@@ -362,14 +362,14 @@ ProvisionBoot.v2:0x<seal_id>:<generation>:<sha256(ticket) 十六进制>:<boot_id
 
 **设置文档**：owner 的设置文档加 `versions`：`{"sealed": "0x<sha256>", "harness": "0x<sha256>"}`，是 owner 选的版本，没选的层不写。attestor 照旧不解析设置文档。sealed 收到推送时和开机时按它换版本（3.1、5.3）；选的版本不在名单里就不换，记日志。
 
-**owner 重启**（容器的 `POST /_seal/restart`）：请求体 `{"layer": "harness"}` 或 `{"layer": "sealed"}`，owner 签名，格式和清空对话等 owner 操作相同（标签 `0GSealRestart`，签名里绑定请求体摘要）；同一条签名只认一次。先回复 202，再重启：harness 由 sealed 重启进程；sealed 照停机的步骤停下 agent 后退出，加载器重新启动它。只对带加载器的 0g-harness 镜像开放：重启 sealed 要求 attestor 已声明 `layered`，并且这次启动已经确认起来；其他镜像回 501。
+**owner 重启**（容器的 `POST /_seal/restart`）：请求体 `{"layer": "harness"}` 或 `{"layer": "sealed"}`，owner 签名，格式和清空对话等 owner 操作相同（标签 `0GSealRestart`，签名里绑定请求体摘要）；同一条签名只认一次，重启后的 sealed 也不再认（用过的请求记在容器磁盘上，只有 root 能读写）。先回复 202，再重启：harness 由 sealed 重启进程；sealed 照停机的步骤停下 agent 后以单独的退出码退出，加载器立即重新启动它，不算作崩溃。只对带加载器的 0g-harness 镜像开放：重启 sealed 要求 attestor 已声明 `layered`，并且这次启动已经确认起来；其他镜像回 501。
 
 **下载**：官方的 sealed 程序和 harness 包是公开 GitHub 仓库 `0gfoundation/0g-agentic-id` 的 `artifacts` 发布（release）的附件，各以自己的 sha256（64 位小写十六进制）命名。sealed 下载 `https://github.com/0gfoundation/0g-agentic-id/releases/download/artifacts/<sha256>`，下载后核对哈希，对不上就丢弃。大小上限 1 GiB。制品从哪里来不影响信任：名字取自信任合约的名单，内容必须哈希到这个名字。任何人都能下载名单上的版本，看它里面是什么。
 
-**信任合约**（暂称 `TrustRegistry`）：部署者的信任决定都放在这里：谁可以代表平台，什么代码可以运行 agent。它和其他合约一样可升级、走 Timelock，owner 和 AgenticID 的相同。
+**信任合约**（暂称 `TrustRegistry`）：部署者的信任决定都放在这里：谁可以代表平台，什么代码可以运行 agent。它和其他合约一样可升级、走 Timelock。它的 owner 是该环境的 Timelock（主网 1 天，测试网和 dev 不用等）：授予信任，也就是登记版本、信任 attestor，是先排期、等待期间可以取消的操作。撤销信任，也就是移出版本、撤掉 attestor，立即生效，owner 或 guardian 密钥都能做（`setGuardian`、`guardian()`）。
 - attestor 名单和它们绑定的 Tapp 应用实例：从 AgenticID 原样搬来，函数和含义不变：`addTrustedAttestor`、`removeTrustedAttestor`、`bindTrustedAttestorApp`、`requireInstanceBoundAttestors`、`isTrustedAttestor`、`trustedAttestorAppBinding`、`instanceBoundAttestorsRequired`。
 - 代码名单，按种类登记。种类是 `keccak256("image")`、`keccak256("sealed")`、`keccak256("harness")`；以后再加一层就是多一个种类，合约不用改。
-  - `list(bytes32 kind, bytes32 hash)`、`delist(bytes32 kind, bytes32 hash)`：owner 调用，立即生效，发 `Listed`、`Delisted` 事件；
+  - `list(bytes32 kind, bytes32 hash)`：owner 调用（即 Timelock 操作）；`delist(bytes32 kind, bytes32 hash)`：owner 或 guardian 调用，立即生效；分别发 `Listed`、`Delisted` 事件；
   - `isListed(bytes32 kind, bytes32 hash) returns (bool)`；
   - `latest(bytes32 kind) returns (bytes32)`：还在名单里、最后登记的那个，没有就是 0；
   - `listed(bytes32 kind) returns (bytes32[])`：名单里的全部。

@@ -108,6 +108,11 @@ type Result struct {
 	// started: a version it refuses (taken off the sealed list) can still
 	// switch to the newest listed one.
 	Layered bool
+	// Unanswered is true when provisioning failed without a definitive
+	// answer: the retry window ran out on an attestor that could not be
+	// reached or answered only "try again" (5xx, 429, 409). The cause is
+	// outside this sealed version.
+	Unanswered bool
 }
 
 // authorization is the GET /provision answer.
@@ -214,7 +219,7 @@ func FromAttestor(boot Boot) Result {
 	remaining := boot.Started.Add(retryWindow).Sub(clock.now())
 	if remaining <= 0 {
 		logger.Logf("FAIL provision: more than %s since boot", retryWindow)
-		return Result{}
+		return Result{Unanswered: true}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), remaining)
 	defer cancel()
@@ -264,7 +269,9 @@ func (c *claim) run() Result {
 			}
 		}
 		if !c.wait(attempt, backoff) {
-			return c.failed()
+			r := c.failed()
+			r.Unanswered = true
+			return r
 		}
 		backoff = min(2*backoff, maxBackoff)
 	}
@@ -360,15 +367,21 @@ func (c *claim) provision(auth authorization) (Result, action) {
 
 // layered reports whether a claim under auth runs the layered flow: the
 // attestor declared it and the loader named this program's hash.
+// LEGACY(v1): false only for an image without the loader, or an attestor
+// that does not declare the flow (a chain whose AgenticID names no trust
+// registry); legacy_v1.go.
 func (c *claim) layered(auth authorization) bool {
 	return auth.Layered && c.boot.SealedHash != ""
 }
 
 // request builds the POST body for auth, signed at c.startedAt.
 func (c *claim) request(auth authorization) (provisionRequest, error) {
-	message := bootMessage(c.boot.Certificate.SealID, auth.Generation, c.ticketHash, c.bootID[:], c.startedAt)
+	var message string
 	if c.layered(auth) {
 		message = bootMessageV2(c.boot.Certificate.SealID, auth.Generation, c.ticketHash, c.bootID[:], c.startedAt, c.boot.SealedHash)
+	} else {
+		// LEGACY(v1)
+		message = bootMessage(c.boot.Certificate.SealID, auth.Generation, c.ticketHash, c.bootID[:], c.startedAt)
 	}
 	signature, err := crypto.Sign(crypto.Keccak256([]byte(message)), c.key)
 	if err != nil {
@@ -479,12 +492,9 @@ func lowerHex(value string, size int) bool {
 	return err == nil && len(decoded) == size && hex.EncodeToString(decoded) == value
 }
 
-func bootMessage(seal string, generation int64, ticketHash [32]byte, bootID []byte, startedAt int64) string {
-	return fmt.Sprintf("ProvisionBoot.v1:0x%s:%d:%x:%x:%d", seal, generation, ticketHash, bootID, startedAt)
-}
-
-// bootMessageV2 is the layered claim: bootMessage's fields, then the sealed
-// hash (64 lowercase hex, no 0x).
+// bootMessageV2 is the layered claim: the seal, the generation, the boot
+// ticket's hash, the boot id and when the boot started, then the sealed hash
+// (64 lowercase hex, no 0x).
 func bootMessageV2(seal string, generation int64, ticketHash [32]byte, bootID []byte, startedAt int64, sealedHash string) string {
 	return fmt.Sprintf("ProvisionBoot.v2:0x%s:%d:%x:%x:%d:%s", seal, generation, ticketHash, bootID, startedAt, sealedHash)
 }

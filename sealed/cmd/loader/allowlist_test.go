@@ -101,15 +101,33 @@ func TestAllowlistAnswers(t *testing.T) {
 	if newAllowlist("", fakeAgenticID) != nil || newAllowlist(srv.URL, "") != nil {
 		t.Fatal("an allowlist without its endpoint or contract")
 	}
+	// Without its endpoint the list cannot be read: no answer.
 	var none *allowlist
-	if refused, err := none.refuses(listed); refused || err != nil {
+	if refused, err := none.refuses(listed); refused || err == nil {
 		t.Fatalf("no allowlist: %v %v", refused, err)
 	}
-	// An AgenticID before 1.4.0 names no trust registry: no answer, so the
-	// version runs.
+	// An AgenticID before 1.4.0 names no trust registry: no answer either.
 	pre := newAllowlist(fakeRPC(t, nil).URL, fakeAgenticID)
 	if refused, err := pre.refuses(delisted); refused || err == nil {
 		t.Fatalf("no trust registry: %v %v", refused, err)
+	}
+}
+
+// An AgenticID that names no trust registry (one before 1.4.0, or one rolled
+// back to it) gives no answer: a staged version does not run, the image's own
+// runs in its place, and the staged one stays recorded.
+func TestRunStandsInWhenTheChainNamesNoTrustRegistry(t *testing.T) {
+	s, _, _ := helper(t, "report", time.Second, true)
+	staged := stageCopy(t, s, "\nstaged\n")
+	s.allow = newAllowlist(fakeRPC(t, nil).URL, fakeAgenticID)
+	if code := waitCode(t, runAsync(s)); code != 7 {
+		t.Fatalf("exit code %d, want 7", code)
+	}
+	if got, want := s.state.read("report"), s.builtin.hash+" "+staged; got != want {
+		t.Fatalf("ran %q, want the image's own in place of the staged one %q", got, want)
+	}
+	if got := s.state.hash("current"); got != staged {
+		t.Fatalf("current %q, want the staged version still recorded", got)
 	}
 }
 

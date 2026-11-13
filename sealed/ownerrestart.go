@@ -6,12 +6,12 @@ package main
 //   - harness: the manager restarts the harness process, as a settings push
 //     does; sealed, the container and the disk stay.
 //   - sealed: sealed stops the agent as a stop signal would (shutdown.go) and
-//     exits; the loader starts this version again, as it does any sealed
-//     that exits on its own under the layered flow (a bounded number of
-//     times). Without the layered flow the loader stops with sealed, so the
-//     restart is refused. While this boot is still coming up (on trial, its
-//     version not yet confirmed to the loader) it is refused too: an exit
-//     then would read as a failed version and send the loader back.
+//     exits with layers.RestartRequestedExit; the loader starts this version
+//     again at once, and does not count it as a crash. Without the layered
+//     flow the loader stops with sealed, so the restart is refused. While
+//     this boot is still coming up (on trial, its version not yet confirmed
+//     to the loader) it is refused too: an exit then would read as a failed
+//     version and send the loader back.
 //
 // Either way what the agent changed since its last commit stays on disk, and
 // the next start keeps it (synced.go).
@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"seal-verify/internal/layers"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/proxy"
 )
@@ -39,6 +40,10 @@ var (
 
 // ownerHarnessRestartTimeout bounds one owner-requested harness restart.
 const ownerHarnessRestartTimeout = 5 * time.Minute
+
+// ownerRestartsFile, under framework.StateDir, keeps the signed restart
+// requests used (proxy.SetOwnerRestartRecord).
+const ownerRestartsFile = "owner-restarts.json"
 
 // ownerRestarter is the /_seal/restart applier for a harness-package adapter;
 // lr is nil without the layered flow.
@@ -57,6 +62,7 @@ func ownerRestarter(mgr interface{ Reload(context.Context) error }, lr *layeredR
 			return nil
 		case "sealed":
 			if lr == nil {
+				// LEGACY(pre-1.4.0): an attestor without the layered flow.
 				return fmt.Errorf("%w: without the layered flow the loader stops with sealed; stop and start the agent instead", proxy.ErrRestartUnavailable)
 			}
 			if !sealedSettled.Load() {
@@ -78,5 +84,5 @@ func restartSealed() {
 	defer cancel()
 	sealedStop.run(ctx)
 	logger.Flush()
-	exitSealed(0)
+	exitSealed(layers.RestartRequestedExit)
 }

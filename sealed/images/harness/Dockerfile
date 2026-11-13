@@ -38,7 +38,11 @@
 # destroys the container right after provision. Under the layered flow its
 # sealed hash (the build prints "loader pinned to bootstrap sha256") and its
 # package hash go on the sealed and harness lists before it boots, and both
-# files on the `artifacts` release (sealed/LAYERS.md). The container does not
+# files on the `artifacts` release (sealed/LAYERS.md). Hashes are listed
+# through the registry's owner, the environment's Timelock: a scheduled
+# operation that takes effect after its delay (one day on mainnet, none on
+# testnet and dev); delisting is immediate, by the owner or the guardian. The
+# container does not
 # check that the agent's framework matches
 # the image: an 0g-harness agent booted on an image without the harness fails
 # at framework start. The SDK picks the image by the agent's framework from

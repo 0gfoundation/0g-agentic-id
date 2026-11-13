@@ -1285,36 +1285,55 @@ The 0g-harness image splits the runtime into layers (`LAYERS.md`): base (the
 image), sealed, the harness official version, and the agent's data. What each
 check rests on:
 
+- **Who lists versions.** The trust registry's owner is the environment's
+  Timelock: listing a sealed, harness or image version, or trusting an
+  attestor, is a scheduled operation, cancellable while it waits (one day on
+  mainnet, none on testnet and dev). Delisting a version or untrusting an
+  attestor takes effect at once, by the owner or the guardian key. So a new
+  version reaches running 0g-harness agents only after the Timelock delay:
+  they move to a version only when their owner picks it or when the version
+  they run is delisted, and then onto a version already through the delay. A
+  delisting reaches them within one heartbeat (5 minutes); the moved-to
+  version then receives the agent key.
 - **Which sealed runs.** The loader runs a sealed only after checking its
   hash (the image's own against the hash compiled into the loader, a
   switched-to version against its name) and asking the chain whether the
   trust registry's sealed list has it (AgenticID names the registry); an
-  explicit "no" keeps it from running. The loader trusts the chain endpoint's answer, as sealed does for
-  every chain read; with no answer to be had it runs the version, and the
-  attestor, which checks the same list before it hands out the key, refuses
-  an unlisted one. Under the layered flow sealed reports its hash at
-  `/provision`, signed with the container key, and the attestor re-checks it
-  at every key release.
+  explicit "no" keeps it from running. The loader trusts the chain endpoint's
+  answer, as sealed does for every chain read. A switched-to version runs
+  only on an explicit "yes": with no answer to be had (the endpoint
+  unreachable or blocked, an AgenticID without a trust registry) the loader
+  runs the image's own sealed instead, which the image hash covers. That is
+  the loader's own check because the attestor's cannot replace it: under the
+  layered flow sealed reports its hash at `/provision`, signed with the
+  container key, and the attestor re-checks it at every key release, but
+  that hash is what the running sealed itself reports, while the image hash
+  comes from the provider's certificate.
 - **Switching versions.** The running sealed, already verified and holding
   the container key, picks the version by one rule (the owner's pick while
   listed, else the running one, else — that one delisted — the newest
   listed), checks it on chain, downloads it by hash from the public artifacts
   release, keeps it only if it hashes to its name, and hands it to the loader,
-  which checks it again. The attestor names no version: what it could change
-  is only which listed one an agent runs, and it does not hold that choice. A version that does not come
-  up is rolled back and not tried again in the container.
+  which checks it and the list again. The attestor names no version: what
+  it could change is only which listed one an agent runs, and it does not
+  hold that choice. A version that does not come up is rolled back and not
+  tried again in the container; one whose boot fails for a reason outside it
+  (an endpoint it cannot reach, a download) is started again later instead.
 - **Which harness runs.** The harness runs from an official version package
   unpacked into a directory root owns and the agent can only read; sealed
   takes a package only if its hash is its name and the chain lists it on the
-  trust registry's harness list (a package it cannot confirm is run only when
-  it is already in the container). The harness holds no key: neither the agent key,
+  trust registry's harness list. One the list explicitly does not hold never
+  runs; when the list cannot be read, the one the container ran last or
+  base's runs, already on disk. The harness holds no key: neither the agent key,
   nor the model key (the inference route fills it), nor the owner's chat token
   (the proxy swaps the owner's for the harness's own at the entry).
 - **What reaches the model.** Every model call goes through sealed's
   inference route, which sends it to the owner's route (0G Compute at its
   registry address, openai and anthropic at their official addresses fixed in
   sealed) with the model the owner's settings pin, and appends the platform
-  doc (identity, doctrine) to its system prompt. A v2 serve-proof's
+  doc (identity, doctrine) to its system prompt. Only model calls pass, by
+  exact path (chat/completions, messages, responses, the model list). Under
+  the layered flow every serve-proof is v2 or none. A v2 serve-proof's
   `inference_url` and `model` say where the route forwarded and with which
   model name; they do not prove that an answer came from that model, since
   the harness can answer without one. A process of the agent's that bypasses

@@ -5,7 +5,9 @@
 // Owner-signed like the other owner container ops (tag "0GSealRestart", the
 // body digest bound into the message; verifyOwnerSig). Unlike /_seal/clear,
 // a restart is not idempotent, so one signed request restarts once: a replay
-// inside the auth window is refused (409), as /_seal/compact does.
+// inside the auth window is refused (409), as /_seal/compact does. The
+// requests used are kept on disk (SetOwnerRestartRecord), so the sealed a
+// restart starts refuses them too.
 //
 // The answer (202) goes out before the restart begins. Only main.go knows how
 // to restart (it owns the manager and the loader hand-off); without an applier
@@ -20,6 +22,9 @@ import (
 	"io"
 	"net/http"
 	"sync"
+
+	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
 )
 
 // maxRestartBody bounds the request body.
@@ -40,11 +45,12 @@ var (
 )
 
 // ownerRestart is the route's state: the applier and the signed requests
-// already used.
+// already used, kept in record ("" keeps them in memory only).
 type ownerRestart struct {
-	mu    sync.Mutex
-	apply OwnerRestarter
-	used  map[string]int64
+	mu     sync.Mutex
+	apply  OwnerRestarter
+	used   map[string]int64
+	record string
 }
 
 // SetOwnerRestart installs the applier. Late-bound like the other appliers.
@@ -52,6 +58,50 @@ func (s *Server) SetOwnerRestart(apply OwnerRestarter) {
 	s.restart.mu.Lock()
 	defer s.restart.mu.Unlock()
 	s.restart.apply = apply
+}
+
+// SetOwnerRestartRecord keeps the signed restart requests used in the file
+// at path, root-only, so a sealed started after a restart refuses them too.
+func (s *Server) SetOwnerRestartRecord(path string) {
+	s.restart.mu.Lock()
+	defer s.restart.mu.Unlock()
+	s.restart.record = path
+	s.restart.used = nil
+}
+
+// usedLocked is the map of used requests, read from the record the first
+// time. s.restart.mu must be held.
+func (r *ownerRestart) usedLocked() map[string]int64 {
+	if r.used != nil {
+		return r.used
+	}
+	r.used = map[string]int64{}
+	if r.record == "" {
+		return r.used
+	}
+	b, err := privsep.ReadFile(r.record, 1<<20)
+	if err != nil {
+		return r.used
+	}
+	if err := json.Unmarshal(b, &r.used); err != nil || r.used == nil {
+		r.used = map[string]int64{}
+	}
+	return r.used
+}
+
+// saveLocked writes the used requests to the record. s.restart.mu must be
+// held.
+func (r *ownerRestart) saveLocked() {
+	if r.record == "" {
+		return
+	}
+	b, err := json.Marshal(r.used)
+	if err == nil {
+		err = privsep.WriteFile(r.record, b, 0o600)
+	}
+	if err != nil {
+		logger.Logf("owner restart: keep the used request: %v", err)
+	}
 }
 
 func (s *Server) handleOwnerRestart(w http.ResponseWriter, r *http.Request) {
@@ -96,22 +146,23 @@ func (s *Server) handleOwnerRestart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "this framework has no owner restart; stop and start the agent instead", http.StatusNotImplemented)
 		return
 	}
-	if s.restart.used == nil {
-		s.restart.used = map[string]int64{}
-	}
-	for k, at := range s.restart.used {
+	spent := s.restart.usedLocked()
+	for k, at := range spent {
 		if now-at > 2*authWindowSec {
-			delete(s.restart.used, k)
+			delete(spent, k)
 		}
 	}
-	if _, seen := s.restart.used[usedKey]; seen {
+	if _, seen := spent[usedKey]; seen {
 		s.restart.mu.Unlock()
 		http.Error(w, "this signed request was already used; sign a fresh one to restart again", http.StatusConflict)
 		return
 	}
 	err = apply(req.Layer)
 	if err == nil {
-		s.restart.used[usedKey] = now
+		// Kept before the answer goes out, and so before a sealed restart
+		// ends this process.
+		spent[usedKey] = now
+		s.restart.saveLocked()
 	}
 	s.restart.mu.Unlock()
 

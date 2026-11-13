@@ -151,10 +151,21 @@ func TestServerForwards(t *testing.T) {
 	if resp := do(http.MethodGet, "/models", ""); resp.StatusCode != http.StatusOK || got.path != "/v1/models" {
 		t.Fatalf("models: %d %s", resp.StatusCode, got.path)
 	}
+	// The Anthropic wire's path, as its client builds it on a base URL
+	// without /v1 (this route's upstream has one, so it doubles here).
+	if resp := do(http.MethodPost, "/v1/messages", `{"messages":[]}`); resp.StatusCode != http.StatusOK || got.path != "/v1/v1/messages" {
+		t.Fatalf("messages: %d %s", resp.StatusCode, got.path)
+	}
 	for _, c := range []struct{ method, path string }{
 		{http.MethodPost, "/files"},
 		{http.MethodGet, "/chat/completions"},
 		{http.MethodDelete, "/models"},
+		// Paths that only end like a model call.
+		{http.MethodPost, "/threads/thread_1/messages"},
+		{http.MethodPost, "/v1/threads/thread_1/messages"},
+		{http.MethodPost, "/x/chat/completions"},
+		{http.MethodGet, "/fine_tuning/models"},
+		{http.MethodPost, "/v1/v1/messages"},
 	} {
 		if resp := do(c.method, c.path, "{}"); resp.StatusCode != http.StatusNotFound {
 			t.Errorf("%s %s: %d, want 404", c.method, c.path, resp.StatusCode)

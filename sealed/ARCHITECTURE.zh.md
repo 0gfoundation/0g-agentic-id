@@ -129,15 +129,19 @@ sealed 要求配套的 provider 和 attestor（v3 证书、attestor TLS 声明�
 之前先核对哈希：镜像自带的 `/bootstrap` 对编镜像时编进去的 sha256
 （`-X main.expectedSealedHash`，`images/harness/Dockerfile`），换上来的版本对它的名字；
 再向 `CHAIN_RPC_URL` 发 `eth_call`，先读 AgenticID 的 `trustRegistry()`，再读信任合约的
-`isListed(SEALED, 哈希)`，链上明确答"不在"的版本不执行（`allowlist.go`）。它把 sealed 作为子进程启动，环境变量原样传下去，
-另加 `SEALED_HASH`（它核对过的哈希）和 `SEALED_TRIAL`（试运行）；转发 SIGTERM、SIGINT、
-SIGQUIT 和 SIGHUP；收到停止信号后 sealed 2 分钟内没退出就杀掉；回收所有孤儿进程。没有
-分层流程时，sealed 退出它就用同样的状态退出，所以 sealed 退出照旧会结束容器。分层流程下
-（`LAYERS.zh.md` 第 3 节、3.1）它还按 sealed 的请求（SIGUSR1）换 sealed 版本：以试运行
-方式启动新版本，没确认起来就退回原版本，换之前清掉旧 sealed 留下的进程；sealed 自己退出时
-（owner 重启 sealed 也是这样）重启它，10 分钟内最多 5 次。它的状态目录是 `/var/lib/loader`（只有 root 能进）。它和
-sealed 一样是 root、不可 dump、设置 `no_new_privs`，只链接标准库和 `golang.org/x/sys`
-（`TestLinkedPackages`）。其他镜像里 sealed 仍是 PID 1。
+`isListed(SEALED, 哈希)`：链上明确答"不在"的版本不执行，换上来的版本要链上明确答"在"才执行；
+查不到答案时改跑镜像自带的版本（`allowlist.go`、`supervise.go`）。它把 sealed 作为子进程启动，
+环境变量原样传下去，另加 `SEALED_HASH`（它核对过的哈希）、`SEALED_TRIAL`（试运行）和
+`SEALED_INSTEAD_OF`（镜像自带的版本是替哪个版本跑的）；转发 SIGTERM、SIGINT、SIGQUIT 和
+SIGHUP；收到停止信号后 sealed 2 分钟内没退出就杀掉；回收所有孤儿进程。没有分层流程时，sealed
+退出它就用同样的状态退出，所以 sealed 退出照旧会结束容器。分层流程下（`LAYERS.zh.md` 第 3 节、
+3.1）它还按 sealed 的请求（SIGUSR1）换 sealed 版本，前提是链上列着新版本：以试运行方式启动
+新版本，没确认起来就退出、或者 20 分钟内没确认的，退回原版本，换之前清掉旧 sealed 留下的进程。
+sealed 自己退出时重启它，10 分钟内最多 5 次；退出码 76（owner 重启 sealed）立即重启、不计次数，
+退出码 69（因为版本以外的原因起不来）过 30 秒起、加倍到 5 分钟后再启动同一个版本，不算在这个
+版本头上。它的状态目录是 `/var/lib/loader`（只有 root 能进）。它和 sealed 一样是 root、不可
+dump、设置 `no_new_privs`，只链接标准库和 `golang.org/x/sys`（`TestLinkedPackages`）。其他
+镜像里 sealed 仍是 PID 1。
 
 不是 PID 1 的 sealed 会处理 SIGTERM 和 SIGINT（`shutdown.go`）：停下监视器，停掉框架
 （之后不再重启它），等监视器手上那一轮跑完，然后以 0 退出，总共不超过 90 秒。它不另起

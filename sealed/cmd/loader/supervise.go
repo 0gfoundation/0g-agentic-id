@@ -26,6 +26,16 @@ const (
 	restartWindow = 10 * time.Minute
 )
 
+// A version on trial must confirm within trialLimit of its start, or the
+// loader stops it and treats it as failed. A version that exits with
+// trialTransientExit is started again (transientBackoff); one on trial that
+// has done so for transientLimit is treated as failed, where a listed version
+// to go back to exists.
+const (
+	trialLimit     = 20 * time.Minute
+	transientLimit = time.Hour
+)
+
 // The environment the loader sets for the sealed it starts
 // (sealed/internal/layers; keep in step).
 const (
@@ -34,6 +44,21 @@ const (
 	// trialEnv is "1" for a version the loader switched to and has not seen
 	// confirmed.
 	trialEnv = "SEALED_TRIAL"
+	// insteadOfEnv names the version the image's own sealed runs in place
+	// of: the one the loader would have run, had the sealed list been
+	// readable.
+	insteadOfEnv = "SEALED_INSTEAD_OF"
+)
+
+// The exit codes sealed tells the loader something with
+// (sealed/internal/layers; keep in step). Any other exit of a version on
+// trial before it confirms is that version failing.
+const (
+	// trialTransientExit: the boot failed for a reason outside the version
+	// (an endpoint it could not reach, a download): start it again later.
+	trialTransientExit = 69
+	// restartRequestedExit: the owner asked for sealed to be restarted.
+	restartRequestedExit = 76
 )
 
 // verifyFile checks that the file at path hashes to want, a lowercase hex
@@ -70,18 +95,17 @@ type version struct {
 
 // supervisor runs sealed as a child and waits for it. sealed inherits the
 // loader's environment as it stands, container key included, plus
-// sealedHashEnv and trialEnv.
+// sealedHashEnv, trialEnv and insteadOfEnv.
 type supervisor struct {
 	// builtin is the image's own sealed, whose hash is built into the
-	// loader. It runs when nothing else was switched to, and is what a
-	// failed switch falls back to last.
+	// loader. It runs when nothing else was switched to, when the sealed
+	// list cannot be read, and is what a failed switch falls back to last.
 	builtin version
 	// state is the directory shared with sealed (state.go). Empty, the
 	// loader runs builtin only, and exits when it exits.
 	state stateDir
-	// allow is the sealed allowlist on chain (allowlist.go); nil checks
-	// nothing.
-	allow *allowlist
+	// allow is the sealed list on chain (allowlist.go).
+	allow sealedList
 
 	stdout io.Writer
 	stderr io.Writer
@@ -105,7 +129,13 @@ type supervisor struct {
 	backoff func(n int) time.Duration
 	// window is restartWindow (tests shorten it).
 	window time.Duration
-	logf   func(string, ...any)
+	// trialLimit and transientLimit are the constants of the same names;
+	// transientBackoff is the wait before the n-th start of a version that
+	// exited with trialTransientExit (tests shorten all three).
+	trialLimit       time.Duration
+	transientLimit   time.Duration
+	transientBackoff func(n int) time.Duration
+	logf             func(string, ...any)
 }
 
 // outcome is how one run of sealed ended.
@@ -127,49 +157,109 @@ type runResult struct {
 // run supervises sealed until the loader should exit, and returns the code
 // to exit with: sealed's own, 128+signal when a signal ended it, and 1 when
 // sealed could not be started.
+//
+// cur is the version the loader means to run, the one its state records.
+// What runs is cur, unless the sealed list cannot be read for it: then the
+// image's own sealed runs in its place, cur stays recorded, and the next
+// start (or sealed itself, once the list reads again) comes back to it.
 func (s *supervisor) run() int {
 	cur := s.current()
 	var restarts []time.Time
+	// transient counts the starts of a version that keeps exiting with
+	// trialTransientExit, transientSince is since when it has; any other end
+	// of a run resets both.
+	var transient int
+	var transientSince time.Time
 	for {
-		chosen, ok := s.allowed(cur)
-		if !ok {
+		p, found := s.allowed(cur)
+		switch found {
+		case runNone:
 			s.logf("FAIL no sealed version this container has is on the sealed list; the agent needs a reset onto a current image")
 			return 1
+		case runLater:
+			transient++
+			wait := s.transientBackoff(transient)
+			s.logf("the sealed list could not be read to confirm a version this container has; reading it again in %v", wait)
+			if code, stop := s.pause(wait); stop {
+				return code
+			}
+			continue
 		}
-		if chosen.hash != cur.hash {
-			s.record(chosen.hash, "")
-			cur = chosen
+		insteadOf := ""
+		switch {
+		case p.v.hash == cur.hash:
+		case p.standIn:
+			insteadOf = cur.hash
+		default:
+			s.record(p.v.hash, "")
+			cur = p.v
 		}
-		trial := s.trial(cur)
-		res := s.runOnce(cur, trial)
+		ran := p.v
+		trial := insteadOf == "" && s.trial(ran)
+		res := s.runOnce(ran, trial, insteadOf)
 		switch res.outcome {
 		case stopped:
 			return res.code
 		case switching:
 			s.killLeftovers()
-			s.logf("switching sealed from %s to %s, on trial", short(cur.hash), short(res.next.hash))
+			s.logf("switching sealed from %s to %s", short(ran.hash), short(res.next.hash))
 			// What a failed switch goes back to is a version that came up:
 			// the one switched from, unless it was itself still on trial.
-			back := cur.hash
-			if trial && s.state.read("confirmed") != cur.hash {
+			// Back to the version the image's own stood in for, that one
+			// keeps the version it replaced.
+			back := ran.hash
+			if (insteadOf != "" && res.next.hash == cur.hash) || (trial && s.state.read("confirmed") != ran.hash) {
 				back = s.state.hash("previous")
 			}
 			s.record(res.next.hash, back)
 			cur = res.next
+			transient, transientSince = 0, time.Time{}
 			continue
 		}
 		s.killLeftovers()
-		if cur.hash != s.builtin.hash && (res.outcome == failedToStart || (trial && s.state.read("confirmed") != cur.hash)) {
-			prev := s.previous(cur)
-			s.logf("sealed %s did not come up (exit %d); going back to %s", short(cur.hash), res.code, short(prev.hash))
-			if err := s.state.markFailed(cur.hash); err != nil {
-				s.logf("record the failed version: %v", err)
+		layered := s.state != "" && s.state.layered()
+		if res.outcome == exited && layered && res.code == restartRequestedExit {
+			// Not a crash: started again at once, and not counted.
+			s.logf("sealed exited for a restart its owner asked for; starting it again")
+			transient, transientSince = 0, time.Time{}
+			continue
+		}
+		if res.outcome == exited && layered && res.code == trialTransientExit {
+			// The boot failed for a reason outside the version: it is not
+			// counted against the version, and runs again after a wait.
+			now := time.Now()
+			if transientSince.IsZero() {
+				transientSince = now
 			}
-			s.record(prev.hash, "")
+			if trial && now.Sub(transientSince) >= s.transientLimit {
+				if prev := s.previous(ran); s.listed(prev) {
+					s.logf("sealed %s has not come up for %v, for reasons outside it; going back to %s", short(ran.hash), s.transientLimit, short(prev.hash))
+					s.goBack(ran, prev)
+					cur = prev
+					transient, transientSince = 0, time.Time{}
+					continue
+				}
+			}
+			transient++
+			wait := s.transientBackoff(transient)
+			s.logf("sealed %s did not come up, for a reason outside it (exit %d); starting it again in %v", short(ran.hash), res.code, wait)
+			if code, stop := s.pause(wait); stop {
+				return code
+			}
+			continue
+		}
+		transient, transientSince = 0, time.Time{}
+		if insteadOf == "" && ran.hash != s.builtin.hash && (res.outcome == failedToStart || (trial && s.state.read("confirmed") != ran.hash)) {
+			prev := s.previous(ran)
+			s.logf("sealed %s did not come up (exit %d); going back to %s", short(ran.hash), res.code, short(prev.hash))
+			s.goBack(ran, prev)
 			cur = prev
 			continue
 		}
-		if res.outcome == failedToStart || s.state == "" || !s.state.layered() {
+		// LEGACY(pre-1.4.0): without the layered flow (an attestor that does
+		// not declare it: a chain whose AgenticID names no trust registry)
+		// the loader stops with sealed, as when sealed is PID 1.
+		if res.outcome == failedToStart || !layered {
 			s.logf("sealed exited with code %d", res.code)
 			return res.code
 		}
@@ -222,11 +312,38 @@ func (s *supervisor) byHash(h string) version {
 	return version{hash: h, path: s.state.staged(h)}
 }
 
-// allowed is the version to run: v, else the version it replaced, else
-// builtin — the first one the allowlist on chain does not refuse. ok is
-// false when it refuses every one. A version whose answer cannot be had
-// runs (allowlist.go).
-func (s *supervisor) allowed(v version) (version, bool) {
+// goBack records that failed did not come up and that prev runs from now on.
+func (s *supervisor) goBack(failed, prev version) {
+	if err := s.state.markFailed(failed.hash); err != nil {
+		s.logf("record the failed version: %v", err)
+	}
+	s.record(prev.hash, "")
+}
+
+// pick is the version allowed chose, and whether it runs in place of the one
+// asked for only because the sealed list could not be read (standIn).
+type pick struct {
+	v       version
+	standIn bool
+}
+
+// found is what allowed found.
+type found int
+
+const (
+	runIt    found = iota // run the version picked
+	runNone               // the chain lists none of the versions this container has
+	runLater              // the chain could not be read for a version it may list
+)
+
+// allowed picks the version to run for v: v, else the version it replaced,
+// else builtin — the first one the chain lists. A staged version runs only
+// on the chain's explicit "listed"; once no answer can be had for one, no
+// staged version runs this time, and builtin runs in its place (standIn).
+// The image hash covers builtin, which the attestor checks from the
+// container certificate, so builtin needs no answer: only a "not listed"
+// keeps it from running.
+func (s *supervisor) allowed(v version) (pick, found) {
 	candidates := []version{v}
 	if s.state != "" && v.hash != s.builtin.hash {
 		if p := s.previous(v); p.hash != v.hash {
@@ -236,18 +353,36 @@ func (s *supervisor) allowed(v version) (version, bool) {
 	if candidates[len(candidates)-1].hash != s.builtin.hash {
 		candidates = append(candidates, s.builtin)
 	}
+	unread := false
 	for _, c := range candidates {
+		isBuiltin := c.hash == s.builtin.hash
+		if unread && !isBuiltin {
+			continue
+		}
 		refused, err := s.allow.refuses(c.hash)
-		if err != nil {
-			s.logf("the sealed list is unreadable for %s (%v); running it, the attestor checks it before any key", short(c.hash), err)
-			return c, true
+		switch {
+		case err != nil && isBuiltin:
+			s.logf("the sealed list is unreadable (%v); running the image's own sealed %s, which the image hash covers", err, short(c.hash))
+			return pick{v: c, standIn: unread}, runIt
+		case err != nil:
+			s.logf("the sealed list is unreadable for %s (%v); a downloaded version runs only once the chain lists it", short(c.hash), err)
+			unread = true
+		case refused:
+			s.logf("sealed %s is not on the sealed list; not running it", short(c.hash))
+		default:
+			return pick{v: c, standIn: unread && isBuiltin}, runIt
 		}
-		if !refused {
-			return c, true
-		}
-		s.logf("sealed %s is not on the sealed list; not running it", short(c.hash))
 	}
-	return version{}, false
+	if unread {
+		return pick{}, runLater
+	}
+	return pick{}, runNone
+}
+
+// listed reports whether the chain says v is listed.
+func (s *supervisor) listed(v version) bool {
+	refused, err := s.allow.refuses(v.hash)
+	return err == nil && !refused
 }
 
 // trial reports whether v runs on trial: switched to, and not yet
@@ -268,7 +403,7 @@ func (s *supervisor) record(current, previous string) {
 
 // requested is the version sealed asked to switch to (SIGUSR1): another
 // version than cur, not one the loader went back from, whose program hashes
-// to its name.
+// to its name and which the chain lists.
 func (s *supervisor) requested(cur version) (version, bool) {
 	if s.state == "" {
 		return version{}, false
@@ -289,15 +424,21 @@ func (s *supervisor) requested(cur version) (version, bool) {
 		s.logf("refusing the switch to %s: %v", short(h), err)
 		return version{}, false
 	}
-	if refused, _ := s.allow.refuses(h); refused {
+	refused, err := s.allow.refuses(h)
+	switch {
+	case err != nil:
+		s.logf("refusing the switch to %s: the sealed list cannot be read (%v)", short(h), err)
+		return version{}, false
+	case refused:
 		s.logf("refusing the switch to %s: it is not on the sealed list", short(h))
 		return version{}, false
 	}
 	return v, true
 }
 
-// runOnce verifies and starts v, and blocks until it exits.
-func (s *supervisor) runOnce(v version, trial bool) runResult {
+// runOnce verifies and starts v, and blocks until it exits. insteadOf names
+// the version v runs in place of, "" for none.
+func (s *supervisor) runOnce(v version, trial bool, insteadOf string) runResult {
 	if err := verifyFile(v.path, v.hash); err != nil {
 		s.logf("FAIL %v", err)
 		return runResult{outcome: failedToStart, code: 1}
@@ -307,6 +448,11 @@ func (s *supervisor) runOnce(v version, trial bool) runResult {
 		_ = os.Setenv(trialEnv, "1")
 	} else {
 		_ = os.Unsetenv(trialEnv)
+	}
+	if insteadOf != "" {
+		_ = os.Setenv(insteadOfEnv, insteadOf)
+	} else {
+		_ = os.Unsetenv(insteadOfEnv)
 	}
 	cmd := exec.Command(v.path)
 	cmd.Stdout = s.stdout
@@ -320,10 +466,21 @@ func (s *supervisor) runOnce(v version, trial bool) runResult {
 	if trial {
 		onTrial = ", on trial"
 	}
+	if insteadOf != "" {
+		onTrial += ", in place of " + short(insteadOf)
+	}
 	s.logf("OK   started %s (pid %d, sealed %s%s)", v.path, pid, short(v.hash), onTrial)
 
 	ticker := time.NewTicker(s.poll)
 	defer ticker.Stop()
+	// A version on trial that has not confirmed by trialEnd is stopped; its
+	// exit then reads as a failure (run).
+	var trialEnd <-chan time.Time
+	if trial && s.trialLimit > 0 {
+		t := time.NewTimer(s.trialLimit)
+		defer t.Stop()
+		trialEnd = t.C
+	}
 	var deadline <-chan time.Time
 	var next *version
 	stopping := false
@@ -354,6 +511,15 @@ func (s *supervisor) runOnce(v version, trial bool) runResult {
 				}
 			}
 		case <-ticker.C:
+		case <-trialEnd:
+			trialEnd = nil
+			if !stopping && next == nil && s.state.read("confirmed") != v.hash {
+				s.logf("sealed %s did not confirm within %v on trial; stopping it", short(v.hash), s.trialLimit)
+				s.forward(pid, syscall.SIGTERM)
+				if deadline == nil {
+					deadline = time.After(s.stopGrace)
+				}
+			}
 		case <-deadline:
 			s.logf("sealed did not exit within %v of the stop signal; killing it", s.stopGrace)
 			_ = syscall.Kill(pid, syscall.SIGKILL)
@@ -493,4 +659,12 @@ func restartBackoff(n int) time.Duration {
 		return 30 * time.Second
 	}
 	return min(time.Second<<max(n-1, 0), 30*time.Second)
+}
+
+// transientRetryBackoff is 30 s, 1 min, 2 min, 4 min, then 5 min.
+func transientRetryBackoff(n int) time.Duration {
+	if n > 4 {
+		return 5 * time.Minute
+	}
+	return min(30*time.Second<<max(n-1, 0), 5*time.Minute)
 }
