@@ -47,7 +47,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 
 | 能力 | 插件 |
 |---|---|
-| 对话 + agent 主循环 | spine(`dsh-agent-spine-demo`):session、tools、system-prompt、agent、agent-loop、skills、任务注册表 |
+| 对话 + agent 主循环 | `src/plugins/core.mjs` 中明确组合的 DSH 0.2 核心：session、tools、system-prompt、agent、agent-loop、skills、任务注册表 |
 | 推理 | `dsh-llm-pi-ai`(路由由适配器按 owner 的 settings 渲染好传进去)、`dsh-credentials-local` |
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | 文件读写 | `dsh-fs-local` + `dsh-tool-fs` |
@@ -56,19 +56,19 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | 循环兜底 | `dsh-tool-call-timeout-policy` |
 | 后台任务(打开 `toolJobs` 时) | `dsh-tool-jobs`:命令可以放到后台跑;agent 空闲时任务结束,会开启新的一轮,这一轮的回复进收件箱 |
 | 子 agent(打开 `subagents` 时) | `dsh-subagent` + `dsh-subagent-spawn-in-process` + `dsh-tool-subagent`:一次性的助手,以后台任务的形式运行,最多一层,工具只有 `read` 和 `skill` |
-| 定时提醒(打开 `schedule` 时) | `dsh-schedule`,加上 harness 自带的最小 `sessionPersistence` 服务(提供 dsh-schedule 需要的落盘确认) |
+| 持久化 | DSH 单写入者 `dsh-session-persistence-jsonl`；通过官方 session-format catalog 迁移旧 0.1.1 对话 |
+| 定时提醒(打开 `schedule` 时) | `dsh-schedule` 与 `dsh-tool-schedule`，使用原生会话持久化和单独的 JSON 定时任务存储 |
 | **平台控制点** | 见下面两项 |
 
 两个平台控制点:
-- **`seal-tools`**:把运行时的工具做成原生工具。工具由 sealed 在 socket 上列出(POST /mcp:签名 socket 上是签名、服务、设置和凭据,取值单独在自己的 socket 上),每次调用都走对应 socket 端点本身,所以工具的检查、拒绝和记录与端点完全一样。注册服务时,sealed 限制描述最长 280 字节、输入示例最长 2048 字节。
+- **DSH 原生 `dsh-mcp-client`**：通过私有 stdio-to-Unix 桥连接。工具由 sealed 在 socket 上列出（POST /mcp：签名 socket 上是签名、服务、设置和凭据，取值单独在自己的 socket 上），每次调用都走对应端点，检查、拒绝和记录仍由 sealed 执行。
 - **`subagent-guard`**:写文件、执行命令、签名,只有主 agent 能做。
 
 **故意没挂这些**(每条都有原因):
 
-- **`session-persistence-*`**:它的日志格式固定在 v0,不保证兼容,也没有可用的具体后端。对话由 harness 自己存盘。重启时按"续上"恢复,不带 `seedLength`,所以待处理的收件箱任务和定时提醒在重启后都还在。harness 只额外提供 dsh-schedule 需要的落盘确认。
 - **`settings-file`**:它会热加载,把 `$DSH_HOME/settings.yaml` 叠在组合之上。挂了它,agent 改一下这个文件,就能给自己塞一条任意的推理路由。我们的做法是:Start 之前,由适配器按 owner 的 settings 文档把模型选择渲染成 `SEAL_MODEL_*` 环境变量,传给 harness(`settings.go`)。不存在 `settings.yaml` 这个文件。
 - **`tool-cordis`**:让 agent 在进程内自定义工具。这些工具没法审计,重启还会丢。
-- **`sandbox` 那一套**:真正的隔离墙是 privsep,也就是内核 uid 隔离。DSH 自带的 `sandbox-local` 依赖 bwrap 或 Landlock,在没有这两者的精简 TEE 容器里会直接拒绝运行。
+- **DSH `sandbox` 那一套**：owner Harness 使用本地执行器，隔离边界由 privsep 的内核 UID 提供；托管程序使用 sealed 独立监管的 bubblewrap 沙箱，Harness 镜像包含对应启动器。
 - **`web`、`e2b`、常驻 `terminal`、`goals`、`agent-presets`、可续聊的子 agent**:这些能力暂不提供,见下面的档位规划。
 
 **owner 可调的**:settings 文档的 `others` 段 → `SEAL_HARNESS_*` 环境变量。什么都不填,就是出厂组合。推送一次配置,下次 spawn 时生效:重启的是进程,不是容器。

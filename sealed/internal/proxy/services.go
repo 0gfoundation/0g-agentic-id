@@ -37,14 +37,9 @@ type ServiceEntry struct {
 	Description  string `json:"description,omitempty"`   // one short sentence
 	InputExample string `json:"input_example,omitempty"` // literal JSON body, if any
 	Backend      string `json:"backend"`                 // loopback upstream: http://127.0.0.1:<port>
-	// Transport marks the service's protocol for consumers. Empty (the
-	// default) = a plain HTTP endpoint. "mcp" = an MCP server endpoint: the
-	// backend speaks the MCP streamable-HTTP protocol (JSON-RPC over POST),
-	// so an MCP-capable client can mount <public-url><path> as an MCP server
-	// and the agent's tools become the client's tools. MCP routes must be
-	// POST: the proxy pins one method per path, and POST is the protocol's
-	// workhorse (a stateless server never needs the optional GET SSE
-	// channel, which the one-method pin could not serve anyway).
+	// Transport marks plain HTTP or an MCP Streamable HTTP endpoint. MCP
+	// registrations name POST; the proxy also relays GET/DELETE and lets
+	// the backend return 405 when an optional method is unsupported.
 	Transport string `json:"transport,omitempty"` // "" (plain HTTP) | "mcp"
 }
 
@@ -63,6 +58,7 @@ var validMethods = map[string]bool{
 // zero leaves a field unbounded.
 type fieldLimits struct {
 	description, inputExample int
+	managedNamespace          bool
 }
 
 // validateServices checks the agent-supplied list as a whole. Any violation
@@ -85,6 +81,9 @@ func validateServices(in []ServiceEntry, limits fieldLimits) ([]ServiceEntry, er
 			if e.Path == p || strings.HasPrefix(e.Path, p) {
 				return nil, fmt.Errorf("services[%d].path %q is platform-reserved", i, e.Path)
 			}
+		}
+		if limits.managedNamespace && managedServicePath(e.Path) {
+			return nil, fmt.Errorf("services[%d].path %q belongs to isolated service hosting; use seal_service_publish", i, e.Path)
 		}
 		if seen[e.Path] {
 			return nil, fmt.Errorf("services[%d].path %q declared more than once", i, e.Path)
@@ -159,10 +158,26 @@ func validateLoopbackBackend(backend string) error {
 
 // getServices returns a copy of the current agent-registered services.
 func (s *Server) getServices() []ServiceEntry {
+	strict := s.isolatedServicePolicy()
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	out := make([]ServiceEntry, len(s.services))
 	copy(out, s.services)
+	host := s.serviceHost
+	s.mu.RUnlock()
+	if strict {
+		kept := out[:0]
+		for _, e := range out {
+			if !managedServicePath(e.Path) {
+				kept = append(kept, e)
+			}
+		}
+		out = kept
+	}
+	if strict && host != nil {
+		for _, svc := range host.List() {
+			out = append(out, ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description})
+		}
+	}
 	return out
 }
 
@@ -205,6 +220,14 @@ func (s *Server) helloServiceList() []report.Service {
 // request path (query string excluded by the caller). Exact match for now;
 // subpath/prefix routing is a later refinement.
 func (s *Server) matchService(path string) (ServiceEntry, bool) {
+	if s.isolatedServicePolicy() && managedServicePath(path) {
+		if host := s.getServiceHost(); host != nil {
+			if svc, ok := host.Match(path); ok {
+				return ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description}, true
+			}
+		}
+		return ServiceEntry{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, e := range s.services {
@@ -234,7 +257,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 			writeSignError(w, http.StatusBadRequest, "decode body: "+err.Error())
 			return
 		}
-		var limits fieldLimits
+		limits := fieldLimits{managedNamespace: s.isolatedServicePolicy()}
 		if l, ok := s.getAdapter().(framework.ServiceFieldLimiter); ok {
 			limits.description, limits.inputExample = l.ServiceFieldLimits()
 		}

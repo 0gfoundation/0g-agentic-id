@@ -48,6 +48,7 @@ import (
 	"seal-verify/internal/layers"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manager"
+	"seal-verify/internal/servicehost"
 	"seal-verify/internal/settings"
 )
 
@@ -724,6 +725,48 @@ func harnessDirOf(hash string) string {
 		return ""
 	}
 	return layers.HarnessDir(hash)
+}
+
+// acquireServiceRuntime is stricter than the owner's availability fallback:
+// new jobs require a fresh positive listing, even if the owner is still running
+// an unlisted package because no replacement is available. Nothing falls back
+// to /opt/0g-harness/base, which loader-only images need not contain.
+func (l *layeredRuntime) acquireServiceRuntime(ctx context.Context, h framework.LayeredRuntime) (servicehost.RuntimeLease, error) {
+	if l == nil || h == nil {
+		return servicehost.RuntimeLease{}, fmt.Errorf("%w: service jobs require the verified layered runtime", servicehost.ErrIsolationUnavailable)
+	}
+	// A download/reload may hold busy for minutes. Service admission has its
+	// own short context and must not hold the service manager's lock past it.
+	locked := l.busy.TryLock()
+	if !locked {
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for !locked {
+			select {
+			case <-ctx.Done():
+				return servicehost.RuntimeLease{}, ctx.Err()
+			case <-tick.C:
+				locked = l.busy.TryLock()
+			}
+		}
+	}
+	defer l.busy.Unlock()
+	if err := ctx.Err(); err != nil {
+		return servicehost.RuntimeLease{}, err
+	}
+	hash := h.HarnessHash()
+	if _, ok := layers.ParseHash(hash); !ok {
+		return servicehost.RuntimeLease{}, fmt.Errorf("service harness is not running")
+	}
+	listed, err := l.listed(ctx, kindHarness, hash)
+	if err != nil || !listed {
+		return servicehost.RuntimeLease{}, fmt.Errorf("service harness %s is not confirmed listed: %v", shortHex(hash), err)
+	}
+	release, err := layers.PinHarness(hash)
+	if err != nil {
+		return servicehost.RuntimeLease{}, err
+	}
+	return servicehost.RuntimeLease{Hash: hash, Dir: layers.HarnessDir(hash), Release: release}, nil
 }
 
 // baseHarness is the package the adapter starts on without the layered

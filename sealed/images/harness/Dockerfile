@@ -85,6 +85,7 @@ COPY *.go ./
 COPY internal/ ./internal/
 COPY cmd/ ./cmd/
 RUN CGO_ENABLED=0 GOOS=linux go build -tags harnessonly -ldflags="-s -w" -o bootstrap . \
+ && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o service-launcher ./cmd/service-launcher \
  && H="$(sha256sum bootstrap | cut -d' ' -f1)" \
  && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.expectedSealedHash=$H" -o loader ./cmd/loader \
  && echo "loader pinned to bootstrap sha256 $H"
@@ -114,7 +115,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -tags harnessonly -ldflags="-s -w" -o boot
 # fails the build.
 FROM debian:13-slim AS harness-package
 ARG NODE_VERSION=24.22.1
-ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/9adb411536477fb61f2a6ffef4982c6e26770649
+ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/7bf3fa0bb56499956d236acb93618ed790829a79
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
@@ -129,7 +130,7 @@ RUN npm install -g --no-fund --no-audit "${HARNESS_REF}" \
  && GOT="$(node -p "require('$H/package.json').version")" \
  && WANT="$(sed -n '/supportedVersions = \[\]string{/,/^}/p' /tmp/harness-whitelist.go | grep -oE '"[^"]+"' | tail -1 | tr -d '"')" \
  && if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "installed 0g-harness $GOT but whitelist.go records $WANT in the framework role" >&2; exit 1; fi \
- && echo "packaging 0g-harness $GOT with DSH $(node -p "require('$H/node_modules/@deepseek-ai/dsh-agent-spine-demo/package.json').version")" \
+ && echo "packaging 0g-harness $GOT with DSH $(node -p "require('$H/node_modules/@deepseek-ai/dsh-agent/package.json').version")" \
  && if [ -n "$(find "$H" ! -type d ! -type f ! -type l)" ]; then echo "the package holds an entry that is not a directory, file or link" >&2; exit 1; fi \
  && if [ -n "$(find "$H" -type l -lname '/*')" ]; then echo "the package holds a link with an absolute target" >&2; exit 1; fi \
  && (cd "$H" && find . -type l | while read -r l; do r="$(realpath -m --relative-to=. "$(dirname "$l")/$(readlink "$l")")"; case "$r" in ..|../*) echo "link $l leaves the package" >&2; exit 1;; esac; done) \
@@ -141,7 +142,7 @@ RUN npm install -g --no-fund --no-audit "${HARNESS_REF}" \
 FROM debian:13-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils \
+ && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils bubblewrap util-linux \
  && rm -rf /var/lib/apt/lists/*
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):
@@ -204,6 +205,7 @@ RUN P="$(sha256sum /tmp/0g-harness.tgz | cut -d' ' -f1)" \
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
 COPY --from=bootstrap-builder /app/bootstrap /bootstrap
 COPY --from=bootstrap-builder /app/loader /loader
+COPY --from=bootstrap-builder /app/service-launcher /usr/local/bin/sealed-service-launcher
 
 # sealed resolves every command it runs by name — as root (RootCommand) and
 # as the agent (AgentCommand, Sweep) alike — only through PATH directories

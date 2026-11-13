@@ -258,7 +258,7 @@ func buildSigningSection(signSock string, tools, rules bool) string {
 		b.WriteString("If your framework's tool list includes native sign tools, prefer them: a native tool call lands in the session log as a structured record, while a shell command is an opaque string. If it does not, the curl route above is the documented way to reach the socket — the socket is the capability, the tool is just the preferred channel.\n\n")
 	}
 	if tools {
-		b.WriteString("These endpoints are also tools in your tool list, from the runtime's MCP server `seal` (your framework may put a prefix before each name, as in `seal__seal_sign`): `seal_sign`, `seal_sign_typed_data`, `seal_sign_transaction`, `seal_services`, `seal_register_service`, `seal_settings` and `seal_set_thinking`. A tool does what its endpoint does; use whichever is at hand.\n\n")
+		b.WriteString("These endpoints are also tools in your tool list, from the runtime's MCP server `seal` (use the names discovered in your tool list; 0g-harness exposes `seal_sign` as `mcp__seal__seal_sign`): `seal_sign`, `seal_sign_typed_data`, `seal_sign_transaction`, `seal_services`, `seal_register_service`, `seal_settings` and `seal_set_thinking`. A tool does what its endpoint does; use whichever is at hand.\n\n")
 	}
 	b.WriteString("### When to use agentSeal\n\n")
 	b.WriteString("- A contract caller / verifier requires `msg.sender == AGENT_SEAL` or checks an EIP-712 signature against `AGENT_SEAL`.\n")
@@ -286,7 +286,7 @@ func buildCredentialsSection(tools bool) string {
 		b.WriteString("The same endpoints are tools from the `seal` server: `seal_credentials`, `seal_credential_token`, `seal_credential_request`, `seal_credential_sign` and `seal_credential_delete` (for derived entries); reveal below is `seal_credential_reveal`, from the server `seal-reveal`.\n\n")
 	}
 	b.WriteString("Signing entries (`use: sign`) are never written into a request; the runtime signs with them. The list shows each one's `signer`. For `sigv4` (AWS) give your AWS tool the entry's `access_key_id` and the placeholder as its secret: the runtime signs the request again with the real key on its way to the entry's hosts. For `sigv4` or `hmac` on a request you build yourself, add the header `X-Seal-Sign: <name>` and the runtime signs it. A `jwt` entry's placeholder stands for a freshly minted token wherever the entry allows it, including in its own token request.\n\n")
-	b.WriteString("An MCP server your owner logged you in to is an entry whose hosts are that server's: configure the server in your MCP client with the header `Authorization: Bearer [[credential:<name>]]`. The runtime keeps the login and refreshes its token; you never handle either.\n\n")
+	b.WriteString("An MCP server your owner logged you in to is an entry whose hosts are that server's: configure the header `Authorization: Bearer [[credential:<name>]]` and route that client's requests through the runtime credential proxy. The runtime keeps the login and refreshes its token; you never handle either. A client that ignores `HTTPS_PROXY` needs the explicit proxy route above. The native 0g-harness `others.mcpServers` connection does not automatically use that proxy or expand environment/credential references; a placeholder header sent directly to the server is not sufficient.\n\n")
 	b.WriteString("Example:\n\n")
 	b.WriteString("    curl --unix-socket \"$SEAL_CRED_SOCKET\" http://localhost/credentials\n")
 	b.WriteString("    curl -H 'Authorization: Bearer [[credential:github]]' https://api.github.com/user\n")

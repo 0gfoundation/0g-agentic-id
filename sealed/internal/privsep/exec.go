@@ -214,6 +214,32 @@ func RootCommand(ctx context.Context, name string, args ...string) (*exec.Cmd, e
 	return cmd, nil
 }
 
+// AttachServiceCgroup passes one already-verified cgroup.procs descriptor only
+// to the fixed trusted prlimit/service-launcher chain. It grants no arbitrary
+// inherited descriptors, paths, environment changes or process credentials.
+func AttachServiceCgroup(cmd *exec.Cmd, procs *os.File) error {
+	trusted, err := resolveRoot("prlimit")
+	if err != nil {
+		return err
+	}
+	if cmd == nil || cmd.Path != trusted || procs == nil || procs.Name() != "cgroup.procs" || len(cmd.ExtraFiles) != 0 {
+		return fmt.Errorf("invalid service cgroup attachment")
+	}
+	var fs unix.Statfs_t
+	var st unix.Stat_t
+	if err := unix.Fstatfs(int(procs.Fd()), &fs); err != nil {
+		return err
+	}
+	if err := unix.Fstat(int(procs.Fd()), &st); err != nil {
+		return err
+	}
+	if fs.Type != unix.CGROUP2_SUPER_MAGIC || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Uid != 0 || st.Mode&0022 != 0 {
+		return fmt.Errorf("service cgroup descriptor is not a protected cgroup-v2 control")
+	}
+	cmd.ExtraFiles = []*os.File{procs}
+	return nil
+}
+
 // RootDir sets the working directory of cmd, a RootCommand, to dir after
 // checking that dir resolves to a directory which, with every directory
 // above it, is owned by root and writable by nobody else.

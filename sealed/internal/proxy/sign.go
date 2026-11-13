@@ -13,12 +13,14 @@
 //   - 127.0.0.1 binds are also exposed by Daytona in some configurations.
 //   - A unix socket is purely intra-container; fs permission is the ACL.
 //
-// Seven routes (signSocketRoutes is the complete set; sign_test.go pins it):
+// Eight routes (signSocketRoutes is the complete set; sign_test.go pins it):
 //
 //	POST     /sign/personal_sign  EIP-191 0x45 — body {"message": str} or {"message_hex": "0x..."}
 //	POST     /sign/typed_data     EIP-712 (EIP-191 0x01) — body is the standard TypedData JSON
 //	POST     /sign/transaction    raw RLP — body has chain_id, nonce, to, value, data,
 //	                                        gas_limit, max_fee_per_gas, max_priority_fee_per_gas
+//	GET/POST /service-host        managed MCP program lifecycle — signs nothing
+//
 //	GET/POST /services            agent service registry (services.go) — signs nothing
 //	GET/POST /settings            agent half of the settings channel (settings.go) — signs nothing
 //	POST     /harness/restart     restart the harness (restart.go) — signs nothing
@@ -144,6 +146,7 @@ func (s *Server) signSocketRoutes() []signRoute {
 		{"/settings", s.handleAgentSettings},
 		{"/harness/restart", s.handleHarnessRestart},
 		{"/mcp", s.handleSignMCP},
+		{"/service-host", s.handleServiceHost},
 	}
 }
 

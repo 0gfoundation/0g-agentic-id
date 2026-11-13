@@ -661,9 +661,13 @@ func TestReadRefusesSocketAndDevice(t *testing.T) {
 	if os.Geteuid() != 0 {
 		return
 	}
-	dev := filepath.Join(dir, "null.md")
-	if err := unix.Mknod(dev, unix.S_IFCHR|0o666, int(unix.Mkdev(1, 3))); err != nil {
-		skipOrFail(t, "cannot create a device node here: %v", err)
+	// Production deliberately lacks CAP_MKNOD. Use the image's existing
+	// character device so the mandatory refusal check still runs with the
+	// same six capabilities, rather than requiring a more privileged fixture.
+	dev := "/dev/null"
+	fi, err := os.Stat(dev)
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		t.Fatalf("expected the image's null character device: %v", err)
 	}
 	_, err = ReadFile(dev, 1<<10)
 	wantUnsafe(t, "ReadFile(device)", err)

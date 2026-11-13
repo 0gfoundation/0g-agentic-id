@@ -67,6 +67,8 @@ type harnessKnobs struct {
 	// MaxParallelToolCalls bounds how many tool calls one turn may run at
 	// once. 1 = strictly serial.
 	MaxParallelToolCalls int
+	// MCPServers are owner-selected DSH stdio/Streamable HTTP connections.
+	MCPServers string
 }
 
 // defaultKnobs is the shipped composition, i.e. what an empty overlay must
@@ -118,6 +120,34 @@ func parseKnobs(raw json.RawMessage) harnessKnobs {
 	parseBoolKnob(fields, "toolJobs", &k.ToolJobs, d.ToolJobs)
 	parseBoolKnob(fields, "subagents", &k.Subagents, d.Subagents)
 	parseBoolKnob(fields, "schedule", &k.Schedule, d.Schedule)
+	if raw, ok := fields["mcpServers"]; ok {
+		var servers []map[string]any
+		if err := json.Unmarshal(raw, &servers); err == nil && len(servers) <= 16 {
+			valid := true
+			names := map[string]bool{"seal": true, "seal-reveal": true}
+			for _, server := range servers {
+				name, _ := server["serverName"].(string)
+				transport, _ := server["transport"].(string)
+				if name == "" || len(name) > 32 || names[name] || (transport != "stdio" && transport != "streamable-http") {
+					valid = false
+					break
+				}
+				names[name] = true
+				for _, c := range name {
+					if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+						valid = false
+					}
+				}
+			}
+			if valid {
+				k.MCPServers = string(raw)
+			} else {
+				logger.Logf("harness: invalid mcpServers; disabled")
+			}
+		} else {
+			logger.Logf("harness: mcpServers must be an array of at most 16 servers; disabled")
+		}
+	}
 
 	if v, ok := fields["maxParallelToolCalls"]; ok {
 		n := defaultKnobs().MaxParallelToolCalls
@@ -215,6 +245,9 @@ func settingsEnv(s settings.Resolved, k harnessKnobs) []string {
 	env["SEAL_HARNESS_SUBAGENTS"] = boolEnv(k.Subagents)
 	env["SEAL_HARNESS_SCHEDULE"] = boolEnv(k.Schedule)
 	env["SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS"] = strconv.Itoa(k.MaxParallelToolCalls)
+	if k.MCPServers != "" {
+		env["SEAL_MCP_SERVERS"] = k.MCPServers
+	}
 
 	env["SEAL_MODEL_PROVIDER"] = s.Provider
 	env["SEAL_MODEL_ID"] = s.Model

@@ -56,6 +56,7 @@ import (
 	"seal-verify/internal/report"
 	"seal-verify/internal/scrub"
 	"seal-verify/internal/secretenv"
+	"seal-verify/internal/servicehost"
 	"seal-verify/internal/settings"
 	"seal-verify/internal/state"
 	"seal-verify/internal/uploader"
@@ -1043,6 +1044,31 @@ func startAgent(
 		chainIDStr = res.client.ChainID().String()
 	}
 
+	harness, isLayeredRuntime := any(adapter).(framework.LayeredRuntime)
+	var hostedServices *servicehost.Manager
+	// Resume untrusted services only after the live owner and identity have
+	// been restored. Each program has its own filesystem/process sandbox.
+	if adapter.Name() == "0g-harness" || adapter.Name() == "dsh" {
+		host, err := servicehost.NewWithOptions(privsep.StateDir+"/services", strings.ToLower(res.owner)+":"+sealID, servicehost.Options{
+			ModelRoute: func(ctx context.Context) (servicehost.ModelRoute, error) {
+				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				return serviceModelRoute(ctx, keys, live.get())
+			},
+			AcquireRuntime: func(ctx context.Context) (servicehost.RuntimeLease, error) {
+				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				return lr.acquireServiceRuntime(ctx, harness)
+			},
+		})
+		if err != nil {
+			logger.Logf("service hosting unavailable: %v", err)
+		} else {
+			sealedProxy.SetServiceHost(host)
+			sealedStop.add(func(context.Context) { host.Close() })
+			hostedServices = host
+		}
+	}
 	mgr := manager.New(adapter, agent, manager.Config{
 		OnFailed: onFailed,
 		// A confirmed start, whoever brought it up, clears an earlier
@@ -1057,7 +1083,6 @@ func startAgent(
 	// Under the layered flow every serve-proof is v2 from the first one: its
 	// layers are set before the agent starts, and until the harness has
 	// started nothing is signed (proxy.SetProofLayers).
-	harness, isLayeredRuntime := any(adapter).(framework.LayeredRuntime)
 	if isLayeredRuntime && lr != nil {
 		sealedHash := cfg.SealedHash
 		sealedProxy.SetProofLayers(func() (proxy.ProofLayers, bool) {
@@ -1136,6 +1161,9 @@ func startAgent(
 		return err
 	}
 	markInUse()
+	if hostedServices != nil {
+		hostedServices.Resume()
+	}
 
 	// Confirm only the document used by the successful initial framework start,
 	// before registering runtime settings mutation callbacks.
