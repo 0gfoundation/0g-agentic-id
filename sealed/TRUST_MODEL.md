@@ -89,7 +89,7 @@ How the implementation maintains this:
 | Host can't read container memory | TDX hardware memory encryption + attestation |
 | Disk persistence is encrypted at rest | `agent_seal_priv` is never written to disk in plaintext; provisioned to memory only |
 | Openclaw subprocess doesn't have it | spawn.go builds the subprocess env from an explicit whitelist (`PATH`, `HOME` — the agent's own home, `/home/agent` —, `OPENCLAW_STATE_DIR` and `OPENCLAW_HOME` — the framework tree's absolute path and its parent, not secret —, the provider `*_API_KEY`, `AGENT_PUBLIC_URL`, `SEAL_SIGN_SOCK`, `AGENT_SEAL`) instead of inheriting the bootstrap's env — the key material never crosses the subprocess boundary |
-| Storage uploads keep it in-process | `dataplane.Upload` uploads through the 0g-storage-client Go SDK inside sealed (`internal/dataplane/upload.go`) and builds the SDK's transaction signer from the key sealed already holds, so the key is never handed to a child process — not in an argument list (`/proc/<pid>/cmdline` is readable by every local user, the de-privileged agent included), an environment, a descriptor or a file. The blob goes to the SDK from memory (no temp file). Once its upload has ended (abandoned at the 90s deadline, say), the SDK can no longer sign or send a transaction with the key: that signer refuses, and so does the fullnode client, on every provider retry; only a send already on the wire at that moment can still reach the node, as one could when the CLI was killed at the deadline. The cost is footprint and fault isolation. The SDK links some 360 more non-standard packages into this process (most of them go-ethereum's node stack; details in `QUIRKS.md`), and through them the standard library's `net/http/pprof` and `expvar` (see the next row); `TestLinkedPackages_Reviewed` pins both the non-standard packages and the standard-library packages they import directly. And an upload now shares sealed's process: a panic in a goroutine the SDK starts, or memory exhausted during an upload, ends sealed, and with it the container and the agent (in the 0g-harness image the loader exits with sealed), where it used to end one CLI run (`runBounded` recovers only the goroutine that calls the SDK; see `QUIRKS.md`). The pinned SDK also leaves a goroutine blocked for good behind each submission of a blob over 2 MiB that reverts or whose receipt query fails, which a CLI run took with it when it exited; `Upload` caps how many can pile up (`QUIRKS.md`). The 0g-storage-client CLI is still run, through `privsep.RootCommand` (resolved only in root-only `PATH` directories), for downloads, which involve no key; the images that build it install it at `/usr/local/bin` (`Dockerfile`, `images/{hermes,prime,harness,sealed}`; the base image `images/openclaw` carries none). Pinned by the `internal/dataplane` tests: `Upload` starts no child process (a source check that nothing on the upload path names a process-starting API, `internal/privsep`'s command builders included; and the root-side guard lists no binary for `Upload`), the dependencies whose source names a process-starting API are a reviewed set, the SDK wiring matches the CLI's, and signing and sending stop with the upload |
+| Storage uploads keep it in-process | `dataplane.Upload` uploads through the 0g-storage-client Go SDK inside sealed (`internal/dataplane/upload.go`) and builds the SDK's transaction signer from the key sealed already holds, so the key is never handed to a child process — not in an argument list (`/proc/<pid>/cmdline` is readable by every local user, the de-privileged agent included), an environment, a descriptor or a file. The blob goes to the SDK from memory (no temp file). Once its upload has ended (abandoned at the 90s deadline, say), the SDK can no longer sign or send a transaction with the key: that signer refuses, and so does the fullnode client, on every provider retry; only a send already on the wire at that moment can still reach the node, as one could when the CLI was killed at the deadline. The cost is footprint and fault isolation. The SDK links some 360 more non-standard packages into this process (most of them go-ethereum's node stack; details in `QUIRKS.md`), and through them the standard library's `net/http/pprof` and `expvar` (see the next row); `TestLinkedPackages_Reviewed` pins both the non-standard packages and the standard-library packages they import directly. And an upload now shares sealed's process: a panic in a goroutine the SDK starts, or memory exhausted during an upload, ends sealed, and with it the agent (as PID 1, the container too; in the 0g-harness image the loader starts sealed again, at most 5 times in 10 minutes), where it used to end one CLI run (`runBounded` recovers only the goroutine that calls the SDK; see `QUIRKS.md`). The pinned SDK also leaves a goroutine blocked for good behind each submission of a blob over 2 MiB that reverts or whose receipt query fails, which a CLI run took with it when it exited; `Upload` caps how many can pile up (`QUIRKS.md`). The 0g-storage-client CLI is still run, through `privsep.RootCommand` (resolved only in root-only `PATH` directories), for downloads, which involve no key; the images that build it install it at `/usr/local/bin` (`Dockerfile`, `images/{hermes,prime,harness,sealed}`; the base image `images/openclaw` carries none). Pinned by the `internal/dataplane` tests: `Upload` starts no child process (a source check that nothing on the upload path names a process-starting API, `internal/privsep`'s command builders included; and the root-side guard lists no binary for `Upload`), the dependencies whose source names a process-starting API are a reviewed set, the SDK wiring matches the CLI's, and signing and sending stop with the upload |
 | No HTTP endpoint exposes it | sealed's mux serves derived signatures and public addresses, never the priv bytes. Nor are profiles or process variables served: the `/debug/pprof/*` and `/debug/vars` routes that linked libraries (`net/http/pprof`, `expvar`) register on `http.DefaultServeMux` at init are dropped at start, by replacing that mux (`defaultmux.go`) |
 | Provisioning chain doesn't leak it | attestor ECIES-encrypts `agent_seal_priv` to the ephemeral `container_pubkey`; only the holder of the matching `container_privkey` can open it. That keypair is **not** generated inside this container — the 0g-Sandbox sealing layer generates it and injects the private half as `SANDBOX_SEAL_KEY`, which Phase 0 only cross-verifies against `attestation.pubkey` (`internal/config/config.go`). The sandbox layer is therefore inside the TCB for this hop; what keeps the hop honest is that attestor will only encrypt to a pubkey carried in a v3 certificate signed by the key of a sandbox provider it trusts and bound to that provider's chain, TappRegistry, appId and registration epoch, or to the pubkey it recorded from such a certificate. sealed zeroes the key bytes and unsets the env once provisioning succeeds, with a documented `/proc/<pid>/environ` caveat (`config.go:265-282`). Full flow + the gating predicates in [Trust chain](#trust-chain-how-agent_seal_priv-reaches-the-tee) below |
 
@@ -826,7 +826,7 @@ cannot ptrace sealed, read `/proc/<sealed pid>/mem`, or read the
 bootstrap environment of sealed or of PID 1 (sealed also sets
 `PR_SET_DUMPABLE=0`; in the 0g-harness image PID 1 is the loader,
 `cmd/loader`, which is root, sets `PR_SET_DUMPABLE=0` too, and runs a sealed
-only after checking its hash and that the chain does not refuse it — see "The
+only after checking its hash and that the chain lists it — see "The
 0g-harness layered runtime" below). sealed
 also sets `no_new_privs` on itself, which every process it starts inherits:
 an exec in the agent's processes never grants privileges, so a setuid-root
@@ -1295,20 +1295,21 @@ check rests on:
   they run is delisted, and then onto a version already through the delay. A
   delisting reaches them within one heartbeat (5 minutes); the moved-to
   version then receives the agent key.
-- **Which sealed runs.** The loader runs a sealed only after checking its
-  hash (the image's own against the hash compiled into the loader, a
-  switched-to version against its name) and asking the chain whether the
-  trust registry's sealed list has it (AgenticID names the registry); an
-  explicit "no" keeps it from running. The loader trusts the chain endpoint's
-  answer, as sealed does for every chain read. A switched-to version runs
-  only on an explicit "yes": with no answer to be had (the endpoint
-  unreachable or blocked, an AgenticID without a trust registry) the loader
-  runs the image's own sealed instead, which the image hash covers. That is
-  the loader's own check because the attestor's cannot replace it: under the
-  layered flow sealed reports its hash at `/provision`, signed with the
-  container key, and the attestor re-checks it at every key release, but
-  that hash is what the running sealed itself reports, while the image hash
-  comes from the provider's certificate.
+- **Which sealed runs.** The image carries no sealed: trust starts at the
+  loader, which the image hash covers. The loader runs a sealed only on the
+  chain's explicit "listed" (the trust registry's sealed list; AgenticID names
+  the registry), and only once the program hashes to that version's name,
+  checked right before it runs. It downloads programs only from the official
+  artifacts release, at an address fixed in the loader. With no answer to be
+  had (the endpoint unreachable or blocked, an AgenticID without a trust
+  registry) nothing runs. The loader trusts the chain endpoint's answer, as
+  sealed does for every chain read. That is the loader's own check because
+  the attestor's cannot replace it: sealed reports its hash at `/provision`,
+  signed with the container key, and the attestor re-checks it at every key
+  release, but that hash is what the running sealed itself reports, while the
+  image hash comes from the provider's certificate. A sealed the loader
+  started claims the agent key only from an attestor that declares the
+  layered flow, so it never sends the v1 claim, which names only the image.
 - **Switching versions.** The running sealed, already verified and holding
   the container key, picks the version by one rule (the owner's pick while
   listed, else the running one, else — that one delisted — the newest
@@ -1322,9 +1323,9 @@ check rests on:
 - **Which harness runs.** The harness runs from an official version package
   unpacked into a directory root owns and the agent can only read; sealed
   takes a package only if its hash is its name and the chain lists it on the
-  trust registry's harness list. One the list explicitly does not hold never
-  runs; when the list cannot be read, the one the container ran last or
-  base's runs, already on disk. The harness holds no key: neither the agent key,
+  trust registry's harness list. The image carries none. One the list does
+  not hold never runs; when the list cannot be read, only the one the
+  container ran last runs, if it is on disk. The harness holds no key: neither the agent key,
   nor the model key (the inference route fills it), nor the owner's chat token
   (the proxy swaps the owner's for the harness's own at the entry).
 - **What reaches the model.** Every model call goes through sealed's

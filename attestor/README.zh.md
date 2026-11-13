@@ -91,10 +91,12 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
    列入信任注册表（AgenticID 1.4.0 起在 TrustRegistry 上调
    `list(keccak256("image"), <hash>)`，经拥有该注册表的本环境 Timelock 排期执行，
    mainnet 要等 1 天；更早的 AgenticID 上用 `addValidFrameworkHash`）。
-   0g-harness 镜像还要列入其 sealed 程序和 harness 包的哈希（`keccak256("sealed")`、
-   `keccak256("harness")`），并把这两个文件以各自的 sha256 命名，附到
-   `0gfoundation/0g-agentic-id` 的 `artifacts` 发布（release）上。检查：每个镜像的
-   `isValidFrameworkHash(<hash>)` 都返回 `true`，且
+   0g-harness 镜像不带 sealed，也不带 harness 包：用它的 Dockerfile 构建这两样（导出命令
+   写在 `sealed/images/harness/Dockerfile` 开头），以各自的 sha256 命名附到
+   `0gfoundation/0g-agentic-id` 的 `artifacts` 发布（release）上，并在这个镜像的任何容器
+   启动之前列入它们的哈希（`keccak256("sealed")`、`keccak256("harness")`）：在那之前它
+   什么都不运行。检查：每个镜像的 `isValidFrameworkHash(<hash>)` 都返回 `true`，sealed 和
+   harness 哈希的 `isListed` 返回 `true`，且
    `https://github.com/0gfoundation/0g-agentic-id/releases/download/artifacts/<sha256>`
    能取到两个文件。
 2. **配置。**在第 4 步升级 attestor 之前，把 `ATTESTOR_SANDBOX_SNAPSHOT` 和

@@ -3,20 +3,23 @@ package layers
 // The hand-over between sealed and the loader (cmd/loader), through files in
 // LoaderDir, which only root can enter:
 //
-//	sealed/<hash>  a sealed program staged for the loader: written here only
-//	               once it hashed to its name, and hashed again by the loader
-//	               before it runs it
+//	sealed/<hash>  a sealed program, downloaded by the loader or staged here
+//	               for a switch: written only once it hashed to its name, and
+//	               hashed again by the loader before it runs it
 //	request        the hash sealed asks the loader to switch to; SIGUSR1 to
 //	               the loader (sealed's parent) says it is there
-//	confirmed      the hash of the version that came up; a version the loader
-//	               started on trial is kept only once this names it
-//	layered        written once the attestor declared the layered flow: from
-//	               then on the loader restarts a sealed that exits on its own
-//	               instead of exiting with it
-//	failed         the versions the loader went back from, one hash per line;
+//	confirmed      the hash of the version that came up; a version that has
+//	               not come up in this container runs on trial until this
+//	               names it
+//	failed         the versions that did not come up here, one hash per line;
 //	               sealed does not switch to them again
+//	mismatched     the versions whose download did not hash to its name here,
+//	               written by the loader
 //	current        the version the loader runs, previous the one it
 //	               replaced: written by the loader, read here
+//	layered        written once the attestor declared the layered flow; only
+//	               the loaders of earlier images, which carried a sealed of
+//	               their own, read it (MarkLayered)
 //
 // Keep these names, the environment variables and the exit codes in step
 // with cmd/loader (supervise.go, state.go).
@@ -43,21 +46,17 @@ const (
 	// SealedHashEnv is set by the loader for the sealed it starts: the
 	// sha256 it verified, 64 lowercase hex.
 	SealedHashEnv = "SEALED_HASH"
-	// TrialEnv is set ("1") by the loader when it starts a version it
-	// switched to and has not seen confirmed.
+	// TrialEnv is set ("1") by the loader when it starts a version that has
+	// not come up in this container yet.
 	TrialEnv = "SEALED_TRIAL"
-	// InsteadOfEnv is set by the loader when it runs the image's own sealed
-	// in place of the version it records, because the sealed list could not
-	// be read: that version's hash. Once the list confirms it, sealed asks
-	// to go back to it.
-	InsteadOfEnv = "SEALED_INSTEAD_OF"
 )
 
 // The exit codes sealed tells the loader something with. Any other exit of a
 // version on trial before it confirms reads as that version failing.
 const (
 	// TrialFailedExit is the exit code of a sealed on trial whose boot
-	// failed: the loader then goes back to the version it switched from.
+	// failed: the loader then takes the version it replaced, or the newest
+	// other listed one.
 	TrialFailedExit = 75
 	// TrialTransientExit is the exit code of a boot that failed for a reason
 	// outside this version (an endpoint it could not reach, a download): the
@@ -143,23 +142,15 @@ func Confirm(hash string) error {
 
 // MarkLayered tells the loader the attestor runs the layered flow.
 //
-// LEGACY(pre-1.4.0): the loader needs telling only because an attestor on a
-// chain whose AgenticID names no trust registry runs no layered flow, and the
-// loader then stops with sealed. Once every environment is on AgenticID
-// 1.4.0 the loader can always restart sealed.
+// LEGACY(builtin-sealed): only the loaders of earlier 0g-harness images, which
+// carried a sealed of their own and stopped with sealed until told, read it;
+// the loader of an image without one always restarts sealed. Delete it once
+// no such image runs.
 func MarkLayered() error {
 	if err := privsep.MkdirAll(LoaderDir, 0o700); err != nil {
 		return err
 	}
 	return privsep.WriteFile(filepath.Join(LoaderDir, "layered"), []byte("1"), 0o600)
-}
-
-// Layered reports whether a sealed in this container has told the loader the
-// attestor runs the layered flow: from then on the loader starts sealed again
-// when it exits.
-func Layered() bool {
-	_, err := privsep.Lstat(filepath.Join(LoaderDir, "layered"))
-	return err == nil
 }
 
 // readHash reads a loader state file that names a version: 64 lowercase

@@ -176,7 +176,7 @@ and degrades gracefully when absent):
 | `ServiceFieldLimiter` | `ServiceFieldLimits() (description, inputExample int)` | proxy, on service registration: a longer description or input example (bytes) is refused | no length caps |
 | `SigningRules` | `AppliesSigningRules() bool` | sign socket: refuses a transaction to AgenticID `update` / `updateAt` (the drift watcher's channel), and records every signature and refusal for the owner (`GET /_seal/signatures`). Set `RuntimeSnapshot.SigningRules` too, so the agent doc says so. Only 0g-harness | the socket signs within its three shapes and keeps no record; `/_seal/signatures` is 404 |
 | `RuntimeTools` | `ServesRuntimeTools() bool` | sign and reveal sockets: `POST /mcp` serves their endpoints (and the credential socket's) as MCP tools, which your framework registers from `tools/list` and calls back with `tools/call`. Set `RuntimeSnapshot.SealTools` too, so the agent doc names them. Only 0g-harness (its `seal-tools` plugin) | `/mcp` is 404 |
-| `LayeredRuntime` | `UseHarness(hash, dir)`, `HarnessHash()`, `InferenceTarget()` | bootstrap and `layered.go`: which harness package `Start` runs, switching packages as the attestor targets them, and serve-proof v2 (`LAYERS.md` §5, §7). Only 0g-harness | the framework the image installed runs; serve-proofs stay v1 |
+| `LayeredRuntime` | `UseHarness(hash, dir)`, `HarnessHash()`, `InferenceTarget()` | bootstrap and `layered.go`: which harness package `Start` runs (the image ships none, so `Start` fails until one is set), switching packages by the version rule, and serve-proof v2 (`LAYERS.md` §5, §7). Only 0g-harness | the framework the image installed runs; serve-proofs stay v1 |
 
 Declare compile-time assertions for everything you implement
 (`var _ framework.VersionReconciler = (*Adapter)(nil)`) — silent non-implementation of an optional
@@ -1538,7 +1538,8 @@ package (~50 of them). Unlike openclaw, hermes and prime-agent, there is no
 single "the framework's config file"; the composition itself (which plugins,
 in what order, with what config) is platform structure: it lives in
 [0g-harness](https://github.com/0gfoundation/0g-harness) (`src/composition.mjs`),
-which the 0g-harness image installs at build time. The state half — `Roles`, `Defaults`, `Restore`/`EvolutionFor`,
+which runs from an official version package sealed installs by hash (the image
+ships none). The state half — `Roles`, `Defaults`, `Restore`/`EvolutionFor`,
 `HandleLegacy["persona"]`, `FrameworkFacts` — is green under
 `conformance.Run` plus adapter-specific tests for persona ingestion and, since
 the settings channel landed, for the render itself
@@ -1627,10 +1628,10 @@ context, no separate answer channel required.
 
 **The process half.** 0g-harness (with its platform plugins `seal-tools` and
 `subagent-guard`) composes the plugin tree in-process — no
-loader, no profile, no `$DSH_HOME` patch layer — and the 0g-harness image installs
-one exact build of it at build time, its dependency tree locked, so the
-composition rides the image hash and an agent editing its home cannot change
-what mounts next boot. It keeps one long-lived `Agent`, runs owner turns one
+loader, no profile, no `$DSH_HOME` patch layer — and an official version
+package holds one exact build of it, its dependency tree locked, so the
+composition rides the package hash (on the trust registry's harness list) and
+an agent editing its home cannot change what mounts next boot. It keeps one long-lived `Agent`, runs owner turns one
 at a time, and routes each turn's output to whoever opened the turn: the
 owner request, or the inbox for a turn the agent opened itself (a background
 job finishing, a reminder coming due). It serves `/v1/chat/completions`

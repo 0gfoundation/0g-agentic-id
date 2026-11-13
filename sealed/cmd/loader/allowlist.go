@@ -4,15 +4,14 @@ package main
 // version, with the standard library's HTTP client: JSON-RPC eth_calls to
 // CHAIN_RPC_URL, the endpoint sealed itself reads the chain through. First
 // AgenticID.trustRegistry() names the trust registry, then its
-// isListed(SEALED, hash) answers (sealed/LAYERS.md §2, §10).
+// listed(SEALED) (every listed version, oldest first) and
+// isListed(SEALED, hash) answer (sealed/LAYERS.md §2, §10).
 //
-// A staged version (one sealed downloaded) runs only on the chain's explicit
-// "listed". When no answer can be had (the endpoint unreachable, any JSON-RPC
-// error, an AgenticID that names no trust registry, which is what one before
-// 1.4.0 is) the loader runs the image's own sealed instead (supervise.go):
-// the image hash, which the attestor checks from the container certificate,
-// covers that one, while a staged version's hash reaches the attestor only as
-// the running sealed reports it.
+// A version runs only on the chain's explicit "listed" (supervise.go). When
+// no answer can be had — the endpoint unreachable, any JSON-RPC error, an
+// AgenticID that names no trust registry (one before 1.4.0) — nothing runs:
+// the loader reads again later. The image holds no sealed of its own, so
+// there is nothing to fall back to that the list does not vouch for.
 
 import (
 	"bytes"
@@ -20,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -28,6 +28,9 @@ import (
 // sealedList is the chain's sealed list as the loader reads it: *allowlist,
 // or a stand-in in tests.
 type sealedList interface {
+	// listed returns every version the chain lists, oldest first (64
+	// lowercase hex each). err is set when no answer could be had.
+	listed() ([]string, error)
 	// refuses reports whether the chain says hash is not listed. err is set
 	// when no answer could be had; refuses is then false.
 	refuses(hash string) (refuses bool, err error)
@@ -38,6 +41,8 @@ const (
 	trustRegistrySelector = "9b835427"
 	// isListedSelector is keccak256("isListed(bytes32,bytes32)")[:4].
 	isListedSelector = "38fd4d0d"
+	// listedSelector is keccak256("listed(bytes32)")[:4].
+	listedSelector = "bf7e3b60"
 	// sealedKind is keccak256("sealed"), the trust registry's SEALED kind.
 	sealedKind = "2969d9028950bc77b790113fba8fea120169b18909fd67661a56ef98be3b78b0"
 )
@@ -48,7 +53,9 @@ const (
 	chainRPCEnv  = "CHAIN_RPC_URL"
 	contractEnv  = "AGENTIC_ID_ADDR"
 	rpcTimeout   = 10 * time.Second
-	rpcMaxAnswer = 64 << 10
+	rpcMaxAnswer = 256 << 10
+	// maxListed bounds the versions one listed() answer may name.
+	maxListed = 4096
 )
 
 // allowlist reads the trust registry's sealed list.
@@ -67,27 +74,70 @@ func newAllowlist(rpc, contract string) *allowlist {
 	return &allowlist{rpc: rpc, contract: contract, client: &http.Client{Timeout: rpcTimeout}}
 }
 
+// registry reads AgenticID.trustRegistry(): the trust registry's address.
+func (a *allowlist) registry() (string, error) {
+	if a == nil {
+		return "", fmt.Errorf("%s or %s is unset: the sealed list cannot be read", chainRPCEnv, contractEnv)
+	}
+	word, err := a.word(a.contract, trustRegistrySelector)
+	if err == nil && (!zero(word[:12]) || zero(word[12:])) {
+		err = fmt.Errorf("it names none")
+	}
+	if err != nil {
+		return "", fmt.Errorf("trustRegistry(): %w (this image runs only on a chain whose AgenticID, 1.4.0 or later, names its trust registry)", err)
+	}
+	return "0x" + hex.EncodeToString(word[12:]), nil
+}
+
+// listed returns every version the chain lists, oldest first.
+func (a *allowlist) listed() ([]string, error) {
+	registry, err := a.registry()
+	if err != nil {
+		return nil, err
+	}
+	out, err := a.call(registry, listedSelector+sealedKind)
+	if err != nil {
+		return nil, fmt.Errorf("listed: %w", err)
+	}
+	hashes, err := decodeBytes32Array(out)
+	if err != nil {
+		return nil, fmt.Errorf("listed: %w", err)
+	}
+	return hashes, nil
+}
+
+// decodeBytes32Array decodes the ABI encoding of one bytes32[] return: the
+// offset of the array (32), its length, then the elements.
+func decodeBytes32Array(out []byte) ([]string, error) {
+	if len(out) < 64 || len(out)%32 != 0 {
+		return nil, fmt.Errorf("return of %d bytes is not a bytes32[]", len(out))
+	}
+	if offset := new(big.Int).SetBytes(out[:32]); offset.Cmp(big.NewInt(32)) != 0 {
+		return nil, fmt.Errorf("return is not a bytes32[] (offset %s)", offset)
+	}
+	n := new(big.Int).SetBytes(out[32:64])
+	if !n.IsInt64() || n.Int64() > maxListed || int64(len(out)) != 64+32*n.Int64() {
+		return nil, fmt.Errorf("return of %d bytes does not hold %s bytes32", len(out), n)
+	}
+	hashes := make([]string, 0, n.Int64())
+	for i := 64; i < len(out); i += 32 {
+		hashes = append(hashes, hex.EncodeToString(out[i:i+32]))
+	}
+	return hashes, nil
+}
+
 // refuses reports whether the chain says hash is not listed. err is set
 // when no answer could be had; refuses is then false.
 func (a *allowlist) refuses(hash string) (refuses bool, err error) {
-	if a == nil {
-		return false, fmt.Errorf("%s or %s is unset: the sealed list cannot be read", chainRPCEnv, contractEnv)
-	}
 	b, err := hex.DecodeString(hash)
 	if err != nil || len(b) != 32 {
 		return false, fmt.Errorf("not a sealed hash: %q", hash)
 	}
-	word, err := a.call(a.contract, trustRegistrySelector)
+	registry, err := a.registry()
 	if err != nil {
-		return false, fmt.Errorf("trustRegistry(): %w", err)
+		return false, err
 	}
-	if !zero(word[:12]) || zero(word[12:]) {
-		// LEGACY(pre-1.4.0): an AgenticID before 1.4.0 reverts above or
-		// names none here; either is no answer.
-		return false, fmt.Errorf("trustRegistry() names no trust registry")
-	}
-	registry := "0x" + hex.EncodeToString(word[12:])
-	word, err = a.call(registry, isListedSelector+sealedKind+hash)
+	word, err := a.word(registry, isListedSelector+sealedKind+hash)
 	if err != nil {
 		return false, fmt.Errorf("isListed: %w", err)
 	}
@@ -97,8 +147,20 @@ func (a *allowlist) refuses(hash string) (refuses bool, err error) {
 	return word[31] == 0, nil
 }
 
+// word runs one eth_call whose return is one ABI word.
+func (a *allowlist) word(to, data string) ([]byte, error) {
+	out, err := a.call(to, data)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) != 32 {
+		return nil, fmt.Errorf("eth_call returned %d bytes, not one ABI word", len(out))
+	}
+	return out, nil
+}
+
 // call runs one eth_call of data (hex, no 0x) on to, at the latest block,
-// and returns its one ABI word.
+// and returns what it returned.
 func (a *allowlist) call(to, data string) ([]byte, error) {
 	call, _ := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
@@ -114,9 +176,12 @@ func (a *allowlist) call(to, data string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, rpcMaxAnswer))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, rpcMaxAnswer+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > rpcMaxAnswer {
+		return nil, fmt.Errorf("answer larger than %d bytes", rpcMaxAnswer)
 	}
 	var answer struct {
 		Result string          `json:"result"`
@@ -128,11 +193,11 @@ func (a *allowlist) call(to, data string) ([]byte, error) {
 	if len(answer.Error) > 0 && string(answer.Error) != "null" {
 		return nil, fmt.Errorf("eth_call: %s", answer.Error)
 	}
-	word, err := hex.DecodeString(strings.TrimPrefix(answer.Result, "0x"))
-	if err != nil || len(word) != 32 {
-		return nil, fmt.Errorf("eth_call returned %q, not one ABI word", answer.Result)
+	out, err := hex.DecodeString(strings.TrimPrefix(answer.Result, "0x"))
+	if err != nil {
+		return nil, fmt.Errorf("eth_call returned %q, not hex", answer.Result)
 	}
-	return word, nil
+	return out, nil
 }
 
 func zero(b []byte) bool {

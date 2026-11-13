@@ -27,10 +27,11 @@ import (
 // The process this adapter runs is 0g-harness (github.com/0gfoundation/0g-harness):
 // it composes the DSH plugin tree, keeps the one agent, routes each turn's
 // output to whoever opened the turn, and serves the owner's /v1/ surface. It
-// runs from an official version package (sealed/LAYERS.md §5): the image
-// unpacks the one it ships, its whole dependency tree locked and built at
-// image build time (images/harness/Dockerfile), and sealed picks which
-// package Start runs (UseHarness); the build also fails unless the package's
+// runs only from an official version package (sealed/LAYERS.md §5): the
+// image ships none; sealed installs the one the trust registry lists and
+// picks which package Start runs (UseHarness). A package holds the harness
+// with its whole dependency tree, locked and built when the package is built
+// (images/harness/Dockerfile), and that build fails unless the package's
 // version is the one whitelist.go records in the framework role. Its
 // environment contract is what environ() builds. Identifiers keep the word
 // "bridge" for the loopback process this adapter talks to.
@@ -42,12 +43,6 @@ const (
 	// packageEntry is the harness's entry script inside a package. It
 	// resolves its @deepseek-ai/* imports from the package's node_modules.
 	packageEntry = "bin/0g-harness.mjs"
-
-	// legacyHarnessEntry is the entry script of an image that installed the
-	// harness globally instead of as a package; Start runs it when no
-	// package was set (UseHarness). LEGACY(v1): only images from before
-	// packages, which run their own older sealed.
-	legacyHarnessEntry = "/usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs"
 
 	// logName names the harness's stdout/stderr log under
 	// framework.StateDir/log, served on /log/agent.
@@ -185,6 +180,9 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		be.agentDoc = agentDocPath()
 	}
 
+	if entry == "" {
+		return framework.StartResult{}, fmt.Errorf("harness.Start: no harness package chosen (UseHarness): the harness runs only from an official version package, which sealed installs under the layered flow (sealed/LAYERS.md §5)")
+	}
 	if !initialized {
 		// A harness an earlier sealed in this container left running (one
 		// that exited without stopping it) would hold the port, and the
@@ -216,11 +214,11 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	return framework.StartResult{Upstream: "http://" + addr, PID: cmd.Process.Pid}, nil
 }
 
-// entryLocked is the entry script Start runs: the chosen package's, or the
-// image's global install when none was chosen. a.mu must be held.
+// entryLocked is the entry script Start runs: the chosen package's, "" when
+// none was chosen. a.mu must be held.
 func (a *Adapter) entryLocked() string {
 	if a.pkgDir == "" {
-		return legacyHarnessEntry
+		return ""
 	}
 	return filepath.Join(a.pkgDir, packageEntry)
 }
@@ -409,7 +407,7 @@ func spawnBridge(be bridgeEnv, entry string) (*exec.Cmd, error) {
 	// otherwise — internal/privsep). Background, not Start's ctx: the harness
 	// outlives the call that spawned it; Stop ends it. entry is in a package
 	// directory root owns and the agent can only read (sealed/LAYERS.md
-	// §5.2), or the image's global install.
+	// §5.2).
 	cmd, err := privsep.AgentCommand(context.Background(), "node", entry)
 	if err != nil {
 		logFile.Close()
@@ -488,7 +486,9 @@ func (a *Adapter) Stop(ctx context.Context, gracefulTimeout time.Duration) error
 		}
 	}
 
-	privsep.Sweep(entry)
+	if entry != "" {
+		privsep.Sweep(entry)
+	}
 	return nil
 }
 

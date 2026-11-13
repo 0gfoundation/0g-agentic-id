@@ -1,17 +1,14 @@
 package provision
 
-// LEGACY(v1): the boot claim of a boot outside the layered flow
-// (sealed/LAYERS.md §8): images without the loader (openclaw, hermes and
-// prime-agent, and 0g-harness images from before the loader), and a loader
-// image whose attestor does not declare the flow (a chain whose AgenticID
-// names no trust registry). Their claim names no sealed hash: the image hash
-// covers their sealed.
+// LEGACY(v1): the boot claim of an image without the loader
+// (sealed/LAYERS.md §8): openclaw, hermes and prime-agent, and 0g-harness
+// images from before the loader. Their claim names no sealed hash: the image
+// hash covers their sealed. A sealed the loader started never sends it.
 //
 // Delete this file, and every branch marked LEGACY(v1)
-// (`git grep -n 'LEGACY(v1)'`), once every running image has the loader and
-// every attestor declares the layered flow — openclaw, hermes and
-// prime-agent retired or moved onto the loader, the older 0g-harness images
-// reset, every environment on AgenticID 1.4.0. The attestor's v1 claim
+// (`git grep -n 'LEGACY(v1)'`), once every running image has the loader —
+// openclaw, hermes and prime-agent retired or moved onto the loader, the
+// older 0g-harness images reset. The attestor's v1 claim
 // (attestor/crates/shared/src/legacy.rs) goes at the same time.
 
 import "fmt"

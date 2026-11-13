@@ -77,7 +77,7 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 | host 读不到容器内存 | TDX 硬件内存加密 + attestation |
 | 磁盘持久化是加密的 | `agent_seal_priv` 从不以明文写盘；只 provision 到内存 |
 | openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`（agent 自己的家目录 `/home/agent`）、`OPENCLAW_STATE_DIR` 和 `OPENCLAW_HOME`（框架目录树的绝对路径及其上级目录，非机密）、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
-| 存储上传不让它离开进程 | `dataplane.Upload` 在 sealed 进程内通过 0g-storage-client Go SDK 上传（`internal/dataplane/upload.go`），SDK 的交易签名器直接由 sealed 已持有的密钥构造，所以密钥从不交给任何子进程 —— 不进参数列表（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），不进环境变量，不经文件描述符，也不落文件。blob 从内存直接交给 SDK（不写临时文件）。本次上传一旦结束（比如在 90s 截止时被放弃），SDK 就不能再用这把密钥签名或发送交易：签名器拒绝签名，fullnode 客户端也拒绝发送，provider 的每次重试都一样；只有截止那一刻已经在线路上的发送仍可能到达节点，这和 CLI 在截止时被杀掉的情形相同。代价是体积和故障隔离。SDK 往这个进程里多链接了约 360 个非标准库包（大部分是 go-ethereum 的 node 栈；细节见 `QUIRKS.md`），并经由它们带进了标准库的 `net/http/pprof` 和 `expvar`（见下一行）；`TestLinkedPackages_Reviewed` 同时钉住这些非标准库包和它们直接导入的标准库包。上传现在也和 sealed 共用一个进程：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed，连同容器和 agent 一起（0g-harness 镜像里加载器随 sealed 退出），而以前只会结束一次 CLI 运行（`runBounded` 只 recover 调用 SDK 的那个 goroutine；见 `QUIRKS.md`）。钉住的 SDK 版本还会在 2 MiB 以上 blob 的提交每次被回滚、或回执查询失败后，留下一个永久阻塞的 goroutine，以前 CLI 运行结束退出时会把它一并带走；`Upload` 给它们能累积的数量设了上限（见 `QUIRKS.md`）。下载仍经 `privsep.RootCommand`（只在仅 root 可写的 `PATH` 目录中解析）运行 0g-storage-client CLI，下载不涉及密钥；构建它的那些镜像（`Dockerfile`、`images/{hermes,prime,harness,sealed}`）把它装到 `/usr/local/bin`，基础镜像 `images/openclaw` 不带。由 `internal/dataplane` 的测试钉住：`Upload` 不起任何子进程（一道源码检查：上传路径上不出现任何启动进程的 API，`internal/privsep` 的命令构造函数也算在内；再加 root 侧的结构测试不给 `Upload` 列任何可运行的二进制）、源码里出现启动进程 API 的依赖是一份审查过的固定清单、SDK 接线与 CLI 一致、签名和发送随上传结束而停止 |
+| 存储上传不让它离开进程 | `dataplane.Upload` 在 sealed 进程内通过 0g-storage-client Go SDK 上传（`internal/dataplane/upload.go`），SDK 的交易签名器直接由 sealed 已持有的密钥构造，所以密钥从不交给任何子进程 —— 不进参数列表（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），不进环境变量，不经文件描述符，也不落文件。blob 从内存直接交给 SDK（不写临时文件）。本次上传一旦结束（比如在 90s 截止时被放弃），SDK 就不能再用这把密钥签名或发送交易：签名器拒绝签名，fullnode 客户端也拒绝发送，provider 的每次重试都一样；只有截止那一刻已经在线路上的发送仍可能到达节点，这和 CLI 在截止时被杀掉的情形相同。代价是体积和故障隔离。SDK 往这个进程里多链接了约 360 个非标准库包（大部分是 go-ethereum 的 node 栈；细节见 `QUIRKS.md`），并经由它们带进了标准库的 `net/http/pprof` 和 `expvar`（见下一行）；`TestLinkedPackages_Reviewed` 同时钉住这些非标准库包和它们直接导入的标准库包。上传现在也和 sealed 共用一个进程：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed，连同 agent 一起（作为 PID 1 时容器也一起结束；0g-harness 镜像里加载器会重新启动 sealed，10 分钟内最多 5 次），而以前只会结束一次 CLI 运行（`runBounded` 只 recover 调用 SDK 的那个 goroutine；见 `QUIRKS.md`）。钉住的 SDK 版本还会在 2 MiB 以上 blob 的提交每次被回滚、或回执查询失败后，留下一个永久阻塞的 goroutine，以前 CLI 运行结束退出时会把它一并带走；`Upload` 给它们能累积的数量设了上限（见 `QUIRKS.md`）。下载仍经 `privsep.RootCommand`（只在仅 root 可写的 `PATH` 目录中解析）运行 0g-storage-client CLI，下载不涉及密钥；构建它的那些镜像（`Dockerfile`、`images/{hermes,prime,harness,sealed}`）把它装到 `/usr/local/bin`，基础镜像 `images/openclaw` 不带。由 `internal/dataplane` 的测试钉住：`Upload` 不起任何子进程（一道源码检查：上传路径上不出现任何启动进程的 API，`internal/privsep` 的命令构造函数也算在内；再加 root 侧的结构测试不给 `Upload` 列任何可运行的二进制）、源码里出现启动进程 API 的依赖是一份审查过的固定清单、SDK 接线与 CLI 一致、签名和发送随上传结束而停止 |
 | 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节。profile 和进程变量也不对外提供：被链接进来的库（`net/http/pprof`、`expvar`）在 init 时注册到 `http.DefaultServeMux` 上的 `/debug/pprof/*` 和 `/debug/vars` 路由，sealed 启动时通过替换这个 mux 一并丢掉（`defaultmux.go`） |
 | provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到 v3 证书携带的那个 pubkey —— 证书须由它信任的 sandbox provider 的 key 签发、并绑定该 provider 的 chain、TappRegistry、appId 和注册 epoch —— 或加密到它从这样一张证书记录下来的 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:265-282`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
 
@@ -695,7 +695,7 @@ owner 没法从外面直接 post。这次 uid 拆分同时把 doctrine 第 2/4 �
 sealed、读不了 `/proc/<sealed pid>/mem`、也读不了 sealed 或 PID 1 的引导环境变量
 （sealed 另外自设 `PR_SET_DUMPABLE=0`；0g-harness 镜像里的 PID 1 是加载器
 `cmd/loader`，同样是 root、同样设 `PR_SET_DUMPABLE=0`，执行 sealed 之前先核对哈希，
-并确认链上没有拒绝它，见下面"0g-harness 的分层运行"）。sealed 还给自己设置
+并确认链上名单列着它，见下面"0g-harness 的分层运行"）。sealed 还给自己设置
 `no_new_privs`，它启动的每个进程都会继承：agent 的进程里任何 exec 都不会
 获得权限，所以镜像里的 setuid-root 二进制（`su`、`mount`、`passwd` 等）
 以 agent 的 uid 运行，uid 拆分也就不依赖这些二进制个个都没有本地提权漏洞
@@ -1059,13 +1059,14 @@ agentSeal，并绑定 owner、agent、链和条目名；整个凭据集由 owner
   Timelock 的等待期，才会到达正在运行的 0g-harness agent：agent 只在 owner 选了它，或者正在跑
   的版本被移出名单时才换版本，换到的也是已经过了等待期的版本。移出名单在一次心跳（5 分钟）内
   生效，换到的版本随后拿到 agent 私钥。
-- **跑哪个 sealed。** 加载器执行 sealed 之前核对它的哈希（镜像自带的对编进加载器的哈希，
-  换上来的版本对它的名字），并在链上查信任合约（由 AgenticID 指明）的 sealed 名单里有没有它；
-  链上明确答"没有"就不执行。加载器信链上节点的回答，sealed 读链上数据也是这样。换上来的
-  版本只有明确答"有"才执行：查不到答案时（节点连不上或被拦、AgenticID 没有信任合约），加载器
-  改跑镜像自带的 sealed，它由镜像哈希覆盖。这一关必须由加载器自己把：分层流程下 sealed 在
+- **跑哪个 sealed。** 镜像不带 sealed：信任从加载器开始，镜像哈希覆盖它。加载器只在链上
+  明确答"在名单里"（信任合约的 sealed 名单，信任合约由 AgenticID 指明）时才执行 sealed，
+  而且执行前一刻核对程序哈希对上这个版本的名字。它只从官方制品发布处下载程序，地址写死在
+  加载器里。查不到答案时（节点连不上或被拦、AgenticID 没有信任合约），什么都不执行。加载器
+  信链上节点的回答，sealed 读链上数据也是这样。这一关必须由加载器自己把：sealed 在
   `/provision` 报上自己的哈希，用容器密钥签名，attestor 每次下发私钥都复查，但这个哈希是正在
-  运行的 sealed 自己报的，而镜像哈希来自 provider 的证书。
+  运行的 sealed 自己报的，而镜像哈希来自 provider 的证书。加载器启动的 sealed 只向声明了
+  分层流程的 attestor 申请 agent 私钥，所以它从不发只写镜像的 v1 开机声明。
 - **换版本。** 正在运行的 sealed 本身已校验过、持有容器密钥，由它按同一条规则定版本
   （owner 选的版本，列着就用；否则保持正在跑的；它被下架时换到最新登记的），在链上核对，
   按哈希从公开的制品发布处下载，哈希对上名字才留下，交给加载器，加载器再核对一次哈希和
@@ -1073,8 +1074,8 @@ agentSeal，并绑定 owner、agent、链和条目名；整个凭据集由 owner
   起不来的版本会被退回，在这个容器里不再换；因为版本以外的原因（连不上的节点、下载）起不来
   的，过一阵再启动。
 - **跑哪个 harness。** harness 从官方版本包运行，包解开在 root 所有、agent 只能读的目录
-  里；sealed 只用哈希对上名字、链上信任合约 harness 名单列着的包。名单明确说不在的包一律
-  不跑；名单读不到时，跑容器上次跑的或 base 自带的，都已在磁盘上。harness 不持有任何密钥：agent 私钥没有，模型 key 由推理代理代填，owner 的聊天
+  里；sealed 只用哈希对上名字、链上信任合约 harness 名单列着的包。镜像不带包。名单里没有的
+  包一律不跑；名单读不到时，只跑容器上次跑的那个，而且要已在磁盘上。harness 不持有任何密钥：agent 私钥没有，模型 key 由推理代理代填，owner 的聊天
   令牌由 proxy 在入口换成 harness 自己的。
 - **模型看到什么。** 每次模型调用都经 sealed 的推理代理：按 owner 设置的模型名，发到
   owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -83,64 +84,84 @@ func (e *layeredEnv) serve(b []byte) string {
 	return h
 }
 
-// installBase installs a package as base's.
-func (e *layeredEnv) installBase(t *testing.T, pkg []byte) string {
+// install installs a package, as an earlier boot in this container would
+// have.
+func (e *layeredEnv) install(t *testing.T, pkg []byte) string {
 	t.Helper()
 	h := hexSum(pkg)
 	if err := layers.InstallHarness(layers.VerifyingReader(nopCloser{bytes.NewReader(pkg)}, h), h); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(layers.PackagesDir, "base"), []byte(h), 0o644); err != nil {
+	return h
+}
+
+// ranLast records package h as the one this container ran last.
+func ranLast(t *testing.T, h string) {
+	t.Helper()
+	if err := layers.SaveHarnessSelection(layers.HarnessSelection{Current: h}); err != nil {
 		t.Fatal(err)
 	}
-	return h
 }
 
 type nopCloser struct{ *bytes.Reader }
 
 func (nopCloser) Close() error { return nil }
 
-// fakeLists is a trust registry holding what it lists; latest names each
-// kind's newest listed hash. unreadable fails every read, unreadableFor the
-// reads of the hashes it holds.
+// fakeLists is a trust registry: each kind's listed hashes, oldest first,
+// so the last is the newest. unreadable fails every read.
 type fakeLists struct {
-	sealed, harness             map[string]bool
-	latestSealed, latestHarness string
-	unreadable                  bool
-	unreadableFor               map[string]bool
+	sealed, harness []string
+	unreadable      bool
+}
+
+func (f fakeLists) of(kind [32]byte) []string {
+	if kind == kindSealed {
+		return f.sealed
+	}
+	return f.harness
 }
 
 func (f fakeLists) Listed(_ context.Context, kind, h [32]byte) (bool, error) {
-	if f.unreadable || f.unreadableFor[hex.EncodeToString(h[:])] {
+	if f.unreadable {
 		return false, errors.New("rpc down")
 	}
-	if kind == kindSealed {
-		return f.sealed[hex.EncodeToString(h[:])], nil
-	}
-	return f.harness[hex.EncodeToString(h[:])], nil
+	return slices.Contains(f.of(kind), hex.EncodeToString(h[:])), nil
 }
 
 func (f fakeLists) Latest(_ context.Context, kind [32]byte) ([32]byte, error) {
 	if f.unreadable {
 		return [32]byte{}, errors.New("rpc down")
 	}
-	if kind == kindSealed {
-		return layers.Bytes32(f.latestSealed), nil
+	listed := f.of(kind)
+	if len(listed) == 0 {
+		return [32]byte{}, nil
 	}
-	return layers.Bytes32(f.latestHarness), nil
+	return layers.Bytes32(listed[len(listed)-1]), nil
+}
+
+func (f fakeLists) Versions(_ context.Context, kind [32]byte) ([][32]byte, error) {
+	if f.unreadable {
+		return nil, errors.New("rpc down")
+	}
+	var out [][32]byte
+	for _, h := range f.of(kind) {
+		out = append(out, layers.Bytes32(h))
+	}
+	return out, nil
 }
 
 func picksOf(v settings.Versions) func() settings.Versions {
 	return func() settings.Versions { return v }
 }
 
+// The owner's pick, while listed, comes before the newest listed package.
 func TestChooseHarnessTakesTheListedPick(t *testing.T) {
 	env := newLayeredEnv(t)
-	base := env.installBase(t, testPackage(t, "base"))
 	target := env.serve(testPackage(t, "target"))
-	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true, target: true}, latestHarness: base}}
+	newest := env.serve(testPackage(t, "newest"))
+	l := &layeredRuntime{lists: fakeLists{harness: []string{target, newest}}}
 
-	hash, dir, err := l.chooseHarness(context.Background(), "0x"+target, base)
+	hash, dir, err := l.chooseHarness(context.Background(), "0x"+target)
 	if err != nil || hash != target || dir != layers.HarnessDir(target) || !layers.HarnessInstalled(target) {
 		t.Fatalf("chose %s at %s (%v)", hash, dir, err)
 	}
@@ -152,36 +173,71 @@ func TestChooseHarnessTakesTheListedPick(t *testing.T) {
 
 func TestChooseHarnessSkipsWhatIsNotListed(t *testing.T) {
 	env := newLayeredEnv(t)
-	base := env.installBase(t, testPackage(t, "base"))
+	listed := env.serve(testPackage(t, "listed"))
 	target := env.serve(testPackage(t, "target"))
-	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true}}}
+	l := &layeredRuntime{lists: fakeLists{harness: []string{listed}}}
 
-	if hash, _, err := l.chooseHarness(context.Background(), "0x"+target, base); hash != base || err != nil {
-		t.Fatalf("chose %s (%v), want base %s", hash, err, base)
+	if hash, _, err := l.chooseHarness(context.Background(), "0x"+target); hash != listed || err != nil {
+		t.Fatalf("chose %s (%v), want the listed %s", hash, err, listed)
 	}
 	if layers.HarnessInstalled(target) {
 		t.Fatal("an unlisted pick was installed")
 	}
 }
 
-// A fresh container with no pick runs the newest listed package, not base's.
+// A fresh container with no pick downloads the newest listed package.
 func TestChooseHarnessFreshContainerTakesTheNewestListed(t *testing.T) {
 	env := newLayeredEnv(t)
-	base := env.installBase(t, testPackage(t, "base"))
+	older := env.serve(testPackage(t, "older"))
 	newest := env.serve(testPackage(t, "newest"))
-	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true, newest: true}, latestHarness: newest}}
-	if hash, _, err := l.chooseHarness(context.Background(), "", base); hash != newest || err != nil {
+	l := &layeredRuntime{lists: fakeLists{harness: []string{older, newest}}}
+	if hash, _, err := l.chooseHarness(context.Background(), ""); hash != newest || err != nil || !layers.HarnessInstalled(newest) {
 		t.Fatalf("chose %s (%v), want the newest listed %s", hash, err, newest)
 	}
 }
 
-// Without a chain to confirm anything, the package this container has runs.
-func TestChooseHarnessUnconfirmedRunsWhatIsInstalled(t *testing.T) {
+// The package this container ran last stays while listed, though a newer one
+// is listed; one that failed here gives way to the next newest listed one.
+func TestChooseHarnessKeepsTheOneThisContainerRan(t *testing.T) {
 	env := newLayeredEnv(t)
-	base := env.installBase(t, testPackage(t, "base"))
-	l := &layeredRuntime{}
-	if hash, _, err := l.chooseHarness(context.Background(), "0x"+env.serve(testPackage(t, "target")), base); hash != base || err != nil {
-		t.Fatalf("chose %s (%v), want base %s", hash, err, base)
+	older := env.install(t, testPackage(t, "older"))
+	middle := env.serve(testPackage(t, "middle"))
+	newest := env.serve(testPackage(t, "newest"))
+	ranLast(t, older)
+	l := &layeredRuntime{lists: fakeLists{harness: []string{older, middle, newest}}}
+	if hash, _, err := l.chooseHarness(context.Background(), ""); hash != older || err != nil {
+		t.Fatalf("chose %s (%v), want the one it ran, %s", hash, err, older)
+	}
+	layers.MarkHarnessFailed(older)
+	layers.MarkHarnessFailed(newest)
+	if hash, _, err := l.chooseHarness(context.Background(), ""); hash != middle || err != nil {
+		t.Fatalf("chose %s (%v), want the newest listed one that did not fail, %s", hash, err, middle)
+	}
+}
+
+// When the list cannot be read, only the package this container ran last
+// starts, and only when it is here and did not fail; else the boot is tried
+// again later (transient). No chain client reads the same.
+func TestChooseHarnessUnreadableListRunsOnlyWhatThisContainerRan(t *testing.T) {
+	env := newLayeredEnv(t)
+	pick := env.serve(testPackage(t, "pick"))
+	for _, l := range []*layeredRuntime{{lists: fakeLists{unreadable: true}}, {}} {
+		if hash, _, err := l.chooseHarness(context.Background(), "0x"+pick); err == nil || !isTransient(err) {
+			t.Fatalf("fresh container: chose %q (%v), want a transient error", hash, err)
+		}
+	}
+	if layers.HarnessInstalled(pick) {
+		t.Fatal("an unconfirmed pick was installed")
+	}
+	ran := env.install(t, testPackage(t, "ran"))
+	ranLast(t, ran)
+	l := &layeredRuntime{lists: fakeLists{unreadable: true}}
+	if hash, _, err := l.chooseHarness(context.Background(), "0x"+pick); hash != ran || err != nil {
+		t.Fatalf("chose %s (%v), want the one this container ran, %s", hash, err, ran)
+	}
+	layers.MarkHarnessFailed(ran)
+	if hash, _, err := l.chooseHarness(context.Background(), ""); err == nil || !isTransient(err) {
+		t.Fatalf("chose %q (%v) after it failed, want a transient error", hash, err)
 	}
 }
 
@@ -216,13 +272,14 @@ func (r fakeReady) Readiness(context.Context) error {
 	return nil
 }
 
-// switchFixture runs base's package, with target served and both listed.
+// switchFixture runs package first, with target served and both listed,
+// target the newer.
 func switchFixture(t *testing.T, bad bool) (*layeredRuntime, *fakeHarness, string, string) {
 	t.Helper()
 	env := newLayeredEnv(t)
-	base := env.installBase(t, testPackage(t, "base"))
+	first := env.install(t, testPackage(t, "first"))
 	target := env.serve(testPackage(t, "target"))
-	h := &fakeHarness{next: base, running: base}
+	h := &fakeHarness{next: first, running: first}
 	ready := fakeReady{h: h}
 	if bad {
 		ready.bad = target
@@ -232,19 +289,19 @@ func switchFixture(t *testing.T, bad bool) (*layeredRuntime, *fakeHarness, strin
 	t.Cleanup(func() { harnessReadyTimeout = old })
 	own := strings.Repeat("aa", 32)
 	l := &layeredRuntime{sealedHash: own,
-		lists:   fakeLists{sealed: map[string]bool{own: true}, harness: map[string]bool{base: true, target: true}, latestHarness: target},
+		lists:   fakeLists{sealed: []string{own}, harness: []string{first, target}},
 		harness: h, mgr: &fakeReloader{h: h}, ready: ready, picks: picksOf(settings.Versions{})}
-	return l, h, base, target
+	return l, h, first, target
 }
 
 func TestRecheckSwitchesTheHarnessToThePick(t *testing.T) {
-	l, h, base, target := switchFixture(t, false)
+	l, h, first, target := switchFixture(t, false)
 	l.picks = picksOf(settings.Versions{Harness: "0x" + target})
 	l.recheck()
 	if h.running != target {
 		t.Fatalf("running %s, want %s", h.running, target)
 	}
-	if got := layers.LoadHarnessSelection(); got.Current != target || got.Previous != base {
+	if got := layers.LoadHarnessSelection(); got.Current != target || got.Previous != first {
 		t.Fatalf("selection %+v", got)
 	}
 }
@@ -252,17 +309,17 @@ func TestRecheckSwitchesTheHarnessToThePick(t *testing.T) {
 // No pick, the running package still listed: a newer listed one does not
 // move it (only a delisting does).
 func TestRecheckStaysWhileTheRunningVersionIsListed(t *testing.T) {
-	l, h, base, _ := switchFixture(t, false)
+	l, h, first, _ := switchFixture(t, false)
 	l.recheck()
-	if h.running != base || l.mgr.(*fakeReloader).reloads != 0 {
-		t.Fatalf("running %s after %d reloads, want base %s untouched", h.running, l.mgr.(*fakeReloader).reloads, base)
+	if h.running != first || l.mgr.(*fakeReloader).reloads != 0 {
+		t.Fatalf("running %s after %d reloads, want %s untouched", h.running, l.mgr.(*fakeReloader).reloads, first)
 	}
 }
 
 func TestRecheckMovesOffADelistedHarness(t *testing.T) {
-	l, h, base, target := switchFixture(t, false)
+	l, h, _, target := switchFixture(t, false)
 	lists := l.lists.(fakeLists)
-	delete(lists.harness, base)
+	lists.harness = []string{target}
 	l.lists = lists
 	l.recheck()
 	if h.running != target {
@@ -272,30 +329,30 @@ func TestRecheckMovesOffADelistedHarness(t *testing.T) {
 
 // A pick the registry does not list is not switched to.
 func TestRecheckIgnoresAnUnlistedPick(t *testing.T) {
-	l, h, base, _ := switchFixture(t, false)
+	l, h, first, _ := switchFixture(t, false)
 	l.picks = picksOf(settings.Versions{Harness: "0x" + strings.Repeat("cd", 32)})
 	l.recheck()
-	if h.running != base {
-		t.Fatalf("running %s, want base %s", h.running, base)
+	if h.running != first {
+		t.Fatalf("running %s, want %s", h.running, first)
 	}
 }
 
 // A list that cannot be read keeps what runs.
 func TestRecheckKeepsWhatRunsWhenTheListIsUnreadable(t *testing.T) {
-	l, h, base, _ := switchFixture(t, false)
+	l, h, first, _ := switchFixture(t, false)
 	l.lists = fakeLists{unreadable: true}
 	l.recheck()
-	if h.running != base {
-		t.Fatalf("running %s, want base %s", h.running, base)
+	if h.running != first {
+		t.Fatalf("running %s, want %s", h.running, first)
 	}
 }
 
 func TestRecheckGoesBackWhenTheHarnessDoesNotComeUp(t *testing.T) {
-	l, h, base, target := switchFixture(t, true)
+	l, h, first, target := switchFixture(t, true)
 	l.picks = picksOf(settings.Versions{Harness: "0x" + target})
 	l.recheck()
-	if h.running != base {
-		t.Fatalf("running %s, want base %s back", h.running, base)
+	if h.running != first {
+		t.Fatalf("running %s, want %s back", h.running, first)
 	}
 	if !layers.HarnessFailed(target) {
 		t.Fatal("the failed package was not recorded")
@@ -317,7 +374,7 @@ func sealedFixture(t *testing.T) (*layeredRuntime, *[]string, string, string, []
 	own := strings.Repeat("aa", 32)
 	h := &fakeHarness{}
 	l := &layeredRuntime{sealedHash: own,
-		lists:   fakeLists{sealed: map[string]bool{own: true, target: true}, latestSealed: target},
+		lists:   fakeLists{sealed: []string{own, target}},
 		harness: h, mgr: &fakeReloader{h: h}, ready: fakeReady{h: h}, picks: picksOf(settings.Versions{})}
 	return l, asked, own, target, program
 }
@@ -345,7 +402,7 @@ func TestRecheckMovesOffADelistedSealed(t *testing.T) {
 		t.Fatalf("switched while its own version is listed: %v", *asked)
 	}
 	lists := l.lists.(fakeLists)
-	delete(lists.sealed, own)
+	lists.sealed = slices.DeleteFunc(slices.Clone(lists.sealed), func(h string) bool { return h == own })
 	l.lists = lists
 	l.recheck()
 	if len(*asked) != 1 || (*asked)[0] != target {
@@ -359,11 +416,11 @@ func TestSwitchSealedSkips(t *testing.T) {
 	requestSealedSwitch = func(string) error { t.Fatal("asked to switch"); return nil }
 	own := strings.Repeat("aa", 32)
 
-	l := &layeredRuntime{sealedHash: own, lists: fakeLists{sealed: map[string]bool{}}}
+	l := &layeredRuntime{sealedHash: own, lists: fakeLists{}}
 	if l.switchSealed(context.Background(), target) {
 		t.Fatal("switched to an unlisted version")
 	}
-	l.lists = fakeLists{sealed: map[string]bool{target: true}}
+	l.lists = fakeLists{sealed: []string{target}}
 	if l.switchSealed(context.Background(), own) {
 		t.Fatal("switched to itself")
 	}
@@ -378,41 +435,33 @@ func TestSwitchSealedSkips(t *testing.T) {
 	}
 }
 
-// A package the list explicitly does not hold never starts, not even base's
-// or the one this container ran last; the boot is retried later (transient),
-// so a version listed afterwards is picked up.
+// A package the list does not hold never starts, not even the one this
+// container ran last; with nothing listed (a fresh container before the
+// first listing) the boot is retried later (transient), so a version listed
+// afterwards is picked up.
 func TestChooseHarnessNeverStartsAnUnlistedOne(t *testing.T) {
 	env := newLayeredEnv(t)
-	base := env.installBase(t, testPackage(t, "base"))
-	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{}}}
-	if hash, _, err := l.chooseHarness(context.Background(), "", base); !errors.Is(err, errNoListedHarness) || !isTransient(err) {
+	l := &layeredRuntime{lists: fakeLists{}}
+	if hash, _, err := l.chooseHarness(context.Background(), ""); !errors.Is(err, errNoListedHarness) || !isTransient(err) {
+		t.Fatalf("fresh container: chose %q (%v), want a transient errNoListedHarness", hash, err)
+	}
+	ranLast(t, env.install(t, testPackage(t, "delisted")))
+	if hash, _, err := l.chooseHarness(context.Background(), ""); !errors.Is(err, errNoListedHarness) || !isTransient(err) {
 		t.Fatalf("chose %q (%v), want a transient errNoListedHarness", hash, err)
 	}
 }
 
-// The list cannot be read for the pick, and says base is not listed: nothing
-// starts now, and the error is transient (the boot is tried again later).
-func TestChooseHarnessDoesNotFallBackToADelistedBase(t *testing.T) {
-	env := newLayeredEnv(t)
-	base := env.installBase(t, testPackage(t, "base"))
-	pick := env.serve(testPackage(t, "pick"))
-	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{}, unreadableFor: map[string]bool{pick: true}}}
-	if hash, _, err := l.chooseHarness(context.Background(), "0x"+pick, base); err == nil || !isTransient(err) {
-		t.Fatalf("chose %q (%v), want a transient error", hash, err)
-	}
-}
-
 // Listed packages that do not install are tried again, then the error is
-// transient; a delisted base is not started meanwhile.
+// transient; a delisted package this container has is not started meanwhile.
 func TestChooseHarnessRetriesInstallsThenGivesUp(t *testing.T) {
 	env := newLayeredEnv(t)
-	base := env.installBase(t, testPackage(t, "base"))
+	ranLast(t, env.install(t, testPackage(t, "delisted")))
 	missing := hexSum([]byte("not served"))
 	old := harnessInstallBackoff
 	harnessInstallBackoff = time.Millisecond
 	t.Cleanup(func() { harnessInstallBackoff = old })
-	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{missing: true}, latestHarness: missing}}
-	if hash, _, err := l.chooseHarness(context.Background(), "", base); err == nil || !isTransient(err) {
+	l := &layeredRuntime{lists: fakeLists{harness: []string{missing}}}
+	if hash, _, err := l.chooseHarness(context.Background(), ""); err == nil || !isTransient(err) {
 		t.Fatalf("chose %q (%v), want a transient error", hash, err)
 	}
 }
@@ -421,10 +470,10 @@ func TestChooseHarnessRetriesInstallsThenGivesUp(t *testing.T) {
 // failed and the next one starts; the choice is recorded once up.
 func TestStartFirstFallsBackWhenThePackageDoesNotStart(t *testing.T) {
 	env := newLayeredEnv(t)
-	base := env.installBase(t, testPackage(t, "base"))
+	older := env.serve(testPackage(t, "older"))
 	target := env.serve(testPackage(t, "target"))
-	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true, target: true}, latestHarness: target}}
-	hash, dir, err := l.chooseHarness(context.Background(), "", base)
+	l := &layeredRuntime{lists: fakeLists{harness: []string{older, target}}}
+	hash, dir, err := l.chooseHarness(context.Background(), "")
 	if err != nil || hash != target {
 		t.Fatalf("chose %s (%v)", hash, err)
 	}
@@ -442,38 +491,40 @@ func TestStartFirstFallsBackWhenThePackageDoesNotStart(t *testing.T) {
 	if err := l.startFirst(context.Background(), h, start, func(context.Context) { stops++ }); err != nil {
 		t.Fatal(err)
 	}
-	if h.running != base || starts != 2 || stops != 1 {
+	if h.running != older || starts != 2 || stops != 1 {
 		t.Fatalf("running %s after %d starts, %d stops", h.running, starts, stops)
 	}
 	if !layers.HarnessFailed(target) {
 		t.Fatal("the package that did not start was not recorded")
 	}
-	if got := layers.LoadHarnessSelection(); got.Current != base {
-		t.Fatalf("selection %+v, want base once it came up", got)
+	if got := layers.LoadHarnessSelection(); got.Current != older {
+		t.Fatalf("selection %+v, want %s once it came up", got, older)
 	}
 }
 
-// Base's package failing fails the start; another kind of failure (the
-// settings, the key) is not the package's, and nothing is recorded.
-func TestStartFirstFailsWhenBaseOrSomethingElseFails(t *testing.T) {
+// When no other package can start, the start fails, transient: a package
+// listed later is picked up. Another kind of failure (the settings, the key)
+// is not the package's, and nothing is recorded.
+func TestStartFirstFailsWhenNothingElseStartsOrSomethingElseFails(t *testing.T) {
 	env := newLayeredEnv(t)
-	base := env.installBase(t, testPackage(t, "base"))
-	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true}, latestHarness: base}}
-	if hash, _, err := l.chooseHarness(context.Background(), "", base); err != nil || hash != base {
+	only := env.serve(testPackage(t, "only"))
+	l := &layeredRuntime{lists: fakeLists{harness: []string{only}}}
+	if hash, _, err := l.chooseHarness(context.Background(), ""); err != nil || hash != only {
 		t.Fatalf("chose %s (%v)", hash, err)
 	}
 	h := &fakeHarness{}
 	didNotStart := fmt.Errorf("%w: exited", framework.ErrHarnessDidNotStart)
-	if err := l.startFirst(context.Background(), h, func() error { return didNotStart }, func(context.Context) {}); !errors.Is(err, didNotStart) {
-		t.Fatalf("err %v", err)
+	err := l.startFirst(context.Background(), h, func() error { return didNotStart }, func(context.Context) {})
+	if !errors.Is(err, didNotStart) || !errors.Is(err, errNoListedHarness) || !isTransient(err) {
+		t.Fatalf("err %v, want the start's and a transient errNoListedHarness", err)
 	}
-	if layers.HarnessFailed(base) {
-		t.Fatal("base recorded as failed")
+	if !layers.HarnessFailed(only) {
+		t.Fatal("the package that did not start was not recorded")
 	}
 
 	target := env.serve(testPackage(t, "target"))
-	l = &layeredRuntime{lists: fakeLists{harness: map[string]bool{base: true, target: true}, latestHarness: target}}
-	if hash, _, err := l.chooseHarness(context.Background(), "", base); err != nil || hash != target {
+	l = &layeredRuntime{lists: fakeLists{harness: []string{only, target}}}
+	if hash, _, err := l.chooseHarness(context.Background(), ""); err != nil || hash != target {
 		t.Fatalf("chose %s (%v)", hash, err)
 	}
 	other := errors.New("no inference key")
@@ -488,15 +539,15 @@ func TestStartFirstFailsWhenBaseOrSomethingElseFails(t *testing.T) {
 // A harness restart that did not happen (the agent stopping) records
 // nothing against the package.
 func TestSwitchHarnessNotRestartedRecordsNothing(t *testing.T) {
-	l, h, base, target := switchFixture(t, false)
+	l, h, first, target := switchFixture(t, false)
 	l.mgr = stoppedReloader{}
 	l.picks = picksOf(settings.Versions{Harness: "0x" + target})
 	l.recheck()
 	if layers.HarnessFailed(target) {
 		t.Fatal("a package recorded as failed because the agent was stopping")
 	}
-	if h.next != base {
-		t.Fatalf("next %s, want base %s back", h.next, base)
+	if h.next != first {
+		t.Fatalf("next %s, want %s back", h.next, first)
 	}
 }
 
@@ -504,25 +555,23 @@ type stoppedReloader struct{}
 
 func (stoppedReloader) Reload(context.Context) error { return manager.ErrStopped }
 
-// The image's own sealed, run in place of another version, applies the rule
-// as that version would, and goes back to it once the list confirms it.
-func TestSealedTargetInPlaceOfAnother(t *testing.T) {
+// The sealed layer's rule: the listed pick, else this version while it is
+// listed, else the newest listed one; a list that cannot be read keeps this
+// one.
+func TestSealedTarget(t *testing.T) {
 	newLayeredEnv(t)
-	own, other, pick, newest := strings.Repeat("aa", 32), strings.Repeat("bb", 32), strings.Repeat("cc", 32), strings.Repeat("dd", 32)
-	l := &layeredRuntime{sealedHash: own, insteadOf: other,
-		lists: fakeLists{sealed: map[string]bool{own: true, other: true, pick: true, newest: true}, latestSealed: newest}}
-	if got, ok := l.sealedTarget(context.Background(), ""); !ok || got != other {
-		t.Fatalf("target %q %v, want back to %s", got, ok, other)
+	own, pick, newest := strings.Repeat("aa", 32), strings.Repeat("cc", 32), strings.Repeat("dd", 32)
+	l := &layeredRuntime{sealedHash: own, lists: fakeLists{sealed: []string{own, pick, newest}}}
+	if got, ok := l.sealedTarget(context.Background(), ""); ok {
+		t.Fatalf("target %q while this version is listed", got)
 	}
 	if got, ok := l.sealedTarget(context.Background(), "0x"+pick); !ok || got != pick {
 		t.Fatalf("target %q %v, want the pick %s", got, ok, pick)
 	}
-	// The one stood in for is delisted: the newest listed, as it would move.
-	l.lists = fakeLists{sealed: map[string]bool{own: true, newest: true}, latestSealed: newest}
+	l.lists = fakeLists{sealed: []string{pick, newest}}
 	if got, ok := l.sealedTarget(context.Background(), ""); !ok || got != newest {
 		t.Fatalf("target %q %v, want the newest listed %s", got, ok, newest)
 	}
-	// Still unreadable: stay.
 	l.lists = fakeLists{unreadable: true}
 	if got, ok := l.sealedTarget(context.Background(), ""); ok {
 		t.Fatalf("target %q while the list is unreadable", got)
@@ -543,7 +592,7 @@ func TestSwitchSealedUsesTheStagedProgram(t *testing.T) {
 	}
 	asked := ""
 	requestSealedSwitch = func(h string) error { asked = h; return nil }
-	l := &layeredRuntime{sealedHash: strings.Repeat("aa", 32), lists: fakeLists{sealed: map[string]bool{target: true}}}
+	l := &layeredRuntime{sealedHash: strings.Repeat("aa", 32), lists: fakeLists{sealed: []string{target}}}
 	if !l.switchSealed(context.Background(), target) || asked != target {
 		t.Fatalf("asked %q", asked)
 	}
@@ -557,7 +606,7 @@ func TestHandOverLapses(t *testing.T) {
 	old := handOverTimeout
 	handOverTimeout = 50 * time.Millisecond
 	t.Cleanup(func() { handOverTimeout = old })
-	l := &layeredRuntime{sealedHash: strings.Repeat("aa", 32), lists: fakeLists{sealed: map[string]bool{target: true}}}
+	l := &layeredRuntime{sealedHash: strings.Repeat("aa", 32), lists: fakeLists{sealed: []string{target}}}
 	if !l.switchSealed(context.Background(), target) || !l.handedOver.Load() {
 		t.Fatal("did not hand over")
 	}
@@ -584,17 +633,16 @@ func TestArtifactMismatchIsRemembered(t *testing.T) {
 	}
 }
 
-// Pruning keeps base's package, the running one, the selection and the
-// owner's pick, the staged sealed versions the loader names and this one; it
-// removes the rest, and what a cut-off install left.
+// Pruning keeps the running package, the selection's current and previous
+// and the owner's pick, the staged sealed versions the loader names and this
+// one; it removes the rest, and what a cut-off install left.
 func TestPruneRemovesWhatNothingRuns(t *testing.T) {
 	env := newLayeredEnv(t)
-	base := env.installBase(t, testPackage(t, "base"))
-	keep, old := testPackage(t, "keep"), testPackage(t, "old")
-	for _, p := range [][]byte{keep, old} {
-		if err := layers.InstallHarness(layers.VerifyingReader(nopCloser{bytes.NewReader(p)}, hexSum(p)), hexSum(p)); err != nil {
-			t.Fatal(err)
-		}
+	running := env.install(t, testPackage(t, "running"))
+	previous := env.install(t, testPackage(t, "previous"))
+	keep, old := env.install(t, testPackage(t, "keep")), env.install(t, testPackage(t, "old"))
+	if err := layers.SaveHarnessSelection(layers.HarnessSelection{Current: running, Previous: previous}); err != nil {
+		t.Fatal(err)
 	}
 	stale := filepath.Join(layers.PackagesDir, ".install-x")
 	if err := os.MkdirAll(stale, 0o755); err != nil {
@@ -612,15 +660,15 @@ func TestPruneRemovesWhatNothingRuns(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(layers.LoaderDir, "current"), []byte(current), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	h := &fakeHarness{running: base}
-	l := &layeredRuntime{sealedHash: own, harness: h, picks: picksOf(settings.Versions{Harness: "0x" + hexSum(keep)})}
+	h := &fakeHarness{running: running}
+	l := &layeredRuntime{sealedHash: own, harness: h, picks: picksOf(settings.Versions{Harness: "0x" + keep})}
 	l.prune()
-	for _, p := range []string{base, hexSum(keep)} {
+	for _, p := range []string{running, previous, keep} {
 		if !layers.HarnessInstalled(p) {
 			t.Fatalf("package %s removed", p)
 		}
 	}
-	if layers.HarnessInstalled(hexSum(old)) {
+	if layers.HarnessInstalled(old) {
 		t.Fatal("an old package kept")
 	}
 	if _, err := os.Stat(stale); err == nil {
@@ -645,6 +693,20 @@ func TestFailTrialExitCodes(t *testing.T) {
 	failTrial(trial, "framework resolve", errors.New("no such framework"))
 	failTrial(&config.Bootstrap{}, "agent start", errors.New("x"))
 	if want := []int{layers.TrialTransientExit, layers.TrialFailedExit}; !reflect.DeepEqual(codes, want) {
+		t.Fatalf("exit codes %v, want %v", codes, want)
+	}
+}
+
+// exitForRetry ends a sealed the loader started for the loader to start it
+// again later; a sealed that is PID 1 itself stays.
+func TestExitForRetry(t *testing.T) {
+	old := exitSealedProcess
+	t.Cleanup(func() { exitSealedProcess = old })
+	var codes []int
+	exitSealedProcess = func(code int) { codes = append(codes, code) }
+	exitForRetry(&config.Bootstrap{}, "harness choice", errNoListedHarness)
+	exitForRetry(&config.Bootstrap{SealedHash: strings.Repeat("aa", 32)}, "provisioning", errors.New("the attestor does not declare the layered flow"))
+	if want := []int{layers.TrialTransientExit}; !reflect.DeepEqual(codes, want) {
 		t.Fatalf("exit codes %v, want %v", codes, want)
 	}
 }

@@ -150,7 +150,7 @@ sealed 的五个组件各自通过一个窄切面消费它:
 | `ServiceFieldLimiter` | `ServiceFieldLimits() (description, inputExample int)` | proxy,注册服务时:描述或输入示例超长(按字节)就拒绝 | 不限长度 |
 | `SigningRules` | `AppliesSigningRules() bool` | 签名 socket:拒签发往 AgenticID `update` / `updateAt` 的交易(drift watcher 的通道),并把每个签名和拒绝记下来给 owner(`GET /_seal/signatures`)。同时设置 `RuntimeSnapshot.SigningRules`,让 agent 文档写明。只有 0g-harness | socket 在三种格式内照签,不做记录;`/_seal/signatures` 返回 404 |
 | `RuntimeTools` | `ServesRuntimeTools() bool` | 签名 socket 和交出 socket:`POST /mcp` 把它们的端点(以及凭据 socket 的端点)作为 MCP 工具提供,由你的框架从 `tools/list` 注册、用 `tools/call` 回调。同时设置 `RuntimeSnapshot.SealTools`,让 agent 文档列出它们。只有 0g-harness(它的 `seal-tools` 插件) | `/mcp` 返回 404 |
-| `LayeredRuntime` | `UseHarness(hash, dir)`、`HarnessHash()`、`InferenceTarget()` | bootstrap 和 `layered.go`:`Start` 运行哪个 harness 包、按 attestor 的目标换包,以及 serve-proof v2(`LAYERS.zh.md` §5、§7)。只有 0g-harness | 运行镜像安装的框架;serve-proof 仍是 v1 |
+| `LayeredRuntime` | `UseHarness(hash, dir)`、`HarnessHash()`、`InferenceTarget()` | bootstrap 和 `layered.go`:`Start` 运行哪个 harness 包(镜像不带包,没设定时 `Start` 失败)、按版本规则换包,以及 serve-proof v2(`LAYERS.zh.md` §5、§7)。只有 0g-harness | 运行镜像安装的框架;serve-proof 仍是 v1 |
 
 实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
 悄悄没实现 = 功能悄悄关闭。
@@ -1271,7 +1271,7 @@ skill、会话、存储、乃至系统提示本身,每一样都是独立版本�
 (约 50 个)。跟 openclaw、hermes、prime-agent 不同,它没有"框架自己的那个配置
 文件"这种东西——组合本身(装哪些插件、什么顺序、什么配置)就是平台结构:它放在
 [0g-harness](https://github.com/0gfoundation/0g-harness)(`src/composition.mjs`)
-里,由 0g-harness 镜像在构建时安装。状态那一半
+里,从 sealed 按哈希装上的官方版本包运行(镜像不带包)。状态那一半
 ——`Roles`、`Defaults`、`Restore`/`EvolutionFor`、`HandleLegacy["persona"]`、
 `FrameworkFacts`——在 `conformance.Run` 之外还配了 persona 注入的专项测试;
 settings 通道落地后,渲染本身也有专项测试(`harness/settings_test.go`:幂等、
@@ -1340,8 +1340,8 @@ skill、推理 pin),跟 openclaw、hermes 追踪的是同一个面;DSH 自己的
 
 **进程那一半。**0g-harness(连同平台插件 `seal-tools`、`subagent-guard`)
 在进程内组出整棵插件树——不走 loader、不走 profile、不吃
-`$DSH_HOME` 的任何 patch 层;0g-harness 镜像在构建时装一个确定版本的 harness,依赖树
-锁定,所以组合跟着镜像哈希走,agent 改自己家目录也改不动下次启动挂什么。harness
+`$DSH_HOME` 的任何 patch 层;官方版本包装着一个确定版本的 harness,依赖树
+锁定,所以组合跟着包哈希走(包登记在信任合约的 harness 名单里),agent 改自己家目录也改不动下次启动挂什么。harness
 常驻一个 `Agent` 对象,owner 的轮次一次跑一个,每一轮的输出交给开启这一轮的一方:
 owner 的请求,或者(agent 自己开启的轮次,比如后台任务结束、提醒到点)收件箱。
 它对外提供 `/v1/chat/completions`(靠 `session/event` 的 `text-delta` 块做流式)、

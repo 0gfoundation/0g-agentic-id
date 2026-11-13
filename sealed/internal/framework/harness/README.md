@@ -27,34 +27,32 @@ boots. The attestor renames `dsh` in its deployment records when it starts
 In 0g-harness (`src/composition.mjs`), in code. 0g-harness is the process this
 adapter runs.
 
-- **Fixed at build time, run by hash.** The 0g-harness image builds one exact
-  build of it (`../../images/harness/Dockerfile`, `HARNESS_REF`), with its
-  whole dependency tree locked, into a package: a deterministic tar of the
-  installed tree, named by its sha256. The image unpacks it as
-  `/opt/0g-harness/<sha256>/`, owned by root and read-only to the agent, and
-  `/opt/0g-harness/base` names it. So the plugin set and every platform
-  decision in it ride the package hash, and the image's own package rides the
-  image hash as well (measured, and listed on chain on the trust registry's
-  image list). Under the layered flow sealed runs the package the version
+- **Fixed at build time, run by hash.** One exact build of it (`HARNESS_REF`
+  in `../../images/harness/Dockerfile`), with its whole dependency tree
+  locked, is built into a package on the image's base and node: a
+  deterministic tar of the installed tree, named by its sha256. The image
+  carries none. Packages are published on the `artifacts` release and listed
+  on the trust registry's harness list; sealed downloads the one the version
   rule picks — the owner's pick while listed, else the one running, else the
-  newest listed — each on the trust registry's harness list
-  (`../../LAYERS.md` §5); otherwise it runs `base`. Other versions are built
-  by the same stage and fetched by hash from the `artifacts` release, so a new
-  harness version needs no new image; `base` is the version a container has
-  without fetching anything.
+  newest listed (`../../LAYERS.md` §5) — and unpacks it as
+  `/opt/0g-harness/<sha256>/`, owned by root and read-only to the agent. So
+  the plugin set and every platform decision in it ride the package hash,
+  which serve-proofs carry (`harnessHash`), and a new harness version needs
+  no new image.
 - **Out of the agent's reach.** The composition is **not** a `cordis.yml`, a
   profile, or any `$DSH_HOME` patch layer, so an agent editing its own home
   cannot change what mounts next boot. This is the structural form of doctrine
   refusal 5 (the agent does not rewrite its own runtime).
-- **Version check.** The image build also checks that the installed
+- **Version check.** The package build also checks that the installed
   0g-harness version is the one `whitelist.go` records in every 0g-harness
   agent's `framework` role. So the role always names the version that runs.
   The harness locks the DSH packages it runs on (its `npm-shrinkwrap.json`).
 
 The **owner** can vary four options inside a fixed allowlist (see
 *Owner-settable* below). They arrive as `SEAL_HARNESS_*` env from the owner's
-signed settings document, applied at each spawn. So the image hash fixes the
-composition *and the set of variations an owner may ask for*.
+signed settings document, applied at each spawn. So the package hash and the
+sealed hash, both on the trust registry's lists, fix the composition *and the
+set of variations an owner may ask for*.
 
 Nothing outside that allowlist is settable by anyone. Measured code decides:
 - which plugins mount;
@@ -67,8 +65,8 @@ Nothing outside that allowlist is settable by anyone. Measured code decides:
 
 `spawn.go` starts the harness and wires it up:
 - It runs `node /opt/0g-harness/<sha256>/bin/0g-harness.mjs` as the agent
-  user, on loopback port 8794 (on an image without packages,
-  `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`).
+  user, on loopback port 8794. With no package chosen it starts nothing and
+  fails.
 - It passes the environment `environ()` builds. The contract is the harness's
   `docs/PROTOCOL.md`.
 - The harness calls the model through sealed's inference route
@@ -172,7 +170,7 @@ so in the log. The other knobs still apply (`settings.go`).
 
 The platform's own composition decisions are NOT owner-settable: the sandbox
 policy mode, the spine invariant checks, the filesystem root, seal-tools and
-subagent-guard. They are the part of the boundary the image hash attests.
+subagent-guard. They are the part of the boundary the package hash attests.
 
 ## Why shell is mounted (not banned)
 
@@ -196,7 +194,7 @@ composition. Larger capability changes take the shape of tiers:
 - **Picked at deploy, visible on chain.** The owner picks a tier at deploy,
   like framework + model. The tier id is recorded in the on-chain `framework`
   binding, so a verifier can see which capability tier an agent runs. The tier's
-  content is still backed by the image hash.
+  content is still backed by the package hash.
 - **Changed by reset only.** Changing tier means a reset (the same path as
   changing framework/model), never a runtime hot-swap: which plugins mount is
   part of the measured boundary, and a tier is a different plugin set. The four

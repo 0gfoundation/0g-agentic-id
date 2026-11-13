@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -331,27 +332,18 @@ func TestLayeredClaimReportsSealedHash(t *testing.T) {
 	}
 }
 
-// The layered claim needs both sides: an attestor that declared it and a
-// sealed the loader started. Either alone leaves the v1 claim, without the
-// field an older attestor would refuse.
-func TestLayeredClaimNeedsBothSides(t *testing.T) {
+// A sealed the loader did not start (an image without the loader) sends the
+// v1 claim, without the field an older attestor would refuse, whether or not
+// the attestor declares the layered flow.
+func TestClaimWithoutTheLoaderIsV1(t *testing.T) {
 	vector := loadCertificateVector(t)
-	for _, test := range []struct {
-		name       string
-		declared   bool
-		sealedHash string
-	}{
-		{"attestor without the declaration", false, strings.Repeat("5a", 32)},
-		{"sealed not started by the loader", true, ""},
-	} {
-		t.Run(test.name, func(t *testing.T) {
+	for _, declared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("declared %v", declared), func(t *testing.T) {
 			f := useFakeClock(t)
 			m, server := newMockAttestor(t, vector.containerKey(t),
-				[]answer{{200, authorization{Generation: 4, Layered: test.declared}}}, []answer{{200, nil}})
-			boot := testBoot(t, server.URL, f.now)
-			boot.SealedHash = test.sealedHash
-			result := FromAttestor(boot)
-			if result.AgentSealPriv == nil || result.Layered {
+				[]answer{{200, authorization{Generation: 4, Layered: declared}}}, []answer{{200, nil}})
+			result := FromAttestor(testBoot(t, server.URL, f.now))
+			if result.AgentSealPriv == nil || result.Layered || result.LayeredRequired {
 				t.Fatalf("boot: %+v", result)
 			}
 			if _, ok := m.raw[0]["sealed_hash"]; ok {
@@ -361,6 +353,24 @@ func TestLayeredClaimNeedsBothSides(t *testing.T) {
 				t.Fatalf("claim %q", canonical)
 			}
 		})
+	}
+}
+
+// A sealed the loader started claims nothing from an attestor that does not
+// declare the layered flow: no claim goes out, and the result says why.
+func TestLoaderSealedNeedsTheLayeredDeclaration(t *testing.T) {
+	vector := loadCertificateVector(t)
+	f := useFakeClock(t)
+	m, server := newMockAttestor(t, vector.containerKey(t),
+		[]answer{{200, authorization{Generation: 4}}}, []answer{{200, nil}})
+	boot := testBoot(t, server.URL, f.now)
+	boot.SealedHash = strings.Repeat("5a", 32)
+	result := FromAttestor(boot)
+	if result.AgentSealPriv != nil || !result.LayeredRequired || result.Layered || result.Unanswered {
+		t.Fatalf("boot: %+v", result)
+	}
+	if gets, posts := m.counts(); gets != 1 || posts != 0 {
+		t.Fatalf("%d GET, %d POST; want the authorization read and no claim", gets, posts)
 	}
 }
 
@@ -612,22 +622,17 @@ func TestProvisionLogsNoSecrets(t *testing.T) {
 
 // A layered claim the attestor refuses still says the attestor runs the
 // layered flow, so the sealed it refused can hand over to the newest listed
-// version. A refusal from an attestor without the flow says nothing of it.
+// version.
 func TestRefusedLayeredClaimKeepsTheDeclaration(t *testing.T) {
-	for _, declared := range []bool{true, false} {
-		vector := loadCertificateVector(t)
-		f := useFakeClock(t)
-		_, server := newMockAttestor(t, vector.containerKey(t),
-			[]answer{{200, authorization{Generation: 4, Layered: declared}}},
-			[]answer{{403, `{"error":"sealed_hash_not_listed"}`}})
-		boot := testBoot(t, server.URL, f.now)
-		boot.SealedHash = strings.Repeat("5a", 32)
-		result := FromAttestor(boot)
-		if result.AgentSealPriv != nil {
-			t.Fatalf("refused claim provisioned: %+v", result)
-		}
-		if result.Layered != declared {
-			t.Fatalf("declared %v: result.Layered %v", declared, result.Layered)
-		}
+	vector := loadCertificateVector(t)
+	f := useFakeClock(t)
+	_, server := newMockAttestor(t, vector.containerKey(t),
+		[]answer{{200, authorization{Generation: 4, Layered: true}}},
+		[]answer{{403, `{"error":"sealed_hash_not_listed"}`}})
+	boot := testBoot(t, server.URL, f.now)
+	boot.SealedHash = strings.Repeat("5a", 32)
+	result := FromAttestor(boot)
+	if result.AgentSealPriv != nil || !result.Layered || result.LayeredRequired {
+		t.Fatalf("refused claim: %+v", result)
 	}
 }
