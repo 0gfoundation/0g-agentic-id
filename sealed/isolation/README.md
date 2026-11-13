@@ -46,7 +46,7 @@ containers. Hence identities are random, not fixed slots.
 The container's root is not exempt from `RLIMIT_NPROC` there either (it is not
 the initial user namespace's root), and its count covers every root process of
 the runner: with the limit set before the launcher left root, the launcher could
-not start a thread (`failed to create new OS thread`, EAGAIN, 2026-11-14). The
+not start a thread (`failed to create new OS thread`, EAGAIN, 2026-11-13). The
 launcher therefore sets every rlimit after the identity drop.
 
 The probe and its results: 0g-tapp-ops `deploy/dev/landlock-probe-20261113/` and
