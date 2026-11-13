@@ -530,8 +530,8 @@ Migration: 2026-10-19 07:54–08:01 UTC, blocks 60946923–60947793 (AgenticID
 | AgenticID impl | `0xFB13f0F3dBD30f55E9F1Da8C6733B02cD497E833` | fixes TrustRegistry `0x71b4…5b17` (`trustRegistry()`); no linked library. Previous: 1.3.0 `0x2faDD255A327d3bB47cE7d94eF4921Bce1623e6B` (links AttestorAppBindingLib `0xC6a9…a01E`), 1.2.0 `0x05cd3114a60fdbd183b0939f85d78e7227406135`, 1.1.0 `0x99484dd8…2F70` |
 | AgenticID beacon | `0x2c60DAF0c41A9FABB8Be1F452F1DD6AE0266F431` | |
 | AttestorAppBindingLib (linked library — stateless, no proxy) | `0xC6a9DcfAe6545c820A97f7a6A60DbC8ED791a01E` | deployed 2026-10-26 with the 1.3.0 impl; 1.4.0 links none |
-| TrustRegistry proxy | `0x71b4dae94C8201169F0F93cAF85aa953650c5b17` | **1.0.0** (deployed 2026-11-12, `DeployTrustRegistry.s.sol`; owner `0x2AB7…a0B3`). Lists copied from AgenticID 1.3.0 by `MigrateTrust.s.sol` in one multicall (tx `0x9d6c5350b8abd9294356424472799f06fa6855fe1cf51c60e7b06643b02c7237`): the two bound attestors below, instance binding required, and the image list holding the four `pr229r2` images (openclaw `0x189913ef…5aca`, hermes `0xadc5e6d3…9ec4`, prime `0x9a6809bc…caca7`, 0g-harness `0xfb712f51…72f7`); the 148 other image hashes AgenticID listed were left behind. The sealed and harness lists started empty |
-| TrustRegistry impl | `0xaA56808Eb309a60e0cb9f3B0393D5Cd0266A6c0C` | |
+| TrustRegistry proxy | `0x71b4dae94C8201169F0F93cAF85aa953650c5b17` | **1.1.0** (guardian — beacon-upgraded 2026-11-13, schedule `0x85093819c81be61a394005b5a2b25bd1ae6b5811bbd35c754afdbc53309d1af9`, execute `0x51a90798c915299d4928f66d0c3990aa0ebff229d887a3e15029ccd24d647eb0`, block 65339219). Owner the Timelock below since block 65339465 (`HandOverTrustRegistry` multicall `0xe2a9ce2ec44632c168920bb400d5e583eca4daf640bd329e56565d24770f7f76`: guardian `0x2AB7…a0B3`, Timelock proposed; `acceptOwnership` scheduled `0xe1e24fff6e059b1d7e133e9f823830b2c0bab5e08a661bc9da2ef009b35cfb8d` and executed `0xa43e387df98cf8881e07b2743a4740aaa42a6568e2817096520f338e37a704f7`); guardian `0x2AB7…a0B3`. 1.0.0 deployed 2026-11-12 (`DeployTrustRegistry.s.sol`; owner `0x2AB7…a0B3` until the hand-over). Lists copied from AgenticID 1.3.0 by `MigrateTrust.s.sol` in one multicall (tx `0x9d6c5350b8abd9294356424472799f06fa6855fe1cf51c60e7b06643b02c7237`): the two bound attestors below, instance binding required, and the image list holding the four `pr229r2` images (openclaw `0x189913ef…5aca`, hermes `0xadc5e6d3…9ec4`, prime `0x9a6809bc…caca7`, 0g-harness `0xfb712f51…72f7`); the 148 other image hashes AgenticID listed were left behind. The sealed and harness lists started empty |
+| TrustRegistry impl | `0x85894c0e2CB73d6c5b21F213053447a5fF0E1329` | 1.1.0 (deploy `0x73f8f3c95817132c3923113687a0c507e6cbca24eb03a04a7e1e54970d93d896`, block 65339025; runtime bytecode equals the build of `contracts/` at `b300f33`). Previous: 1.0.0 `0xaA56808Eb309a60e0cb9f3B0393D5Cd0266A6c0C` |
 | TrustRegistry beacon | `0xe6B42aa9C2dD58B9C43d85E8CC02d486ACdf8534` | owned by the Timelock |
 | ReputationRegistry proxy (DEPRECATED — **paused** 2026-10-21: it still verifies the legacy ServeProof digest; §7) | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` | **1.2.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | ReputationRegistry impl | `0x2580630Ddce3b1836C8f5FF8D93134CdDd8661f3` | |
@@ -548,8 +548,8 @@ Migration: 2026-10-19 07:54–08:01 UTC, blocks 60946923–60947793 (AgenticID
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.2.0** (beacon-upgraded 2026-10-21; 1.1.0 audit on 2026-08-06; §7) |
 | TEEDataVerifier impl | `0x1bAf71F43644F02990d689027f8b0DEEB29Ba33c` | Previous: 1.1.0 `0x2509aE42…AF20` |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
-| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | `minDelay` 0; proposer + canceller + admin = `0x2AB7…a0B3` (admin also self; open execution) — migrated 2026-10-19 from `0x9C58…80Bb`, which renounced its roles (itself migrated 2026-10-12 from `0x7344…431b`); owns the six beacons (the TrustRegistry's since 2026-11-12) |
-| owner / pauser (all contracts) + TEE oracle | `0x2AB7F05bA6560ef2B21Aa1b52FCc96DB51Cfa0B3` | migrated 2026-10-19 from `0x9C58…80Bb` (AgenticID `OwnershipTransferred` at block 60947194; window blocks 60946923–60947793), which was migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xB831…CEd7`, deployer/oracle history). TEEDataVerifier `teeOracleAddress()` = `0x2AB7…a0B3` too (2026-10-19) |
+| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | `minDelay` 0; proposer + canceller + admin = `0x2AB7…a0B3` (admin also self; open execution) — migrated 2026-10-19 from `0x9C58…80Bb`, which renounced its roles (itself migrated 2026-10-12 from `0x7344…431b`); owns the six beacons (the TrustRegistry's since 2026-11-12) and, since 2026-11-13, the TrustRegistry itself: dev's listings are Timelock operations (`TrustRegistryCalls.s.sol`, delay 0) |
+| owner / pauser (all contracts but the TrustRegistry, whose guardian it is) + TEE oracle | `0x2AB7F05bA6560ef2B21Aa1b52FCc96DB51Cfa0B3` | migrated 2026-10-19 from `0x9C58…80Bb` (AgenticID `OwnershipTransferred` at block 60947194; window blocks 60946923–60947793), which was migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xB831…CEd7`, deployer/oracle history). TEEDataVerifier `teeOracleAddress()` = `0x2AB7…a0B3` too (2026-10-19) |
 
 **Trusted attestors (AgenticID 1.3.0, read on chain 2026-10-28; since 2026-11-12
 held by the TrustRegistry, copied unchanged and read back through AgenticID
@@ -705,7 +705,8 @@ that version's beacon upgrade executed):
 
 Changelog:
 
-- **TrustRegistry 1.1.0 — source; no environment runs it yet** — a guardian,
+- **TrustRegistry 1.1.0 — dev beacon-upgraded 2026-11-13 (upgrade block
+  65339219) and handed to the dev Timelock (block 65339465; §6.2)** — a guardian,
   so adding trust can wait for the Timelock while removing it does not (§1):
   `guardian` appended to the namespaced struct (zero until set, no
   reinitializer); `delist` and `removeTrustedAttestor` take the owner or the
