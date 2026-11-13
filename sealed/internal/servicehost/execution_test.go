@@ -205,3 +205,58 @@ func TestExecutionTerminationFailureAndOutputLimits(t *testing.T) {
 		t.Fatal("old deduplication key could start a new process")
 	}
 }
+
+func TestRuntimeInputHandoffIsConsumedAtomically(t *testing.T) {
+	m := executionManager(t)
+	handle, cleanup, err := m.handoff("first", []byte(`{"token":"private-handoff-fixture"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	const attempts = 8
+	var wg sync.WaitGroup
+	results := make(chan ExecutionStatus, attempts)
+	// Queue contenders behind the manager mutex before the first reservation.
+	// This exposes a consume-after-unlock gap without relying on worker output.
+	m.mu.Lock()
+	for i := range attempts {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			status, err := m.spawnWithHandoff("first", executionTestKey(100+i), []byte(`{"delay":0.1}`), handle)
+			if err == nil {
+				results <- status
+			}
+		}(i)
+	}
+	time.Sleep(20 * time.Millisecond)
+	m.mu.Unlock()
+	wg.Wait()
+	close(results)
+	var winner ExecutionStatus
+	count := 0
+	for status := range results {
+		winner = status
+		count++
+	}
+	if count != 1 {
+		t.Fatalf("one-use private input launched %d executions", count)
+	}
+	// A lost spawn acknowledgement can still be retried after consumption.
+	retry, err := m.spawnWithHandoff("first", winner.Key, []byte(`{"delay":0.1}`), handle)
+	if err != nil || retry.Handle != winner.Handle {
+		t.Fatalf("same-key retry lost execution: %+v %v", retry, err)
+	}
+	// A duplicate execution must not consume an unrelated fresh handoff.
+	fresh, discard, err := m.handoff("first", []byte(`{"token":"fresh-handoff-fixture"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer discard()
+	if _, err := m.spawnWithHandoff("first", winner.Key, []byte(`{"delay":0.1}`), fresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.spawnWithHandoff("first", executionTestKey(200), []byte(`{}`), fresh); err != nil {
+		t.Fatalf("deduplication consumed unused private input: %v", err)
+	}
+}

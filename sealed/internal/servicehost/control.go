@@ -41,7 +41,7 @@ func (m *Manager) handoff(service string, data []byte) (string, func(), error) {
 }
 
 func (m *Manager) spawnWithHandoff(service, key string, input []byte, handle string) (ExecutionStatus, error) {
-	status, err := m.spawnExecution(service, key, input, func() ([]byte, error) {
+	return m.spawnExecution(service, key, input, func() ([]byte, error) {
 		// spawnExecution holds m.mu and checks duplicate keys before resolving
 		// input, so retries can recover the original handle after handoff use.
 		if handle == "" {
@@ -52,15 +52,11 @@ func (m *Manager) spawnWithHandoff(service, key string, input []byte, handle str
 			return nil, fmt.Errorf("private input is unavailable")
 		}
 		return p.data, nil
+	}, func() {
+		// Called under the same lock as the new durable reservation, never for
+		// a duplicate execution. No competing key can reuse this private input.
+		delete(m.pendingInputs, handle)
 	})
-	if status.Handle != "" && handle != "" {
-		m.mu.Lock()
-		if p, ok := m.pendingInputs[handle]; ok && p.service == service {
-			delete(m.pendingInputs, handle)
-		}
-		m.mu.Unlock()
-	}
-	return status, err
 }
 
 // ExecutionHandler is mounted only on the private socket of one isolated

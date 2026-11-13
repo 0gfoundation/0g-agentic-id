@@ -112,7 +112,9 @@ sampling，也不强制雇主交模型 API key。
 
 模板验证 exact EVM EIP-3009 付款授权，执行隔离任务，**先持久保存结果再结算**，通过
 外部 facilitator 结算，用 RPC 独立核对直接调用 token 的交易后开放结果。重试复用原授权；
-结算未知时暂不交付，按 payer/nonce 链上对账，不自动另授权扣款。
+结算未知时暂不交付，按 payer/nonce 链上对账。确认 nonce 未用且原授权仍有效后，
+可以按持久化间隔重发原签名，不另授权、不重跑 worker。pending/已用/未知 nonce
+继续锁定；链上确认授权过期后，结束失败付款尝试。
 定价、鉴权、付款/结果、facilitator 设置均属应用；sealed 不增加钱包、托管或 x402 API。
 接入见配套 Harness 的 skills/publish-mcp-service/paid-service.md。
 
@@ -122,8 +124,8 @@ x402 **不是付款和交付的跨系统原子公平交换**。保存结果让�
 ## 验证
 
 以 root 分别在没有/有 agent 用户时运行，设置 SEALED_PRIVSEP_TESTS=1。
-SEALED_SERVICE_TESTS=1 测真实 namespace、UID、stdin、去重、限额、取消和回收。
+SEALED_SERVICE_TESTS=1 测真实 namespace、UID、stdin、去重、限额、取消、原子私有输入交接、反复 Stop/Start 和回收。
 SEALED_LOOP_TESTS=1 加测公开 DSH/tool 链路和完整收费 MCP 链路：真实 SDK/签名、钱包
-隔离、并发重试、私有 stdin、进度、取消、证明校验/拒绝篡改及结算响应丢失。
+隔离、并发重试、私有 stdin、进度、取消、证明校验/拒绝篡改及广播前/后的结算响应丢失。
 链和 facilitator 为本地模拟，不花资金、不证明已真实部署。特权 Linux 测试容器需挂载
 配套源码 checkout（包括 test/helpers）到 /opt/0g-harness/<hash>，以及 base 指针和 Node。

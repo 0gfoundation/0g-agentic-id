@@ -145,8 +145,11 @@ The template verifies exact EVM EIP-3009 authorization, runs the isolated job,
 **persists results before settlement**, settles through an external facilitator,
 independently checks the direct token transaction via RPC, then opens result
 retrieval. Retry reuses the same authorization. Unknown settlement keeps results
-locked and reconciles by payer/nonce on chain, never automatically authorizing
-a new charge. Pricing, authorization, payment/results and facilitator settings
+locked and reconciles by payer/nonce on chain. A confirmed unused nonce with a
+still-valid original authorization permits bounded resubmission of that same
+signature; no fresh authorization or worker rerun. Pending/used/unknown nonce
+stays locked; confirmed on-chain expiry ends the failed payment attempt.
+Pricing, authorization, payment/results and facilitator settings
 belong to the application. Sealed adds no wallet, escrow or x402 API. Setup is in
 the companion Harness `skills/publish-mcp-service/paid-service.md`.
 
@@ -159,9 +162,9 @@ Neither execution receipts nor HTTP proofs remove this limitation.
 
 Run root suites without/with the agent account and `SEALED_PRIVSEP_TESTS=1`.
 `SEALED_SERVICE_TESTS=1` checks real namespaces, UIDs, stdin, deduplication, limits,
-cancellation and GC. `SEALED_LOOP_TESTS=1` adds the public DSH/tool path and a
+cancellation, atomic private-input handoff, repeated Stop/Start and GC. `SEALED_LOOP_TESTS=1` adds the public DSH/tool path and a
 complete paid MCP path: real SDKs/signatures, wallet isolation, concurrent retry,
 private stdin, progress, cancellation, receipt verification/tamper rejection and
-lost settlement response. Local chain/facilitator fixtures spend no funds and
+lost settlement responses before/after broadcast. Local chain/facilitator fixtures spend no funds and
 do not prove a live deployment. Mount the companion source checkout (including test/helpers) under
 `/opt/0g-harness/<hash>`, its base pointer and Node in the privileged Linux test.

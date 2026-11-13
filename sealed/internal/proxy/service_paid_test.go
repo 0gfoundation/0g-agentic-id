@@ -72,7 +72,7 @@ func TestPublicPaidMCPWithExecutionReceipt(t *testing.T) {
 	url := front.URL + "/api/mcp/paid"
 	config := fmt.Sprintf(`import {pathToFileURL} from 'node:url'
 const {z}=await import(pathToFileURL(process.env.HARNESS_RUNTIME_ROOT+'/src/service-paid.mjs'))
-export default {id:'paid',publicUrl:%q,pollMs:20,inputSchema:z.object({text:z.string().max(1000),delay_ms:z.number().int().min(0).max(3000)}).strict(),
+export default {id:'paid',publicUrl:%q,pollMs:20,settlementRetryMs:1000,inputSchema:z.object({text:z.string().max(1000),delay_ms:z.number().int().min(0).max(3000)}).strict(),
  payment:{network:%q,payTo:%q,price:{amount:'1',asset:%q,extra:{name:'Fixture USD',version:'2'}},facilitatorUrl:'http://facilitator.example',rpcUrl:'http://rpc.example/rpc'}}
 `, url, fixture.Network, fixture.PayTo, fixture.Asset)
 	worker := `import {setTimeout as delay} from 'node:timers/promises'
@@ -129,8 +129,8 @@ export default async function(input,{runtimeInput,progress}) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("expected one paid and one cancelled worker, got %d", len(entries))
+	if len(entries) != 3 {
+		t.Fatalf("expected one paid, one cancelled and one recovered-payment worker, got %d", len(entries))
 	}
 	for _, e := range entries {
 		data, err := os.ReadFile(filepath.Join(stateDir, "executions", e.Name()))

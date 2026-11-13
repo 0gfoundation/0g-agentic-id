@@ -188,10 +188,10 @@ func (m *Manager) collectExecutions() {
 // stdin stream; neither goes through the resident owner Harness or the disk.
 func (m *Manager) SpawnExecution(service, key string, input, runtimeInput []byte) (ExecutionStatus, error) {
 	runtimeInput = bytes.Clone(runtimeInput)
-	return m.spawnExecution(service, key, input, func() ([]byte, error) { return runtimeInput, nil })
+	return m.spawnExecution(service, key, input, func() ([]byte, error) { return runtimeInput, nil }, nil)
 }
 
-func (m *Manager) spawnExecution(service, key string, input []byte, privateInput func() ([]byte, error)) (ExecutionStatus, error) {
+func (m *Manager) spawnExecution(service, key string, input []byte, privateInput func() ([]byte, error), consumeInput func()) (ExecutionStatus, error) {
 	if !validExecutionKey.MatchString(key) || len(input) > MaxExecutionInput {
 		return ExecutionStatus{}, fmt.Errorf("invalid execution input or key")
 	}
@@ -256,6 +256,9 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 	if err := m.persistExecutionLocked(e); err != nil {
 		cancel()
 		return ExecutionStatus{}, err
+	}
+	if consumeInput != nil {
+		consumeInput()
 	}
 	m.executions[e.Handle], m.executionKeys[k] = e, e.Handle
 	w := &worker{service: service, cancel: cancel, done: e.done}

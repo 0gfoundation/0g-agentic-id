@@ -139,7 +139,6 @@ func (m *Manager) superviseCoordinator(ctx context.Context, e *entry, c *coordin
 	err := c.cmd.Wait()
 	c.cancel()
 	c.server.Close()
-	close(c.done)
 	<-readyDone
 	m.mu.Lock()
 	if e.controller == c {
@@ -152,6 +151,10 @@ func (m *Manager) superviseCoordinator(ctx context.Context, e *entry, c *coordin
 		e.State = "stopped"
 	}
 	m.mu.Unlock()
+	// Stop waits for this signal before a subsequent Start. Publish the cleared
+	// controller/state first so Start cannot mistake an exited process for a
+	// live one. Cancellation already stops the readiness watcher above.
+	close(c.done)
 	if !restart {
 		return
 	}
