@@ -327,7 +327,9 @@ the `msg.sender` of clone mints — without it every `cloneFrom` reverts), and
 `list(IMAGE, <sealed image hash>)` (else `image_hash not in
 validFrameworkHashes`); for 0g-harness loader images also
 `list(SEALED, <sealed program hash>)` and `list(HARNESS, <package hash>)`
-(sealed/LAYERS.md §10). `multicall` takes them in one transaction. Then the
+(sealed/LAYERS.md §10): the image carries neither, so its containers run
+nothing until both are listed and published on the `artifacts` release.
+`multicall` takes them in one transaction. Then the
 owner hands the registry to the Timelock and becomes its guardian (§1):
 
 ```bash

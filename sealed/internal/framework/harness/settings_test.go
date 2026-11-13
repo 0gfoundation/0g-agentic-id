@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -403,6 +404,26 @@ func TestStart_WithoutAPinFails(t *testing.T) {
 	if _, err := a.Start(context.Background(), framework.RuntimeContext{}); err == nil {
 		t.Fatal("Start with no provider/model must fail, got nil error")
 	}
+}
+
+// The harness runs only from a package: with none chosen (UseHarness), Start
+// fails and says so, without spawning anything and without blaming a package.
+func TestStart_WithoutAPackageFails(t *testing.T) {
+	catalogServer(t, reasoningModel("glm-5.3"))
+	a := New()
+	dshHome = t.TempDir()
+	if err := a.RenderSettings(context.Background(), settings.Resolve(context.Background(),
+		settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3"}, "")); err != nil {
+		t.Fatalf("RenderSettings: %v", err)
+	}
+	_, err := a.Start(context.Background(), framework.RuntimeContext{})
+	if err == nil || !strings.Contains(err.Error(), "no harness package") || errors.Is(err, framework.ErrHarnessDidNotStart) {
+		t.Fatalf("Start without a package: %v", err)
+	}
+	if a.HarnessHash() != "" {
+		t.Fatalf("a harness ran: %s", a.HarnessHash())
+	}
+	_ = a.Stop(context.Background(), 0)
 }
 
 // The credential this adapter hands the bridge comes from the resolved

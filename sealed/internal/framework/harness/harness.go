@@ -117,8 +117,8 @@ type Adapter struct {
 	proc *harnessProc
 
 	// pkgHash and pkgDir name the harness official version package Start
-	// runs (UseHarness, sealed/LAYERS.md §5). Unset, Start runs the image's
-	// global install (legacyHarnessEntry) and the hash is unknown.
+	// runs (UseHarness, sealed/LAYERS.md §5). Unset, Start fails: the harness
+	// runs only from a package.
 	pkgHash string
 	pkgDir  string
 	// runHash is the package the last spawned harness process runs.
@@ -327,8 +327,7 @@ func (a *Adapter) UseHarness(hash, dir string) {
 }
 
 // HarnessHash is the sha256 (64 hex) of the package the harness process
-// last started from, "" before the first Start or when it runs the image's
-// global install.
+// last started from, "" before the first Start.
 func (a *Adapter) HarnessHash() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()

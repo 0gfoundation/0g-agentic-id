@@ -119,9 +119,10 @@ found" is `-32000`), and the clients blur them:
   "execution reverted") or `ContractFunctionZeroDataError` (no code at the
   address) as the contract's answer; a `-32603` throws.
 
-Treating any node error as "no registry" would tell a loader image to claim
-without its sealed hash, or refuse a claim that names one, on a passing RPC
-hiccup.
+Treating any node error as "no registry" would, on a passing RPC hiccup,
+send a loader image's sealed away without a claim (the earlier loader images,
+which carry a sealed of their own, would claim without its sealed hash), or
+refuse a claim that names one.
 
 ---
 
@@ -270,8 +271,8 @@ deliberate:
   recovers none in the goroutines it starts (its non-test sources at the pinned
   version contain no `recover()`). A panic in one of those goroutines (a fatal log
   there included), or memory exhausted during an upload, therefore ends sealed,
-  and with it the container and the agent (in the 0g-harness image the loader exits
-  with sealed). This is the trade accepted to
+  and with it the agent (as PID 1, the container too; in the 0g-harness image
+  the loader starts sealed again, at most 5 times in 10 minutes). This is the trade accepted to
   keep the key in one process.
 
 ### 0g-sandbox billing rejects random keys

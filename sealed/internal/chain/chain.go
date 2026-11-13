@@ -316,7 +316,11 @@ var (
 	trustRegistrySelector = crypto.Keccak256([]byte("trustRegistry()"))[:4]
 	isListedSelector      = crypto.Keccak256([]byte("isListed(bytes32,bytes32)"))[:4]
 	latestSelector        = crypto.Keccak256([]byte("latest(bytes32)"))[:4]
+	listedSelector        = crypto.Keccak256([]byte("listed(bytes32)"))[:4]
 )
+
+// maxListedVersions bounds the versions one listed(kind) answer may name.
+const maxListedVersions = 4096
 
 // TrustRegistry reads AgenticID.trustRegistry(): the contract that holds the
 // deployer's trust decisions, the code lists among them. An AgenticID before
@@ -362,6 +366,38 @@ func (c *Client) Latest(ctx context.Context, kind [32]byte) ([32]byte, error) {
 	}
 	copy(h[:], out)
 	return h, nil
+}
+
+// Versions reads the trust registry's listed(kind): every hash listed under
+// kind, oldest first.
+func (c *Client) Versions(ctx context.Context, kind [32]byte) ([][32]byte, error) {
+	out, err := c.callTrustRegistry(ctx, "listed", listedSelector, kind[:])
+	if err != nil {
+		return nil, err
+	}
+	return decodeBytes32Array(out)
+}
+
+// decodeBytes32Array decodes the ABI encoding of one bytes32[] return: the
+// offset of the array (32), its length, then the elements.
+func decodeBytes32Array(out []byte) ([][32]byte, error) {
+	if len(out) < 64 || len(out)%32 != 0 {
+		return nil, fmt.Errorf("listed: return of %d bytes is not a bytes32[]", len(out))
+	}
+	if offset := new(big.Int).SetBytes(out[:32]); offset.Cmp(big.NewInt(32)) != 0 {
+		return nil, fmt.Errorf("listed: return is not a bytes32[] (offset %s)", offset)
+	}
+	n := new(big.Int).SetBytes(out[32:64])
+	if !n.IsInt64() || n.Int64() > maxListedVersions || int64(len(out)) != 64+32*n.Int64() {
+		return nil, fmt.Errorf("listed: return of %d bytes does not hold %s bytes32", len(out), n)
+	}
+	hashes := make([][32]byte, 0, n.Int64())
+	for i := 64; i < len(out); i += 32 {
+		var h [32]byte
+		copy(h[:], out[i:i+32])
+		hashes = append(hashes, h)
+	}
+	return hashes, nil
 }
 
 // callTrustRegistry calls a view of the trust registry AgenticID names now.

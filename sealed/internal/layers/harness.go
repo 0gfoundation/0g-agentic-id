@@ -3,11 +3,11 @@ package layers
 // Harness official version packages (sealed/LAYERS.md §5). A package is the
 // gzip'd tar of an installed 0g-harness package directory (its source,
 // package.json, lockfile and node_modules built for base's node, native
-// modules included), named by the sha256 of the .tgz. Each one is unpacked
-// into its own directory under PackagesDir, owned by root and read-only to
-// everyone else: the harness runs from there as the agent user, who can read
-// and run it but not change it. base ships one, which PackagesDir/base
-// names; the others are fetched by hash and unpacked by InstallHarness.
+// modules included), named by the sha256 of the .tgz. Each one is fetched by
+// hash and unpacked by InstallHarness into its own directory under
+// PackagesDir, owned by root and read-only to everyone else: the harness runs
+// from there as the agent user, who can read and run it but not change it.
+// The image ships none.
 
 import (
 	"archive/tar"
@@ -64,9 +64,6 @@ func PinHarness(hash string) (func(), error) {
 	}, nil
 }
 
-// baseFile, under PackagesDir, names the package base ships.
-const baseFile = "base"
-
 // selectionFile, under framework.StateDir, records which package runs.
 const selectionFile = "harness.json"
 
@@ -75,19 +72,6 @@ const (
 	maxPackageEntries = 200_000
 	maxPackageBytes   = 4 << 30
 )
-
-// BaseHarness is the hash of the package base ships.
-func BaseHarness() (string, error) {
-	b, err := privsep.ReadFile(filepath.Join(PackagesDir, baseFile), 4<<10)
-	if err != nil {
-		return "", err
-	}
-	h, ok := ParseHash(string(b))
-	if !ok {
-		return "", fmt.Errorf("%s does not hold a sha256", filepath.Join(PackagesDir, baseFile))
-	}
-	return h, nil
-}
 
 // HarnessDir is where the package with this hash is unpacked.
 func HarnessDir(hash string) string { return filepath.Join(PackagesDir, hash) }
@@ -156,9 +140,9 @@ func HarnessFailed(hash string) bool {
 	return err == nil
 }
 
-// PrunePackages removes the unpacked packages none of keep names (base's is
-// always kept), and what an install cut off left behind
-// (CleanCutOffInstalls). Only while no install runs.
+// PrunePackages removes the unpacked packages none of keep names, and what
+// an install cut off left behind (CleanCutOffInstalls). Only while no
+// install runs.
 func PrunePackages(keep ...string) {
 	packagePins.Lock()
 	defer packagePins.Unlock()
@@ -166,9 +150,6 @@ func PrunePackages(keep ...string) {
 	kept := map[string]bool{}
 	for h := range packagePins.refs {
 		kept[h] = true
-	}
-	if base, err := BaseHarness(); err == nil {
-		kept[base] = true
 	}
 	for _, h := range keep {
 		if p, ok := ParseHash(h); ok {

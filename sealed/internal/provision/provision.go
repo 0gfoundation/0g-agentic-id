@@ -15,10 +15,11 @@
 //
 // "layered": true declares that the attestor runs the layered runtime
 // (sealed/LAYERS.md §8): it checks the sealed program's hash against the
-// trust registry's sealed list before it hands out the key. Only then does a
-// sealed the loader started (Boot.SealedHash) report that hash, as
-// sealed_hash, signed into the claim (ProvisionBoot.v2). An attestor without
-// the declaration gets the v1 claim it knows, which has no such field.
+// trust registry's sealed list before it hands out the key. A sealed the
+// loader started (Boot.SealedHash) claims only then, reporting that hash as
+// sealed_hash, signed into the claim (ProvisionBoot.v2); from an attestor
+// without the declaration it claims nothing (Result.LayeredRequired). Images
+// without the loader send the v1 claim, which has no such field.
 package provision
 
 import (
@@ -113,6 +114,12 @@ type Result struct {
 	// reached or answered only "try again" (5xx, 429, 409). The cause is
 	// outside this sealed version.
 	Unanswered bool
+	// LayeredRequired is true when the attestor did not declare the layered
+	// flow to a sealed the loader started. Such a sealed claims nothing: its
+	// image carries no sealed, so a v1 claim and v1 proofs, which name only
+	// the image, would not name the sealed that serves. The cause is outside
+	// this sealed version.
+	LayeredRequired bool
 }
 
 // authorization is the GET /provision answer.
@@ -239,6 +246,10 @@ func (c *claim) run() Result {
 	for attempt := 1; ; attempt++ {
 		if auth == nil {
 			found, outcome := c.discover()
+			if outcome == proceed && c.boot.SealedHash != "" && !found.Layered {
+				logger.Logf("FAIL provision: the attestor does not declare the layered flow; a sealed the loader started claims only under it")
+				return Result{LayeredRequired: true}
+			}
 			if outcome == proceed {
 				c.declared = c.layered(found)
 			}
@@ -367,9 +378,8 @@ func (c *claim) provision(auth authorization) (Result, action) {
 
 // layered reports whether a claim under auth runs the layered flow: the
 // attestor declared it and the loader named this program's hash.
-// LEGACY(v1): false only for an image without the loader, or an attestor
-// that does not declare the flow (a chain whose AgenticID names no trust
-// registry); legacy_v1.go.
+// LEGACY(v1): false only for an image without the loader (a sealed the loader
+// started does not claim without the declaration); legacy_v1.go.
 func (c *claim) layered(auth authorization) bool {
 	return auth.Layered && c.boot.SealedHash != ""
 }
