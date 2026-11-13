@@ -126,7 +126,7 @@ const params = {
     // image (the operator-maintained default; same fallback reset() uses).
     // Pass a name only to pin/rollback (0g-sandbox calls this field `snapshot` on the wire):
     sealedImage: process.env.SEALED_IMAGE,
-    apiKey:      process.env.AGENT_API_KEY,        // injected into the container as an env secret
+    apiKey:      process.env.AGENT_API_KEY,        // the model key: stored in the agent's credential set
   },
 };
 
@@ -219,13 +219,13 @@ await ag.agent.stop(sealId, sandboxId);     // stop a running container
 await ag.agent.start(sealId, sandboxId);    // resume a STOPPED container
 await ag.agent.start(sealId, { apiKey });   // FIRST provision: bring a mint-only /
                                             // never-provisioned agent online with a fresh
-                                            // container (apiKey required in practice). The
-                                            // semantic counterpart to a sandbox-less deploy;
-                                            // distinct from reset ("recreate an EXISTING one").
+                                            // container (apiKey: see "The model key" below).
+                                            // The semantic counterpart to a sandbox-less
+                                            // deploy; distinct from reset ("recreate an
+                                            // EXISTING one").
 await ag.agent.reset(sealId, { apiKey });   // recreate an EXISTING container: re-read iData
                                             // from chain, reselect the framework adapter.
-                                            // apiKey required in practice (attestor doesn't
-                                            // cache the model key); sealedImage optional.
+                                            // sealedImage optional.
 // A booting agent with no settings document uses the model pinned in its minted
 // persona, which leaves the chain at its first commit. So start and reset of an
 // agent that has no document and is a clone or has provisioned before first
@@ -587,10 +587,33 @@ For the router's live model catalog:
 await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …]
 ```
 
-`sandbox.apiKey` is required in practice — without it the agent boots but
-cannot reach its model. It travels inside the owner-signed "create"
-envelope into the TEE container's environment, and the attestor keeps no
-reusable copy (which is why `reset()` needs it again).
+**The model key.** `sandbox.apiKey` (and `apiKey` of `start` / `reset` /
+`retry`) is stored in the agent's credential set as `model.<provider>`,
+sealed to the agent ([credentials](../../docs/credentials.md#the-model-key)):
+`deploy` checks the key before it signs anything and stores it as soon as
+the attestor accepts the agent, without waiting for the mint
+(`modelKeyStored` in the result); the attestor creates the container once
+it is stored, ten seconds after the mint without one, or after a minute at
+the latest, so the first boot has it (`awaitCredentials`, signed with the
+deploy). `start` / `reset` / `retry` store it after their own checks pass,
+before the request is signed. A store asks the owner's wallet for three
+signatures (reading the stored set, the new set, the write); `deploy`'s for
+two, as the new agent has no set to read. A container whose image reads
+model keys from the set takes the key from there at boot, so with one
+stored, a `reset` on that image needs none, and a `retry` with the
+provider's key in the set can create a container. A key given without
+`provider` is the 0g-compute key (`model.0g-compute`): pass `provider` for
+any other provider's key. `ag.credentials.setModelKey(sealId, provider,
+apiKey)` sets or replaces it at any time (three signatures, a fourth to
+push it to the running agent). Without a key, 0g-harness on 0g-compute
+boots and its model calls fail until one is set; with no key for the
+provider in the set, the CLI asks for one for every other framework and
+provider, and the SDK refuses a create without one for a provider other
+than 0g-compute.
+
+While older images are in use, the key also travels with the request:
+inside the owner-signed "create" envelope into the TEE container's
+environment, of which the attestor keeps no copy.
 
 The owner's wallet shows that envelope verbatim when it signs. When the
 attestor's `GET /config` advertises `secret_env_scheme`, `start` / `reset` /
@@ -611,22 +634,29 @@ without `sandbox`, persist the provider/model settings, then
 
 **When your app supplies the key and the user signs.** Sealing in the
 browser still means the key reaches the user's browser. Seal it on your
-server instead, and hand the browser only the ciphertext:
+server instead, and hand the browser only the sealed key:
 
 ```ts
 // server: a read-only client is enough (no wallet)
 const ag = new AgentDNA({ attestorUrl, addresses, rpcUrl, chain });
-const sealed = await ag.agent.sealApiKey(sealId, { owner, apiKey });
+const sealed = await ag.credentials.sealModelKey(sealId, { owner, provider, apiKey });
 
-// browser: signs ciphertext only; the key never reaches it
-await ag.agent.start(sealId, { sealedSecretEnv: sealed });
+// browser: stores it in the agent's credential set, signing only its hash
+await ag.credentials.setModelKey(sealId, provider, sealed);
+// or with a new container, in place of apiKey
+await ag.agent.start(sealId, { sealedModelKey: sealed });
 ```
 
-`owner` must be the wallet that signs: the container applies the secret only
-while that address owns the agent on chain, so `sealApiKey` checks `ownerOf`
-once the agent is minted. `sealedSecretEnv` is accepted by `start` / `reset`
-/ `retry`, requires the attestor to advertise `secret_env_scheme`, and never
-falls back to `API_KEY`.
+`owner` must be the wallet that signs: the value is bound to it (and to the
+agent, the chain and `model.<provider>`), so `sealModelKey` checks `ownerOf`
+once the agent is minted, and `setModelKey` refuses a key sealed for another
+agent, provider or wallet. From the set the key reaches every boot of the
+agent, like the owner's own key. While older images are in use,
+`sealed.secretEnv` holds the same key as they read it with the request;
+`start` / `reset` / `retry` send it (it is present when the attestor
+advertises `secret_env_scheme`). The request-only form, `agent.sealApiKey`
+passed as `sealedSecretEnv`, still works for the request it rides and goes
+away with the request path.
 
 Every refusal on these paths throws `SecretEnvRefusedError` (exported) before
 anything is signed or sent: `signed` is always `false`, and `code` names the

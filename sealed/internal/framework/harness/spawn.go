@@ -89,17 +89,13 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	//
 	ep := modelEndpoint(rendered.resolved)
 
-	// Missing is fatal here rather than at the first turn: the 0G router and
-	// the native providers answer an unauthenticated call with a 401, so the
-	// container would come up healthy, serve /hello, and fail every single
-	// chat with an error the owner cannot place.
+	// No key is a state the owner sees and fixes: the agent's credential view
+	// says no model key is in use, and `cred <agent> set model` applies one
+	// to the running agent. So the harness starts, and its model calls fail
+	// until then.
 	apiKey := rendered.resolved.APIKey
 	if apiKey == "" {
-		if ep != nil {
-			return framework.StartResult{}, fmt.Errorf(
-				"harness.Start: %s is served at %s but this boot has no inference key — every turn would 401 (check API_KEY in the container's environment, or the owner's sealed key)", model, ep.BaseURL)
-		}
-		logger.Logf("warn: harness.Start: no inference key for this boot; provider %q must serve %s unauthenticated or the first turn fails", provider, model)
+		logger.Logf("warn: harness.Start: no model key for %s on %s; model calls fail until the owner sets one (cred <agent> set model)", model, provider)
 	}
 
 	// The key stays in sealed: the credential proxy fills it in on the

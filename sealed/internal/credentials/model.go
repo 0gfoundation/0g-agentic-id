@@ -50,7 +50,7 @@ type ModelKey struct {
 type ModelInUse struct {
 	Provider string `json:"provider,omitempty"`
 	// Source is "credentials" (an entry of the set), "deploy" (the key
-	// handed over at create/reset) or "none".
+	// handed over at create/reset; LEGACY(model-key)) or "none".
 	Source string `json:"source"`
 	// ValueHash is the entry's value hash when Source is "credentials".
 	ValueHash string `json:"value_hash,omitempty"`
@@ -58,7 +58,7 @@ type ModelInUse struct {
 	Issue string `json:"issue,omitempty"`
 	// DeployProvider is the provider of the key handed over at
 	// create/reset, when that key is usable: a switch to it needs no key in
-	// the set.
+	// the set. LEGACY(model-key).
 	DeployProvider string `json:"deploy_provider,omitempty"`
 }
 

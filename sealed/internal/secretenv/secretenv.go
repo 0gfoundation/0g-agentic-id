@@ -24,6 +24,19 @@
 // replayed into a container the next owner controls. Version 2 additionally
 // carries "provider", binding the credential to a registered provider ID.
 // Legacy v1 and plaintext credentials are restricted to 0g-compute.
+//
+// LEGACY(model-key): model keys come from the owner's credential set
+// (internal/credentials, modelkey.go). The key handed over with the
+// create/reset serves images and clients from before that. It goes once no
+// client sends it any more (SDK and CLI releases until they stop, the
+// attestor's console until it stores keys in the set, integrators on
+// sealedSecretEnv) and the attestor stops relaying it: delete this package
+// and every piece marked LEGACY(model-key) (`git grep -n
+// 'LEGACY(model-key)'`). Deleting the package makes the compiler list
+// applySecretEnv; the marks find the rest of the key handed over at
+// create/reset (config API_KEY and InferenceCredential, modelKeys.boot and
+// the choices made from it, RuntimeContext.APIKey, the "deploy" source and
+// deploy_provider of GET /_seal/credentials).
 package secretenv
 
 import (

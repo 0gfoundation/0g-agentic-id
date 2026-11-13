@@ -180,6 +180,14 @@ pub struct DeployRequest {
     /// deploy (SDK `provision: false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_envelope: Option<SandboxEnvelope>,
+
+    /// The owner stores the agent's credential set right after this deploy
+    /// is accepted (the SDK puts the model key there), so its container is
+    /// created once the set is stored, or after `AWAIT_CREDENTIALS` in the
+    /// worker: a container that boots first gets no set until its next
+    /// boot. Signed with the rest (`CanonicalDeploy`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub await_credentials: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -671,6 +679,7 @@ mod tests {
             description: "d".into(),
             image: None,
             sandbox_envelope: Some(env),
+            await_credentials: false,
         };
         let out = format!("{job:?}");
         assert!(
@@ -691,6 +700,7 @@ mod tests {
                 description: String::new(),
                 image: None,
                 sandbox_envelope: None,
+                await_credentials: false,
             },
             JobPayload::SandboxStart { seal_id: seal, sandbox_envelope: envelope("x") },
             JobPayload::SandboxStop { seal_id: seal, sandbox_envelope: envelope("x") },
@@ -792,6 +802,7 @@ mod tests {
                     description: "d".into(),
                     image: None,
                     sandbox_envelope: Some(env.clone()),
+                    await_credentials: false,
                 },
                 None,
             ),
@@ -1476,6 +1487,10 @@ pub enum JobPayload {
         /// brought online later via SandboxStart). `Some` provisions as usual.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sandbox_envelope: Option<SandboxEnvelope>,
+        /// The container waits for the owner's credential set before it is
+        /// created (`DeployRequest::await_credentials`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        await_credentials: bool,
     },
     /// Resume a previously stopped sandbox. Worker calls
     /// `SandboxClient::start(seal_id, envelope)` which relays to
