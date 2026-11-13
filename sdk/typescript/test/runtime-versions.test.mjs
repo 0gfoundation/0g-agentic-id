@@ -54,6 +54,19 @@ test('canonicalSettings: versions after others, sealed before harness, empty pic
   assert.equal(canonicalSettings({ versions: 'latest' }), '{"versions":"latest"}');
 });
 
+test('canonicalSettings: a pick for a layer this SDK does not know is kept, after sealed and harness, in its own order', () => {
+  const B1 = `0x${'c1'.repeat(32)}`;
+  assert.equal(
+    canonicalSettings({ model: 'm', versions: { zeta: 'z', harness: H1, base: B1, sealed: S1 } }),
+    `{"model":"m","versions":{"sealed":"${S1}","harness":"${H1}","zeta":"z","base":"${B1}"}}`,
+  );
+  assert.equal(canonicalSettings({ model: 'm', versions: { base: B1 } }), `{"model":"m","versions":{"base":"${B1}"}}`);
+  // The CLI's read-modify-write keeps it too, and shows it.
+  const next = applyAssignments({ model: 'm', versions: { sealed: S1, base: B1 } }, parseAssignments(['sealed=']));
+  assert.deepEqual(next.versions, { base: B1 });
+  assert.deepEqual(renderSettings(next), ['model      m', `versions.base ${B1}`]);
+});
+
 test('versionPicksProblem: a pick is "0x" + 64 hex or empty', () => {
   assert.equal(versionPicksProblem(undefined), null);
   assert.equal(versionPicksProblem({ sealed: S1, harness: '' }), null);

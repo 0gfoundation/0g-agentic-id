@@ -3,18 +3,21 @@
  *
  * - the v2 tag, inner hash and signed digest match the cross-impl
  *   known-answer vectors (contracts VersionedFeedback.t.sol, sealed
- *   serveproof_v2_test.go), and the v1 hash of the same fields differs;
+ *   serveproof_v2_test.go), and the v1 hash of the same fields differs; a
+ *   non-ASCII model hashes its UTF-8 bytes;
  * - signServeProof → verifyServeProofSignature round-trips a v2 proof, and
  *   the version picks the digest: a v1 signature claimed as v2, a v2
  *   signature with its version stripped, a changed layer field, an unknown
  *   version and malformed layer fields all fail;
- * - parseServeProofHeader keeps a v2 envelope's version and layer fields;
+ * - parseServeProofHeader keeps a v2 envelope's version and layer fields and
+ *   reads the envelope as UTF-8, so a non-ASCII model or URL verifies;
  * - ServeSession.verifyProof checks a v2 proof's image, sealed and harness
  *   hashes against the trust registry's lists (layersListed), and says why
  *   when a list misses one or the chain has no registry;
  * - ReputationClient routes a v2 proof to attestVersionedFeedback (and the
- *   batcher's giveFeedbackAndAttestVersioned when it has one), refuses it
- *   before any broadcast on a registry before 1.3.0, and leaves v1 alone;
+ *   batcher's giveFeedbackAndAttestVersioned when it has one — the probe
+ *   keeps the batcher's answer, never a node error), refuses it before any
+ *   broadcast on a registry before 1.3.0, and leaves v1 alone;
  * - the CLI proof jar keeps a v2 ticket's version and layers.
  */
 
@@ -26,6 +29,7 @@ import { join } from 'node:path';
 import {
   ContractFunctionRevertedError,
   ExecutionRevertedError,
+  InternalRpcError,
   encodeErrorResult,
   encodeEventTopics,
   encodeAbiParameters,
@@ -76,6 +80,11 @@ const KAT_V2_TAG = '0xbb9f274649f44f7d428828efb016a5eec5ee4a38dda5d4ec21b530ccaf
 const KAT_PROOF_HASH_V2 = '0xdac99843c8993224fa49be6989ea6cb8fc3c5190e2d2e8be132e9d073ba73a73';
 const KAT_SIGNED_DIGEST_V2 = '0x50f91a86a4e744dddd29bc16e936ab717a8c54074458e4332c5f43661538df4e';
 const KAT_PROOF_HASH_V1 = '0xabfe2e6d0cc940ac398826e607b3d4d9bce2002bda0281c1b9e2efc7aaef3d5b';
+// The same v2 tuple with a non-ASCII model: a string's UTF-8 bytes are hashed
+// (模 e6a8a1, 型 e59e8b, é c3a9; computed with cast).
+const KAT_MODEL_UTF8 = '模型-é';
+const KAT_PROOF_HASH_V2_UTF8 = '0x00dc0a9ba85191968c4bdcb00d11b4003216306420d80a6e68432fe01f24a977';
+const KAT_SIGNED_DIGEST_V2_UTF8 = '0xcab300c137d0d07deb4e73c3e027db4ff63df5045e0a95767519cce28ffbd963';
 
 test('KAT: v2 tag, inner hash and signed digest match the cross-impl vectors', () => {
   assert.equal(SERVE_PROOF_V2_TAG, KAT_V2_TAG);
@@ -85,6 +94,10 @@ test('KAT: v2 tag, inner hash and signed digest match the cross-impl vectors', (
   // The same shared fields without a version are v1 — the v1 vector.
   assert.equal(buildServeProofMessageHash({ ...KAT_V1, ...KAT_LAYERS }), KAT_PROOF_HASH_V1);
   assert.notEqual(KAT_PROOF_HASH_V1, KAT_PROOF_HASH_V2);
+  // A non-ASCII model hashes its UTF-8 bytes.
+  const utf8 = { ...KAT_V2, model: KAT_MODEL_UTF8 };
+  assert.equal(buildServeProofMessageHash(utf8), KAT_PROOF_HASH_V2_UTF8);
+  assert.equal(buildServeProofSigningHash({ ...utf8, validator: KAT_VALIDATOR }), KAT_SIGNED_DIGEST_V2_UTF8);
 });
 
 test('build: an unknown version or missing / malformed layer fields throw', () => {
@@ -213,6 +226,21 @@ test('parseServeProofHeader keeps a v2 envelope\'s version and layers; a v1 one 
   assert.equal(await verifyServeProofSignature(odd, seal.address, DOMAIN), false);
 });
 
+test('parseServeProofHeader reads the envelope as UTF-8: a non-ASCII model and URL round-trip and verify', async () => {
+  // sealed writes the envelope with Go's json.Marshal: raw UTF-8, then base64url.
+  for (const over of [{ model: KAT_MODEL_UTF8 }, { model: 'modèle 🧪', inferenceURL: 'https://路由.example/v1' }]) {
+    const proof = await signServeProof(v2Params(over), (hash) => seal.sign({ hash }));
+    const parsed = parseServeProofHeader(v2Header(proof));
+    assert.equal(parsed.model, proof.model);
+    assert.equal(parsed.inferenceURL, proof.inferenceURL);
+    assert.equal(await verifyServeProofSignature(parsed, seal.address, DOMAIN), true, JSON.stringify(over));
+  }
+  // Bytes that are not UTF-8 are a malformed header, not a garbled string.
+  const proof = await signServeProof(v2Params(), (hash) => seal.sign({ hash }));
+  const bad = `${proof.signature}.${Buffer.from([0x7b, 0x22, 0xff, 0x22, 0x3a, 0x31, 0x7d]).toString('base64url')}`;
+  assert.throws(() => parseServeProofHeader(bad));
+});
+
 // ── ServeSession.verifyProof: layers against the trust registry ──
 
 const TRUST = '0x0000000000000000000000000000000000007777';
@@ -322,8 +350,9 @@ function feedbackVerifiedLog(feedbackIndex) {
   return { address: VFR, data, topics };
 }
 
-/** `opts`: { registryVersion, batcher, code, batcherHasVersioned, authThrows }
- *  (registryVersion may change between calls: the stub reads it live). */
+/** `opts`: { registryVersion, batcher, code, batcherHasVersioned, probeNodeError, authThrows }
+ *  (registryVersion and probeNodeError may change between calls: the stub
+ *  reads them live). */
 function mkRep(opts = {}) {
   const calls = { writes: [], sends: [], probes: 0, reads: [] };
   const ctx = {
@@ -348,13 +377,24 @@ function mkRep(opts = {}) {
       },
       // The batcher probe: a batcher with the versioned entry answers
       // BatcherNotSelf to an outside caller; one without it reverts bare.
+      // viem's chain for a revert: ContractFunctionRevertedError ←
+      // ExecutionRevertedError (the node's code 3). A node's internal error
+      // (-32603) gets a ContractFunctionRevertedError too, without a revert
+      // under it.
       simulateContract: async ({ functionName }) => {
         calls.probes += 1;
         assert.equal(functionName, 'giveFeedbackAndAttestVersioned');
+        if (opts.probeNodeError) {
+          throw new ContractFunctionRevertedError({
+            abi: feedbackBatcherAbi, functionName, message: 'internal error',
+            cause: new InternalRpcError(new Error('internal error')),
+          });
+        }
         throw new ContractFunctionRevertedError({
           abi: feedbackBatcherAbi,
           functionName,
           data: opts.batcherHasVersioned ? encodeErrorResult({ abi: feedbackBatcherAbi, errorName: 'BatcherNotSelf' }) : '0x',
+          cause: new ExecutionRevertedError({ message: 'execution reverted' }),
         });
       },
       waitForTransactionReceipt: async () => ({ status: 'success', logs: [feedbackVerifiedLog(7n)] }),
@@ -449,6 +489,21 @@ test('atomic v2: a batcher without the versioned entry → sequential path, noth
   await rep.giveFeedback({ agentId: 352n, value: 5n, serveProof: PROOF_V2 });
   assert.equal(calls.sends.length, 0, 'no type-4 transaction');
   assert.deepEqual(calls.writes.map((w) => w.functionName), ['giveFeedback', 'attestVersionedFeedback']);
+  // The batcher's bare revert is its answer: kept.
+  await rep.giveFeedback({ agentId: 352n, value: 4n, serveProof: PROOF_V2 });
+  assert.equal(calls.probes, 1);
+});
+
+test('atomic v2: a node error during the batcher probe is no answer — sequential now, asked again next time', async () => {
+  const opts = { batcher: BATCHER, code: DESIGNATOR, batcherHasVersioned: true, probeNodeError: true };
+  const { rep, calls } = mkRep(opts);
+  await rep.giveFeedback({ agentId: 352n, value: 5n, serveProof: PROOF_V2 });
+  assert.equal(calls.sends.length, 0, 'sequential this time');
+  assert.deepEqual(calls.writes.map((w) => w.functionName), ['giveFeedback', 'attestVersionedFeedback']);
+  opts.probeNodeError = false;
+  await rep.giveFeedback({ agentId: 352n, value: 4n, serveProof: PROOF_V2 });
+  assert.equal(calls.probes, 2, 'not kept');
+  assert.equal(calls.sends.length, 1, 'the batcher answered: atomic');
 });
 
 test('v1 proofs keep the v1 entry points and never probe the batcher', async () => {

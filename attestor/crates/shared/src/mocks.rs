@@ -248,6 +248,8 @@ pub struct MockChain {
     identity_registry: Mutex<Option<Address>>,
     /// What `trust_registry` answers; None (default) = a chain without one.
     trust_registry: Mutex<Option<Address>>,
+    /// `trust_registry` fails as a node error does (not a revert).
+    trust_registry_failure: AtomicBool,
     /// (kind, hash) pairs the trust registry lists.
     listed: Mutex<Vec<(B256, B256)>>,
 }
@@ -288,6 +290,7 @@ impl MockChain {
             last_clone_from: Mutex::new(None),
             identity_registry: Mutex::new(None),
             trust_registry: Mutex::new(None),
+            trust_registry_failure: AtomicBool::new(false),
             listed: Mutex::new(Vec::new()),
         }
     }
@@ -295,6 +298,11 @@ impl MockChain {
     /// Give the chain a trust registry (test-only); None = AgenticID before 1.4.0.
     pub fn set_trust_registry(&self, registry: Option<Address>) {
         *self.trust_registry.lock().unwrap() = registry;
+    }
+
+    /// Make `trust_registry` fail as an unreadable chain does (test-only).
+    pub fn set_trust_registry_failure(&self, fail: bool) {
+        self.trust_registry_failure.store(fail, Ordering::SeqCst);
     }
 
     /// List (true) or delist (false) `hash` under the trust kind `kind` ("sealed", …).
@@ -420,6 +428,10 @@ impl ChainClient for MockChain {
     }
 
     async fn trust_registry(&self) -> anyhow::Result<Option<Address>> {
+        anyhow::ensure!(
+            !self.trust_registry_failure.load(Ordering::SeqCst),
+            "server returned an error response: error code -32000: header not found"
+        );
         Ok(*self.trust_registry.lock().unwrap())
     }
 

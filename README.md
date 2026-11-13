@@ -374,8 +374,12 @@ chain from on-chain registration to each signed response.
 | **TappRegistry** | Code-fingerprint registry for all Tapp components |
 
 Since AgenticID 1.4 the trust decisions live in the TrustRegistry: AgenticID's
-implementation fixes its address and forwards its trust reads there. The pinned
-compiler and the upgrade are documented in [`contracts/README.md`](contracts/README.md).
+implementation fixes its address and forwards its trust reads there. The
+registry's owner is the environment's Timelock, so listing a version and
+trusting an attestor are scheduled operations that can be cancelled before
+they run (mainnet delay 1 day, dev and test 0); a guardian key delists
+versions and untrusts attestors at once. The pinned compiler and the upgrade
+are documented in [`contracts/README.md`](contracts/README.md).
 
 ### TEE layer (deployed on 0g-Tapp)
 

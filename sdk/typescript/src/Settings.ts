@@ -107,6 +107,9 @@ export interface SettingsDoc {
 export interface VersionPicks {
   sealed?: string;
   harness?: string;
+  /** A pick for a layer this SDK does not know yet: carried through
+   *  {@link canonicalSettings} untouched, like an unknown top-level field. */
+  [layer: string]: unknown;
 }
 
 /** `'0g-compute'` — the provider for which the platform routes the model. */
@@ -177,6 +180,13 @@ export function canonicalSettings(doc: SettingsDoc): string {
       const inner: string[] = [];
       if (picks.sealed) inner.push(`"sealed":${JSON.stringify(picks.sealed)}`);
       if (picks.harness) inner.push(`"harness":${JSON.stringify(picks.harness)}`);
+      // A pick for a layer this SDK has never heard of goes through untouched,
+      // in its own order, for the reason unknown top-level fields do (below).
+      for (const [layer, pick] of Object.entries(picks)) {
+        if (layer === 'sealed' || layer === 'harness' || pick === undefined) continue;
+        const raw = JSON.stringify(pick);
+        if (raw !== undefined) inner.push(`${JSON.stringify(layer)}:${raw}`);
+      }
       if (inner.length) parts.push(`"versions":{${inner.join(',')}}`);
     } else {
       // Not the shape the container takes: passed through for it to refuse.

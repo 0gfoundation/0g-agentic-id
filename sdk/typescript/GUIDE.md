@@ -260,7 +260,7 @@ await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3
 
 **Whole-document write.** `setSettings` replaces the document — read it first and spread it to change one field. A `thinking` outside `low|high|max` (case-insensitive, as the container compares it) is refused before signing.
 
-**Version picks (0g-harness).** `versions: { sealed, harness }` pins the layered runtime to a sealed program and an official harness version, each by its sha256 (`"0x"` + 64 hex; anything else is refused before signing). `ag.agent.listedVersions()` reads what the trust registry lists — `{ registry, sealed: [...], harness: [...] }` in listing order, the last the newest; `null` on a chain without a trust registry (AgenticID before 1.4.0). The agent runs a pick while it is listed; a layer with no pick keeps its running version while that stays listed and otherwise moves to the newest. The container applies a pushed document at once (`pushSettingsToContainer`), every boot, and every five minutes; the other frameworks ignore `versions`.
+**Version picks (0g-harness).** `versions: { sealed, harness }` pins the layered runtime to a sealed program and an official harness version, each by its sha256 (`"0x"` + 64 hex; anything else is refused before signing). A pick for a layer this SDK does not know is written back as it is, as an unknown top-level field is. `ag.agent.listedVersions()` reads what the trust registry lists — `{ registry, sealed: [...], harness: [...] }` in listing order, the last the newest; `null` on a chain without a trust registry (AgenticID before 1.4.0, whose `trustRegistry()` reverts); any other failed read throws. The agent runs a pick while it is listed; a layer with no pick keeps its running version while that stays listed and otherwise moves to the newest. The container applies a pushed document at once (`pushSettingsToContainer`), every boot, and every five minutes; the other frameworks ignore `versions`.
 
 **Who may read or write it.** Owner-signed, both directions, against the **live on-chain owner** read at request time — so a seller cannot keep configuring (or reading) an agent they already sold. The SDK signs `AgenticID.Settings.v1:<sealId>:<ts>:<base_version>:<sha256 of the document>` (EIP-191) for a write, and the same message minus the digest for a read (`GET /settings`, no body, base version 0). A rejected call is a clearly-worded HTTP 401. The document is on **no** listing tier and on no public deployment row: `getSettings` is the only way to read it.
 
@@ -343,6 +343,9 @@ await ag.reputation.verifyProof(proof);
 // trust registry's lists now (AgenticID.trustRegistry(), 1.4.0+) — `ok` needs it;
 // a version delisted since the proof was signed fails, with the layer named in
 // reasons. The registry does not check the lists, so such a proof still redeems.
+// A chain whose AgenticID has no trustRegistry() (it reverts) gives false with a
+// reason; a list read that fails for any other reason throws. The envelope is
+// read as UTF-8, so a model or URL with non-ASCII text verifies.
 // signer attribution only. Pass { task } (the TaskExchange fetchWithProof
 // recorded) to also get taskMatches — the proof bound to THIS exchange's
 // bytes; ok requires the match, and task: null fails closed. Hand-rolled

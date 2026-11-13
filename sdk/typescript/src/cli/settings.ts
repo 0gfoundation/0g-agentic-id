@@ -171,7 +171,8 @@ export function applyAssignments(base: SettingsDoc | null, assignments: Assignme
       const picks: VersionPicks = { ...(doc.versions ?? {}) };
       if (a.value === undefined) delete picks[a.key];
       else picks[a.key] = a.value as string;
-      if (picks.sealed || picks.harness) doc.versions = picks;
+      // A pick for a layer this CLI does not know stays, as in canonicalSettings.
+      if (Object.values(picks).some((pick) => pick !== undefined && pick !== '')) doc.versions = picks;
       else delete doc.versions;
     } else if (a.value === undefined) delete doc[a.key];
     else if (a.key === 'others') doc.others = a.value;
@@ -223,17 +224,23 @@ export function renderSettings(doc: SettingsDoc | null): string[] {
   if (!doc || Object.keys(doc).length === 0) return ['(not configured — the agent boots on its framework defaults)'];
   const show = (v: unknown): string =>
     v === undefined || v === null ? '—' : typeof v === 'string' ? v : JSON.stringify(v);
-  // `versions` shows as its two picks, the keys that write them; a value of
+  // `versions` shows as its two picks, the keys that write them, and a pick
+  // for a layer this CLI does not know as `versions.<layer>`; a value of
   // another shape shows as itself.
   const v = doc.versions as unknown;
   const picks = v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
   const flat: Record<string, unknown> = { ...doc, versions: picks ? undefined : v };
-  if (picks) for (const k of VERSION_KEYS) flat[k] = picks[k] || undefined;
+  if (picks) {
+    for (const k of VERSION_KEYS) flat[k] = picks[k] || undefined;
+    for (const [k, pick] of Object.entries(picks)) {
+      if (!(VERSION_KEYS as readonly string[]).includes(k)) flat[`versions.${k}`] = pick;
+    }
+  }
   const extra = Object.keys(flat).filter(
     (k) => !(SETTINGS_KEYS as readonly string[]).includes(k) && flat[k] !== undefined,
   );
   return [...SETTINGS_KEYS.filter((k) => flat[k] !== undefined), ...extra].map(
-    (k) => `${k.padEnd(11)}${show(flat[k])}`,
+    (k) => `${`${k} `.padEnd(11)}${show(flat[k])}`,
   );
 }
 

@@ -816,6 +816,8 @@ export const verifiedFeedbackAbi = [
   },
 
   // ── Attest ──
+  // LEGACY(v1): attestFeedback and attestFeedbackWithTask take v1 proofs
+  // (legacy/serveProofV1.ts); the registry keeps them.
   {
     type: 'function',
     name: 'attestFeedback',
@@ -1041,6 +1043,7 @@ export const verifiedFeedbackAbi = [
  */
 export const feedbackBatcherAbi = [
   {"type":"error","name":"BatcherNotSelf","inputs":[]},
+  // LEGACY(v1): the batch for a v1 proof (legacy/serveProofV1.ts).
   {
     type: 'function',
     name: 'giveFeedbackAndAttest',

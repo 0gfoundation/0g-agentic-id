@@ -731,10 +731,12 @@ export class AgentApi {
    * it is listed — picked through the settings document's `versions` —
    * otherwise keeps its running version while that stays listed, and
    * otherwise moves to the last entry, the newest (sealed/LAYERS.md §10).
-   * null when the chain has no trust registry (AgenticID before 1.4.0).
+   * LEGACY(pre-1.4.0): null when the chain has no trust registry (AgenticID
+   * before 1.4.0).
    */
   async listedVersions(): Promise<{ registry: Address; sealed: Hash[]; harness: Hash[] } | null> {
     const registry = await trustRegistryOf(this.ctx.publicClient, this.ctx.addresses.agenticID);
+    // LEGACY(pre-1.4.0)
     if (!registry) return null;
     const [sealed, harness] = await Promise.all([
       listedHashes(this.ctx.publicClient, registry, 'sealed'),

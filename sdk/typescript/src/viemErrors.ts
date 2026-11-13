@@ -5,6 +5,10 @@
  * made by one copy is no instance of the other's class — a caller's client,
  * or a test stub, on the ESM build would slip past this CommonJS build's
  * checks.
+ *
+ * LEGACY(pre-1.4.0): every caller tells a deployment from before AgenticID
+ * 1.4.0 / FeedbackBatcher v5 by a revert (trustRegistryOf, the batcher
+ * probe); the file goes with them.
  */
 
 /** A viem error's fields this SDK reads. */
@@ -24,8 +28,12 @@ export function findViemError(e: unknown, names: readonly string[]): ViemErrorLi
   return null;
 }
 
-/** Whether `e` is the contract refusing the call — a revert, or a function
- *  the contract does not have — as opposed to a call that got no answer. */
+/** Whether `e` is the contract refusing the call — the node said it
+ *  reverted (JSON-RPC code 3, or "execution reverted": viem's
+ *  ExecutionRevertedError), or it returned no data at all — as opposed to a
+ *  call that got no answer, or an answer that is no revert. A
+ *  ContractFunctionRevertedError alone proves nothing: viem also wraps a
+ *  node's internal error (-32603) in one. */
 export function isContractRevert(e: unknown): boolean {
-  return !!findViemError(e, ['ContractFunctionRevertedError', 'ContractFunctionZeroDataError', 'ExecutionRevertedError']);
+  return !!findViemError(e, ['ExecutionRevertedError', 'ContractFunctionZeroDataError']);
 }

@@ -89,7 +89,8 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
 
 1. **镜像。**为每个框架构建 sealed 镜像，注册为 provider snapshot，并把其镜像哈希
    列入信任注册表（AgenticID 1.4.0 起在 TrustRegistry 上调
-   `list(keccak256("image"), <hash>)`；更早的 AgenticID 上用 `addValidFrameworkHash`）。
+   `list(keccak256("image"), <hash>)`，经拥有该注册表的本环境 Timelock 排期执行，
+   mainnet 要等 1 天；更早的 AgenticID 上用 `addValidFrameworkHash`）。
    0g-harness 镜像还要列入其 sealed 程序和 harness 包的哈希（`keccak256("sealed")`、
    `keccak256("harness")`），并把这两个文件以各自的 sha256 命名，附到
    `0gfoundation/0g-agentic-id` 的 `artifacts` 发布（release）上。检查：每个镜像的
@@ -246,7 +247,7 @@ cargo run -p attestor-indexer# 第三个终端
 
 | 路径 | 干什么 | 鉴权 |
 |---|---|---|
-| `GET /provision?seal_id=…` | 返回 `{"generation", "certificate_required", "layered"}`：已启用的启动代次（不返回票据），当前是否尚未记录容器公钥、下一次启动必须携带证书，以及本 attestor 是否运行分层流程（`sealed/LAYERS.zh.md` 第 10 节）——链上有信任注册表（AgenticID 的 `trustRegistry()` 不为零）时为 true；读链失败返回 503。没有已启用的授权时返回 `403 no authorized boot; reset required` | 公开元数据 |
+| `GET /provision?seal_id=…` | 返回 `{"generation", "certificate_required", "layered"}`：已启用的启动代次（不返回票据），当前是否尚未记录容器公钥、下一次启动必须携带证书，以及本 attestor 是否运行分层流程（`sealed/LAYERS.zh.md` 第 10 节）——链上有信任注册表（AgenticID 的 `trustRegistry()` 不为零）时为 true。只有 AgenticID 拒绝该调用时为 false，1.4.0 之前的 AgenticID 就是这样（revert：JSON-RPC 错误码 3 或 "execution reverted"）；其他读取失败，包括节点返回的其他错误，一律返回 503。结果缓存 60 秒。没有已启用的授权时返回 `403 no authorized boot; reset required` | 公开元数据 |
 | `GET /attestor-tls?provider=0x…` | 原样（逐字节）转发 sandbox provider 对本 attestor TLS SPKI pin 的最新签名声明（EIP-712 `AttestorTLS`，取自已发现 provider 的 `/api/attestor-tls`）。转发前检查 provider 签名、租期（最长 300 秒）以及本 attestor 自己的 TLS 公钥在 pin 中；到期前 60 秒刷新，声明到期前 15 秒停止下发（sealed 要求剩余超过 5 秒），且只在刷新时询问 sandbox discovery，因此 discovery 续期或不可用不会阻塞或拒绝缓存能回答的请求。未知 provider → 404；没有有效声明 → 503 并带 `Retry-After: 5`。始终 `Cache-Control: no-store`。每份新声明都会打日志；api 启动时取一次并记录结果。sealed 之后对 attestor 的所有连接都钉在这些 pin 上 | 公开 |
 | `POST /provision` | 容器领取 ECIES 加密的 `agentSeal_priv`、owner 配置文档、owner 的凭据集（`encrypted_credentials`：`{document, owner_epoch}` 及其写回，只发给当前所有权），以及不透明的单次启动状态令牌（`encrypted_status_binding`，明文 `{"token":"<64 hex>"}`；只存其 SHA-256，旁边记录实际下发的配置版本和摘要）。**首次启动**携带 v3 证书（`certificate`：`SANDBOX_SEAL_ATTESTATION` 对象，provider 密钥签的 EIP-712 `ImageAttestation`）。attestor 要求签名者与 scope 是已发现的 provider 实例，签发时间在启动票据之前 300 秒到当前时间 + 300 秒之间，镜像在 `validFrameworkHashes` 中，且公钥是 provider 为本 attestor 在当前票据下创建的 sandbox 所报告的公钥（`401 certificate is not for the sandbox this attestor created; reset required`），然后记录容器公钥、镜像和 provider 实例。**之后的启动**不带证书：由已记录的公钥签 boot claim，已记录的 provider 实例必须仍是当前发现的实例（否则 `403 provider instance no longer trusted; reset required`），已记录镜像仍须在白名单中（否则 `401 recorded image_hash not in validFrameworkHashes; reset required`）。没有记录也没有证书 → `409 certificate_required`；证书对应另一把公钥 → `403 container key differs from record; reset required`。每个请求都带 owner 授权的票据、启动代次和容器公钥签名的 boot claim，`boot_started_at` 必须严格递增；create 尚未落库时返回 409。拒绝的请求不删除容器；对已授权启动的 401/403 会打日志（`provision rejected`），在该代次仍有效时记为 `last_provision_error`，并立即把容器 stage 置为 `failed`（发布 `container_failed`）；下一次被接受的启动或新容器的票据会清除它。未确认配置多次启动后回退至 last-known-good（同一次启动的重试算同一次尝试）。**分层流程**：由加载器启动 sealed 的容器加上 `sealed_hash`（`0x` + 64 位十六进制），并把它签进 boot claim（`ProvisionBoot.v2:…:<sealed hash>`）；信任注册表的 sealed 名单必须包含它。不在名单上返回 `403`，记为 `last_provision_error`，但不让 agent 下线：sealed 切到最新的已列出版本，在同一代次下重新申领。链上没有信任注册表时带 `sealed_hash` 返回 `400`。不带它的 claim（`ProvisionBoot.v1`）来自没有加载器的镜像，按原流程处理（`crates/shared/src/legacy.rs`）| provider 签名的证书（首次启动）或已记录的容器公钥 + owner 授权的票据、启动代次和容器公钥签名的 boot claim |
 | `POST /status` | sealed 心跳与状态（`StatusReport.v2` canonical；`StatusReport.v3` 末尾追加等待 owner 处理的凭据待办数量，按 seal 记录：配置了通知时，数量上升会给 owner 发邮件）。签名覆盖状态令牌哈希和实际使用的配置摘要；在一个事务里检查令牌属于当前启动，再更新状态、心跳与精确版本确认。只有实际使用的配置摘要等于该次启动下发摘要的 `running` / `warning` 上报才能提升配置；旧容器上报被忽略，`error` 不改配置。上报的级别和原因（`error_detail`）作为 `container_status` 记在该行 | agentSeal 原始 keccak 签名 + 当前状态令牌 |
@@ -271,7 +272,7 @@ cargo run -p attestor-indexer# 第三个终端
 | 合约 | 用途 |
 |---|---|
 | **AgenticID** | NFT mint、iData 注册、镜像白名单 `isValidFrameworkHash`（1.4.0 起经信任注册表读取）以及 `trustRegistry()` |
-| **TrustRegistry** | 部署方的信任决定（AgenticID 1.4.0 起，经其 `trustRegistry()` 找到）：受信 attestor，以及按类别的代码名单——`image`、`sealed`、`harness`。`/provision` 用 sealed 名单检查分层启动的 sealed 程序。attestor 只读它 |
+| **TrustRegistry** | 部署方的信任决定（AgenticID 1.4.0 起，经其 `trustRegistry()` 找到）：受信 attestor，以及按类别的代码名单——`image`、`sealed`、`harness`。owner 是本环境的 Timelock（列入和信任是排期执行、可取消的操作；mainnet 延迟 1 天，dev/test 为 0）；guardian 密钥可以立即下架、撤销信任。`/provision` 用 sealed 名单检查分层启动的 sealed 程序。attestor 只读它 |
 | **VerifiedFeedbackRegistry** | 验证 ServeProof——agentSeal 的 EIP-191 version 0x00 签名 `keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)`，validator = 本 proxy——并在官方 ERC-8004 reputation registry 之上记录 TEE 标记。attestor 从不写它：只在 `GET /config` 公布地址，并作为 `VERIFIED_FEEDBACK_ADDR` 注入每个新容器（`ATTESTOR_VERIFIED_FEEDBACK_ADDR`）；唯一的读取在 worker / api 启动时——`getIdentityRegistry()` 必须等于 `ATTESTOR_AGENTIC_ID_ADDR`，否则启动失败 |
 | **TappRegistry** | attestor / 0g-kms / 0g-sandbox-provider 三个 Tapp app 的代码身份 + 节点签名注册表，也是 provider 证书与 TLS 声明的 EIP-712 `verifyingContract`；`/provision` 用已认证的 sandbox discovery 校验证书签名者与注册 scope |
 | **SandboxServing** | sandbox 预付费余额 + voucher 结算；前端 deploy gate 要求 owner 余额 ≥ 0.1 OG |

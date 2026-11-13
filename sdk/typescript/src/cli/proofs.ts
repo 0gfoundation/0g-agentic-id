@@ -32,8 +32,8 @@ export interface SavedProof {
     taskHash: `0x${string}`; dataHashes: `0x${string}`[]; frameworkHash: `0x${string}`;
     signature: `0x${string}`;
     validator?: `0x${string}`; // envelope diagnostics: lets `rate` tell a registry mismatch from a bad ticket
-    // v2 (absent on a v1 ticket): the version picks the digest and the
-    // registry entry point, so a ticket keeps all of it.
+    // v2 (LEGACY(v1): absent on a v1 ticket): the version picks the digest
+    // and the registry entry point, so a ticket keeps all of it.
     version?: number;
     sealedHash?: `0x${string}`;
     harnessHash?: `0x${string}`;
@@ -87,6 +87,7 @@ export function saveProof(proof: ServeProof, task: TaskReveal, endpoint: string)
       frameworkHash: proof.frameworkHash,
       signature: proof.signature,
       ...(proof.validator ? { validator: proof.validator } : {}),
+      // LEGACY(v1): a proof without a version keeps no layers.
       ...(proof.version === undefined
         ? {}
         : {
@@ -172,6 +173,7 @@ export function toServeProof(e: SavedProof): ServeProof {
     frameworkHash: e.proof.frameworkHash,
     signature: e.proof.signature,
     ...(e.proof.validator ? { validator: e.proof.validator } : {}),
+    // LEGACY(v1): a v1 ticket has no layers.
     ...(e.proof.version === undefined
       ? {}
       : {

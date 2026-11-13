@@ -24,8 +24,9 @@ const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 /**
  * The trust registry AgenticID names, or null when the chain has none: an
  * AgenticID before 1.4.0 has no `trustRegistry()` and reverts. Any other
- * failure (an unreachable RPC) throws — "no registry" is a fact about the
- * chain, never a guess from a dropped connection.
+ * failure throws — an unreachable RPC, or an error the node answered that is
+ * no revert (an internal error, a missing header): "no registry" is a fact
+ * about the chain, never a guess from a failed read.
  */
 export async function trustRegistryOf(publicClient: PublicClient, agenticID: Address): Promise<Address | null> {
   try {
@@ -36,6 +37,7 @@ export async function trustRegistryOf(publicClient: PublicClient, agenticID: Add
     })) as Address;
     return registry.toLowerCase() === ZERO_ADDRESS ? null : registry;
   } catch (e) {
+    // LEGACY(pre-1.4.0): the null a chain before AgenticID 1.4.0 answers.
     if (isContractRevert(e)) return null;
     throw e;
   }

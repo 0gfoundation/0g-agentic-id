@@ -2101,7 +2101,8 @@ async function showHello(ag: AgenticID, url: string, clientAddr?: `0x${string}`)
     : '(no proof header)';
   out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${proofLine}\n`);
   // A v2 proof names what each layer ran (sealed/LAYERS.md §7); the header
-  // is the agent's, so every field goes through cleanCell.
+  // is the agent's, so every field goes through cleanCell. LEGACY(v1): a
+  // proof without a version names none.
   if (proof?.version !== undefined) {
     out(`sealed  : ${cleanCell(String(proof.sealedHash ?? '?'))}\nharness : ${cleanCell(String(proof.harnessHash ?? '?'))}\n`);
     if (proof.model || proof.inferenceURL) {

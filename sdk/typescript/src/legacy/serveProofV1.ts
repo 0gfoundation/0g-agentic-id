@@ -1,15 +1,18 @@
 /**
  * @file legacy/serveProofV1.ts
- * @description ServeProof v1 — what every image before the layered runtime
- * signs (sealed/LAYERS.md §8, "Compatibility with existing 0g-harness
- * images"): a proof whose envelope carries no `version`.
+ * @description LEGACY(v1): ServeProof v1 — what every image before the
+ * layered runtime signs (sealed/LAYERS.md §8, "Compatibility with existing
+ * 0g-harness images"): a proof whose envelope carries no `version`.
  *
  * The rest of the SDK speaks v2 and comes here only for a proof without a
  * version: the v1 digest, and the registry's and the batcher's v1 entry
- * points. Once those images are gone, delete this file; the compiler then
- * lists every call site, each one branch of a version dispatch. The registry
- * keeps its v1 entry points, and nothing here is needed to read the marks v1
- * proofs left.
+ * points. Once those images are gone, delete this file and every
+ * `LEGACY(v1)` mark (`git grep -n 'LEGACY(v1)'`): the compiler lists every
+ * call site, each one branch of a version dispatch, and the marks show the
+ * places it cannot see — where a proof without a `version` is read as v1, the
+ * v1 ABI entries and vectors. A proof without a version is then malformed.
+ * The registry keeps its v1 entry points, and nothing here is needed to read
+ * the marks v1 proofs left.
  */
 
 import {
@@ -26,6 +29,7 @@ import {
   type WalletClient,
 } from 'viem';
 import { feedbackBatcherAbi, verifiedFeedbackAbi } from '../abi';
+import type { FeedbackArgs } from '../ReputationClient';
 import type { ServeProof, TaskReveal } from '../types';
 
 /** The fields the v1 preimage covers (BuildServeProofHashParams without a version). */
@@ -108,9 +112,6 @@ export function attestV1(
         args: [agentId, feedbackIndex, v1Tuple(proof)],
       });
 }
-
-/** The canonical giveFeedback arguments, in the batcher's order. */
-export type FeedbackArgs = readonly [bigint, bigint, number, string, string, string, string, Hex];
 
 /** FeedbackBatcher calldata for a v1 proof: `giveFeedbackAndAttest`. An empty
  *  `task.method` routes to plain attestFeedback. */

@@ -164,6 +164,7 @@ pub fn boot_signing_message(
     ticket_hash: &[u8; 32],
     boot_id: B256,
     started_at: i64,
+    // LEGACY(v1): None for an image without the loader.
     sealed_hash: Option<B256>,
 ) -> String {
     let Some(sealed) = sealed_hash else {

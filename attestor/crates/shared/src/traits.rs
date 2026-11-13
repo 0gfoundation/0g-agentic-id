@@ -20,8 +20,10 @@ pub trait ChainClient: Send + Sync {
     async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool>;
 
     /// AgenticID `trustRegistry()` (1.4.0+): the contract holding the
-    /// deployer's trust lists (sealed/LAYERS.md §10). None when the chain has
-    /// none — an AgenticID before 1.4.0 has no such function and reverts.
+    /// deployer's trust lists (sealed/LAYERS.md §10). LEGACY(pre-1.4.0): None
+    /// when the chain has none — an AgenticID before 1.4.0 has no such
+    /// function and reverts. Only a revert means that; a read that fails for
+    /// any other reason is an error.
     async fn trust_registry(&self) -> anyhow::Result<Option<Address>> {
         Ok(None)
     }

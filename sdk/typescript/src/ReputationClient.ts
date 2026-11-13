@@ -15,7 +15,7 @@
  * The proof's own `version` picks the registry entry point: a v2 proof goes
  * to `attestVersionedFeedback` (registry 1.3.0+, batcher
  * `giveFeedbackAndAttestVersioned`), a proof without one to the v1 entry
- * points (legacy/serveProofV1.ts).
+ * points (LEGACY(v1): legacy/serveProofV1.ts).
  */
 
 import {
@@ -38,8 +38,8 @@ import { agenticIDAbi, canonicalReputationAbi, verifiedFeedbackAbi, feedbackBatc
 import { RECEIPT_WAIT } from './constants';
 import { type Ctx } from './context';
 import { SERVE_PROOF_VERSION, serveProofLayers, verifyServeProofSignature } from './ServeProof';
-import { attestV1, batchCallV1, type FeedbackArgs } from './legacy/serveProofV1';
-import { findViemError } from './viemErrors';
+import { attestV1, batchCallV1 } from './legacy/serveProofV1';
+import { findViemError, isContractRevert } from './viemErrors';
 import type {
   ServeProof,
   GiveFeedbackParams,
@@ -57,13 +57,17 @@ import type {
 const ZERO32 = ('0x' + '0'.repeat(64)) as `0x${string}`;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
+/** The canonical giveFeedback arguments, in the batcher's order. */
+export type FeedbackArgs = readonly [bigint, bigint, number, string, string, string, string, Hex];
+
 /** The task argument when there is no receipt to open: an EMPTY method makes
  *  the batcher (and attestVersionedFeedback) skip the opening, so statusCode
  *  0 is never checked. */
 const NO_TASK: TaskReveal = { method: '', uri: '', reqBodyHash: ZERO32, respBodyHash: ZERO32, statusCode: 0 };
 
 /** The first VerifiedFeedbackRegistry version with attestVersionedFeedback
- *  and getServeLayers. */
+ *  and getServeLayers. LEGACY(pre-1.4.0): checked only because a registry
+ *  before it may still be configured. */
 const VERSIONED_REGISTRY = [1, 3, 0] as const;
 
 /** Whether a "major.minor.patch" version string is at least `min`. */
@@ -197,8 +201,8 @@ export class ReputationClient {
   }
 
   /** The VerifiedFeedbackRegistry's VERSION. Kept once it is 1.3.0 or later;
-   *  an older one is read again each time, as its upgrade can land while
-   *  this client lives. */
+   *  LEGACY(pre-1.4.0): an older one is read again each time, as its upgrade
+   *  can land while this client lives. */
   private async registryVersion(): Promise<string> {
     if (this.registryVersionValue !== undefined) return this.registryVersionValue;
     const version = (await this.publicClient.readContract({
@@ -229,6 +233,7 @@ export class ReputationClient {
           'inferenceURL and model strings) — nothing was broadcast',
       );
     }
+    // LEGACY(pre-1.4.0): a registry before 1.3.0 has no attestVersionedFeedback.
     const version = await this.registryVersion();
     if (!versionAtLeast(version, VERSIONED_REGISTRY)) {
       throw new Error(
@@ -283,6 +288,7 @@ export class ReputationClient {
     // sequential canonical write that precedes attestFeedbackWithTask.
     if (params.task) assertTaskStatusCode(params.task);
     assertFeedbackValueInRange(params.value, params.valueDecimals ?? 0);
+    // LEGACY(v1): a proof without a version takes the v1 entry points.
     if (params.serveProof.version !== undefined) await this.assertVersionedAccepted(params.serveProof);
 
     const batcher = this.ctx.addresses.feedbackBatcher;
@@ -399,7 +405,8 @@ export class ReputationClient {
       refuse(
         proof.validator
           ? 'signature does not match the on-chain agentSeal'
-          : 'signature does not match the on-chain agentSeal; the proof names no validator — likely a pre-upgrade sealed image, which only an owner reset fixes',
+          : // LEGACY(v1): the hint for an image from before the validator.
+            'signature does not match the on-chain agentSeal; the proof names no validator — likely a pre-upgrade sealed image, which only an owner reset fixes',
       );
     }
     // Owner / operator self-feedback — the registry's ERC-721 checks against
@@ -453,9 +460,11 @@ export class ReputationClient {
   ): Promise<GiveFeedbackResult | null> {
     const me = this.account!.address;
     const sp = params.serveProof;
+    // LEGACY(v1): a proof without a version takes the v1 batch.
     const versioned = sp.version !== undefined;
-    // A batcher deployed before versioned proofs has no entry for them: take
-    // the sequential path, before anything is signed or sent.
+    // LEGACY(pre-1.4.0): a batcher deployed before versioned proofs has no
+    // entry for them: take the sequential path, before anything is signed or
+    // sent.
     if (versioned && !(await this.batcherTakesVersioned(batcher))) return null;
 
     // Delegation designator this EOA needs: 0xef0100 ‖ batcher.
@@ -527,8 +536,11 @@ export class ReputationClient {
    * Whether `batcher` has giveFeedbackAndAttestVersioned, asked gas-free: a
    * call from anyone but the delegated EOA itself reverts BatcherNotSelf
    * when the entry exists, and with no data when it does not (the batcher
-   * has no fallback). Anything else — an unreachable RPC — counts as no, which
-   * only costs the atomicity: the sequential path checks the proof first.
+   * has no fallback). Only those answers are kept. Anything else — an
+   * unreachable RPC, an error the node answered that is no revert — counts
+   * as no this time and is asked again next time; it only costs the
+   * atomicity: the sequential path checks the proof first.
+   * LEGACY(pre-1.4.0): needed while a batcher before v5 may be configured.
    */
   private async batcherTakesVersioned(batcher: Address): Promise<boolean> {
     const known = this.batcherVersioned.get(batcher.toLowerCase());
@@ -551,9 +563,12 @@ export class ReputationClient {
       });
       takes = true;
     } catch (e) {
+      // The batcher's own error, decoded, is its answer; a revert without one
+      // is the missing entry. viem wraps a node's internal error in a
+      // ContractFunctionRevertedError too, so that alone is no answer.
       const reverted = findViemError(e, ['ContractFunctionRevertedError']);
-      if (!reverted) return false; // not an answer from the batcher: ask again next time
-      takes = reverted.data?.errorName === 'BatcherNotSelf';
+      if (reverted?.data?.errorName === 'BatcherNotSelf') takes = true;
+      else if (!isContractRevert(e)) return false; // not an answer from the batcher: ask again next time
     }
     this.batcherVersioned.set(batcher.toLowerCase(), takes);
     return takes;
@@ -567,6 +582,7 @@ export class ReputationClient {
     task?: TaskReveal,
   ): Promise<WriteContractReturnType> {
     if (task) assertTaskStatusCode(task);
+    // LEGACY(v1): a proof without a version takes the v1 entry points.
     if (proof.version === undefined) {
       return attestV1(
         this.walletClient!,
@@ -589,7 +605,8 @@ export class ReputationClient {
    * Attest an EXISTING canonical feedback entry of the connected wallet with
    * a ServeProof (the second half of `giveFeedback`, exposed for callers that
    * submitted the canonical entry separately). A v2 proof goes to
-   * attestVersionedFeedback (registry 1.3.0+), a v1 proof to attestFeedback.
+   * attestVersionedFeedback (registry 1.3.0+), a v1 proof (LEGACY(v1)) to
+   * attestFeedback.
    */
   async attestFeedback(
     agentId: bigint,
@@ -907,6 +924,7 @@ export class ReputationClient {
     clientAddress: Address,
     feedbackIndex: bigint,
   ): Promise<ServeLayers> {
+    // LEGACY(pre-1.4.0): a registry before 1.3.0 has no getServeLayers.
     const version = await this.registryVersion();
     if (!versionAtLeast(version, VERSIONED_REGISTRY)) {
       throw new Error(

@@ -55,7 +55,8 @@ pub async fn challenge(
         .await?
         .is_some_and(|d| d.container_record.is_some());
     // An unreadable chain is a retry, not "no": a loader image told `false`
-    // would claim without its sealed hash.
+    // would claim without its sealed hash. LEGACY(pre-1.4.0): `false` only
+    // for a chain whose AgenticID names no trust registry.
     let layered = trust_registry(&state).await?.is_some();
     Ok(Json(serde_json::json!({
         "generation": auth.generation,
@@ -64,8 +65,9 @@ pub async fn challenge(
     })))
 }
 
-/// The chain's trust registry; None on an AgenticID before 1.4.0. A chain
-/// read that fails is a 503, which sealed retries.
+/// The chain's trust registry; None (LEGACY(pre-1.4.0)) only when AgenticID
+/// refuses the call, as one before 1.4.0 does. A chain read that fails for
+/// any other reason is a 503, which sealed retries.
 async fn trust_registry(state: &AppState) -> ApiResult<Option<alloy::primitives::Address>> {
     state
         .chain
@@ -300,9 +302,10 @@ async fn provision(
     )?;
     // The layered flow: the sealed program the loader started, which the
     // container signed into its claim, must be on the trust registry's sealed
-    // list. A claim without one comes from an image without the loader
-    // (`attestor_shared::legacy`), whose sealed the image hash covers.
+    // list. A claim without one comes from an image without the loader.
     if let Some(sealed) = req.sealed_hash {
+        // LEGACY(pre-1.4.0): a chain without a trust registry runs no
+        // layered flow, so no claim on it names a sealed program.
         let registry = trust_registry(state).await?.ok_or_else(|| {
             ApiError::bad_request(
                 "sealed_hash reported, but the chain has no trust registry: this attestor runs no layered flow",
@@ -337,6 +340,9 @@ async fn provision(
             *authorized = None;
             return Err(ApiError::forbidden(reason));
         }
+    } else {
+        // LEGACY(v1): such an image's sealed is the one its image hash covers.
+        attestor_shared::legacy::sealed_covered_by_image();
     }
     // A recorded container stays trusted only while the provider instance
     // that certified it is the one discovery authenticates now, and its
@@ -1711,6 +1717,34 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A trust-registry read the node answered with an error that is not a
+    /// revert says nothing about the chain: both sides are a 503, which
+    /// sealed retries — never `layered: false` (a loader image would claim
+    /// without its sealed hash) and never the final 400.
+    #[tokio::test]
+    async fn an_unreadable_trust_registry_is_503_at_discovery_and_at_the_claim() {
+        let (mut state, repo, seal) = setup(None).await;
+        let chain = layered_chain(&mut state, &[SEALED]);
+        chain.set_trust_registry_failure(true);
+        let error = challenge(
+            State(state.clone()),
+            axum::extract::Query(BootQuery { seal_id: seal }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        let error = call(&state, first_layered(&repo, seal, SEALED).await)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        // Readable again: the same claim is served.
+        chain.set_trust_registry_failure(false);
+        assert!(layered(&state, seal).await);
+        call(&state, first_layered(&repo, seal, SEALED).await)
+            .await
+            .unwrap();
     }
 
     // ── Settings delivery ─────────────────────────────────────────────────

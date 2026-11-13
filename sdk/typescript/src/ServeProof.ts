@@ -18,8 +18,8 @@
  *         keccak256(abi.encodePacked(dataHashes)), frameworkHash,
  *         sealedHash, harnessHash,
  *         keccak256(bytes(inferenceURL)), keccak256(bytes(model))))
- *   - v1 (no `version`, every image before it) is the nine words alone —
- *     legacy/serveProofV1.ts.
+ *   - LEGACY(v1): v1 (no `version`, every image before it) is the nine words
+ *     alone — legacy/serveProofV1.ts.
  *
  * v1's preimage opens with the chain id and is 9 words long, v2's with the
  * tag and 14, so a signature over either never verifies as the other.
@@ -54,8 +54,8 @@ import { serveProofHashV1 } from './legacy/serveProofV1';
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
-/** The ServeProof version this SDK signs and verifies; a proof without a
- *  version is v1 (legacy/serveProofV1.ts). */
+/** The ServeProof version this SDK signs and verifies; LEGACY(v1): a proof
+ *  without a version is v1 (legacy/serveProofV1.ts). */
 export const SERVE_PROOF_VERSION = 2;
 
 /** keccak256("AgentDNA.ServeProof.v2") — the first word of the v2 preimage. */
@@ -85,7 +85,8 @@ export interface BuildServeProofHashParams {
   /** Hash of the agent framework version: the image hash (base) */
   frameworkHash: Hash;
   /** 2 for a versioned proof, which then also needs the four fields below;
-   *  absent for v1, the format of images before the layered runtime. */
+   *  LEGACY(v1): absent for v1, the format of images before the layered
+   *  runtime. */
   version?: number;
   /** v2: sha256 of the sealed program the loader verified and ran */
   sealedHash?: Hash;
@@ -157,6 +158,7 @@ export interface BuildServeProofSigningHashParams extends BuildServeProofHashPar
  *   missing or malformed
  */
 export function buildServeProofMessageHash(params: BuildServeProofHashParams): Hash {
+  // LEGACY(v1): a proof without a version.
   if (params.version === undefined) return serveProofHashV1(params);
   if (params.version !== SERVE_PROOF_VERSION) {
     throw new Error(
@@ -251,7 +253,7 @@ export function buildServeProof(
  * rejects on purpose, and the proof fails `verifyServeProofSignature`.
  *
  * Pass `version: 2` and the four layer fields for a v2 proof; without a
- * version the proof is v1.
+ * version the proof is v1 (LEGACY(v1)).
  *
  * @param params - The ServeProof parameters plus the validator (VerifiedFeedbackRegistry)
  * @param sign - A function that raw-signs the final digest (e.g. `account.sign`)
@@ -287,6 +289,7 @@ export async function signServeProof(
     signature,
     validator: params.validator,
     // buildServeProofSigningHash has checked these for a v2 proof.
+    // LEGACY(v1): a proof without a version carries no layers.
     ...(params.version === undefined
       ? {}
       : { version: params.version, ...serveProofLayers(params)! }),
@@ -326,6 +329,7 @@ export async function verifyServeProofSignature(
   if (!isUsableValidator(domain?.validator)) return false;
   if (!isRegistryCanonicalSignature(proof.signature)) return false;
   let layers: ServeProofLayers | null = null;
+  // LEGACY(v1): without a version the proof is checked as v1.
   if (proof.version !== undefined) {
     layers = proof.version === SERVE_PROOF_VERSION ? serveProofLayers(proof) : null;
     if (!layers) return false;

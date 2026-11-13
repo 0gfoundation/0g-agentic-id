@@ -1214,8 +1214,9 @@ pub struct ProvisionRequest {
     pub boot_started_at: i64,
     /// The sealed program the loader verified and started (sealed/LAYERS.md
     /// §10): sent only under the layered flow (`GET /provision` answered
-    /// `layered`), and then signed into the claim as ProvisionBoot.v2. A
-    /// container that sends none claims with ProvisionBoot.v1 (`legacy`).
+    /// `layered`), and then signed into the claim as ProvisionBoot.v2.
+    /// LEGACY(v1): optional for a container that sends none and claims with
+    /// ProvisionBoot.v1 (`legacy`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealed_hash: Option<B256>,
     pub container_signature: Bytes,

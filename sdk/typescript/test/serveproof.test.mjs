@@ -14,6 +14,10 @@ import nodeHttp from 'node:http';
  * - ServeSession.verifyProof reports distinct reasons for "no registry
  *   configured", "proof signed for a different registry" and a bad signature,
  *   and parses the envelope's `validator` field.
+ *
+ * LEGACY(v1): every proof here is v1 (no `version`). When v1 goes, the
+ * vectors go with it, and the encoding, validator and reason checks move to
+ * v2 proofs (test/serveproof-v2.test.mjs).
  */
 
 import { test } from 'node:test';

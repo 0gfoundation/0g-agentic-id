@@ -76,9 +76,9 @@ export interface ServeProof {
    *  = the VerifiedFeedbackRegistry proxy) over the proof's abi.encode hash —
    *  see buildServeProofSigningHash. NOT personal_sign. */
   signature: `0x${string}`;
-  /** 2 for a versioned proof, which also signs the four fields below; absent
-   *  for v1, what images before the layered runtime sign. It picks the digest
-   *  and the registry entry point (sealed/LAYERS.md §7). */
+  /** 2 for a versioned proof, which also signs the four fields below;
+   *  LEGACY(v1): absent for v1, what images before the layered runtime sign.
+   *  It picks the digest and the registry entry point (sealed/LAYERS.md §7). */
   version?: number;
   /** v2: sha256 of the sealed program the loader verified and ran. */
   sealedHash?: `0x${string}`;

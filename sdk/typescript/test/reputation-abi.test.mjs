@@ -32,7 +32,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const GUARDED = [
   ['VerifiedFeedbackRegistry', verifiedFeedbackAbi, '046c3cdafb4bf96c42a35363c89c477dc0aeaadbe474848b5bd5fd14b8ad0511'],
   ['FeedbackBatcher', feedbackBatcherAbi, '90a441a77f5fe5b1fc9bd1a077ae70a9fe04ad6bb3a1f74956759732a544592d'],
-  ['TrustRegistry', trustRegistryAbi, 'd3924ae92297659e5606fe6a2fee3d41deb841d0c64cad26a2f3f424f7f70038'],
+  ['TrustRegistry', trustRegistryAbi, '897460a9eca67b1a29c78c1e064096f8aa4a58e08eb4348e2cc8c931f309181f'],
 ];
 
 // Canonical type string with tuples expanded, e.g. ((bytes32,bytes),uint256)[]

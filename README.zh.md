@@ -308,7 +308,10 @@ Oracle TEE 用买家公钥重封，Oracle 签 OwnershipProof；链上 `iTransfer
 | **TappRegistry** | 所有 Tapp 组件的代码指纹注册表 |
 
 从 AgenticID 1.4 起，信任决定都在 TrustRegistry 里：AgenticID 的实现固定它的地址，
-信任相关的读取都转发过去。固定编译器和升级方式见 [`contracts/README.zh.md`](contracts/README.zh.md)。
+信任相关的读取都转发过去。注册表的 owner 是各环境的 Timelock，所以列入版本、信任
+attestor 都是排期执行、执行前可以取消的操作（mainnet 延迟 1 天，dev 和 test 为 0）；
+guardian 密钥可以立即下架版本、撤销 attestor 的信任。固定编译器和升级方式见
+[`contracts/README.zh.md`](contracts/README.zh.md)。
 
 ### TEE 层（0g-Tapp 部署）
 
