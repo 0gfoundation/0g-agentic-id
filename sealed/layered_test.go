@@ -379,13 +379,14 @@ func TestSwitchSealedSkips(t *testing.T) {
 }
 
 // A package the list explicitly does not hold never starts, not even base's
-// or the one this container ran last.
+// or the one this container ran last; the boot is retried later (transient),
+// so a version listed afterwards is picked up.
 func TestChooseHarnessNeverStartsAnUnlistedOne(t *testing.T) {
 	env := newLayeredEnv(t)
 	base := env.installBase(t, testPackage(t, "base"))
 	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{}}}
-	if hash, _, err := l.chooseHarness(context.Background(), "", base); !errors.Is(err, errNoListedHarness) || isTransient(err) {
-		t.Fatalf("chose %q (%v), want errNoListedHarness", hash, err)
+	if hash, _, err := l.chooseHarness(context.Background(), "", base); !errors.Is(err, errNoListedHarness) || !isTransient(err) {
+		t.Fatalf("chose %q (%v), want a transient errNoListedHarness", hash, err)
 	}
 }
 

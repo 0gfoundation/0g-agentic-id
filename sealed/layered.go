@@ -95,7 +95,9 @@ type codeLists interface {
 var requestSealedSwitch = layers.RequestSwitch
 
 // errNoListedHarness: the harness list holds none of the packages this
-// container could start.
+// container could start. chooseHarness returns it transient: sealed exits for
+// the loader to start it again later (exitForRetry), so a version listed
+// afterwards is picked up, and a sealed on trial is not blamed for it.
 var errNoListedHarness = errors.New("the harness list holds none of the packages this container can start")
 
 // layeredRuntime switches versions under the layered flow.
@@ -502,7 +504,7 @@ func (l *layeredRuntime) chooseHarnessOnce(ctx context.Context, pick, base strin
 	if len(unread) > 0 {
 		return "", "", nil, transient(errors.New("the harness list cannot be read for the packages this container could start"))
 	}
-	return "", "", nil, errNoListedHarness
+	return "", "", nil, transient(errNoListedHarness)
 }
 
 // installHarness makes sure the package hash is unpacked, downloading it

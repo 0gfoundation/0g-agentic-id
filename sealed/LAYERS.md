@@ -441,7 +441,8 @@ boundaries.
    container ran last, or for base's, sealed runs that one (it is on disk) and
    logs so. When listed versions exist but none installs (the artifacts
    release unreachable), sealed tries again for a few minutes, then exits, and
-   the loader starts it again later. sealed
+   the loader starts it again later; so too when the list holds none of them,
+   so a version listed afterwards is picked up. sealed
    applies the diff to the new version; if it does not apply, the role becomes
    the new official version with an empty diff and is committed, and the old
    diff stays in chain history.
