@@ -255,22 +255,9 @@ func TestInstallHarnessRefusesAMismatch(t *testing.T) {
 	}
 }
 
-func TestBaseHarnessAndSelection(t *testing.T) {
+func TestHarnessSelection(t *testing.T) {
 	usePackagesDir(t)
-	if _, err := BaseHarness(); err == nil {
-		t.Fatal("base named without a base file")
-	}
 	h := strings.Repeat("ab", 32)
-	if err := os.MkdirAll(PackagesDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(PackagesDir, "base"), []byte(h+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := BaseHarness(); err != nil || got != h {
-		t.Fatalf("BaseHarness = %q, %v", got, err)
-	}
-
 	if s := LoadHarnessSelection(); s != (HarnessSelection{}) {
 		t.Fatalf("selection without a record: %+v", s)
 	}
@@ -343,8 +330,8 @@ func TestLoaderHandOver(t *testing.T) {
 }
 
 // A staged program is found again by its hash; a partial file a cut-off
-// staging left goes at the next boot, and Layered says whether the loader was
-// told about the layered flow.
+// staging or download left (the loader's .fetch-<hash>-<suffix> too) goes at
+// the next boot.
 func TestStagedAndCutOffStaging(t *testing.T) {
 	old := LoaderDir
 	LoaderDir = filepath.Join(t.TempDir(), "loader")
@@ -352,8 +339,8 @@ func TestStagedAndCutOffStaging(t *testing.T) {
 
 	program := []byte("sealed v2")
 	h := sum(program)
-	if SealedStaged(h) || Layered() {
-		t.Fatal("staged or layered before anything was written")
+	if SealedStaged(h) {
+		t.Fatal("staged before anything was written")
 	}
 	if err := StageSealed(VerifyingReader(io.NopCloser(bytes.NewReader(program)), h), h); err != nil {
 		t.Fatal(err)
@@ -361,18 +348,17 @@ func TestStagedAndCutOffStaging(t *testing.T) {
 	if !SealedStaged(h) {
 		t.Fatal("a staged program not found")
 	}
-	partial := filepath.Join(LoaderDir, "sealed", "."+h+".sealed-tmp-0123")
-	if err := os.WriteFile(partial, []byte("sea"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	CleanCutOffStaging()
-	if _, err := os.Lstat(partial); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("partial staging kept: %v", err)
+	for _, name := range []string{"." + h + ".sealed-tmp-0123", ".fetch-" + h + "-0123456789ab"} {
+		partial := filepath.Join(LoaderDir, "sealed", name)
+		if err := os.WriteFile(partial, []byte("sea"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		CleanCutOffStaging()
+		if _, err := os.Lstat(partial); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("partial %s kept: %v", name, err)
+		}
 	}
 	if !SealedStaged(h) {
 		t.Fatal("the staged program went with it")
-	}
-	if err := MarkLayered(); err != nil || !Layered() {
-		t.Fatalf("Layered after MarkLayered: %v", err)
 	}
 }

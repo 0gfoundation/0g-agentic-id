@@ -221,7 +221,9 @@ MODE=check forge script script/MigrateTrust.s.sol --rpc-url <RPC>
 5. In the same window, list the 0g-harness loader images' sealed program and
    harness package on the registry (`list(SEALED, …)`, `list(HARNESS, …)`;
    sealed/LAYERS.md §10): from the upgrade on the loader reads the sealed list
-   and does not run an unlisted sealed. As the owner still, directly.
+   and runs only a listed sealed. A loader image that carries no sealed of its
+   own runs nothing until a sealed and a harness package are listed (and
+   published on the `artifacts` release). As the owner still, directly.
 6. Hand the registry to the Timelock (DEPLOYMENT.md §1, §3):
    `HandOverTrustRegistry.s.sol` with `GUARDIAN` = the governance key (on
    mainnet `MODE=plan`, submitted from the vault), then the Timelock's

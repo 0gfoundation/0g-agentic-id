@@ -2,7 +2,7 @@
 
 Status: draft. This document first explains what each layer does, then sets
 out the target design. The sealed side (the loader, sealed, the 0g-harness
-image) is implemented as §8 "Image side first" describes; the contract side
+image) is implemented as §8 "What the image needs" describes; the contract side
 is implemented and not yet deployed; the SDK side is implemented and not yet
 released; the attestor side is implemented and not yet deployed. The
 interfaces between the two are in §10.
@@ -20,17 +20,17 @@ only base, sealed and the official harness get fields of their own.
 
 ### base
 
-- **Contents**: the OS, node, the loader, and one official harness package, a
-  fallback for when no other version can be fetched.
+- **Contents**: the OS, node, the tools sealed runs (git, procps,
+  0g-storage-client), and the loader. No sealed and no harness package.
 - **Role**: the runtime environment. The loader keeps the container key and
-  the create-time environment, and verifies and starts sealed.
+  the create-time environment, and picks, downloads, verifies and starts
+  sealed.
 - **Decided by**: the project. Changes least.
 - **Loading and verification**: the platform creates the container from the
-  image, and its certificate attests the image hash. The attestor checks that
-  hash against the trust registry's image list (§10) before releasing the
-  agent identity key.
-- **In the ServeProof**: `frameworkHash`, the image hash, with the same meaning
-  as in v1.
+  image, and its certificate attests the image hash, which covers base and the
+  loader. The attestor checks that hash against the trust registry's image
+  list (§10) before releasing the agent identity key.
+- **In the ServeProof**: `frameworkHash`, the image hash.
 - **Update**: a new image and a container recreate.
 
 ### sealed
@@ -43,13 +43,13 @@ only base, sealed and the official harness get fields of their own.
   signing channels; it enforces the rules that cannot be left to the harness
   (§4.3); it tracks and uploads iData; it signs ServeProofs.
 - **Decided by**: the project.
-- **Loading and verification**: base carries one sealed, whose hash is built
-  into the loader. For a version change, the running sealed first checks on
-  chain that the target is on the trust registry's sealed list, then
-  downloads it by hash from the public artifacts release (§10) and hands it
-  to the loader. Before every exec
-  the loader checks the program's hash and asks the chain whether it is on
-  that list. The attestor checks again before every key release.
+- **Loading and verification**: base carries none. The loader picks a
+  version on the trust registry's sealed list (§3) and downloads it by hash
+  from the public artifacts release (§10); for a version change the running
+  sealed checks on chain that the target is listed, downloads it and hands it
+  to the loader. Before every exec the loader checks the program's hash and
+  asks the chain whether it is on that list. The attestor checks again before
+  every key release.
 - **In the ServeProof**: `sealedHash`, naming the sealed program that runs. The
   address and model name the inference channel forwarded to are two more
   fields, `inferenceURL` and `model` (§7).
@@ -63,9 +63,9 @@ only base, sealed and the official harness get fields of their own.
   version, native modules included.
 - **Role**: the baseline of the code the agent runs.
 - **Decided by**: the project.
-- **Loading and verification**: sealed fetches it by hash (base carries one,
-  others are downloaded) and checks it against the trust registry's harness
-  list before start. The harness holds no keys, so the attestor does not check it before
+- **Loading and verification**: sealed downloads it by hash (base carries
+  none) and checks it against the trust registry's harness list before start.
+  The harness holds no keys, so the attestor does not check it before
   releasing the key.
 - **In the ServeProof**: `harnessHash`.
 - **Update**: the same rules as sealed; a harness restart applies it (§5.3). No
@@ -122,13 +122,14 @@ image list, with their contents and behaviour unchanged (§10).
 ## 2. Trust chain
 
 1. The platform injects the container key when it creates the container and
-   issues a certificate. The certificate attests only the image hash, which is
-   base.
-2. The loader is PID 1 in base. Before it runs any sealed it checks the hash
-   (the one base carries against the hash built into the loader, a
-   switched-to version against its name), then asks the chain whether that
-   hash is on the trust registry's sealed list. sealed receives the container
-   key the moment it runs, so the check has to come first.
+   issues a certificate. The certificate attests only the image hash, which
+   covers base and the loader.
+2. The loader is PID 1 in base. It runs only a sealed on the trust registry's
+   sealed list: before every exec it checks that the program hashes to its
+   name and asks the chain whether that hash is listed. sealed receives the
+   container key the moment it runs, so the check has to come first. Trust
+   starts at the loader, which the image hash covers: it runs nothing the
+   chain does not list.
 3. sealed asks the attestor for the agent identity key and reports its own hash;
    the base hash is in the certificate. The attestor releases the key only if
    base is on the trust registry's image list and sealed on its sealed list,
@@ -140,20 +141,16 @@ image list, with their contents and behaviour unchanged (§10).
    can use the sign socket, and the signing policy decides what it may sign.
 
 The loader links the standard library and `golang.org/x/sys/unix` only: it
-reads the allowlist with `eth_call`s to `CHAIN_RPC_URL`, first AgenticID's
+reads the list with `eth_call`s to `CHAIN_RPC_URL`, first AgenticID's
 `trustRegistry()` for the trust registry's address, then the trust registry's
-`isListed`, through the endpoint sealed reads the chain through. A version the
-chain says is not listed does not run; the loader falls back to the version it
-replaced, then to the one base carries, and when none is listed it runs
-nothing and only a recreate helps. A version sealed downloaded runs only when
+`listed` and `isListed`, through the endpoint sealed reads the chain through,
+and downloads over HTTPS from the artifacts release. A version runs only when
 the chain says it is listed. When no answer can be had (the endpoint
 unreachable, an error from the node, or an AgenticID that does not point at a
-trust registry) the loader runs the one base carries in its place: the image
-hash covers that one, and the attestor checks the image hash from the
-certificate, while a downloaded version's hash reaches the attestor only as
-the running sealed reports it. The loader keeps the version it recorded and
-names it to that sealed (`SEALED_INSTEAD_OF`), which goes back to it once the
-list confirms it (§3.1).
+trust registry) nothing runs, and the loader reads the list again after a
+wait (30 seconds, doubling up to 5 minutes); on a chain whose AgenticID names
+no trust registry it logs that the image needs AgenticID 1.4.0's trust
+registry.
 
 For a version change the running sealed does the download: it checks on chain
 that the target is listed, downloads it by hash from the public artifacts
@@ -163,35 +160,51 @@ release, and hands it to the loader only if it hashes to that name.
 
 Contents:
 - Debian and a pinned node;
-- the loader;
-- one official harness package with all its dependencies, a fallback for when
-  no other version can be fetched.
+- the tools sealed runs: git, procps, 0g-storage-client (the CLI at the
+  version sealed's `go.mod` pinned when the image was built; a sealed version
+  that needs another needs a new image);
+- the loader.
+
+Base carries no sealed and no harness package: both come from the trust
+registry's lists and the artifacts release (§10). Before a new image boots, a
+sealed and a harness package that run on it are published and listed (§8).
 
 The loader (`sealed/cmd/loader`) does four things:
 1. Hardens itself first: non-dumpable and `no_new_privs`, like sealed.
 2. Keeps the container key, the certificate and the rest of the create-time
    environment in its own environment, and hands them unchanged to every
-   sealed it starts, plus `SEALED_HASH` (the hash it checked),
-   `SEALED_TRIAL` (on trial) and `SEALED_INSTEAD_OF` (the version base's
-   sealed runs in place of, §2). An in-place swap does not restart the container,
-   and the platform does not inject them again. The loader is root and
-   non-dumpable, so another uid cannot read its `/proc/1/environ`.
-3. Starts sealed once its hash checks out and the chain lists it (§2): the
-   version it last switched to, or the one base carries, which also runs in
-   place of a switched-to version while the list cannot be read. A
-   switched-to version is placed by sealed in the loader's state directory
-   (`/var/lib/loader`, which only root can enter).
-4. Supervises sealed: forwards stop signals and reaps orphans. When sealed asks
-   to switch, it checks the new version's hash and the list once more, stops
-   the old sealed, ends the processes it left behind, and starts the new
-   version on trial; if that version exits before it confirms it came up, or
-   has not confirmed 20 minutes after it started, the loader goes back to the
-   version it replaced and records the new one as not to be switched to
-   again. A boot that fails for a reason outside the version exits with its
-   own code (§3.1), and the loader starts the same version again later. Under
-   the layered flow it restarts a sealed that exits on its own, at most 5
-   times in 10 minutes; a sealed that exits because its owner asked for a
-   restart it starts again at once, without counting it.
+   sealed it starts, plus `SEALED_HASH` (the hash it checked) and
+   `SEALED_TRIAL` (on trial). An in-place swap does not restart the
+   container, and the platform does not inject them again. The loader is root
+   and non-dumpable, so another uid cannot read its `/proc/1/environ`.
+3. Picks the sealed to start, at every start: the version it ran last, while
+   the chain lists it and it has not failed here; else the version that one
+   replaced, likewise; else the listed versions, newest first (the trust
+   registry's `listed`), skipping those that failed here. A version it does
+   not have it downloads from the artifacts release into its state directory
+   (`/var/lib/loader`, which only root can enter); a download that does not
+   hash to its name is not fetched again in this container. It starts sealed
+   once the program hashes to its name and the chain lists it (§2). When the
+   list cannot be read, or lists nothing that can run here, nothing runs, and
+   the loader reads the list again after a wait. A switched-to version is
+   placed by sealed in the same directory.
+4. Supervises sealed: forwards stop signals and reaps orphans. Every version
+   that has not come up in this container runs on trial, a new container's
+   first one too: if it exits before it confirms it came up, or has not
+   confirmed 20 minutes after it started, the loader records it as failed
+   here and takes the next version by item 3 (after a switch, the version it
+   replaced). When sealed asks to switch, the loader checks the new version's
+   hash and the list once more, stops the old sealed, ends the processes it
+   left behind, and starts the new version. A boot that fails for a reason
+   outside the version exits with its own code (§3.1), and the loader starts
+   the same version again later. It restarts a sealed that exits on its own,
+   at most 5 times in 10 minutes; a sealed that exits because its owner asked
+   for a restart it starts again at once, without counting it.
+
+A sealed the loader started claims the identity key only from an attestor
+that declares the layered flow (§10); from any other it claims nothing and
+exits with the code for a cause outside the version, and the loader starts it
+again later.
 
 Restarts come in four levels, from heaviest to lightest. Each level includes
 the lighter ones: a recreate or a container restart starts the loader, sealed
@@ -257,24 +270,28 @@ made after the last commit go with the old container, at most 30 s of them.
    ServeProofs changes with it.
 8. **Rollback**: if the new version exits before it confirms (it fails to
    start, or its provision is refused), or has not confirmed 20 minutes after
-   it started, the loader goes back to the version it replaced and records the
-   new one as not to be switched to again in this container. If that version
-   is delisted too, its provision is refused and it switches to the newest
-   listed version; with no usable version left, only a recreate helps. A boot
-   that fails for a reason outside the version (no answer from the attestor
-   within the provision window, a chain read or a storage download that
-   fails) is no rollback: sealed exits with its own code, and the loader
-   starts the same version again after a wait (30 seconds, doubling up to 5
-   minutes). Only after an hour of such failures does it go back, and only to
-   a listed version.
+   it started, the loader records it as failed in this container and goes back
+   to the version it replaced, while that one is listed; else it takes the
+   newest listed version that has not failed here. When every listed version
+   has failed here, nothing runs until a new version is listed. A boot that
+   fails for a reason outside the version (no answer from the attestor within
+   the provision window, an attestor that does not declare the layered flow,
+   a chain read or a storage download that fails) is no rollback: sealed exits
+   with its own code, and the loader starts the same version again after a
+   wait (30 seconds, doubling up to 5 minutes). Only after an hour of such
+   failures does it go back, and only to a listed version it replaced.
 
 Port 8080 pauses for about one normal sealed start.
 
 ### 3.2 Existing containers
 
-In existing containers sealed is PID 1 with no loader, so it cannot update in
-place. Moving to the loader image takes one recreate; after that, sealed
-updates need none.
+In containers of the images without the loader, sealed is PID 1, so it cannot
+update in place. Moving to the loader image takes one recreate; after that,
+sealed updates need none. Containers of the earlier loader images, which
+carry a sealed of their own, switch to listed versions in place like any
+other; their loader still waits for the `layered` mark before it restarts a
+sealed that exits, so sealed keeps writing it for them
+(`LEGACY(builtin-sealed)`, `internal/layers` `MarkLayered`).
 
 ## 4. sealed layer: the neutral layer
 
@@ -346,11 +363,10 @@ boundaries.
   installed for base's node version (native modules built). A package is the
   installed package directory as a gzip'd tar, named by its sha256; the
   project publishes packages to the artifacts release, and the deployer lists
-  them on the trust registry's harness list. Base carries one, unpacked at
-  `/opt/0g-harness/<hash>/` and named by `/opt/0g-harness/base`; sealed
-  downloads the others by hash, verifies them and unpacks them to the same
-  place. A package may hold only directories, regular files and links that stay
-  inside it.
+  them on the trust registry's harness list. Base carries none: sealed
+  downloads them by hash, verifies them and unpacks them to
+  `/opt/0g-harness/<hash>/`. A package may hold only directories, regular
+  files and links that stay inside it.
 - Diff: the 0g-harness adapter defines `harness/` as a tracked role, recording
   which official version it applies to and the changes against it. The working
   directory on disk is the full source, and sealed computes the diff when it
@@ -400,8 +416,8 @@ boundaries.
 2. The installed version goes into a read-only directory the agent cannot
    modify (root's; the agent can only read and run it). It stays on disk for
    later restarts; after a recreate the disk is empty and it is installed
-   again. Versions nothing here runs any more (not base's, the running one,
-   the last two this container ran, or the owner's pick) are removed, and a
+   again. Versions nothing here runs any more (not the running one, the last
+   two this container ran, or the owner's pick) are removed, and a
    download that does not hash to its name is not fetched again in this
    container. sealed starts the harness from there as the agent user, with no model
    key, owner token or other secret in its environment: the inference proxy
@@ -427,22 +443,26 @@ boundaries.
 3. If a new version fails to start or fails its health check, sealed records
    it as not to be used again in this container and runs another: on a
    switch, the version that ran before, kept locally; at boot, the next one in
-   item 4's order, base's last. A restart that does not happen (the agent
-   stopping) counts against no version. In a new container without a local
-   copy, the fallback is base's official package without the diff.
+   item 4's order. A restart that does not happen (the agent stopping) counts
+   against no version. In a new container without a local copy, the fallback
+   is the next listed official package, without the diff.
 4. Official versions follow the sealed rules (§3.1): the owner picks a version
    in their settings, and while the old version stays listed, switching is the
    owner's call; when the deployer delists it, the agent moves to the owner's
    pick, or, with no pick or an unlisted one, to the newest listed official
    version. At boot sealed tries the owner's pick, the version this container
-   ran last, the newest listed version and base's, in that order, and runs the
-   first one that is listed and installs; a version the list says is not
-   listed never runs. When the list cannot be read for the version this
-   container ran last, or for base's, sealed runs that one (it is on disk) and
-   logs so. When listed versions exist but none installs (the artifacts
-   release unreachable), sealed tries again for a few minutes, then exits, and
-   the loader starts it again later; so too when the list holds none of them,
-   so a version listed afterwards is picked up. sealed
+   ran last, then the listed versions newest first (the trust registry's
+   `listed`), and runs the first one that is listed, has not failed here and
+   installs; a version the list does not hold never runs. When the list cannot
+   be read, sealed runs the version this container ran last if it is on disk,
+   and logs so; otherwise it exits, and the loader starts it again later.
+   When listed versions exist but none installs (the artifacts release
+   unreachable), sealed tries again for a few minutes, then exits, and the
+   loader starts it again later; so too when the list holds none it can run
+   (a new container before the first listing, say), so a version listed
+   afterwards is picked up. When every one it could run fails to start, the
+   start fails, transient: a sealed on trial exits, and the loader starts it
+   again later. sealed
    applies the diff to the new version; if it does not apply, the role becomes
    the new official version with an empty diff and is committed, and the old
    diff stays in chain history.
@@ -522,7 +542,7 @@ keeps every v1 field and gives each layer its own field:
 
 | Field | Meaning |
 |---|---|
-| `frameworkHash` | The image hash, i.e. base; same meaning as in v1 |
+| `frameworkHash` | The image hash: base and the loader |
 | `sealedHash` | The sealed program hash the loader verified |
 | `harnessHash` | The official harness version running when the proof was signed, i.e. an entry of the trust registry's harness list at that time |
 | `inferenceURL` | The inference address the owner set when the proof was signed; sealed's inference proxy forwards only there |
@@ -697,14 +717,17 @@ proofs that look the same.
   the old one. Once the old images are gone, those places are deleted whole;
   the contracts keep their v1 entry points. In sealed the v1 proof and the v1
   boot claim sit in `legacy_v1.go` (the proxy and provision packages), and
-  every other branch kept for them is marked `LEGACY(v1)`; the branches for a
-  chain whose AgenticID names no trust registry are marked
-  `LEGACY(pre-1.4.0)`.
+  every other branch kept for them is marked `LEGACY(v1)`. Outside sealed,
+  the branches for a chain whose AgenticID names no trust registry are marked
+  `LEGACY(pre-1.4.0)`; sealed has none, since its loader image runs only on a
+  chain with a trust registry. The `layered` mark sealed writes for the
+  earlier loader images is marked `LEGACY(builtin-sealed)` (§3.2).
 - Release order: the contracts first (the trust registry, plus AgenticID and
   the registry upgraded in one batch), then the SDK, the console and
-  `verify-agent.sh`, then the attestor. A new attestor declares `layered` as
-  soon as it runs, and loader images then start signing v2, so verifiers must
-  be able to check it first.
+  `verify-agent.sh`, then the attestor, then a sealed and a harness package
+  published and listed, then the loader image. A new attestor declares
+  `layered` as soon as it runs, and loader images then start signing v2, so
+  verifiers must be able to check it first.
 - iData reads in both directions: the new sealed reads old entries and adds
   missing plaintext commitments on the next upload; the old sealed ignores extra
   description fields, so an agent moved back to an old image still restores.
@@ -717,31 +740,26 @@ proofs that look the same.
 - The `framework` role is still written; the migration from the old `dsh` name
   still runs.
 
-### Image side first
+### What the image needs
 
-The image side can ship before the attestor, contracts and SDK, replacing the
-current 0g-harness image. Everything sealed-side in step one is in the new
-image: the loader's checks, version switches, trials, rollbacks and restarts
-(§3, §3.1); fetching, verifying, unpacking, switching and rolling back official
-harness packages (§5.2, §5.3); reporting the sealed hash and ServeProof v2
-(§7); keeping uncommitted changes across a stop and a restart (§3); plaintext
-commitments on upload (§7.1).
+The 0g-harness image is base and the loader. The loader's checks, version
+picks, downloads, switches, trials, rollbacks and restarts (§3, §3.1) are in
+the image; the rest of step one's sealed side comes with the sealed and
+harness versions the chain lists: fetching, verifying, unpacking, switching
+and rolling back official harness packages (§5.2, §5.3); reporting the sealed
+hash and ServeProof v2 (§7); keeping uncommitted changes across a stop and a
+restart (§3); plaintext commitments on upload (§7.1).
 
-All of it takes effect only once the attestor declares support for the new flow
-in its `GET /provision` answer (`"layered": true`, §10). Until then the new
-image runs in a compatible mode:
-- the loader runs only the sealed built into the image: its sha256 is compiled
-  into the loader when the image is built, and a mismatch runs nothing. This
-  holds in a container that ran another version under the layered flow
-  before, too: with no trust registry to answer, a downloaded version does not
-  run (§2). In a container that never ran the layered flow the loader exits
-  when sealed exits, as when sealed is PID 1;
-- sealed reports no sealed hash (an old attestor would refuse it) and signs
-  ServeProof v1; sealed and the harness are both in the image, so the image hash
-  still covers everything;
-- the harness runs only the official version built into the image;
-- uncommitted changes are still kept across a stop and a restart: that does not
-  depend on the attestor.
+So the image runs only where the rest is in place:
+- a chain whose AgenticID (1.4.0 or later) names its trust registry. On any
+  other the loader runs nothing and logs that the image needs it;
+- a sealed program and a harness package published on the artifacts release
+  and listed. Without a listed sealed the loader runs nothing; without a
+  listed harness package sealed exits, and the loader starts it again later;
+  both pick up a version listed afterwards;
+- an attestor that declares the layered flow in its `GET /provision` answer
+  (`"layered": true`, §10). Without it sealed claims nothing and exits, and the
+  loader starts it again later.
 
 ### Neutral proxies: can ship separately
 
@@ -850,7 +868,10 @@ attestor and image lists all four frameworks share.
 next to `generation` and `certificate_required`. `true` says the attestor runs
 the new flow: it takes the sealed hash and checks it against the trust
 registry's sealed list, and the registry has the versioned entry point. A new attestor answers `true` once the chain has a
-trust registry (AgenticID's `trustRegistry()` is not zero).
+trust registry (AgenticID's `trustRegistry()` is not zero). A sealed the
+loader started claims only after `true`: on `false` it sends no claim and
+exits with the code for a cause outside its version (69), and the loader
+starts it again later.
 
 **Boot claim** (`POST /provision`): when `layered` is true and the loader
 started sealed, the body adds `sealed_hash` (`0x` and 64 lowercase hex), and
@@ -886,12 +907,15 @@ boot confirmed as up; other images answer 501.
 **Download**: the official sealed programs and harness packages are the
 assets of the `artifacts` release of the public GitHub repository
 `0gfoundation/0g-agentic-id`, each named by its sha256 (64 lowercase hex).
-sealed downloads
+The loader (a sealed to start) and sealed (a harness package, a sealed to
+switch to) download
 `https://github.com/0gfoundation/0g-agentic-id/releases/download/artifacts/<sha256>`,
-checks the hash of what it downloaded and discards it on a mismatch. Size
-limit 1 GiB. Where an artifact comes from does not matter for trust: its name
-comes from the trust registry's lists and the bytes must hash to it. Anyone
-can download a listed version and see what it contains.
+check the hash of what they downloaded and discard it on a mismatch; a
+mismatched one is not fetched again in that container. Size limits: 64 MiB
+for a sealed program the loader downloads, 1 GiB for what sealed downloads.
+Where an artifact comes from does not matter for trust: its name comes from
+the trust registry's lists and the bytes must hash to it. Anyone can download
+a listed version and see what it contains.
 
 **Trust registry** (provisionally `TrustRegistry`): the deployer's trust
 decisions, who may act for the platform and what code may run an agent, all
@@ -933,7 +957,7 @@ the loader, the attestor and the SDK all find the trust registry through
 2. Rebuild the current attestor list, app bindings, instance-binding mode and
    image list from AgenticID's events and write them into the trust registry;
    at the same time list the sealed and harness hashes the loader images use:
-   after step 4 the loader can read the list, and it does not run an unlisted
+   after step 4 the loader can read the list, and it runs only a listed
    sealed.
 3. Check entry by entry: for every attestor and image hash in the events,
    AgenticID's read-only functions and the trust registry's give the same
@@ -953,4 +977,10 @@ image list the attestor checks keeps its contents.
 gzip'd tar (names sorted, owner 0, mtime 0, hard links stored as files, gzip
 without a timestamp), named by its sha256. It may hold only directories,
 regular files and links that stay inside it. The `harness-package` stage of
-`sealed/images/harness/Dockerfile` produces it.
+`sealed/images/harness/Dockerfile` produces it, on the image's own base and
+node.
+
+**Official sealed program**: the sealed binary built with the `harnessonly`
+tag, named by its sha256. The `bootstrap-builder` stage of
+`sealed/images/harness/Dockerfile` produces it (the export commands are at the
+top of that file).

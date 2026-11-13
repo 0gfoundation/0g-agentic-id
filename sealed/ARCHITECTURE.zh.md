@@ -125,23 +125,27 @@ sealed 要求配套的 provider 和 attestor（v3 证书、attestor TLS 声明�
 
 ### 加载器（0g-harness 镜像）、停机和分层运行
 
-0g-harness 镜像里的 PID 1 不是 sealed，而是加载器（`cmd/loader`）。它每次执行 sealed
-之前先核对哈希：镜像自带的 `/bootstrap` 对编镜像时编进去的 sha256
-（`-X main.expectedSealedHash`，`images/harness/Dockerfile`），换上来的版本对它的名字；
-再向 `CHAIN_RPC_URL` 发 `eth_call`，先读 AgenticID 的 `trustRegistry()`，再读信任合约的
-`isListed(SEALED, 哈希)`：链上明确答"不在"的版本不执行，换上来的版本要链上明确答"在"才执行；
-查不到答案时改跑镜像自带的版本（`allowlist.go`、`supervise.go`）。它把 sealed 作为子进程启动，
-环境变量原样传下去，另加 `SEALED_HASH`（它核对过的哈希）、`SEALED_TRIAL`（试运行）和
-`SEALED_INSTEAD_OF`（镜像自带的版本是替哪个版本跑的）；转发 SIGTERM、SIGINT、SIGQUIT 和
-SIGHUP；收到停止信号后 sealed 2 分钟内没退出就杀掉；回收所有孤儿进程。没有分层流程时，sealed
-退出它就用同样的状态退出，所以 sealed 退出照旧会结束容器。分层流程下（`LAYERS.zh.md` 第 3 节、
-3.1）它还按 sealed 的请求（SIGUSR1）换 sealed 版本，前提是链上列着新版本：以试运行方式启动
-新版本，没确认起来就退出、或者 20 分钟内没确认的，退回原版本，换之前清掉旧 sealed 留下的进程。
-sealed 自己退出时重启它，10 分钟内最多 5 次；退出码 76（owner 重启 sealed）立即重启、不计次数，
-退出码 69（因为版本以外的原因起不来）过 30 秒起、加倍到 5 分钟后再启动同一个版本，不算在这个
-版本头上。它的状态目录是 `/var/lib/loader`（只有 root 能进）。它和 sealed 一样是 root、不可
-dump、设置 `no_new_privs`，只链接标准库和 `golang.org/x/sys`（`TestLinkedPackages`）。其他
-镜像里 sealed 仍是 PID 1。
+0g-harness 镜像里的 PID 1 不是 sealed，而是加载器（`cmd/loader`）；镜像不带 sealed 程序
+（`images/harness/Dockerfile`）。每次启动，加载器向 `CHAIN_RPC_URL` 发 `eth_call` 读信任合约的
+sealed 名单（先读 AgenticID 的 `trustRegistry()`，再读信任合约的 `listed(SEALED)` 和
+`isListed(SEALED, 哈希)`，`allowlist.go`），选上次跑的版本（还在名单里、在这里没失败过），
+否则选它换下来的版本，再否则按名单从新到旧选（`supervise.go` 的 `choose`）。没有的版本按哈希
+从制品发布处下载（`fetch.go`；不超过 64 MiB，哈希对上名字才留下；对不上的，这个容器里不再
+下载）。执行前一刻核对程序哈希；链上明确答"在"的版本才执行；名单读不到，或者名单里没有能在
+这里跑的版本时，什么都不执行，过 30 秒起、加倍到 5 分钟后再读名单。它把 sealed 作为子进程启动，
+环境变量原样传下去，另加 `SEALED_HASH`（它核对过的哈希）和 `SEALED_TRIAL`（试运行）；转发
+SIGTERM、SIGINT、SIGQUIT 和 SIGHUP；收到停止信号后 sealed 2 分钟内没退出就杀掉；回收所有孤儿
+进程。这个容器里还没起来过的版本都以试运行方式启动，新容器的第一个版本也是：没确认起来就退出、
+或者 20 分钟内没确认的，记下它在这里失败，启动下一个版本。它还按 sealed 的请求（SIGUSR1）换
+sealed 版本，前提是链上列着新版本，换之前清掉旧 sealed 留下的进程（`LAYERS.zh.md` 第 3 节、
+3.1）。sealed 自己退出时重启它，10 分钟内最多 5 次；退出码 76（owner 重启 sealed）立即重启、
+不计次数，退出码 69（因为版本以外的原因起不来）过 30 秒起、加倍到 5 分钟后再启动同一个版本，
+不算在这个版本头上。它的状态目录是 `/var/lib/loader`（只有 root 能进）。它和 sealed 一样是
+root、不可 dump、设置 `no_new_privs`，只链接标准库和 `golang.org/x/sys`
+（`TestLinkedPackages`）。其他镜像里 sealed 仍是 PID 1。
+
+加载器启动的 sealed（设了 `SEALED_HASH`）只在 attestor 声明分层流程时才在 `/provision`
+申请；否则什么都不申请，以 69 退出（`internal/provision` 的 `LayeredRequired`）。
 
 不是 PID 1 的 sealed 会处理 SIGTERM 和 SIGINT（`shutdown.go`）：停下监视器，停掉框架
 （之后不再重启它），等监视器手上那一轮跑完，然后以 0 退出，总共不超过 90 秒。它不另起
@@ -152,8 +156,8 @@ dump、设置 `no_new_privs`，只链接标准库和 `golang.org/x/sys`（`TestL
 adapter，即 0g-harness）。重建容器只留下链上的 iData。作为 PID 1 时 sealed 不处理这些
 信号，行为和以前一样。
 
-0g-harness 的 harness 从官方版本包运行：`/opt/0g-harness/<sha256>/`，root 所有，agent
-只能读和执行，镜像自带的那个由 `/opt/0g-harness/base` 指明（`internal/layers`）。只要
+0g-harness 的 harness 只从官方版本包运行：sealed 按哈希从制品发布处下载，解开到
+`/opt/0g-harness/<sha256>/`，root 所有，agent 只能读和执行（`internal/layers`）；镜像不带包。只要
 sealed 知道 provider 的 endpoint，它的模型调用就经 sealed 的推理代理（`internal/inferproxy`），
 native 的 `openai` 和 `anthropic` 也一样，用 sealed 固定的官方地址
 （`inference.NativeEndpoint`）：sealed 定地址和模型名，把平台
@@ -168,7 +172,8 @@ native 的 `openai` 和 `anthropic` 也一样，用 sealed 固定的官方地址
 （`internal/uploader/commitments.go`）。attestor 声明分层流程后，sealed 上报自己的哈希、
 签 ServeProof v2，并在开机、每次设置推送和每次心跳时按规则换 harness 和 sealed：owner 在
 设置文档 `versions` 里选的版本（信任合约列着时），否则保持正在跑的版本，它被下架时换到最新
-登记的版本（`layered.go`）。
+登记的版本（`layered.go`）。开机时 harness 依次退到这个容器上次跑的包、名单里从新到旧的包；
+一个能跑的都没有时，sealed 以 69 退出，由加载器过一阵再启动它。
 完整设计见 `LAYERS.zh.md`。
 
 ### settings document 为什么走 `/provision`

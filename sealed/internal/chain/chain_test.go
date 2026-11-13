@@ -2,7 +2,9 @@ package chain
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -113,5 +115,39 @@ func TestIdentityRegistryOf(t *testing.T) {
 				t.Fatalf("eth_call input %q lacks getIdentityRegistry() selector", in)
 			}
 		})
+	}
+}
+
+// listed(kind) answers every hash listed under kind, oldest first, as one
+// ABI-encoded bytes32[].
+func TestDecodeBytes32Array(t *testing.T) {
+	if got := hex.EncodeToString(listedSelector); got != "bf7e3b60" {
+		t.Fatalf("listed(bytes32) selector %s", got)
+	}
+	a, b := strings.Repeat("aa", 32), strings.Repeat("bb", 32)
+	enc := func(offset, n int, body string) []byte {
+		out, err := hex.DecodeString(fmt.Sprintf("%064x%064x%s", offset, n, body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	got, err := decodeBytes32Array(enc(32, 2, a+b))
+	if err != nil || len(got) != 2 || hex.EncodeToString(got[0][:]) != a || hex.EncodeToString(got[1][:]) != b {
+		t.Fatalf("decoded %x, %v", got, err)
+	}
+	if got, err := decodeBytes32Array(enc(32, 0, "")); err != nil || len(got) != 0 {
+		t.Fatalf("empty: %x, %v", got, err)
+	}
+	for name, out := range map[string][]byte{
+		"short":     {1, 2, 3},
+		"offset":    enc(64, 1, a),
+		"length":    enc(32, 2, a),
+		"too many":  enc(32, maxListedVersions+1, ""),
+		"not words": append(enc(32, 1, a), 0),
+	} {
+		if _, err := decodeBytes32Array(out); err == nil {
+			t.Errorf("%s: decoded", name)
+		}
 	}
 }

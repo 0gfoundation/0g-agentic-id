@@ -148,34 +148,40 @@ above); every agent is recreated onto it.
 
 ### The loader (0g-harness image), stopping, and the layered runtime
 
-In the 0g-harness image PID 1 is not sealed but the loader (`cmd/loader`).
-Before it runs any sealed it checks the hash (`/bootstrap`, the image's own,
-against the sha256 compiled in when the image is built,
-`-X main.expectedSealedHash`, `images/harness/Dockerfile`; a switched-to
-version against its name), then sends `eth_call`s to `CHAIN_RPC_URL`,
-AgenticID's `trustRegistry()` and the trust registry's `isListed(SEALED,
-hash)`: a version the chain says is not listed does not run, and a
-switched-to version runs only when the chain says it is listed; when no answer
-can be had the image's own runs in its place (`allowlist.go`,
-`supervise.go`). It starts sealed as its child with the environment unchanged
-plus `SEALED_HASH` (the hash it checked), `SEALED_TRIAL` (on trial) and
-`SEALED_INSTEAD_OF` (the version the image's own runs in place of), forwards
-SIGTERM, SIGINT, SIGQUIT and SIGHUP, kills sealed if it has not exited 2 min
-after a stop signal, and reaps every orphan. Without the layered flow it exits
-with sealed's status when sealed exits, so a sealed exit still ends the
-container. Under the layered flow (`LAYERS.md` §3, §3.1) it also switches
-sealed versions when sealed asks (SIGUSR1) and the chain lists the new one: it
-starts the new version on trial, goes back to the old one if the new one exits
-before confirming it came up or has not confirmed within 20 minutes, and ends
-what the old sealed left behind before the switch. It restarts a sealed that
-exits on its own at most 5 times in 10 minutes; exit code 76 (an owner restart
-of sealed) restarts at once and is not counted, and exit code 69 (a boot that
-failed for a reason outside the version) restarts the same version after 30 s,
-doubling up to 5 min, without counting it against the version. Its state
-directory is `/var/lib/loader`, which only root can enter. Like sealed it is
-root, non-dumpable and sets `no_new_privs`, and it links only the standard
-library and `golang.org/x/sys` (`TestLinkedPackages`). The other images keep
-sealed as PID 1.
+In the 0g-harness image PID 1 is not sealed but the loader (`cmd/loader`);
+the image carries no sealed program (`images/harness/Dockerfile`). At every
+start the loader reads the trust registry's sealed list with `eth_call`s to
+`CHAIN_RPC_URL` (AgenticID's `trustRegistry()`, then the registry's
+`listed(SEALED)` and `isListed(SEALED, hash)`, `allowlist.go`) and picks the
+version it ran last while listed and not failed here, else the one that
+replaced, else the listed versions newest first (`supervise.go` `choose`). A
+version it does not have it downloads by hash from the artifacts release
+(`fetch.go`; at most 64 MiB, kept only if it hashes to its name; a mismatch is
+not fetched again in this container). It checks the program's hash right
+before it runs it; a version runs only when the chain says it is listed, and
+when the list cannot be read, or lists nothing that can run here, nothing
+runs and it reads the list again after 30 s, doubling up to 5 min. It starts
+sealed as its child with the environment unchanged plus `SEALED_HASH` (the
+hash it checked) and `SEALED_TRIAL` (on trial), forwards SIGTERM, SIGINT,
+SIGQUIT and SIGHUP, kills sealed if it has not exited 2 min after a stop
+signal, and reaps every orphan. Every version that has not come up in this
+container runs on trial, a new container's first one too: one that exits
+before confirming it came up, or has not confirmed within 20 minutes, is
+recorded as failed here and the next version starts. It also switches sealed
+versions when sealed asks (SIGUSR1) and the chain lists the new one, ending
+what the old sealed left behind before the switch (`LAYERS.md` §3, §3.1). It
+restarts a sealed that exits on its own at most 5 times in 10 minutes; exit
+code 76 (an owner restart of sealed) restarts at once and is not counted, and
+exit code 69 (a boot that failed for a reason outside the version) restarts
+the same version after 30 s, doubling up to 5 min, without counting it
+against the version. Its state directory is `/var/lib/loader`, which only
+root can enter. Like sealed it is root, non-dumpable and sets `no_new_privs`,
+and it links only the standard library and `golang.org/x/sys`
+(`TestLinkedPackages`). The other images keep sealed as PID 1.
+
+A sealed the loader started (`SEALED_HASH` set) claims at `/provision` only
+when the attestor declares the layered flow; otherwise it claims nothing and
+exits 69 (`internal/provision` `LayeredRequired`).
 
 A sealed that is not PID 1 handles SIGTERM and SIGINT (`shutdown.go`): it
 stops the watcher, stops the framework (which nothing restarts afterwards),
@@ -191,10 +197,10 @@ adapters that declare `framework.UncommittedKeeper`, i.e. 0g-harness). A
 recreate keeps only the iData on chain. As PID 1 sealed does not handle these
 signals, as before.
 
-The 0g-harness harness runs from an official version package:
+The 0g-harness harness runs only from an official version package, which
+sealed downloads by hash from the artifacts release and unpacks into
 `/opt/0g-harness/<sha256>/`, root's, readable and runnable by the agent but
-not writable, with the image's own named by `/opt/0g-harness/base`
-(`internal/layers`). Its model calls go through sealed's inference proxy
+not writable (`internal/layers`); the image ships none. Its model calls go through sealed's inference proxy
 (`internal/inferproxy`) for every provider sealed knows the endpoint of, the
 native `openai` and `anthropic` included, at official URLs fixed in sealed
 (`inference.NativeEndpoint`): sealed sets the address and the model name, puts the
@@ -215,7 +221,10 @@ attestor declares the layered flow, sealed reports its own hash, signs
 ServeProof v2, and at boot, after every settings push and at every heartbeat
 picks the harness and sealed versions by one rule: the owner's pick in the
 settings document's `versions` while the trust registry lists it, else the
-version running, else — that one delisted — the newest listed (`layered.go`). The full design is in `LAYERS.md`.
+version running, else — that one delisted — the newest listed (`layered.go`).
+At boot the harness falls back to the package this container ran last, then
+to the listed packages newest first; with none it can run, sealed exits 69
+for the loader to start it again later. The full design is in `LAYERS.md`.
 
 ### Why the settings document comes down `/provision`
 

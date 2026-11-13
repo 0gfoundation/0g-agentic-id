@@ -3,14 +3,18 @@ package main
 // The loader's state directory, shared with sealed (sealed/internal/layers,
 // sealed.go, which writes the same names; keep the two in step):
 //
-//	sealed/<hash>  sealed programs sealed staged; each is hashed again here
-//	               before it runs
+//	sealed/<hash>  sealed programs, downloaded here (fetch.go) or staged by
+//	               sealed for a switch; each is hashed again before it runs
 //	request        the version sealed asked to switch to (SIGUSR1 says so)
 //	confirmed      the version that came up, written by sealed
-//	layered        written by sealed once the attestor runs the layered flow
 //	current        the version to run, written here
 //	previous       the version current replaced, written here
-//	failed         versions the loader went back from, one per line
+//	failed         versions that did not come up here, one per line
+//	mismatched     versions whose download did not hash to its name, one per
+//	               line; not downloaded again
+//
+// sealed also writes `layered` there, for the loaders of earlier images; this
+// loader does not read it.
 //
 // The directory is root's, mode 0700: only the loader and sealed, both root,
 // can enter it.
@@ -61,12 +65,12 @@ func (d stateDir) hash(name string) string {
 	return h
 }
 
-// staged is where sealed staged version hash.
+// staged is where version hash's program is kept.
 func (d stateDir) staged(hash string) string { return filepath.Join(string(d), "sealed", hash) }
 
-// failed reports whether the loader went back from version hash.
-func (d stateDir) failed(hash string) bool {
-	for _, line := range strings.Split(d.read("failed"), "\n") {
+// holds reports whether the list file name holds hash.
+func (d stateDir) holds(name, hash string) bool {
+	for _, line := range strings.Split(d.read(name), "\n") {
 		if strings.TrimSpace(line) == hash {
 			return true
 		}
@@ -74,18 +78,29 @@ func (d stateDir) failed(hash string) bool {
 	return false
 }
 
-// markFailed adds version hash to failed.
-func (d stateDir) markFailed(hash string) error {
-	if d.failed(hash) {
+// add appends hash to the list file name.
+func (d stateDir) add(name, hash string) error {
+	if d.holds(name, hash) {
 		return nil
 	}
 	var b bytes.Buffer
-	if prev := d.read("failed"); prev != "" {
+	if prev := d.read(name); prev != "" {
 		b.WriteString(prev + "\n")
 	}
 	b.WriteString(hash + "\n")
-	return d.write("failed", b.String())
+	return d.write(name, b.String())
 }
 
-// layered reports whether sealed said the attestor runs the layered flow.
-func (d stateDir) layered() bool { return d.read("layered") != "" }
+// failed reports whether version hash did not come up here.
+func (d stateDir) failed(hash string) bool { return d.holds("failed", hash) }
+
+// markFailed records that version hash did not come up here.
+func (d stateDir) markFailed(hash string) error { return d.add("failed", hash) }
+
+// mismatched reports whether a download of version hash did not hash to its
+// name here.
+func (d stateDir) mismatched(hash string) bool { return d.holds("mismatched", hash) }
+
+// markMismatched records that a download of version hash did not hash to its
+// name.
+func (d stateDir) markMismatched(hash string) error { return d.add("mismatched", hash) }
