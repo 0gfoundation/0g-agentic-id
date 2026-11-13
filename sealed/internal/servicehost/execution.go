@@ -20,10 +20,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"seal-verify/internal/inferproxy"
 	"seal-verify/internal/privsep"
+	"seal-verify/internal/servicesandbox"
 )
 
 const MaxExecutionInput = 512 << 10
@@ -63,24 +65,54 @@ type ExecutionStatus struct {
 }
 
 // IsolationProfile describes enforced mechanisms, not a claim that programs
-// have a separate kernel or that their business output is correct.
+// have a separate kernel or that their business output is correct. Driver
+// "landlock-v1" is servicesandbox: one identity per process tree, Landlock
+// (filesystem allowlist, no /proc, TCP refused, abstract sockets and signals
+// scoped to the domain) and a seccomp filter with no inet sockets. Memory and
+// disk are watched by sealed, which kills the identity over its limit;
+// processes are bounded by RLIMIT_NPROC on the identity.
 type IsolationProfile struct {
-	Driver             string                 `json:"driver"`
-	WorkerRuntimeHash  string                 `json:"worker_runtime_hash,omitempty"`
-	PrivatePID         bool                   `json:"private_pid"`
-	PrivateMounts      bool                   `json:"private_mounts"`
-	PrivateNetwork     bool                   `json:"private_network"`
-	ReadOnlyCode       bool                   `json:"readonly_code"`
-	TemporaryWork      bool                   `json:"temporary_work"`
-	OwnerInterfaces    bool                   `json:"owner_interfaces"`
-	Network            string                 `json:"network"`
-	EgressHosts        []string               `json:"egress_hosts,omitempty"`
-	VirtualMemoryMB    int                    `json:"virtual_memory_mb"`
-	HardResourceLimits bool                   `json:"hard_resource_limits"`
-	ResidentMemoryMB   int                    `json:"resident_memory_mb"`
-	Processes          int                    `json:"processes"`
-	TimeoutSeconds     int                    `json:"timeout_seconds"`
-	InferenceBudget    *inferproxy.TaskLimits `json:"inference_budget,omitempty"`
+	Driver               string                 `json:"driver"`
+	WorkerRuntimeHash    string                 `json:"worker_runtime_hash,omitempty"`
+	LandlockABI          int                    `json:"landlock_abi"`
+	FilesystemAllowlist  bool                   `json:"filesystem_allowlist"`
+	ProcHidden           bool                   `json:"proc_hidden"`
+	SignalScoped         bool                   `json:"signal_scoped"`
+	AbstractSocketScoped bool                   `json:"abstract_socket_scoped"`
+	DirectNetwork        bool                   `json:"direct_network"`
+	ReadOnlyCode         bool                   `json:"readonly_code"`
+	TemporaryWork        bool                   `json:"temporary_work"`
+	OwnerInterfaces      bool                   `json:"owner_interfaces"`
+	Network              string                 `json:"network"`
+	EgressHosts          []string               `json:"egress_hosts,omitempty"`
+	VirtualMemoryMB      int                    `json:"virtual_memory_mb"`
+	ResidentMemoryMB     int                    `json:"resident_memory_mb"`
+	Processes            int                    `json:"processes"`
+	TimeoutSeconds       int                    `json:"timeout_seconds"`
+	InferenceBudget      *inferproxy.TaskLimits `json:"inference_budget,omitempty"`
+}
+
+var (
+	abiOnce  sync.Once
+	abiValue int
+)
+
+func landlockABI() int {
+	abiOnce.Do(func() { abiValue, _ = servicesandbox.ABI() })
+	return abiValue
+}
+
+// landlockProfile is the receipt's description of what servicesandbox enforced.
+func landlockProfile(man Manifest) IsolationProfile {
+	p := IsolationProfile{Driver: "landlock-v1", LandlockABI: landlockABI(), FilesystemAllowlist: true, ProcHidden: true, SignalScoped: true,
+		AbstractSocketScoped: true, DirectNetwork: false, ReadOnlyCode: true, TemporaryWork: true, OwnerInterfaces: false,
+		Network: man.Network, EgressHosts: append([]string(nil), man.EgressHosts...), VirtualMemoryMB: man.MemoryMB,
+		ResidentMemoryMB: man.ResidentMemoryMB, Processes: man.Processes, TimeoutSeconds: man.RequestTimeoutSeconds}
+	if man.InferenceBudget != nil {
+		budget := *man.InferenceBudget
+		p.InferenceBudget = &budget
+	}
+	return p
 }
 
 type ExecutionAttestor func(ExecutionStatus, IsolationProfile) (string, error)
@@ -90,6 +122,7 @@ type execution struct {
 	Isolation IsolationProfile
 	output    []byte
 	done      chan struct{}
+	ctx       context.Context
 	cancel    context.CancelFunc
 	limit     bool
 	failure   string
@@ -201,92 +234,40 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 	input = bytes.Clone(input)
 	digest := sha256.Sum256(input)
 	inputHash := hex.EncodeToString(digest[:])
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pruneExecutionsLocked()
-	entry := m.entries[service]
-	if m.closed || entry == nil || !entry.Desired || entry.Manifest.Worker == nil {
-		return ExecutionStatus{}, fmt.Errorf("service execution unavailable")
+	e, job, runtimeInput, status, err := m.reserveExecution(service, key, inputHash, privateInput, consumeInput)
+	if e == nil {
+		return status, err
 	}
-	k := executionKey(service, key)
-	if h := m.executionKeys[k]; h != "" {
-		e := m.executions[h]
-		if e.InputHash != inputHash || e.Version != entry.Version {
-			return ExecutionStatus{}, ErrExecutionConflict
-		}
-		return e.ExecutionStatus, nil
-	}
-	issued, _ := strconv.ParseInt(strings.SplitN(key, "-", 2)[0], 10, 64)
-	if issued < time.Now().Add(-executionRetention).UnixMilli() || issued > time.Now().Add(30*time.Second).UnixMilli() {
-		return ExecutionStatus{}, fmt.Errorf("execution key expired or issued in the future")
-	}
-	if len(m.executions) >= MaxExecutionRecords {
-		return ExecutionStatus{}, fmt.Errorf("execution record limit reached; acknowledge completed output")
-	}
-	uid := uint32(workerUIDBase)
-	for m.workers[uid] != nil && uid < workerUIDBase+MaxWorkers {
-		uid++
-	}
-	if uid == workerUIDBase+MaxWorkers {
-		return ExecutionStatus{}, fmt.Errorf("worker limit reached")
-	}
-	var token [32]byte
-	if _, err := rand.Read(token[:]); err != nil {
-		return ExecutionStatus{}, err
-	}
-	runtimeInput, err := privateInput()
-	if err != nil {
-		return ExecutionStatus{}, err
-	}
-	if len(runtimeInput) == 0 {
-		runtimeInput = []byte("{}")
-	}
-	var fields map[string]string
-	if len(runtimeInput) > MaxRuntimeInput || json.Unmarshal(runtimeInput, &fields) != nil || fields == nil {
-		return ExecutionStatus{}, fmt.Errorf("runtime input must be a bounded JSON string map")
-	}
-	now := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(entry.Manifest.RequestTimeoutSeconds)*time.Second)
-	e := &execution{ExecutionStatus: ExecutionStatus{
-		Handle: hex.EncodeToString(token[:]), Service: service, Key: key, Version: entry.Version,
-		InputHash: inputHash, State: "starting", StartedAt: now.UnixMilli(), Deadline: now.Add(time.Duration(entry.Manifest.RequestTimeoutSeconds) * time.Second).UnixMilli(), UID: uid,
-	}, done: make(chan struct{}), cancel: cancel}
-	e.Isolation = IsolationProfile{Driver: "bubblewrap-v1", PrivatePID: true, PrivateMounts: true, PrivateNetwork: true, ReadOnlyCode: true, TemporaryWork: true, OwnerInterfaces: false,
-		Network: entry.Manifest.Network, EgressHosts: append([]string(nil), entry.Manifest.EgressHosts...), VirtualMemoryMB: entry.Manifest.MemoryMB, Processes: entry.Manifest.Processes, TimeoutSeconds: entry.Manifest.RequestTimeoutSeconds}
-	if entry.Manifest.InferenceBudget != nil {
-		budget := *entry.Manifest.InferenceBudget
-		e.Isolation.InferenceBudget = &budget
-	}
-	// Reserve durably before spawning. If sealed crashes in the start window,
-	// the next boot reports interrupted and never silently re-executes input.
-	if err := m.persistExecutionLocked(e); err != nil {
-		cancel()
-		return ExecutionStatus{}, err
-	}
-	if consumeInput != nil {
-		consumeInput()
-	}
-	m.executions[e.Handle], m.executionKeys[k] = e, e.Handle
-	w := &worker{service: service, cancel: cancel, done: e.done}
-	m.workers[uid] = w
-	dir, cmd, err := m.prepareExecution(ctx, entry, uid, input, runtimeInput)
+	ctx, cancel := e.ctx, e.cancel
+	// The slow part runs without the manager lock, so /hello and other
+	// services' requests never wait on a probe, a chain read or a process
+	// start. Stop cancels ctx, which fails the start below.
+	lease, err := m.prepareLaunch(ctx)
+	var dir string
+	var cmd *isolatedCommand
 	if err == nil {
-		e.Isolation.WorkerRuntimeHash = cmd.runtimeHash
-		if cmd.resources != nil {
-			e.Isolation.HardResourceLimits = true
-			e.Isolation.ResidentMemoryMB = int(cmd.resources.MemoryLimitBytes() >> 20)
-			e.Isolation.Processes = cmd.resources.PIDsLimit()
-		}
+		dir, cmd, err = m.prepareExecution(ctx, job, e.UID, input, runtimeInput, lease)
+	}
+	if err == nil {
 		cmd.onCleanupFailure = func() {
 			m.mu.Lock()
 			e.failure, e.State, e.Reason = "resource_cleanup_failed", "quarantined", "resource_cleanup_failed"
 			_ = m.persistExecutionLocked(e)
 			m.mu.Unlock()
 		}
+		cmd.onLimit = func(reason string) {
+			m.mu.Lock()
+			if e.failure == "" {
+				e.failure = reason
+			}
+			m.mu.Unlock()
+		}
 		cmd.Stdout, cmd.Stderr = &executionOutput{manager: m, execution: e}, io.Discard
 		cmd.WaitDelay = 250 * time.Millisecond
 		err = cmd.Start()
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err != nil {
 		cancel()
 		if dir != "" {
@@ -297,6 +278,7 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 		m.finishFailedExecutionStart(e, cmd)
 		return e.ExecutionStatus, fmt.Errorf("start isolated execution: %w", err)
 	}
+	e.Isolation.WorkerRuntimeHash = cmd.runtimeHash
 	e.State = "running"
 	if err := m.persistExecutionLocked(e); err != nil {
 		e.failure = "metadata_write_failed"
@@ -308,8 +290,78 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 	return e.ExecutionStatus, nil
 }
 
-// Called with m.mu held after Start failed. The allocation remains reserved
-// while cleanup cannot prove the cgroup empty, even though exec returned error.
+// reserveExecution validates and durably reserves an execution under the
+// manager lock. It returns a nil execution with the status or error to report
+// when nothing is to be started (a duplicate key returns the original).
+func (m *Manager) reserveExecution(service, key, inputHash string, privateInput func() ([]byte, error), consumeInput func()) (*execution, *entry, []byte, ExecutionStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pruneExecutionsLocked()
+	entry := m.entries[service]
+	if m.closed || entry == nil || !entry.Desired || entry.Manifest.Worker == nil {
+		return nil, nil, nil, ExecutionStatus{}, fmt.Errorf("service execution unavailable")
+	}
+	k := executionKey(service, key)
+	if h := m.executionKeys[k]; h != "" {
+		e := m.executions[h]
+		if e.InputHash != inputHash || e.Version != entry.Version {
+			return nil, nil, nil, ExecutionStatus{}, ErrExecutionConflict
+		}
+		return nil, nil, nil, e.ExecutionStatus, nil
+	}
+	issued, _ := strconv.ParseInt(strings.SplitN(key, "-", 2)[0], 10, 64)
+	if issued < time.Now().Add(-executionRetention).UnixMilli() || issued > time.Now().Add(30*time.Second).UnixMilli() {
+		return nil, nil, nil, ExecutionStatus{}, fmt.Errorf("execution key expired or issued in the future")
+	}
+	if len(m.executions) >= MaxExecutionRecords {
+		return nil, nil, nil, ExecutionStatus{}, fmt.Errorf("execution record limit reached; acknowledge completed output")
+	}
+	if len(m.workers) >= MaxWorkers {
+		return nil, nil, nil, ExecutionStatus{}, fmt.Errorf("worker limit reached")
+	}
+	uid, err := m.allocateIdentityLocked()
+	if err != nil {
+		return nil, nil, nil, ExecutionStatus{}, err
+	}
+	var token [32]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return nil, nil, nil, ExecutionStatus{}, err
+	}
+	runtimeInput, err := privateInput()
+	if err != nil {
+		return nil, nil, nil, ExecutionStatus{}, err
+	}
+	if len(runtimeInput) == 0 {
+		runtimeInput = []byte("{}")
+	}
+	var fields map[string]string
+	if len(runtimeInput) > MaxRuntimeInput || json.Unmarshal(runtimeInput, &fields) != nil || fields == nil {
+		return nil, nil, nil, ExecutionStatus{}, fmt.Errorf("runtime input must be a bounded JSON string map")
+	}
+	now := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(entry.Manifest.RequestTimeoutSeconds)*time.Second)
+	e := &execution{ExecutionStatus: ExecutionStatus{
+		Handle: hex.EncodeToString(token[:]), Service: service, Key: key, Version: entry.Version,
+		InputHash: inputHash, State: "starting", StartedAt: now.UnixMilli(), Deadline: now.Add(time.Duration(entry.Manifest.RequestTimeoutSeconds) * time.Second).UnixMilli(), UID: uid,
+	}, done: make(chan struct{}), ctx: ctx, cancel: cancel}
+	e.Isolation = landlockProfile(entry.Manifest)
+	// Reserve durably before spawning. If sealed crashes in the start window,
+	// the next boot reports interrupted and never silently re-executes input.
+	if err := m.persistExecutionLocked(e); err != nil {
+		cancel()
+		return nil, nil, nil, ExecutionStatus{}, err
+	}
+	if consumeInput != nil {
+		consumeInput()
+	}
+	m.executions[e.Handle], m.executionKeys[k] = e, e.Handle
+	m.workers[uid] = &worker{service: service, cancel: cancel, done: e.done}
+	job := *entry
+	return e, &job, runtimeInput, ExecutionStatus{}, nil
+}
+
+// Called with m.mu held after Start failed. The identity remains reserved
+// while cleanup cannot prove it has no process left, even though exec failed.
 func (m *Manager) finishFailedExecutionStart(e *execution, cmd *isolatedCommand) {
 	if cmd != nil && !cmd.resourcesReleased() {
 		e.State, e.Reason = "quarantined", "resource_cleanup_failed"
@@ -328,24 +380,24 @@ func (m *Manager) finishFailedExecutionStart(e *execution, cmd *isolatedCommand)
 	close(e.done)
 }
 
-func (m *Manager) prepareExecution(ctx context.Context, source *entry, uid uint32, input, runtimeInput []byte) (string, *isolatedCommand, error) {
+// prepareExecution owns lease: command takes it over, and it is released here
+// if preparation fails first.
+func (m *Manager) prepareExecution(ctx context.Context, source *entry, uid uint32, input, runtimeInput []byte, lease RuntimeLease) (string, *isolatedCommand, error) {
 	dir, err := os.MkdirTemp(filepath.Join(m.programs, taskDirName), "e-")
 	if err != nil {
+		lease.Release()
 		return "", nil, err
 	}
-	if err = privsep.Chmod(dir, 0755); err != nil {
-		return dir, nil, err
+	if err = privsep.Chmod(dir, 0755); err == nil {
+		err = privateDir(filepath.Join(dir, "run"), uid)
 	}
-	run := filepath.Join(dir, "run")
-	if err = privsep.MkdirAll(run, 0700); err != nil {
-		return dir, nil, err
-	}
-	if err = os.Chown(run, int(uid), int(uid)); err != nil {
+	if err != nil {
+		lease.Release()
 		return dir, nil, err
 	}
 	job := *source
 	job.Manifest.Command, job.Manifest.Args = source.Manifest.Worker.Command, source.Manifest.Worker.Args
-	cmd, err := m.command(ctx, &job, uid, dir, false)
+	cmd, err := m.command(ctx, &job, uid, dir, executionCommand, lease)
 	if err != nil {
 		return dir, nil, err
 	}

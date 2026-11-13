@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"seal-verify/internal/serviceidentity"
 )
 
 func cleanupFailureFixture(cmd *exec.Cmd) (*isolatedCommand, chan struct{}, <-chan struct{}, *atomic.Int32) {
@@ -57,7 +59,7 @@ func TestCleanupFailurePinsRuntimeAndWorkerUntilVerifiedEmpty(t *testing.T) {
 	defer m.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	e := &execution{ExecutionStatus: ExecutionStatus{Handle: strings.Repeat("a", 64), Service: "audit", Key: executionTestKey(991), Version: strings.Repeat("b", 64), State: "running", UID: workerUIDBase}, done: make(chan struct{}), cancel: cancel}
+	e := &execution{ExecutionStatus: ExecutionStatus{Handle: strings.Repeat("a", 64), Service: "audit", Key: executionTestKey(991), Version: strings.Repeat("b", 64), State: "running", UID: serviceidentity.Base + 7}, done: make(chan struct{}), cancel: cancel}
 	m.workers[e.UID] = &worker{service: "audit", cancel: cancel, done: e.done}
 	m.executions[e.Handle] = e
 	var receipts atomic.Int32
@@ -111,7 +113,7 @@ func TestFailedStartQuarantinesWorkerAndCoordinator(t *testing.T) {
 			var controller *coordinator
 			var ent *entry
 			if coordinatorCase {
-				ent = &entry{Status: Status{ID: "audit"}, ControllerUID: coordinatorUIDBase}
+				ent = &entry{Status: Status{ID: "audit"}, ControllerUID: serviceidentity.Base + 3}
 				controller = &coordinator{cancel: func() {}, done: make(chan struct{})}
 				m.entries[ent.ID] = ent
 				m.mu.Lock()
@@ -119,7 +121,7 @@ func TestFailedStartQuarantinesWorkerAndCoordinator(t *testing.T) {
 				m.mu.Unlock()
 				done = controller.done
 			} else {
-				e := &execution{ExecutionStatus: ExecutionStatus{Handle: strings.Repeat("c", 64), Service: "audit", State: "failed", UID: workerUIDBase}, done: make(chan struct{})}
+				e := &execution{ExecutionStatus: ExecutionStatus{Handle: strings.Repeat("c", 64), Service: "audit", State: "failed", UID: serviceidentity.Base + 9}, done: make(chan struct{})}
 				m.workers[e.UID] = &worker{service: "audit", cancel: func() {}, done: e.done}
 				m.mu.Lock()
 				m.finishFailedExecutionStart(e, cmd)

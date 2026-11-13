@@ -12,18 +12,19 @@ A manifest requires `id`, `command`, `args`, `files`; optional fields are
 `resident_memory_mb`, `processes`, `inference_budget`, `request_timeout_seconds`. Files are `{path,data}` with relative
 paths and standard-base64 contents. `env` is durable **public configuration**.
 Commands name trusted image interpreters such as `node`; owner code executes
-only after privilege drop. Source/dependencies are regular read-only files
-at `/app`; root never unpacks archives, interprets symlinks or installs packages.
+only after privilege drop. Source/dependencies are regular read-only files in
+the release directory, the program's working directory (name them by relative
+path); root never unpacks archives, interprets symlinks or installs packages.
 
-Programs listen on `$MCP_SOCKET` (`/run/service.sock`); the public endpoint is
+Programs listen on `$MCP_SOCKET` (in their private run directory); the public endpoint is
 `<sandbox-url>/api/mcp/<id>`, advertised by `/hello`. The original path is kept.
 Publication uses the existing public 8080 and adds no port or management entry.
 
 Omit `worker` for a small stateless server: each POST starts a temporary sandbox.
 For async jobs, declare `worker:{command,args}`: sealed starts an **isolated
-coordinator** for MCP, with service-private persistent `/work` and a private,
+coordinator** for MCP, with a service-private persistent `$HOME` and a private,
 service-scoped process-control socket. Every job it submits starts a **separate
-temporary worker**, with tmpfs `/work` and `/tmp`. The coordinator is application
+temporary worker**, with private temporary `$HOME` and `$TMPDIR`. The coordinator is application
 code with no owner Harness, signing or credential authority. Workers cannot
 inherit its control socket or opt out of isolation. Execution receipts bind
 results to actual temporary workers.
@@ -41,10 +42,10 @@ Eight releases are retained; republish an earlier bundle for rollback.
 
 The root registry is owner/identity-bound; enabled services resume only after
 chain bootstrap validates that binding. Coordinators may restart and read their
-own work database; **task processes, private input and tmpfs never resume**.
+own work database; **task processes, private input and temporary directories never resume**.
 Interrupted executions are reported, never silently rerun. Owner transfer
 permanently closes the manager and existing owner gate. Stop/start preserves
-application `/work`; it is not iData, on-chain data or cross-sandbox backup.
+the coordinator's `$HOME`; it is not iData, on-chain data or cross-sandbox backup.
 
 Limits: 16 services, 512 files and 16 MiB decoded/release, 24 MiB publication JSON,
 8 MiB registry. Internal MCP requests cap at 1 MiB; larger manifests can be
@@ -56,45 +57,62 @@ never an owner-readable log.
 
 ## Isolation and network
 
-Coordinators use container UIDs 50000–50015; active temporary workers use distinct
-UIDs 51000–51031, at most 32 across services. These must be present in the
-provider's UID/GID maps. The trusted launcher clears
-supplementary groups and drops UID/GID before bubblewrap. Programs have private
-PID, mount, user, IPC, UTS and **network** namespaces, no capabilities and
-no-new-privs. Only image runtime, immutable code and their own work/run mounts
-are present. Owner home/state, sealed state, sign/reveal sockets and other
-workers' files are absent. `/proc` is empty, never a bind of the parent's procfs.
+Every service process runs at a service identity of its own, drawn at random
+from container UIDs 20000–64999, which the provider's UID/GID maps must include.
+The kernel counts `RLIMIT_NPROC` per UID across every sandbox of a runner
+(measured on the dev runner), so fixed slots would let one sandbox's processes
+block another's. The trusted launcher clears supplementary groups, drops UID/GID,
+sets no-new-privs and `oom_score_adj` 1000, then confines the process with Landlock
+(ABI 6 or later) and a seccomp filter before executing the interpreter:
+
+- Landlock lets it read and execute only the image's system directories, its
+  release and the leased Harness runtime, read `/etc/resolv.conf`, `/etc/hosts`
+  and `/etc/ssl/certs`, use `/dev/null`, `zero`, `full`, `random`, `urandom`,
+  create sockets in its private run directory (and nothing else there, so a
+  socket sealed dials cannot become a link), and write only its private `$HOME`
+  and `$TMPDIR`. `/proc` is unreadable. TCP bind and connect are refused.
+  Abstract Unix sockets and signals reach only its own processes.
+- The seccomp filter refuses inet, netlink and packet sockets and io_uring.
+
+Owner home/state, sealed state, sign/reveal sockets and other workers' files are
+unreachable. Unix sockets sealed hands the process are owned by its identity;
+any other path socket keeps its file mode, which Landlock does not cover.
 At every launch sealed checks that the active verified Harness package is still
 listed, then pins it against package pruning until all job processes exit.
 That package is read-only at `$HARNESS_RUNTIME_ROOT`; resident writable
 differences and conversations are not shared. No image-base package is required.
-Missing namespace or resource-controller support fails closed with `unsupported`.
-The six-capability provider needs the constrained namespace seccomp/AppArmor
-policy and delegated cgroups described in [isolation/README.md](isolation/README.md)
-and [isolation/CGROUPS.md](isolation/CGROUPS.md). The existing stock provider
-configuration does not become compatible merely by updating sealed.
+A kernel without Landlock ABI 6, or a container whose seccomp policy refuses
+Landlock, fails closed with `unsupported`. The provider needs no change: the dev
+runner (kernel 6.17, Landlock ABI 7, Docker 28.5.2 inside Sysbox, the six
+capabilities, Docker's default seccomp) provides all of it; see
+[isolation/README.md](isolation/README.md).
 
 `network:"none"` is default. `network:"egress"` requires 1–32 explicit
 `egress_hosts` as `host:port`. A private Unix HTTP/CONNECT proxy permits only
 those destinations and rejects private, loopback, link-local and metadata IPs,
-including DNS answers. Raw host networking is unavailable. Node automatically
-loads the image proxy bootstrap (Node >=24.14); other runtimes must explicitly
-support the Unix proxy. Ignoring the proxy grants no route outside the namespace.
-Owner credential proxies are never inherited.
+including DNS answers. A service process has no network socket of its own; its
+loopback would be the container's, shared with the owner, so nothing listens
+there. Node automatically loads the image bootstrap (Node >=24.14), which routes
+`fetch` through the Unix proxy as CONNECT tunnels; other runtimes must speak to
+the Unix proxy themselves. Owner credential proxies are never inherited.
 
-Per-process rlimits remain: virtual address space (8192 MiB default, 128–16384),
-processes per UID (64 default, 1–256), 256 descriptors and 64 MiB/file. A provider-
-delegated cgroup additionally bounds the whole process tree's resident memory
-(`resident_memory_mb`, default 256 MiB, 64–4096), process/thread count and swap
-(disabled). A finite service-pool cgroup bounds all concurrent services/jobs;
-it remains inside the billed sandbox's original aggregate limits. Cleanup uses
-`cgroup.kill` and waits for an empty subtree before reusing identities or
-unpinning the runtime. `/tmp` and temporary `/work` are each capped at 64 MiB.
-This is not a separate CPU allocation or a total disk quota; coordinator work
-and run mounts still use the sandbox's outer storage boundary. Workers
-end at EOF, terminate, timeout (300 seconds default, 1–3600), stop or transfer.
-Disconnect cancels a one-shot request worker; a detached job survives its
-submitting HTTP connection and is managed by the coordinator.
+Per-process rlimits: virtual address space (8192 MiB default, 128–16384),
+processes and threads per identity (64 default, 1–256), 256 descriptors and
+64 MiB/file. Sealed reads the identity's resident memory every 500 ms
+(`resident_memory_mb`, default 256 MiB, 64–4096) and its private `$HOME` and
+`$TMPDIR` every 2 s (128 MiB together for a temporary worker; a coordinator's
+`$TMPDIR` 64 MiB, its `$HOME` being durable application state), and kills the
+identity over a limit. These are watched, not kernel limits: a burst between two
+reads can pass them. Under memory pressure the kernel's OOM killer takes service
+processes first (`oom_score_adj` 1000), and Landlock keeps them from lowering it.
+Cleanup becomes the identity and signals every process of it (a descendant
+cannot change identity, so none escapes by re-parenting or a new session), then
+confirms from root that none remains before reusing the identity or unpinning
+the runtime. This is not a separate CPU allocation or a total disk quota; the
+sandbox's outer limits still apply. Workers end at EOF, terminate, timeout
+(300 seconds default, 1–3600), stop or transfer. Disconnect cancels a one-shot
+request worker; a detached job survives its submitting HTTP connection and is
+managed by the coordinator.
 
 For 0g-harness/dsh, `/api/mcp/` is reserved for hosted services and cannot fall
 back to a legacy backend, including when hosting is unavailable. Other legacy
@@ -205,13 +223,17 @@ Neither execution receipts nor HTTP proofs remove this limitation.
 ## Validation
 
 Run root suites without/with the agent account and `SEALED_PRIVSEP_TESTS=1`.
-`SEALED_SERVICE_TESTS=1` checks real namespaces, UIDs, stdin, deduplication, limits,
+`SEALED_LANDLOCK_TESTS=1` (internal/servicesandbox) checks the confinement itself:
+files, `/proc`, `oom_score_adj`, links in the run directory, inet/UDP sockets,
+signals and abstract sockets outside the domain, and cleanup by identity.
+`SEALED_SERVICE_TESTS=1` checks real confinement, identities, stdin, deduplication, limits,
 cancellation, atomic private-input handoff, repeated Stop/Start and GC. `SEALED_LOOP_TESTS=1` adds the public DSH/tool path and a
 complete paid MCP path: real SDKs/signatures, wallet isolation, concurrent retry,
 private stdin, progress, cancellation, receipt verification/tamper rejection and
 lost settlement responses before/after broadcast. Local chain/facilitator fixtures spend no funds and
 do not prove a live deployment. Mount the companion source checkout (including test/helpers) under
 `/opt/0g-harness/<hash>`, its fixture base pointer and Node for the local tests.
-Production admission never reads that fixture pointer. Also run the constrained
-six-capability namespace policy and real delegated-cgroup enforcement tests; a
-privileged-container pass alone does not establish provider compatibility.
+Production admission never reads that fixture pointer. Run these as root on a
+kernel with Landlock ABI 6, in a container with the provider's six capabilities
+and Docker's default seccomp profile; a privileged-container pass alone does not
+establish provider compatibility.

@@ -12,33 +12,63 @@ import (
 )
 
 func TestServiceIdentityFitsProviderUIDMap(t *testing.T) {
-	if MaxServices != serviceidentity.CoordinatorCount || MaxWorkers != serviceidentity.WorkerCount {
-		t.Fatal("service capacity differs from the launcher's reserved identities")
-	}
 	// Sysbox remaps the runner and its children into this 65536-ID range.
 	// The host offset does not alter the IDs available inside the sandbox.
 	mapping := []byte("         0     100000      65536\n")
-	for _, span := range [][2]uint64{{coordinatorUIDBase, serviceidentity.CoordinatorCount}, {workerUIDBase, serviceidentity.WorkerCount}} {
-		if !mappedIdentity(mapping, span[0], span[1]) {
-			t.Fatalf("service identities do not fit provider uid_map: %v", span)
-		}
+	if !mappedIdentity(mapping, serviceidentity.Base, serviceidentity.Count) {
+		t.Fatal("service identities do not fit the provider uid_map")
 	}
-	for _, span := range [][2]uint64{{200000, 16}, {210000, 32}, {65535, 2}, {0, 0}, {^uint64(0), 2}} {
+	for _, span := range [][2]uint64{{200000, 16}, {60000, 6000}, {65535, 2}, {0, 0}, {^uint64(0), 2}} {
 		if mappedIdentity(mapping, span[0], span[1]) {
 			t.Fatalf("unmapped identities accepted: %v", span)
 		}
 	}
-	if mappedIdentity([]byte("not a uid map"), coordinatorUIDBase, 1) {
+	if mappedIdentity([]byte("not a uid map"), serviceidentity.Base, 1) {
 		t.Fatal("accepted invalid uid_map")
+	}
+	for _, uid := range []int{0, 1000, serviceidentity.Base - 1, serviceidentity.Base + serviceidentity.Count, 65534} {
+		if serviceidentity.Valid(uid) {
+			t.Fatalf("identity %d must not be a service identity", uid)
+		}
+	}
+}
+
+func TestIdentitiesAreDrawnAtRandomAndNeverShared(t *testing.T) {
+	m := &Manager{workers: map[uint32]*worker{}, entries: map[string]*entry{}}
+	seen := map[uint32]bool{}
+	for range MaxWorkers {
+		uid, err := m.allocateIdentityLocked()
+		if err != nil || !serviceidentity.Valid(int(uid)) || seen[uid] {
+			t.Fatalf("identity %d: %v (seen %v)", uid, err, seen[uid])
+		}
+		seen[uid] = true
+		m.workers[uid] = &worker{}
+	}
+	m.entries["svc"] = &entry{ControllerUID: serviceidentity.Base}
+	for range 256 {
+		uid, err := m.allocateIdentityLocked()
+		if err != nil || seen[uid] || uid == serviceidentity.Base {
+			t.Fatalf("reused an identity in use: %d %v", uid, err)
+		}
+	}
+	// Fixed slots (51000.. in every sandbox) would share RLIMIT_NPROC across
+	// sandboxes; consecutive draws must not be a counter.
+	a, _ := m.allocateIdentityLocked()
+	b, _ := m.allocateIdentityLocked()
+	c, _ := m.allocateIdentityLocked()
+	if b == a+1 && c == b+1 {
+		t.Fatal("identities look sequential")
 	}
 }
 
 func TestServiceAdmissionReportsUnsupportedProvider(t *testing.T) {
 	root(t)
 	if os.Getenv("SEALED_ISOLATION_EXPECT") != "unsupported" {
-		t.Skip("requires the explicit stock provider seccomp profile")
+		t.Skip("set SEALED_ISOLATION_EXPECT=unsupported on a kernel or container without Landlock ABI 6")
 	}
-	m, err := New(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	m, err := NewWithOptions(filepath.Join(t.TempDir(), "services"), "owner:identity", Options{AcquireRuntime: func(context.Context) (RuntimeLease, error) {
+		return RuntimeLease{}, errors.New("unused")
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,25 +76,25 @@ func TestServiceAdmissionReportsUnsupportedProvider(t *testing.T) {
 	for _, id := range []string{"request", "coordinator"} {
 		man := manifest(id, requestFixture)
 		if id == "coordinator" {
-			man.Worker = &Program{Command: "python3", Args: []string{"/app/server.py"}}
+			man.Worker = &Program{Command: "python3", Args: []string{"server.py"}}
 		}
 		if _, err := m.Publish(man); err != nil {
 			t.Fatal(err)
 		}
 		status, err := m.Start(id)
-		if !errors.Is(err, ErrIsolationUnavailable) || status.State != "unsupported" || !status.Desired || !strings.Contains(status.Error, "provider") {
+		if !errors.Is(err, ErrIsolationUnavailable) || status.State != "unsupported" || !status.Desired || !strings.Contains(status.Error, "Landlock") {
 			t.Fatalf("missing actionable unsupported admission: %+v %v", status, err)
 		}
 	}
 	m.Resume()
 	for _, status := range m.List() {
-		if status.State != "unsupported" || !strings.Contains(status.Error, "provider") {
+		if status.State != "unsupported" || !strings.Contains(status.Error, "Landlock") {
 			t.Fatalf("resume hid unsupported provider: %+v", status)
 		}
 	}
 }
 
-func TestProviderNamespacePolicy(t *testing.T) {
+func TestProviderConfinementProbe(t *testing.T) {
 	root(t)
 	switch os.Getenv("SEALED_ISOLATION_EXPECT") {
 	case "supported":
@@ -76,6 +106,6 @@ func TestProviderNamespacePolicy(t *testing.T) {
 			t.Fatalf("missing fail-closed provider policy denial: %v", err)
 		}
 	default:
-		t.Skip("set SEALED_ISOLATION_EXPECT for a real provider-profile probe")
+		t.Skip("set SEALED_ISOLATION_EXPECT for a real confinement probe")
 	}
 }

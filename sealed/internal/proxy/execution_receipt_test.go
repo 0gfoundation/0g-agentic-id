@@ -20,8 +20,8 @@ import (
 func TestExecutionReceiptHasIndependentUnforgeableDomain(t *testing.T) {
 	s, signer := armedProxy(t, "http://localhost", testValidator)
 	code := 0
-	status := servicehost.ExecutionStatus{Handle: strings.Repeat("a", 64), Service: "report", Version: strings.Repeat("b", 64), State: "exited", ExitCode: &code, UID: 210000, StartedAt: 1, FinishedAt: 2, OutputHash: strings.Repeat("c", 64), OutputBytes: 42, OutputAvailable: true}
-	profile := servicehost.IsolationProfile{Driver: "bubblewrap-v1", PrivatePID: true, PrivateMounts: true, PrivateNetwork: true, ReadOnlyCode: true, TemporaryWork: true, Network: "none"}
+	status := servicehost.ExecutionStatus{Handle: strings.Repeat("a", 64), Service: "report", Version: strings.Repeat("b", 64), State: "exited", ExitCode: &code, UID: 41234, StartedAt: 1, FinishedAt: 2, OutputHash: strings.Repeat("c", 64), OutputBytes: 42, OutputAvailable: true}
+	profile := servicehost.IsolationProfile{Driver: "landlock-v1", LandlockABI: 7, FilesystemAllowlist: true, ProcHidden: true, SignalScoped: true, AbstractSocketScoped: true, ReadOnlyCode: true, TemporaryWork: true, Network: "none"}
 	token, err := s.signExecutionReceipt(status, profile)
 	if err != nil {
 		t.Fatal(err)

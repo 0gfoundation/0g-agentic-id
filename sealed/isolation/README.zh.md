@@ -1,86 +1,53 @@
-# 托管服务的命名空间策略
+# 托管服务的进程限制
 
 [English](README.md)
 
-`docker-bubblewrap-seccomp.json` 是供 runner 审核采用的 sealed 临时服务进程策略。
-它基于 [Moby v27.5.1 默认配置](https://github.com/moby/moby/blob/v27.5.1/profiles/seccomp/default.json)，
-遵循 [Apache 2.0 许可证](LICENSE.moby)，增加以下四条规则：
+sealed 在 agent 自己的沙箱里运行每个托管服务进程（`internal/servicesandbox`，由
+`sealed-service-launcher` 启动），不用 namespace，不需要 provider 六项以外的 capability，
+也不改 provider：
 
-| 系统调用 | 额外允许的操作 |
+| 机制 | 限制内容 |
 | --- | --- |
-| `clone` | 精确标志 `0x7c020011`：user、mount、PID、network、IPC、UTS 命名空间，以及 `SIGCHLD` |
-| `clone` | 精确标志 `0x7e020011`：上述命名空间，加上 cgroup 命名空间 |
-| `unshare` | 精确标志 `CLONE_NEWUSER`（`0x10000000`），用于 bubblewrap 最后的权限分离 |
-| `mount`、`umount2`、`pivot_root` | 设置命名空间内的文件系统；内核的 capability 检查仍然有效 |
+| 服务身份 | 独立的 UID/GID，从 20000–64999 随机抽取；无附加组；no-new-privs |
+| rlimit（prlimit） | 虚拟内存、每个身份的进程和线程数（`RLIMIT_NPROC`）、256 描述符、单文件 64 MiB、不生成 core |
+| Landlock（ABI 6 及以上） | 只读/执行镜像系统目录、版本目录和租用的运行包；读三个 `/etc` 条目；无害的 `/dev` 节点；只在私有 run 目录建 socket；只写私有 `$HOME` 和 `$TMPDIR`；`/proc` 不可读；TCP bind/connect 被拒；抽象 Unix socket 和信号限于自身域 |
+| seccomp 过滤器 | 不能建 inet、netlink、packet socket；不能用 io_uring |
+| `oom_score_adj` 1000 | 内核 OOM 先杀服务进程，再轮到 sealed 或 owner Harness；Landlock 使其无法调低 |
+| 资源监视 | sealed 每 500 ms 读该身份的驻留内存、每 2 s 读私有目录，超限即杀掉该身份 |
+| 按身份清理 | launcher 切换到该身份给它的所有进程发信号，root 再确认一个不剩 |
 
-配置的 SHA256 为
-`add283d4e086d3198b77d6e8baf56151ab20e2d4a739dfe26e5b942a591e4225`。
-新增 `clone` 规则的参数布局面向 Linux amd64/arm64；其他架构需要单独审核和验证。
+进程对外只有 sealed 交给它的 Unix socket：出网代理（只到发布的主机，以 CONNECT 隧道）和
+每个任务的模型代理。它的 loopback 是整个容器共用的（owner 也在上面），所以不在上面监听。
 
-## Provider 约定
+## 在 dev runner 上的实测（2026-11-13）
 
-runner 必须在创建支持托管服务的 sealed 容器时应用审核后的策略。
-Docker CLI 接受 `--security-opt seccomp=<file>`；使用 Docker Go API 的 runner
-应将 `seccomp=` 加 JSON 内容写入 `HostConfig.SecurityOpt`。
-在 sealed 内加载本文件不能放宽继承的 seccomp 过滤器。
-更换策略也需要重建现有容器；只重启容器内的现有进程不会改变过滤器。
+在 runner 镜像同款基础（`docker:28.5.2-dind-alpine3.22`）的 Sysbox 容器里，按 runner 的
+沙箱参数起容器（runc、六项 capability、Docker 默认 seccomp、`--init`、内存上限）。内核
+6.17.0-42-generic，Landlock ABI 7，容器内 AppArmor 为 `unconfined`。UID 51000、no-new-privs
+的进程执行 `landlock_restrict_self` 之后：
 
-保留容器的六项 capability：`CHOWN`、`DAC_OVERRIDE`、`FOWNER`、`SETUID`、
-`SETGID`、`KILL`，保留 Sysbox runner 隔离边界和 Docker 的 proc 屏蔽挂载。
-不要使用 `privileged`、`SYS_ADMIN`、unconfined seccomp/AppArmor 配置或宿主
-Docker socket。如果 LSM 另外禁止非特权 user namespace，provider 还需要提供
-相应的受限 LSM 策略。
+- 被拒：规则外所有人可读的文件、`/etc`、写 `/tmp`、别的进程的 `/proc`、调低自己的
+  `oom_score_adj`、连 127.0.0.1 和外网的 TCP、域外的抽象 Unix socket、给域外同 UID 进程发信号；
+- 允许：自己的工作目录、启动子进程；
+- 规则外权限 0666 的路径型 Unix socket 仍能连上：Landlock 不管路径型 socket，只能靠文件权限。
 
-sealed 为 coordinator 保留 UID/GID `50000–50015`，为临时 worker 保留
-UID/GID `51000–51031`；两组都落在 provider 的 Sysbox 65536-ID 映射范围内。
-sealed 会检查实际 UID/GID 映射，并在接纳服务前运行可信的命名空间探针。
-探针被拒绝时，服务报告 `unsupported` 和具体 provider 错误；不会取消必要的
-命名空间后继续启动。
+进程给自己装的 seccomp 过滤器拒绝 `socket(AF_INET/AF_INET6)`，允许 `AF_UNIX`。`RLIMIT_NPROC`
+到上限即不能再 fork；以该身份执行 `kill(-1, SIGKILL)` 能清掉它的全部进程，包括开了新会话、
+已挂到 init 下的进程。两个容器之间，同一 UID 的计数是合并的（一个容器里有 11 个进程时，另一个
+在上限 8 下一个也开不出来），而 `kill(-1)` 不会跨容器。所以身份是随机抽取，不用固定编号。
 
-worker 的 `/proc` 为空。在 Docker 继承的 proc 屏蔽挂载之下，新挂载 procfs
-会被拒绝；挂载父进程的 procfs 则会暴露 owner 进程。依赖 procfs 的程序，
-包括通过 `/dev/fd` 指向 procfs 的访问，需要适应该限制。根目录和 `/dev`
-只读；worker 的 `/tmp` 与 `/work` 分别使用 64 MiB tmpfs。
+探测程序和结果：0g-tapp-ops 的 `deploy/dev/landlock-probe-20261113/` 和
+`deployments/sandbox.md`（2026-11-13 15:55）。
 
-仅使用此命名空间策略不能提供严格的任务总资源上限。生产环境还需要 provider
-委派 cgroup v2 边界，实际执行 `memory.max`、`memory.swap.max`、`pids.max`，
-并完整清理所有后代进程。任务必须始终处于计费 sandbox 的总资源上限之内。
-rlimit 是额外的进程限制，不能替代聚合 cgroup 限制。用于 `/run` socket 的共享
-宿主目录还需要有容量上限的底层文件系统，或改用不向 worker 开放宿主可写存储的
-传输方式。本 JSON 文件不会创建 cgroup 委派或有容量上限的宿主文件系统。
+## 这个设计的边界
 
-## 已验证范围与剩余验证
+- 内存和磁盘是监视，不是内核限额：两次读取之间的瞬时峰值可能越过，硬上限是沙箱自身的内存限制。
+- 进程能看到系统的进程号（信号和 `/proc` 被拒）。
+- 不同沙箱的身份碰巧相同时，共用 `RLIMIT_NPROC` 计数。
 
-本地命名空间测试在 Linux arm64、内核 `6.10.14-linuxkit`、bubblewrap
-`0.12.0` 下通过，仅授予上述六项 capability，保留 Docker 默认 proc 屏蔽挂载，
-并显式使用本策略。测试覆盖并发临时 worker、私密输入投递、代码和根目录只读、
-空 procfs、私有网络、tmpfs 容量、取消和清理。Node `24.22.1` 也在该边界内
-运行并启动了子进程。使用未修改的 Moby 默认策略时，同一探针正确报告不支持。
-UID-map 测试使用 65536-ID 映射样例。
+## 测试
 
-另行通过了真实内核 cgroup 测试和公开 DSH/收费 MCP 联合测试：本地可信引导先准备
-有限额的计费父组和服务池，然后降到完全相同的六项 capability（CapEff=CapBnd=0xeb）
-和 seccomp mode 2，才运行测试及服务代码。覆盖后代总内存 OOM、进程数耗尽和另开
-会话的子进程清理，见 [CGROUPS.zh.md](CGROUPS.zh.md)。服务代码运行时已无引导阶段权限。
-
-这些结果**不代表**已在实际 Sysbox、生产 amd64、AppArmor 或托管 provider 上通过验证。
-在目标 runner 开启生产服务接纳前，仍需完成这些验证。本文件不声称已有生产服务或已完成生产部署。
-
-本地复现时，进入 `sealed/`，将 `SEALED_TEST_IMAGE` 设置为包含 Go 1.24、
-bubblewrap 0.12.0 和 Python 3 的 Linux 测试镜像：
-
-```sh
-docker run --rm --cap-drop ALL \
-  --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
-  --cap-add SETUID --cap-add SETGID --cap-add KILL \
-  --security-opt seccomp="$PWD/isolation/docker-bubblewrap-seccomp.json" \
-  -v "$PWD":/src -w /src \
-  -e SEALED_SERVICE_TESTS=1 -e SEALED_ISOLATION_EXPECT=supported \
-  "${SEALED_TEST_IMAGE:?set a Linux test image}" \
-  sh -c 'go build -o /usr/local/bin/sealed-service-launcher ./cmd/service-launcher && go test ./internal/servicehost -count=1'
-```
-
-验证拒绝行为时，改用未修改的 Moby v27.5.1 默认策略，设置
-`SEALED_ISOLATION_EXPECT=unsupported`，不设置 `SEALED_SERVICE_TESTS`，运行
-`go test ./internal/servicehost -run 'TestServiceIdentityFitsProviderUIDMap|TestProviderNamespacePolicy|TestServiceAdmissionReportsUnsupportedProvider' -count=1`。
-命名空间测试通过，并不能证明 provider 已提供生产环境另外要求的 cgroup 和文件系统条件。
+`SEALED_LANDLOCK_TESTS=1 go test ./internal/servicesandbox` 和
+`SEALED_SERVICE_TESTS=1 SEALED_ISOLATION_EXPECT=supported go test ./internal/servicehost`，
+以 root 在带六项 capability 和 Docker 默认 seccomp 的容器里、在 Landlock ABI 6 及以上的内核上运行
+（dev runner）。在没有 Landlock 的内核上，`SEALED_ISOLATION_EXPECT=unsupported` 检查接纳会明确拒绝。

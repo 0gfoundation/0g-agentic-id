@@ -11,7 +11,7 @@ import (
 )
 
 func manifest(id, source string) Manifest {
-	return Manifest{ID: id, Command: "python3", Args: []string{"/app/server.py"}, Files: []File{{Path: "server.py", Data: base64.StdEncoding.EncodeToString([]byte(source))}}}
+	return Manifest{ID: id, Command: "python3", Args: []string{"server.py"}, Files: []File{{Path: "server.py", Data: base64.StdEncoding.EncodeToString([]byte(source))}}}
 }
 
 func root(t *testing.T) {
@@ -90,7 +90,7 @@ func TestPublishBindingAndImmutableRelease(t *testing.T) {
 func TestSandboxLifecycleAndIsolation(t *testing.T) {
 	root(t)
 	if os.Getenv("SEALED_SERVICE_TESTS") != "1" {
-		t.Skip("set SEALED_SERVICE_TESTS=1 in a namespace-capable container")
+		t.Skip("set SEALED_SERVICE_TESTS=1 as root on a kernel with Landlock ABI 6")
 	}
 	t.Setenv("SERVICE_TEST_SECRET", "not-for-the-child")
 	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")

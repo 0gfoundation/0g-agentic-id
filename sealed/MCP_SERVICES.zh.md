@@ -10,16 +10,16 @@ manifest 必填 `id`、`command`、`args`、`files`；可选 `worker`、`descrip
 `env`、`network`、`egress_hosts`、`memory_mb`、`resident_memory_mb`、`processes`、`inference_budget`、
 `request_timeout_seconds`。文件是 `{path,data}`，即相对路径和标准 base64。
 `env` 是持久保存的**公开配置**。command 指定镜像中的可信解释器，例如 node；代码只在
-降权后执行。源码和依赖以普通只读文件挂载到 `/app`；root 不解压、不处理符号链接、不安装包。
+降权后执行。源码和依赖是版本目录里的普通只读文件，该目录就是程序的工作目录（用相对路径引用）；root 不解压、不处理符号链接、不安装包。
 
-程序监听 `$MCP_SOCKET`（`/run/service.sock`），公开入口是
+程序监听 `$MCP_SOCKET`（在它私有的 run 目录里），公开入口是
 `<sandbox-url>/api/mcp/<id>`，由 `/hello` 宣告，保留原始请求路径。沿用现有公网
 8080，不新增端口或管理入口。
 
 简单无状态服务不填 `worker`，每个 POST 启动临时沙箱。异步任务声明
 `worker:{command,args}`：sealed 启动**隔离的服务进程**处理 MCP，带服务私有、持久化的
-`/work` 和仅限该服务的进程控制 socket；每个任务再启动**独立临时 worker**，用 tmpfs
-`/work`、`/tmp`。服务进程属于应用代码，拿不到 owner Harness、签名或凭证权限。
+`$HOME` 和仅限该服务的进程控制 socket；每个任务再启动**独立临时 worker**，用私有的临时
+`$HOME`、`$TMPDIR`。服务进程属于应用代码，拿不到 owner Harness、签名或凭证权限。
 worker 不继承控制 socket，不能选择跳过隔离；执行证明将结果绑定到真实的临时 worker。
 
 start 开放请求并启动声明的服务进程；轮询 list 到 running 后仍须验证实际 MCP 行为，
@@ -32,9 +32,9 @@ JSON 原始字节的 base64，其 SHA-256 必须等于 version。通过已验证
 重新发布旧 bundle。
 
 root registry 绑定 owner/identity，链上启动校验通过后才恢复已开启的服务。
-服务进程可重启并读取自己的业务数据库；**任务进程、私有输入和 tmpfs 不恢复**。
+服务进程可重启并读取自己的业务数据库；**任务进程、私有输入和临时目录不恢复**。
 中断执行只报告、不自动重跑。owner 转移永久关闭 manager 及原有 owner gate。
-stop/start 保留应用 `/work`，但它不是 iData、上链数据或跨沙箱备份。
+stop/start 保留服务进程的 `$HOME`，但它不是 iData、上链数据或跨沙箱备份。
 
 限制：16 个服务，每版 512 文件、解码后 16 MiB，发布 JSON 24 MiB，registry 8 MiB。
 内部 MCP 请求上限 1 MiB；更大 manifest 可从本地 JSON 文件经 `$SEAL_SIGN_SOCK`
@@ -44,32 +44,43 @@ start/stop/logs 接收 id。不公开管理接口。logs 为空：服务/请求�
 
 ## 隔离与网络
 
-服务进程用容器 UID 50000–50015；活跃临时 worker 使用不同 UID 51000–51031，
-所有服务合计最多 32 个，provider 的 UID/GID 映射必须覆盖这些编号。
-可信 launcher 清除附加组并切换 UID/GID 后才启动 bubblewrap。
-程序有独立 PID、mount、user、IPC、UTS、**network** namespace，无 capabilities，
-启用 no-new-privs。只挂载镜像运行时、不可变源码和自己的 work/run；owner 家目录/状态、
-sealed 状态、sign/reveal socket、其他 worker 文件均不可见。`/proc` 为空，不绑定父进程的 procfs。
+每个服务进程都用自己的服务身份运行，从容器 UID 20000–64999 中随机抽取；provider 的
+UID/GID 映射必须覆盖这一范围。内核按 UID 在同一 runner 的所有沙箱之间合计 `RLIMIT_NPROC`
+（在 dev runner 上实测），固定编号会让一个沙箱的进程卡住另一个沙箱。可信 launcher 清除
+附加组、切换 UID/GID、启用 no-new-privs、把 `oom_score_adj` 设为 1000，再用 Landlock
+（ABI 6 及以上）和 seccomp 过滤器限制进程，然后才执行解释器：
+
+- Landlock 只允许它读取并执行镜像的系统目录、自己的版本和租用的 Harness 运行包，读取
+  `/etc/resolv.conf`、`/etc/hosts`、`/etc/ssl/certs`，使用 `/dev/null`、`zero`、`full`、
+  `random`、`urandom`，在私有 run 目录里创建 socket（只能建 socket，sealed 要连的 socket
+  不能被换成链接），只写自己私有的 `$HOME` 和 `$TMPDIR`。`/proc` 不可读，TCP bind/connect
+  被拒绝，抽象 Unix socket 和信号只能到达它自己的进程。
+- seccomp 过滤器拒绝 inet、netlink、packet socket 和 io_uring。
+
+owner 家目录/状态、sealed 状态、sign/reveal socket、其他 worker 的文件都访问不到。sealed
+交给进程的 Unix socket 归它的身份所有；其他路径型 socket 仍按文件权限控制，Landlock 不管。
 每次启动均检查当前已验证 Harness 包仍在允许列表中，并锁定包，直到任务全部进程退出才允许清理。
-该包只读挂载为 `$HARNESS_RUNTIME_ROOT`，不共享常驻 Harness 的可写差分和对话，也不要求镜像带 base 包。
-namespace 或资源控制器不可用则明确报告 unsupported，不退回弱隔离。
-六项 capability 的 provider 还需要受限 namespace seccomp/AppArmor 策略和 cgroup 委派，见
-[isolation/README.zh.md](isolation/README.zh.md) 和 [isolation/CGROUPS.zh.md](isolation/CGROUPS.zh.md)。
-仅更新 sealed 不会让现有 provider 配置自动兼容。
+该包只读，位于 `$HARNESS_RUNTIME_ROOT`，不共享常驻 Harness 的可写差分和对话，也不要求镜像带 base 包。
+内核没有 Landlock ABI 6、或容器的 seccomp 策略不允许 Landlock 时，明确报告 unsupported。
+provider 不需要任何改动：dev runner（内核 6.17、Landlock ABI 7、Sysbox 内的 Docker 28.5.2、
+六项 capability、Docker 默认 seccomp）全部满足，见 [isolation/README.zh.md](isolation/README.zh.md)。
 
 默认 `network:"none"`；`network:"egress"` 必须指定 1–32 个 `host:port`
 格式的 egress_hosts。私有 Unix HTTP/CONNECT 代理只允许这些目标，并拒绝私网、
-loopback、link-local、metadata IP，包括 DNS 解析结果。不能使用宿主网络。
-Node 自动加载镜像代理引导（Node >=24.14）；其他语言需明确支持 Unix 代理。
-不使用代理的代码没有对外路由，也不继承 owner 凭证代理。
+loopback、link-local、metadata IP，包括 DNS 解析结果。服务进程没有自己的网络 socket；
+它的 loopback 是整个容器共用的（owner 也在上面），所以不在上面监听。Node 自动加载镜像
+引导（Node >=24.14），把 `fetch` 以 CONNECT 隧道经 Unix 代理发出；其他语言需自行连接
+Unix 代理。不继承 owner 凭证代理。
 
-单进程 rlimit 仍限制虚拟地址空间（默认 8192 MiB，128–16384）、每 UID 进程数（默认 64，
-1–256）、256 描述符和单文件 64 MiB。provider 委派的 cgroup 另外硬性限制整个进程树的
-驻留内存（resident_memory_mb，默认 256 MiB，64–4096）、进程/线程数，并禁用 swap。
-有限额的服务池再约束所有服务/任务总量，仍在原有计费沙箱的总体 cgroup 下。
-清理使用 cgroup.kill，确认整个子树为空后才复用身份和解除运行包锁定。
-临时 `/tmp`、`/work` 各限 64 MiB。这不提供独立 CPU 分配或总磁盘配额，服务数据库和
-run 挂载仍受外围沙箱存储边界约束。worker 在 EOF、terminate、超时（默认 300 秒，1–3600）、stop 或转移时结束。
+单进程 rlimit：虚拟地址空间（默认 8192 MiB，128–16384）、每个身份的进程和线程数（默认 64，
+1–256）、256 描述符和单文件 64 MiB。sealed 每 500 ms 读取该身份的驻留内存
+（resident_memory_mb，默认 256 MiB，64–4096），每 2 s 读取私有 `$HOME` 和 `$TMPDIR`
+（临时 worker 两者合计 128 MiB；服务进程只算 `$TMPDIR` 64 MiB，其 `$HOME` 是持久业务状态），
+超过即杀掉该身份。这些是监视，不是内核限额：两次读取之间的瞬时峰值可能越过。内存紧张时
+内核 OOM 先杀服务进程（`oom_score_adj` 1000），Landlock 使它们无法调低。清理时 launcher
+切换到该身份给它的所有进程发信号（子进程改不了身份，重新挂靠或新会话都逃不掉），再由 root
+确认一个不剩，才复用身份和解除运行包锁定。这不提供独立 CPU 分配或总磁盘配额，仍受外围沙箱
+限制。worker 在 EOF、terminate、超时（默认 300 秒，1–3600）、stop 或转移时结束。
 断线会终止单次请求 worker；异步任务不随提交它的 HTTP 连接结束，继续由服务进程管理。
 
 0g-harness/dsh 只保留 `/api/mcp/` 给托管服务，该路径在 hosting 不可用时也不能回退到旧后端。
@@ -153,9 +164,11 @@ x402 **不是付款和交付的跨系统原子公平交换**。保存结果让�
 ## 验证
 
 以 root 分别在没有/有 agent 用户时运行，设置 SEALED_PRIVSEP_TESTS=1。
-SEALED_SERVICE_TESTS=1 测真实 namespace、UID、stdin、去重、限额、取消、原子私有输入交接、反复 Stop/Start 和回收。
+SEALED_LANDLOCK_TESTS=1（internal/servicesandbox）测限制本身：文件、`/proc`、`oom_score_adj`、run 目录里的链接、
+inet/UDP socket、对域外的信号和抽象 socket，以及按身份清理。
+SEALED_SERVICE_TESTS=1 测真实限制、身份、stdin、去重、限额、取消、原子私有输入交接、反复 Stop/Start 和回收。
 SEALED_LOOP_TESTS=1 加测公开 DSH/tool 链路和完整收费 MCP 链路：真实 SDK/签名、钱包
 隔离、并发重试、私有 stdin、进度、取消、证明校验/拒绝篡改及广播前/后的结算响应丢失。
 链和 facilitator 为本地模拟，不花资金、不证明已真实部署。本地测试挂载配套源码 checkout
 （包括 test/helpers）到 /opt/0g-harness/<hash>，以及测试 base 指针和 Node；生产接纳不读该测试指针。
-还必须测试受限六项 capability 策略和真实委派 cgroup 的强制限制；只通过特权容器测试不能证明 provider 兼容。
+这些测试要以 root 在 Landlock ABI 6 及以上的内核上、在带 provider 六项 capability 和 Docker 默认 seccomp 的容器里运行；只通过特权容器测试不能证明 provider 兼容。

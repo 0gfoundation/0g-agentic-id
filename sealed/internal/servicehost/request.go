@@ -121,11 +121,13 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		cancel()
 		return response(req, 503, "service unavailable"), nil
 	}
-	uid := uint32(workerUIDBase)
-	for m.workers[uid] != nil && uid < workerUIDBase+MaxWorkers {
-		uid++
+	if len(m.workers) >= MaxWorkers {
+		m.mu.Unlock()
+		cancel()
+		return response(req, 503, "request worker limit reached"), nil
 	}
-	if uid == workerUIDBase+MaxWorkers {
+	uid, err := m.allocateIdentityLocked()
+	if err != nil {
 		m.mu.Unlock()
 		cancel()
 		return response(req, 503, "request worker limit reached"), nil
@@ -160,7 +162,6 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			cleanup()
 		}
 	}()
-	var err error
 	dir, err = os.MkdirTemp(filepath.Join(m.programs, taskDirName), "t-")
 	if err != nil {
 		return nil, fmt.Errorf("prepare request sandbox")
@@ -170,14 +171,15 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("prepare request sandbox")
 	}
 	run := filepath.Join(dir, "run")
-	if err = privsep.MkdirAll(run, 0700); err != nil {
+	if err = privateDir(run, uid); err != nil {
 		return nil, fmt.Errorf("prepare request sandbox")
 	}
-	if err = os.Chown(run, int(uid), int(uid)); err != nil {
-		return nil, fmt.Errorf("prepare request sandbox")
+	lease, err := m.prepareLaunch(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("prepare request interpreter: %w", err)
 	}
 	job := &entry{Manifest: man, Status: status}
-	cmd, err := m.command(ctx, job, uid, dir, false)
+	cmd, err := m.command(ctx, job, uid, dir, requestCommand, lease)
 	if err != nil {
 		return nil, fmt.Errorf("prepare request interpreter")
 	}

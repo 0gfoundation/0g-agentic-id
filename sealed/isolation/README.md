@@ -1,99 +1,62 @@
-# Hosted service namespace policy
+# Hosted service confinement
 
 [中文](README.zh.md)
 
-`docker-bubblewrap-seccomp.json` is a proposed runner policy for sealed's
-temporary service processes. It is based on [Moby v27.5.1's default
-profile](https://github.com/moby/moby/blob/v27.5.1/profiles/seccomp/default.json),
-under the [Apache 2.0 license](LICENSE.moby), with four added rules:
+Sealed runs each hosted service process (`internal/servicesandbox`, started by
+`sealed-service-launcher`) inside the agent's own sandbox, with no namespace, no
+capability beyond the provider's six and no change to the provider:
 
-| System call | Additional permission |
+| Mechanism | What it enforces |
 | --- | --- |
-| `clone` | Exact flags `0x7c020011`: user, mount, PID, network, IPC and UTS namespaces, plus `SIGCHLD` |
-| `clone` | Exact flags `0x7e020011`: the same namespaces plus a cgroup namespace |
-| `unshare` | Exact flags `CLONE_NEWUSER` (`0x10000000`), used by bubblewrap's final privilege separation |
-| `mount`, `umount2`, `pivot_root` | Namespace filesystem setup; kernel capability checks still apply |
+| Service identity | A UID/GID of its own, drawn at random from 20000–64999; no supplementary groups; no-new-privs |
+| rlimits (prlimit) | Virtual memory, processes and threads per identity (`RLIMIT_NPROC`), 256 descriptors, 64 MiB per file, no core files |
+| Landlock (ABI 6 or later) | Read/execute only the image's system directories, the release and the leased runtime; read three `/etc` entries; harmless `/dev` nodes; sockets only in the private run directory; write only the private `$HOME` and `$TMPDIR`; no `/proc`; no TCP bind/connect; abstract Unix sockets and signals scoped to the process's own domain |
+| seccomp filter | No inet, netlink or packet socket; no io_uring |
+| `oom_score_adj` 1000 | The kernel's OOM killer takes service processes before sealed or the owner Harness; Landlock keeps them from lowering it |
+| Resource watcher | sealed reads the identity's resident memory every 500 ms and its private directories every 2 s, and kills the identity over a limit |
+| Cleanup by identity | The launcher becomes the identity and signals every process of it; root then confirms none remains |
 
-The profile's SHA256 is
-`add283d4e086d3198b77d6e8baf56151ab20e2d4a739dfe26e5b942a591e4225`.
-The additional `clone` argument layout targets Linux amd64/arm64. Other
-architectures require their own review and verification.
+The process's only way out is a Unix socket sealed hands it: the egress proxy
+(published hosts only, as CONNECT tunnels) and the per-task model proxy. Its
+loopback is the container's, shared with the owner, so nothing listens there.
 
-## Provider contract
+## Measured on the dev runner (2026-11-13)
 
-The runner must apply this reviewed profile when it creates a hosting-capable
-sealed container. Docker's CLI accepts `--security-opt seccomp=<file>`; a runner
-using Docker's Go API supplies `HostConfig.SecurityOpt` with `seccomp=` followed
-by the JSON contents. Loading this file inside sealed cannot relax an inherited
-seccomp filter. Applying a new profile also requires recreating existing
-containers; restarting their existing processes does not change the filter.
+A Sysbox container on the runner image's base (`docker:28.5.2-dind-alpine3.22`)
+ran containers with the runner's sandbox flags (runc, the six capabilities,
+Docker's default seccomp profile, `--init`, a memory limit). Kernel
+6.17.0-42-generic, Landlock ABI 7, AppArmor `unconfined` inside. A process at UID
+51000 with no-new-privs, after `landlock_restrict_self`:
 
-Keep the six container capabilities `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID`,
-`SETGID`, `KILL`, the Sysbox runner boundary, and Docker's proc masks. Do not use
-`privileged`, `SYS_ADMIN`, an unconfined seccomp/AppArmor profile, or a host Docker
-socket. If an LSM independently denies unprivileged user namespaces, the provider
-needs an appropriately constrained LSM policy too.
+- refused: a world-readable file outside its rules, `/etc`, writing `/tmp`,
+  another process's `/proc`, lowering its own `oom_score_adj`, TCP to 127.0.0.1
+  and to the internet, an abstract Unix socket and a signal to a same-UID process
+  outside its domain;
+- allowed: its own work directory and executing a child;
+- a mode-0666 path Unix socket outside its rules still connected: Landlock does
+  not cover path sockets, which rely on their file modes.
 
-Sealed reserves coordinator UIDs/GIDs `50000–50015` and temporary worker UIDs/GIDs
-`51000–51031`; both ranges fit the provider's 65536-ID Sysbox mapping. Sealed
-checks the actual UID/GID maps and runs a trusted namespace probe before service
-admission. A denied probe reports `unsupported` with the concrete provider
-failure. There is no launch without the required namespaces.
+Its own seccomp filter refused `socket(AF_INET/AF_INET6)` and allowed `AF_UNIX`.
+`RLIMIT_NPROC` stopped forks at the limit, and `kill(-1, SIGKILL)` as the identity
+removed every process of it, including ones in their own session re-parented to
+init. Between two containers, the count for one UID was shared (11 processes in
+one left the other unable to fork under a limit of 8), and `kill(-1)` did not cross
+containers. Hence identities are random, not fixed slots.
 
-Worker `/proc` is empty. A fresh procfs mount is denied below Docker's inherited
-masked proc mounts, while mounting the parent's procfs would expose owner
-processes. Programs requiring procfs, including `/dev/fd` paths pointing into it,
-must account for this constraint. Root and `/dev` are read-only; worker `/tmp`
-and `/work` use separate 64 MiB tmpfs mounts.
+The probe and its results: 0g-tapp-ops `deploy/dev/landlock-probe-20261113/` and
+`deployments/sandbox.md` (2026-11-13 15:55).
 
-This namespace profile alone does not provide hard aggregate resource limits.
-Production admission also needs a provider-delegated cgroup v2 boundary with
-enforced `memory.max`, `memory.swap.max`, `pids.max`, and complete descendant
-cleanup. That boundary must stay within the billed sandbox's aggregate limits.
-Rlimits are additional process limits, not substitutes for aggregate cgroups.
-The shared host directory used for `/run` sockets also needs a bounded backing
-filesystem or a transport that does not grant workers writable host storage.
-No cgroup delegation or bounded host filesystem is created by this JSON file.
+## Limits of this design
 
-## Verification and remaining qualification
+- Memory and disk are watched, not kernel limits: a burst between two reads can
+  pass them, and the sandbox's own memory limit is the hard bound.
+- Processes see the system's process IDs (signals and `/proc` are refused).
+- Identities of different sandboxes share `RLIMIT_NPROC` when they collide.
 
-The namespace tests passed locally on Linux arm64, kernel `6.10.14-linuxkit`,
-bubblewrap `0.12.0`, with only the six capabilities above, normal Docker proc
-masks and this explicit profile. They exercise concurrent temporary workers,
-private input delivery, read-only code/root, empty procfs, private networking,
-tmpfs sizes, cancellation and cleanup. Node `24.22.1` also ran and launched a
-child process inside this boundary. The same probe correctly reported
-unsupported under the unchanged Moby default profile. The UID-map test uses a
-65536-ID mapping fixture.
+## Tests
 
-Separate real-kernel cgroup tests and the public DSH/paid-MCP integration also
-passed after a trusted local bootstrap prepared the finite billed-parent/pool
-layout, then dropped to exactly the same six capabilities (`CapEff=CapBnd=0xeb`)
-and seccomp mode 2. They exercised aggregate descendant OOM, PID exhaustion and
-cleanup of a child in another session. See [CGROUPS.md](CGROUPS.md). Bootstrap
-setup privileges were absent when service code ran.
-
-These results do **not** constitute actual Sysbox, production amd64, AppArmor,
-or hosted provider validation. Those checks remain required on the target runner
-before enabling production service admission. This file does not claim a running
-production service or a production deployment.
-
-For a local reproduction, start in `sealed/` and set `SEALED_TEST_IMAGE` to a
-Linux test image containing Go 1.24, bubblewrap 0.12.0 and Python 3:
-
-```sh
-docker run --rm --cap-drop ALL \
-  --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
-  --cap-add SETUID --cap-add SETGID --cap-add KILL \
-  --security-opt seccomp="$PWD/isolation/docker-bubblewrap-seccomp.json" \
-  -v "$PWD":/src -w /src \
-  -e SEALED_SERVICE_TESTS=1 -e SEALED_ISOLATION_EXPECT=supported \
-  "${SEALED_TEST_IMAGE:?set a Linux test image}" \
-  sh -c 'go build -o /usr/local/bin/sealed-service-launcher ./cmd/service-launcher && go test ./internal/servicehost -count=1'
-```
-
-For the denial check, use the unchanged Moby v27.5.1 default profile, set
-`SEALED_ISOLATION_EXPECT=unsupported`, omit `SEALED_SERVICE_TESTS`, and run
-`go test ./internal/servicehost -run 'TestServiceIdentityFitsProviderUIDMap|TestProviderNamespacePolicy|TestServiceAdmissionReportsUnsupportedProvider' -count=1`.
-The supported namespace run does not prove that a provider supplied the separate
-production cgroup and filesystem prerequisites.
+`SEALED_LANDLOCK_TESTS=1 go test ./internal/servicesandbox` and
+`SEALED_SERVICE_TESTS=1 SEALED_ISOLATION_EXPECT=supported go test ./internal/servicehost`,
+as root, in a container with the six capabilities and Docker's default seccomp
+profile on a kernel with Landlock ABI 6 (the dev runner). On a kernel without
+Landlock, `SEALED_ISOLATION_EXPECT=unsupported` checks that admission fails closed.

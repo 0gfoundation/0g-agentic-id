@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"seal-verify/internal/privsep"
+	"seal-verify/internal/serviceidentity"
 )
 
 type coordinator struct {
@@ -46,8 +47,39 @@ func (m *Manager) prepareCoordinatorWork(e *entry) error {
 	return os.Chown(work, int(e.ControllerUID), int(e.ControllerUID))
 }
 
-func (m *Manager) startCoordinatorLocked(e *entry) error {
-	if e.ControllerUID < coordinatorUIDBase || e.ControllerUID >= coordinatorUIDBase+MaxServices {
+// startCoordinator does the slow preparation (probe, runtime pin) without the
+// manager lock, then starts the coordinator under it if the service is still
+// wanted. Admission failures are recorded on the entry.
+func (m *Manager) startCoordinator(id string) error {
+	lease, err := m.prepareLaunch(context.Background())
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.entries[id]
+	if e == nil || !e.Desired || m.closed || e.controller != nil {
+		if err == nil {
+			lease.Release()
+		}
+		return nil
+	}
+	if err == nil {
+		err = m.startCoordinatorLocked(e, lease)
+	}
+	if err != nil {
+		setAdmissionFailure(e, err)
+	}
+	return err
+}
+
+// startCoordinatorLocked owns lease: released on failure, else after the
+// coordinator's identity has been reaped.
+func (m *Manager) startCoordinatorLocked(e *entry, lease RuntimeLease) (err error) {
+	started := false
+	defer func() {
+		if !started && lease.Release != nil {
+			lease.Release()
+		}
+	}()
+	if !serviceidentity.Valid(int(e.ControllerUID)) {
 		return fmt.Errorf("invalid coordinator identity")
 	}
 	if e.controller != nil {
@@ -84,10 +116,21 @@ func (m *Manager) startCoordinatorLocked(e *entry) error {
 	}
 	c.server = &http.Server{Handler: m.ExecutionHandler(e.ID), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	go func() { _ = c.server.Serve(ln) }()
-	cmd, err := m.command(ctx, e, e.ControllerUID, base, true)
+	started = true // command owns the lease from here
+	cmd, err := m.command(ctx, e, e.ControllerUID, base, coordinatorCommand, lease)
 	if err == nil {
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = bytes.NewReader([]byte("{}")), io.Discard, io.Discard
 		cmd.WaitDelay = 250 * time.Millisecond
+		cmd.onCleanupFailure = func() {
+			m.mu.Lock()
+			e.State, e.Error = "quarantined", "resource cleanup failed; identity and runtime remain pinned"
+			m.mu.Unlock()
+		}
+		cmd.onLimit = func(reason string) {
+			m.mu.Lock()
+			e.Error = reason
+			m.mu.Unlock()
+		}
 		err = cmd.Start()
 	}
 	if err != nil {
@@ -97,11 +140,6 @@ func (m *Manager) startCoordinatorLocked(e *entry) error {
 		return fmt.Errorf("start isolated coordinator: %w", err)
 	}
 	c.cmd = cmd
-	cmd.onCleanupFailure = func() {
-		m.mu.Lock()
-		e.State, e.Error = "quarantined", "resource cleanup failed; identity and runtime remain pinned"
-		m.mu.Unlock()
-	}
 	e.generation++
 	gen := e.generation
 	e.controller, e.State, e.Error = c, "starting", ""
@@ -110,7 +148,7 @@ func (m *Manager) startCoordinatorLocked(e *entry) error {
 }
 
 // Called with m.mu held. Stable service identities cannot be restarted or
-// handed to another process while the old cgroup remains unverified.
+// handed to another process while processes of the old one may remain.
 func (m *Manager) holdFailedCoordinator(e *entry, c *coordinator, cmd *isolatedCommand) {
 	if cmd == nil || cmd.resourcesReleased() {
 		return
@@ -190,11 +228,10 @@ func (m *Manager) superviseCoordinator(ctx context.Context, e *entry, c *coordin
 	case <-timer.C:
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if e.generation == gen && e.Desired && !m.closed {
-		if err := m.startCoordinatorLocked(e); err != nil {
-			setAdmissionFailure(e, err)
-		}
+	again := e.generation == gen && e.Desired && !m.closed
+	m.mu.Unlock()
+	if again {
+		_ = m.startCoordinator(e.ID)
 	}
 }
 

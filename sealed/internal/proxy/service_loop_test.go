@@ -94,7 +94,7 @@ func TestPublicMCPTemporaryDSHLoop(t *testing.T) {
 import {pathToFileURL} from 'node:url'
 const {mountServiceModel,defineTool}=await import(pathToFileURL(process.env.HARNESS_RUNTIME_ROOT+'/src/service-loop.mjs'))
 const model={provider:'loop-mock',id:'mock',baseURL:%q}
-export default {model,persona:'Use check_access to perform the task.',cwd:'/work',
+export default {model,persona:'Use check_access to perform the task.',cwd:process.env.HOME,
  async configure(ctx,{runtimeInput}) {
   await mountServiceModel(ctx,model)
   ctx.tools.register(defineTool({name:'check_access',description:'Check access without disclosing credentials',parameters:{},
@@ -112,7 +112,7 @@ export default {model,persona:'Use check_access to perform the task.',cwd:'/work
 		t.Fatal(err)
 	}
 	defer host.Close()
-	if _, err := host.Publish(servicehost.Manifest{ID: "loop", Command: "node", Args: []string{"/app/loop-server.mjs"}, Network: "none", InferenceBudget: &inferproxy.TaskLimits{Calls: 2, InputBytes: 65536, OutputTokens: 512}, RequestTimeoutSeconds: 15,
+	if _, err := host.Publish(servicehost.Manifest{ID: "loop", Command: "node", Args: []string{"loop-server.mjs"}, Network: "none", InferenceBudget: &inferproxy.TaskLimits{Calls: 2, InputBytes: 65536, OutputTokens: 512}, RequestTimeoutSeconds: 15,
 		Files: []servicehost.File{{Path: "loop-server.mjs", Data: base64.StdEncoding.EncodeToString(server)}, {Path: "agent-config.mjs", Data: base64.StdEncoding.EncodeToString([]byte(config))}}}); err != nil {
 		t.Fatal(err)
 	}

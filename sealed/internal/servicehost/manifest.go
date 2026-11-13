@@ -48,8 +48,9 @@ type Manifest struct {
 	// Worker is the separately isolated program a service may execute. The
 	// service controls business workflow; sealed only manages its processes.
 	Worker *Program `json:"worker,omitempty"`
-	// Programs always have a private network namespace. egress grants only
-	// public destinations explicitly named in EgressHosts through a Unix proxy.
+	// Programs never get a network route of their own: no inet socket, no
+	// TCP. egress grants only public destinations explicitly named in
+	// EgressHosts, through a Unix-socket proxy run by sealed.
 	Network          string   `json:"network,omitempty"`
 	EgressHosts      []string `json:"egress_hosts,omitempty"`
 	MemoryMB         int      `json:"memory_mb,omitempty"`

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,7 +20,8 @@ import (
 
 	"seal-verify/internal/credproxy"
 	"seal-verify/internal/privsep"
-	"seal-verify/internal/servicecgroup"
+	"seal-verify/internal/serviceidentity"
+	"seal-verify/internal/servicesandbox"
 )
 
 type Status struct {
@@ -57,8 +59,10 @@ type Manager struct {
 	attestor                   ExecutionAttestor
 	runtime                    func(context.Context) (RuntimeLease, error)
 	model                      func(context.Context) (ModelRoute, error)
-	resources                  *servicecgroup.Pool
-	resourceErr                error
+	watcher                    *resourceWatcher
+	probeMu                    sync.Mutex
+	probeAt                    time.Time
+	probeErr                   error
 	skipResourceLimitsForTests bool
 }
 
@@ -69,8 +73,8 @@ type Options struct {
 	EgressDial     func(context.Context, string, string) (net.Conn, error)
 	AcquireRuntime func(context.Context) (RuntimeLease, error)
 	ModelRoute     func(context.Context) (ModelRoute, error)
-	// Only Go test fixtures may bypass real aggregate limits. No HTTP, env or
-	// manifest field can enable this; production wiring always leaves it false.
+	// Only Go test fixtures may bypass the confinement probe and runtime pin.
+	// No HTTP, env or manifest field can enable this; production leaves it false.
 	SkipResourceLimitsForTests bool
 }
 
@@ -103,12 +107,7 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 	m.runtime = opts.AcquireRuntime
 	m.model = opts.ModelRoute
 	m.skipResourceLimitsForTests = opts.SkipResourceLimitsForTests
-	if !opts.SkipResourceLimitsForTests {
-		m.resources, err = servicecgroup.New()
-		if err != nil {
-			m.resourceErr = fmt.Errorf("%w: %v", ErrIsolationUnavailable, err)
-		}
-	}
+	m.watcher = newResourceWatcher(m.stopGC)
 	m.egressDial = opts.EgressDial
 	if m.egressDial == nil {
 		m.egressDial = credproxy.SafeDial
@@ -153,7 +152,7 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 			if m.entries[e.ID] != nil {
 				return nil, fmt.Errorf("duplicate saved service")
 			}
-			if e.Manifest.Worker != nil && (e.ControllerUID < coordinatorUIDBase || e.ControllerUID >= coordinatorUIDBase+MaxServices) {
+			if e.Manifest.Worker != nil && !serviceidentity.Valid(int(e.ControllerUID)) {
 				return nil, fmt.Errorf("invalid saved coordinator identity")
 			}
 			if e.ControllerUID != 0 {
@@ -263,14 +262,11 @@ func (m *Manager) Publish(man Manifest) (Status, error) {
 	}
 	if man.Worker != nil {
 		if e.ControllerUID == 0 {
-			e.ControllerUID = coordinatorUIDBase
-			used := map[uint32]bool{}
-			for _, prior := range m.entries {
-				used[prior.ControllerUID] = true
+			uid, err := m.allocateIdentityLocked()
+			if err != nil {
+				return Status{}, err
 			}
-			for used[e.ControllerUID] {
-				e.ControllerUID++
-			}
+			e.ControllerUID = uid
 		}
 		if err := m.prepareCoordinatorWork(e); err != nil {
 			return Status{}, err
@@ -321,38 +317,55 @@ func (m *Manager) List() []Status {
 }
 
 // Start enables a published endpoint. A program with a worker entrypoint runs
-// a separately isolated service coordinator; business execution uses fresh
+// a separately confined service coordinator; business execution uses fresh
 // worker identities. Plain one-shot MCP programs retain request isolation.
+// The confinement probe and runtime pin run without the manager lock.
 func (m *Manager) Start(id string) (Status, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return Status{}, fmt.Errorf("service manager closed")
 	}
 	e := m.entries[id]
 	if e == nil {
+		m.mu.Unlock()
 		return Status{}, fmt.Errorf("unknown service")
 	}
 	if e.Desired && (e.State == "running" || e.State == "starting" || e.State == "restarting") {
-		return e.Status, nil
+		out := e.Status
+		m.mu.Unlock()
+		return out, nil
+	}
+	if e.controller != nil {
+		m.mu.Unlock()
+		return Status{}, fmt.Errorf("the previous coordinator is still being cleaned up; retry")
 	}
 	previousDesired := e.Desired
 	e.Desired = true
 	e.Error = ""
 	if err := m.persistLocked(); err != nil {
 		e.Desired = previousDesired
+		m.mu.Unlock()
 		return Status{}, err
 	}
-	if err := m.probeAdmission(context.Background()); err != nil {
-		setAdmissionFailure(e, err)
+	e.State = "starting"
+	coordinated := e.Manifest.Worker != nil
+	m.mu.Unlock()
+	if coordinated {
+		err := m.startCoordinator(id)
+		m.mu.Lock()
+		defer m.mu.Unlock()
 		return e.Status, err
 	}
-	if e.Manifest.Worker != nil {
-		if err := m.startCoordinatorLocked(e); err != nil {
-			setAdmissionFailure(e, err)
-			return e.Status, err
-		}
+	err := m.admission(context.Background())
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !e.Desired || m.closed {
 		return e.Status, nil
+	}
+	if err != nil {
+		setAdmissionFailure(e, err)
+		return e.Status, err
 	}
 	e.State = "running"
 	return e.Status, nil
@@ -365,123 +378,165 @@ func setAdmissionFailure(e *entry, err error) {
 	}
 }
 
-func (m *Manager) probeAdmission(ctx context.Context) error {
-	if m.resourceErr != nil {
-		return m.resourceErr
+// allocateIdentityLocked draws an unused service identity at random:
+// identities of different sandboxes then meet only by chance (serviceidentity).
+func (m *Manager) allocateIdentityLocked() (uint32, error) {
+	for i := 0; i < 64; i++ {
+		var b [4]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return 0, err
+		}
+		uid := uint32(serviceidentity.Base) + binary.BigEndian.Uint32(b[:])%serviceidentity.Count
+		if m.workers[uid] != nil || m.controllerLocked(uid) {
+			continue
+		}
+		return uid, nil
 	}
-	if !m.skipResourceLimitsForTests && m.runtime == nil {
-		return fmt.Errorf("%w: a verified listed Harness runtime callback is required", ErrIsolationUnavailable)
-	}
-	return ProbeIsolation(ctx)
+	return 0, fmt.Errorf("no free service identity")
 }
 
-func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir string, coordinator bool) (*isolatedCommand, error) {
-	if err := m.probeAdmission(ctx); err != nil {
-		return nil, err
+func (m *Manager) controllerLocked(uid uint32) bool {
+	for _, e := range m.entries {
+		if e.ControllerUID == uid {
+			return true
+		}
 	}
-	bwrap, err := privsep.LookPath("bwrap")
-	if err != nil {
-		return nil, fmt.Errorf("isolation unavailable: %w", err)
+	return false
+}
+
+// privateDir creates dir as root (so a service cannot place it first) and
+// hands it to the service identity alone.
+func privateDir(dir string, uid uint32) error {
+	if err := privsep.MkdirAll(dir, 0700); err != nil {
+		return err
 	}
+	if err := os.Chown(dir, int(uid), int(uid)); err != nil {
+		return err
+	}
+	return privsep.Chmod(dir, 0700)
+}
+
+type commandKind int
+
+const (
+	requestCommand     commandKind = iota // one anonymous MCP request
+	coordinatorCommand                    // a service's long-running coordinator
+	executionCommand                      // a detached execution its coordinator started
+)
+
+// command builds the confined launch of one service process (servicesandbox):
+// prlimit sets the rlimits, then the trusted launcher confines itself to the
+// identity and execs the interpreter. It owns lease from here: released on
+// failure, otherwise once the identity has been reaped.
+func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir string, kind commandKind, lease RuntimeLease) (_ *isolatedCommand, err error) {
+	defer func() {
+		if err != nil && lease.Release != nil {
+			lease.Release()
+		}
+	}()
+	sys := imageSystem()
 	interpreter, err := privsep.LookPath(e.Manifest.Command)
 	if err != nil {
 		return nil, err
+	}
+	if real, rerr := filepath.EvalSymlinks(interpreter); rerr == nil {
+		interpreter = real
+	}
+	if !withinAny(interpreter, sys.readExec) {
+		return nil, fmt.Errorf("interpreter %s is outside the image's system directories", e.Manifest.Command)
 	}
 	launcher, err := privsep.LookPath("sealed-service-launcher")
 	if err != nil {
 		return nil, err
 	}
-	var resources *servicecgroup.Lease
-	if !m.skipResourceLimitsForTests {
-		var nonce [16]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
+	program := filepath.Join(m.programs, e.ID, "versions", e.Version)
+	run := filepath.Join(taskDir, "run")
+	work := filepath.Join(taskDir, "work")
+	tmp := filepath.Join(taskDir, "tmp")
+	if kind != coordinatorCommand {
+		if err = privateDir(work, uid); err != nil {
 			return nil, err
 		}
-		resources, err = m.resources.Acquire(fmt.Sprintf("%d-%x", uid, nonce), int64(e.Manifest.ResidentMemoryMB)<<20, e.Manifest.Processes)
-		if err != nil {
-			return nil, fmt.Errorf("%w: acquire process-tree resource limits: %v", ErrIsolationUnavailable, err)
-		}
 	}
-	resourceOwner := &isolatedCommand{resources: resources, release: func() {}}
-	transferred := false
-	defer func() {
-		if !transferred {
-			resourceOwner.beginCleanup()
-		}
-	}()
-	args := []string{fmt.Sprintf("--as=%d", int64(e.Manifest.MemoryMB)<<20), fmt.Sprintf("--nproc=%d", e.Manifest.Processes), "--core=0", "--nofile=256", "--fsize=67108864", "--", launcher}
-	if resources != nil {
-		args = append(args, "--cgroup-fd=3")
-	}
-	args = append(args, fmt.Sprint(uid), bwrap)
-	args = append(args, namespaceArguments(uid)...)
-	args = append(args, "--setenv", "MCP_SOCKET", "/run/service.sock", "--ro-bind", filepath.Join(m.programs, e.ID, "versions", e.Version), "/app", "--bind", filepath.Join(taskDir, "run"), "/run", "--chdir", "/app")
-	args = append(args, "--setenv", "SEAL_SERVICE_ID", e.ID, "--setenv", "SEAL_SERVICE_VERSION", e.Version)
-	if coordinator {
-		args = append(args, "--bind", filepath.Join(taskDir, "work"), "/work", "--setenv", "SEAL_EXEC_SOCKET", "/run/control.sock")
-	} else {
-		args = append(args, "--size", fmt.Sprint(temporaryFilesystemBytes), "--tmpfs", "/work")
-	}
-	runtime, err := m.acquireRuntime(ctx)
-	if err != nil {
+	if err = privsep.RemoveAll(tmp); err != nil {
 		return nil, err
 	}
-	ok := false
-	defer func() {
-		if !ok {
-			runtime.Release()
-		}
-	}()
+	if err = privateDir(tmp, uid); err != nil {
+		return nil, err
+	}
+	p := servicesandbox.Policy{
+		UID:        uid,
+		ReadExec:   append(append([]string(nil), sys.readExec...), program),
+		ReadOnly:   sys.readOnly,
+		Devices:    sys.devices,
+		SocketDirs: []string{run},
+		ReadWrite:  []string{work, tmp},
+		Dir:        program,
+		Program:    interpreter,
+	}
+	env := []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=" + work, "TMPDIR=" + tmp, "MCP_SOCKET=" + filepath.Join(run, "service.sock"),
+		"SEAL_SERVICE_ID=" + e.ID, "SEAL_SERVICE_VERSION=" + e.Version}
+	if kind == coordinatorCommand {
+		env = append(env, "SEAL_EXEC_SOCKET="+filepath.Join(run, "control.sock"))
+	}
 	var networkBootstrap string
-	if runtime.Dir != "" {
-		args = append(args, "--ro-bind", runtime.Dir, runtime.Dir, "--setenv", "HARNESS_RUNTIME_ROOT", runtime.Dir)
-		networkBootstrap = filepath.Join(runtime.Dir, "src", "service-network.mjs")
+	if lease.Dir != "" {
+		p.ReadExec = append(p.ReadExec, lease.Dir)
+		env = append(env, "HARNESS_RUNTIME_ROOT="+lease.Dir)
+		networkBootstrap = filepath.Join(lease.Dir, "src", "service-network.mjs")
 	}
+	bridged := false
 	if e.Manifest.Network == "egress" {
-		if err := m.startEgress(ctx, e.Manifest.EgressHosts, uid, filepath.Join(taskDir, "run", "egress.sock")); err != nil {
+		if err = m.startEgress(ctx, e.Manifest.EgressHosts, uid, filepath.Join(run, "egress.sock")); err != nil {
 			return nil, err
 		}
-		args = append(args, "--setenv", "SEAL_EGRESS_SOCKET", "/run/egress.sock")
+		env = append(env, "SEAL_EGRESS_SOCKET="+filepath.Join(run, "egress.sock"))
+		bridged = true
 	}
-	if !coordinator && e.Manifest.InferenceBudget != nil {
-		route, err := m.startModel(ctx, *e.Manifest.InferenceBudget, uid, filepath.Join(taskDir, "run", "model.sock"))
-		if err != nil {
-			return nil, err
+	// Temporary workers (requests and executions) may spend the published
+	// budget on the owner's model; the coordinator never receives the route.
+	if kind != coordinatorCommand && e.Manifest.InferenceBudget != nil {
+		route, rerr := m.startModel(ctx, *e.Manifest.InferenceBudget, uid, filepath.Join(run, "model.sock"))
+		if rerr != nil {
+			return nil, rerr
 		}
-		args = append(args, "--setenv", "SEAL_MODEL_SOCKET", "/run/model.sock", "--setenv", "SEAL_MODEL_ID", route.Route.Model, "--setenv", "SEAL_MODEL_API", route.API)
+		env = append(env, "SEAL_MODEL_SOCKET="+filepath.Join(run, "model.sock"), "SEAL_MODEL_ID="+route.Route.Model, "SEAL_MODEL_API="+route.API)
+		bridged = true
 	}
-	args = append(args, imageSystemArguments()...)
 	keys := make([]string, 0, len(e.Manifest.Env))
 	for k := range e.Manifest.Env {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		args = append(args, "--setenv", k, e.Manifest.Env[k])
+		env = append(env, k+"="+e.Manifest.Env[k])
 	}
-	args = append(args, "--remount-ro", "/", "--", interpreter)
-	if (e.Manifest.Network == "egress" || (!coordinator && e.Manifest.InferenceBudget != nil)) && e.Manifest.Command == "node" {
+	p.Env = env
+	if bridged && e.Manifest.Command == "node" {
 		if networkBootstrap == "" {
 			return nil, fmt.Errorf("immutable Node egress bridge unavailable")
 		}
-		args = append(args, "--import", networkBootstrap)
+		p.Args = append(p.Args, "--import", networkBootstrap)
 	}
-	args = append(args, e.Manifest.Args...)
-	// Only the trusted image's resource limiter and sandbox launcher execute
-	// as root. bwrap drops all capabilities before the service interpreter.
+	p.Args = append(p.Args, e.Manifest.Args...)
+	if err = p.Validate(); err != nil {
+		return nil, err
+	}
+	args := []string{fmt.Sprintf("--as=%d", int64(e.Manifest.MemoryMB)<<20), fmt.Sprintf("--nproc=%d", e.Manifest.Processes), "--core=0", "--nofile=256", "--fsize=67108864", "--", launcher}
+	args = append(args, p.LauncherArgs()...)
+	// Only the trusted image's resource limiter and launcher execute as root;
+	// the launcher drops to the service identity before the interpreter runs.
 	cmd, err := privsep.RootCommand(ctx, "prlimit", args...)
 	if err != nil {
 		return nil, err
 	}
-	if resources != nil {
-		if err := privsep.AttachServiceCgroup(cmd, resources.ProcsFile()); err != nil {
-			return nil, err
-		}
+	c := &isolatedCommand{Cmd: cmd, uid: uid, runtimeHash: lease.Hash, release: lease.Release, watcher: m.watcher,
+		limits: limits{residentBytes: int64(e.Manifest.ResidentMemoryMB) << 20, diskDirs: []string{work, tmp}, diskBytes: 2 * temporaryFilesystemBytes}}
+	if kind == coordinatorCommand {
+		// The coordinator's work directory is its durable business state.
+		c.limits.diskDirs, c.limits.diskBytes = []string{tmp}, temporaryFilesystemBytes
 	}
-	ok = true
-	transferred = true
-	resourceOwner.Cmd, resourceOwner.runtimeHash, resourceOwner.release = cmd, runtime.Hash, runtime.Release
-	return resourceOwner, nil
+	return c, nil
 }
 
 func (m *Manager) Stop(id string) (Status, error) {
@@ -513,8 +568,22 @@ func (m *Manager) Stop(id string) (Status, error) {
 	e.State = "stopped"
 	out := e.Status
 	m.mu.Unlock()
+	// Processes are killed at once; only an identity whose reap keeps failing
+	// stays pinned. Report that instead of blocking the caller indefinitely.
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
 	for _, d := range taskWaits {
-		<-d
+		select {
+		case <-d:
+		case <-deadline.C:
+			m.mu.Lock()
+			if !e.Desired {
+				e.State, e.Error = "stopping", "processes are still being cleaned up"
+			}
+			out = e.Status
+			m.mu.Unlock()
+			return out, nil
+		}
 	}
 	return out, nil
 }
@@ -523,22 +592,33 @@ func (m *Manager) Stop(id string) (Status, error) {
 // owner binding. Published versions and desired states survive a reboot.
 func (m *Manager) Resume() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	probeErr := m.probeAdmission(context.Background())
-	for _, e := range m.entries {
-		if e.Desired {
+	var coordinated, plain []string
+	for id, e := range m.entries {
+		if !e.Desired {
+			continue
+		}
+		e.State = "starting"
+		if e.Manifest.Worker != nil {
+			coordinated = append(coordinated, id)
+		} else {
+			plain = append(plain, id)
+		}
+	}
+	m.mu.Unlock()
+	probeErr := m.admission(context.Background())
+	m.mu.Lock()
+	for _, id := range plain {
+		if e := m.entries[id]; e != nil && e.Desired && !m.closed {
 			if probeErr != nil {
 				setAdmissionFailure(e, probeErr)
-				continue
+			} else {
+				e.State = "running"
 			}
-			if e.Manifest.Worker != nil {
-				if err := m.startCoordinatorLocked(e); err != nil {
-					setAdmissionFailure(e, err)
-				}
-				continue
-			}
-			e.State = "running"
 		}
+	}
+	m.mu.Unlock()
+	for _, id := range coordinated {
+		_ = m.startCoordinator(id)
 	}
 }
 
@@ -569,14 +649,6 @@ func (m *Manager) Close() {
 		case <-d:
 		case <-time.After(5 * time.Second):
 		}
-	}
-	if m.resources != nil {
-		go func() {
-			for _, done := range waits {
-				<-done
-			}
-			_ = m.resources.Close()
-		}()
 	}
 }
 

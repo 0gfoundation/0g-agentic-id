@@ -5,16 +5,21 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"seal-verify/internal/privsep"
 	"seal-verify/internal/serviceidentity"
+	"seal-verify/internal/servicesandbox"
 )
 
-const coordinatorUIDBase = serviceidentity.CoordinatorBase
-const workerUIDBase = serviceidentity.WorkerBase
+// Work and temporary files of one request or execution, enforced by the
+// resource monitor (a service cannot mount a size-limited filesystem).
 const temporaryFilesystemBytes = 64 << 20
 
 var ErrIsolationUnavailable = errors.New("isolation unavailable")
@@ -44,38 +49,71 @@ func mappedIdentity(mapping []byte, first, count uint64) bool {
 func checkServiceIdentityMaps() error {
 	for _, name := range []string{"uid_map", "gid_map"} {
 		mapping, err := os.ReadFile("/proc/self/" + name)
-		if err != nil || !mappedIdentity(mapping, coordinatorUIDBase, serviceidentity.CoordinatorCount) || !mappedIdentity(mapping, workerUIDBase, serviceidentity.WorkerCount) {
-			return fmt.Errorf("%w: provider %s must map reserved service IDs %d..%d and %d..%d", ErrIsolationUnavailable, name, coordinatorUIDBase, coordinatorUIDBase+serviceidentity.CoordinatorCount-1, workerUIDBase, workerUIDBase+serviceidentity.WorkerCount-1)
+		if err != nil || !mappedIdentity(mapping, serviceidentity.Base, serviceidentity.Count) {
+			return fmt.Errorf("%w: provider %s must map service IDs %d..%d", ErrIsolationUnavailable, name, serviceidentity.Base, serviceidentity.Base+serviceidentity.Count-1)
 		}
 	}
 	return nil
 }
 
-func imageSystemArguments() []string {
-	var args []string
-	for _, p := range []string{"/bin", "/sbin", "/lib", "/lib64", "/etc/resolv.conf", "/etc/hosts", "/etc/ssl/certs"} {
-		if _, err := privsep.Lstat(p); err == nil {
-			args = append(args, "--ro-bind", p, p)
+// systemPaths is what every service process may use from the image: system
+// code read-only, a few /etc entries, and harmless device nodes. Links are
+// resolved here so each Landlock rule names the real directory.
+type systemPaths struct {
+	readExec, readOnly, devices []string
+}
+
+var (
+	systemOnce sync.Once
+	system     systemPaths
+)
+
+func imageSystem() systemPaths {
+	systemOnce.Do(func() {
+		seen := map[string]bool{}
+		covered := func(p string) bool {
+			for d := range seen {
+				if p == d || strings.HasPrefix(p, d+"/") {
+					return true
+				}
+			}
+			return false
+		}
+		for _, p := range []string{"/usr", "/bin", "/sbin", "/lib", "/lib64"} {
+			if real, err := filepath.EvalSymlinks(p); err == nil && !covered(real) {
+				if fi, err := os.Stat(real); err == nil && fi.IsDir() {
+					seen[real] = true
+					system.readExec = append(system.readExec, real)
+				}
+			}
+		}
+		for _, p := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/ssl/certs"} {
+			if real, err := filepath.EvalSymlinks(p); err == nil && !covered(real) {
+				system.readOnly = append(system.readOnly, real)
+			}
+		}
+		for _, p := range []string{"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom"} {
+			var st unix.Stat_t
+			if unix.Lstat(p, &st) == nil && st.Mode&unix.S_IFMT == unix.S_IFCHR {
+				system.devices = append(system.devices, p)
+			}
+		}
+	})
+	return system
+}
+
+func withinAny(p string, dirs []string) bool {
+	for _, d := range dirs {
+		if p == d || strings.HasPrefix(p, d+"/") {
+			return true
 		}
 	}
-	return args
+	return false
 }
 
-// namespaceArguments always creates the full isolation boundary. /proc stays
-// empty: mounting a fresh procfs is forbidden below Docker's masked proc mounts,
-// and binding the parent's procfs would reveal the owner's processes.
-func namespaceArguments(uid uint32) []string {
-	return []string{
-		"--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try", "--unshare-user", "--unshare-net",
-		"--cap-drop", "ALL", "--uid", fmt.Sprint(uid), "--gid", fmt.Sprint(uid),
-		"--clearenv", "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/work", "--setenv", "TMPDIR", "/tmp",
-		"--ro-bind", "/usr", "/usr", "--dir", "/proc", "--dev", "/dev", "--remount-ro", "/dev",
-		"--size", strconv.Itoa(temporaryFilesystemBytes), "--tmpfs", "/tmp", "--dir", "/etc", "--dir", "/run",
-	}
-}
-
-// ProbeIsolation verifies the actual provider policy before admitting service
-// code. It never relaxes namespaces, proc masks, capabilities or seccomp.
+// ProbeIsolation runs the trusted launcher's probe: it confines itself at a
+// service identity and checks that Landlock and the seccomp filter refuse
+// what they must. It never relaxes capabilities or the provider's policy.
 func ProbeIsolation(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -85,14 +123,7 @@ func ProbeIsolation(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	bwrap, err := privsep.LookPath("bwrap")
-	if err != nil {
-		return fmt.Errorf("%w: trusted bubblewrap is required: %v", ErrIsolationUnavailable, err)
-	}
-	args := append([]string{strconv.Itoa(workerUIDBase), bwrap}, namespaceArguments(workerUIDBase)...)
-	args = append(args, imageSystemArguments()...)
-	args = append(args, "--remount-ro", "/", "--", "/usr/bin/true")
-	cmd, err := privsep.RootCommand(ctx, "sealed-service-launcher", args...)
+	cmd, err := privsep.RootCommand(ctx, "sealed-service-launcher", "probe")
 	if err != nil {
 		return fmt.Errorf("%w: trusted service launcher is required: %v", ErrIsolationUnavailable, err)
 	}
@@ -107,7 +138,37 @@ func ProbeIsolation(ctx context.Context) error {
 		if len(detail) > 512 {
 			detail = detail[:512]
 		}
-		return fmt.Errorf("%w: provider must enable the constrained bubblewrap namespace seccomp/AppArmor policy (six capabilities and masked proc retained): %s: %v", ErrIsolationUnavailable, detail, err)
+		return fmt.Errorf("%w: the kernel must provide Landlock ABI %d or later and the container must allow it and seccomp filters: %s: %v", ErrIsolationUnavailable, servicesandbox.MinABI, detail, err)
 	}
 	return nil
+}
+
+// admission caches the probe: the kernel and the container's policy do not
+// change while sealed runs. A failure is retried after a minute.
+func (m *Manager) admission(ctx context.Context) error {
+	if m.skipResourceLimitsForTests {
+		return nil
+	}
+	if m.runtime == nil {
+		return fmt.Errorf("%w: a verified listed Harness runtime callback is required", ErrIsolationUnavailable)
+	}
+	m.probeMu.Lock()
+	defer m.probeMu.Unlock()
+	ttl := 10 * time.Minute
+	if m.probeErr != nil {
+		ttl = time.Minute
+	}
+	if m.probeAt.IsZero() || time.Since(m.probeAt) > ttl {
+		m.probeErr, m.probeAt = ProbeIsolation(ctx), time.Now()
+	}
+	return m.probeErr
+}
+
+// prepareLaunch does the slow part of starting a service process (probe,
+// runtime listing and pin) without the manager lock.
+func (m *Manager) prepareLaunch(ctx context.Context) (RuntimeLease, error) {
+	if err := m.admission(ctx); err != nil {
+		return RuntimeLease{}, err
+	}
+	return m.acquireRuntime(ctx)
 }

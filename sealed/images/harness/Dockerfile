@@ -142,7 +142,7 @@ RUN npm install -g --no-fund --no-audit "${HARNESS_REF}" \
 FROM debian:13-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils bubblewrap util-linux \
+ && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils util-linux \
  && rm -rf /var/lib/apt/lists/*
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):

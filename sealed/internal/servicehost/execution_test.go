@@ -17,6 +17,9 @@ import (
 )
 
 const executionFixture = `import sys,os,json,struct,time,socket,resource
+def refused(f):
+ try: f();return False
+ except OSError: return True
 data=sys.stdin.buffer.read()
 assert data[:8]==b'SEALRUN1'
 private_len,public_len=struct.unpack('>II',data[8:16])
@@ -25,18 +28,19 @@ runtime=json.loads(data[16:16+private_len])
 args=json.loads(data[16+private_len:])
 if args.get('fail'): sys.exit(7)
 time.sleep(args.get('delay',0))
+home=os.environ['HOME']
 flags={'uid':os.getuid(),'authorized':bool(runtime.get('token')),
- 'label':args.get('label'),'fresh':not os.path.exists('/work/witness'),
- 'owner_home':os.path.exists('/home/agent'),'sealed_state':os.path.exists('/var/lib/sealed'),
+ 'label':args.get('label'),'fresh':not os.path.exists(os.path.join(home,'witness')),
+ 'owner_home':not refused(lambda:os.listdir('/home')),'sealed_state':not refused(lambda:os.listdir('/var/lib')),
  'argv_private':runtime.get('token','!') not in str(sys.argv),
- 'proc_private':os.listdir('/proc')==[],
- 'root_readonly':bool(os.statvfs('/').f_flag & os.ST_RDONLY),
- 'tmp_bounded':os.statvfs('/tmp').f_blocks*os.statvfs('/tmp').f_frsize==67108864,
- 'work_bounded':os.statvfs('/work').f_blocks*os.statvfs('/work').f_frsize==67108864,
+ 'proc_private':refused(lambda:os.listdir('/proc')),
+ 'root_readonly':refused(lambda:open('/sealed-probe-write','w')),
+ 'tmp_private':os.environ['TMPDIR']!='/tmp' and not refused(lambda:open(os.path.join(os.environ['TMPDIR'],'t'),'w').close()) and refused(lambda:open('/tmp/sealed-probe','w')),
+ 'work_private':(os.stat(home).st_mode&0o777)==0o700,
  'core_disabled':resource.getrlimit(resource.RLIMIT_CORE)==(0,0),
  'env_private':runtime.get('token','!') not in str(dict(os.environ))}
 try:
- open('/app/worker.py','w');flags['readonly']=False
+ open('worker.py','w');flags['readonly']=False
 except OSError: flags['readonly']=True
 flags['host_loopback']=False
 if args.get('host_addr'):
@@ -44,7 +48,7 @@ if args.get('host_addr'):
  try:
   conn=socket.create_connection((host,int(port)),timeout=.2);conn.close();flags['host_loopback']=True
  except OSError: pass
-open('/work/witness','w').write('temporary')
+open(os.path.join(home,'witness'),'w').write('temporary')
 print(json.dumps(flags),flush=True)
 if args.get('output'): sys.stdout.write('x'*args['output'])
 `
@@ -57,7 +61,7 @@ func executionManager(t *testing.T) *Manager {
 	t.Helper()
 	root(t)
 	if os.Getenv("SEALED_SERVICE_TESTS") != "1" {
-		t.Skip("set SEALED_SERVICE_TESTS=1 in a namespace-capable Linux container")
+		t.Skip("set SEALED_SERVICE_TESTS=1 as root on a kernel with Landlock ABI 6")
 	}
 	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
 	if err != nil {
@@ -66,7 +70,7 @@ func executionManager(t *testing.T) *Manager {
 	t.Cleanup(m.Close)
 	for _, id := range []string{"first", "second"} {
 		man := manifest(id, requestFixture)
-		man.Worker = &Program{Command: "python3", Args: []string{"/app/worker.py"}}
+		man.Worker = &Program{Command: "python3", Args: []string{"worker.py"}}
 		man.Files = append(man.Files, File{Path: "worker.py", Data: base64.StdEncoding.EncodeToString([]byte(executionFixture))})
 		man.RequestTimeoutSeconds = 5
 		if _, err := m.Publish(man); err != nil {
@@ -145,7 +149,7 @@ func TestDetachedExecutionDeduplicationIsolationAndTransientInput(t *testing.T) 
 	if err := json.Unmarshal(output, &flags); err != nil {
 		t.Fatalf("worker output: %q %v", output, err)
 	}
-	for _, k := range []string{"authorized", "fresh", "argv_private", "env_private", "proc_private", "root_readonly", "tmp_bounded", "work_bounded", "core_disabled", "readonly"} {
+	for _, k := range []string{"authorized", "fresh", "argv_private", "env_private", "proc_private", "root_readonly", "tmp_private", "work_private", "core_disabled", "readonly"} {
 		if flags[k] != true {
 			t.Fatalf("missing isolation %s: %s", k, output)
 		}

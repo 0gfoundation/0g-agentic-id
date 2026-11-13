@@ -17,6 +17,9 @@ import (
 
 const requestFixture = `import os,sys,json,http.server,socket,time
 values=json.load(sys.stdin)
+def refused(f):
+ try: f();return False
+ except OSError: return True
 print(values,flush=True) # task stdout/stderr must never enter the owner's logs
 class Handler(http.server.BaseHTTPRequestHandler):
  def log_message(self,*args): pass
@@ -27,16 +30,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
   token=values.get('token','')
   flags={'uid':os.getuid(),'private':token=='runtime-fixture-'+data['who'],
    'header':self.headers.get('X-Seal-Runtime-Input'),
-   'fresh':not os.path.exists('/work/witness'),
+   'fresh':not os.path.exists(os.path.join(os.environ['HOME'],'witness')),
    'argv':token not in str(sys.argv),
-   'proc_private':os.listdir('/proc')==[],
+   'proc_private':refused(lambda:os.listdir('/proc')),
    'env':token not in str(dict(os.environ)),
-   'owner_home':os.path.exists('/home/agent'),'sign_socket':os.path.exists('/run/seal-sign.sock'),
-   'sealed_state':os.path.exists('/var/lib/sealed'),'secret':os.environ.get('SERVICE_TEST_SECRET')}
+   'owner_home':not refused(lambda:os.listdir('/home')),'sign_socket':not refused(lambda:os.listdir('/run')),
+   'sealed_state':not refused(lambda:os.listdir('/var/lib')),'secret':os.environ.get('SERVICE_TEST_SECRET')}
   try:
-   open('/app/server.py','w');flags['readonly']=False
+   open('server.py','w');flags['readonly']=False
   except OSError: flags['readonly']=True
-  open('/work/witness','w').write(token)
+  open(os.path.join(os.environ['HOME'],'witness'),'w').write(token)
   self.send_response(200);self.end_headers();self.wfile.write(json.dumps(flags).encode())
 class Server(http.server.HTTPServer):
  address_family=socket.AF_UNIX
@@ -48,7 +51,7 @@ func taskManager(t *testing.T, timeout int) *Manager {
 	t.Helper()
 	root(t)
 	if os.Getenv("SEALED_SERVICE_TESTS") != "1" {
-		t.Skip("set SEALED_SERVICE_TESTS=1 in a namespace-capable container")
+		t.Skip("set SEALED_SERVICE_TESTS=1 as root on a kernel with Landlock ABI 6")
 	}
 	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
 	if err != nil {
