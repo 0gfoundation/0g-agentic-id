@@ -20,7 +20,7 @@ import (
 )
 
 // Runs both companion PRs together: the official MCP/x402 clients, real wallet
-// signatures, a namespace-isolated coordinator and worker, and sealed's receipt
+// signatures, a coordinator and worker confined by servicesandbox, and sealed's receipt
 // verifier. The facilitator/RPC simulate a chain; no money or live APIs are used.
 func TestPublicPaidMCPWithExecutionReceipt(t *testing.T) {
 	if os.Getenv("SEALED_LOOP_TESTS") != "1" {
@@ -94,7 +94,7 @@ export default async function(input,{runtimeInput,progress}) {
 	for name, data := range map[string]string{"service-config.mjs": config, "worker-config.mjs": worker} {
 		files = append(files, servicehost.File{Path: name, Data: base64.StdEncoding.EncodeToString([]byte(data))})
 	}
-	status, err := host.Publish(servicehost.Manifest{ID: "paid", Command: "node", Args: []string{"/app/paid-server.mjs"}, Worker: &servicehost.Program{Command: "node", Args: []string{"/app/paid-worker.mjs"}}, Files: files, Network: "egress", EgressHosts: []string{"facilitator.example:80", "rpc.example:80"}, RequestTimeoutSeconds: 10})
+	status, err := host.Publish(servicehost.Manifest{ID: "paid", Command: "node", Args: []string{"paid-server.mjs"}, Worker: &servicehost.Program{Command: "node", Args: []string{"paid-worker.mjs"}}, Files: files, Network: "egress", EgressHosts: []string{"facilitator.example:80", "rpc.example:80"}, RequestTimeoutSeconds: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

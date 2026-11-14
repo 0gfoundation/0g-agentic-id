@@ -1,10 +1,12 @@
 // Package servicesandbox confines one hosted service process inside the
 // sandbox with no namespaces, no capability beyond the provider's six and no
 // provider change: a service identity of its own, rlimits set once it has left
-// root, oom_score_adj 1000, a Landlock domain and a seccomp filter. Landlock lets the process read only the system, its program and its
+// root, nice 19, oom_score_adj 1000, a Landlock domain and a seccomp filter.
+// Landlock lets the process read only the system, its program and its
 // runtime, write only its private directories, and keeps its abstract Unix
 // sockets and signals inside its own domain; it also refuses TCP. The seccomp
-// filter refuses inet, netlink and packet sockets and io_uring, so the only
+// filter allows only AF_UNIX sockets and refuses io_uring, System V IPC,
+// message queues, keyrings, x32 calls and clone with CLONE_PARENT, so the only
 // way out is a Unix socket sealed hands it. sealed/isolation/README.md records
 // what was measured on the dev runner.
 package servicesandbox

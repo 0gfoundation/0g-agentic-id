@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"seal-verify/internal/credproxy"
+	"seal-verify/internal/logger"
 	"seal-verify/internal/privsep"
 	"seal-verify/internal/serviceidentity"
 	"seal-verify/internal/servicesandbox"
@@ -40,6 +41,11 @@ type entry struct {
 	ControllerUID uint32 `json:"controller_uid,omitempty"`
 	controller    *coordinator
 	generation    uint64
+	// Restart bookkeeping (coordinator.go): the last retry delay, and the
+	// generation a keepCoordinator loop is retrying, if any.
+	restartDelay time.Duration
+	keeping      bool
+	keepingGen   uint64
 }
 
 type Manager struct {
@@ -64,6 +70,10 @@ type Manager struct {
 	probeAt                    time.Time
 	probeErr                   error
 	skipResourceLimitsForTests bool
+	// quarantined holds identities whose leftover processes could not be
+	// reaped at startup: never handed out, and a saved coordinator on one
+	// reports why it cannot start.
+	quarantined map[uint32]string
 }
 
 // Options is trusted Go wiring, never owner-controlled manifest configuration.
@@ -92,6 +102,18 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 	if binding == "" {
 		return nil, fmt.Errorf("service binding is required")
 	}
+	// A previous sealed in this container may have left service processes
+	// (the loader kills its descendants only when it runs as PID 1, and the
+	// runner starts sandboxes with --init). They hold identities and may still
+	// write their old directories: stop them before anything else, and never
+	// hand out an identity that could not be cleared.
+	quarantined := map[uint32]string{}
+	if !opts.SkipResourceLimitsForTests {
+		quarantined = reapLeftoverIdentities()
+		for uid, cause := range quarantined {
+			logger.Logf("service identity %d quarantined: leftover processes could not be stopped: %s", uid, cause)
+		}
+	}
 	if err := privsep.MkdirAll(base, 0700); err != nil {
 		return nil, err
 	}
@@ -103,7 +125,7 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 	if st.Uid != 0 || st.Mode&077 != 0 {
 		return nil, fmt.Errorf("service state must be root-owned 0700")
 	}
-	m := &Manager{base: base, binding: binding, entries: map[string]*entry{}, workers: map[uint32]*worker{}, executions: map[string]*execution{}, executionKeys: map[string]string{}, stopGC: make(chan struct{}), pendingInputs: map[string]pendingInput{}}
+	m := &Manager{base: base, binding: binding, entries: map[string]*entry{}, workers: map[uint32]*worker{}, executions: map[string]*execution{}, executionKeys: map[string]string{}, stopGC: make(chan struct{}), pendingInputs: map[string]pendingInput{}, quarantined: quarantined}
 	m.runtime = opts.AcquireRuntime
 	m.model = opts.ModelRoute
 	m.skipResourceLimitsForTests = opts.SkipResourceLimitsForTests
@@ -118,19 +140,16 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 		return nil, err
 	}
 	m.watcher = newResourceWatcher(m.stopGC, m.programs)
-	// A previous sealed in this container may have left service processes
-	// (the loader kills its descendants only when it runs as PID 1, and the
-	// runner starts sandboxes with --init). They hold identities and may still
-	// write their old directories, so none may survive into this manager.
-	if err := reapLeftoverIdentities(); err != nil {
-		return nil, err
-	}
 	// Never resume a request or any caller-provided runtime input after reboot.
-	if err := privsep.RemoveAll(filepath.Join(m.programs, taskDirName)); err != nil {
-		return nil, err
-	}
-	if err := privsep.MkdirAll(filepath.Join(m.programs, taskDirName), 0755); err != nil {
-		return nil, err
+	// Old task and socket directories go aside and are removed in the
+	// background, however many entries a service left in them.
+	for _, name := range []string{taskDirName, runDirName} {
+		if err := discardDir(filepath.Join(m.programs, name)); err != nil {
+			return nil, err
+		}
+		if err := privsep.MkdirAll(filepath.Join(m.programs, name), 0755); err != nil {
+			return nil, err
+		}
 	}
 	b, err := privsep.ReadFile(filepath.Join(base, "registry.json"), privsep.LimitConfig)
 	if err != nil && !os.IsNotExist(err) {
@@ -203,6 +222,9 @@ func (m *Manager) persistLocked() error {
 func (m *Manager) Publish(man Manifest) (Status, error) {
 	v, err := man.normalize()
 	if err != nil {
+		return Status{}, err
+	}
+	if err := man.checkPublish(); err != nil {
 		return Status{}, err
 	}
 	// Decode and bound the bundle before touching durable state.
@@ -360,15 +382,17 @@ func (m *Manager) Start(id string) (Status, error) {
 		return Status{}, err
 	}
 	e.State = "starting"
+	e.restartDelay = 0
 	coordinated := e.Manifest.Worker != nil
+	gen := e.generation
 	m.mu.Unlock()
 	if coordinated {
-		err := m.startCoordinator(id)
+		err := m.launchCoordinator(e, gen)
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		return e.Status, err
 	}
-	err := m.admission(context.Background())
+	err := m.admission()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !e.Desired || m.closed {
@@ -389,16 +413,23 @@ func setAdmissionFailure(e *entry, err error) {
 	}
 }
 
+// drawRandom fills b with random bytes (a variable so a test can script the
+// draws).
+var drawRandom = func(b []byte) error {
+	_, err := rand.Read(b)
+	return err
+}
+
 // allocateIdentityLocked draws an unused service identity at random:
 // identities of different sandboxes then meet only by chance (serviceidentity).
 func (m *Manager) allocateIdentityLocked() (uint32, error) {
 	for i := 0; i < 64; i++ {
 		var b [4]byte
-		if _, err := rand.Read(b[:]); err != nil {
+		if err := drawRandom(b[:]); err != nil {
 			return 0, err
 		}
 		uid := serviceidentity.Draw(binary.BigEndian.Uint32(b[:]))
-		if m.workers[uid] != nil || m.controllerLocked(uid) {
+		if m.workers[uid] != nil || m.controllerLocked(uid) || m.quarantined[uid] != "" {
 			continue
 		}
 		return uid, nil
@@ -421,7 +452,7 @@ func privateDir(dir string, uid uint32) error {
 	if err := privsep.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	if err := os.Chown(dir, int(uid), int(uid)); err != nil {
+	if err := os.Lchown(dir, int(uid), int(uid)); err != nil {
 		return err
 	}
 	return privsep.Chmod(dir, 0700)
@@ -458,6 +489,9 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 	}
 	program := filepath.Join(m.programs, e.ID, "versions", e.Version)
 	run := filepath.Join(taskDir, "run")
+	if kind == coordinatorCommand {
+		run = m.coordinatorRunDir(uid)
+	}
 	work := filepath.Join(taskDir, "work")
 	tmp := filepath.Join(taskDir, "tmp")
 	if kind != coordinatorCommand {
@@ -536,14 +570,20 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 	if err != nil {
 		return nil, err
 	}
+	// The run directory is counted too: each entry is at least one block, so
+	// sockets left there cannot pile up inodes unseen.
 	c := &isolatedCommand{Cmd: cmd, uid: uid, runtimeHash: lease.Hash, release: lease.Release, watcher: m.watcher,
-		limits: limits{residentBytes: int64(e.Manifest.ResidentMemoryMB) << 20, diskDirs: []string{work, tmp}, diskBytes: 2 * temporaryFilesystemBytes}}
+		limits: limits{residentBytes: int64(e.Manifest.ResidentMemoryMB) << 20, diskDirs: []string{work, tmp, run}, diskBytes: 2 * temporaryFilesystemBytes}}
 	if kind == coordinatorCommand {
 		// The coordinator's work directory is its durable business state.
 		c.limits.diskBytes = coordinatorStateBytes + temporaryFilesystemBytes
 	}
 	return c, nil
 }
+
+// stopWait is how long Stop waits for a service's processes before it
+// reports "stopping" (a variable for tests).
+var stopWait = 10 * time.Second
 
 func (m *Manager) Stop(id string) (Status, error) {
 	m.mu.Lock()
@@ -576,9 +616,9 @@ func (m *Manager) Stop(id string) (Status, error) {
 	m.mu.Unlock()
 	// Processes are killed at once; only an identity whose reap keeps failing
 	// stays pinned. Report that instead of blocking the caller indefinitely.
-	deadline := time.NewTimer(10 * time.Second)
+	deadline := time.NewTimer(stopWait)
 	defer deadline.Stop()
-	for _, d := range taskWaits {
+	for i, d := range taskWaits {
 		select {
 		case <-d:
 		case <-deadline.C:
@@ -588,6 +628,18 @@ func (m *Manager) Stop(id string) (Status, error) {
 			}
 			out = e.Status
 			m.mu.Unlock()
+			// Report stopped once the last of them is gone.
+			rest := taskWaits[i:]
+			go func() {
+				for _, d := range rest {
+					<-d
+				}
+				m.mu.Lock()
+				if !e.Desired && e.State == "stopping" {
+					e.State, e.Error = "stopped", ""
+				}
+				m.mu.Unlock()
+			}()
 			return out, nil
 		}
 	}
@@ -598,20 +650,26 @@ func (m *Manager) Stop(id string) (Status, error) {
 // owner binding. Published versions and desired states survive a reboot.
 func (m *Manager) Resume() {
 	m.mu.Lock()
-	var coordinated, plain []string
+	type wanted struct {
+		e   *entry
+		gen uint64
+	}
+	var coordinated []wanted
+	var plain []string
 	for id, e := range m.entries {
-		if !e.Desired {
+		// A coordinator the owner started before Resume keeps its state.
+		if !e.Desired || e.controller != nil {
 			continue
 		}
 		e.State = "starting"
 		if e.Manifest.Worker != nil {
-			coordinated = append(coordinated, id)
+			coordinated = append(coordinated, wanted{e, e.generation})
 		} else {
 			plain = append(plain, id)
 		}
 	}
 	m.mu.Unlock()
-	probeErr := m.admission(context.Background())
+	probeErr := m.admission()
 	m.mu.Lock()
 	for _, id := range plain {
 		if e := m.entries[id]; e != nil && e.Desired && !m.closed {
@@ -623,8 +681,8 @@ func (m *Manager) Resume() {
 		}
 	}
 	m.mu.Unlock()
-	for _, id := range coordinated {
-		_ = m.startCoordinator(id)
+	for _, w := range coordinated {
+		_ = m.launchCoordinator(w.e, w.gen)
 	}
 }
 
@@ -650,10 +708,15 @@ func (m *Manager) Close() {
 		e.State = "stopped"
 	}
 	m.mu.Unlock()
+	// Every process was cancelled at once; wait for them together, with one
+	// deadline for all.
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
 	for _, d := range waits {
 		select {
 		case <-d:
-		case <-time.After(5 * time.Second):
+		case <-deadline.C:
+			return
 		}
 	}
 }

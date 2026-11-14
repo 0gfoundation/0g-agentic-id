@@ -148,8 +148,10 @@ func ProbeIsolation(ctx context.Context) error {
 }
 
 // admission caches the probe: the kernel and the container's policy do not
-// change while sealed runs. A failure is retried after a minute.
-func (m *Manager) admission(ctx context.Context) error {
+// change while sealed runs. A failure is retried after a minute. The probe
+// runs on its own context, so a caller that went away is never cached as the
+// kernel's answer for every service.
+func (m *Manager) admission() error {
 	if m.skipResourceLimitsForTests {
 		return nil
 	}
@@ -163,7 +165,9 @@ func (m *Manager) admission(ctx context.Context) error {
 		ttl = time.Minute
 	}
 	if m.probeAt.IsZero() || time.Since(m.probeAt) > ttl {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		m.probeErr, m.probeAt = ProbeIsolation(ctx), time.Now()
+		cancel()
 	}
 	return m.probeErr
 }
@@ -175,7 +179,7 @@ var ErrDiskLow = errors.New("sandbox disk space is low; service processes are re
 // prepareLaunch does the slow part of starting a service process (probe, free
 // space, runtime listing and pin) without the manager lock.
 func (m *Manager) prepareLaunch(ctx context.Context) (RuntimeLease, error) {
-	if err := m.admission(ctx); err != nil {
+	if err := m.admission(); err != nil {
 		return RuntimeLease{}, err
 	}
 	if diskLow(m.programs) {

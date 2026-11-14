@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"seal-verify/internal/framework"
+	"seal-verify/internal/inferproxy"
 	"seal-verify/internal/servicehost"
 )
 
@@ -62,6 +64,32 @@ func TestExecutionReceiptHasIndependentUnforgeableDomain(t *testing.T) {
 	if _, err := s.signExecutionReceipt(status, profile); err == nil {
 		t.Fatal("missing trust domain still signed")
 	}
+}
+
+// The largest receipt sealed signs (32 egress hosts of 253 characters, every
+// other field at its longest) stays within the 16 KiB the Harness verifier
+// accepts (service-store.mjs MAX_RECEIPT_BYTES).
+func TestLargestExecutionReceiptFitsTheHarnessBound(t *testing.T) {
+	s, _ := armedProxy(t, "http://localhost", testValidator)
+	code := -2147483648
+	status := servicehost.ExecutionStatus{Handle: strings.Repeat("a", 64), Service: strings.Repeat("s", 32), Key: "1234567890123-" + strings.Repeat("k", 48),
+		Version: strings.Repeat("b", 64), InputHash: strings.Repeat("i", 64), State: "exited", StartedAt: 1 << 62, Deadline: 1 << 62, FinishedAt: 1 << 62,
+		ExitCode: &code, Reason: "resource_cleanup_failed", OutputBytes: 1 << 20, OutputHash: strings.Repeat("c", 64), UID: 64999}
+	hosts := make([]string, 32)
+	for i := range hosts {
+		hosts[i] = fmt.Sprintf("%0*d.example:65535", 253-8, i)
+	}
+	profile := servicehost.IsolationProfile{Driver: "landlock-v1", WorkerRuntimeHash: strings.Repeat("w", 64), LandlockABI: 7, FilesystemAllowlist: true, ProcHidden: true,
+		SignalScoped: true, AbstractSocketScoped: true, ReadOnlyCode: true, TemporaryWork: true, Network: "egress", EgressHosts: hosts,
+		VirtualMemoryMB: 16384, ResidentMemoryMB: 4096, Processes: 256, TimeoutSeconds: 3600, InferenceBudget: &inferproxy.TaskLimits{Calls: 64, InputBytes: 16 << 20, OutputTokens: 8192}}
+	token, err := s.signExecutionReceipt(status, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(token) > 16<<10 {
+		t.Fatalf("largest receipt is %d bytes, over 16 KiB", len(token))
+	}
+	t.Logf("largest receipt: %d bytes", len(token))
 }
 
 func TestHarnessServiceIngressFailsClosed(t *testing.T) {

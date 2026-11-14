@@ -2,6 +2,7 @@ package servicehost
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -44,11 +45,10 @@ func TestIdentitiesAreDrawnAtRandomAndNeverShared(t *testing.T) {
 		seen[uid] = true
 		m.workers[uid] = &worker{}
 	}
-	m.entries["svc"] = &entry{ControllerUID: serviceidentity.Base}
 	for range 256 {
 		uid, err := m.allocateIdentityLocked()
-		if err != nil || seen[uid] || uid == serviceidentity.Base {
-			t.Fatalf("reused an identity in use: %d %v", uid, err)
+		if err != nil || seen[uid] || uid == serviceidentity.Probe {
+			t.Fatalf("reused an identity in use or the probe's: %d %v", uid, err)
 		}
 	}
 	// Fixed slots (51000.. in every sandbox) would share RLIMIT_NPROC across
@@ -58,6 +58,25 @@ func TestIdentitiesAreDrawnAtRandomAndNeverShared(t *testing.T) {
 	c, _ := m.allocateIdentityLocked()
 	if b == a+1 && c == b+1 {
 		t.Fatal("identities look sequential")
+	}
+}
+
+// Scripted draws: a coordinator's, a worker's and a quarantined identity
+// come up first and are each skipped for the free one after them.
+func TestIdentityAllocationSkipsIdentitiesInUse(t *testing.T) {
+	controller, busy, held, free := uint32(serviceidentity.Base+11), uint32(serviceidentity.Base+12), uint32(serviceidentity.Base+13), uint32(serviceidentity.Base+14)
+	m := &Manager{workers: map[uint32]*worker{busy: {}}, entries: map[string]*entry{"svc": {ControllerUID: controller}}, quarantined: map[uint32]string{held: "fixture"}}
+	draws := []uint32{controller, busy, held, free}
+	old := drawRandom
+	drawRandom = func(b []byte) error {
+		binary.BigEndian.PutUint32(b, draws[0]-serviceidentity.Base-1) // Draw maps r to Base+1+r
+		draws = draws[1:]
+		return nil
+	}
+	defer func() { drawRandom = old }()
+	uid, err := m.allocateIdentityLocked()
+	if err != nil || uid != free {
+		t.Fatalf("allocated %d (%v), want the free identity %d", uid, err, free)
 	}
 }
 

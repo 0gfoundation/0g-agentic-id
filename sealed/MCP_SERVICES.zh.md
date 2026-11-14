@@ -47,18 +47,21 @@ start/stop/logs 接收 id。不公开管理接口。logs 为空：服务/请求�
 每个服务进程都用自己的服务身份运行，从容器 UID 20001–64999 中随机抽取（20000 留给隔离
 探测）；provider 的 UID/GID 映射必须覆盖 20000–64999。内核按 UID 在同一 runner 的所有沙箱之间合计 `RLIMIT_NPROC`
 （在 dev runner 上实测），固定编号会让一个沙箱的进程卡住另一个沙箱。可信 launcher 清除
-附加组、切换 UID/GID、启用 no-new-privs、把 `oom_score_adj` 设为 1000，再用 Landlock
-（ABI 6 及以上）和 seccomp 过滤器限制进程，然后才执行解释器：
+附加组、切换 UID/GID、启用 no-new-privs、把 `oom_score_adj` 设为 1000、nice 设为 19（`RLIMIT_NICE`
+为 0，始终排在 sealed 和 owner 之后），再用 Landlock（ABI 6 及以上）和 seccomp 过滤器限制进程，
+然后才执行解释器：
 
 - Landlock 只允许它读取并执行镜像的系统目录、自己的版本和租用的 Harness 运行包，读取
   `/etc/resolv.conf`、`/etc/hosts`、`/etc/ssl/certs`，使用 `/dev/null`、`zero`、`full`、
-  `random`、`urandom`，在私有 run 目录里创建 socket（只能建 socket，sealed 要连的 socket
-  不能被换成链接），只在自己私有的 `$HOME` 和 `$TMPDIR` 里写（以及建文件、链接、socket，
+  `random`、`urandom`，在私有 run 目录里列目录、建 socket、删除条目（不能建文件或链接，
+  sealed 要连的 socket 不能被换成链接），只在自己私有的 `$HOME` 和 `$TMPDIR` 里写（以及建文件、链接、socket，
   执行其中的程序）。`/proc` 不可读，TCP bind/connect 被拒绝，抽象 Unix socket 和信号只能
   到达它自己的进程。
 - seccomp 过滤器只允许 `AF_UNIX` 协议族的 socket；拒绝 io_uring、System V IPC、POSIX
   消息队列和内核 keyring（这些对象比进程活得久，或会留给下一个用同一 UID 的任务）以及所有
-  x32 调用；`fallocate` 返回 EOPNOTSUPP，占用磁盘只能靠写入，而写入受单文件上限约束。
+  x32 调用；拒绝带 `CLONE_PARENT` 的 `clone`（子进程会挂到 sealed 下，sealed 不回收它，它会
+  变成僵尸一直占该身份的计数），`clone3` 返回 ENOSYS，libc 因而改用 `clone`；`fallocate` 返回
+  EOPNOTSUPP，占用磁盘只能靠写入，而写入受单文件上限约束。
 
 owner 家目录/状态、sealed 状态、sign/reveal socket、其他 worker 的文件都访问不到。sealed
 交给进程的 Unix socket 归它的身份所有；其他路径型 socket 仍按文件权限控制，Landlock 不管。
@@ -69,25 +72,31 @@ provider 不需要任何改动：dev runner（内核 6.17、Landlock ABI 7、Sys
 六项 capability、Docker 默认 seccomp）全部满足，见 [isolation/README.zh.md](isolation/README.zh.md)。
 
 默认 `network:"none"`；`network:"egress"` 必须指定 1–32 个 `host:port`
-格式的 egress_hosts。私有 Unix HTTP/CONNECT 代理只允许这些目标，并拒绝私网、
-loopback、link-local、metadata IP，包括 DNS 解析结果。服务进程没有自己的网络 socket；
-它的 loopback 是整个容器共用的（owner 也在上面），所以不在上面监听。Node 自动加载镜像
-引导（Node >=24.14），把 `fetch` 以 CONNECT 隧道经 Unix 代理发出；其他语言需自行连接
-Unix 代理。不继承 owner 凭证代理。
+格式的 egress_hosts，主机名最多 253 个字符。私有 Unix HTTP/CONNECT 代理只允许这些目标，并拒绝私网、
+loopback、link-local、metadata IP，包括 DNS 解析结果。服务进程没有自己的网络 socket：
+sealed 在容器 loopback（owner 也共用）上的监听端口它连不到，因为 inet socket 和 TCP connect
+都被拒绝。Node 自动加载租用运行包里的引导（`$HARNESS_RUNTIME_ROOT/src/service-network.mjs`，
+Node >=24.14），把 `fetch` 以 CONNECT 隧道经 Unix 代理发出；基于 `node:http`/`https` 的客户端
+没有出口，其他语言需自行连接 Unix 代理。不继承 owner 凭证代理。
 
 单进程 rlimit：虚拟地址空间（默认 8192 MiB，128–16384）、每个身份的进程和线程数（默认 64，
-1–256，`node` 至少 16）、256 描述符和单文件 64 MiB。所有服务进程合计最多 2048 个进程和线程：
+1–256；命令或 worker 是 `node` 时至少 16，发布时检查）、256 描述符和单文件 64 MiB。所有服务进程合计最多 2048 个进程和线程：
 每个运行中的请求、执行和服务进程按自己的 `processes` 上限占用额度，额度不够的启动会被拒绝。
 sealed 每 500 ms 读取该身份的驻留内存（resident_memory_mb，默认 256 MiB，64–4096），每 2 s
-统计私有 `$HOME` 和 `$TMPDIR` 下实际分配的块（临时 worker 两者合计 128 MiB；服务进程合计
-576 MiB，其 `$HOME` 是持久业务状态），超过即杀掉该身份。同样每 2 s，任务目录所在文件系统
-剩余空间不足 1 GiB 时，sealed 停掉所有服务进程并拒绝新的启动；这也会回收遍历看不到的空间，
-比如已删除但仍打开的文件。这些是监视，不是内核限额：两次读取之间的瞬时峰值可能越过。内存
-紧张时内核 OOM 先杀服务进程（`oom_score_adj` 1000），Landlock 使它们无法调低。清理时
+统计私有 `$HOME`、`$TMPDIR` 和 run 目录下实际分配的块，每个条目至少按 4 KiB 计（临时 worker
+合计 128 MiB；服务进程合计 576 MiB，其 `$HOME` 是持久业务状态），超过即杀掉该身份。同样每 2 s，
+任务目录所在文件系统剩余空间不足 1 GiB 或剩余 inode 不足 65536 个时，sealed 停掉所有服务进程
+并拒绝新的启动；这也会回收遍历看不到的空间，比如已删除但仍打开的文件。这些是监视，不是内核
+限额：两次读取之间的瞬时峰值可能越过。不驻留在任何进程里的内存（写入但未映射的 memfd、管道
+缓冲）只受沙箱内存上限约束。内存紧张时内核 OOM 先杀服务进程（`oom_score_adj` 1000），Landlock
+使它们无法调低。清理时
 launcher 切换到该身份给它的所有进程发信号（子进程改不了身份，重新挂靠或新会话都逃不掉），
 再由 root 确认一个不剩，才复用身份和解除运行包锁定。sealed 启动时先停掉所有服务身份的进程：
 容器里上一个 sealed 可能留下了进程，因为 loader 只有作为 PID 1 时才会清理它的后代，而 runner
-用 `--init` 启动沙箱。这不提供独立 CPU 分配或磁盘配额，仍受外围沙箱限制。worker 在 EOF、terminate、超时（默认 300 秒，1–3600）、stop 或转移时结束。
+用 `--init` 启动沙箱。清不掉的身份被隔离：不再分配，存在它上面的服务进程会报告无法启动的原因。
+期望运行的服务进程退出或启动失败后，2 s 后重试，启动后一分钟内反复失败时间隔加倍、最多 60 s；
+此时状态为 `restarting`，错误里是原因（超限、`readiness_timeout`、`coordinator_exit` 或接纳错误）。
+这不提供独立 CPU 分配或磁盘配额，仍受外围沙箱限制。worker 在 EOF、terminate、超时（默认 300 秒，1–3600）、stop 或转移时结束。
 断线会终止单次请求 worker；异步任务不随提交它的 HTTP 连接结束，继续由服务进程管理。
 
 0g-harness/dsh 只保留 `/api/mcp/` 给托管服务，该路径在 hosting 不可用时也不能回退到旧后端。
@@ -108,7 +117,10 @@ provider 可以在创建沙箱时另配端口，服务发布本身不授予此�
 不增加雇主 vault、reveal 审批、续期/writeback、私有输入持久化。值不经过 owner 常驻
 Harness，不自动进模型消息，不注册到 owner credential scrubber。任务代码可能泄露
 自己读取的内容，调用者必须信任代码；隔离不能向代码作者隐藏输入。检查源码并将交付绑定到
-已核验版本，让这个信任关系明确。ServeProof 不绑定此 header。
+已核验版本，让这个信任关系明确。ServeProof 不绑定此 header。服务进程的持久 `$HOME` 在各个
+发布版本之间保留同一身份和目录，所以 owner 之后发布的版本能读到之前版本存在里面的内容（比如
+收费服务的任务输入和结果）；私有输入从不存进去。调用者的信任要覆盖之后会读取这些状态的版本，
+不只是自己核验过的那一个。
 
 ## 任务的模型调用通道
 
@@ -117,7 +129,7 @@ Harness，不自动进模型消息，不注册到 owner credential scrubber。�
 上游失败也计数。worker 生命周期取消调用，单次响应流限 8 MiB。
 socket 固定 owner 当前解析的 HTTPS provider/model，真实模型密钥只在 sealed 内注入。
 不提供凭证查询、签名、跟随重定向或任意上游路由；服务管理进程拿不到该 socket。
-`network:"none"` 也可使用。Node 引导设置 SEAL_MODEL_URL、SEAL_MODEL_ID、SEAL_MODEL_API；
+`network:"none"` 也可使用。sealed 设置 SEAL_MODEL_ID、SEAL_MODEL_API，Node 引导设置 SEAL_MODEL_URL；
 Harness mountServiceModel 使用公开占位符，拿不到真实密钥。其他语言可对私有 Unix socket 发 HTTP。
 这些限制约束请求和请求的输出上限，不等于实际 token 用量或货币支出额度；定价、退款仍属于应用。
 
@@ -171,8 +183,9 @@ x402 **不是付款和交付的跨系统原子公平交换**。保存结果让�
 ## 验证
 
 以 root 分别在没有/有 agent 用户时运行，设置 SEALED_PRIVSEP_TESTS=1。
-SEALED_LANDLOCK_TESTS=1（internal/servicesandbox）测限制本身：文件、`/proc`、`oom_score_adj`、run 目录里的链接、
-inet/UDP socket、对域外的信号和抽象 socket，以及按身份清理。
+SEALED_LANDLOCK_TESTS=1（internal/servicesandbox）测限制本身：文件、`/proc`、`oom_score_adj`、nice、run 目录里的链接、
+inet/UDP、SMC 和 vsock socket、System V IPC、消息队列、keyring、`fallocate`、带 `CLONE_PARENT` 的 `clone`、
+对域外的信号和抽象 socket，以及按身份清理。
 SEALED_SERVICE_TESTS=1 测真实限制、身份、stdin、去重、限额、取消、原子私有输入交接、反复 Stop/Start 和回收。
 SEALED_LOOP_TESTS=1 加测公开 DSH/tool 链路和完整收费 MCP 链路：真实 SDK/签名、钱包
 隔离、并发重试、私有 stdin、进度、取消、证明校验/拒绝篡改及广播前/后的结算响应丢失。

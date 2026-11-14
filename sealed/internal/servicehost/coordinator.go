@@ -9,12 +9,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"seal-verify/internal/privsep"
@@ -26,13 +28,40 @@ type coordinator struct {
 	done   chan struct{}
 	server *http.Server
 	cmd    *isolatedCommand
+	// held marks a coordinator whose start failed: it only keeps the identity
+	// until cleanup is proven. started and reason are set under m.mu.
+	held    bool
+	started time.Time
+	reason  string // why it ended, when sealed ended it: a limit or readiness_timeout
+}
+
+const (
+	minRestartDelay = 2 * time.Second
+	maxRestartDelay = 60 * time.Second
+	// A coordinator that stayed up this long restarts after minRestartDelay
+	// again; one that keeps failing sooner backs off up to maxRestartDelay.
+	stableCoordinator = 60 * time.Second
+)
+
+func nextRestartDelay(prev, uptime time.Duration) time.Duration {
+	if uptime >= stableCoordinator || prev < minRestartDelay {
+		return minRestartDelay
+	}
+	return min(2*prev, maxRestartDelay)
 }
 
 func (m *Manager) coordinatorDir(id string) string {
 	return filepath.Join(m.programs, id, "coordinator")
 }
-func (m *Manager) coordinatorSocket(id string) string {
-	return filepath.Join(m.coordinatorDir(id), "run", "service.sock")
+
+// coordinatorRunDir holds a coordinator's sockets. It is keyed by identity
+// under a short root, so every socket path stays within the 107 bytes a Unix
+// socket address allows whatever the service id (TestSocketPathsFit).
+func (m *Manager) coordinatorRunDir(uid uint32) string {
+	return filepath.Join(m.programs, runDirName, strconv.FormatUint(uint64(uid), 10))
+}
+func (m *Manager) coordinatorSocket(uid uint32) string {
+	return filepath.Join(m.coordinatorRunDir(uid), "service.sock")
 }
 
 func (m *Manager) prepareCoordinatorWork(e *entry) error {
@@ -44,30 +73,112 @@ func (m *Manager) prepareCoordinatorWork(e *entry) error {
 	if err := privsep.MkdirAll(work, 0700); err != nil {
 		return err
 	}
-	return os.Chown(work, int(e.ControllerUID), int(e.ControllerUID))
+	return os.Lchown(work, int(e.ControllerUID), int(e.ControllerUID))
 }
 
-// startCoordinator does the slow preparation (probe, runtime pin) without the
-// manager lock, then starts the coordinator under it if the service is still
-// wanted. Admission failures are recorded on the entry.
-func (m *Manager) startCoordinator(id string) error {
+// errCoordinatorHeld reports a previous coordinator of the entry whose
+// identity is still being cleaned up.
+var errCoordinatorHeld = errors.New("the previous coordinator is still being cleaned up")
+
+// startCoordinator makes one attempt for this generation of e: the slow
+// preparation (probe, free space, runtime pin) runs without the manager lock,
+// the start under it, and only while the entry is still wanted. A failure is
+// recorded on the entry.
+func (m *Manager) startCoordinator(e *entry, gen uint64) error {
 	lease, err := m.prepareLaunch(context.Background())
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	e := m.entries[id]
-	if e == nil || !e.Desired || m.closed || e.controller != nil {
+	if m.entries[e.ID] != e || e.generation != gen || !e.Desired || m.closed || e.controller != nil {
 		if err == nil {
 			lease.Release()
 		}
+		if e.controller != nil && e.controller.held {
+			return errCoordinatorHeld
+		}
 		return nil
+	}
+	if err == nil {
+		if cause := m.quarantined[e.ControllerUID]; cause != "" {
+			lease.Release()
+			err = fmt.Errorf("coordinator identity %d is quarantined: %s", e.ControllerUID, cause)
+		}
 	}
 	if err == nil {
 		err = m.startCoordinatorLocked(e, lease)
 	}
 	if err != nil {
-		setAdmissionFailure(e, err)
+		e.State, e.Error = "restarting", err.Error()
+		if errors.Is(err, ErrIsolationUnavailable) {
+			e.State = "unsupported"
+		}
 	}
 	return err
+}
+
+// launchCoordinator makes the first attempt now and, if it fails, keeps
+// trying in the background.
+func (m *Manager) launchCoordinator(e *entry, gen uint64) error {
+	err := m.startCoordinator(e, gen)
+	if err != nil {
+		go m.keepCoordinator(e, gen, minRestartDelay)
+	}
+	return err
+}
+
+// keepCoordinator retries a wanted coordinator's start, backing off from
+// delay up to maxRestartDelay, for as long as this generation of e stays
+// wanted: admission can fail for a while (free space, the process budget, a
+// probe or a runtime listing), and a failed start holds its identity until
+// cleanup is proven. Stop, Close and Publish end it; a started coordinator's
+// supervisor takes over (a start advances the generation).
+func (m *Manager) keepCoordinator(e *entry, gen uint64, delay time.Duration) {
+	m.mu.Lock()
+	if e.keeping && e.keepingGen == gen {
+		m.mu.Unlock()
+		return
+	}
+	e.keeping, e.keepingGen = true, gen
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		if e.keepingGen == gen {
+			e.keeping = false
+		}
+		m.mu.Unlock()
+	}()
+	for {
+		m.mu.Lock()
+		if m.entries[e.ID] != e || e.generation != gen || !e.Desired || m.closed {
+			m.mu.Unlock()
+			return
+		}
+		var held chan struct{}
+		if c := e.controller; c != nil {
+			if !c.held {
+				m.mu.Unlock()
+				return
+			}
+			held = c.done
+		}
+		e.restartDelay = delay
+		m.mu.Unlock()
+		if held != nil {
+			select {
+			case <-held:
+			case <-m.stopGC:
+				return
+			}
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-m.stopGC:
+			timer.Stop()
+			return
+		}
+		_ = m.startCoordinator(e, gen)
+		delay = min(2*delay, maxRestartDelay)
+	}
 }
 
 // startCoordinatorLocked owns lease: released on failure, else after the
@@ -89,14 +200,11 @@ func (m *Manager) startCoordinatorLocked(e *entry, lease RuntimeLease) (err erro
 		return ErrProcessBudget
 	}
 	base := m.coordinatorDir(e.ID)
-	run := filepath.Join(base, "run")
-	if err := privsep.RemoveAll(run); err != nil {
+	run := m.coordinatorRunDir(e.ControllerUID)
+	if err := discardDir(run); err != nil {
 		return err
 	}
-	if err := privsep.MkdirAll(run, 0700); err != nil {
-		return err
-	}
-	if err := os.Chown(run, int(e.ControllerUID), int(e.ControllerUID)); err != nil {
+	if err := privateDir(run, e.ControllerUID); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -107,7 +215,7 @@ func (m *Manager) startCoordinatorLocked(e *entry, lease RuntimeLease) (err erro
 		cancel()
 		return err
 	}
-	if err = os.Chown(socket, int(e.ControllerUID), int(e.ControllerUID)); err != nil {
+	if err = os.Lchown(socket, int(e.ControllerUID), int(e.ControllerUID)); err != nil {
 		cancel()
 		ln.Close()
 		return err
@@ -131,7 +239,7 @@ func (m *Manager) startCoordinatorLocked(e *entry, lease RuntimeLease) (err erro
 		}
 		cmd.onLimit = func(reason string) {
 			m.mu.Lock()
-			e.Error = reason
+			c.reason, e.Error = reason, reason
 			m.mu.Unlock()
 		}
 		err = cmd.Start()
@@ -142,7 +250,7 @@ func (m *Manager) startCoordinatorLocked(e *entry, lease RuntimeLease) (err erro
 		m.holdFailedCoordinator(e, c, cmd)
 		return fmt.Errorf("start isolated coordinator: %w", err)
 	}
-	c.cmd = cmd
+	c.cmd, c.started = cmd, time.Now()
 	e.generation++
 	gen := e.generation
 	e.controller, e.State, e.Error = c, "starting", ""
@@ -156,7 +264,7 @@ func (m *Manager) holdFailedCoordinator(e *entry, c *coordinator, cmd *isolatedC
 	if cmd == nil || cmd.resourcesReleased() {
 		return
 	}
-	c.cmd = cmd
+	c.cmd, c.held = cmd, true
 	e.controller = c
 	go func() {
 		<-cmd.cleanupDone
@@ -184,10 +292,15 @@ func (m *Manager) superviseCoordinator(ctx context.Context, e *entry, c *coordin
 			case <-c.done:
 				return
 			case <-deadline.C:
+				m.mu.Lock()
+				if c.reason == "" {
+					c.reason = "readiness_timeout"
+				}
+				m.mu.Unlock()
 				c.cancel()
 				return
 			case <-tick.C:
-				conn, err := net.DialTimeout("unix", m.coordinatorSocket(e.ID), 20*time.Millisecond)
+				conn, err := net.DialTimeout("unix", m.coordinatorSocket(e.ControllerUID), 20*time.Millisecond)
 				if err != nil {
 					continue
 				}
@@ -209,9 +322,16 @@ func (m *Manager) superviseCoordinator(ctx context.Context, e *entry, c *coordin
 	if e.controller == c {
 		e.controller = nil
 	}
-	restart := e.generation == gen && e.Desired && !m.closed
+	restart := m.entries[e.ID] == e && e.generation == gen && e.Desired && !m.closed
+	var delay time.Duration
 	if restart {
-		e.State, e.Error = "restarting", "coordinator_exit"
+		// The reason sealed ended it (a limit, readiness) stays visible.
+		reason := c.reason
+		if reason == "" {
+			reason = "coordinator_exit"
+		}
+		e.State, e.Error = "restarting", reason
+		delay = nextRestartDelay(e.restartDelay, time.Since(c.started))
 	} else if err != nil && e.State != "stopped" {
 		e.State = "stopped"
 	}
@@ -220,21 +340,8 @@ func (m *Manager) superviseCoordinator(ctx context.Context, e *entry, c *coordin
 	// controller/state first so Start cannot mistake an exited process for a
 	// live one. Cancellation already stops the readiness watcher above.
 	close(c.done)
-	if !restart {
-		return
-	}
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-m.stopGC:
-		return
-	case <-timer.C:
-	}
-	m.mu.Lock()
-	again := e.generation == gen && e.Desired && !m.closed
-	m.mu.Unlock()
-	if again {
-		_ = m.startCoordinator(e.ID)
+	if restart {
+		m.keepCoordinator(e, gen, delay)
 	}
 }
 
@@ -280,9 +387,13 @@ func (t *taskTransport) coordinatorRoundTrip(req *http.Request) (*http.Response,
 	m.mu.Lock()
 	e = m.entries[t.id]
 	ready = e != nil && e.Desired && e.State == "running" && e.Version == version && !m.closed
+	var uid uint32
+	if ready {
+		uid = e.ControllerUID
+	}
 	m.mu.Unlock()
 	if !ready {
 		return response(req, 503, "service release admission changed"), nil
 	}
-	return Client(m.coordinatorSocket(t.id)).Transport.RoundTrip(req)
+	return Client(m.coordinatorSocket(uid)).Transport.RoundTrip(req)
 }

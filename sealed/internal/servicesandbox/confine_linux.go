@@ -190,7 +190,12 @@ func (b *bpf) assemble() ([]unix.SockFilter, error) {
 // hands the service), refuses refusedCalls and every x32 call, and answers
 // fallocate with EOPNOTSUPP: fallocate can reserve blocks past RLIMIT_FSIZE
 // without growing the file, while callers such as glibc's posix_fallocate fall
-// back to writes, which RLIMIT_FSIZE bounds. Any other architecture is killed.
+// back to writes, which RLIMIT_FSIZE bounds. clone with CLONE_PARENT is
+// refused: its child would be sealed's, which never waits for it, so once
+// killed it would stay a zombie counting against the identity's
+// RLIMIT_NPROC. clone3 answers ENOSYS (its flags are out of the filter's
+// reach), so libc falls back to clone, as under Docker's default profile.
+// Any other architecture is killed.
 func serviceFilter() ([]unix.SockFilter, error) {
 	arch, ok := auditArch[runtime.GOARCH]
 	if !ok {
@@ -200,6 +205,7 @@ func serviceFilter() ([]unix.SockFilter, error) {
 		ld   = unix.BPF_LD | unix.BPF_W | unix.BPF_ABS
 		jeq  = unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K
 		jge  = unix.BPF_JMP | unix.BPF_JGE | unix.BPF_K
+		jset = unix.BPF_JMP | unix.BPF_JSET | unix.BPF_K
 		ret  = unix.BPF_RET | unix.BPF_K
 		nr   = 0  // offsetof(struct seccomp_data, nr)
 		arc  = 4  // offsetof(struct seccomp_data, arch)
@@ -216,8 +222,13 @@ func serviceFilter() ([]unix.SockFilter, error) {
 		b.jump(jeq, n, "deny", "")
 	}
 	b.jump(jeq, unix.SYS_FALLOCATE, "unsupported", "")
+	b.jump(jeq, unix.SYS_CLONE3, "nosys", "")
+	b.jump(jeq, unix.SYS_CLONE, "clone", "")
 	b.jump(jeq, unix.SYS_SOCKET, "family", "")
 	b.jump(jeq, unix.SYS_SOCKETPAIR, "family", "allow")
+	b.label("clone")
+	b.stmt(ld, arg0) // clone's flags, on amd64 and arm64 alike
+	b.jump(jset, unix.CLONE_PARENT, "deny", "allow")
 	b.label("family")
 	b.stmt(ld, arg0)
 	b.jump(jeq, unix.AF_UNIX, "allow", "deny")
@@ -227,6 +238,8 @@ func serviceFilter() ([]unix.SockFilter, error) {
 	b.stmt(ret, unix.SECCOMP_RET_ERRNO|uint32(unix.EPERM))
 	b.label("unsupported")
 	b.stmt(ret, unix.SECCOMP_RET_ERRNO|uint32(unix.EOPNOTSUPP))
+	b.label("nosys")
+	b.stmt(ret, unix.SECCOMP_RET_ERRNO|uint32(unix.ENOSYS))
 	b.label("kill")
 	b.stmt(ret, unix.SECCOMP_RET_KILL_PROCESS)
 	return b.assemble()
@@ -286,6 +299,19 @@ func applyLimits(l Limits) error {
 	return nil
 }
 
+// demote sets nice 19 on the calling thread, which execve keeps, and takes
+// away the right to lower it again (RLIMIT_NICE 0), so service processes
+// yield the CPU to sealed and the owner Harness.
+func demote() error {
+	if err := unix.Setrlimit(unix.RLIMIT_NICE, &unix.Rlimit{}); err != nil {
+		return fmt.Errorf("rlimit nice: %w", err)
+	}
+	if err := unix.Setpriority(unix.PRIO_PROCESS, 0, 19); err != nil {
+		return fmt.Errorf("nice: %w", err)
+	}
+	return nil
+}
+
 // confine applies the whole policy to the calling thread and process. The
 // caller must have locked the goroutine to its OS thread: no_new_privs,
 // Landlock and seccomp attach to the thread that later calls execve.
@@ -315,6 +341,9 @@ func confine(p Policy) error {
 		return err
 	}
 	if err := applyLimits(p.Limits); err != nil {
+		return err
+	}
+	if err := demote(); err != nil {
 		return err
 	}
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {

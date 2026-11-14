@@ -63,22 +63,26 @@ provider's UID/GID maps must include 20000–64999.
 The kernel counts `RLIMIT_NPROC` per UID across every sandbox of a runner
 (measured on the dev runner), so fixed slots would let one sandbox's processes
 block another's. The trusted launcher clears supplementary groups, drops UID/GID,
-sets no-new-privs and `oom_score_adj` 1000, then confines the process with Landlock
-(ABI 6 or later) and a seccomp filter before executing the interpreter:
+sets no-new-privs, `oom_score_adj` 1000 and nice 19 (with `RLIMIT_NICE` 0, so it
+stays behind sealed and the owner), then confines the process with Landlock (ABI 6
+or later) and a seccomp filter before executing the interpreter:
 
 - Landlock lets it read and execute only the image's system directories, its
   release and the leased Harness runtime, read `/etc/resolv.conf`, `/etc/hosts`
   and `/etc/ssl/certs`, use `/dev/null`, `zero`, `full`, `random`, `urandom`,
-  create sockets in its private run directory (and nothing else there, so a
-  socket sealed dials cannot become a link), and write (and create files,
+  list its private run directory, create sockets and remove entries there (no
+  file or link, so a socket sealed dials cannot become a link), and write (and create files,
   links and sockets in, and execute from) only its private `$HOME` and
   `$TMPDIR`. `/proc` is unreadable. TCP bind and connect are refused. Abstract
   Unix sockets and signals reach only its own processes.
 - The seccomp filter allows sockets of family `AF_UNIX` only; refuses io_uring,
   System V IPC, POSIX message queues and kernel keyrings (objects that outlive
-  the process, or reach the next task at the same UID) and every x32 call; and
-  answers `fallocate` with EOPNOTSUPP, so writes, which the file-size limit
-  bounds, are the only way to take disk space.
+  the process, or reach the next task at the same UID) and every x32 call;
+  refuses `clone` with `CLONE_PARENT` (its child would be sealed's, which never
+  waits for it, and would stay a zombie counting against the identity) and
+  answers `clone3` with ENOSYS, so libc uses `clone`; and answers `fallocate`
+  with EOPNOTSUPP, so writes, which the file-size limit bounds, are the only way
+  to take disk space.
 
 Owner home/state, sealed state, sign/reveal sockets and other workers' files are
 unreachable. Unix sockets sealed hands the process are owned by its identity;
@@ -94,37 +98,47 @@ capabilities, Docker's default seccomp) provides all of it; see
 [isolation/README.md](isolation/README.md).
 
 `network:"none"` is default. `network:"egress"` requires 1–32 explicit
-`egress_hosts` as `host:port`. A private Unix HTTP/CONNECT proxy permits only
+`egress_hosts` as `host:port`, a host at most 253 characters. A private Unix HTTP/CONNECT proxy permits only
 those destinations and rejects private, loopback, link-local and metadata IPs,
-including DNS answers. A service process has no network socket of its own; its
-loopback would be the container's, shared with the owner, so nothing listens
-there. Node automatically loads the image bootstrap (Node >=24.14), which routes
-`fetch` through the Unix proxy as CONNECT tunnels; other runtimes must speak to
-the Unix proxy themselves. Owner credential proxies are never inherited.
+including DNS answers. A service process has no network socket of its own:
+sealed's listeners on the container's loopback (shared with the owner) stay out
+of reach, since inet sockets and TCP connect are refused. Node automatically
+loads the leased runtime's bootstrap (`$HARNESS_RUNTIME_ROOT/src/service-network.mjs`,
+Node >=24.14), which routes `fetch` through the Unix proxy as CONNECT tunnels;
+clients built on `node:http`/`https` have no route, and other runtimes must speak
+to the Unix proxy themselves. Owner credential proxies are never inherited.
 
 Per-process rlimits: virtual address space (8192 MiB default, 128–16384),
-processes and threads per identity (64 default, 1–256, at least 16 for `node`),
+processes and threads per identity (64 default, 1–256; at least 16 when the
+command or the worker is `node`, checked when a release is published),
 256 descriptors and 64 MiB/file. All service processes together hold at most
 2048 processes and threads: each running request, execution and coordinator
 reserves its `processes` limit, and a launch the budget cannot hold is refused.
 Sealed reads the identity's resident memory every 500 ms (`resident_memory_mb`,
-default 256 MiB, 64–4096) and the blocks allocated below its private `$HOME`
-and `$TMPDIR` every 2 s (128 MiB together for a temporary worker; 576 MiB for a
-coordinator, whose `$HOME` is durable application state), and kills the
-identity over a limit. On the same 2 s tick, while the filesystem holding the
-task directories has less than 1 GiB free, sealed stops every service process
-and refuses new ones; that also reclaims space no walk sees, such as files
-deleted while still open. These are watched, not kernel limits: a burst between
-two reads can pass them. Under memory pressure the kernel's OOM killer takes
-service processes first (`oom_score_adj` 1000), and Landlock keeps them from
-lowering it. Cleanup becomes the identity and signals every process of it (a
+default 256 MiB, 64–4096) and the blocks allocated below its private `$HOME`,
+`$TMPDIR` and run directory every 2 s, each entry counting at least 4 KiB
+(128 MiB together for a temporary worker; 576 MiB for a coordinator, whose
+`$HOME` is durable application state), and kills the identity over a limit. On
+the same 2 s tick, while the filesystem holding the task directories has less
+than 1 GiB or 65536 inodes free, sealed stops every service process and refuses
+new ones; that also reclaims space no walk sees, such as files deleted while
+still open. These are watched, not kernel limits: a burst between two reads can
+pass them. Memory no process has resident (a memfd written but not mapped, pipe
+buffers) is bounded only by the sandbox's memory limit. Under memory pressure
+the kernel's OOM killer takes service processes first (`oom_score_adj` 1000),
+and Landlock keeps them from lowering it. Cleanup becomes the identity and signals every process of it (a
 descendant cannot change identity, so none escapes by re-parenting or a new
 session), then confirms from root that none remains before reusing the identity
 or unpinning the runtime. A starting sealed first stops every process of any
 service identity: a previous sealed in the container may have left some, since
 the loader stops its descendants only as PID 1 and the runner starts sandboxes
-with `--init`. This is not a separate CPU allocation or a disk quota; the
-sandbox's outer limits still apply. Workers end at EOF, terminate, timeout
+with `--init`. An identity it cannot clear is quarantined: never handed out, and
+a coordinator saved on it reports why it does not start. A wanted coordinator
+that exits or cannot start is retried after 2 s, doubling up to 60 s while it
+keeps failing within a minute of starting; its state is then `restarting`, with
+the cause (a limit, `readiness_timeout`, `coordinator_exit` or the admission
+error). This is not a separate CPU allocation or a disk quota; the sandbox's
+outer limits still apply. Workers end at EOF, terminate, timeout
 (300 seconds default, 1–3600), stop or transfer. Disconnect cancels a one-shot
 request worker; a detached job survives its submitting HTTP connection and is
 managed by the coordinator.
@@ -156,6 +170,11 @@ model messages. They are not registered with the owner credential scrubber.
 The task program can disclose what it reads and must be trusted; process isolation
 does not hide input from its own code author. Auditing source and binding delivery
 to its version makes that trust explicit. ServeProof does not bind this header.
+A coordinator's durable `$HOME` keeps its identity and directory across published
+versions, so a later version the owner publishes can read what earlier versions
+stored there (a paid service's task inputs and results, for example); private
+input is never stored there. Callers' trust covers the versions that will read
+that state, not only the one they audited.
 
 ## Task-funded model access
 
@@ -166,9 +185,9 @@ count too. The worker's lifetime cancels requests; response streams cap at 8 MiB
 The socket fixes the owner's currently resolved HTTPS provider/model and injects
 the real model key only inside sealed. It offers no credential lookup, signing,
 redirect following or arbitrary upstream routing; coordinators receive no socket.
-The route works with `network:"none"`. Node's bootstrap sets `SEAL_MODEL_URL`,
-`SEAL_MODEL_ID` and `SEAL_MODEL_API`; Harness `mountServiceModel` uses a public
-placeholder instead of a real key. Other runtimes can speak HTTP to the private
+The route works with `network:"none"`. Sealed sets `SEAL_MODEL_ID` and
+`SEAL_MODEL_API`, and the Node bootstrap sets `SEAL_MODEL_URL`; Harness
+`mountServiceModel` uses a public placeholder instead of a real key. Other runtimes can speak HTTP to the private
 Unix socket. These limits bound requests and requested output, not actual token
 usage or currency spend; pricing and refunds remain application policy.
 
@@ -239,8 +258,10 @@ Neither execution receipts nor HTTP proofs remove this limitation.
 
 Run root suites without/with the agent account and `SEALED_PRIVSEP_TESTS=1`.
 `SEALED_LANDLOCK_TESTS=1` (internal/servicesandbox) checks the confinement itself:
-files, `/proc`, `oom_score_adj`, links in the run directory, inet/UDP sockets,
-signals and abstract sockets outside the domain, and cleanup by identity.
+files, `/proc`, `oom_score_adj`, nice, links in the run directory, inet/UDP,
+SMC and vsock sockets, System V IPC, message queues, keyrings, `fallocate`,
+`clone` with `CLONE_PARENT`, signals and abstract sockets outside the domain,
+and cleanup by identity.
 `SEALED_SERVICE_TESTS=1` checks real confinement, identities, stdin, deduplication, limits,
 cancellation, atomic private-input handoff, repeated Stop/Start and GC. `SEALED_LOOP_TESTS=1` adds the public DSH/tool path and a
 complete paid MCP path: real SDKs/signatures, wallet isolation, concurrent retry,

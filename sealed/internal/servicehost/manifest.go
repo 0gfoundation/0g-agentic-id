@@ -23,6 +23,10 @@ const MaxServices = 16
 
 const minNodeProcesses = 16
 
+// maxHostLength is the longest DNS name, which bounds the signed receipt and
+// the execution record that carry the egress hosts.
+const maxHostLength = 253
+
 var validID = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 var validEnv = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 
@@ -63,6 +67,23 @@ type Manifest struct {
 	InferenceBudget *inferproxy.TaskLimits `json:"inference_budget,omitempty"`
 	// Bounds temporary request/task workers, never the service coordinator.
 	RequestTimeoutSeconds int `json:"request_timeout_seconds,omitempty"`
+}
+
+// checkPublish holds the rules Publish applies to a new release on top of
+// normalize. Loading a saved service does not apply them, so a release saved
+// before them still loads (and fails at start, if at all) instead of taking
+// every service down.
+func (m *Manifest) checkPublish() error {
+	for _, addr := range m.EgressHosts {
+		if h, _, _ := net.SplitHostPort(addr); len(h) > maxHostLength {
+			return fmt.Errorf("egress_hosts: a host name has at most %d characters", maxHostLength)
+		}
+	}
+	// RLIMIT_NPROC counts threads: Node starts about a dozen before any code.
+	if m.Processes < minNodeProcesses && (m.Command == "node" || (m.Worker != nil && m.Worker.Command == "node")) {
+		return fmt.Errorf("processes must be at least %d when the command or the worker is node", minNodeProcesses)
+	}
+	return nil
 }
 
 func (m *Manifest) normalize() (string, error) {
@@ -143,10 +164,6 @@ func (m *Manifest) normalize() (string, error) {
 	}
 	if m.MemoryMB < 128 || m.MemoryMB > 16384 || m.Processes < 1 || m.Processes > 256 {
 		return "", fmt.Errorf("resource limits out of range")
-	}
-	// RLIMIT_NPROC counts threads: Node starts about a dozen before any code.
-	if m.Command == "node" && m.Processes < minNodeProcesses {
-		return "", fmt.Errorf("processes must be at least %d for node", minNodeProcesses)
 	}
 	if len(m.Files) == 0 || len(m.Files) > MaxFiles {
 		return "", fmt.Errorf("give 1..%d files", MaxFiles)

@@ -2,6 +2,10 @@ package servicehost
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -11,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"seal-verify/internal/inferproxy"
+	"seal-verify/internal/privsep"
 	"seal-verify/internal/serviceidentity"
 	"seal-verify/internal/servicesandbox"
 )
@@ -55,16 +61,121 @@ func TestDiskUsageCountsAllocatedBlocksAndFollowsNoLink(t *testing.T) {
 	}
 }
 
-func TestNodeNeedsSixteenProcesses(t *testing.T) {
-	m := manifest("demo", "x")
-	m.Command, m.Processes = "node", minNodeProcesses-1
-	if _, err := m.normalize(); err == nil {
-		t.Fatal("accepted node with too few processes")
+// Sockets a service binds and closes stay as directory entries; each counts
+// at least one block, so a run directory cannot pile up inodes unseen.
+func TestDiskUsageCountsSocketEntries(t *testing.T) {
+	dir := t.TempDir()
+	for i := range 64 {
+		ln, err := net.Listen("unix", filepath.Join(dir, fmt.Sprintf("s%d", i)))
+		if err != nil {
+			t.Skipf("cannot bind a unix socket here: %v", err)
+		}
+		ln.(*net.UnixListener).SetUnlinkOnClose(false)
+		ln.Close()
 	}
-	m.Processes = minNodeProcesses
-	if _, err := m.normalize(); err != nil {
+	if got := diskUsage([]string{dir}, 1<<40); got < 64*4096 {
+		t.Fatalf("64 socket entries counted %d bytes", got)
+	}
+}
+
+// Every socket path sealed binds or hands a service must fit a Unix socket
+// address (107 bytes and a NUL) with the longest service id and identity.
+func TestSocketPathsFit(t *testing.T) {
+	programID := sha256.Sum256([]byte("/any/services/base"))
+	m := &Manager{programs: fmt.Sprintf("/var/lib/sealed-service-programs/%x", programID[:8])}
+	coordinator := m.coordinatorRunDir(serviceidentity.Base + serviceidentity.Count - 1)
+	task := filepath.Join(m.programs, taskDirName, "e-4294967295", "run") // os.MkdirTemp's longest suffix
+	for _, dir := range []string{coordinator, task} {
+		for _, name := range []string{"service.sock", "control.sock", "egress.sock", "model.sock"} {
+			if p := filepath.Join(dir, name); len(p) > 107 {
+				t.Errorf("%s is %d bytes", p, len(p))
+			}
+		}
+	}
+}
+
+func TestPublishRulesApplyToNewReleasesOnly(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		edit func(*Manifest)
+		ok   bool
+	}{
+		{"node with too few processes", func(m *Manifest) { m.Command, m.Processes = "node", minNodeProcesses-1 }, false},
+		{"node worker with too few processes", func(m *Manifest) {
+			m.Worker, m.Processes = &Program{Command: "node", Args: []string{"w.mjs"}}, minNodeProcesses-1
+		}, false},
+		{"node with enough processes", func(m *Manifest) {
+			m.Command, m.Worker, m.Processes = "node", &Program{Command: "node", Args: []string{"w.mjs"}}, minNodeProcesses
+		}, true},
+		{"egress host too long", func(m *Manifest) {
+			m.Network, m.EgressHosts = "egress", []string{strings.Repeat("a", maxHostLength-4) + ".com" + "x:443"}
+		}, false},
+		{"longest egress host", func(m *Manifest) {
+			m.Network, m.EgressHosts = "egress", []string{strings.Repeat("a", maxHostLength-4) + ".com:443"}
+		}, true},
+	} {
+		m := manifest("demo", "x")
+		c.edit(&m)
+		if _, err := m.normalize(); err != nil {
+			t.Fatalf("%s: normalize: %v", c.name, err)
+		}
+		if err := m.checkPublish(); (err == nil) != c.ok {
+			t.Errorf("%s: checkPublish %v", c.name, err)
+		}
+	}
+	// A release saved before these rules still loads.
+	root(t)
+	base := filepath.Join(t.TempDir(), "services")
+	if err := os.MkdirAll(base, 0700); err != nil {
 		t.Fatal(err)
 	}
+	legacy := manifest("legacy", "x")
+	legacy.Command, legacy.Processes = "node", 8
+	v, err := legacy.normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, _ := json.Marshal(map[string]any{"binding": "owner:identity", "entries": []*entry{{Manifest: legacy, Status: Status{ID: "legacy", Version: v}}}})
+	if err := os.WriteFile(filepath.Join(base, "registry.json"), saved, 0600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := newTestManager(base, "owner:identity")
+	if err != nil {
+		t.Fatalf("a saved release failed to load: %v", err)
+	}
+	defer m.Close()
+	if _, ok := m.Match("/api/mcp/legacy"); !ok {
+		t.Fatal("saved release missing")
+	}
+}
+
+// The largest saved execution record, with a receipt as large as the
+// Harness accepts, stays within the record cap that restore reads.
+func TestLargestExecutionRecordFits(t *testing.T) {
+	man := manifest("abcdefghijklmnopqrstuvwxyz012345", "x")
+	man.Network = "egress"
+	for i := range 32 {
+		man.EgressHosts = append(man.EgressHosts, fmt.Sprintf("%0*d.example:65535", maxHostLength-8, i))
+	}
+	man.InferenceBudget = &inferproxy.TaskLimits{Calls: 64, InputBytes: 16 << 20, OutputTokens: 8192}
+	if _, err := man.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	code := -2147483648
+	status := ExecutionStatus{Handle: strings.Repeat("h", 64), Service: man.ID, Key: "1234567890123-" + strings.Repeat("k", 48), Version: strings.Repeat("v", 64),
+		InputHash: strings.Repeat("i", 64), State: "quarantined", StartedAt: 1 << 62, Deadline: 1 << 62, FinishedAt: 1 << 62, ExitCode: &code,
+		Reason: "resource_cleanup_failed", OutputBytes: MaxExecutionOutput, OutputHash: strings.Repeat("o", 64), OutputAvailable: true, UID: 64999,
+		Receipt: strings.Repeat("r", 16<<10)}
+	isolation := landlockProfile(man)
+	isolation.WorkerRuntimeHash = strings.Repeat("w", 64)
+	b, err := json.Marshal(executionRecord{"0x" + strings.Repeat("a", 40) + ":" + strings.Repeat("s", 64), status, isolation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) > maxExecutionRecordBytes {
+		t.Fatalf("largest record is %d bytes, cap %d", len(b), maxExecutionRecordBytes)
+	}
+	t.Logf("largest record: %d bytes", len(b))
 }
 
 func TestProcessBudgetRefusesRequests(t *testing.T) {
@@ -80,8 +191,10 @@ func TestProcessBudgetRefusesRequests(t *testing.T) {
 	if _, err := m.Start("task"); err != nil {
 		t.Fatal(err)
 	}
+	done := make(chan struct{})
+	close(done)
 	m.mu.Lock()
-	m.workers[1] = &worker{service: "other", processes: MaxServiceProcesses - 63}
+	m.workers[1] = &worker{service: "other", processes: MaxServiceProcesses - 63, cancel: func() {}, done: done}
 	m.mu.Unlock()
 	resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), "x", 0, testServiceVersion(m, "task")))
 	if err != nil {
@@ -96,6 +209,12 @@ func TestProcessBudgetRefusesRequests(t *testing.T) {
 	m.mu.Unlock()
 }
 
+func closedController() *coordinator {
+	done := make(chan struct{})
+	close(done)
+	return &coordinator{cancel: func() {}, done: done}
+}
+
 func TestPublishWaitsForCoordinatorCleanup(t *testing.T) {
 	root(t)
 	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
@@ -107,7 +226,7 @@ func TestPublishWaitsForCoordinatorCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.mu.Lock()
-	m.entries["task"].controller = &coordinator{}
+	m.entries["task"].controller = closedController()
 	m.mu.Unlock()
 	if _, err := m.Publish(manifest("task", "v2")); err == nil || !strings.Contains(err.Error(), "still being cleaned up") {
 		t.Fatalf("published over a coordinator being cleaned up: %v", err)
@@ -117,31 +236,166 @@ func TestPublishWaitsForCoordinatorCleanup(t *testing.T) {
 	m.mu.Unlock()
 }
 
+// Resume leaves alone a coordinator the owner started before it.
+func TestResumeKeepsARunningCoordinator(t *testing.T) {
+	root(t)
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if _, err := m.Publish(manifest("task", "v1")); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	e := m.entries["task"]
+	e.Desired, e.State, e.controller = true, "running", closedController()
+	m.mu.Unlock()
+	m.Resume()
+	m.mu.Lock()
+	state := e.State
+	e.controller = nil
+	m.mu.Unlock()
+	if state != "running" {
+		t.Fatalf("Resume set a running coordinator to %q", state)
+	}
+}
+
+// A coordinator that cannot start (here: its identity is quarantined) stays
+// wanted and is retried; the retry reports the next cause.
+func TestCoordinatorStartIsRetried(t *testing.T) {
+	root(t)
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	man := manifest("task", "x")
+	man.Worker = &Program{Command: "python3", Args: []string{"w.py"}}
+	if _, err := m.Publish(man); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	uid := m.entries["task"].ControllerUID
+	m.quarantined[uid] = "fixture"
+	m.mu.Unlock()
+	if _, err := m.Start("task"); err == nil || !strings.Contains(err.Error(), "quarantined") {
+		t.Fatalf("start of a quarantined coordinator: %v", err)
+	}
+	m.mu.Lock()
+	state := m.entries["task"].State
+	delete(m.quarantined, uid)
+	m.mu.Unlock()
+	if state != "restarting" {
+		t.Fatalf("state %q, want restarting", state)
+	}
+	deadline := time.Now().Add(minRestartDelay + 3*time.Second)
+	for {
+		m.mu.Lock()
+		e := m.entries["task"]
+		retried := !strings.Contains(e.Error, "quarantined") || e.controller != nil
+		m.mu.Unlock()
+		if retried {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the coordinator start was not retried")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestRestartDelayBacksOffAndResets(t *testing.T) {
+	for _, c := range []struct{ prev, uptime, want time.Duration }{
+		{0, time.Second, minRestartDelay},
+		{minRestartDelay, time.Second, 2 * minRestartDelay},
+		{40 * time.Second, time.Second, maxRestartDelay},
+		{maxRestartDelay, time.Second, maxRestartDelay},
+		{maxRestartDelay, stableCoordinator, minRestartDelay},
+	} {
+		if got := nextRestartDelay(c.prev, c.uptime); got != c.want {
+			t.Errorf("nextRestartDelay(%v, %v) = %v, want %v", c.prev, c.uptime, got, c.want)
+		}
+	}
+}
+
+// Stop reports "stopping" when processes outlive its wait, and "stopped"
+// once they are gone.
+func TestStoppingClearsWhenProcessesExit(t *testing.T) {
+	root(t)
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if _, err := m.Publish(manifest("task", "x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Start("task"); err != nil {
+		t.Fatal(err)
+	}
+	old := stopWait
+	stopWait = 50 * time.Millisecond
+	defer func() { stopWait = old }()
+	done := make(chan struct{})
+	m.mu.Lock()
+	m.workers[1] = &worker{service: "task", cancel: func() {}, done: done}
+	m.mu.Unlock()
+	s, err := m.Stop("task")
+	if err != nil || s.State != "stopping" {
+		t.Fatalf("Stop: %+v %v", s, err)
+	}
+	m.mu.Lock()
+	delete(m.workers, 1)
+	m.mu.Unlock()
+	close(done)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		m.mu.Lock()
+		state, msg := m.entries["task"].State, m.entries["task"].Error
+		m.mu.Unlock()
+		if state == "stopped" && msg == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("state %q (%q) after the processes exited", state, msg)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestDiscardDirReturnsBeforeRemoval(t *testing.T) {
 	root(t)
 	dir := filepath.Join(t.TempDir(), "tmp")
 	if err := os.MkdirAll(filepath.Join(dir, "a", "b"), 0700); err != nil {
 		t.Fatal(err)
 	}
+	var queued []string
+	old := removeInBackground
+	removeInBackground = func(p string) { queued = append(queued, p) }
+	defer func() { removeInBackground = old }()
 	if err := discardDir(dir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
 		t.Fatalf("directory still in place: %v", err)
 	}
+	// The removal was only queued: the moved tree is still whole.
+	if len(queued) != 1 || !strings.HasPrefix(queued[0], dir+".discard-") {
+		t.Fatalf("queued removals %v", queued)
+	}
+	if _, err := os.Lstat(filepath.Join(queued[0], "a", "b")); err != nil {
+		t.Fatalf("discarded tree was removed before discardDir returned: %v", err)
+	}
 	if err := discardDir(dir); err != nil {
 		t.Fatalf("missing directory: %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		left, _ := filepath.Glob(dir + ".discard-*")
-		if len(left) == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("discarded directories remain: %v", left)
-		}
-		time.Sleep(20 * time.Millisecond)
+	// A later discard sweeps what an earlier one left.
+	if len(queued) != 2 || queued[1] != queued[0] {
+		t.Fatalf("queued removals %v", queued)
+	}
+	if err := privsep.RemoveAll(queued[0]); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -163,12 +417,16 @@ func TestLeftoverIdentitiesAreReaped(t *testing.T) {
 	if n := servicesandbox.Scan(map[uint32]bool{uid: true})[uid].Processes; n < 2 {
 		t.Fatalf("fixture started %d processes", n)
 	}
-	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	// Production options: the startup reap runs (test managers skip it).
+	m, err := NewWithOptions(filepath.Join(t.TempDir(), "services"), "owner:identity", Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
 	if n := servicesandbox.Scan(map[uint32]bool{uid: true})[uid].Processes; n != 0 {
 		t.Fatalf("%d leftover processes survived the new manager", n)
+	}
+	if len(m.quarantined) != 0 {
+		t.Fatalf("quarantined %v", m.quarantined)
 	}
 }

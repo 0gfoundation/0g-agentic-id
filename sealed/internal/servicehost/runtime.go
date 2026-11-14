@@ -169,6 +169,10 @@ func reapIdentity(ctx context.Context, uid uint32) error {
 	return nil
 }
 
+// removeInBackground removes a discarded directory (a variable so a test can
+// show discardDir does not wait for it).
+var removeInBackground = func(path string) { go privsep.RemoveAll(path) }
+
 // discardDir moves dir aside and removes it in the background, so a service
 // that filled it cannot hold callers (some under the manager lock) for the
 // time a removal takes. Earlier discards left by a crash go the same way.
@@ -177,7 +181,7 @@ func discardDir(dir string) error {
 	if entries, err := privsep.ReadDir(parent); err == nil {
 		for _, e := range entries {
 			if strings.HasPrefix(e.Name(), name+".discard-") {
-				go privsep.RemoveAll(filepath.Join(parent, e.Name()))
+				removeInBackground(filepath.Join(parent, e.Name()))
 			}
 		}
 	}
@@ -192,22 +196,23 @@ func discardDir(dir string) error {
 		}
 		return err
 	}
-	go privsep.RemoveAll(aside)
+	removeInBackground(aside)
 	return nil
 }
 
 // reapLeftoverIdentities stops every process of any service identity, before
-// a manager hands identities out.
-func reapLeftoverIdentities() error {
+// a manager hands identities out. It returns the identities it could not
+// clear, with the cause, for the manager to quarantine.
+func reapLeftoverIdentities() map[uint32]string {
+	failed := map[uint32]string{}
 	for _, uid := range servicesandbox.Identities() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := reapIdentity(ctx, uid)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("leftover service processes: %w", err)
+		if err := reapIdentity(ctx, uid); err != nil {
+			failed[uid] = err.Error()
 		}
+		cancel()
 	}
-	return nil
+	return failed
 }
 
 func firstLine(b []byte) string {
@@ -300,14 +305,19 @@ func (w *resourceWatcher) loop() {
 	}
 }
 
+// diskReserveInodes is the floor of free inodes, for filesystems that
+// report a fixed inode count.
+const diskReserveInodes = 65536
+
 // diskLow reports whether the filesystem holding path has less than
-// diskReserveBytes available. An unreadable filesystem counts as low.
+// diskReserveBytes available or, where it counts inodes, fewer than
+// diskReserveInodes free. An unreadable filesystem counts as low.
 func diskLow(path string) bool {
 	var st unix.Statfs_t
 	if err := unix.Statfs(path, &st); err != nil {
 		return true
 	}
-	return int64(st.Bavail)*int64(st.Bsize) < diskReserveBytes
+	return int64(st.Bavail)*int64(st.Bsize) < diskReserveBytes || (st.Files > 0 && st.Ffree < diskReserveInodes)
 }
 
 // maxWalkDepth bounds how deep diskUsage descends (each level holds one open
@@ -316,8 +326,8 @@ const maxWalkDepth = 64
 
 // diskUsage sums the blocks allocated below dirs (st_blocks, so preallocated
 // and sparse files count what they occupy), stopping once the sum passes
-// stopAt. Each entry counts at least one 4 KiB block, so an identity cannot
-// exhaust inodes with empty files either. Each directory is opened relative
+// stopAt. Each entry (empty files, sockets, links) counts at least one 4 KiB
+// block, so the identity's entries in these directories are bounded too. Each directory is opened relative
 // to its parent with O_NOFOLLOW, so a service that swaps a directory for a
 // link cannot steer the walk outside its own tree.
 func diskUsage(dirs []string, stopAt int64) int64 {

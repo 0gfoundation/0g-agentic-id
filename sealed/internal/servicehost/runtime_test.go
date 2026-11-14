@@ -112,6 +112,7 @@ func TestFailedStartQuarantinesWorkerAndCoordinator(t *testing.T) {
 			var done <-chan struct{}
 			var controller *coordinator
 			var ent *entry
+			var failed *execution
 			if coordinatorCase {
 				ent = &entry{Status: Status{ID: "audit"}, ControllerUID: serviceidentity.Base + 3}
 				controller = &coordinator{cancel: func() {}, done: make(chan struct{})}
@@ -121,12 +122,16 @@ func TestFailedStartQuarantinesWorkerAndCoordinator(t *testing.T) {
 				m.mu.Unlock()
 				done = controller.done
 			} else {
-				e := &execution{ExecutionStatus: ExecutionStatus{Handle: strings.Repeat("c", 64), Service: "audit", State: "failed", UID: serviceidentity.Base + 9}, done: make(chan struct{})}
+				e := &execution{ExecutionStatus: ExecutionStatus{Handle: strings.Repeat("c", 64), Service: "audit", State: "failed", Reason: "start_failed", UID: serviceidentity.Base + 9}, done: make(chan struct{})}
 				m.workers[e.UID] = &worker{service: "audit", cancel: func() {}, done: e.done}
 				m.mu.Lock()
 				m.finishFailedExecutionStart(e, cmd)
+				// The worker never ran: a client may start the task again.
+				if e.State != "quarantined" || e.Reason != "start_failed" {
+					t.Errorf("failed start reported %s/%s, want quarantined/start_failed", e.State, e.Reason)
+				}
 				m.mu.Unlock()
-				done = e.done
+				done, failed = e.done, e
 			}
 			expectHeld(t, released, "failed-start runtime lease")
 			expectHeld(t, done, "failed-start identity")
@@ -150,6 +155,14 @@ func TestFailedStartQuarantinesWorkerAndCoordinator(t *testing.T) {
 			m.mu.Unlock()
 			if held {
 				t.Fatal("verified empty failed-start slot was not released")
+			}
+			if failed != nil {
+				m.mu.Lock()
+				state, reason := failed.State, failed.Reason
+				m.mu.Unlock()
+				if state != "failed" || reason != "start_failed" {
+					t.Errorf("released failed start reported %s/%s, want failed/start_failed", state, reason)
+				}
 			}
 		})
 	}

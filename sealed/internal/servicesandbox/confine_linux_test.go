@@ -38,10 +38,15 @@ func runFilter(t *testing.T, prog []unix.SockFilter, arch, nr uint32, arg0 uint3
 			default:
 				t.Fatalf("unexpected load offset %d", in.K)
 			}
-		case unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, unix.BPF_JMP | unix.BPF_JGE | unix.BPF_K:
-			taken := acc == in.K
-			if in.Code&0xf0 == unix.BPF_JGE {
+		case unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, unix.BPF_JMP | unix.BPF_JGE | unix.BPF_K, unix.BPF_JMP | unix.BPF_JSET | unix.BPF_K:
+			var taken bool
+			switch in.Code & 0xf0 {
+			case unix.BPF_JEQ:
+				taken = acc == in.K
+			case unix.BPF_JGE:
 				taken = acc >= in.K
+			case unix.BPF_JSET:
+				taken = acc&in.K != 0
 			}
 			if taken {
 				pc += int(in.Jt)
@@ -67,6 +72,9 @@ func TestServiceFilterDecisions(t *testing.T) {
 	allow := uint32(unix.SECCOMP_RET_ALLOW)
 	deny := uint32(unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM))
 	unsupported := uint32(unix.SECCOMP_RET_ERRNO | uint32(unix.EOPNOTSUPP))
+	// glibc's pthread_create flags.
+	const threadClone = unix.CLONE_VM | unix.CLONE_FS | unix.CLONE_FILES | unix.CLONE_SIGHAND | unix.CLONE_THREAD |
+		unix.CLONE_SYSVSEM | unix.CLONE_SETTLS | unix.CLONE_PARENT_SETTID | unix.CLONE_CHILD_CLEARTID
 	type decision struct {
 		name string
 		arch uint32
@@ -85,6 +93,11 @@ func TestServiceFilterDecisions(t *testing.T) {
 		{"vsock socket", arch, unix.SYS_SOCKET, unix.AF_VSOCK, deny},
 		{"inet socketpair", arch, unix.SYS_SOCKETPAIR, unix.AF_INET, deny},
 		{"fallocate", arch, unix.SYS_FALLOCATE, 3, unsupported},
+		{"clone3", arch, unix.SYS_CLONE3, 0, uint32(unix.SECCOMP_RET_ERRNO | uint32(unix.ENOSYS))},
+		{"clone with CLONE_PARENT", arch, unix.SYS_CLONE, unix.CLONE_PARENT | uint32(unix.SIGCHLD), deny},
+		{"thread clone with CLONE_PARENT", arch, unix.SYS_CLONE, threadClone | unix.CLONE_PARENT, deny},
+		{"fork-style clone", arch, unix.SYS_CLONE, unix.CLONE_CHILD_SETTID | unix.CLONE_CHILD_CLEARTID | uint32(unix.SIGCHLD), allow},
+		{"thread clone", arch, unix.SYS_CLONE, threadClone, allow},
 		{"read", arch, unix.SYS_READ, unix.AF_INET, allow},
 		{"connect", arch, unix.SYS_CONNECT, unix.AF_INET, allow},
 		{"write", arch, unix.SYS_WRITE, 0, allow},
@@ -144,7 +157,10 @@ out={'uid':os.getuid(),
  'shmget_errno':call_errno(calls['shmget'],L(0),L(4096),L(0o1600)),
  'mq_open_errno':call_errno(calls['mq_open'],ctypes.c_char_p(b'/sealed-q'),L(0o102),L(0o600),None),
  'keyctl_errno':call_errno(calls['keyctl'],L(0),L(-4),L(1)),
- 'fallocate_errno':call_errno(calls['fallocate'],L(fd),L(1),L(0),L(1<<30))}
+ 'fallocate_errno':call_errno(calls['fallocate'],L(fd),L(1),L(0),L(1<<30)),
+ 'clone_parent_errno':call_errno(calls['clone'],L(calls['clone_parent_sigchld']),L(0),L(0),L(0),L(0)),
+ 'nice':os.nice(0),
+ 'renice_refused':refused(lambda:os.nice(-1))}
 print(json.dumps(out))
 `
 
@@ -243,7 +259,8 @@ func TestConfinedProcess(t *testing.T) {
 	defer func() { _ = outsider.Process.Kill(); _ = outsider.Wait() }()
 	// x32 calls are covered by TestServiceFilterDecisions: under Docker's
 	// default profile one kills the calling thread before this filter answers.
-	calls, _ := json.Marshal(map[string]int{"shmget": unix.SYS_SHMGET, "mq_open": unix.SYS_MQ_OPEN, "keyctl": unix.SYS_KEYCTL, "fallocate": unix.SYS_FALLOCATE})
+	calls, _ := json.Marshal(map[string]int{"shmget": unix.SYS_SHMGET, "mq_open": unix.SYS_MQ_OPEN, "keyctl": unix.SYS_KEYCTL, "fallocate": unix.SYS_FALLOCATE,
+		"clone": unix.SYS_CLONE, "clone_parent_sigchld": unix.CLONE_PARENT | int(unix.SIGCHLD)})
 	p := Policy{UID: uid, ReadExec: []string{"/usr", release}, SocketDirs: []string{run}, ReadWrite: []string{work, tmp}, Dir: release, Program: python,
 		Env:  []string{"HOME=" + work, "TMPDIR=" + tmp, "RUN=" + run, "OUTSIDE=" + outside, "OUTSIDE_PID=" + strconv.Itoa(outsider.Process.Pid), "ABSTRACT=" + abstract, "CALLS=" + string(calls)},
 		Args: []string{"checks.py"}}
@@ -267,7 +284,8 @@ func TestConfinedProcess(t *testing.T) {
 		"write_home": true, "write_tmp_shared": false, "write_release": false, "symlink_in_run": false, "socket_in_run": true,
 		"inet": false, "udp": false, "signal_outside": false, "abstract_outside": false, "unix_pair": true,
 		"smc_errno": float64(unix.EPERM), "vsock_errno": float64(unix.EPERM), "shmget_errno": float64(unix.EPERM), "mq_open_errno": float64(unix.EPERM),
-		"keyctl_errno": float64(unix.EPERM), "fallocate_errno": float64(unix.EOPNOTSUPP)}
+		"keyctl_errno": float64(unix.EPERM), "fallocate_errno": float64(unix.EOPNOTSUPP), "clone_parent_errno": float64(unix.EPERM),
+		"nice": float64(19), "renice_refused": true}
 	for k, v := range want {
 		if got[k] != v {
 			t.Errorf("%s = %v, want %v (%s)", k, got[k], v, out)

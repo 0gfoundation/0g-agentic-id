@@ -24,12 +24,12 @@ func TestPublishedReleaseIsSignedWithoutInvokingStoppedProgram(t *testing.T) {
 	called := false
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true; w.WriteHeader(500) }))
 	defer backend.Close()
-	host, err := servicehost.New(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	host, err := servicehost.NewWithOptions(filepath.Join(t.TempDir(), "services"), "owner:identity", servicehost.Options{SkipResourceLimitsForTests: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer host.Close()
-	status, err := host.Publish(servicehost.Manifest{ID: "audit", Command: "python3", Args: []string{"/app/main.py"}, Files: []servicehost.File{{Path: "main.py", Data: base64.StdEncoding.EncodeToString([]byte("print('public source')"))}}})
+	status, err := host.Publish(servicehost.Manifest{ID: "audit", Command: "python3", Args: []string{"main.py"}, Files: []servicehost.File{{Path: "main.py", Data: base64.StdEncoding.EncodeToString([]byte("print('public source')"))}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,12 +94,12 @@ func TestReleaseAuditConcurrencyIncludesSlowResponseWrites(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root-owned service publication")
 	}
-	host, err := servicehost.New(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	host, err := servicehost.NewWithOptions(filepath.Join(t.TempDir(), "services"), "owner:identity", servicehost.Options{SkipResourceLimitsForTests: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer host.Close()
-	if _, err := host.Publish(servicehost.Manifest{ID: "audit", Command: "python3", Args: []string{"/app/main.py"}, Files: []servicehost.File{{Path: "main.py", Data: base64.StdEncoding.EncodeToString([]byte("print('public source')"))}}}); err != nil {
+	if _, err := host.Publish(servicehost.Manifest{ID: "audit", Command: "python3", Args: []string{"main.py"}, Files: []servicehost.File{{Path: "main.py", Data: base64.StdEncoding.EncodeToString([]byte("print('public source')"))}}}); err != nil {
 		t.Fatal(err)
 	}
 	s, _ := armedProxy(t, "http://localhost", testValidator)

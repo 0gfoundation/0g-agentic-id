@@ -36,7 +36,7 @@ func (m *Manager) startModel(ctx context.Context, limits inferproxy.TaskLimits, 
 	if err != nil {
 		return ModelRoute{}, err
 	}
-	if err = os.Chown(socket, int(uid), int(uid)); err == nil {
+	if err = os.Lchown(socket, int(uid), int(uid)); err == nil {
 		err = privsep.Chmod(socket, 0600)
 	}
 	if err != nil {

@@ -585,7 +585,14 @@ func inheritOwner(parentfd, fd int, emptyPath bool) error {
 // caller owns that name, and something else sitting there must not keep
 // the file from being written.
 func WriteFile(path string, data []byte, perm fs.FileMode) error {
-	_, err := WriteFileFrom(path, bytes.NewReader(data), perm)
+	_, err := writeFileFrom(path, bytes.NewReader(data), perm, false)
+	return err
+}
+
+// WriteFileSync is WriteFile that survives a crash once it returns: the file
+// is synced before the rename and its directory after it.
+func WriteFileSync(path string, data []byte, perm fs.FileMode) error {
+	_, err := writeFileFrom(path, bytes.NewReader(data), perm, true)
 	return err
 }
 
@@ -593,6 +600,10 @@ func WriteFile(path string, data []byte, perm fs.FileMode) error {
 // held in memory. It returns the number of bytes written. A read error from
 // r leaves the destination untouched.
 func WriteFileFrom(path string, r io.Reader, perm fs.FileMode) (int64, error) {
+	return writeFileFrom(path, r, perm, false)
+}
+
+func writeFileFrom(path string, r io.Reader, perm fs.FileMode, durable bool) (int64, error) {
 	pfd, base, err := openParent("write", path)
 	if err != nil {
 		return 0, err
@@ -618,6 +629,12 @@ func WriteFileFrom(path string, r io.Reader, perm fs.FileMode) (int64, error) {
 		f.Close()
 		return n, pathErr("write", path, err)
 	}
+	if durable {
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return n, pathErr("write", path, err)
+		}
+	}
 	if err := finishWrite(f, pfd, perm); err != nil {
 		return n, pathErr("write", path, err)
 	}
@@ -634,6 +651,18 @@ func WriteFileFrom(path string, r io.Reader, perm fs.FileMode) (int64, error) {
 		return n, pathErr("write", path, err)
 	}
 	done = true
+	if durable {
+		// The parent was opened O_PATH; fsync needs a readable descriptor.
+		dfd, err := unix.Openat(pfd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return n, pathErr("write", path, err)
+		}
+		err = unix.Fsync(dfd)
+		unix.Close(dfd)
+		if err != nil {
+			return n, pathErr("write", path, err)
+		}
+	}
 	return n, nil
 }
 

@@ -812,6 +812,23 @@ func TestWriteFileFromStreams(t *testing.T) {
 	}
 }
 
+func TestWriteFileSyncWritesAndReplaces(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "record.json")
+	for _, data := range []string{"first", "second"} {
+		if err := WriteFileSync(p, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(p)
+		if err != nil || string(b) != data {
+			t.Fatalf("read %q, %v; want %q", b, err, data)
+		}
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".*sealed-tmp-*")); len(left) != 0 {
+		t.Fatalf("temp files left: %v", left)
+	}
+}
+
 type iotestErrReader struct{}
 
 func (iotestErrReader) Read([]byte) (int, error) { return 0, errors.New("simulated read error") }

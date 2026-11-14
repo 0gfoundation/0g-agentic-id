@@ -111,21 +111,22 @@ func (s *Server) serviceHostTools() []sealmcp.Tool {
 	}
 	manifest := obj(map[string]any{
 		"id":                      str("Lowercase service name, up to 32 characters; public endpoint /api/mcp/<id>."),
-		"command":                 str("Trusted image interpreter name, e.g. node. Runs inside a sandbox, never as sealed."),
-		"args":                    map[string]any{"type": "array", "items": str("Interpreter argument, e.g. /app/server.mjs.")},
+		"command":                 str("Trusted image interpreter name, e.g. node. Runs at a service identity of its own, never as sealed."),
+		"args":                    map[string]any{"type": "array", "items": str("Interpreter argument; files are relative to the release directory, which is the working directory and read-only, e.g. server.mjs.")},
 		"files":                   map[string]any{"type": "array", "items": obj(map[string]any{"path": str("Relative release file path."), "data": str("Standard base64 file bytes.")}, "path", "data")},
 		"description":             str("Short public service description."),
 		"env":                     map[string]any{"type": "object", "additionalProperties": true, "description": "Non-secret program configuration; string values. Never put credentials in tool arguments."},
 		"worker":                  obj(map[string]any{"command": str("Trusted image interpreter for isolated task execution."), "args": map[string]any{"type": "array", "items": str("Worker interpreter argument.")}}, "command", "args"),
-		"network":                 map[string]any{"type": "string", "enum": []string{"none", "egress"}, "description": "Programs always have private networking. egress permits only public destinations in egress_hosts through a restricted Unix proxy."},
-		"egress_hosts":            map[string]any{"type": "array", "maxItems": 32, "items": str("Explicit allowed host:port, for example api.example:443. Private/loopback addresses remain blocked.")},
+		"network":                 map[string]any{"type": "string", "enum": []string{"none", "egress"}, "description": "Programs have no network socket of their own. egress reaches only the public destinations in egress_hosts, through sealed's Unix-socket proxy (Node's fetch uses it automatically)."},
+		"egress_hosts":            map[string]any{"type": "array", "maxItems": 32, "items": str("Explicit allowed host:port, host at most 253 characters, for example api.example:443. Private/loopback addresses remain blocked.")},
 		"memory_mb":               map[string]any{"type": "integer", "description": "Per-process virtual address-space limit, default 8192 MiB; 128..16384."},
-		"resident_memory_mb":      map[string]any{"type": "integer", "description": "Hard memory limit for the whole process tree, default 256 MiB; 64..4096. Requires provider cgroup delegation."},
-		"processes":               map[string]any{"type": "integer", "description": "Hard process/thread limit for the whole process tree, plus a per-UID rlimit; default 64, 1..256."},
+		"resident_memory_mb":      map[string]any{"type": "integer", "description": "Resident memory of all the program's processes, read every 500 ms; over it the program is stopped. Default 256 MiB; 64..4096."},
+		"processes":               map[string]any{"type": "integer", "description": "Processes plus threads of the program (RLIMIT_NPROC on its identity); default 64, 1..256, at least 16 when command or worker is node."},
+		"inference_budget":        obj(map[string]any{"calls": map[string]any{"type": "integer", "description": "Model calls per temporary worker, 1..64."}, "input_bytes": map[string]any{"type": "integer", "description": "Total request bytes per worker, 1024..16777216 (512 KiB per call)."}, "output_tokens": map[string]any{"type": "integer", "description": "Output-token ceiling per call, 1..8192."}}, "calls", "input_bytes", "output_tokens"),
 		"request_timeout_seconds": map[string]any{"type": "integer", "description": "Whole isolated task-worker lifetime, default 300 seconds; 1..3600. Task workers never resume."},
 	}, "id", "command", "args", "files")
 	tools := []sealmcp.Tool{{Name: "seal_service_list", Description: "List hosted MCP services, versions, desired state and request admission status.", Schema: obj(map[string]any{}), Method: http.MethodGet, Path: "/service-host"}}
-	tools = append(tools, sealmcp.Tool{Name: "seal_service_publish", Description: "Publish a stopped service's immutable release. Files are base64. Without worker, each POST starts an isolated temporary server. With worker, an isolated coordinator handles MCP and starts only separately isolated temporary task processes through its service-scoped control socket. /app is read-only; only coordinator /work is durable. Stop before updating. No employer credential custody.", Schema: obj(map[string]any{"manifest": manifest}, "manifest"), Method: http.MethodPost, Path: "/service-host", Prepare: func(args map[string]any) (any, error) {
+	tools = append(tools, sealmcp.Tool{Name: "seal_service_publish", Description: "Publish a stopped service's immutable release. Files are base64. Without worker, each POST starts an isolated temporary server. With worker, an isolated coordinator handles MCP and starts only separately isolated temporary task processes through its service-scoped control socket. The release is read-only; $HOME is durable only for a coordinator, $TMPDIR is temporary. Stop before updating. No employer credential custody.", Schema: obj(map[string]any{"manifest": manifest}, "manifest"), Method: http.MethodPost, Path: "/service-host", Prepare: func(args map[string]any) (any, error) {
 		if err := sealmcp.Allow(args, "manifest"); err != nil {
 			return nil, err
 		}

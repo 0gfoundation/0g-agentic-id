@@ -14,8 +14,9 @@ import (
 )
 
 // egressProxy has no credential registry, signing authority or access to owner
-// loopback services. Even a program that ignores proxy settings has no route
-// out of its private network namespace.
+// loopback services. A program that ignores the proxy has no other route out:
+// its own sockets may only be AF_UNIX and TCP connects are refused
+// (servicesandbox).
 type egressProxy struct {
 	ctx       context.Context
 	allowed   map[string]bool
@@ -29,7 +30,7 @@ func (m *Manager) startEgress(ctx context.Context, hosts []string, uid uint32, s
 	if err != nil {
 		return fmt.Errorf("prepare restricted egress")
 	}
-	if err := os.Chown(socket, int(uid), int(uid)); err != nil {
+	if err := os.Lchown(socket, int(uid), int(uid)); err != nil {
 		ln.Close()
 		return err
 	}

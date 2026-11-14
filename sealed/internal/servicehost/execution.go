@@ -35,6 +35,11 @@ const MaxExecutionRecords = 1024
 const MaxRetainedExecutionOutput = 32 << 20
 const executionRetention = 10 * time.Minute
 
+// maxExecutionRecordBytes bounds one saved execution record. The largest one
+// (32 egress hosts of maxHostLength, a signed receipt carrying them again)
+// fits with room to spare (TestLargestExecutionRecordFits).
+const maxExecutionRecordBytes = 64 << 10
+
 // A dated nonce allows bounded deduplication without ever rerunning an old
 // key after its tombstone is collected. SDKs generate <unix-ms>-<random>.
 var validExecutionKey = regexp.MustCompile(`^[0-9]{13}-[a-zA-Z0-9_-]{16,48}$`)
@@ -68,9 +73,9 @@ type ExecutionStatus struct {
 // have a separate kernel or that their business output is correct. Driver
 // "landlock-v1" is servicesandbox: one identity per process tree, Landlock
 // (filesystem allowlist, no /proc, TCP refused, abstract sockets and signals
-// scoped to the domain) and a seccomp filter with no inet sockets. Memory and
-// disk are watched by sealed, which kills the identity over its limit;
-// processes are bounded by RLIMIT_NPROC on the identity.
+// scoped to the domain) and a seccomp filter allowing only AF_UNIX sockets.
+// Memory and disk are watched by sealed, which kills the identity over its
+// limit; processes are bounded by RLIMIT_NPROC on the identity.
 type IsolationProfile struct {
 	Driver               string                 `json:"driver"`
 	WorkerRuntimeHash    string                 `json:"worker_runtime_hash,omitempty"`
@@ -141,7 +146,9 @@ func (m *Manager) persistExecutionLocked(e *execution) error {
 	if err != nil {
 		return err
 	}
-	return privsep.WriteFile(filepath.Join(m.base, "executions", e.Handle+".json"), b, 0600)
+	// Synced: a spawn key must stay known after a crash, or a retry of its
+	// key could run the worker again.
+	return privsep.WriteFileSync(filepath.Join(m.base, "executions", e.Handle+".json"), b, 0600)
 }
 
 func (m *Manager) restoreExecutions() error {
@@ -161,7 +168,7 @@ func (m *Manager) restoreExecutions() error {
 		if f.Name() != handle+".json" || !validExecutionHandle.MatchString(handle) || !f.Type().IsRegular() {
 			return fmt.Errorf("invalid execution record")
 		}
-		b, err := privsep.ReadFile(filepath.Join(dir, f.Name()), 16<<10)
+		b, err := privsep.ReadFile(filepath.Join(dir, f.Name()), maxExecutionRecordBytes)
 		if err != nil {
 			return err
 		}
@@ -271,7 +278,7 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 	if err != nil {
 		cancel()
 		if dir != "" {
-			_ = privsep.RemoveAll(dir)
+			_ = discardDir(dir) // under the manager lock: never a slow removal
 		}
 		e.State, e.Reason, e.FinishedAt = "failed", "start_failed", time.Now().UnixMilli()
 		_ = m.persistExecutionLocked(e)
@@ -365,9 +372,10 @@ func (m *Manager) reserveExecution(service, key, inputHash string, privateInput 
 
 // Called with m.mu held after Start failed. The identity remains reserved
 // while cleanup cannot prove it has no process left, even though exec failed.
+// The reason stays start_failed: the worker never ran, whatever the cleanup.
 func (m *Manager) finishFailedExecutionStart(e *execution, cmd *isolatedCommand) {
 	if cmd != nil && !cmd.resourcesReleased() {
-		e.State, e.Reason = "quarantined", "resource_cleanup_failed"
+		e.State = "quarantined"
 		go func() {
 			<-cmd.cleanupDone
 			m.mu.Lock()
