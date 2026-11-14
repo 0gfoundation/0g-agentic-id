@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/net/netutil"
+
 	"seal-verify/internal/privsep"
 	"seal-verify/internal/serviceidentity"
 )
@@ -226,7 +228,7 @@ func (m *Manager) startCoordinatorLocked(e *entry, lease RuntimeLease) (err erro
 		return err
 	}
 	c.server = &http.Server{Handler: m.ExecutionHandler(e.ID), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
-	go func() { _ = c.server.Serve(ln) }()
+	go func() { _ = c.server.Serve(netutil.LimitListener(ln, maxControlConns)) }()
 	started = true // command owns the lease from here
 	cmd, err := m.command(ctx, e, e.ControllerUID, base, coordinatorCommand, lease)
 	if err == nil {
@@ -332,6 +334,10 @@ func (m *Manager) superviseCoordinator(ctx context.Context, e *entry, c *coordin
 		}
 		e.State, e.Error = "restarting", reason
 		delay = nextRestartDelay(e.restartDelay, time.Since(c.started))
+	} else if m.entries[e.ID] == e && !e.Desired {
+		// Ended because it is no longer wanted. Wait returned only once its
+		// identity was proven empty, so no stopping or cleanup error is left.
+		e.State, e.Error = "stopped", ""
 	} else if err != nil && e.State != "stopped" {
 		e.State = "stopped"
 	}

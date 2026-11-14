@@ -98,7 +98,8 @@ capabilities, Docker's default seccomp) provides all of it; see
 [isolation/README.md](isolation/README.md).
 
 `network:"none"` is default. `network:"egress"` requires 1–32 explicit
-`egress_hosts` as `host:port`, a host at most 253 characters. A private Unix HTTP/CONNECT proxy permits only
+`egress_hosts` as `host:port`, a host at most 253 characters. A private Unix HTTP/CONNECT proxy (at most 64
+open connections per identity) permits only
 those destinations and rejects private, loopback, link-local and metadata IPs,
 including DNS answers. A service process has no network socket of its own:
 sealed's listeners on the container's loopback (shared with the owner) stay out
@@ -114,6 +115,9 @@ command or the worker is `node`, checked when a release is published),
 256 descriptors and 64 MiB/file. All service processes together hold at most
 2048 processes and threads: each running request, execution and coordinator
 reserves its `processes` limit, and a launch the budget cannot hold is refused.
+One-shot request workers (each POST to a service without a worker) may hold at
+most 16 of the 32 worker slots and 1024 of those processes, so executions a
+coordinator spawns always have room.
 Sealed reads the identity's resident memory every 500 ms (`resident_memory_mb`,
 default 256 MiB, 64–4096) and the blocks allocated below its private `$HOME`,
 `$TMPDIR` and run directory every 2 s, each entry counting at least 4 KiB
@@ -137,7 +141,9 @@ a coordinator saved on it reports why it does not start. A wanted coordinator
 that exits or cannot start is retried after 2 s, doubling up to 60 s while it
 keeps failing within a minute of starting; its state is then `restarting`, with
 the cause (a limit, `readiness_timeout`, `coordinator_exit` or the admission
-error). This is not a separate CPU allocation or a disk quota; the sandbox's
+error), `unsupported` when the kernel or container lacks the confinement, or
+`quarantined` while the cleanup of its identity is unproven. A coordinator that
+ends because it is no longer wanted leaves its service `stopped`. This is not a separate CPU allocation or a disk quota; the sandbox's
 outer limits still apply. Workers end at EOF, terminate, timeout
 (300 seconds default, 1–3600), stop or transfer. Disconnect cancels a one-shot
 request worker; a detached job survives its submitting HTTP connection and is
@@ -197,11 +203,17 @@ Only the coordinator gets `$SEAL_EXEC_SOCKET`: POST `/executions` actions
 Keys are `<unix-ms>-<16..48 random URL-safe characters>`. Concurrent same-key,
 same-input, same-code retries return one execution; changes conflict. `find`
 recovers a lost acknowledgement without spawning. Keys older than ten minutes
-cannot start anything, even after record GC.
+cannot start anything, even after record GC. A spawn's reservation is synced to
+disk before its worker starts; a crash before that leaves no record, and nothing
+ran. The control socket accepts at most 64 connections, and a request body must
+arrive within 30 s.
 
-`capabilities` takes no other field and answers `{"receipts":true|false}`:
-whether an execution that exits 0 now would receive a signed receipt (see
-Execution receipts). A paid service asks before charging.
+`capabilities` takes no other field and answers
+`{"launch":true|false,"receipts":true|false}`. `receipts`: whether an execution
+that exits 0 now would receive a signed receipt (see Execution receipts).
+`launch`: whether sealed's own preparation for a service process succeeds now
+(the confinement probe, free space, and the verified runtime's listing and pin).
+A paid service asks before charging and takes work only when both are true.
 
 An execution's `state` is one of `starting` (reserved; the worker is not running
 yet), `running`, `exited` (exit code 0), `failed`, `timed_out` (reason
@@ -212,9 +224,13 @@ processes gone; the identity stays reserved). `reason` names the cause:
 `sandbox_disk_low`, `cleanup_failed`, `resource_cleanup_failed`,
 `metadata_write_failed`. `reason:"start_failed"` with no `exit_code` means the
 worker never ran: the state is `failed`, or `quarantined` until its cleanup is proven.
+`failed` with `process_exit` and `exit_code` 0 means the worker exited 0 but a
+process it left still held its output open 250 ms later.
 
 Public input caps at 512 KiB; opaque stdout at 1 MiB/execution and 32 MiB globally;
-reads return up to 64 KiB. At most 1024 records, collected ten minutes after exit.
+reads return up to 64 KiB. At most 1024 records, collected ten minutes after exit
+and never while their key could still be accepted. A record sealed cannot read
+at boot is set aside (`.bad-<name>`) and logged; it never disables hosting.
 Output is memory only, lost on sealed restart. Applications must persist output
 before `release`; metadata/dedup survives release until GC. Waiter timeout does
 not cancel execution. Metadata contains hashes, version, UID, timing, exit facts

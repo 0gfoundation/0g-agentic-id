@@ -39,7 +39,7 @@ stop/start 保留协调进程的 `$HOME`，但它不是 iData、上链数据或�
 限制：16 个服务，每版 512 文件、解码后 16 MiB，发布 JSON 24 MiB，registry 8 MiB。
 内部 MCP 请求上限 1 MiB；更大 manifest 可从本地 JSON 文件经 `$SEAL_SIGN_SOCK`
 向 `/service-host` POST `{action:"publish",manifest:...}`。GET 列表，
-start/stop/logs 接收 id。不公开管理接口。logs 为空：服务/请求进程 stdout/stderr 丢弃，
+start/stop/logs 接收 id。不公开管理接口。logs 为空：协调进程和请求进程的 stdout/stderr 丢弃，
 任务 stdout 只私下交给所属应用，不成为 owner 可读日志。
 
 ## 隔离与网络
@@ -72,7 +72,7 @@ provider 不需要任何改动：dev runner（内核 6.17、Landlock ABI 7、Sys
 六项 capability、Docker 默认 seccomp）全部满足，见 [isolation/README.zh.md](isolation/README.zh.md)。
 
 默认 `network:"none"`；`network:"egress"` 必须指定 1–32 个 `host:port`
-格式的 egress_hosts，主机名最多 253 个字符。私有 Unix HTTP/CONNECT 代理只允许这些目标，并拒绝私网、
+格式的 egress_hosts，主机名最多 253 个字符。私有 Unix HTTP/CONNECT 代理（每个身份最多 64 个连接）只允许这些目标，并拒绝私网、
 loopback、link-local、metadata IP，包括 DNS 解析结果。服务进程没有自己的网络 socket：
 sealed 在容器 loopback（owner 也共用）上的监听端口它连不到，因为 inet socket 和 TCP connect
 都被拒绝。Node 自动加载租用运行包里的引导（`$HARNESS_RUNTIME_ROOT/src/service-network.mjs`，
@@ -82,6 +82,8 @@ Node >=24.14），把 `fetch` 以 CONNECT 隧道经 Unix 代理发出；基于 `
 单进程 rlimit：虚拟地址空间（默认 8192 MiB，128–16384）、每个身份的进程和线程数（默认 64，
 1–256；命令或 worker 是 `node` 时至少 16，发布时检查）、256 描述符和单文件 64 MiB。所有服务进程合计最多 2048 个进程和线程：
 每个运行中的请求、执行和协调进程按自己的 `processes` 上限占用额度，额度不够的启动会被拒绝。
+单次请求 worker（对没有 worker 的服务的每个 POST）最多占 32 个 worker 名额中的 16 个、上述额度中的
+1024 个，协调进程派出的执行总有空间。
 sealed 每 500 ms 读取该身份的驻留内存（resident_memory_mb，默认 256 MiB，64–4096），每 2 s
 统计私有 `$HOME`、`$TMPDIR` 和 run 目录下实际分配的块，每个条目至少按 4 KiB 计（临时 worker
 合计 128 MiB；协调进程合计 576 MiB，其 `$HOME` 是持久业务状态），超过即杀掉该身份。同样每 2 s，
@@ -95,7 +97,9 @@ launcher 切换到该身份给它的所有进程发信号（子进程改不了�
 容器里上一个 sealed 可能留下了进程，因为 loader 只有作为 PID 1 时才会清理它的后代，而 runner
 用 `--init` 启动沙箱。清不掉的身份被隔离：从此不分配给任何任务，存在它上面的协调进程会报告无法启动的原因。
 期望运行的协调进程退出或启动失败后，2 s 后重试，启动后一分钟内反复失败时间隔加倍、最多 60 s；
-此时状态为 `restarting`，错误里是原因（超限、`readiness_timeout`、`coordinator_exit` 或接纳错误）。
+此时状态为 `restarting`，错误里是原因（超限、`readiness_timeout`、`coordinator_exit` 或接纳错误）；
+内核或容器不具备隔离条件时为 `unsupported`；身份的清理还没得到证明时为 `quarantined`。服务被停用后
+结束的协调进程，其服务状态为 `stopped`。
 这不提供独立 CPU 分配或磁盘配额，仍受外围沙箱限制。worker 在 EOF、terminate、超时（默认 300 秒，1–3600）、stop 或转移时结束。
 断线会终止单次请求 worker；异步任务不随提交它的 HTTP 连接结束，继续由协调进程管理。
 
@@ -138,10 +142,13 @@ Harness mountServiceModel 使用公开占位符，拿不到真实密钥。其他
 key、base64 公开 input、可选 input_handle，状态用随机 handle 查询。key 格式
 `<unix-ms>-<16..48 random URL-safe characters>`。同 key/输入/代码的并发重试
 只返回一次执行，修改输入/代码冲突。find 只读找回丢失回执，不启动任何进程。
-十分钟前的 key 即使已 GC，也不能启动新执行。
+十分钟前的 key 即使已 GC，也不能启动新执行。spawn 的预留记录在 worker 启动前同步写入磁盘；
+在此之前崩溃不留记录，也没有任何程序运行过。控制 socket 最多 64 个连接，请求体须在 30 秒内送达。
 
-capabilities 不带其他字段，返回 `{"receipts":true|false}`：现在退出码为 0 的执行能否
-拿到签名证明（见执行证明）。收费服务在扣款前先查询。
+capabilities 不带其他字段，返回 `{"launch":true|false,"receipts":true|false}`。receipts：
+现在退出码为 0 的执行能否拿到签名证明（见执行证明）。launch：sealed 自己为服务进程做的准备
+（隔离探测、剩余空间、已验证运行包的列表检查与锁定）现在能否成功。收费服务在扣款前先查询，
+两项都为 true 才接活。
 
 执行的 state 取值：starting（已预留，worker 还没运行）、running、exited（退出码 0）、
 failed、timed_out（reason 为 deadline）、cancelled（terminated）、interrupted
@@ -149,10 +156,12 @@ failed、timed_out（reason 为 deadline）、cancelled（terminated）、interr
 退出，身份保持预留）。reason 写明原因：start_failed、process_exit、output_limit、
 memory_limit、disk_limit、sandbox_disk_low、cleanup_failed、resource_cleanup_failed、
 metadata_write_failed。reason 为 start_failed 且没有 exit_code，表示 worker 从未运行：
-state 为 failed，清理得到证明之前为 quarantined。
+state 为 failed，清理得到证明之前为 quarantined。failed 且 reason 为 process_exit、exit_code 为 0，
+表示 worker 以 0 退出，但它留下的进程在 250 ms 后仍占着它的输出。
 
 公开输入上限 512 KiB，stdout 每次 1 MiB、全局 32 MiB，每次读最多 64 KiB。
-记录最多 1024 条，退出十分钟后回收。输出仅内存保存，sealed 重启会丢失；应用必须在
+记录最多 1024 条，退出十分钟后回收，但在其 key 仍可能被接受时不回收。启动时读不了的记录
+移到一边（`.bad-<name>`）并记日志，不会让托管服务不可用。输出仅内存保存，sealed 重启会丢失；应用必须在
 release 前持久保存。release 后元数据/去重保留至 GC。wait 超时不取消执行。
 元数据只含 hash、版本、UID、时间、退出事实、证明，不含输入/stdout，也不定义雇主归属、
 业务进度或付款状态。

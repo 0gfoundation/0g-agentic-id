@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"seal-verify/internal/inferproxy"
+	"seal-verify/internal/logger"
 	"seal-verify/internal/privsep"
 	"seal-verify/internal/servicesandbox"
 )
@@ -141,16 +142,40 @@ type executionRecord struct {
 
 func executionKey(service, key string) string { return service + ":" + key }
 
+func (m *Manager) executionRecordPath(handle string) string {
+	return filepath.Join(m.base, "executions", handle+".json")
+}
+
+func (m *Manager) executionRecordLocked(e *execution) ([]byte, error) {
+	return json.Marshal(executionRecord{m.binding, e.ExecutionStatus, e.Isolation})
+}
+
+// persistExecutionLocked records a status change. It is not synced: losing it
+// to a crash leaves the synced reservation, which restores as interrupted and
+// never runs again (reserveDurably).
 func (m *Manager) persistExecutionLocked(e *execution) error {
-	b, err := json.Marshal(executionRecord{m.binding, e.ExecutionStatus, e.Isolation})
+	b, err := m.executionRecordLocked(e)
 	if err != nil {
 		return err
 	}
-	// Synced: a spawn key must stay known after a crash, or a retry of its
-	// key could run the worker again.
-	return privsep.WriteFileSync(filepath.Join(m.base, "executions", e.Handle+".json"), b, 0600)
+	return privsep.WriteFile(m.executionRecordPath(e.Handle), b, 0600)
 }
 
+// reserveDurably syncs a new reservation record before anything can run under
+// its key, without the manager lock (fsync can take seconds on a busy disk).
+// A crash before it completes leaves no record, and nothing has run.
+func (m *Manager) reserveDurably(handle string, record []byte) error {
+	return syncRecord(m.executionRecordPath(handle), record, 0600)
+}
+
+// syncRecord is privsep.WriteFileSync, replaceable in tests.
+var syncRecord = privsep.WriteFileSync
+
+// restoreExecutions loads the records a previous sealed left. A file that
+// cannot be a record (a temporary file a crash left between write and rename,
+// a corrupt, oversized or foreign record) never disables hosting: temporary
+// files are removed, anything else is set aside as .bad-<name> and logged, and
+// its key is not restored.
 func (m *Manager) restoreExecutions() error {
 	dir := filepath.Join(m.base, "executions")
 	if err := privsep.MkdirAll(dir, 0700); err != nil {
@@ -160,44 +185,71 @@ func (m *Manager) restoreExecutions() error {
 	if err != nil {
 		return err
 	}
-	if len(files) > MaxExecutionRecords {
-		return fmt.Errorf("too many execution records")
+	setAside := func(name, why string) {
+		logger.Logf("service execution record %s set aside: %s", name, why)
+		if err := privsep.Rename(filepath.Join(dir, name), filepath.Join(dir, ".bad-"+name)); err != nil {
+			_ = privsep.Remove(filepath.Join(dir, name))
+		}
 	}
 	for _, f := range files {
-		handle := strings.TrimSuffix(f.Name(), ".json")
-		if f.Name() != handle+".json" || !validExecutionHandle.MatchString(handle) || !f.Type().IsRegular() {
-			return fmt.Errorf("invalid execution record")
+		name := f.Name()
+		if strings.HasPrefix(name, ".") {
+			if strings.Contains(name, ".sealed-tmp-") {
+				_ = privsep.Remove(filepath.Join(dir, name))
+			}
+			continue // set aside earlier
 		}
-		b, err := privsep.ReadFile(filepath.Join(dir, f.Name()), maxExecutionRecordBytes)
+		handle := strings.TrimSuffix(name, ".json")
+		if name != handle+".json" || !validExecutionHandle.MatchString(handle) || !f.Type().IsRegular() {
+			setAside(name, "not an execution record")
+			continue
+		}
+		if len(m.executions) >= MaxExecutionRecords {
+			setAside(name, "too many execution records")
+			continue
+		}
+		b, err := privsep.ReadFile(filepath.Join(dir, name), maxExecutionRecordBytes)
 		if err != nil {
-			return err
+			setAside(name, err.Error())
+			continue
 		}
 		var r executionRecord
 		if err := json.Unmarshal(b, &r); err != nil || r.Binding != m.binding || r.Handle != handle || !validID.MatchString(r.Service) || !validExecutionKey.MatchString(r.Key) {
-			return fmt.Errorf("invalid or foreign execution record")
+			setAside(name, "invalid or foreign record")
+			continue
+		}
+		k := executionKey(r.Service, r.Key)
+		if m.executionKeys[k] != "" {
+			setAside(name, "duplicate execution key")
+			continue
 		}
 		e := &execution{ExecutionStatus: r.ExecutionStatus, Isolation: r.Isolation, done: make(chan struct{})}
 		if e.FinishedAt == 0 {
 			e.State, e.Reason, e.FinishedAt = "interrupted", "sealed_restarted", time.Now().UnixMilli()
-			if err := m.persistExecutionLocked(e); err != nil {
-				return err
-			}
+			_ = m.persistExecutionLocked(e)
 		}
 		close(e.done)
-		k := executionKey(e.Service, e.Key)
-		if m.executionKeys[k] != "" {
-			return fmt.Errorf("duplicate execution key")
-		}
 		m.executions[handle], m.executionKeys[k] = e, handle
 	}
 	m.pruneExecutionsLocked()
 	return nil
 }
 
+// keyAcceptedUntil is the last moment reserveExecution would accept key: a key
+// is accepted from 30 s before its issue time until executionRetention after it.
+func keyAcceptedUntil(key string) int64 {
+	issued, _ := strconv.ParseInt(strings.SplitN(key, "-", 2)[0], 10, 64)
+	return issued + executionRetention.Milliseconds()
+}
+
+// pruneExecutionsLocked deletes a finished record executionRetention after it
+// finished, but never while its key could still be accepted: the record is the
+// key's tombstone, and without it a retry of the key would run again.
 func (m *Manager) pruneExecutionsLocked() {
-	cutoff := time.Now().Add(-executionRetention).UnixMilli()
+	now := time.Now().UnixMilli()
+	cutoff := now - executionRetention.Milliseconds()
 	for h, e := range m.executions {
-		if e.FinishedAt == 0 || e.FinishedAt >= cutoff {
+		if e.FinishedAt == 0 || e.FinishedAt >= cutoff || keyAcceptedUntil(e.Key) >= now {
 			continue
 		}
 		if err := privsep.Remove(filepath.Join(m.base, "executions", h+".json")); err != nil && !os.IsNotExist(err) {
@@ -241,11 +293,23 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 	input = bytes.Clone(input)
 	digest := sha256.Sum256(input)
 	inputHash := hex.EncodeToString(digest[:])
-	e, job, runtimeInput, status, err := m.reserveExecution(service, key, inputHash, privateInput, consumeInput)
+	e, job, runtimeInput, record, status, err := m.reserveExecution(service, key, inputHash, privateInput, consumeInput)
 	if e == nil {
 		return status, err
 	}
 	ctx, cancel := e.ctx, e.cancel
+	if err := m.reserveDurably(e.Handle, record); err != nil {
+		// Nothing ran. The in-memory record stays the key's tombstone, so a
+		// retry of the key sees start_failed (never ran) rather than running.
+		m.mu.Lock()
+		cancel()
+		e.State, e.Reason, e.FinishedAt = "failed", "start_failed", time.Now().UnixMilli()
+		_ = m.persistExecutionLocked(e)
+		delete(m.workers, e.UID)
+		close(e.done)
+		m.mu.Unlock()
+		return e.ExecutionStatus, fmt.Errorf("reserve execution: %w", err)
+	}
 	// The slow part runs without the manager lock, so /hello and other
 	// services' requests never wait on a probe, a chain read or a process
 	// start. Stop cancels ctx, which fails the start below.
@@ -297,56 +361,58 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 	return e.ExecutionStatus, nil
 }
 
-// reserveExecution validates and durably reserves an execution under the
-// manager lock. It returns a nil execution with the status or error to report
-// when nothing is to be started (a duplicate key returns the original).
-func (m *Manager) reserveExecution(service, key, inputHash string, privateInput func() ([]byte, error), consumeInput func()) (*execution, *entry, []byte, ExecutionStatus, error) {
+// reserveExecution validates and reserves an execution under the manager lock,
+// in memory: a duplicate spawn of the key from then on returns this execution.
+// It returns the record the caller must sync (reserveDurably) before starting
+// anything. It returns a nil execution with the status or error to report when
+// nothing is to be started (a duplicate key returns the original).
+func (m *Manager) reserveExecution(service, key, inputHash string, privateInput func() ([]byte, error), consumeInput func()) (*execution, *entry, []byte, []byte, ExecutionStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pruneExecutionsLocked()
 	entry := m.entries[service]
 	if m.closed || entry == nil || !entry.Desired || entry.Manifest.Worker == nil {
-		return nil, nil, nil, ExecutionStatus{}, fmt.Errorf("service execution unavailable")
+		return nil, nil, nil, nil, ExecutionStatus{}, fmt.Errorf("service execution unavailable")
 	}
 	k := executionKey(service, key)
 	if h := m.executionKeys[k]; h != "" {
 		e := m.executions[h]
 		if e.InputHash != inputHash || e.Version != entry.Version {
-			return nil, nil, nil, ExecutionStatus{}, ErrExecutionConflict
+			return nil, nil, nil, nil, ExecutionStatus{}, ErrExecutionConflict
 		}
-		return nil, nil, nil, e.ExecutionStatus, nil
+		return nil, nil, nil, nil, e.ExecutionStatus, nil
 	}
 	issued, _ := strconv.ParseInt(strings.SplitN(key, "-", 2)[0], 10, 64)
 	if issued < time.Now().Add(-executionRetention).UnixMilli() || issued > time.Now().Add(30*time.Second).UnixMilli() {
-		return nil, nil, nil, ExecutionStatus{}, fmt.Errorf("execution key expired or issued in the future")
+		return nil, nil, nil, nil, ExecutionStatus{}, fmt.Errorf("execution key expired or issued in the future")
 	}
 	if len(m.executions) >= MaxExecutionRecords {
-		return nil, nil, nil, ExecutionStatus{}, fmt.Errorf("execution record limit reached; acknowledge completed output")
+		return nil, nil, nil, nil, ExecutionStatus{}, fmt.Errorf("execution record limit reached; acknowledge completed output")
 	}
 	if len(m.workers) >= MaxWorkers {
-		return nil, nil, nil, ExecutionStatus{}, fmt.Errorf("worker limit reached")
+		return nil, nil, nil, nil, ExecutionStatus{}, fmt.Errorf("worker limit reached")
 	}
 	if m.processesInUseLocked()+entry.Manifest.Processes > MaxServiceProcesses {
-		return nil, nil, nil, ExecutionStatus{}, ErrProcessBudget
+		return nil, nil, nil, nil, ExecutionStatus{}, ErrProcessBudget
 	}
 	uid, err := m.allocateIdentityLocked()
 	if err != nil {
-		return nil, nil, nil, ExecutionStatus{}, err
+		return nil, nil, nil, nil, ExecutionStatus{}, err
 	}
 	var token [32]byte
 	if _, err := rand.Read(token[:]); err != nil {
-		return nil, nil, nil, ExecutionStatus{}, err
+		return nil, nil, nil, nil, ExecutionStatus{}, err
 	}
 	runtimeInput, err := privateInput()
 	if err != nil {
-		return nil, nil, nil, ExecutionStatus{}, err
+		return nil, nil, nil, nil, ExecutionStatus{}, err
 	}
 	if len(runtimeInput) == 0 {
 		runtimeInput = []byte("{}")
 	}
 	var fields map[string]string
 	if len(runtimeInput) > MaxRuntimeInput || json.Unmarshal(runtimeInput, &fields) != nil || fields == nil {
-		return nil, nil, nil, ExecutionStatus{}, fmt.Errorf("runtime input must be a bounded JSON string map")
+		return nil, nil, nil, nil, ExecutionStatus{}, fmt.Errorf("runtime input must be a bounded JSON string map")
 	}
 	now := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(entry.Manifest.RequestTimeoutSeconds)*time.Second)
@@ -355,11 +421,13 @@ func (m *Manager) reserveExecution(service, key, inputHash string, privateInput 
 		InputHash: inputHash, State: "starting", StartedAt: now.UnixMilli(), Deadline: now.Add(time.Duration(entry.Manifest.RequestTimeoutSeconds) * time.Second).UnixMilli(), UID: uid,
 	}, done: make(chan struct{}), ctx: ctx, cancel: cancel}
 	e.Isolation = landlockProfile(entry.Manifest)
-	// Reserve durably before spawning. If sealed crashes in the start window,
-	// the next boot reports interrupted and never silently re-executes input.
-	if err := m.persistExecutionLocked(e); err != nil {
+	// The caller syncs this record before spawning. If sealed crashes in the
+	// start window, the next boot reports interrupted and never silently
+	// re-executes input; with no record yet, nothing has run.
+	record, err := m.executionRecordLocked(e)
+	if err != nil {
 		cancel()
-		return nil, nil, nil, ExecutionStatus{}, err
+		return nil, nil, nil, nil, ExecutionStatus{}, err
 	}
 	if consumeInput != nil {
 		consumeInput()
@@ -367,7 +435,7 @@ func (m *Manager) reserveExecution(service, key, inputHash string, privateInput 
 	m.executions[e.Handle], m.executionKeys[k] = e, e.Handle
 	m.workers[uid] = &worker{service: service, cancel: cancel, done: e.done, processes: entry.Manifest.Processes}
 	job := *entry
-	return e, &job, runtimeInput, ExecutionStatus{}, nil
+	return e, &job, runtimeInput, record, ExecutionStatus{}, nil
 }
 
 // Called with m.mu held after Start failed. The identity remains reserved
@@ -523,6 +591,32 @@ func (m *Manager) ReceiptsAvailable() bool {
 	attest, ready := m.attestor, m.receiptsReady
 	m.mu.Unlock()
 	return attest != nil && ready != nil && ready()
+}
+
+// launchProbeTimeout bounds LaunchAvailable.
+const launchProbeTimeout = 5 * time.Second
+
+// LaunchAvailable reports whether sealed's own preparation for a service
+// process succeeds now: the confinement probe (cached), free space, and the
+// verified runtime's listing and pin, whose lease it releases at once. It runs
+// without the manager lock. A paid coordinator asks before charging.
+func (m *Manager) LaunchAvailable() bool {
+	m.mu.Lock()
+	closed := m.closed
+	m.mu.Unlock()
+	if closed {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), launchProbeTimeout)
+	defer cancel()
+	lease, err := m.prepareLaunch(ctx)
+	if err != nil {
+		return false
+	}
+	if lease.Release != nil {
+		lease.Release()
+	}
+	return true
 }
 
 func (m *Manager) attestExecutionLocked(e *execution) {

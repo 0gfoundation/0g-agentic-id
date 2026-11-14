@@ -10,8 +10,15 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/netutil"
+
 	"seal-verify/internal/privsep"
 )
+
+// maxEgressConns bounds one identity's open connections to its egress proxy
+// (each holds a sealed descriptor and goroutine; a CONNECT tunnel holds one
+// for its whole life). The proxy's 16 upstream slots bound upstream traffic.
+const maxEgressConns = 64
 
 // egressProxy has no credential registry, signing authority or access to owner
 // loopback services. A program that ignores the proxy has no other route out:
@@ -44,7 +51,7 @@ func (m *Manager) startEgress(ctx context.Context, hosts []string, uid uint32, s
 	}
 	p.transport = &http.Transport{DialContext: p.dial, TLSHandshakeTimeout: 10 * time.Second, IdleConnTimeout: 30 * time.Second, MaxIdleConns: 16}
 	srv := &http.Server{Handler: p, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 32 << 10}
-	go func() { _ = srv.Serve(ln) }()
+	go func() { _ = srv.Serve(netutil.LimitListener(ln, maxEgressConns)) }()
 	go func() { <-ctx.Done(); srv.Close(); p.transport.CloseIdleConnections() }()
 	return nil
 }

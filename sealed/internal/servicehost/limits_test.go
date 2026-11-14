@@ -447,20 +447,300 @@ func TestCapabilitiesReportReceiptReadiness(t *testing.T) {
 		h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/executions", strings.NewReader(body)))
 		return w.Code, strings.TrimSpace(w.Body.String())
 	}
-	if code, body := ask(`{"action":"capabilities"}`); code != 200 || body != `{"receipts":false}` {
+	if code, body := ask(`{"action":"capabilities"}`); code != 200 || body != `{"launch":true,"receipts":false}` {
 		t.Fatalf("without an attestor: %d %s", code, body)
 	}
 	ready := true
 	m.SetExecutionAttestor(func(ExecutionStatus, IsolationProfile) (string, error) { return "receipt", nil })
 	m.SetReceiptCapability(func() bool { return ready })
-	if code, body := ask(`{"action":"capabilities"}`); code != 200 || body != `{"receipts":true}` {
+	if code, body := ask(`{"action":"capabilities"}`); code != 200 || body != `{"launch":true,"receipts":true}` {
 		t.Fatalf("ready: %d %s", code, body)
 	}
 	ready = false
-	if code, body := ask(`{"action":"capabilities"}`); code != 200 || body != `{"receipts":false}` {
+	if code, body := ask(`{"action":"capabilities"}`); code != 200 || body != `{"launch":true,"receipts":false}` {
 		t.Fatalf("not ready: %d %s", code, body)
 	}
 	if code, _ := ask(`{"action":"capabilities","key":"1234567890123-abcdefghijklmnop"}`); code != 400 {
 		t.Fatalf("capabilities accepted an argument: %d", code)
+	}
+}
+
+// A coordinator that ends because it is no longer wanted leaves its service
+// stopped, with no "still being cleaned up" error behind.
+func TestCoordinatorStopClearsCleanupError(t *testing.T) {
+	root(t)
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	man := manifest("coord", "x")
+	man.Worker = &Program{Command: "python3", Args: []string{"server.py"}}
+	if _, err := m.Publish(man); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := &isolatedCommand{Cmd: exec.Command("/bin/sh", "-c", "exit 0"), cleanupResource: func(context.Context) error { return nil }}
+	c := &coordinator{cancel: cancel, done: make(chan struct{}), server: &http.Server{}, cmd: cmd, started: time.Now()}
+	m.mu.Lock()
+	e := m.entries["coord"]
+	e.Desired, e.State, e.Error = false, "stopping", "processes are still being cleaned up"
+	e.controller = c
+	gen := e.generation
+	m.mu.Unlock()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	m.superviseCoordinator(ctx, e, c, gen)
+	m.mu.Lock()
+	state, msg, held := e.State, e.Error, e.controller
+	m.mu.Unlock()
+	if state != "stopped" || msg != "" || held != nil {
+		t.Fatalf("after the coordinator ended: state %q error %q controller %v", state, msg, held != nil)
+	}
+}
+
+// The memory check keeps its cadence while a disk walk is slow.
+func TestSlowDiskWalkDoesNotDelayMemoryCheck(t *testing.T) {
+	stop := make(chan struct{})
+	defer close(stop)
+	w := newResourceWatcher(stop, "")
+	w.memTick, w.dskTick = 20*time.Millisecond, 20*time.Millisecond
+	w.walk = func([]string, int64) int64 { time.Sleep(5 * time.Second); return 0 }
+	w.scan = func(uids map[uint32]bool) map[uint32]servicesandbox.Usage {
+		out := map[uint32]servicesandbox.Usage{}
+		for uid := range uids {
+			out[uid] = servicesandbox.Usage{RSSBytes: 1 << 30}
+		}
+		return out
+	}
+	limited := make(chan string, 1)
+	c := &isolatedCommand{Cmd: &exec.Cmd{}, uid: 20042, limits: limits{residentBytes: 1 << 20, diskBytes: 1 << 20, diskDirs: []string{"/nonexistent"}},
+		onLimit: func(reason string) { limited <- reason }}
+	w.add(c)
+	select {
+	case reason := <-limited:
+		if reason != "memory_limit" {
+			t.Fatalf("stopped for %q", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a slow disk walk delayed the memory check")
+	}
+}
+
+// One-shot request workers cannot take the slots executions need.
+func TestRequestWorkersLeaveRoomForExecutions(t *testing.T) {
+	root(t)
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if _, err := m.Publish(manifest("task", "x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Start("task"); err != nil {
+		t.Fatal(err)
+	}
+	try := func() int {
+		resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), "x", 0, testServiceVersion(m, "task")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	m.mu.Lock()
+	for i := range MaxRequestWorkers {
+		m.workers[uint32(1+i)] = &worker{service: "other", cancel: func() {}, done: make(chan struct{}), processes: 1, request: true}
+	}
+	m.mu.Unlock()
+	if code := try(); code != http.StatusServiceUnavailable {
+		t.Fatalf("a request worker beyond its share got %d", code)
+	}
+	m.mu.Lock()
+	for i := range MaxRequestWorkers {
+		delete(m.workers, uint32(1+i))
+	}
+	m.workers[1] = &worker{service: "other", cancel: func() {}, done: make(chan struct{}), processes: MaxRequestProcesses - 10, request: true}
+	m.mu.Unlock()
+	if code := try(); code != http.StatusServiceUnavailable {
+		t.Fatalf("request workers beyond their process share got %d", code)
+	}
+	m.mu.Lock()
+	delete(m.workers, 1)
+	m.mu.Unlock()
+}
+
+// launch is false whenever sealed's own preparation for a service process
+// would fail now: low free space, or the verified runtime unavailable.
+func TestCapabilitiesReportLaunchReadiness(t *testing.T) {
+	root(t)
+	runtimeErr := error(nil)
+	m, err := NewWithOptions(filepath.Join(t.TempDir(), "services"), "owner:identity", Options{SkipResourceLimitsForTests: true,
+		AcquireRuntime: func(context.Context) (RuntimeLease, error) {
+			if runtimeErr != nil {
+				return RuntimeLease{}, runtimeErr
+			}
+			hash := strings.Repeat("c", 64)
+			return RuntimeLease{Hash: hash, Dir: "/opt/0g-harness/" + hash, Release: func() {}}, nil
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if !m.LaunchAvailable() {
+		t.Fatal("launch unavailable on a ready manager")
+	}
+	old := diskLowCheck
+	diskLowCheck = func(string) bool { return true }
+	low := m.LaunchAvailable()
+	diskLowCheck = old
+	if low {
+		t.Fatal("launch available with low free space")
+	}
+	runtimeErr = fmt.Errorf("runtime listing unavailable")
+	if m.LaunchAvailable() {
+		t.Fatal("launch available without the verified runtime")
+	}
+}
+
+// A temporary file a crash left between write and rename, or a corrupt
+// record, never disables hosting: the temporary file is removed, the record
+// set aside, and the manager starts.
+func TestRestoreSurvivesLeftoverAndCorruptRecords(t *testing.T) {
+	root(t)
+	base := filepath.Join(t.TempDir(), "services")
+	m, err := newTestManager(base, "owner:identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Close()
+	dir := filepath.Join(base, "executions")
+	handle := strings.Repeat("ab", 32)
+	tmp := "." + handle + ".json.sealed-tmp-0123456789ab"
+	for name, data := range map[string]string{tmp: "{\"partial", handle + ".json": "not json", "notes.txt": "x"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m, err = newTestManager(base, "owner:identity")
+	if err != nil {
+		t.Fatalf("one bad file disabled hosting: %v", err)
+	}
+	defer m.Close()
+	if _, err := os.Lstat(filepath.Join(dir, tmp)); !os.IsNotExist(err) {
+		t.Fatalf("leftover temporary file kept: %v", err)
+	}
+	for _, name := range []string{handle + ".json", "notes.txt"} {
+		if _, err := os.Lstat(filepath.Join(dir, ".bad-"+name)); err != nil {
+			t.Fatalf("%s not set aside: %v", name, err)
+		}
+	}
+	if len(m.executions) != 0 {
+		t.Fatalf("restored %d records from bad files", len(m.executions))
+	}
+}
+
+// The reservation is synced outside the manager lock; a spawn of the same key
+// meanwhile sees the reservation, and a failed sync leaves the key's
+// tombstone as never ran.
+func TestReservationSyncsOutsideTheLock(t *testing.T) {
+	root(t)
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	man := manifest("paid", "x")
+	man.Worker = &Program{Command: "python3", Args: []string{"server.py"}}
+	if _, err := m.Publish(man); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.entries["paid"].Desired = true // admission only; no coordinator is needed here
+	m.mu.Unlock()
+	old := syncRecord
+	defer func() { syncRecord = old }()
+	entered, release := make(chan struct{}), make(chan struct{})
+	syncRecord = func(string, []byte, os.FileMode) error {
+		close(entered)
+		<-release
+		return fmt.Errorf("disk failed")
+	}
+	key := fmt.Sprintf("%d-%s", time.Now().UnixMilli(), strings.Repeat("k", 20))
+	first := make(chan error, 1)
+	go func() {
+		_, err := m.SpawnExecution("paid", key, []byte("{}"), nil)
+		first <- err
+	}()
+	<-entered
+	// The lock is free while the sync runs, and the key is already taken.
+	done := make(chan struct{})
+	var dup ExecutionStatus
+	var dupErr error
+	go func() {
+		dup, dupErr = m.SpawnExecution("paid", key, []byte("{}"), nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a duplicate spawn waited on the reservation sync")
+	}
+	if dupErr != nil || dup.State != "starting" {
+		t.Fatalf("duplicate during the sync: %+v %v", dup, dupErr)
+	}
+	m.List() // the manager lock is not held by the sync
+	close(release)
+	if err := <-first; err == nil {
+		t.Fatal("a failed reservation sync started the execution")
+	}
+	status, err := m.FindExecution("paid", key)
+	if err != nil || status.State != "failed" || status.Reason != "start_failed" || status.ExitCode != nil {
+		t.Fatalf("tombstone after a failed sync: %+v %v", status, err)
+	}
+	again, err := m.SpawnExecution("paid", key, []byte("{}"), nil)
+	if err != nil || again.Handle != status.Handle || again.State != "failed" {
+		t.Fatalf("a retry of the key ran again: %+v %v", again, err)
+	}
+	m.mu.Lock()
+	_, held := m.workers[status.UID]
+	m.mu.Unlock()
+	if held {
+		t.Fatal("the identity of a failed reservation stays held")
+	}
+}
+
+// A record outlives its key's acceptance window even when it finished long
+// ago: a key issued up to 30 s ahead is accepted until ten minutes after its
+// issue time, and its record is the tombstone that keeps it from running again.
+func TestRecordOutlivesItsKeyWindow(t *testing.T) {
+	root(t)
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	now := time.Now()
+	future := fmt.Sprintf("%d-%s", now.Add(25*time.Second).UnixMilli(), strings.Repeat("f", 20))
+	stale := fmt.Sprintf("%d-%s", now.Add(-11*time.Minute).UnixMilli(), strings.Repeat("s", 20))
+	finished := now.Add(-executionRetention - time.Second).UnixMilli()
+	m.mu.Lock()
+	for i, key := range []string{future, stale} {
+		h := strings.Repeat(fmt.Sprintf("%x", i+1), 64)
+		m.executions[h] = &execution{ExecutionStatus: ExecutionStatus{Handle: h, Service: "svc", Key: key, State: "exited", FinishedAt: finished}, done: make(chan struct{})}
+		m.executionKeys[executionKey("svc", key)] = h
+	}
+	m.pruneExecutionsLocked()
+	_, keptFuture := m.executionKeys[executionKey("svc", future)]
+	_, keptStale := m.executionKeys[executionKey("svc", stale)]
+	m.mu.Unlock()
+	if !keptFuture {
+		t.Fatal("pruned the tombstone of a key that can still be accepted")
+	}
+	if keptStale {
+		t.Fatal("kept a record past both windows")
 	}
 }

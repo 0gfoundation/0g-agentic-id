@@ -60,11 +60,18 @@ func (m *Manager) spawnWithHandoff(service, key string, input []byte, handle str
 		}
 		return p.data, nil
 	}, func() {
-		// Called under the same lock as the new durable reservation, never for
-		// a duplicate execution. No competing key can reuse this private input.
+		// Called under the same lock as the new reservation, never for a
+		// duplicate execution. No competing key can reuse this private input.
 		delete(m.pendingInputs, handle)
 	})
 }
+
+// maxControlConns bounds a coordinator's open connections to its control
+// socket, and controlBodyTimeout how long one request body may take to arrive.
+const (
+	maxControlConns    = 64
+	controlBodyTimeout = 30 * time.Second
+)
 
 // ExecutionHandler is mounted only on the private socket of one isolated
 // service coordinator. The service argument is selected by sealed, never by
@@ -77,6 +84,10 @@ func (m *Manager) ExecutionHandler(service string) http.Handler {
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		// The request body must arrive within controlBodyTimeout; the deadline
+		// covers reading only, not a long wait the action itself may take.
+		rc := http.NewResponseController(w)
+		_ = rc.SetReadDeadline(time.Now().Add(controlBodyTimeout))
 		var in struct {
 			Action      string `json:"action"`
 			Key         string `json:"key,omitempty"`
@@ -91,18 +102,19 @@ func (m *Manager) ExecutionHandler(service string) http.Handler {
 			http.Error(w, "invalid process control request", http.StatusBadRequest)
 			return
 		}
+		_ = rc.SetReadDeadline(time.Time{})
 		var status ExecutionStatus
 		var output []byte
 		var err error
 		code := http.StatusOK
 		if in.Action == "capabilities" {
-			// What this sealed can attest now; it takes no arguments.
+			// What this sealed can attest and launch now; it takes no arguments.
 			if in.Key != "" || in.Handle != "" || len(in.Input) != 0 || in.InputHandle != "" || in.Offset != 0 {
 				http.Error(w, "capabilities takes no arguments", http.StatusBadRequest)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]bool{"receipts": m.ReceiptsAvailable()})
+			_ = json.NewEncoder(w).Encode(map[string]bool{"receipts": m.ReceiptsAvailable(), "launch": m.LaunchAvailable()})
 			return
 		}
 		switch in.Action {

@@ -18,8 +18,8 @@ sealed 在 agent 自己的沙箱里运行每个托管服务进程（`internal/se
 | 资源监视 | sealed 每 500 ms 读该身份的驻留内存、每 2 s 统计私有目录（`$HOME`、`$TMPDIR`、run 目录；每个条目至少按 4 KiB 计）下实际分配的块，超限即杀掉该身份；任务目录所在文件系统剩余不足 1 GiB 或不足 65536 个 inode 时停掉所有服务进程并拒绝新的启动 |
 | 按身份清理 | launcher 切换到该身份给它的所有进程发信号，root 再确认一个不剩。sealed 启动时对每个还有进程的服务身份都这样清理一遍，清不掉的身份从此不分配给任何任务 |
 
-进程对外只有 sealed 交给它的 Unix socket：出网代理（只到发布的主机，以 CONNECT 隧道）和
-每个任务的模型代理。sealed 自己在容器 loopback（owner 也共用）上的监听端口它连不到，因为 inet
+进程对外只有 Unix socket：sealed 交给它的那些（出网代理，只到发布的主机，以 CONNECT 隧道；
+每个任务的模型代理），以及文件权限本身允许它连接的路径型 socket，Landlock 不管这类 socket。sealed 自己在容器 loopback（owner 也共用）上的监听端口它连不到，因为 inet
 socket 和 TCP connect 都被拒绝。
 
 ## 在 dev runner 上的实测（2026-11-13）

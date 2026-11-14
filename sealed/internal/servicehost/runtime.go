@@ -225,19 +225,26 @@ func firstLine(b []byte) string {
 	return s
 }
 
-// resourceWatcher scans /proc once per tick for every running identity and
-// walks private directories less often, so the cost does not grow with the
-// number of tasks times the number of processes. On the same slower tick it
-// checks the free space of the filesystem that holds the task directories:
-// below diskReserveBytes it stops every service process, whatever space they
-// hold that no walk can see (files deleted while open), since sealed and the
-// owner need that space.
+// resourceWatcher scans /proc every 500 ms for every running identity, so
+// the cost does not grow with the number of tasks times the number of
+// processes. A separate 2 s loop walks private directories and checks the free
+// space of the filesystem that holds the task directories: below
+// diskReserveBytes it stops every service process, whatever space they hold
+// that no walk can see (files deleted while open), since sealed and the owner
+// need that space. A slow walk never delays the memory check.
 type resourceWatcher struct {
 	mu      sync.Mutex
 	active  map[uint32]*isolatedCommand
 	started bool
 	stop    chan struct{}
 	disk    string
+	// Injectable for tests; production reads /proc, walks the directories
+	// and checks the filesystem's free space.
+	scan    func(map[uint32]bool) map[uint32]servicesandbox.Usage
+	walk    func(dirs []string, stopAt int64) int64
+	low     func(path string) bool
+	memTick time.Duration
+	dskTick time.Duration
 }
 
 // diskReserveBytes is the free space service processes must leave on the
@@ -245,7 +252,9 @@ type resourceWatcher struct {
 const diskReserveBytes = 1 << 30
 
 func newResourceWatcher(stop chan struct{}, disk string) *resourceWatcher {
-	return &resourceWatcher{active: map[uint32]*isolatedCommand{}, stop: stop, disk: disk}
+	return &resourceWatcher{active: map[uint32]*isolatedCommand{}, stop: stop, disk: disk,
+		scan: servicesandbox.Scan, walk: diskUsage, low: func(path string) bool { return diskLowCheck(path) },
+		memTick: 500 * time.Millisecond, dskTick: 2 * time.Second}
 }
 
 func (w *resourceWatcher) add(c *isolatedCommand) {
@@ -254,7 +263,10 @@ func (w *resourceWatcher) add(c *isolatedCommand) {
 	w.active[c.uid] = c
 	if !w.started {
 		w.started = true
-		go w.loop()
+		// Memory and disk run on their own goroutines, so a walk of a large
+		// tree never delays the memory check.
+		go w.memoryLoop()
+		go w.diskLoop()
 	}
 }
 
@@ -266,39 +278,60 @@ func (w *resourceWatcher) remove(c *isolatedCommand) {
 	}
 }
 
-func (w *resourceWatcher) loop() {
-	tick := time.NewTicker(500 * time.Millisecond)
+func (w *resourceWatcher) snapshot() ([]*isolatedCommand, map[uint32]bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	cmds := make([]*isolatedCommand, 0, len(w.active))
+	uids := make(map[uint32]bool, len(w.active))
+	for uid, c := range w.active {
+		cmds, uids[uid] = append(cmds, c), true
+	}
+	return cmds, uids
+}
+
+func (w *resourceWatcher) memoryLoop() {
+	tick := time.NewTicker(w.memTick)
 	defer tick.Stop()
-	for n := 0; ; n++ {
+	for {
 		select {
 		case <-w.stop:
 			return
 		case <-tick.C:
 		}
-		w.mu.Lock()
-		cmds := make([]*isolatedCommand, 0, len(w.active))
-		uids := make(map[uint32]bool, len(w.active))
-		for uid, c := range w.active {
-			cmds, uids[uid] = append(cmds, c), true
-		}
-		w.mu.Unlock()
+		cmds, uids := w.snapshot()
 		if len(cmds) == 0 {
 			continue
 		}
-		slow := n%4 == 0
-		if slow && w.disk != "" && diskLow(w.disk) {
+		usage := w.scan(uids)
+		for _, c := range cmds {
+			if c.limits.residentBytes > 0 && usage[c.uid].RSSBytes > c.limits.residentBytes {
+				c.exceeded("memory_limit")
+			}
+		}
+	}
+}
+
+func (w *resourceWatcher) diskLoop() {
+	tick := time.NewTicker(w.dskTick)
+	defer tick.Stop()
+	for {
+		select {
+		case <-w.stop:
+			return
+		case <-tick.C:
+		}
+		cmds, _ := w.snapshot()
+		if len(cmds) == 0 {
+			continue
+		}
+		if w.disk != "" && w.low(w.disk) {
 			for _, c := range cmds {
 				c.exceeded("sandbox_disk_low")
 			}
 			continue
 		}
-		usage := servicesandbox.Scan(uids)
 		for _, c := range cmds {
-			if c.limits.residentBytes > 0 && usage[c.uid].RSSBytes > c.limits.residentBytes {
-				c.exceeded("memory_limit")
-				continue
-			}
-			if slow && c.limits.diskBytes > 0 && diskUsage(c.limits.diskDirs, c.limits.diskBytes) > c.limits.diskBytes {
+			if c.limits.diskBytes > 0 && w.walk(c.limits.diskDirs, c.limits.diskBytes) > c.limits.diskBytes {
 				c.exceeded("disk_limit")
 			}
 		}
@@ -308,6 +341,9 @@ func (w *resourceWatcher) loop() {
 // diskReserveInodes is the floor of free inodes, for filesystems that
 // report a fixed inode count.
 const diskReserveInodes = 65536
+
+// diskLowCheck is diskLow, replaceable in tests.
+var diskLowCheck = diskLow
 
 // diskLow reports whether the filesystem holding path has less than
 // diskReserveBytes available or, where it counts inodes, fewer than

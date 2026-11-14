@@ -41,11 +41,32 @@ const MaxServiceProcesses = 2048
 // ErrProcessBudget refuses a service process the budget cannot hold.
 var ErrProcessBudget = errors.New("service process budget reached; retry later")
 
+// One-shot request workers serve anonymous POSTs to plain services. They may
+// hold at most MaxRequestWorkers of the MaxWorkers slots and
+// MaxRequestProcesses of the process budget, so executions a coordinator
+// spawns (paid jobs among them) always have room.
+const (
+	MaxRequestWorkers   = MaxWorkers / 2
+	MaxRequestProcesses = MaxServiceProcesses / 2
+)
+
 type worker struct {
 	service   string
 	cancel    context.CancelFunc
 	done      chan struct{}
 	processes int
+	request   bool // a one-shot request worker
+}
+
+// requestWorkersLocked counts the running one-shot request workers and the
+// processes they hold.
+func (m *Manager) requestWorkersLocked() (n, processes int) {
+	for _, w := range m.workers {
+		if w.request {
+			n, processes = n+1, processes+w.processes
+		}
+	}
+	return n, processes
 }
 
 // processesInUseLocked sums the processes limits of every running request,
@@ -138,7 +159,7 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req.Header.Del(ServiceVersionHeader)
 	req.Header.Del(InputHandleHeader)
 	ctx, cancel := context.WithTimeout(req.Context(), time.Duration(man.RequestTimeoutSeconds)*time.Second)
-	w := &worker{service: t.id, cancel: cancel, done: make(chan struct{}), processes: man.Processes}
+	w := &worker{service: t.id, cancel: cancel, done: make(chan struct{}), processes: man.Processes, request: true}
 	m.mu.Lock()
 	// Recheck after parsing; Stop must not race admission and miss this worker.
 	e = m.entries[t.id]
@@ -156,6 +177,11 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		m.mu.Unlock()
 		cancel()
 		return response(req, 503, ErrProcessBudget.Error()), nil
+	}
+	if n, procs := m.requestWorkersLocked(); n >= MaxRequestWorkers || procs+man.Processes > MaxRequestProcesses {
+		m.mu.Unlock()
+		cancel()
+		return response(req, 503, "request worker limit reached"), nil
 	}
 	uid, err := m.allocateIdentityLocked()
 	if err != nil {

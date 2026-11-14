@@ -18,8 +18,9 @@ capability beyond the provider's six and no change to the provider:
 | Resource watcher | sealed reads the identity's resident memory every 500 ms and the blocks allocated below its private directories (`$HOME`, `$TMPDIR`, the run directory; each entry at least 4 KiB) every 2 s, and kills the identity over a limit; below 1 GiB or 65536 inodes free on the task directories' filesystem it stops every service process and refuses new ones |
 | Cleanup by identity | The launcher becomes the identity and signals every process of it; root then confirms none remains. A starting sealed does this for every service identity that has a process, and never hands out one it could not clear |
 
-The process's only way out is a Unix socket sealed hands it: the egress proxy
-(published hosts only, as CONNECT tunnels) and the per-task model proxy.
+The process's only way out is a Unix socket: those sealed hands it (the egress
+proxy, published hosts only, as CONNECT tunnels, and the per-task model proxy),
+and any path socket whose own file mode admits it, which Landlock does not cover.
 Sealed's own listeners on the container's loopback (shared with the owner) stay
 out of reach, since inet sockets and TCP connect are refused.
 

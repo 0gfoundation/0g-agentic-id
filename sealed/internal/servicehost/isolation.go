@@ -182,7 +182,7 @@ func (m *Manager) prepareLaunch(ctx context.Context) (RuntimeLease, error) {
 	if err := m.admission(); err != nil {
 		return RuntimeLease{}, err
 	}
-	if diskLow(m.programs) {
+	if diskLowCheck(m.programs) {
 		return RuntimeLease{}, ErrDiskLow
 	}
 	return m.acquireRuntime(ctx)
