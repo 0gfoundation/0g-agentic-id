@@ -210,9 +210,10 @@ cannot start anything, even after record GC. An execution is two files: an
 immutable key record (service, key, input hash, version, times, UID), synced to
 disk before its worker starts, and a status record rewritten on each change. A
 crash before the key record is synced leaves no record, and nothing ran. With
-the status lost or unusable, the key record restores the execution as
-`interrupted` (reason `record_lost`, or `sealed_restarted` when no status was
-written yet), never as a start that did not run, so the key never runs again.
+the status unusable or missing, the key record restores the execution as
+`interrupted` (reason `record_lost` for a status file it cannot read,
+`sealed_restarted` when there is none), never as a start that did not run, so
+the key never runs again.
 The control socket accepts at most 64 connections, and a request body must
 arrive within 30 s.
 
@@ -227,7 +228,7 @@ Concurrent asks share one preparation, and its answer is reused for 5 s.
 An execution's `state` is one of `starting` (reserved; the worker is not running
 yet), `running`, `exited` (exit code 0), `failed`, `timed_out` (reason
 `deadline`), `cancelled` (`terminated`), `interrupted` (`sealed_restarted`: sealed
-restarted while it ran; `record_lost`: its status record was lost) and `quarantined` (sealed cannot yet prove the identity's
+restarted while it ran; `record_lost`: its status record could not be read) and `quarantined` (sealed cannot yet prove the identity's
 processes gone; the identity stays reserved). `reason` names the cause:
 `start_failed`, `process_exit`, `output_limit`, `memory_limit`, `disk_limit`,
 `sandbox_disk_low`, `cleanup_failed`, `resource_cleanup_failed`,

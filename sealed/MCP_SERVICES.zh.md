@@ -146,8 +146,8 @@ key、base64 公开 input、可选 input_handle，状态用随机 handle 查询�
 只返回一次执行，修改输入/代码冲突。find 只读找回丢失回执，不启动任何进程。
 十分钟前的 key 即使已 GC，也不能启动新执行。每个执行有两个文件：不可变的 key 记录（service、key、
 输入 hash、版本、时间、UID），在 worker 启动前同步写入磁盘；以及每次变化都重写的状态记录。
-key 记录同步之前崩溃不留记录，也没有任何程序运行过。状态记录丢失或不可用时，key 记录把该执行恢复为
-interrupted（reason 为 record_lost；尚未写过状态时为 sealed_restarted），而不是"从未运行"，
+key 记录同步之前崩溃不留记录，也没有任何程序运行过。状态记录不可用或不存在时，key 记录把该执行恢复为
+interrupted（状态文件读不出来时 reason 为 record_lost，没有状态文件时为 sealed_restarted），而不是"从未运行"，
 所以该 key 永远不会再次运行。控制 socket 最多 64 个连接，请求体须在 30 秒内送达。
 
 capabilities 不带其他字段，返回 `{"launch":true|false,"receipts":true|false}`。receipts：
@@ -157,7 +157,7 @@ capabilities 不带其他字段，返回 `{"launch":true|false,"receipts":true|f
 
 执行的 state 取值：starting（已预留，worker 还没运行）、running、exited（退出码 0）、
 failed、timed_out（reason 为 deadline）、cancelled（terminated）、interrupted
-（sealed_restarted：运行中 sealed 重启；record_lost：状态记录丢失）和 quarantined（sealed 还不能证明该身份的进程已全部
+（sealed_restarted：运行中 sealed 重启；record_lost：状态记录读不出来）和 quarantined（sealed 还不能证明该身份的进程已全部
 退出，身份保持预留）。reason 写明原因：start_failed、process_exit、output_limit、
 memory_limit、disk_limit、sandbox_disk_low、cleanup_failed、resource_cleanup_failed、
 metadata_write_failed。reason 为 start_failed 且没有 exit_code，表示 worker 从未运行：

@@ -329,10 +329,12 @@ func (m *Manager) pruneExecutionsLocked() {
 		if e.FinishedAt == 0 || e.FinishedAt >= cutoff || keyAcceptedUntil(e.Key) >= now {
 			continue
 		}
-		if err := privsep.Remove(m.executionRecordPath(h)); err != nil && !os.IsNotExist(err) {
+		// The key record goes first: a crash between the two leaves a status
+		// record, which restores with its true state, never a bare key record.
+		if err := privsep.Remove(m.executionKeyPath(h)); err != nil && !os.IsNotExist(err) {
 			continue
 		}
-		if err := privsep.Remove(m.executionKeyPath(h)); err != nil && !os.IsNotExist(err) {
+		if err := privsep.Remove(m.executionRecordPath(h)); err != nil && !os.IsNotExist(err) {
 			continue
 		}
 		m.outputBytes -= len(e.output)
@@ -674,9 +676,8 @@ func (m *Manager) ReceiptsAvailable() bool {
 }
 
 // launchProbeTimeout bounds the free-space check and the runtime listing and
-// pin of one LaunchAvailable preparation. The confinement probe it may run
-// first has its own 10 s bound under probeMu (admission), so one preparation
-// can take up to about 15 s.
+// pin of one LaunchAvailable preparation. They start after the confinement
+// probe, which has its own 10 s bound under probeMu (admission).
 const launchProbeTimeout = 5 * time.Second
 
 // launchCacheTTL is how long a LaunchAvailable answer, true or false, is
@@ -715,15 +716,23 @@ func (m *Manager) LaunchAvailable() bool {
 	w := make(chan struct{})
 	m.launchWait = w
 	m.launchMu.Unlock()
-	ok := m.prepareLaunchNow()
-	m.launchMu.Lock()
-	m.launchOK, m.launchAt, m.launchWait = ok, time.Now(), nil
-	m.launchMu.Unlock()
-	close(w)
+	// The answer is dated from the start of its checks, and waiters are
+	// released however the preparation ends.
+	started, ok := time.Now(), false
+	defer func() {
+		m.launchMu.Lock()
+		m.launchOK, m.launchAt, m.launchWait = ok, started, nil
+		m.launchMu.Unlock()
+		close(w)
+	}()
+	ok = m.prepareLaunchNow()
 	return ok
 }
 
 func (m *Manager) prepareLaunchNow() bool {
+	if m.admission() != nil {
+		return false
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), launchProbeTimeout)
 	defer cancel()
 	lease, err := m.prepareLaunch(ctx)
