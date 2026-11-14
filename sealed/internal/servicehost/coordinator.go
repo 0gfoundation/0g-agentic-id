@@ -336,8 +336,11 @@ func (m *Manager) superviseCoordinator(ctx context.Context, e *entry, c *coordin
 		delay = nextRestartDelay(e.restartDelay, time.Since(c.started))
 	} else if m.entries[e.ID] == e && !e.Desired {
 		// Ended because it is no longer wanted. Wait returned only once its
-		// identity was proven empty, so no stopping or cleanup error is left.
-		e.State, e.Error = "stopped", ""
+		// identity was proven empty. While the service's execution workers are
+		// still being cleaned up, Stop's note stays until they are gone too.
+		if !m.serviceHasWorkersLocked(e.ID) {
+			e.State, e.Error = "stopped", ""
+		}
 	} else if err != nil && e.State != "stopped" {
 		e.State = "stopped"
 	}

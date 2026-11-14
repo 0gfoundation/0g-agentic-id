@@ -10,7 +10,7 @@ sealed 在 agent 自己的沙箱里运行每个托管服务进程（`internal/se
 | --- | --- |
 | 服务身份 | 独立的 UID/GID，从 20001–64999 随机抽取（20000 留给探测）；无附加组；no-new-privs |
 | rlimit | 虚拟内存、每个身份的进程和线程数（`RLIMIT_NPROC`）、256 描述符、单文件 64 MiB、不生成 core；由 launcher 离开 root 之后设置 |
-| CPU 优先级 | nice 19，`RLIMIT_NICE` 为 0：服务进程把 CPU 让给 sealed 和 owner Harness，且无法调高自己的优先级 |
+| CPU 优先级 | nice 19，`RLIMIT_NICE` 为 0：服务进程无法调高自己的优先级；它们与 sealed、owner Harness 共用沙箱的 CPU 配额（见下面的实测） |
 | 进程额度 | 所有服务进程合计最多 2048 个进程和线程，每次启动按 manifest 的 `processes` 占用 |
 | Landlock（ABI 6 及以上） | 只读/执行镜像系统目录、版本目录和租用的运行包；读三个 `/etc` 条目；无害的 `/dev` 节点；在私有 run 目录里只能列目录、建 socket 和删除条目；只在私有 `$HOME` 和 `$TMPDIR` 下有完整权限（写、建、执行）；`/proc` 不可读；TCP bind/connect 被拒；抽象 Unix socket 和信号限于自身域 |
 | seccomp 过滤器 | 只能建 `AF_UNIX` 协议族的 socket；不能用 io_uring、System V IPC、POSIX 消息队列、内核 keyring 和任何 x32 调用；不能带 `CLONE_PARENT` 调 `clone`，`clone3` 返回 ENOSYS，libc 随即使用 `clone`；`fallocate` 返回 EOPNOTSUPP |
@@ -55,6 +55,9 @@ EAGAIN，2026-11-13）。launcher 在切换身份之后设置全部 rlimit。
 - 容器的 `pids.max` 为 `max`：进程额度是所有服务进程合计的上限。
 - 根文件系统是 ext 文件系统上的 overlay，Daytona 的 runner 在这种文件系统上不给单个沙箱设
   容量（只在 xfs 上设），`statfs` 报的是整块盘：剩余空间下限保护这块盘。
+- CPU 配额为 1 个 CPU 时（2026-11-15），`kernel.sched_autogroup_enabled` 为 1；自开会话（launcher
+  启动服务的方式）的 nice 19 忙循环在 4 秒内分到的 CPU 和 nice 0 的一样多（比值 1.056）：在那里
+  nice 19 不能让服务进程让出沙箱的 CPU。
 
 ## 这个设计的边界
 
@@ -62,7 +65,8 @@ EAGAIN，2026-11-13）。launcher 在切换身份之后设置全部 rlimit。
   不驻留在任何进程里的内存（写入但未映射的 memfd、管道缓冲）只受这个上限约束；内核 OOM 先杀
   服务进程。已删除但仍打开的文件占用的磁盘不按身份统计（root 没有 `CAP_SYS_PTRACE`，读不了
   别的身份的描述符），由剩余空间下限兜底。
-- CPU 是共用的：nice 19 让服务进程排在 sealed 和 owner 之后，不是单独的配额。
+- CPU 是共用的：服务进程、sealed 和 owner 共用一份沙箱 CPU 配额，sealed 不为自己或 owner 留出
+  任何部分；nice 19 只在内核对它们应用 nice 时才排序，dev runner 的实测没有看到这一点。
 - 进程能看到系统的进程号（信号和 `/proc` 被拒）。
 - 不同沙箱的身份碰巧相同时，共用 `RLIMIT_NPROC` 计数。
 

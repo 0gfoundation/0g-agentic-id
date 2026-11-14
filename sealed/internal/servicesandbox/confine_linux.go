@@ -300,8 +300,10 @@ func applyLimits(l Limits) error {
 }
 
 // demote sets nice 19 on the calling thread, which execve keeps, and takes
-// away the right to lower it again (RLIMIT_NICE 0), so service processes
-// yield the CPU to sealed and the owner Harness.
+// away the right to lower it again (RLIMIT_NICE 0). It orders service
+// processes only where the kernel applies nice between them and sealed or the
+// owner; on the dev runner (autogroup on, a CPU quota) a nice-19 process in
+// its own session got as much CPU as a nice-0 one.
 func demote() error {
 	if err := unix.Setrlimit(unix.RLIMIT_NICE, &unix.Rlimit{}); err != nil {
 		return fmt.Errorf("rlimit nice: %w", err)

@@ -64,8 +64,11 @@ The kernel counts `RLIMIT_NPROC` per UID across every sandbox of a runner
 (measured on the dev runner), so fixed slots would let one sandbox's processes
 block another's. The trusted launcher clears supplementary groups, drops UID/GID,
 sets no-new-privs, `oom_score_adj` 1000 and nice 19 (with `RLIMIT_NICE` 0, so it
-stays behind sealed and the owner), then confines the process with Landlock (ABI 6
-or later) and a seccomp filter before executing the interpreter:
+cannot raise its priority), then confines the process with Landlock (ABI 6 or
+later) and a seccomp filter before executing the interpreter. Service processes
+share the sandbox's CPU quota with sealed and the owner: on the dev runner a
+nice-19 process in its own session got as much CPU as a nice-0 one, so nice does
+not reserve CPU for sealed or the owner there (isolation/README.md):
 
 - Landlock lets it read and execute only the image's system directories, its
   release and the leased Harness runtime, read `/etc/resolv.conf`, `/etc/hosts`
@@ -203,9 +206,14 @@ Only the coordinator gets `$SEAL_EXEC_SOCKET`: POST `/executions` actions
 Keys are `<unix-ms>-<16..48 random URL-safe characters>`. Concurrent same-key,
 same-input, same-code retries return one execution; changes conflict. `find`
 recovers a lost acknowledgement without spawning. Keys older than ten minutes
-cannot start anything, even after record GC. A spawn's reservation is synced to
-disk before its worker starts; a crash before that leaves no record, and nothing
-ran. The control socket accepts at most 64 connections, and a request body must
+cannot start anything, even after record GC. An execution is two files: an
+immutable key record (service, key, input hash, version, times, UID), synced to
+disk before its worker starts, and a status record rewritten on each change. A
+crash before the key record is synced leaves no record, and nothing ran. With
+the status lost or unusable, the key record restores the execution as
+`interrupted` (reason `record_lost`, or `sealed_restarted` when no status was
+written yet), never as a start that did not run, so the key never runs again.
+The control socket accepts at most 64 connections, and a request body must
 arrive within 30 s.
 
 `capabilities` takes no other field and answers
@@ -214,11 +222,12 @@ that exits 0 now would receive a signed receipt (see Execution receipts).
 `launch`: whether sealed's own preparation for a service process succeeds now
 (the confinement probe, free space, and the verified runtime's listing and pin).
 A paid service asks before charging and takes work only when both are true.
+Concurrent asks share one preparation, and its answer is reused for 5 s.
 
 An execution's `state` is one of `starting` (reserved; the worker is not running
 yet), `running`, `exited` (exit code 0), `failed`, `timed_out` (reason
 `deadline`), `cancelled` (`terminated`), `interrupted` (`sealed_restarted`: sealed
-restarted while it ran) and `quarantined` (sealed cannot yet prove the identity's
+restarted while it ran; `record_lost`: its status record was lost) and `quarantined` (sealed cannot yet prove the identity's
 processes gone; the identity stays reserved). `reason` names the cause:
 `start_failed`, `process_exit`, `output_limit`, `memory_limit`, `disk_limit`,
 `sandbox_disk_low`, `cleanup_failed`, `resource_cleanup_failed`,
@@ -229,7 +238,7 @@ process it left still held its output open 250 ms later.
 
 Public input caps at 512 KiB; opaque stdout at 1 MiB/execution and 32 MiB globally;
 reads return up to 64 KiB. At most 1024 records, collected ten minutes after exit
-and never while their key could still be accepted. A record sealed cannot read
+and never while their key could still be accepted. A file sealed cannot read
 at boot is set aside (`.bad-<name>`) and logged; it never disables hosting.
 Output is memory only, lost on sealed restart. Applications must persist output
 before `release`; metadata/dedup survives release until GC. Waiter timeout does

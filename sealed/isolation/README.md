@@ -10,7 +10,7 @@ capability beyond the provider's six and no change to the provider:
 | --- | --- |
 | Service identity | A UID/GID of its own, drawn at random from 20001–64999 (20000 is the probe's); no supplementary groups; no-new-privs |
 | rlimits | Virtual memory, processes and threads per identity (`RLIMIT_NPROC`), 256 descriptors, 64 MiB per file, no core files; set by the launcher after it leaves root |
-| CPU priority | nice 19 with `RLIMIT_NICE` 0: service processes yield the CPU to sealed and the owner Harness and cannot raise their priority |
+| CPU priority | nice 19 with `RLIMIT_NICE` 0: service processes cannot raise their priority; they share the sandbox's CPU quota with sealed and the owner Harness (see the measurement below) |
 | Process budget | All service processes together hold at most 2048 processes and threads, reserved per launch from each manifest's `processes` |
 | Landlock (ABI 6 or later) | Read/execute only the image's system directories, the release and the leased runtime; read three `/etc` entries; harmless `/dev` nodes; in the private run directory only listing, creating sockets and removing entries; full access (write, create, execute) only below the private `$HOME` and `$TMPDIR`; no `/proc`; no TCP bind/connect; abstract Unix sockets and signals scoped to the process's own domain |
 | seccomp filter | Sockets of family `AF_UNIX` only; no io_uring, System V IPC, POSIX message queue, kernel keyring or x32 call; no `clone` with `CLONE_PARENT`, and `clone3` answers ENOSYS so libc uses `clone`; `fallocate` answers EOPNOTSUPP |
@@ -71,6 +71,10 @@ flags (2026-11-14):
 - The root filesystem was overlay on an ext filesystem, where Daytona's runner
   sets no per-sandbox size (it does only on xfs), and `statfs` reported the
   whole disk: the free-space floor protects that disk.
+- With a 1-CPU quota (2026-11-15), `kernel.sched_autogroup_enabled` was 1, and a
+  nice-19 busy loop in its own session (as the launcher starts a service) got as
+  much CPU as a nice-0 one over 4 s (ratio 1.056): nice 19 does not make service
+  processes yield the sandbox's CPU there.
 
 ## Limits of this design
 
@@ -81,8 +85,10 @@ flags (2026-11-14):
   files deleted while open is not counted per identity (root, without
   `CAP_SYS_PTRACE`, cannot read another identity's descriptors); the free-space
   floor bounds it.
-- CPU is shared: nice 19 puts service processes behind sealed and the owner, not
-  on a separate allocation.
+- CPU is shared: service processes, sealed and the owner draw on one sandbox
+  CPU quota, and sealed reserves none of it for itself or the owner; nice 19
+  orders them only where the kernel applies nice between them, which the dev
+  runner measurement did not show.
 - Processes see the system's process IDs (signals and `/proc` are refused).
 - Identities of different sandboxes share `RLIMIT_NPROC` when they collide.
 

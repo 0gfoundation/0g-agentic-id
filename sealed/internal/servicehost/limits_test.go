@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -499,6 +501,28 @@ func TestCoordinatorStopClearsCleanupError(t *testing.T) {
 	if state != "stopped" || msg != "" || held != nil {
 		t.Fatalf("after the coordinator ended: state %q error %q controller %v", state, msg, held != nil)
 	}
+	// While one of the service's execution workers is still being cleaned
+	// up, Stop's note stays.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	cmd2 := &isolatedCommand{Cmd: exec.Command("/bin/sh", "-c", "exit 0"), cleanupResource: func(context.Context) error { return nil }}
+	c2 := &coordinator{cancel: cancel2, done: make(chan struct{}), server: &http.Server{}, cmd: cmd2, started: time.Now()}
+	m.mu.Lock()
+	e.State, e.Error, e.controller = "stopping", "processes are still being cleaned up", c2
+	m.workers[999] = &worker{service: "coord", cancel: func() {}, done: make(chan struct{})}
+	gen = e.generation
+	m.mu.Unlock()
+	if err := cmd2.Start(); err != nil {
+		t.Fatal(err)
+	}
+	m.superviseCoordinator(ctx2, e, c2, gen)
+	m.mu.Lock()
+	state, msg = e.State, e.Error
+	delete(m.workers, 999)
+	m.mu.Unlock()
+	if state != "stopping" || msg != "processes are still being cleaned up" {
+		t.Fatalf("with a worker still being cleaned up: state %q error %q", state, msg)
+	}
 }
 
 // The memory check keeps its cadence while a disk walk is slow.
@@ -593,16 +617,159 @@ func TestCapabilitiesReportLaunchReadiness(t *testing.T) {
 	if !m.LaunchAvailable() {
 		t.Fatal("launch unavailable on a ready manager")
 	}
+	fresh := func() bool { // past the answer's reuse window
+		m.launchMu.Lock()
+		m.launchAt = time.Time{}
+		m.launchMu.Unlock()
+		return m.LaunchAvailable()
+	}
 	old := diskLowCheck
 	diskLowCheck = func(string) bool { return true }
-	low := m.LaunchAvailable()
+	low := fresh()
 	diskLowCheck = old
 	if low {
 		t.Fatal("launch available with low free space")
 	}
 	runtimeErr = fmt.Errorf("runtime listing unavailable")
-	if m.LaunchAvailable() {
+	if fresh() {
 		t.Fatal("launch available without the verified runtime")
+	}
+}
+
+// However many callers ask at once, one preparation runs (one runtime lock and
+// chain read), and its answer is reused for launchCacheTTL.
+func TestLaunchAvailableSharesOneCheck(t *testing.T) {
+	root(t)
+	var calls atomic.Int32
+	release := make(chan struct{})
+	m, err := NewWithOptions(filepath.Join(t.TempDir(), "services"), "owner:identity", Options{SkipResourceLimitsForTests: true,
+		AcquireRuntime: func(context.Context) (RuntimeLease, error) {
+			calls.Add(1)
+			<-release
+			hash := strings.Repeat("c", 64)
+			return RuntimeLease{Hash: hash, Dir: "/opt/0g-harness/" + hash, Release: func() {}}, nil
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	var wg sync.WaitGroup
+	answers := make(chan bool, 64)
+	for range 64 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			answers <- m.LaunchAvailable()
+		}()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // let the others queue behind it
+	close(release)
+	wg.Wait()
+	close(answers)
+	for ok := range answers {
+		if !ok {
+			t.Fatal("a shared check answered false")
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("%d preparations for 64 concurrent asks", n)
+	}
+	if !m.LaunchAvailable() || calls.Load() != 1 {
+		t.Fatalf("an ask within %v ran another preparation (%d)", launchCacheTTL, calls.Load())
+	}
+}
+
+// writeExecutionFiles puts a key record and, optionally, a status file for one
+// handle where a previous sealed would have left them.
+func writeExecutionFiles(t *testing.T, base, handle, key string, status *string) {
+	t.Helper()
+	dir := filepath.Join(base, "executions")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	k, _ := json.Marshal(executionKeyRecord{Binding: "owner:identity", Handle: handle, Service: "paid", Key: key, Version: strings.Repeat("v", 64),
+		InputHash: strings.Repeat("i", 64), StartedAt: time.Now().UnixMilli(), Deadline: time.Now().Add(time.Minute).UnixMilli(), UID: 30000})
+	if err := os.WriteFile(filepath.Join(dir, handle+".key"), k, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if status != nil {
+		if err := os.WriteFile(filepath.Join(dir, handle+".json"), []byte(*status), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The synced key record keeps a key from ever running again: with its status
+// file lost (empty or corrupt after a crash) or never written, the execution
+// restores as interrupted, never as a start that did not run.
+func TestKeyRecordSurvivesALostStatus(t *testing.T) {
+	root(t)
+	base := filepath.Join(t.TempDir(), "services")
+	m, err := newTestManager(base, "owner:identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Close()
+	now := time.Now().UnixMilli()
+	empty, corrupt := "", "{\"binding\":"
+	cases := []struct {
+		handle, key, reason string
+		status              *string
+	}{
+		{strings.Repeat("a1", 32), fmt.Sprintf("%d-%s", now, strings.Repeat("e", 20)), "record_lost", &empty},
+		{strings.Repeat("b2", 32), fmt.Sprintf("%d-%s", now, strings.Repeat("c", 20)), "record_lost", &corrupt},
+		{strings.Repeat("c3", 32), fmt.Sprintf("%d-%s", now, strings.Repeat("n", 20)), "sealed_restarted", nil},
+	}
+	for _, c := range cases {
+		writeExecutionFiles(t, base, c.handle, c.key, c.status)
+	}
+	m, err = newTestManager(base, "owner:identity")
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	defer m.Close()
+	for _, c := range cases {
+		status, err := m.FindExecution("paid", c.key)
+		if err != nil || status.Handle != c.handle || status.State != "interrupted" || status.Reason != c.reason || status.ExitCode != nil {
+			t.Fatalf("%s: %+v %v", c.reason, status, err)
+		}
+	}
+	// Crash before the key record was synced: nothing was reserved, nothing ran.
+	if _, err := m.FindExecution("paid", fmt.Sprintf("%d-%s", now, strings.Repeat("z", 20))); err != ErrExecutionNotFound {
+		t.Fatalf("an unreserved key: %v", err)
+	}
+}
+
+// Pruning a record removes both of its files.
+func TestPruneRemovesKeyAndStatus(t *testing.T) {
+	root(t)
+	base := filepath.Join(t.TempDir(), "services")
+	m, err := newTestManager(base, "owner:identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	old := time.Now().Add(-time.Hour).UnixMilli()
+	handle, key := strings.Repeat("d4", 32), fmt.Sprintf("%d-%s", old, strings.Repeat("p", 20))
+	status := "{}"
+	writeExecutionFiles(t, base, handle, key, &status)
+	m.mu.Lock()
+	m.executions[handle] = &execution{ExecutionStatus: ExecutionStatus{Handle: handle, Service: "paid", Key: key, State: "exited", FinishedAt: old}, done: make(chan struct{})}
+	m.executionKeys[executionKey("paid", key)] = handle
+	m.pruneExecutionsLocked()
+	_, kept := m.executions[handle]
+	m.mu.Unlock()
+	if kept {
+		t.Fatal("record not pruned")
+	}
+	for _, ext := range []string{".key", ".json"} {
+		if _, err := os.Lstat(filepath.Join(base, "executions", handle+ext)); !os.IsNotExist(err) {
+			t.Fatalf("%s left after prune: %v", ext, err)
+		}
 	}
 }
 

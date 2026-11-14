@@ -48,8 +48,10 @@ start/stop/logs 接收 id。不公开管理接口。logs 为空：协调进程�
 探测）；provider 的 UID/GID 映射必须覆盖 20000–64999。内核按 UID 在同一 runner 的所有沙箱之间合计 `RLIMIT_NPROC`
 （在 dev runner 上实测），固定编号会让一个沙箱的进程卡住另一个沙箱。可信 launcher 清除
 附加组、切换 UID/GID、启用 no-new-privs、把 `oom_score_adj` 设为 1000、nice 设为 19（`RLIMIT_NICE`
-为 0，始终排在 sealed 和 owner 之后），再用 Landlock（ABI 6 及以上）和 seccomp 过滤器限制进程，
-然后才执行解释器：
+为 0，无法调高优先级），再用 Landlock（ABI 6 及以上）和 seccomp 过滤器限制进程，然后才执行解释器。
+服务进程与 sealed、owner 共用沙箱的 CPU 配额：在 dev runner 上，自开会话、nice 19 的进程和
+nice 0 的进程分到的 CPU 一样多，所以 nice 在那里不能给 sealed 或 owner 留出 CPU
+（isolation/README.zh.md）：
 
 - Landlock 只允许它读取并执行镜像的系统目录、自己的版本和租用的 Harness 运行包，读取
   `/etc/resolv.conf`、`/etc/hosts`、`/etc/ssl/certs`，使用 `/dev/null`、`zero`、`full`、
@@ -142,17 +144,20 @@ Harness mountServiceModel 使用公开占位符，拿不到真实密钥。其他
 key、base64 公开 input、可选 input_handle，状态用随机 handle 查询。key 格式
 `<unix-ms>-<16..48 random URL-safe characters>`。同 key/输入/代码的并发重试
 只返回一次执行，修改输入/代码冲突。find 只读找回丢失回执，不启动任何进程。
-十分钟前的 key 即使已 GC，也不能启动新执行。spawn 的预留记录在 worker 启动前同步写入磁盘；
-在此之前崩溃不留记录，也没有任何程序运行过。控制 socket 最多 64 个连接，请求体须在 30 秒内送达。
+十分钟前的 key 即使已 GC，也不能启动新执行。每个执行有两个文件：不可变的 key 记录（service、key、
+输入 hash、版本、时间、UID），在 worker 启动前同步写入磁盘；以及每次变化都重写的状态记录。
+key 记录同步之前崩溃不留记录，也没有任何程序运行过。状态记录丢失或不可用时，key 记录把该执行恢复为
+interrupted（reason 为 record_lost；尚未写过状态时为 sealed_restarted），而不是"从未运行"，
+所以该 key 永远不会再次运行。控制 socket 最多 64 个连接，请求体须在 30 秒内送达。
 
 capabilities 不带其他字段，返回 `{"launch":true|false,"receipts":true|false}`。receipts：
 现在退出码为 0 的执行能否拿到签名证明（见执行证明）。launch：sealed 自己为服务进程做的准备
 （隔离探测、剩余空间、已验证运行包的列表检查与锁定）现在能否成功。收费服务在扣款前先查询，
-两项都为 true 才接活。
+两项都为 true 才接活。同时到达的查询共用一次准备，结果复用 5 秒。
 
 执行的 state 取值：starting（已预留，worker 还没运行）、running、exited（退出码 0）、
 failed、timed_out（reason 为 deadline）、cancelled（terminated）、interrupted
-（sealed_restarted：运行中 sealed 重启）和 quarantined（sealed 还不能证明该身份的进程已全部
+（sealed_restarted：运行中 sealed 重启；record_lost：状态记录丢失）和 quarantined（sealed 还不能证明该身份的进程已全部
 退出，身份保持预留）。reason 写明原因：start_failed、process_exit、output_limit、
 memory_limit、disk_limit、sandbox_disk_low、cleanup_failed、resource_cleanup_failed、
 metadata_write_failed。reason 为 start_failed 且没有 exit_code，表示 worker 从未运行：
@@ -160,7 +165,7 @@ state 为 failed，清理得到证明之前为 quarantined。failed 且 reason �
 表示 worker 以 0 退出，但它留下的进程在 250 ms 后仍占着它的输出。
 
 公开输入上限 512 KiB，stdout 每次 1 MiB、全局 32 MiB，每次读最多 64 KiB。
-记录最多 1024 条，退出十分钟后回收，但在其 key 仍可能被接受时不回收。启动时读不了的记录
+记录最多 1024 条，退出十分钟后回收，但在其 key 仍可能被接受时不回收。启动时读不了的文件
 移到一边（`.bad-<name>`）并记日志，不会让托管服务不可用。输出仅内存保存，sealed 重启会丢失；应用必须在
 release 前持久保存。release 后元数据/去重保留至 GC。wait 超时不取消执行。
 元数据只含 hash、版本、UID、时间、退出事实、证明，不含输入/stdout，也不定义雇主归属、

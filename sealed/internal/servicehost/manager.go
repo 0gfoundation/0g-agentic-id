@@ -49,26 +49,32 @@ type entry struct {
 }
 
 type Manager struct {
-	mu                         sync.Mutex
-	base                       string
-	programs                   string
-	binding                    string
-	entries                    map[string]*entry
-	closed                     bool
-	workers                    map[uint32]*worker
-	executions                 map[string]*execution
-	executionKeys              map[string]string
-	outputBytes                int
-	stopGC                     chan struct{}
-	pendingInputs              map[string]pendingInput
-	egressDial                 func(context.Context, string, string) (net.Conn, error)
-	attestor                   ExecutionAttestor
-	receiptsReady              func() bool
-	runtime                    func(context.Context) (RuntimeLease, error)
-	model                      func(context.Context) (ModelRoute, error)
-	watcher                    *resourceWatcher
-	probeMu                    sync.Mutex
-	probeAt                    time.Time
+	mu            sync.Mutex
+	base          string
+	programs      string
+	binding       string
+	entries       map[string]*entry
+	closed        bool
+	workers       map[uint32]*worker
+	executions    map[string]*execution
+	executionKeys map[string]string
+	outputBytes   int
+	stopGC        chan struct{}
+	pendingInputs map[string]pendingInput
+	egressDial    func(context.Context, string, string) (net.Conn, error)
+	attestor      ExecutionAttestor
+	receiptsReady func() bool
+	runtime       func(context.Context) (RuntimeLease, error)
+	model         func(context.Context) (ModelRoute, error)
+	watcher       *resourceWatcher
+	probeMu       sync.Mutex
+	probeAt       time.Time
+	// LaunchAvailable's shared check: one preparation at a time, its answer
+	// reused for launchCacheTTL.
+	launchMu                   sync.Mutex
+	launchAt                   time.Time
+	launchOK                   bool
+	launchWait                 chan struct{}
 	probeErr                   error
 	skipResourceLimitsForTests bool
 	// quarantined holds identities whose leftover processes could not be

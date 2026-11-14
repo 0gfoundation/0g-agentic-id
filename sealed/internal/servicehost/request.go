@@ -69,6 +69,17 @@ func (m *Manager) requestWorkersLocked() (n, processes int) {
 	return n, processes
 }
 
+// serviceHasWorkersLocked reports whether any request or execution worker of
+// the service is still running or being cleaned up.
+func (m *Manager) serviceHasWorkersLocked(id string) bool {
+	for _, w := range m.workers {
+		if w.service == id {
+			return true
+		}
+	}
+	return false
+}
+
 // processesInUseLocked sums the processes limits of every running request,
 // execution and coordinator (including ones still being cleaned up).
 func (m *Manager) processesInUseLocked() int {
