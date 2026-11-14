@@ -21,6 +21,8 @@ const MaxFiles = 512
 const MaxBundleBytes = 16 << 20
 const MaxServices = 16
 
+const minNodeProcesses = 16
+
 var validID = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 var validEnv = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 
@@ -141,6 +143,10 @@ func (m *Manifest) normalize() (string, error) {
 	}
 	if m.MemoryMB < 128 || m.MemoryMB > 16384 || m.Processes < 1 || m.Processes > 256 {
 		return "", fmt.Errorf("resource limits out of range")
+	}
+	// RLIMIT_NPROC counts threads: Node starts about a dozen before any code.
+	if m.Command == "node" && m.Processes < minNodeProcesses {
+		return "", fmt.Errorf("processes must be at least %d for node", minNodeProcesses)
 	}
 	if len(m.Files) == 0 || len(m.Files) > MaxFiles {
 		return "", fmt.Errorf("give 1..%d files", MaxFiles)

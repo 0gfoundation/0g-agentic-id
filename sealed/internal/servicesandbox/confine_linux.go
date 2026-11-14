@@ -125,9 +125,73 @@ func buildRuleset(p Policy, abi int) (*ruleset, error) {
 
 var auditArch = map[string]uint32{"amd64": unix.AUDIT_ARCH_X86_64, "arm64": unix.AUDIT_ARCH_AARCH64}
 
-// networkFilter refuses inet, netlink and packet sockets and io_uring (which
-// could open sockets without socket(2)). Any other architecture is killed.
-func networkFilter() ([]unix.SockFilter, error) {
+// x32Bit marks x32 system calls on amd64. They arrive with AUDIT_ARCH_X86_64
+// but their own numbers, so the filter refuses the whole x32 range.
+const x32Bit = 0x40000000
+
+// refusedCalls fail with EPERM in a service process:
+//   - io_uring, which could open sockets without socket(2);
+//   - System V IPC and POSIX message queues, whose objects belong to the
+//     whole sandbox and outlive the processes that created them;
+//   - kernel keyrings, which belong to a UID and so would reach the next task
+//     that draws the same identity.
+var refusedCalls = []uint32{
+	unix.SYS_IO_URING_SETUP, unix.SYS_IO_URING_ENTER, unix.SYS_IO_URING_REGISTER,
+	unix.SYS_SHMGET, unix.SYS_SHMAT, unix.SYS_SHMCTL, unix.SYS_SHMDT,
+	unix.SYS_MSGGET, unix.SYS_MSGSND, unix.SYS_MSGRCV, unix.SYS_MSGCTL,
+	unix.SYS_SEMGET, unix.SYS_SEMOP, unix.SYS_SEMCTL, unix.SYS_SEMTIMEDOP,
+	unix.SYS_MQ_OPEN, unix.SYS_MQ_UNLINK, unix.SYS_MQ_TIMEDSEND, unix.SYS_MQ_TIMEDRECEIVE, unix.SYS_MQ_NOTIFY, unix.SYS_MQ_GETSETATTR,
+	unix.SYS_ADD_KEY, unix.SYS_REQUEST_KEY, unix.SYS_KEYCTL,
+}
+
+// bpf assembles a classic BPF program with forward jumps to named labels.
+type bpf struct {
+	prog   []unix.SockFilter
+	jumps  []bpfJump
+	labels map[string]int
+}
+
+type bpfJump struct {
+	at     int
+	jt, jf string // "" falls through
+}
+
+func (b *bpf) stmt(code uint16, k uint32) {
+	b.prog = append(b.prog, unix.SockFilter{Code: code, K: k})
+}
+
+func (b *bpf) jump(code uint16, k uint32, jt, jf string) {
+	b.jumps = append(b.jumps, bpfJump{at: len(b.prog), jt: jt, jf: jf})
+	b.stmt(code, k)
+}
+
+func (b *bpf) label(name string) { b.labels[name] = len(b.prog) }
+
+func (b *bpf) assemble() ([]unix.SockFilter, error) {
+	for _, j := range b.jumps {
+		for _, t := range []struct {
+			label string
+			off   *uint8
+		}{{j.jt, &b.prog[j.at].Jt}, {j.jf, &b.prog[j.at].Jf}} {
+			if t.label == "" {
+				continue
+			}
+			to, ok := b.labels[t.label]
+			if !ok || to <= j.at || to-j.at-1 > 255 {
+				return nil, fmt.Errorf("seccomp jump to %q", t.label)
+			}
+			*t.off = uint8(to - j.at - 1)
+		}
+	}
+	return b.prog, nil
+}
+
+// serviceFilter allows sockets only of family AF_UNIX (the sockets sealed
+// hands the service), refuses refusedCalls and every x32 call, and answers
+// fallocate with EOPNOTSUPP: fallocate can reserve blocks past RLIMIT_FSIZE
+// without growing the file, while callers such as glibc's posix_fallocate fall
+// back to writes, which RLIMIT_FSIZE bounds. Any other architecture is killed.
+func serviceFilter() ([]unix.SockFilter, error) {
 	arch, ok := auditArch[runtime.GOARCH]
 	if !ok {
 		return nil, fmt.Errorf("unsupported architecture %s", runtime.GOARCH)
@@ -135,41 +199,41 @@ func networkFilter() ([]unix.SockFilter, error) {
 	const (
 		ld   = unix.BPF_LD | unix.BPF_W | unix.BPF_ABS
 		jeq  = unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K
+		jge  = unix.BPF_JMP | unix.BPF_JGE | unix.BPF_K
 		ret  = unix.BPF_RET | unix.BPF_K
 		nr   = 0  // offsetof(struct seccomp_data, nr)
 		arc  = 4  // offsetof(struct seccomp_data, arch)
 		arg0 = 16 // low word of args[0] (little endian)
 	)
-	denyNR := []uint32{unix.SYS_IO_URING_SETUP, unix.SYS_IO_URING_ENTER, unix.SYS_IO_URING_REGISTER}
-	denyFamily := []uint32{unix.AF_INET, unix.AF_INET6, unix.AF_NETLINK, unix.AF_PACKET}
-	allow := 4 + len(denyNR) + 2 + len(denyFamily)
-	deny := allow + 1
-	var p []unix.SockFilter
-	add := func(code uint16, k uint32, jt, jf int) {
-		p = append(p, unix.SockFilter{Code: code, Jt: uint8(jt), Jf: uint8(jf), K: k})
+	b := &bpf{labels: map[string]int{}}
+	b.stmt(ld, arc)
+	b.jump(jeq, arch, "", "kill")
+	b.stmt(ld, nr)
+	if runtime.GOARCH == "amd64" {
+		b.jump(jge, x32Bit, "deny", "")
 	}
-	add(ld, arc, 0, 0)
-	add(jeq, arch, 1, 0)
-	add(ret, unix.SECCOMP_RET_KILL_PROCESS, 0, 0)
-	add(ld, nr, 0, 0)
-	for _, n := range denyNR {
-		add(jeq, n, deny-len(p)-1, 0)
+	for _, n := range refusedCalls {
+		b.jump(jeq, n, "deny", "")
 	}
-	add(jeq, unix.SYS_SOCKET, 0, allow-len(p)-1)
-	add(ld, arg0, 0, 0)
-	for _, f := range denyFamily {
-		add(jeq, f, deny-len(p)-1, 0)
-	}
-	add(ret, unix.SECCOMP_RET_ALLOW, 0, 0)
-	add(ret, unix.SECCOMP_RET_ERRNO|uint32(unix.EPERM), 0, 0)
-	if len(p) != deny+1 {
-		return nil, fmt.Errorf("seccomp program layout")
-	}
-	return p, nil
+	b.jump(jeq, unix.SYS_FALLOCATE, "unsupported", "")
+	b.jump(jeq, unix.SYS_SOCKET, "family", "")
+	b.jump(jeq, unix.SYS_SOCKETPAIR, "family", "allow")
+	b.label("family")
+	b.stmt(ld, arg0)
+	b.jump(jeq, unix.AF_UNIX, "allow", "deny")
+	b.label("allow")
+	b.stmt(ret, unix.SECCOMP_RET_ALLOW)
+	b.label("deny")
+	b.stmt(ret, unix.SECCOMP_RET_ERRNO|uint32(unix.EPERM))
+	b.label("unsupported")
+	b.stmt(ret, unix.SECCOMP_RET_ERRNO|uint32(unix.EOPNOTSUPP))
+	b.label("kill")
+	b.stmt(ret, unix.SECCOMP_RET_KILL_PROCESS)
+	return b.assemble()
 }
 
-func installNetworkFilter() error {
-	filter, err := networkFilter()
+func installServiceFilter() error {
+	filter, err := serviceFilter()
 	if err != nil {
 		return err
 	}
@@ -259,7 +323,7 @@ func confine(p Policy) error {
 	if err := r.restrictSelf(); err != nil {
 		return err
 	}
-	if err := installNetworkFilter(); err != nil {
+	if err := installServiceFilter(); err != nil {
 		return err
 	}
 	if _, err := unix.Setsid(); err != nil {

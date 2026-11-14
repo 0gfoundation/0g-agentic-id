@@ -8,13 +8,14 @@ capability beyond the provider's six and no change to the provider:
 
 | Mechanism | What it enforces |
 | --- | --- |
-| Service identity | A UID/GID of its own, drawn at random from 20000–64999; no supplementary groups; no-new-privs |
+| Service identity | A UID/GID of its own, drawn at random from 20001–64999 (20000 is the probe's); no supplementary groups; no-new-privs |
 | rlimits | Virtual memory, processes and threads per identity (`RLIMIT_NPROC`), 256 descriptors, 64 MiB per file, no core files; set by the launcher after it leaves root |
-| Landlock (ABI 6 or later) | Read/execute only the image's system directories, the release and the leased runtime; read three `/etc` entries; harmless `/dev` nodes; sockets only in the private run directory; write only the private `$HOME` and `$TMPDIR`; no `/proc`; no TCP bind/connect; abstract Unix sockets and signals scoped to the process's own domain |
-| seccomp filter | No inet, netlink or packet socket; no io_uring |
+| Process budget | All service processes together hold at most 2048 processes and threads, reserved per launch from each manifest's `processes` |
+| Landlock (ABI 6 or later) | Read/execute only the image's system directories, the release and the leased runtime; read three `/etc` entries; harmless `/dev` nodes; sockets only in the private run directory; full access (write, create, execute) only below the private `$HOME` and `$TMPDIR`; no `/proc`; no TCP bind/connect; abstract Unix sockets and signals scoped to the process's own domain |
+| seccomp filter | Sockets of family `AF_UNIX` only; no io_uring, System V IPC, POSIX message queue, kernel keyring or x32 call; `fallocate` answers EOPNOTSUPP |
 | `oom_score_adj` 1000 | The kernel's OOM killer takes service processes before sealed or the owner Harness; Landlock keeps them from lowering it |
-| Resource watcher | sealed reads the identity's resident memory every 500 ms and its private directories every 2 s, and kills the identity over a limit |
-| Cleanup by identity | The launcher becomes the identity and signals every process of it; root then confirms none remains |
+| Resource watcher | sealed reads the identity's resident memory every 500 ms and the blocks allocated below its private directories every 2 s, and kills the identity over a limit; below 1 GiB free on the task directories' filesystem it stops every service process and refuses new ones |
+| Cleanup by identity | The launcher becomes the identity and signals every process of it; root then confirms none remains. A starting sealed does this for every service identity that has a process |
 
 The process's only way out is a Unix socket sealed hands it: the egress proxy
 (published hosts only, as CONNECT tunnels) and the per-task model proxy. Its
@@ -52,10 +53,25 @@ launcher therefore sets every rlimit after the identity drop.
 The probe and its results: 0g-tapp-ops `deploy/dev/landlock-probe-20261113/` and
 `deployments/sandbox.md` (2026-11-13 15:55).
 
+As nobody, without sealed's filter, in a container with the runner's sandbox
+flags (2026-11-14): a `socket(AF_SMC)` was created, so a family list that names
+only inet, netlink and packet leaves another route to TCP; hence the filter
+allows `AF_UNIX` only. `kernel.shm_rmid_forced` was 0, so a System V shared
+memory segment outlives its process, outside any process's resident memory;
+hence no System V IPC. An x32 call ended the process with SIGSYS (Docker's
+default profile); sealed's filter refuses x32 calls on its own as well. The
+container's `pids.max` was `max`, hence the process budget. Its root filesystem
+was overlay on an ext filesystem, where Daytona's runner sets no per-sandbox
+size (it does only on xfs), and `statfs` reported the whole disk, which the
+free-space floor then protects.
+
 ## Limits of this design
 
 - Memory and disk are watched, not kernel limits: a burst between two reads can
-  pass them, and the sandbox's own memory limit is the hard bound.
+  pass them, and the sandbox's own memory limit is the hard bound. Disk held by
+  files deleted while open is not counted per identity (root, without
+  `CAP_SYS_PTRACE`, cannot read another identity's descriptors); the free-space
+  floor bounds it.
 - Processes see the system's process IDs (signals and `/proc` are refused).
 - Identities of different sandboxes share `RLIMIT_NPROC` when they collide.
 

@@ -4,6 +4,7 @@ package servicesandbox
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,7 +20,7 @@ import (
 	"seal-verify/internal/serviceidentity"
 )
 
-// runFilter interprets the subset of classic BPF the network filter uses.
+// runFilter interprets the subset of classic BPF the service filter uses.
 func runFilter(t *testing.T, prog []unix.SockFilter, arch, nr uint32, arg0 uint32) uint32 {
 	t.Helper()
 	var acc uint32
@@ -37,8 +38,12 @@ func runFilter(t *testing.T, prog []unix.SockFilter, arch, nr uint32, arg0 uint3
 			default:
 				t.Fatalf("unexpected load offset %d", in.K)
 			}
-		case unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K:
-			if acc == in.K {
+		case unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, unix.BPF_JMP | unix.BPF_JGE | unix.BPF_K:
+			taken := acc == in.K
+			if in.Code&0xf0 == unix.BPF_JGE {
+				taken = acc >= in.K
+			}
+			if taken {
 				pc += int(in.Jt)
 			} else {
 				pc += int(in.Jf)
@@ -53,70 +58,72 @@ func runFilter(t *testing.T, prog []unix.SockFilter, arch, nr uint32, arg0 uint3
 	return 0
 }
 
-func TestNetworkFilterDecisions(t *testing.T) {
-	prog, err := networkFilter()
+func TestServiceFilterDecisions(t *testing.T) {
+	prog, err := serviceFilter()
 	if err != nil {
 		t.Fatal(err)
 	}
 	arch := auditArch[runtime.GOARCH]
+	allow := uint32(unix.SECCOMP_RET_ALLOW)
 	deny := uint32(unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM))
-	for _, c := range []struct {
+	unsupported := uint32(unix.SECCOMP_RET_ERRNO | uint32(unix.EOPNOTSUPP))
+	type decision struct {
 		name string
 		arch uint32
 		nr   uint32
 		arg0 uint32
 		want uint32
-	}{
+	}
+	cases := []decision{
+		{"unix socket", arch, unix.SYS_SOCKET, unix.AF_UNIX, allow},
+		{"unix socketpair", arch, unix.SYS_SOCKETPAIR, unix.AF_UNIX, allow},
 		{"inet socket", arch, unix.SYS_SOCKET, unix.AF_INET, deny},
 		{"inet6 socket", arch, unix.SYS_SOCKET, unix.AF_INET6, deny},
 		{"netlink socket", arch, unix.SYS_SOCKET, unix.AF_NETLINK, deny},
 		{"packet socket", arch, unix.SYS_SOCKET, unix.AF_PACKET, deny},
-		{"unix socket", arch, unix.SYS_SOCKET, unix.AF_UNIX, unix.SECCOMP_RET_ALLOW},
-		{"io_uring_setup", arch, unix.SYS_IO_URING_SETUP, 0, deny},
-		{"io_uring_enter", arch, unix.SYS_IO_URING_ENTER, 0, deny},
-		{"io_uring_register", arch, unix.SYS_IO_URING_REGISTER, 0, deny},
-		{"read", arch, unix.SYS_READ, unix.AF_INET, unix.SECCOMP_RET_ALLOW},
-		{"connect", arch, unix.SYS_CONNECT, unix.AF_INET, unix.SECCOMP_RET_ALLOW},
+		{"smc socket", arch, unix.SYS_SOCKET, unix.AF_SMC, deny},
+		{"vsock socket", arch, unix.SYS_SOCKET, unix.AF_VSOCK, deny},
+		{"inet socketpair", arch, unix.SYS_SOCKETPAIR, unix.AF_INET, deny},
+		{"fallocate", arch, unix.SYS_FALLOCATE, 3, unsupported},
+		{"read", arch, unix.SYS_READ, unix.AF_INET, allow},
+		{"connect", arch, unix.SYS_CONNECT, unix.AF_INET, allow},
+		{"write", arch, unix.SYS_WRITE, 0, allow},
 		{"foreign architecture", arch ^ 1, unix.SYS_READ, 0, unix.SECCOMP_RET_KILL_PROCESS},
-	} {
+	}
+	for _, n := range refusedCalls {
+		cases = append(cases, decision{fmt.Sprintf("refused call %d", n), arch, n, 0, deny})
+	}
+	if runtime.GOARCH == "amd64" {
+		cases = append(cases,
+			decision{"x32 socket", arch, x32Bit | unix.SYS_SOCKET, unix.AF_INET, deny},
+			decision{"x32 read", arch, x32Bit | unix.SYS_READ, 0, deny},
+			decision{"x32 sendmsg", arch, x32Bit | 518, 0, deny})
+	}
+	for _, c := range cases {
 		if got := runFilter(t, prog, c.arch, c.nr, c.arg0); got != c.want {
 			t.Errorf("%s: %#x, want %#x", c.name, got, c.want)
 		}
 	}
 }
 
-func TestScanSumsOneIdentity(t *testing.T) {
-	dir := t.TempDir()
-	write := func(pid, body string) {
-		if err := os.MkdirAll(filepath.Join(dir, pid), 0755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, pid, "status"), []byte(body), 0644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write("10", "State:\tS\nUid:\t20001\t20001\t20001\t20001\nThreads:\t2\nVmRSS:\t100 kB\n")
-	write("11", "State:\tR\nUid:\t20001\t20001\t20001\t20001\nThreads:\t1\nVmRSS:\t50 kB\n")
-	write("12", "State:\tZ\nUid:\t20001\t20001\t20001\t20001\n")
-	write("13", "State:\tS\nUid:\t20002\t20002\t20002\t20002\nThreads:\t1\nVmRSS:\t999 kB\n")
-	write("self", "State:\tS\nUid:\t20001\n")
-	old := procRoot
-	procRoot = dir
-	defer func() { procRoot = old }()
-	u := Scan(map[uint32]bool{20001: true})[20001]
-	if u.Processes != 2 || u.Tasks != 3 || u.RSSBytes != 150<<10 {
-		t.Fatalf("scan: %+v", u)
-	}
-}
-
 // The gated tests below need root, Landlock ABI 6 and a container that lets
 // the launcher use it (the provider's sandbox). They re-run this test binary
 // as the launcher: the child confines itself, then execs python3 with checks.
-const confinedChecks = `import os,json,socket,signal
+const confinedChecks = `import os,json,socket,signal,ctypes
 def refused(f):
  try: f();return False
  except OSError: return True
+libc=ctypes.CDLL(None,use_errno=True)
+L=ctypes.c_long
+def call_errno(nr,*args):
+ ctypes.set_errno(0)
+ return 0 if libc.syscall(L(nr),*args)>=0 else ctypes.get_errno()
+def socket_errno(family):
+ try: socket.socket(family,socket.SOCK_STREAM).close();return 0
+ except OSError as e: return e.errno
+calls=json.loads(os.environ['CALLS'])
 home=os.environ['HOME']
+fd=os.open(os.path.join(home,'prealloc'),os.O_CREAT|os.O_RDWR,0o600)
 out={'uid':os.getuid(),
  'read_system':not refused(lambda:open('/usr/lib/os-release').read()),
  'read_outside':not refused(lambda:open(os.environ['OUTSIDE']).read()),
@@ -130,7 +137,14 @@ out={'uid':os.getuid(),
  'inet':not refused(lambda:socket.socket(socket.AF_INET,socket.SOCK_STREAM)),
  'udp':not refused(lambda:socket.socket(socket.AF_INET,socket.SOCK_DGRAM)),
  'signal_outside':not refused(lambda:os.kill(int(os.environ['OUTSIDE_PID']),0)),
- 'abstract_outside':not refused(lambda:socket.socket(socket.AF_UNIX).connect('\0'+os.environ['ABSTRACT']))}
+ 'abstract_outside':not refused(lambda:socket.socket(socket.AF_UNIX).connect('\0'+os.environ['ABSTRACT'])),
+ 'unix_pair':not refused(lambda:socket.socketpair(socket.AF_UNIX)),
+ 'smc_errno':socket_errno(43),
+ 'vsock_errno':socket_errno(40),
+ 'shmget_errno':call_errno(calls['shmget'],L(0),L(4096),L(0o1600)),
+ 'mq_open_errno':call_errno(calls['mq_open'],ctypes.c_char_p(b'/sealed-q'),L(0o102),L(0o600),None),
+ 'keyctl_errno':call_errno(calls['keyctl'],L(0),L(-4),L(1)),
+ 'fallocate_errno':call_errno(calls['fallocate'],L(fd),L(1),L(0),L(1<<30))}
 print(json.dumps(out))
 `
 
@@ -227,8 +241,11 @@ func TestConfinedProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = outsider.Process.Kill(); _ = outsider.Wait() }()
+	// x32 calls are covered by TestServiceFilterDecisions: under Docker's
+	// default profile one kills the calling thread before this filter answers.
+	calls, _ := json.Marshal(map[string]int{"shmget": unix.SYS_SHMGET, "mq_open": unix.SYS_MQ_OPEN, "keyctl": unix.SYS_KEYCTL, "fallocate": unix.SYS_FALLOCATE})
 	p := Policy{UID: uid, ReadExec: []string{"/usr", release}, SocketDirs: []string{run}, ReadWrite: []string{work, tmp}, Dir: release, Program: python,
-		Env:  []string{"HOME=" + work, "TMPDIR=" + tmp, "RUN=" + run, "OUTSIDE=" + outside, "OUTSIDE_PID=" + strconv.Itoa(outsider.Process.Pid), "ABSTRACT=" + abstract},
+		Env:  []string{"HOME=" + work, "TMPDIR=" + tmp, "RUN=" + run, "OUTSIDE=" + outside, "OUTSIDE_PID=" + strconv.Itoa(outsider.Process.Pid), "ABSTRACT=" + abstract, "CALLS=" + string(calls)},
 		Args: []string{"checks.py"}}
 	for _, d := range []string{"/lib", "/lib64", "/bin"} {
 		if real, err := filepath.EvalSymlinks(d); err == nil && !strings.HasPrefix(real, "/usr") {
@@ -248,7 +265,9 @@ func TestConfinedProcess(t *testing.T) {
 	}
 	want := map[string]any{"uid": float64(uid), "read_system": true, "read_outside": false, "list_proc": false, "lower_oom": false,
 		"write_home": true, "write_tmp_shared": false, "write_release": false, "symlink_in_run": false, "socket_in_run": true,
-		"inet": false, "udp": false, "signal_outside": false, "abstract_outside": false}
+		"inet": false, "udp": false, "signal_outside": false, "abstract_outside": false, "unix_pair": true,
+		"smc_errno": float64(unix.EPERM), "vsock_errno": float64(unix.EPERM), "shmget_errno": float64(unix.EPERM), "mq_open_errno": float64(unix.EPERM),
+		"keyctl_errno": float64(unix.EPERM), "fallocate_errno": float64(unix.EOPNOTSUPP)}
 	for k, v := range want {
 		if got[k] != v {
 			t.Errorf("%s = %v, want %v (%s)", k, got[k], v, out)

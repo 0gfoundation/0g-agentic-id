@@ -319,6 +319,9 @@ func (m *Manager) reserveExecution(service, key, inputHash string, privateInput 
 	if len(m.workers) >= MaxWorkers {
 		return nil, nil, nil, ExecutionStatus{}, fmt.Errorf("worker limit reached")
 	}
+	if m.processesInUseLocked()+entry.Manifest.Processes > MaxServiceProcesses {
+		return nil, nil, nil, ExecutionStatus{}, ErrProcessBudget
+	}
 	uid, err := m.allocateIdentityLocked()
 	if err != nil {
 		return nil, nil, nil, ExecutionStatus{}, err
@@ -355,7 +358,7 @@ func (m *Manager) reserveExecution(service, key, inputHash string, privateInput 
 		consumeInput()
 	}
 	m.executions[e.Handle], m.executionKeys[k] = e, e.Handle
-	m.workers[uid] = &worker{service: service, cancel: cancel, done: e.done}
+	m.workers[uid] = &worker{service: service, cancel: cancel, done: e.done, processes: entry.Manifest.Processes}
 	job := *entry
 	return e, &job, runtimeInput, ExecutionStatus{}, nil
 }

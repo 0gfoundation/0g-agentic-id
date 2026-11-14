@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -31,10 +32,34 @@ const MaxRuntimeInput = 16 << 10
 const MaxWorkers = 32
 const taskDirName = ".tasks" // cannot collide with a valid published service id
 
+// MaxServiceProcesses bounds the processes and threads of all service
+// processes together: each running request, execution and coordinator holds
+// its manifest's processes limit (its RLIMIT_NPROC) against this budget.
+const MaxServiceProcesses = 2048
+
+// ErrProcessBudget refuses a service process the budget cannot hold.
+var ErrProcessBudget = errors.New("service process budget reached; retry later")
+
 type worker struct {
-	service string
-	cancel  context.CancelFunc
-	done    chan struct{}
+	service   string
+	cancel    context.CancelFunc
+	done      chan struct{}
+	processes int
+}
+
+// processesInUseLocked sums the processes limits of every running request,
+// execution and coordinator (including ones still being cleaned up).
+func (m *Manager) processesInUseLocked() int {
+	n := 0
+	for _, w := range m.workers {
+		n += w.processes
+	}
+	for _, e := range m.entries {
+		if e.controller != nil {
+			n += e.Manifest.Processes
+		}
+	}
+	return n
 }
 
 type taskTransport struct {
@@ -112,7 +137,7 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req.Header.Del(ServiceVersionHeader)
 	req.Header.Del(InputHandleHeader)
 	ctx, cancel := context.WithTimeout(req.Context(), time.Duration(man.RequestTimeoutSeconds)*time.Second)
-	w := &worker{service: t.id, cancel: cancel, done: make(chan struct{})}
+	w := &worker{service: t.id, cancel: cancel, done: make(chan struct{}), processes: man.Processes}
 	m.mu.Lock()
 	// Recheck after parsing; Stop must not race admission and miss this worker.
 	e = m.entries[t.id]
@@ -125,6 +150,11 @@ func (t *taskTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		m.mu.Unlock()
 		cancel()
 		return response(req, 503, "request worker limit reached"), nil
+	}
+	if m.processesInUseLocked()+man.Processes > MaxServiceProcesses {
+		m.mu.Unlock()
+		cancel()
+		return response(req, 503, ErrProcessBudget.Error()), nil
 	}
 	uid, err := m.allocateIdentityLocked()
 	if err != nil {

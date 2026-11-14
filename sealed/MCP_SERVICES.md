@@ -58,7 +58,8 @@ never an owner-readable log.
 ## Isolation and network
 
 Every service process runs at a service identity of its own, drawn at random
-from container UIDs 20000–64999, which the provider's UID/GID maps must include.
+from container UIDs 20001–64999 (20000 is the confinement probe's); the
+provider's UID/GID maps must include 20000–64999.
 The kernel counts `RLIMIT_NPROC` per UID across every sandbox of a runner
 (measured on the dev runner), so fixed slots would let one sandbox's processes
 block another's. The trusted launcher clears supplementary groups, drops UID/GID,
@@ -69,10 +70,15 @@ sets no-new-privs and `oom_score_adj` 1000, then confines the process with Landl
   release and the leased Harness runtime, read `/etc/resolv.conf`, `/etc/hosts`
   and `/etc/ssl/certs`, use `/dev/null`, `zero`, `full`, `random`, `urandom`,
   create sockets in its private run directory (and nothing else there, so a
-  socket sealed dials cannot become a link), and write only its private `$HOME`
-  and `$TMPDIR`. `/proc` is unreadable. TCP bind and connect are refused.
-  Abstract Unix sockets and signals reach only its own processes.
-- The seccomp filter refuses inet, netlink and packet sockets and io_uring.
+  socket sealed dials cannot become a link), and write (and create files,
+  links and sockets in, and execute from) only its private `$HOME` and
+  `$TMPDIR`. `/proc` is unreadable. TCP bind and connect are refused. Abstract
+  Unix sockets and signals reach only its own processes.
+- The seccomp filter allows sockets of family `AF_UNIX` only; refuses io_uring,
+  System V IPC, POSIX message queues and kernel keyrings (objects that outlive
+  the process, or reach the next task at the same UID) and every x32 call; and
+  answers `fallocate` with EOPNOTSUPP, so writes, which the file-size limit
+  bounds, are the only way to take disk space.
 
 Owner home/state, sealed state, sign/reveal sockets and other workers' files are
 unreachable. Unix sockets sealed hands the process are owned by its identity;
@@ -97,18 +103,27 @@ there. Node automatically loads the image bootstrap (Node >=24.14), which routes
 the Unix proxy themselves. Owner credential proxies are never inherited.
 
 Per-process rlimits: virtual address space (8192 MiB default, 128–16384),
-processes and threads per identity (64 default, 1–256), 256 descriptors and
-64 MiB/file. Sealed reads the identity's resident memory every 500 ms
-(`resident_memory_mb`, default 256 MiB, 64–4096) and its private `$HOME` and
-`$TMPDIR` every 2 s (128 MiB together for a temporary worker; a coordinator's
-`$TMPDIR` 64 MiB, its `$HOME` being durable application state), and kills the
-identity over a limit. These are watched, not kernel limits: a burst between two
-reads can pass them. Under memory pressure the kernel's OOM killer takes service
-processes first (`oom_score_adj` 1000), and Landlock keeps them from lowering it.
-Cleanup becomes the identity and signals every process of it (a descendant
-cannot change identity, so none escapes by re-parenting or a new session), then
-confirms from root that none remains before reusing the identity or unpinning
-the runtime. This is not a separate CPU allocation or a total disk quota; the
+processes and threads per identity (64 default, 1–256, at least 16 for `node`),
+256 descriptors and 64 MiB/file. All service processes together hold at most
+2048 processes and threads: each running request, execution and coordinator
+reserves its `processes` limit, and a launch the budget cannot hold is refused.
+Sealed reads the identity's resident memory every 500 ms (`resident_memory_mb`,
+default 256 MiB, 64–4096) and the blocks allocated below its private `$HOME`
+and `$TMPDIR` every 2 s (128 MiB together for a temporary worker; 576 MiB for a
+coordinator, whose `$HOME` is durable application state), and kills the
+identity over a limit. On the same 2 s tick, while the filesystem holding the
+task directories has less than 1 GiB free, sealed stops every service process
+and refuses new ones; that also reclaims space no walk sees, such as files
+deleted while still open. These are watched, not kernel limits: a burst between
+two reads can pass them. Under memory pressure the kernel's OOM killer takes
+service processes first (`oom_score_adj` 1000), and Landlock keeps them from
+lowering it. Cleanup becomes the identity and signals every process of it (a
+descendant cannot change identity, so none escapes by re-parenting or a new
+session), then confirms from root that none remains before reusing the identity
+or unpinning the runtime. A starting sealed first stops every process of any
+service identity: a previous sealed in the container may have left some, since
+the loader stops its descendants only as PID 1 and the runner starts sandboxes
+with `--init`. This is not a separate CPU allocation or a disk quota; the
 sandbox's outer limits still apply. Workers end at EOF, terminate, timeout
 (300 seconds default, 1–3600), stop or transfer. Disconnect cancels a one-shot
 request worker; a detached job survives its submitting HTTP connection and is

@@ -9,7 +9,15 @@ package serviceidentity
 const (
 	Base  = 20000
 	Count = 45000 // 20000..64999: clear of the agent account and of nobody (65534)
+	// Probe is the identity of sealed's confinement probe. Tasks never draw
+	// it, so reaping a task's identity cannot kill a running probe.
+	Probe = Base
 )
+
+// Draw maps a random number onto the task identities, Base+1..Base+Count-1.
+func Draw(r uint32) uint32 {
+	return Base + 1 + r%(Count-1)
+}
 
 func Valid(uid int) bool {
 	return uid >= Base && uid < Base+Count

@@ -2,14 +2,18 @@ package servicehost
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
-	"io/fs"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"seal-verify/internal/privsep"
 	"seal-verify/internal/servicesandbox"
@@ -165,6 +169,47 @@ func reapIdentity(ctx context.Context, uid uint32) error {
 	return nil
 }
 
+// discardDir moves dir aside and removes it in the background, so a service
+// that filled it cannot hold callers (some under the manager lock) for the
+// time a removal takes. Earlier discards left by a crash go the same way.
+func discardDir(dir string) error {
+	parent, name := filepath.Dir(dir), filepath.Base(dir)
+	if entries, err := privsep.ReadDir(parent); err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), name+".discard-") {
+				go privsep.RemoveAll(filepath.Join(parent, e.Name()))
+			}
+		}
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return err
+	}
+	aside := filepath.Join(parent, fmt.Sprintf("%s.discard-%x", name, b))
+	if err := privsep.Rename(dir, aside); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	go privsep.RemoveAll(aside)
+	return nil
+}
+
+// reapLeftoverIdentities stops every process of any service identity, before
+// a manager hands identities out.
+func reapLeftoverIdentities() error {
+	for _, uid := range servicesandbox.Identities() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := reapIdentity(ctx, uid)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("leftover service processes: %w", err)
+		}
+	}
+	return nil
+}
+
 func firstLine(b []byte) string {
 	s := string(b)
 	for i, r := range s {
@@ -177,16 +222,25 @@ func firstLine(b []byte) string {
 
 // resourceWatcher scans /proc once per tick for every running identity and
 // walks private directories less often, so the cost does not grow with the
-// number of tasks times the number of processes.
+// number of tasks times the number of processes. On the same slower tick it
+// checks the free space of the filesystem that holds the task directories:
+// below diskReserveBytes it stops every service process, whatever space they
+// hold that no walk can see (files deleted while open), since sealed and the
+// owner need that space.
 type resourceWatcher struct {
 	mu      sync.Mutex
 	active  map[uint32]*isolatedCommand
 	started bool
 	stop    chan struct{}
+	disk    string
 }
 
-func newResourceWatcher(stop chan struct{}) *resourceWatcher {
-	return &resourceWatcher{active: map[uint32]*isolatedCommand{}, stop: stop}
+// diskReserveBytes is the free space service processes must leave on the
+// filesystem of their task directories; new tasks are refused below it.
+const diskReserveBytes = 1 << 30
+
+func newResourceWatcher(stop chan struct{}, disk string) *resourceWatcher {
+	return &resourceWatcher{active: map[uint32]*isolatedCommand{}, stop: stop, disk: disk}
 }
 
 func (w *resourceWatcher) add(c *isolatedCommand) {
@@ -226,44 +280,92 @@ func (w *resourceWatcher) loop() {
 		if len(cmds) == 0 {
 			continue
 		}
+		slow := n%4 == 0
+		if slow && w.disk != "" && diskLow(w.disk) {
+			for _, c := range cmds {
+				c.exceeded("sandbox_disk_low")
+			}
+			continue
+		}
 		usage := servicesandbox.Scan(uids)
 		for _, c := range cmds {
 			if c.limits.residentBytes > 0 && usage[c.uid].RSSBytes > c.limits.residentBytes {
 				c.exceeded("memory_limit")
 				continue
 			}
-			if n%4 == 0 && c.limits.diskBytes > 0 && diskUsage(c.limits.diskDirs, c.limits.diskBytes) > c.limits.diskBytes {
+			if slow && c.limits.diskBytes > 0 && diskUsage(c.limits.diskDirs, c.limits.diskBytes) > c.limits.diskBytes {
 				c.exceeded("disk_limit")
 			}
 		}
 	}
 }
 
-// diskUsage sums allocated blocks below dirs, stopping once the sum passes
-// stopAt. Each entry is charged at least one block, so an identity cannot
-// exhaust inodes with empty files either.
+// diskLow reports whether the filesystem holding path has less than
+// diskReserveBytes available. An unreadable filesystem counts as low.
+func diskLow(path string) bool {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return true
+	}
+	return int64(st.Bavail)*int64(st.Bsize) < diskReserveBytes
+}
+
+// maxWalkDepth bounds how deep diskUsage descends (each level holds one open
+// directory). A deeper tree counts as over any limit.
+const maxWalkDepth = 64
+
+// diskUsage sums the blocks allocated below dirs (st_blocks, so preallocated
+// and sparse files count what they occupy), stopping once the sum passes
+// stopAt. Each entry counts at least one 4 KiB block, so an identity cannot
+// exhaust inodes with empty files either. Each directory is opened relative
+// to its parent with O_NOFOLLOW, so a service that swaps a directory for a
+// link cannot steer the walk outside its own tree.
 func diskUsage(dirs []string, stopAt int64) int64 {
 	var total int64
 	for _, dir := range dirs {
-		_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			size := int64(4096)
-			if info, err := d.Info(); err == nil && info.Size() > size {
-				size = info.Size()
-			}
-			total += size
-			if total > stopAt {
-				return filepath.SkipAll
-			}
-			return nil
-		})
-		if total > stopAt {
+		fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			continue
+		}
+		if total = addBlocks(os.NewFile(uintptr(fd), dir), total, stopAt, 0); total > stopAt {
 			break
 		}
 	}
 	return total
+}
+
+func addBlocks(dir *os.File, total, stopAt int64, depth int) int64 {
+	defer dir.Close()
+	dirfd := int(dir.Fd())
+	for {
+		names, err := dir.Readdirnames(256)
+		for _, name := range names {
+			var st unix.Stat_t
+			if unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW) != nil {
+				continue
+			}
+			total += max(st.Blocks*512, 4096)
+			if total > stopAt {
+				return total
+			}
+			if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+				continue
+			}
+			if depth+1 >= maxWalkDepth {
+				return stopAt + 1
+			}
+			fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			if err != nil {
+				continue
+			}
+			if total = addBlocks(os.NewFile(uintptr(fd), name), total, stopAt, depth+1); total > stopAt {
+				return total
+			}
+		}
+		if err != nil || len(names) == 0 {
+			return total
+		}
+	}
 }
 
 func (m *Manager) acquireRuntime(ctx context.Context) (RuntimeLease, error) {

@@ -85,6 +85,9 @@ func (m *Manager) startCoordinatorLocked(e *entry, lease RuntimeLease) (err erro
 	if e.controller != nil {
 		return nil
 	}
+	if m.processesInUseLocked()+e.Manifest.Processes > MaxServiceProcesses {
+		return ErrProcessBudget
+	}
 	base := m.coordinatorDir(e.ID)
 	run := filepath.Join(base, "run")
 	if err := privsep.RemoveAll(run); err != nil {

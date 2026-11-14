@@ -64,17 +64,3 @@ func TestPolicyRefusesForeignOrLoosePaths(t *testing.T) {
 		t.Error("accepted an unknown flag")
 	}
 }
-
-func TestParseStatus(t *testing.T) {
-	status := []byte("Name:\tpython3\nState:\tS (sleeping)\nUid:\t20042\t20042\t20042\t20042\nThreads:\t3\nVmRSS:\t  2048 kB\n")
-	uid, u, ok := parseStatus(status)
-	if !ok || uid != 20042 || u.Processes != 1 || u.Tasks != 3 || u.RSSBytes != 2048<<10 {
-		t.Fatalf("parse: %d %+v %v", uid, u, ok)
-	}
-	if _, _, ok := parseStatus([]byte("State:\tZ (zombie)\nUid:\t20042\t20042\t20042\t20042\n")); ok {
-		t.Fatal("counted a zombie")
-	}
-	if _, _, ok := parseStatus([]byte("Name:\tx\n")); ok {
-		t.Fatal("counted a status without Uid")
-	}
-}

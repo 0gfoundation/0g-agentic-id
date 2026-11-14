@@ -22,6 +22,10 @@ import (
 // resource monitor (a service cannot mount a size-limited filesystem).
 const temporaryFilesystemBytes = 64 << 20
 
+// coordinatorStateBytes bounds a coordinator's durable work directory (its
+// business state, such as a paid service's task store).
+const coordinatorStateBytes = 512 << 20
+
 var ErrIsolationUnavailable = errors.New("isolation unavailable")
 
 // mappedIdentity checks the namespace's inside IDs, not its host UID offset.
@@ -164,11 +168,18 @@ func (m *Manager) admission(ctx context.Context) error {
 	return m.probeErr
 }
 
-// prepareLaunch does the slow part of starting a service process (probe,
-// runtime listing and pin) without the manager lock.
+// ErrDiskLow refuses a new service process while the filesystem of the task
+// directories has less than diskReserveBytes free.
+var ErrDiskLow = errors.New("sandbox disk space is low; service processes are refused until space is freed")
+
+// prepareLaunch does the slow part of starting a service process (probe, free
+// space, runtime listing and pin) without the manager lock.
 func (m *Manager) prepareLaunch(ctx context.Context) (RuntimeLease, error) {
 	if err := m.admission(ctx); err != nil {
 		return RuntimeLease{}, err
+	}
+	if diskLow(m.programs) {
+		return RuntimeLease{}, ErrDiskLow
 	}
 	return m.acquireRuntime(ctx)
 }

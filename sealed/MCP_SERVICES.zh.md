@@ -44,8 +44,8 @@ start/stop/logs 接收 id。不公开管理接口。logs 为空：服务/请求�
 
 ## 隔离与网络
 
-每个服务进程都用自己的服务身份运行，从容器 UID 20000–64999 中随机抽取；provider 的
-UID/GID 映射必须覆盖这一范围。内核按 UID 在同一 runner 的所有沙箱之间合计 `RLIMIT_NPROC`
+每个服务进程都用自己的服务身份运行，从容器 UID 20001–64999 中随机抽取（20000 留给隔离
+探测）；provider 的 UID/GID 映射必须覆盖 20000–64999。内核按 UID 在同一 runner 的所有沙箱之间合计 `RLIMIT_NPROC`
 （在 dev runner 上实测），固定编号会让一个沙箱的进程卡住另一个沙箱。可信 launcher 清除
 附加组、切换 UID/GID、启用 no-new-privs、把 `oom_score_adj` 设为 1000，再用 Landlock
 （ABI 6 及以上）和 seccomp 过滤器限制进程，然后才执行解释器：
@@ -53,9 +53,12 @@ UID/GID 映射必须覆盖这一范围。内核按 UID 在同一 runner 的所�
 - Landlock 只允许它读取并执行镜像的系统目录、自己的版本和租用的 Harness 运行包，读取
   `/etc/resolv.conf`、`/etc/hosts`、`/etc/ssl/certs`，使用 `/dev/null`、`zero`、`full`、
   `random`、`urandom`，在私有 run 目录里创建 socket（只能建 socket，sealed 要连的 socket
-  不能被换成链接），只写自己私有的 `$HOME` 和 `$TMPDIR`。`/proc` 不可读，TCP bind/connect
-  被拒绝，抽象 Unix socket 和信号只能到达它自己的进程。
-- seccomp 过滤器拒绝 inet、netlink、packet socket 和 io_uring。
+  不能被换成链接），只在自己私有的 `$HOME` 和 `$TMPDIR` 里写（以及建文件、链接、socket，
+  执行其中的程序）。`/proc` 不可读，TCP bind/connect 被拒绝，抽象 Unix socket 和信号只能
+  到达它自己的进程。
+- seccomp 过滤器只允许 `AF_UNIX` 协议族的 socket；拒绝 io_uring、System V IPC、POSIX
+  消息队列和内核 keyring（这些对象比进程活得久，或会留给下一个用同一 UID 的任务）以及所有
+  x32 调用；`fallocate` 返回 EOPNOTSUPP，占用磁盘只能靠写入，而写入受单文件上限约束。
 
 owner 家目录/状态、sealed 状态、sign/reveal socket、其他 worker 的文件都访问不到。sealed
 交给进程的 Unix socket 归它的身份所有；其他路径型 socket 仍按文件权限控制，Landlock 不管。
@@ -73,14 +76,18 @@ loopback、link-local、metadata IP，包括 DNS 解析结果。服务进程没�
 Unix 代理。不继承 owner 凭证代理。
 
 单进程 rlimit：虚拟地址空间（默认 8192 MiB，128–16384）、每个身份的进程和线程数（默认 64，
-1–256）、256 描述符和单文件 64 MiB。sealed 每 500 ms 读取该身份的驻留内存
-（resident_memory_mb，默认 256 MiB，64–4096），每 2 s 读取私有 `$HOME` 和 `$TMPDIR`
-（临时 worker 两者合计 128 MiB；服务进程只算 `$TMPDIR` 64 MiB，其 `$HOME` 是持久业务状态），
-超过即杀掉该身份。这些是监视，不是内核限额：两次读取之间的瞬时峰值可能越过。内存紧张时
-内核 OOM 先杀服务进程（`oom_score_adj` 1000），Landlock 使它们无法调低。清理时 launcher
-切换到该身份给它的所有进程发信号（子进程改不了身份，重新挂靠或新会话都逃不掉），再由 root
-确认一个不剩，才复用身份和解除运行包锁定。这不提供独立 CPU 分配或总磁盘配额，仍受外围沙箱
-限制。worker 在 EOF、terminate、超时（默认 300 秒，1–3600）、stop 或转移时结束。
+1–256，`node` 至少 16）、256 描述符和单文件 64 MiB。所有服务进程合计最多 2048 个进程和线程：
+每个运行中的请求、执行和服务进程按自己的 `processes` 上限占用额度，额度不够的启动会被拒绝。
+sealed 每 500 ms 读取该身份的驻留内存（resident_memory_mb，默认 256 MiB，64–4096），每 2 s
+统计私有 `$HOME` 和 `$TMPDIR` 下实际分配的块（临时 worker 两者合计 128 MiB；服务进程合计
+576 MiB，其 `$HOME` 是持久业务状态），超过即杀掉该身份。同样每 2 s，任务目录所在文件系统
+剩余空间不足 1 GiB 时，sealed 停掉所有服务进程并拒绝新的启动；这也会回收遍历看不到的空间，
+比如已删除但仍打开的文件。这些是监视，不是内核限额：两次读取之间的瞬时峰值可能越过。内存
+紧张时内核 OOM 先杀服务进程（`oom_score_adj` 1000），Landlock 使它们无法调低。清理时
+launcher 切换到该身份给它的所有进程发信号（子进程改不了身份，重新挂靠或新会话都逃不掉），
+再由 root 确认一个不剩，才复用身份和解除运行包锁定。sealed 启动时先停掉所有服务身份的进程：
+容器里上一个 sealed 可能留下了进程，因为 loader 只有作为 PID 1 时才会清理它的后代，而 runner
+用 `--init` 启动沙箱。这不提供独立 CPU 分配或磁盘配额，仍受外围沙箱限制。worker 在 EOF、terminate、超时（默认 300 秒，1–3600）、stop 或转移时结束。
 断线会终止单次请求 worker；异步任务不随提交它的 HTTP 连接结束，继续由服务进程管理。
 
 0g-harness/dsh 只保留 `/api/mcp/` 给托管服务，该路径在 hosting 不可用时也不能回退到旧后端。

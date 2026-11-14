@@ -107,7 +107,6 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 	m.runtime = opts.AcquireRuntime
 	m.model = opts.ModelRoute
 	m.skipResourceLimitsForTests = opts.SkipResourceLimitsForTests
-	m.watcher = newResourceWatcher(m.stopGC)
 	m.egressDial = opts.EgressDial
 	if m.egressDial == nil {
 		m.egressDial = credproxy.SafeDial
@@ -118,7 +117,14 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 	if err := privsep.MkdirAll(m.programs, 0755); err != nil {
 		return nil, err
 	}
-	// Loader startup has already killed the previous sealed's descendants.
+	m.watcher = newResourceWatcher(m.stopGC, m.programs)
+	// A previous sealed in this container may have left service processes
+	// (the loader kills its descendants only when it runs as PID 1, and the
+	// runner starts sandboxes with --init). They hold identities and may still
+	// write their old directories, so none may survive into this manager.
+	if err := reapLeftoverIdentities(); err != nil {
+		return nil, err
+	}
 	// Never resume a request or any caller-provided runtime input after reboot.
 	if err := privsep.RemoveAll(filepath.Join(m.programs, taskDirName)); err != nil {
 		return nil, err
@@ -221,6 +227,11 @@ func (m *Manager) Publish(man Manifest) (Status, error) {
 	old := m.entries[man.ID]
 	if old != nil && old.Desired {
 		return Status{}, fmt.Errorf("stop the service before publishing an update")
+	}
+	if old != nil && old.controller != nil {
+		// The new entry keeps the coordinator identity; its old processes
+		// must be gone before anything can start under it again.
+		return Status{}, fmt.Errorf("the previous coordinator is still being cleaned up; retry")
 	}
 	if old == nil {
 		if len(m.entries) >= MaxServices {
@@ -386,7 +397,7 @@ func (m *Manager) allocateIdentityLocked() (uint32, error) {
 		if _, err := rand.Read(b[:]); err != nil {
 			return 0, err
 		}
-		uid := uint32(serviceidentity.Base) + binary.BigEndian.Uint32(b[:])%serviceidentity.Count
+		uid := serviceidentity.Draw(binary.BigEndian.Uint32(b[:]))
 		if m.workers[uid] != nil || m.controllerLocked(uid) {
 			continue
 		}
@@ -454,7 +465,7 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 			return nil, err
 		}
 	}
-	if err = privsep.RemoveAll(tmp); err != nil {
+	if err = discardDir(tmp); err != nil {
 		return nil, err
 	}
 	if err = privateDir(tmp, uid); err != nil {
@@ -529,7 +540,7 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 		limits: limits{residentBytes: int64(e.Manifest.ResidentMemoryMB) << 20, diskDirs: []string{work, tmp}, diskBytes: 2 * temporaryFilesystemBytes}}
 	if kind == coordinatorCommand {
 		// The coordinator's work directory is its durable business state.
-		c.limits.diskDirs, c.limits.diskBytes = []string{tmp}, temporaryFilesystemBytes
+		c.limits.diskBytes = coordinatorStateBytes + temporaryFilesystemBytes
 	}
 	return c, nil
 }
