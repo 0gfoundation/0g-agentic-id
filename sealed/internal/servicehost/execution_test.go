@@ -162,7 +162,7 @@ func TestDetachedExecutionDeduplicationIsolationAndTransientInput(t *testing.T) 
 	}
 	dirs, err := os.ReadDir(filepath.Join(m.programs, taskDirName))
 	if err != nil || len(dirs) != 0 {
-		t.Fatalf("execution namespace not collected: %v %v", dirs, err)
+		t.Fatalf("execution task directory not collected: %v %v", dirs, err)
 	}
 	record, err := os.ReadFile(filepath.Join(m.base, "executions", handle+".json"))
 	if err != nil {

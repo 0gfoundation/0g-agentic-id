@@ -187,17 +187,31 @@ the real model key only inside sealed. It offers no credential lookup, signing,
 redirect following or arbitrary upstream routing; coordinators receive no socket.
 The route works with `network:"none"`. Sealed sets `SEAL_MODEL_ID` and
 `SEAL_MODEL_API`, and the Node bootstrap sets `SEAL_MODEL_URL`; Harness
-`mountServiceModel` uses a public placeholder instead of a real key. Other runtimes can speak HTTP to the private
+`mountServiceModel` uses a public placeholder; the real key never reaches it. Other runtimes can speak HTTP to the private
 Unix socket. These limits bound requests and requested output, not actual token
 usage or currency spend; pricing and refunds remain application policy.
 
 Only the coordinator gets `$SEAL_EXEC_SOCKET`: POST `/executions` actions
-`spawn/get/find/wait/terminate/release`. Sealed fixes the service scope. Spawn takes
+`spawn/get/find/wait/terminate/release/capabilities`. Sealed fixes the service scope. Spawn takes
 `key`, base64 opaque `input`, optional `input_handle`; random handles query status.
 Keys are `<unix-ms>-<16..48 random URL-safe characters>`. Concurrent same-key,
 same-input, same-code retries return one execution; changes conflict. `find`
 recovers a lost acknowledgement without spawning. Keys older than ten minutes
 cannot start anything, even after record GC.
+
+`capabilities` takes no other field and answers `{"receipts":true|false}`:
+whether an execution that exits 0 now would receive a signed receipt (see
+Execution receipts). A paid service asks before charging.
+
+An execution's `state` is one of `starting` (reserved; the worker is not running
+yet), `running`, `exited` (exit code 0), `failed`, `timed_out` (reason
+`deadline`), `cancelled` (`terminated`), `interrupted` (`sealed_restarted`: sealed
+restarted while it ran) and `quarantined` (sealed cannot yet prove the identity's
+processes gone; the identity stays reserved). `reason` names the cause:
+`start_failed`, `process_exit`, `output_limit`, `memory_limit`, `disk_limit`,
+`sandbox_disk_low`, `cleanup_failed`, `resource_cleanup_failed`,
+`metadata_write_failed`. `reason:"start_failed"` with no `exit_code` means the
+worker never ran: the state is `failed`, or `quarantined` until its cleanup is proven.
 
 Public input caps at 512 KiB; opaque stdout at 1 MiB/execution and 32 MiB globally;
 reads return up to 64 KiB. At most 1024 records, collected ten minutes after exit.
@@ -209,7 +223,11 @@ and receipt, never input/stdout, employer ownership, business progress or paymen
 ## Execution receipts and HTTP attribution
 
 Successful jobs receive a `0G.SealedExecution.v1` agentSeal receipt under a separate
-EIP-191 version-0x00 digest. It binds chain/registry/agent, validator, UID, source
+EIP-191 version-0x00 digest, when sealed can sign one: that needs the agent key,
+an anchored AgenticID serve-proof validator (`VERIFIED_FEEDBACK_ADDR`), the agent
+id, chain and identity registry. Without a validator no receipt is signed for the
+container's whole life, so a paid service, which charges for a receipted result,
+refuses work while `capabilities` reports `receipts:false`. It binds chain/registry/agent, validator, UID, source
 version, public-input/stdout SHA-256, limits and enforced isolation profile.
 `isolation.worker_runtime_hash` is the actual leased Harness package used by the worker;
 outer `harness_hash` belongs to the resident layered runtime context and may differ.

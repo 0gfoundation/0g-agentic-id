@@ -60,7 +60,23 @@ func TestExecutionReceiptHasIndependentUnforgeableDomain(t *testing.T) {
 			t.Fatal("tampered receipt accepted")
 		}
 	}
+	if !s.executionReceiptsReady() {
+		t.Fatal("a signing server reports receipts unavailable")
+	}
+	// Runtime layers not yet known: neither ready nor signed.
+	s.mu.Lock()
+	s.proofLayers = func() (ProofLayers, bool) { return ProofLayers{}, false }
+	s.mu.Unlock()
+	if s.executionReceiptsReady() {
+		t.Fatal("receipts reported ready without runtime layer hashes")
+	}
+	if _, err := s.signExecutionReceipt(status, profile); err == nil {
+		t.Fatal("signed without runtime layer hashes")
+	}
 	s, _ = armedProxy(t, "http://localhost", "")
+	if s.executionReceiptsReady() {
+		t.Fatal("receipts reported ready without an anchored validator")
+	}
 	if _, err := s.signExecutionReceipt(status, profile); err == nil {
 		t.Fatal("missing trust domain still signed")
 	}

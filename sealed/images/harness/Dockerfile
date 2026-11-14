@@ -8,8 +8,9 @@
 # Contents beyond debian-slim: node, ca-certificates (chain RPC + 0G storage +
 # router TLS), git and procps (the adapter's orphan sweep), one 0g-harness
 # official version package (its locked DSH dependency tree included), the
-# sealed bootstrap binary, the loader that runs it (cmd/loader), and
-# 0g-storage-client.
+# sealed bootstrap binary, the loader that runs it (cmd/loader),
+# sealed-service-launcher (cmd/service-launcher: confines each hosted service
+# process), and 0g-storage-client.
 #
 # The harness runs from an official version package (sealed/LAYERS.md §5): the
 # gzip'd tar of an installed 0g-harness package directory, named by its
@@ -115,7 +116,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -tags harnessonly -ldflags="-s -w" -o boot
 # fails the build.
 FROM debian:13-slim AS harness-package
 ARG NODE_VERSION=24.22.1
-ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/8a29c40c4e2e5ca255ece950cab7186040bcdad3
+ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/e9c8d458019bda8aa778f426c7882c687015aff4
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
@@ -142,7 +143,7 @@ RUN npm install -g --no-fund --no-audit "${HARNESS_REF}" \
 FROM debian:13-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils util-linux \
+ && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):

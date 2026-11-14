@@ -31,24 +31,47 @@ func executionReceiptDigest(validator common.Address, payload []byte) []byte {
 	return serveProofDigest(validator, crypto.Keccak256([]byte(executionReceiptTag), payload))
 }
 
-func (s *Server) signExecutionReceipt(status servicehost.ExecutionStatus, isolation servicehost.IsolationProfile) (string, error) {
+// receiptDomain gathers what every execution receipt carries, or says why
+// sealed cannot sign one now: the agent key, an anchored serve-proof validator,
+// the agent id, chain and identity registry, and known runtime layer hashes.
+func (s *Server) receiptDomain() ([]byte, common.Address, executionReceipt, error) {
 	priv, _, _, _, _ := s.agent.Snapshot()
 	agentID, _ := s.agent.ProofIdentity()
 	chainID, identity, validator := s.agent.ProofDomain()
 	v, valid := parseValidator(validator)
 	if len(priv) != 32 || !valid || agentID == "" || agentID == "0" || chainID == "" || !common.IsHexAddress(identity) {
-		return "", fmt.Errorf("execution attestation unavailable")
+		return nil, common.Address{}, executionReceipt{}, fmt.Errorf("execution attestation unavailable")
 	}
-	status.Receipt = ""
-	status.OutputAvailable = false // availability is transient, not an execution fact
-	env := executionReceipt{Version: 1, ChainID: chainID, IdentityRegistry: identity, AgentID: agentID, Validator: v.Hex(), Execution: status, Isolation: isolation}
+	if _, err := crypto.ToECDSA(priv); err != nil {
+		return nil, common.Address{}, executionReceipt{}, err
+	}
+	env := executionReceipt{Version: 1, ChainID: chainID, IdentityRegistry: identity, AgentID: agentID, Validator: v.Hex()}
 	layers, ready := s.layersForProof()
 	if !ready {
-		return "", fmt.Errorf("execution runtime layers unavailable")
+		return nil, common.Address{}, executionReceipt{}, fmt.Errorf("execution runtime layers unavailable")
 	}
 	if layers != nil {
 		env.SealedHash, env.HarnessHash = layers.SealedHash, layers.HarnessHash
 	}
+	return priv, v, env, nil
+}
+
+// executionReceiptsReady reports, without signing, whether a finished
+// execution would receive a receipt now (the process-control "capabilities"
+// action). Without an anchored validator it stays false for the container's life.
+func (s *Server) executionReceiptsReady() bool {
+	_, _, _, err := s.receiptDomain()
+	return err == nil
+}
+
+func (s *Server) signExecutionReceipt(status servicehost.ExecutionStatus, isolation servicehost.IsolationProfile) (string, error) {
+	priv, v, env, err := s.receiptDomain()
+	if err != nil {
+		return "", err
+	}
+	status.Receipt = ""
+	status.OutputAvailable = false // availability is transient, not an execution fact
+	env.Execution, env.Isolation = status, isolation
 	payload, err := json.Marshal(env)
 	if err != nil {
 		return "", err

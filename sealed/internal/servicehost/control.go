@@ -95,6 +95,16 @@ func (m *Manager) ExecutionHandler(service string) http.Handler {
 		var output []byte
 		var err error
 		code := http.StatusOK
+		if in.Action == "capabilities" {
+			// What this sealed can attest now; it takes no arguments.
+			if in.Key != "" || in.Handle != "" || len(in.Input) != 0 || in.InputHandle != "" || in.Offset != 0 {
+				http.Error(w, "capabilities takes no arguments", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]bool{"receipts": m.ReceiptsAvailable()})
+			return
+		}
 		switch in.Action {
 		case "spawn":
 			status, err = m.spawnWithHandoff(service, in.Key, in.Input, in.InputHandle)

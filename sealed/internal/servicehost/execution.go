@@ -412,8 +412,8 @@ func (m *Manager) prepareExecution(ctx context.Context, source *entry, uid uint3
 	if err != nil {
 		return dir, nil, err
 	}
-	// Framing keeps private input distinct from public task input without
-	// depending on inherited descriptors that the sandbox correctly closes.
+	// Framing keeps private input distinct from public task input on the one
+	// stdin pipe: the launcher passes the worker no other descriptor.
 	header := make([]byte, 16)
 	copy(header, "SEALRUN1")
 	binary.BigEndian.PutUint32(header[8:12], uint32(len(runtimeInput)))
@@ -506,6 +506,23 @@ func (m *Manager) SetExecutionAttestor(attest ExecutionAttestor) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.attestor = attest
+}
+
+// SetReceiptCapability is trusted runtime wiring beside the attestor: ready
+// reports, without signing, whether the attestor can sign a receipt now.
+func (m *Manager) SetReceiptCapability(ready func() bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.receiptsReady = ready
+}
+
+// ReceiptsAvailable reports whether an execution that exits 0 now would
+// receive a signed receipt. A paid coordinator asks before charging.
+func (m *Manager) ReceiptsAvailable() bool {
+	m.mu.Lock()
+	attest, ready := m.attestor, m.receiptsReady
+	m.mu.Unlock()
+	return attest != nil && ready != nil && ready()
 }
 
 func (m *Manager) attestExecutionLocked(e *execution) {

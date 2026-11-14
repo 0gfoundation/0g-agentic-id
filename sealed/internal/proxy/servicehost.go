@@ -12,6 +12,7 @@ import (
 func (s *Server) SetServiceHost(m *servicehost.Manager) {
 	if m != nil {
 		m.SetExecutionAttestor(s.signExecutionReceipt)
+		m.SetReceiptCapability(s.executionReceiptsReady)
 	}
 	s.mu.Lock()
 	s.serviceHost = m

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -428,5 +429,38 @@ func TestLeftoverIdentitiesAreReaped(t *testing.T) {
 	}
 	if len(m.quarantined) != 0 {
 		t.Fatalf("quarantined %v", m.quarantined)
+	}
+}
+
+// The process-control "capabilities" action tells a coordinator, before it
+// charges anyone, whether an execution that exits 0 would receive a receipt.
+func TestCapabilitiesReportReceiptReadiness(t *testing.T) {
+	root(t)
+	m, err := newTestManager(filepath.Join(t.TempDir(), "services"), "owner:identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	h := m.ExecutionHandler("svc")
+	ask := func(body string) (int, string) {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/executions", strings.NewReader(body)))
+		return w.Code, strings.TrimSpace(w.Body.String())
+	}
+	if code, body := ask(`{"action":"capabilities"}`); code != 200 || body != `{"receipts":false}` {
+		t.Fatalf("without an attestor: %d %s", code, body)
+	}
+	ready := true
+	m.SetExecutionAttestor(func(ExecutionStatus, IsolationProfile) (string, error) { return "receipt", nil })
+	m.SetReceiptCapability(func() bool { return ready })
+	if code, body := ask(`{"action":"capabilities"}`); code != 200 || body != `{"receipts":true}` {
+		t.Fatalf("ready: %d %s", code, body)
+	}
+	ready = false
+	if code, body := ask(`{"action":"capabilities"}`); code != 200 || body != `{"receipts":false}` {
+		t.Fatalf("not ready: %d %s", code, body)
+	}
+	if code, _ := ask(`{"action":"capabilities","key":"1234567890123-abcdefghijklmnop"}`); code != 400 {
+		t.Fatalf("capabilities accepted an argument: %d", code)
 	}
 }

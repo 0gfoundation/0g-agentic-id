@@ -63,6 +63,7 @@ type Manager struct {
 	pendingInputs              map[string]pendingInput
 	egressDial                 func(context.Context, string, string) (net.Conn, error)
 	attestor                   ExecutionAttestor
+	receiptsReady              func() bool
 	runtime                    func(context.Context) (RuntimeLease, error)
 	model                      func(context.Context) (ModelRoute, error)
 	watcher                    *resourceWatcher

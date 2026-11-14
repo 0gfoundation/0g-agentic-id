@@ -1047,7 +1047,8 @@ func startAgent(
 	harness, isLayeredRuntime := any(adapter).(framework.LayeredRuntime)
 	var hostedServices *servicehost.Manager
 	// Resume untrusted services only after the live owner and identity have
-	// been restored. Each program has its own filesystem/process sandbox.
+	// been restored. Each service process runs at its own identity under
+	// Landlock and seccomp (internal/servicesandbox).
 	if adapter.Name() == "0g-harness" || adapter.Name() == "dsh" {
 		host, err := servicehost.NewWithOptions(privsep.StateDir+"/services", strings.ToLower(res.owner)+":"+sealID, servicehost.Options{
 			ModelRoute: func(ctx context.Context) (servicehost.ModelRoute, error) {
