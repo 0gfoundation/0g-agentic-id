@@ -132,8 +132,20 @@ export default async function(input,{runtimeInput,progress}) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 3 {
-		t.Fatalf("expected one paid, one cancelled and one recovered-payment worker, got %d", len(entries))
+	// Each execution keeps an immutable key record and a status record.
+	keys, statuses := 0, 0
+	for _, e := range entries {
+		switch filepath.Ext(e.Name()) {
+		case ".key":
+			keys++
+		case ".json":
+			statuses++
+		default:
+			t.Fatalf("unexpected execution file %s", e.Name())
+		}
+	}
+	if keys != 3 || statuses != 3 {
+		t.Fatalf("expected one paid, one cancelled and one recovered-payment worker, got %d key and %d status records", keys, statuses)
 	}
 	for _, e := range entries {
 		data, err := os.ReadFile(filepath.Join(stateDir, "executions", e.Name()))
