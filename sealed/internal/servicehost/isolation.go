@@ -91,7 +91,10 @@ func imageSystem() systemPaths {
 				}
 			}
 		}
-		for _, p := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/ssl/certs"} {
+		// openssl.cnf: Node's bundled OpenSSL reads it at startup and exits
+		// when it exists but cannot be read (it exists wherever the image
+		// installs ca-certificates).
+		for _, p := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/ssl/certs", "/etc/ssl/openssl.cnf"} {
 			if real, err := filepath.EvalSymlinks(p); err == nil && !covered(real) {
 				system.readOnly = append(system.readOnly, real)
 			}

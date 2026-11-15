@@ -128,3 +128,18 @@ func TestProviderConfinementProbe(t *testing.T) {
 		t.Skip("set SEALED_ISOLATION_EXPECT for a real confinement probe")
 	}
 }
+
+// Node's bundled OpenSSL exits at startup when /etc/ssl/openssl.cnf exists
+// but cannot be read, so a service process may read it wherever it exists.
+func TestImageSystemReadsOpenSSLConfig(t *testing.T) {
+	real, err := filepath.EvalSymlinks("/etc/ssl/openssl.cnf")
+	if err != nil {
+		t.Skip("no OpenSSL configuration on this host")
+	}
+	for _, p := range imageSystem().readOnly {
+		if p == real {
+			return
+		}
+	}
+	t.Fatalf("%s missing from the read-only allowlist %v", real, imageSystem().readOnly)
+}

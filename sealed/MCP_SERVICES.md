@@ -71,8 +71,8 @@ nice-19 process in its own session got as much CPU as a nice-0 one, so nice does
 not reserve CPU for sealed or the owner there (isolation/README.md):
 
 - Landlock lets it read and execute only the image's system directories, its
-  release and the leased Harness runtime, read `/etc/resolv.conf`, `/etc/hosts`
-  and `/etc/ssl/certs`, use `/dev/null`, `zero`, `full`, `random`, `urandom`,
+  release and the leased Harness runtime, read `/etc/resolv.conf`, `/etc/hosts`,
+  `/etc/ssl/certs` and `/etc/ssl/openssl.cnf` (Node exits when it exists but cannot be read), use `/dev/null`, `zero`, `full`, `random`, `urandom`,
   list its private run directory, create sockets and remove entries there (no
   file or link, so a socket sealed dials cannot become a link), and write (and create files,
   links and sockets in, and execute from) only its private `$HOME` and

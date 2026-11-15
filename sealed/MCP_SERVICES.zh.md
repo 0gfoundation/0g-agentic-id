@@ -54,7 +54,7 @@ nice 0 的进程分到的 CPU 一样多，所以 nice 在那里不能给 sealed 
 （isolation/README.zh.md）：
 
 - Landlock 只允许它读取并执行镜像的系统目录、自己的版本和租用的 Harness 运行包，读取
-  `/etc/resolv.conf`、`/etc/hosts`、`/etc/ssl/certs`，使用 `/dev/null`、`zero`、`full`、
+  `/etc/resolv.conf`、`/etc/hosts`、`/etc/ssl/certs`、`/etc/ssl/openssl.cnf`（该文件存在却读不到时 Node 会直接退出），使用 `/dev/null`、`zero`、`full`、
   `random`、`urandom`，在私有 run 目录里列目录、建 socket、删除条目（不能建文件或链接，
   sealed 要连的 socket 不能被换成链接），只在自己私有的 `$HOME` 和 `$TMPDIR` 里写（以及建文件、链接、socket，
   执行其中的程序）。`/proc` 不可读，TCP bind/connect 被拒绝，抽象 Unix socket 和信号只能
