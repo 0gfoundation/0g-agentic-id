@@ -71,7 +71,7 @@ flags (2026-11-14):
 - The root filesystem was overlay on an ext filesystem, where Daytona's runner
   sets no per-sandbox size (it does only on xfs), and `statfs` reported the
   whole disk: the free-space floor protects that disk.
-- With a 1-CPU quota (2026-11-15), `kernel.sched_autogroup_enabled` was 1, and a
+- With a 1-CPU quota (2026-11-14), `kernel.sched_autogroup_enabled` was 1, and a
   nice-19 busy loop in its own session (as the launcher starts a service) got as
   much CPU as a nice-0 one over 4 s (ratio 1.056): nice 19 does not make service
   processes yield the sandbox's CPU there.

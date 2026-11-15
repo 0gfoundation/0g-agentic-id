@@ -55,7 +55,7 @@ EAGAIN，2026-11-13）。launcher 在切换身份之后设置全部 rlimit。
 - 容器的 `pids.max` 为 `max`：进程额度是所有服务进程合计的上限。
 - 根文件系统是 ext 文件系统上的 overlay，Daytona 的 runner 在这种文件系统上不给单个沙箱设
   容量（只在 xfs 上设），`statfs` 报的是整块盘：剩余空间下限保护这块盘。
-- CPU 配额为 1 个 CPU 时（2026-11-15），`kernel.sched_autogroup_enabled` 为 1；自开会话（launcher
+- CPU 配额为 1 个 CPU 时（2026-11-14），`kernel.sched_autogroup_enabled` 为 1；自开会话（launcher
   启动服务的方式）的 nice 19 忙循环在 4 秒内分到的 CPU 和 nice 0 的一样多（比值 1.056）：在那里
   nice 19 不能让服务进程让出沙箱的 CPU。
 
