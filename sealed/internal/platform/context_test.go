@@ -122,7 +122,7 @@ func TestCapabilities_CredentialsSectionFollowsTheSocket(t *testing.T) {
 		t.Fatal("credentials described while they are off")
 	}
 	on := Build(RuntimeSnapshot{SealSignSock: "/s", AgentSeal: "0x01", CredSock: "/c", CredRevealSock: "/r"}).Capabilities
-	for _, want := range []string{"[[credential:<name>]]", "[[credential:derived:<name>]]", "$SEAL_CRED_SOCKET", "$SEAL_CRED_REVEAL_SOCKET", "$SEAL_CRED_PROXY", "authorization_pending", "X-Seal-Sign", "/credentials/sign", "X-Seal-Credential-Filled"} {
+	for _, want := range []string{"[[credential:<name>]]", "[[credential:derived:<name>]]", "$SEAL_CRED_SOCKET", "$SEAL_CRED_REVEAL_SOCKET", "$SEAL_CRED_PROXY", "authorization_pending", "X-Seal-Sign", "/credentials/sign", "X-Seal-Credential-Filled", "route that client's requests through the runtime credential proxy", "does not automatically use that proxy or expand environment/credential references"} {
 		if !strings.Contains(on, want) {
 			t.Fatalf("credentials section lacks %q", want)
 		}
@@ -137,7 +137,7 @@ func TestCapabilities_SealToolsAndSigningRulesFollowTheAdapter(t *testing.T) {
 	plain := Build(rs)
 	rs.SealTools, rs.SigningRules = true, true
 	declared := Build(rs)
-	for _, s := range []string{"`seal_sign_transaction`", "`seal_credential_sign`", "`seal_credential_reveal`", "server `seal-reveal`",
+	for _, s := range []string{"`seal_sign_transaction`", "`seal_credential_sign`", "`seal_credential_reveal`", "server `seal-reveal`", "`mcp__seal__seal_sign`",
 		"keeps a record of every signature", "The socket refuses a call to AgenticID update/updateAt"} {
 		if strings.Contains(plain.Capabilities, s) {
 			t.Errorf("rendered %s for a framework that declares neither", s)

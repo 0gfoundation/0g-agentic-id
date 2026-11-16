@@ -954,3 +954,7 @@ gzip'd tar (names sorted, owner 0, mtime 0, hard links stored as files, gzip
 without a timestamp), named by its sha256. It may hold only directories,
 regular files and links that stay inside it. The `harness-package` stage of
 `sealed/images/harness/Dockerfile` produces it.
+
+## Hosted MCP programs
+
+The owner Harness can publish and supervise independent MCP programs through sealed's private service-management tools. See [MCP_SERVICES.md](MCP_SERVICES.md) for the manifest, isolation boundary, recovery and streaming proof policy. Owner settings `others.mcpServers` configure extra native DSH MCP connections; namespaces `seal` and `seal-reveal` are reserved.

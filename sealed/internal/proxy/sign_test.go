@@ -68,7 +68,7 @@ func mustHex(t *testing.T, v any) []byte {
 	return b
 }
 
-// The route set is exactly these seven. A new signing route — a raw-hash /
+// The route set is exactly these eight. A new signing route — a raw-hash /
 // eth_sign / v0x00 endpoint above all — must fail this test and get a
 // conscious review against the invariant, not slip in. (/mcp signs only
 // through the three sign routes.)
@@ -76,7 +76,7 @@ func TestSignSocket_RouteSetPinned(t *testing.T) {
 	s, _ := signServer(t)
 	mux, paths := s.signSocketMux()
 
-	want := []string{"/sign/personal_sign", "/sign/typed_data", "/sign/transaction", "/services", "/settings", "/harness/restart", "/mcp"}
+	want := []string{"/sign/personal_sign", "/sign/typed_data", "/sign/transaction", "/services", "/settings", "/harness/restart", "/mcp", "/service-host"}
 	if !reflect.DeepEqual(paths, want) {
 		t.Fatalf("sign socket routes = %v, want exactly %v", paths, want)
 	}

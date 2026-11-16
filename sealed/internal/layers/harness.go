@@ -22,6 +22,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
@@ -31,6 +32,37 @@ import (
 // PackagesDir holds the unpacked packages, one directory per hash. A var so
 // tests can redirect it; production code never reassigns it.
 var PackagesDir = "/opt/0g-harness"
+
+// Pins cover every process using a package, including temporary service jobs.
+// Pinning and pruning share a lock so a successful lease cannot race removal.
+var packagePins = struct {
+	sync.Mutex
+	refs map[string]int
+}{refs: make(map[string]int)}
+
+func PinHarness(hash string) (func(), error) {
+	h, ok := ParseHash(hash)
+	if !ok {
+		return nil, fmt.Errorf("invalid harness package hash")
+	}
+	packagePins.Lock()
+	defer packagePins.Unlock()
+	if !HarnessInstalled(h) {
+		return nil, fmt.Errorf("harness package is not installed")
+	}
+	packagePins.refs[h]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			packagePins.Lock()
+			defer packagePins.Unlock()
+			packagePins.refs[h]--
+			if packagePins.refs[h] == 0 {
+				delete(packagePins.refs, h)
+			}
+		})
+	}, nil
+}
 
 // baseFile, under PackagesDir, names the package base ships.
 const baseFile = "base"
@@ -128,8 +160,13 @@ func HarnessFailed(hash string) bool {
 // always kept), and what an install cut off left behind
 // (CleanCutOffInstalls). Only while no install runs.
 func PrunePackages(keep ...string) {
+	packagePins.Lock()
+	defer packagePins.Unlock()
 	defer CleanCutOffInstalls()
 	kept := map[string]bool{}
+	for h := range packagePins.refs {
+		kept[h] = true
+	}
 	if base, err := BaseHarness(); err == nil {
 		kept[base] = true
 	}

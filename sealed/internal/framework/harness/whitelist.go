@@ -14,7 +14,8 @@ package harness
 // LAST entry is whitelistMax, the version a `framework` role drift
 // reconciles against.
 var supportedVersions = []string{
-	"0.1.0", // pre-1.0: expect this list to move often (see package doc)
+	"0.1.0", // Existing bindings remain accepted; 0.2.0 stays preferred.
+	"0.2.0", // DSH 0.2.2-rc.1, native MCP and handle-based persistence
 }
 
 // whitelistMax returns the version sealed targets: always the last element.

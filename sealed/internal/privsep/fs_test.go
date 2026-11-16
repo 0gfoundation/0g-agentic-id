@@ -661,9 +661,13 @@ func TestReadRefusesSocketAndDevice(t *testing.T) {
 	if os.Geteuid() != 0 {
 		return
 	}
-	dev := filepath.Join(dir, "null.md")
-	if err := unix.Mknod(dev, unix.S_IFCHR|0o666, int(unix.Mkdev(1, 3))); err != nil {
-		skipOrFail(t, "cannot create a device node here: %v", err)
+	// Production deliberately lacks CAP_MKNOD. Use the image's existing
+	// character device so the mandatory refusal check still runs with the
+	// same six capabilities, rather than requiring a more privileged fixture.
+	dev := "/dev/null"
+	fi, err := os.Stat(dev)
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		t.Fatalf("expected the image's null character device: %v", err)
 	}
 	_, err = ReadFile(dev, 1<<10)
 	wantUnsafe(t, "ReadFile(device)", err)
@@ -805,6 +809,23 @@ func TestWriteFileFromStreams(t *testing.T) {
 	}
 	if fi2, _ := os.Lstat(p); fi2.Size() != 1<<20 {
 		t.Fatal("a failed write changed the destination")
+	}
+}
+
+func TestWriteFileSyncWritesAndReplaces(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "record.json")
+	for _, data := range []string{"first", "second"} {
+		if err := WriteFileSync(p, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(p)
+		if err != nil || string(b) != data {
+			t.Fatalf("read %q, %v; want %q", b, err, data)
+		}
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".*sealed-tmp-*")); len(left) != 0 {
+		t.Fatalf("temp files left: %v", left)
 	}
 }
 
