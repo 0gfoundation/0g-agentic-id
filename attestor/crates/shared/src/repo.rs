@@ -74,6 +74,84 @@ impl PostgresDeploymentRepo {
     pub fn new(pool: PgPool) -> Arc<Self> {
         Arc::new(Self { pool })
     }
+
+    async fn prepare_runtime_boot(
+        &self,
+        seal: SealId,
+        ticket: Option<[u8; 32]>,
+        owner: Address,
+        operator: Option<(Address, i64)>,
+        expected: Option<(&str, i64)>,
+    ) -> anyhow::Result<Option<i64>> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        let deployment =
+            sqlx::query("SELECT sandbox_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
+                .bind(seal.as_slice())
+                .fetch_one(&mut *tx)
+                .await?;
+        if let Some((_, version)) = operator {
+            let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM operator_grants WHERE seal_id=$1 AND version=$2 AND owner=$3 AND NOT transfer_invalidated)")
+                .bind(seal.as_slice()).bind(version).bind(owner.as_slice()).fetch_one(&mut *tx).await?;
+            if !current {
+                return Ok(None);
+            }
+        }
+        if ticket.is_none() {
+            let boot = sqlx::query("SELECT generation,authorized_owner,authorized_operator,operator_version,authorized_sandbox_id,ticket_hash FROM container_status_bindings WHERE seal_id=$1")
+                .bind(seal.as_slice()).fetch_optional(&mut *tx).await?;
+            let Some(boot) = boot else {
+                return Ok(None);
+            };
+            let owner_matches = boot
+                .try_get::<Option<Vec<u8>>, _>("authorized_owner")?
+                .as_deref()
+                == Some(owner.as_slice());
+            let expected_actor = operator.map(|(actor, _)| actor.as_slice().to_vec());
+            if !owner_matches
+                || boot.try_get::<Option<Vec<u8>>, _>("authorized_operator")? != expected_actor
+                || boot.try_get::<Option<i64>, _>("operator_version")?
+                    != operator.map(|(_, version)| version)
+                || boot.try_get::<Option<Vec<u8>>, _>("ticket_hash")?.is_none()
+            {
+                return Ok(None);
+            }
+            if let Some((sandbox, generation)) = expected {
+                if sandbox.is_empty()
+                    || deployment
+                        .try_get::<Option<String>, _>("sandbox_id")?
+                        .as_deref()
+                        != Some(sandbox)
+                    || boot
+                        .try_get::<Option<String>, _>("authorized_sandbox_id")?
+                        .as_deref()
+                        != Some(sandbox)
+                    || boot.try_get::<i64, _>("generation")? != generation
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        let actor = operator.map(|(actor, _)| actor.as_slice().to_vec());
+        let version = operator.map(|(_, version)| version);
+        let generation: Option<i64> = if let Some(ticket) = ticket {
+            sqlx::query(&format!("UPDATE deployments SET {CLEAR_CONTAINER_RECORD},last_provision_error=NULL,last_provision_error_at=NULL,updated_at=now() WHERE seal_id=$1"))
+                .bind(seal.as_slice()).execute(&mut *tx).await?;
+            Some(sqlx::query_scalar("INSERT INTO container_status_bindings(seal_id,binding_hash,generation,ticket_hash,ticket_issued_at,enabled,authorized_owner,authorized_operator,operator_version) VALUES($1,NULL,1,$2,EXTRACT(EPOCH FROM now())::BIGINT,TRUE,$3,$4,$5) ON CONFLICT(seal_id) DO UPDATE SET generation=container_status_bindings.generation+1,ticket_hash=EXCLUDED.ticket_hash,ticket_issued_at=EXCLUDED.ticket_issued_at,enabled=TRUE,binding_hash=NULL,boot_started_at=0,boot_id=NULL,authorized_owner=EXCLUDED.authorized_owner,authorized_operator=EXCLUDED.authorized_operator,operator_version=EXCLUDED.operator_version,authorized_sandbox_id=NULL,authorized_container_pubkey=NULL RETURNING generation")
+                .bind(seal.as_slice()).bind(ticket.as_slice()).bind(owner.as_slice()).bind(actor).bind(version).fetch_one(&mut *tx).await?)
+        } else {
+            let generation = sqlx::query_scalar("UPDATE container_status_bindings SET generation=generation+1,enabled=TRUE,binding_hash=NULL,boot_started_at=0,boot_id=NULL,authorized_owner=$2,authorized_operator=$3,operator_version=$4 WHERE seal_id=$1 AND ticket_hash IS NOT NULL RETURNING generation")
+                .bind(seal.as_slice()).bind(owner.as_slice()).bind(actor).bind(version).fetch_optional(&mut *tx).await?;
+            if generation.is_some() {
+                sqlx::query("UPDATE deployments SET container_status=NULL WHERE seal_id=$1")
+                    .bind(seal.as_slice())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            generation
+        };
+        tx.commit().await?;
+        Ok(generation)
+    }
 }
 
 fn agent_id_to_text(id: &AgentId) -> String {
@@ -197,6 +275,335 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
 
 #[async_trait]
 impl DeploymentRepo for PostgresDeploymentRepo {
+    async fn operator_grant(
+        &self,
+        seal: SealId,
+    ) -> anyhow::Result<Option<crate::auth::operator::OperatorGrant>> {
+        let row = sqlx::query(
+            "SELECT version,owner,signed_message_b64,signature FROM operator_grants WHERE seal_id=$1",
+        )
+        .bind(seal.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let owner: Vec<u8> = row.try_get("owner")?;
+            anyhow::ensure!(owner.len() == 20, "invalid operator grant owner");
+            Ok(crate::auth::operator::OperatorGrant {
+                version: row.try_get("version")?,
+                owner: Address::from_slice(&owner),
+                signed_message_b64: row.try_get("signed_message_b64")?,
+                signature: row.try_get::<Vec<u8>, _>("signature")?.into(),
+            })
+        })
+        .transpose()
+    }
+
+    async fn invalidate_operator_for_transfer(
+        &self,
+        agent: AgentId,
+        previous_owner: Address,
+    ) -> anyhow::Result<()> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        let row = sqlx::query("SELECT seal_id,sandbox_id,storage_stage,mint_stage FROM deployments WHERE agent_id=$1 FOR UPDATE")
+            .bind(agent_id_to_text(&agent)).fetch_optional(&mut *tx).await?;
+        let Some(row) = row else { return Ok(()) };
+        let seal: Vec<u8> = row.try_get("seal_id")?;
+        let invalidated = sqlx::query("UPDATE operator_grants SET version=version+1,transfer_invalidated=TRUE,updated_at=now() WHERE seal_id=$1 AND owner=$2 AND NOT transfer_invalidated")
+            .bind(&seal).bind(previous_owner.as_slice()).execute(&mut *tx).await?.rows_affected();
+        if invalidated == 0 {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let delegated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM container_status_bindings WHERE seal_id=$1 AND authorized_owner=$2 AND authorized_operator IS NOT NULL)")
+            .bind(&seal).bind(previous_owner.as_slice()).fetch_one(&mut *tx).await?;
+        if delegated {
+            let sandbox = row
+                .try_get::<Option<String>, _>("sandbox_id")?
+                .filter(|s| !s.is_empty());
+            if let Some(sandbox) = sandbox {
+                sqlx::query("INSERT INTO operator_teardowns(seal_id,sandbox_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
+                    .bind(&seal).bind(sandbox).execute(&mut *tx).await?;
+            }
+            let storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
+            let mint: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
+            let phase = derive_phase(&storage, &mint, &StageStatus::NotStarted);
+            sqlx::query(&format!("UPDATE deployments SET sandbox_id=NULL,{CLEAR_CONTAINER_RECORD},provisioned_at=NULL,provision_deadline=NULL,last_heartbeat=NULL,container_stage=$2,phase=$3,updated_at=now() WHERE seal_id=$1"))
+                .bind(&seal).bind(serde_json::to_value(StageStatus::NotStarted)?).bind(phase.serde_tag())
+                .execute(&mut *tx).await?;
+            sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1,authorized_sandbox_id=NULL,authorized_container_pubkey=NULL WHERE seal_id=$1")
+                .bind(&seal).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn compare_and_swap_operator(
+        &self,
+        seal: SealId,
+        base_version: i64,
+        grant: crate::auth::operator::OperatorGrant,
+    ) -> anyhow::Result<Option<crate::auth::operator::OperatorUpdate>> {
+        anyhow::ensure!(
+            base_version >= 0,
+            "operator base version must be nonnegative"
+        );
+        let version = base_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("operator version exhausted"))?;
+        anyhow::ensure!(grant.version == version, "operator grant version mismatch");
+        let mut tx = deployment_tx(&self.pool).await?;
+        let row = sqlx::query(
+            "SELECT sandbox_id,storage_stage,mint_stage FROM deployments WHERE seal_id=$1 FOR UPDATE",
+        )
+        .bind(seal.as_slice())
+        .fetch_one(&mut *tx)
+        .await?;
+        let current: Option<i64> =
+            sqlx::query_scalar("SELECT version FROM operator_grants WHERE seal_id=$1")
+                .bind(seal.as_slice())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if current.unwrap_or(0) != base_version {
+            return Ok(None);
+        }
+        let retired_sandbox_id = row
+            .try_get::<Option<String>, _>("sandbox_id")?
+            .filter(|id| !id.is_empty());
+        sqlx::query(
+            "INSERT INTO operator_grants(seal_id,version,owner,signed_message_b64,signature) VALUES($1,$2,$3,$4,$5) ON CONFLICT(seal_id) DO UPDATE SET version=EXCLUDED.version,owner=EXCLUDED.owner,signed_message_b64=EXCLUDED.signed_message_b64,signature=EXCLUDED.signature,transfer_invalidated=FALSE,updated_at=now()",
+        )
+        .bind(seal.as_slice()).bind(version).bind(grant.owner.as_slice())
+        .bind(grant.signed_message_b64).bind(grant.signature.as_ref())
+        .execute(&mut *tx).await?;
+        if let Some(id) = &retired_sandbox_id {
+            sqlx::query(
+                "INSERT INTO operator_teardowns(seal_id,sandbox_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+            )
+            .bind(seal.as_slice()).bind(id).execute(&mut *tx).await?;
+        }
+        let storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
+        let mint: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
+        let stage = StageStatus::NotStarted;
+        let phase = derive_phase(&storage, &mint, &stage);
+        sqlx::query(
+            &format!("UPDATE deployments SET sandbox_id=NULL,{CLEAR_CONTAINER_RECORD},provisioned_at=NULL,provision_deadline=NULL,last_heartbeat=NULL,container_stage=$2,phase=$3,updated_at=now() WHERE seal_id=$1"),
+        )
+        .bind(seal.as_slice()).bind(serde_json::to_value(stage)?).bind(phase.serde_tag())
+        .execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1,authorized_sandbox_id=NULL,authorized_container_pubkey=NULL WHERE seal_id=$1",
+        )
+        .bind(seal.as_slice()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Some(crate::auth::operator::OperatorUpdate {
+            version,
+            retired_sandbox_id,
+        }))
+    }
+
+    async fn pending_operator_teardowns(&self) -> anyhow::Result<Vec<(SealId, String)>> {
+        let rows = sqlx::query(
+            "SELECT seal_id,sandbox_id FROM operator_teardowns ORDER BY created_at,seal_id,sandbox_id",
+        )
+        .fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                let seal: Vec<u8> = row.try_get("seal_id")?;
+                anyhow::ensure!(seal.len() == 32, "invalid operator teardown seal");
+                Ok((B256::from_slice(&seal), row.try_get("sandbox_id")?))
+            })
+            .collect()
+    }
+
+    async fn complete_operator_teardown(&self, seal: SealId, sandbox: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM operator_teardowns WHERE seal_id=$1 AND sandbox_id=$2")
+            .bind(seal.as_slice())
+            .bind(sandbox)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn enqueue_operator_teardown(&self, seal: SealId, sandbox: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!sandbox.is_empty(), "operator teardown ID must be nonempty");
+        let mut tx = deployment_tx(&self.pool).await?;
+        sqlx::query("SELECT seal_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
+            .bind(seal.as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO operator_teardowns(seal_id,sandbox_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
+            .bind(seal.as_slice()).bind(sandbox).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn prepare_operator_boot(
+        &self,
+        seal: SealId,
+        ticket: Option<[u8; 32]>,
+        owner: Address,
+        operator: Address,
+        operator_version: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        self.prepare_runtime_boot(
+            seal,
+            ticket,
+            owner,
+            Some((operator, operator_version)),
+            None,
+        )
+        .await
+    }
+
+    async fn prepare_status_resume(
+        &self,
+        seal: SealId,
+        expected_sandbox: &str,
+        expected_generation: i64,
+        owner: Address,
+    ) -> anyhow::Result<Option<i64>> {
+        self.prepare_runtime_boot(
+            seal,
+            None,
+            owner,
+            None,
+            Some((expected_sandbox, expected_generation)),
+        )
+        .await
+    }
+
+    async fn prepare_operator_resume(
+        &self,
+        seal: SealId,
+        expected_sandbox: &str,
+        expected_generation: i64,
+        owner: Address,
+        operator: Address,
+        operator_version: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        self.prepare_runtime_boot(
+            seal,
+            None,
+            owner,
+            Some((operator, operator_version)),
+            Some((expected_sandbox, expected_generation)),
+        )
+        .await
+    }
+
+    async fn bind_runtime_sandbox(
+        &self,
+        seal: SealId,
+        sandbox: String,
+        generation: i64,
+        pin: Option<Vec<u8>>,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(!sandbox.is_empty(), "sandbox ID must be nonempty");
+        if let Some(pin) = &pin {
+            anyhow::ensure!(
+                pin.len() == 33 && k256::PublicKey::from_sec1_bytes(pin).is_ok(),
+                "invalid certified container public key"
+            );
+        }
+        let mut tx = deployment_tx(&self.pool).await?;
+        sqlx::query("SELECT seal_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
+            .bind(seal.as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+        let changed = sqlx::query("UPDATE container_status_bindings SET authorized_sandbox_id=$2,authorized_container_pubkey=$3 WHERE seal_id=$1 AND enabled=TRUE AND generation=$4 AND ticket_hash IS NOT NULL")
+            .bind(seal.as_slice()).bind(&sandbox).bind(pin).bind(generation).execute(&mut *tx).await?.rows_affected();
+        if changed == 0 {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE deployments SET sandbox_id=$2,updated_at=now() WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .bind(sandbox)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn transition_runtime(
+        &self,
+        seal: SealId,
+        expected_sandbox: Option<&str>,
+        expected_generation: Option<i64>,
+        stage: StageStatus,
+        deadline: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<bool> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        let row = sqlx::query(
+            "SELECT sandbox_id,storage_stage,mint_stage,container_stage FROM deployments WHERE seal_id=$1 FOR UPDATE",
+        )
+        .bind(seal.as_slice()).fetch_optional(&mut *tx).await?;
+        let Some(row) = row else { return Ok(false) };
+        let sandbox: Option<String> = row.try_get("sandbox_id")?;
+        if sandbox.as_deref() != expected_sandbox {
+            return Ok(false);
+        }
+        let boot = sqlx::query(
+            "SELECT generation,enabled,ticket_hash,binding_hash FROM container_status_bindings WHERE seal_id=$1",
+        )
+        .bind(seal.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let provisioned = boot.as_ref().is_some_and(|b| {
+            b.try_get::<Option<Vec<u8>>, _>("binding_hash")
+                .ok()
+                .flatten()
+                .is_some()
+        });
+        let authorized = match (expected_generation, boot) {
+            (None, None) => {
+                !sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM operator_grants WHERE seal_id=$1)",
+                )
+                .bind(seal.as_slice())
+                .fetch_one(&mut *tx)
+                .await?
+            }
+            (Some(expected), Some(boot)) => {
+                boot.try_get::<i64, _>("generation")? == expected
+                    && boot.try_get::<bool, _>("enabled")?
+                    && boot.try_get::<Option<Vec<u8>>, _>("ticket_hash")?.is_some()
+            }
+            _ => false,
+        };
+        if !authorized {
+            return Ok(false);
+        }
+        let current: StageStatus = serde_json::from_value(row.try_get("container_stage")?)?;
+        if provisioned
+            && matches!(current, StageStatus::Confirmed { .. })
+            && matches!(stage, StageStatus::Submitted { .. })
+        {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        let stopped = matches!(
+            stage,
+            StageStatus::Stopped { .. } | StageStatus::Failed { .. }
+        );
+        let deadline = if stopped || provisioned {
+            None
+        } else {
+            deadline
+        };
+        let storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
+        let mint: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
+        let phase = derive_phase(&storage, &mint, &stage);
+        sqlx::query("UPDATE deployments SET container_stage=$2,phase=$3,provision_deadline=$4,updated_at=now() WHERE seal_id=$1")
+            .bind(seal.as_slice()).bind(serde_json::to_value(stage)?).bind(phase.serde_tag())
+            .bind(deadline).execute(&mut *tx).await?;
+        if stopped {
+            sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1 WHERE seal_id=$1")
+                .bind(seal.as_slice()).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     async fn insert(&self, d: &Deployment) -> anyhow::Result<()> {
         sqlx::query(
             r#"
@@ -457,6 +864,8 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         let Some(row) = row else { return Ok(None) };
         let seal: Vec<u8> = row.try_get("seal_id")?;
         let sandbox: Option<String> = row.try_get("sandbox_id")?;
+        sqlx::query("UPDATE operator_grants SET version=version+1,transfer_invalidated=TRUE,updated_at=now() WHERE seal_id=$1 AND owner<>$2 AND NOT transfer_invalidated")
+            .bind(&seal).bind(live_owner.as_slice()).execute(&mut *tx).await?;
         let auth=sqlx::query("SELECT authorized_owner,authorized_sandbox_id,enabled FROM container_status_bindings WHERE seal_id=$1").bind(&seal).fetch_optional(&mut *tx).await?;
         if let Some(auth) = auth {
             let owner: Option<Vec<u8>> = auth.try_get("authorized_owner")?;
@@ -923,45 +1332,19 @@ impl DeploymentRepo for PostgresDeploymentRepo {
 
     async fn prepare_status_boot(
         &self,
-        seal_id: SealId,
+        seal: SealId,
         ticket: Option<[u8; 32]>,
         owner: Address,
     ) -> anyhow::Result<Option<i64>> {
-        let mut tx = deployment_tx(&self.pool).await?;
-        sqlx::query("SELECT seal_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
-            .bind(seal_id.as_slice())
-            .fetch_one(&mut *tx)
-            .await?;
-        let generation: Option<i64> = if let Some(ticket) = ticket {
-            // A new container must present its own certificate, and a
-            // rejection of the previous container no longer describes it.
-            sqlx::query(&format!(
-                "UPDATE deployments SET {CLEAR_CONTAINER_RECORD},last_provision_error=NULL,last_provision_error_at=NULL,updated_at=now() WHERE seal_id=$1"
-            ))
-            .bind(seal_id.as_slice())
-            .execute(&mut *tx)
-            .await?;
-            Some(sqlx::query_scalar("INSERT INTO container_status_bindings(seal_id,binding_hash,generation,ticket_hash,ticket_issued_at,enabled,authorized_owner) VALUES($1,NULL,1,$2,EXTRACT(EPOCH FROM now())::BIGINT,TRUE,$3) ON CONFLICT(seal_id) DO UPDATE SET generation=container_status_bindings.generation+1,ticket_hash=EXCLUDED.ticket_hash,ticket_issued_at=EXCLUDED.ticket_issued_at,enabled=TRUE,binding_hash=NULL,boot_started_at=0,boot_id=NULL,authorized_owner=EXCLUDED.authorized_owner,authorized_sandbox_id=NULL,authorized_container_pubkey=NULL RETURNING generation")
-                .bind(seal_id.as_slice()).bind(ticket.as_slice()).bind(owner.as_slice()).fetch_one(&mut *tx).await?)
-        } else {
-            // The resumed boot reports afresh; the last report described the
-            // boot before it.
-            sqlx::query("UPDATE deployments SET container_status=NULL WHERE seal_id=$1")
-                .bind(seal_id.as_slice())
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query_scalar("UPDATE container_status_bindings SET generation=generation+1,enabled=TRUE,binding_hash=NULL,boot_started_at=0,boot_id=NULL,authorized_owner=$2 WHERE seal_id=$1 AND ticket_hash IS NOT NULL RETURNING generation")
-                .bind(seal_id.as_slice()).bind(owner.as_slice()).fetch_optional(&mut *tx).await?
-        };
-        tx.commit().await?;
-        Ok(generation)
+        self.prepare_runtime_boot(seal, ticket, owner, None, None)
+            .await
     }
 
     async fn boot_authorization(
         &self,
         seal_id: SealId,
     ) -> anyhow::Result<Option<crate::auth::status::BootAuthorization>> {
-        let row=sqlx::query("SELECT generation,ticket_hash,ticket_issued_at,enabled,boot_started_at,authorized_owner,authorized_sandbox_id,authorized_container_pubkey FROM container_status_bindings WHERE seal_id=$1 AND ticket_hash IS NOT NULL").bind(seal_id.as_slice()).fetch_optional(&self.pool).await?;
+        let row=sqlx::query("SELECT generation,ticket_hash,ticket_issued_at,enabled,boot_started_at,authorized_owner,authorized_sandbox_id,authorized_container_pubkey,authorized_operator,operator_version FROM container_status_bindings WHERE seal_id=$1 AND ticket_hash IS NOT NULL").bind(seal_id.as_slice()).fetch_optional(&self.pool).await?;
         row.map(|r| {
             Ok(crate::auth::status::BootAuthorization {
                 generation: r.try_get("generation")?,
@@ -977,6 +1360,10 @@ impl DeploymentRepo for PostgresDeploymentRepo {
                     .map(|v| Address::from_slice(&v)),
                 sandbox_id: r.try_get("authorized_sandbox_id")?,
                 container_pubkey: r.try_get("authorized_container_pubkey")?,
+                operator: r
+                    .try_get::<Option<Vec<u8>>, _>("authorized_operator")?
+                    .map(|v| Address::from_slice(&v)),
+                operator_version: r.try_get("operator_version")?,
             })
         })
         .transpose()
@@ -2318,6 +2705,767 @@ mod settings_retry_tests {
             tx.commit().await.unwrap();
         };
         let _ = tokio::join!(bootstrap, mutate);
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod operator_storage_tests {
+    use super::*;
+    use crate::auth::operator::OperatorGrant;
+    use crate::auth::status::{BootClaim, ServedSettings};
+    use crate::mocks::InMemoryDeploymentRepo;
+
+    fn grant(owner: Address, version: i64) -> OperatorGrant {
+        OperatorGrant {
+            owner,
+            version,
+            signed_message_b64: "storage-test-proof".into(),
+            signature: alloy::primitives::Bytes::from(vec![version as u8; 65]),
+        }
+    }
+
+    fn pin() -> Vec<u8> {
+        hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap()
+    }
+
+    fn record() -> ContainerRecord {
+        ContainerRecord {
+            pubkey: pin().into(),
+            image_hash: B256::repeat_byte(0x11),
+            provider: ProviderInstance {
+                chain_id: 16602,
+                registry_address: Address::repeat_byte(0x22),
+                app_id: "operator-storage-fixture".into(),
+                registered_at: 100,
+                signer: Address::repeat_byte(0x33),
+            },
+        }
+    }
+
+    fn deployment(seal: SealId, agent: AgentId, owner: Address) -> Deployment {
+        let now = Utc::now();
+        Deployment {
+            seal_id: seal,
+            agent_seal_addr: Address::repeat_byte(0x10),
+            owner,
+            agent_id: Some(agent),
+            agent_uri: "ipfs://operator-storage-fixture".into(),
+            agent_card: serde_json::json!({"name":"fixture"}),
+            i_data: vec![],
+            clone_params: None,
+            framework: Some("openclaw".into()),
+            phase: DeploymentPhase::Running,
+            storage_stage: StageStatus::Confirmed { at: now },
+            mint_stage: StageStatus::Confirmed { at: now },
+            container_stage: StageStatus::Confirmed { at: now },
+            sandbox_id: Some("old-runtime".into()),
+            provisioned_at: Some(now),
+            container_record: None,
+            provision_deadline: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
+            container_status: None,
+            settings: None,
+            settings_last_good: None,
+            settings_version: 0,
+            settings_confirmed_version: 0,
+            settings_attempts: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // Run the same contract against the mock and Postgres. The latter exercises
+    // real row locking and the complete certified-container record, rather than
+    // approximating database behavior with a second independent fake.
+    async fn exercise_operator_storage(repo: &dyn DeploymentRepo, seal: SealId, agent: AgentId) {
+        let owner = Address::repeat_byte(0xa1);
+        let actor = Address::repeat_byte(0xb1);
+        let buyer = Address::repeat_byte(0xc1);
+        repo.insert(&deployment(seal, agent, owner)).await.unwrap();
+        repo.set_settings(seal, serde_json::json!({"model":"last-good"}), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.note_settings_attempt(seal, 1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.promote_settings_last_good(seal)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.set_settings(seal, serde_json::json!({"model":"owner-config"}), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.note_settings_attempt(seal, 2, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let old_generation = repo
+            .prepare_status_boot(seal, Some([0; 32]), owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(repo
+            .bind_runtime_sandbox(seal, "old-runtime".into(), old_generation, Some(pin()))
+            .await
+            .unwrap());
+        let old_claim = BootClaim {
+            generation: old_generation,
+            ticket_hash: [0; 32],
+            boot_id: B256::repeat_byte(0x40),
+            started_at: Utc::now().timestamp(),
+        };
+        assert!(repo
+            .bind_status_boot(seal, &record(), [3; 32], None, &old_claim)
+            .await
+            .unwrap());
+        let old_report = ContainerStatus {
+            level: ContainerReportStatus::Running,
+            reason: None,
+            at: Utc::now(),
+        };
+        assert!(repo
+            .apply_status_report(
+                seal,
+                [3; 32],
+                StageStatus::Confirmed { at: Utc::now() },
+                None,
+                &old_report
+            )
+            .await
+            .unwrap());
+        repo.mark_heartbeat(seal, Utc::now()).await.unwrap();
+        let (left, right) = tokio::join!(
+            repo.compare_and_swap_operator(seal, 0, grant(owner, 1)),
+            repo.compare_and_swap_operator(seal, 0, grant(owner, 1))
+        );
+        assert_eq!(
+            usize::from(left.unwrap().is_some()) + usize::from(right.unwrap().is_some()),
+            1
+        );
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(
+            d.sandbox_id.is_none() && d.container_record.is_none() && d.container_status.is_none()
+        );
+        assert!(d.provisioned_at.is_none() && d.provision_deadline.is_none());
+        assert!(matches!(d.container_stage, StageStatus::NotStarted));
+        let retired_boot = repo.boot_authorization(seal).await.unwrap().unwrap();
+        assert!(!retired_boot.enabled);
+        assert!(retired_boot.sandbox_id.is_none() && retired_boot.container_pubkey.is_none());
+        assert_eq!(d.settings_version, 2);
+        assert_eq!(d.settings_confirmed_version, 1);
+        assert_eq!(d.settings_attempts, 1);
+        assert_eq!(
+            d.settings,
+            Some(serde_json::json!({"model":"owner-config"}))
+        );
+        assert_eq!(d.agent_uri, "ipfs://operator-storage-fixture");
+        assert!(repo
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "old-runtime".into())));
+        assert!(repo
+            .prepare_operator_boot(seal, Some([1; 32]), buyer, actor, 1)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_operator_boot(seal, Some([1; 32]), owner, actor, 0)
+            .await
+            .unwrap()
+            .is_none());
+        let generation = repo
+            .prepare_operator_boot(seal, Some([1; 32]), owner, actor, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let submitted = StageStatus::Submitted {
+            tx_hash: None,
+            at: Utc::now(),
+        };
+        let deadline = Utc::now() + chrono::Duration::minutes(5);
+        assert!(repo
+            .transition_runtime(
+                seal,
+                None,
+                Some(generation),
+                submitted.clone(),
+                Some(deadline)
+            )
+            .await
+            .unwrap());
+        assert!(repo
+            .bind_runtime_sandbox(seal, "alpha".into(), generation, Some(pin()))
+            .await
+            .unwrap());
+        let auth = repo.boot_authorization(seal).await.unwrap().unwrap();
+        assert_eq!(auth.owner, Some(owner));
+        assert_eq!(auth.operator, Some(actor));
+        assert_eq!(auth.operator_version, Some(1));
+        assert_eq!(auth.container_pubkey, Some(pin()));
+        assert!(auth.ticket_issued_at.is_some());
+        let claim = BootClaim {
+            generation,
+            ticket_hash: [1; 32],
+            boot_id: B256::repeat_byte(0x41),
+            started_at: Utc::now().timestamp(),
+        };
+        assert!(repo
+            .bind_status_boot(
+                seal,
+                &record(),
+                [4; 32],
+                Some(ServedSettings {
+                    version: 2,
+                    digest: B256::repeat_byte(0x52)
+                }),
+                &claim
+            )
+            .await
+            .unwrap());
+        // The provider callback may arrive after /provision and before /status.
+        assert!(repo
+            .transition_runtime(
+                seal,
+                Some("alpha"),
+                Some(generation),
+                submitted.clone(),
+                Some(deadline)
+            )
+            .await
+            .unwrap());
+        assert!(repo
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .provision_deadline
+            .is_none());
+        assert!(repo
+            .prepare_status_boot(seal, None, owner)
+            .await
+            .unwrap()
+            .is_none());
+        let resumed_generation = repo
+            .prepare_operator_resume(seal, "alpha", generation, owner, actor, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let resumed = repo.boot_authorization(seal).await.unwrap().unwrap();
+        assert!(resumed_generation > generation);
+        assert_eq!(resumed.ticket_issued_at, auth.ticket_issued_at);
+        assert_eq!(resumed.container_pubkey, Some(pin()));
+        assert_eq!(resumed.operator, Some(actor));
+        assert_eq!(resumed.operator_version, Some(1));
+        let generation = resumed_generation;
+        assert!(repo
+            .compare_and_swap_operator(seal, 1, grant(owner, 2))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(!repo
+            .bind_runtime_sandbox(seal, "stale-create".into(), generation, Some(pin()))
+            .await
+            .unwrap());
+        assert!(!repo
+            .transition_runtime(
+                seal,
+                Some("alpha"),
+                Some(generation),
+                submitted.clone(),
+                Some(deadline)
+            )
+            .await
+            .unwrap());
+        let report = ContainerStatus {
+            level: ContainerReportStatus::Running,
+            reason: None,
+            at: Utc::now(),
+        };
+        assert!(!repo
+            .apply_status_report(
+                seal,
+                [4; 32],
+                StageStatus::Confirmed { at: Utc::now() },
+                None,
+                &report
+            )
+            .await
+            .unwrap());
+        assert!(repo
+            .prepare_operator_boot(seal, Some([2; 32]), owner, actor, 1)
+            .await
+            .unwrap()
+            .is_none());
+        let generation = repo
+            .prepare_operator_boot(seal, Some([2; 32]), owner, actor, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(repo
+            .bind_runtime_sandbox(seal, "beta".into(), generation, Some(pin()))
+            .await
+            .unwrap());
+        repo.complete_operator_teardown(seal, "alpha")
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get(seal).await.unwrap().unwrap().sandbox_id.as_deref(),
+            Some("beta")
+        );
+        repo.enqueue_operator_teardown(seal, "orphan")
+            .await
+            .unwrap();
+        repo.enqueue_operator_teardown(seal, "orphan")
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.pending_operator_teardowns()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|(s, id)| *s == seal && id == "orphan")
+                .count(),
+            1
+        );
+        // Chain has already returned to A while the first A -> B transfer is
+        // still being indexed. Transfer.from must revoke A's previous grant.
+        repo.set_owner(agent, buyer).await.unwrap();
+        repo.set_owner(agent, owner).await.unwrap();
+        repo.invalidate_operator_for_transfer(agent, owner)
+            .await
+            .unwrap();
+        assert_eq!(repo.operator_grant(seal).await.unwrap().unwrap().version, 3);
+        assert!(repo.get(seal).await.unwrap().unwrap().sandbox_id.is_none());
+        assert!(
+            !repo
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        assert!(repo
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "beta".into())));
+        repo.invalidate_operator_for_transfer(agent, owner)
+            .await
+            .unwrap();
+        assert_eq!(repo.operator_grant(seal).await.unwrap().unwrap().version, 3);
+        // Revoking an owner's grant never revokes a new owner-direct boot.
+        repo.compare_and_swap_operator(seal, 3, grant(owner, 4))
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = repo
+            .prepare_status_boot(seal, Some([3; 32]), owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(repo
+            .bind_runtime_sandbox(seal, "owner-direct".into(), generation, Some(pin()))
+            .await
+            .unwrap());
+        repo.invalidate_operator_for_transfer(agent, owner)
+            .await
+            .unwrap();
+        assert_eq!(repo.operator_grant(seal).await.unwrap().unwrap().version, 5);
+        assert!(
+            repo.boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        assert!(repo
+            .clear_container_binding(agent, owner)
+            .await
+            .unwrap()
+            .is_none());
+        // A buyer already acting under live ownership survives a late old
+        // seller event; its grant and boot are distinct from the seller's.
+        repo.set_owner(agent, buyer).await.unwrap();
+        repo.compare_and_swap_operator(seal, 5, grant(buyer, 6))
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = repo
+            .prepare_operator_boot(seal, Some([4; 32]), buyer, actor, 6)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(repo
+            .bind_runtime_sandbox(seal, "buyer-runtime".into(), generation, Some(pin()))
+            .await
+            .unwrap());
+        repo.invalidate_operator_for_transfer(agent, owner)
+            .await
+            .unwrap();
+        assert!(repo
+            .clear_container_binding(agent, buyer)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(repo.operator_grant(seal).await.unwrap().unwrap().version, 6);
+        assert_eq!(
+            repo.get(seal).await.unwrap().unwrap().sandbox_id.as_deref(),
+            Some("buyer-runtime")
+        );
+        assert!(
+            repo.boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+    }
+
+    async fn install_test_runtime(
+        repo: &dyn DeploymentRepo,
+        seal: SealId,
+        owner: Address,
+        actor: Option<(Address, i64)>,
+        ticket: u8,
+        sandbox: &str,
+    ) -> (crate::auth::status::BootAuthorization, ContainerStatus) {
+        let generation = match actor {
+            Some((actor, version)) => repo
+                .prepare_operator_boot(seal, Some([ticket; 32]), owner, actor, version)
+                .await
+                .unwrap()
+                .unwrap(),
+            None => repo
+                .prepare_status_boot(seal, Some([ticket; 32]), owner)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        assert!(repo
+            .bind_runtime_sandbox(seal, sandbox.into(), generation, Some(pin()))
+            .await
+            .unwrap());
+        let claim = BootClaim {
+            generation,
+            ticket_hash: [ticket; 32],
+            boot_id: B256::repeat_byte(ticket),
+            started_at: Utc::now().timestamp(),
+        };
+        assert!(repo
+            .bind_status_boot(seal, &record(), [ticket; 32], None, &claim)
+            .await
+            .unwrap());
+        let report = ContainerStatus {
+            level: ContainerReportStatus::Running,
+            reason: None,
+            at: Utc::now(),
+        };
+        assert!(repo
+            .apply_status_report(
+                seal,
+                [ticket; 32],
+                StageStatus::Confirmed { at: Utc::now() },
+                None,
+                &report
+            )
+            .await
+            .unwrap());
+        (
+            repo.boot_authorization(seal).await.unwrap().unwrap(),
+            report,
+        )
+    }
+
+    async fn assert_runtime_untouched(
+        repo: &dyn DeploymentRepo,
+        seal: SealId,
+        expected: &crate::auth::status::BootAuthorization,
+        ticket: u8,
+        report: &ContainerStatus,
+    ) {
+        assert_eq!(
+            &repo.boot_authorization(seal).await.unwrap().unwrap(),
+            expected
+        );
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.sandbox_id, expected.sandbox_id);
+        assert_eq!(d.container_record, Some(record()));
+        assert_eq!(
+            serde_json::to_value(d.container_status).unwrap(),
+            serde_json::to_value(Some(report)).unwrap()
+        );
+        assert!(
+            repo.apply_status_report(
+                seal,
+                [ticket; 32],
+                StageStatus::Confirmed { at: Utc::now() },
+                None,
+                report
+            )
+            .await
+            .unwrap(),
+            "a rejected resume must retain the new boot's opaque token"
+        );
+    }
+
+    async fn exercise_stale_resume(repo: &dyn DeploymentRepo, seal: SealId, agent: AgentId) {
+        let owner = Address::repeat_byte(0xa2);
+        let actor = Address::repeat_byte(0xb2);
+        let stranger = Address::repeat_byte(0xc2);
+        repo.insert(&deployment(seal, agent, owner)).await.unwrap();
+        let (old, _) = install_test_runtime(repo, seal, owner, None, 10, "old-owner-runtime").await;
+        let (new, report) =
+            install_test_runtime(repo, seal, owner, None, 11, "new-owner-runtime").await;
+        assert!(repo
+            .prepare_status_resume(seal, "old-owner-runtime", old.generation, owner)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_status_resume(seal, "new-owner-runtime", old.generation, owner)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_status_resume(seal, "old-owner-runtime", new.generation, owner)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_status_resume(seal, "new-owner-runtime", new.generation, stranger)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_status_boot(seal, None, stranger)
+            .await
+            .unwrap()
+            .is_none());
+        assert_runtime_untouched(repo, seal, &new, 11, &report).await;
+        let resumed = repo
+            .prepare_status_resume(seal, "new-owner-runtime", new.generation, owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(resumed > new.generation);
+        assert_eq!(
+            repo.boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .container_pubkey,
+            Some(pin())
+        );
+
+        repo.compare_and_swap_operator(seal, 0, grant(owner, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let (old, _) = install_test_runtime(
+            repo,
+            seal,
+            owner,
+            Some((actor, 1)),
+            12,
+            "old-operator-runtime",
+        )
+        .await;
+        let (new, report) = install_test_runtime(
+            repo,
+            seal,
+            owner,
+            Some((actor, 1)),
+            13,
+            "new-operator-runtime",
+        )
+        .await;
+        // A stale owner-direct start cannot strip delegation from a new
+        // operator-funded boot even if it guesses the current revision.
+        assert!(repo
+            .prepare_status_resume(seal, "new-operator-runtime", new.generation, owner)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_status_boot(seal, None, owner)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_operator_resume(
+                seal,
+                "old-operator-runtime",
+                old.generation,
+                owner,
+                actor,
+                1
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_operator_resume(
+                seal,
+                "new-operator-runtime",
+                old.generation,
+                owner,
+                actor,
+                1
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_operator_resume(
+                seal,
+                "new-operator-runtime",
+                new.generation,
+                owner,
+                stranger,
+                1
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_operator_resume(
+                seal,
+                "new-operator-runtime",
+                new.generation,
+                stranger,
+                actor,
+                1
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_operator_resume(
+                seal,
+                "new-operator-runtime",
+                new.generation,
+                owner,
+                actor,
+                0
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .prepare_operator_boot(seal, None, owner, stranger, 1)
+            .await
+            .unwrap()
+            .is_none());
+        assert_runtime_untouched(repo, seal, &new, 13, &report).await;
+        // A legitimate stop disables the old boot. A subsequent fenced resume
+        // still works and retains the certified key and ticket issuance time.
+        assert!(repo
+            .transition_runtime(
+                seal,
+                Some("new-operator-runtime"),
+                Some(new.generation),
+                StageStatus::Stopped {
+                    at: Utc::now(),
+                    reason: "operator_stop".into()
+                },
+                None
+            )
+            .await
+            .unwrap());
+        let stopped = repo.boot_authorization(seal).await.unwrap().unwrap();
+        assert!(!stopped.enabled);
+        let resumed = repo
+            .prepare_operator_resume(
+                seal,
+                "new-operator-runtime",
+                stopped.generation,
+                owner,
+                actor,
+                1,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let current = repo.boot_authorization(seal).await.unwrap().unwrap();
+        assert_eq!(current.generation, resumed);
+        assert!(current.enabled);
+        assert_eq!(current.container_pubkey, new.container_pubkey);
+        assert_eq!(current.ticket_issued_at, new.ticket_issued_at);
+        assert_eq!(current.operator, Some(actor));
+        assert_eq!(current.operator_version, Some(1));
+        assert!(repo
+            .prepare_operator_resume(
+                seal,
+                "new-operator-runtime",
+                stopped.generation,
+                owner,
+                actor,
+                1
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repo.boot_authorization(seal).await.unwrap().unwrap(),
+            current
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_stale_resume_cannot_mutate_replacement_boot() {
+        exercise_stale_resume(
+            &InMemoryDeploymentRepo::new(),
+            B256::repeat_byte(0x72),
+            U256::from(72),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_stale_resume_cannot_mutate_replacement_boot() {
+        let url = std::env::var("AGENTDNA_TEST_DATABASE_URL").expect("isolated DB URL");
+        let pool = connect(&url).await.unwrap();
+        let repo = PostgresDeploymentRepo::new(pool.clone());
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        let agent = U256::from_be_bytes(rand::random::<[u8; 32]>());
+        exercise_stale_resume(repo.as_ref(), seal, agent).await;
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_operator_storage_revocation_and_generation_fences() {
+        exercise_operator_storage(
+            &InMemoryDeploymentRepo::new(),
+            B256::repeat_byte(0x71),
+            U256::from(71),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_operator_storage_revocation_and_generation_fences() {
+        let url = std::env::var("AGENTDNA_TEST_DATABASE_URL").expect("isolated DB URL");
+        let pool = connect(&url).await.unwrap();
+        let repo = PostgresDeploymentRepo::new(pool.clone());
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        let agent = U256::from_be_bytes(rand::random::<[u8; 32]>());
+        exercise_operator_storage(repo.as_ref(), seal, agent).await;
         sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
             .bind(seal.as_slice())
             .execute(&pool)

@@ -267,6 +267,30 @@ ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS ticket_issued_at 
 -- sandbox created at the provider directly, even one carrying the ticket,
 -- has another key. Cleared with every new ticket.
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_container_pubkey BYTEA;
+
+-- Agent-scoped delegation keeps NFT authority separate from the wallet that
+-- owns and pays for its sandbox. Proof bytes are reverified before use.
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_operator BYTEA;
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS operator_version BIGINT;
+CREATE TABLE IF NOT EXISTS operator_grants (
+    seal_id BYTEA PRIMARY KEY REFERENCES deployments(seal_id) ON DELETE CASCADE,
+    version BIGINT NOT NULL CHECK (version > 0),
+    owner BYTEA NOT NULL CHECK (octet_length(owner) = 20),
+    signed_message_b64 TEXT NOT NULL,
+    signature BYTEA NOT NULL,
+    transfer_invalidated BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE operator_grants ADD COLUMN IF NOT EXISTS transfer_invalidated BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Revocation and the exact cleanup targets commit together. No credentials
+-- or executable queue payloads live in this outbox.
+CREATE TABLE IF NOT EXISTS operator_teardowns (
+    seal_id BYTEA NOT NULL REFERENCES deployments(seal_id) ON DELETE CASCADE,
+    sandbox_id TEXT NOT NULL CHECK (sandbox_id <> ''),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (seal_id, sandbox_id)
+);
 -- The settings document the current boot was served. A running/warning
 -- report confirms the version only when its applied digest equals this one.
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS served_settings_version BIGINT;

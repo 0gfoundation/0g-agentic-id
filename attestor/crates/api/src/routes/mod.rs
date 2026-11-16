@@ -17,6 +17,7 @@ mod deploy;
 mod deployment;
 mod deployments;
 mod lifecycle_auth;
+mod operator;
 mod preflight;
 mod probe;
 mod providers;
@@ -88,6 +89,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::put(providers::update),
         )
         .route("/deploy", post(deploy::handle))
+        .route("/operator", get(operator::handle_get).put(operator::handle_set))
         .route("/clone", post(clone::handle))
         .route(
             "/provision",

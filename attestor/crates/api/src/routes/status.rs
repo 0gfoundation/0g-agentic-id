@@ -60,14 +60,32 @@ pub async fn handle(
         ));
     }
 
-    if let (Some(agent), Some(auth)) = (
-        d.agent_id,
-        state.deployments.boot_authorization(report.seal_id).await?,
-    ) {
-        if auth.owner != Some(state.chain.owner_of(agent).await?) {
-            return Err(ApiError::forbidden(
-                "boot authorization belongs to a previous owner",
-            ));
+    if let Some(auth) = state.deployments.boot_authorization(report.seal_id).await? {
+        if let Some(agent) = d.agent_id {
+            if auth.owner != Some(state.chain.owner_of(agent).await?) {
+                return Err(ApiError::forbidden(
+                    "boot authorization belongs to a previous owner",
+                ));
+            }
+        }
+        if auth.operator.is_some() {
+            if !auth.enabled {
+                return Ok((
+                    StatusCode::OK,
+                    Json(json!({"ok": true, "ignored": "revoked boot"})),
+                ));
+            }
+            attestor_shared::auth::operator::validate_boot_operator(
+                state.chain.as_ref(),
+                state.crypto.as_ref(),
+                state.deployments.as_ref(),
+                state.cfg.chain_id,
+                state.cfg.agentic_id_addr,
+                &d,
+                &auth,
+            )
+            .await
+            .map_err(|e| ApiError::forbidden(format!("boot authorization: {e}")))?;
         }
     }
 
@@ -348,6 +366,8 @@ mod tests {
                 owner: Some(Address::ZERO),
                 sandbox_id: Some("sb-1".into()),
                 container_pubkey: None,
+                operator: None,
+                operator_version: None,
             },
         );
         repo.status_bindings

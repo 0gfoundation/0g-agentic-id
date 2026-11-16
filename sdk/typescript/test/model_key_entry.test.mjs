@@ -27,6 +27,8 @@ function agentApi({ stored = [], failSet = false, failSetOnce = false, refuse = 
   // As the real client: every check first (a refusal writes nothing), then
   // beforeWrite, then the request.
   api.attestor = {
+    isRuntimeOperator: async () => false,
+    currentSandboxId: async () => null,
     lifecycle: async (op, p) => {
       if (refuse) throw new Error('refused by a check');
       await p.beforeWrite?.();

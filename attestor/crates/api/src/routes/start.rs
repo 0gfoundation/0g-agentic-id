@@ -18,9 +18,10 @@
 //! container cannot provision, so only a `create` brings the agent back. A
 //! `start` signed for a sandbox other than the deployment's is also 409.
 
-use super::lifecycle_auth::authorize_lifecycle;
+use super::lifecycle_auth::{authorize_runtime_lifecycle, validate_operator_create};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use attestor_shared::auth::operator::LifecyclePermission;
 use attestor_shared::sandbox::{
     check_owner_env, envelope_names_sandbox, CanonicalSignedMessage, NOT_CURRENT_SANDBOX,
 };
@@ -64,11 +65,37 @@ pub async fn handle(
             .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
     }
 
-    // Real owner authorization: the envelope must be signed by the current
-    // on-chain owner (covers both the resume and recreate dispatch below).
-    // The previous `req.owner == d.owner` check trusted an unsigned,
-    // attacker-supplied field and was forgeable — see {lifecycle_auth}.
-    authorize_lifecycle(&state, &d, &req.sandbox_envelope).await?;
+    // The provider acts on resource_id while lifecycle state follows this
+    // deployment. Preserve the existing conflict response for stale routing
+    // before runtime authorization also checks the resource binding.
+    if action == "start" && !envelope_names_sandbox(&req.sandbox_envelope, d.sandbox_id.as_deref())
+    {
+        return Err(ApiError::conflict(NOT_CURRENT_SANDBOX));
+    }
+
+    // An operator signs and pays with its own sandbox wallet. Its authority
+    // comes from the live NFT owner's versioned grant, not req.owner.
+    let permission = if action == "start" {
+        LifecyclePermission::Resume
+    } else if d.sandbox_id.as_deref().map(str::is_empty).unwrap_or(true)
+        && d.provisioned_at.is_none()
+    {
+        LifecyclePermission::Provision
+    } else {
+        LifecyclePermission::Recreate
+    };
+    let principal =
+        authorize_runtime_lifecycle(&state, &d, &req.sandbox_envelope, permission).await?;
+    if action == "create" {
+        validate_operator_create(
+            &state,
+            &d,
+            &principal,
+            req.framework.as_deref(),
+            &canonical.payload,
+        )?;
+        super::preflight::check_owner_ready(&state, principal.actor).await?;
+    }
 
     // First-provision (action="create") may carry a framework, same contract
     // as /reset: validate against the supported list and persist so a legacy
@@ -109,16 +136,6 @@ pub async fn handle(
             attestor_shared::auth::status::NOT_RESUMABLE,
         ));
     }
-    // The provider starts the sandbox the owner signed for (`resource_id`),
-    // while the check above and the worker's bookkeeping follow the
-    // deployment's sandbox. A start signed for another one, such as a sandbox
-    // a reset replaced, would start a container the attestor does not track,
-    // so it is refused and the owner signs again for the current sandbox.
-    if action == "start" && !envelope_names_sandbox(&req.sandbox_envelope, d.sandbox_id.as_deref())
-    {
-        return Err(ApiError::conflict(NOT_CURRENT_SANDBOX));
-    }
-
     let payload = if action == "start" {
         JobPayload::SandboxStart {
             seal_id: req.seal_id,
@@ -379,6 +396,8 @@ mod tests {
                 owner: Some(s.owner),
                 sandbox_id: Some("sb-old".into()),
                 container_pubkey: None,
+                operator: None,
+                operator_version: None,
             },
         );
     }

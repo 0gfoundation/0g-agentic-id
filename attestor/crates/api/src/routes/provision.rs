@@ -209,6 +209,19 @@ async fn provision(
             ));
         }
     }
+    if auth.operator.is_some() {
+        attestor_shared::auth::operator::validate_boot_operator(
+            state.chain.as_ref(),
+            state.crypto.as_ref(),
+            state.deployments.as_ref(),
+            state.cfg.chain_id,
+            state.cfg.agentic_id_addr,
+            &d,
+            &auth,
+        )
+        .await
+        .map_err(|e| ApiError::forbidden(format!("boot authorization: {e}")))?;
+    }
     *authorized = Some(auth.generation);
 
     let boot = match (certificate, d.container_record.clone()) {
@@ -892,6 +905,112 @@ pub(crate) mod tests {
     }
 
     // ── v3 certificate: first boot, later boots ───────────────────────────
+
+    async fn write_runtime_operator(
+        state: &AppState,
+        seal: B256,
+        owner: &PrivateKeySigner,
+        operator: Option<Address>,
+        base_version: i64,
+    ) {
+        use base64::Engine;
+        let canonical = serde_json::json!({
+            "domain": "AgenticID.Operator.v1",
+            "chain_id": state.cfg.chain_id,
+            "contract": state.cfg.agentic_id_addr,
+            "seal_id": seal,
+            "owner": owner.address(),
+            "operator": operator,
+            "base_version": base_version,
+            "allow_recreate": false,
+            "expires_at": 0,
+            "issued_at": Utc::now().timestamp(),
+        });
+        let bytes = serde_json::to_vec(&canonical).unwrap();
+        let signature = owner
+            .sign_hash_sync(&B256::from(attestor_shared::sandbox::eip191_digest(&bytes)))
+            .unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "seal_id": seal,
+            "signed_message_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            "signature": format!("0x{}", hex::encode(signature.as_bytes())),
+        }))
+        .unwrap();
+        super::super::operator::handle_set(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+    }
+
+    async fn operator_setup() -> (
+        AppState,
+        Arc<InMemoryDeploymentRepo>,
+        B256,
+        PrivateKeySigner,
+        Address,
+    ) {
+        let (mut state, repo, seal) = setup(None).await;
+        let owner = PrivateKeySigner::random();
+        let operator = PrivateKeySigner::random().address();
+        let chain = Arc::new(MockChain::new());
+        chain.set_owner_of(owner.address());
+        state.chain = chain;
+        let mut d = repo.get(seal).await.unwrap().unwrap();
+        d.owner = owner.address();
+        d.agent_id = Some(alloy::primitives::U256::from(7));
+        d.framework = Some("openclaw".into());
+        repo.seed(d);
+        write_runtime_operator(&state, seal, &owner, Some(operator), 0).await;
+        let generation = repo
+            .prepare_operator_boot(seal, Some(binding_hash(&ticket())), owner.address(), operator, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(repo
+            .bind_runtime_sandbox(seal, "operator-runtime".into(), generation, Some(pubkey(CONTAINER_PRIV)))
+            .await
+            .unwrap());
+        repo.set_container_stage(seal, StageStatus::Submitted { tx_hash: None, at: Utc::now() })
+            .await
+            .unwrap();
+        (state, repo, seal, owner, operator)
+    }
+
+    #[tokio::test]
+    async fn delegated_v3_provision_keeps_nft_owner_and_container_proof() {
+        let (state, repo, seal, owner, operator) = operator_setup().await;
+        let auth = repo.boot_authorization(seal).await.unwrap().unwrap();
+        assert_eq!(auth.owner, Some(owner.address()));
+        assert_eq!(auth.operator, Some(operator));
+        assert_ne!(auth.owner, auth.operator);
+        let response = call(&state, first(&repo, seal).await).await.unwrap();
+        assert_eq!(
+            decrypt(&state, &response.encrypted_agent_seal_priv, CONTAINER_PRIV),
+            state.crypto.derive_agent_seal(seal).await.unwrap().priv_key,
+        );
+        assert!(repo.get(seal).await.unwrap().unwrap().container_record.is_some());
+    }
+
+    #[tokio::test]
+    async fn revoked_operator_cannot_renew_v3_provisioning() {
+        let (state, repo, seal, owner, _) = operator_setup().await;
+        call(&state, first(&repo, seal).await).await.unwrap();
+        let old_request = later(&repo, seal).await;
+        write_runtime_operator(&state, seal, &owner, None, 1).await;
+        assert_eq!(call(&state, old_request).await.unwrap_err().status, StatusCode::FORBIDDEN);
+        assert!(repo.get(seal).await.unwrap().unwrap().sandbox_id.is_none());
+        assert!(!repo.boot_authorization(seal).await.unwrap().unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn operator_ticket_cannot_provision_a_different_v3_certified_container() {
+        let (state, repo, seal, _, _) = operator_setup().await;
+        let other_private = [0x59; 32]; // privacy-check: allow
+        let other = request(&repo, seal, other_private, Some(certificate(seal, other_private))).await;
+        let error = call(&state, other).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(error.message.contains("not for the sandbox this attestor created"));
+        assert!(repo.get(seal).await.unwrap().unwrap().container_record.is_none());
+    }
 
     #[tokio::test]
     async fn first_boot_records_the_certificate_and_later_boots_need_none() {

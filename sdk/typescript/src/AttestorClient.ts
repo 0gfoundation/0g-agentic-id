@@ -13,6 +13,7 @@ import { getAddress, hexToBytes, isAddress, keccak256 } from 'viem';
 import { requireWallet, type Ctx, type AttestorPublicConfig } from './context';
 import { listInferenceProviders, ProviderRegistryClient, routeHash, registrySigningMessage, acceptedRegistryDigest, validateProvider, type InferenceProvider, type ProviderRegistrySnapshot } from './Providers';
 import { SDK_VERSION } from './constants';
+import { OPERATOR_DOMAIN, OperatorConflictError, assertOperatorComputeOptions, type OperatorOptions, type OperatorState, type RuntimeBinding } from './Operators';
 import { agenticIDAbi, cloneGateAbi, tappRegistryAbi } from './abi';
 import {
   canonicalSettings, modelAdvisory, settingsAuthMessage, SettingsConflictError, sha256Hex,
@@ -448,6 +449,7 @@ export class AttestorClient {
     resourceId: string,
     payload: Record<string, unknown>,
     ttlSec: number,
+    agenticBinding?: RuntimeBinding,
   ) {
     const { walletClient, account } = requireWallet(this.ctx);
     // Provider binding (0g-sandbox#93, anti cross-provider replay): inserted
@@ -456,6 +458,7 @@ export class AttestorClient {
     const provider = await this.resolveProviderAddr();
     const canonical = JSON.stringify({
       action,
+      ...(agenticBinding ? { agentic_id: agenticBinding } : {}),
       expires_at: Math.floor(Date.now() / 1000) + ttlSec,
       nonce: randHex(16),
       payload,
@@ -468,6 +471,119 @@ export class AttestorClient {
       signed_message_b64: b64encode(canonical),
       wallet_signature: signature,
     };
+  }
+
+  /** Public summary; the attestor resolves the current NFT owner live. */
+  async getOperator(sealId: `0x${string}`): Promise<OperatorState> {
+    const res = await fetch(`${this.baseUrl()}/operator?seal_id=${encodeURIComponent(sealId)}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      const error = new Error(`/operator failed: HTTP ${res.status} ${await res.text().catch(() => '')}`);
+      Object.assign(error, { status: res.status });
+      throw error;
+    }
+    const body = await res.json() as {
+      owner: Address; operator: Address | null; version: number; allow_recreate: boolean;
+      expires_at: number;
+    };
+    if (!isAddress(body.owner) || (body.operator !== null && !isAddress(body.operator)) ||
+        !Number.isSafeInteger(body.version) || body.version < 0 ||
+        !Number.isSafeInteger(body.expires_at) || body.expires_at < 0 ||
+        typeof body.allow_recreate !== 'boolean') {
+      throw new Error('/operator returned an invalid authorization summary');
+    }
+    return {
+      sealId, owner: getAddress(body.owner), operator: body.operator === null ? null : getAddress(body.operator),
+      version: body.version, allowRecreate: body.allow_recreate, expiresAt: body.expires_at,
+    };
+  }
+
+  /** Owner-only. A successful grant update retires the current runtime; provision again with its controller wallet. */
+  async setOperator(sealId: `0x${string}`, operator: Address, opts: OperatorOptions = {}): Promise<OperatorState> {
+    if (!isAddress(operator) || /^0x0{40}$/i.test(operator)) throw new Error('setOperator: operator must be a nonzero wallet address');
+    return this.writeOperator(sealId, getAddress(operator), opts);
+  }
+
+  /** Owner-only. Revokes future operations and retires the current runtime. */
+  async revokeOperator(sealId: `0x${string}`, opts: { baseVersion?: number } = {}): Promise<OperatorState> {
+    return this.writeOperator(sealId, null, opts);
+  }
+
+  private async writeOperator(sealId: `0x${string}`, operator: Address | null, opts: OperatorOptions): Promise<OperatorState> {
+    const { account, walletClient } = requireWallet(this.ctx);
+    const current = await this.getOperator(sealId);
+    if (getAddress(account.address) !== current.owner) throw new Error('operator authorization requires the current NFT owner');
+    const base = opts.baseVersion ?? current.version;
+    const expiry = operator === null ? 0 : opts.expiresAt ?? 0;
+    if (!Number.isSafeInteger(base) || base < 0) throw new Error('operator baseVersion must be a nonnegative safe integer');
+    if (!Number.isSafeInteger(expiry) || expiry < 0 || (expiry !== 0 && expiry <= Math.floor(Date.now() / 1000))) {
+      throw new Error('operator expiresAt must be 0 or a future Unix timestamp');
+    }
+    if (opts.allowRecreate !== undefined && typeof opts.allowRecreate !== 'boolean') {
+      throw new Error('operator allowRecreate must be a boolean');
+    }
+    const contract = this.ctx.addresses?.agenticID;
+    const chainId = this.ctx.chain?.id;
+    if (!contract || !isAddress(contract) || !Number.isSafeInteger(chainId) || chainId <= 0) {
+      throw new Error('operator authorization requires an AgenticID contract and chain');
+    }
+    const canonical = JSON.stringify({
+      domain: OPERATOR_DOMAIN, chain_id: chainId, contract, seal_id: sealId,
+      owner: account.address, base_version: base, operator,
+      allow_recreate: operator === null ? false : opts.allowRecreate ?? false,
+      expires_at: expiry, issued_at: Math.floor(Date.now() / 1000),
+    });
+    const signature = await walletClient.signMessage({ account, message: canonical });
+    const res = await fetch(`${this.baseUrl()}/operator`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ seal_id: sealId, signed_message_b64: b64encode(canonical), signature }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      if (res.status === 409) throw new OperatorConflictError(sealId, base, text);
+      throw new Error(`/operator failed: HTTP ${res.status} ${text}`);
+    }
+    // Re-read the effective grant and runtime routing after the write.
+    return this.getOperator(sealId);
+  }
+
+  private async runtimeAuthority(sealId: `0x${string}`): Promise<{ owner: Address; binding?: RuntimeBinding }> {
+    const { account } = requireWallet(this.ctx);
+    let state: OperatorState;
+    try {
+      state = await this.getOperator(sealId);
+    } catch (e) {
+      // Older attestors have no operator route and remain owner-only. Other
+      // failures must not produce an unbound operator envelope.
+      if ((e as { status?: number }).status === 404) return { owner: account.address };
+      throw e;
+    }
+    if (state.owner === getAddress(account.address)) return { owner: state.owner };
+    if (state.operator !== getAddress(account.address) || (state.expiresAt !== 0 && state.expiresAt <= Math.floor(Date.now() / 1000))) {
+      throw new Error('connected wallet is neither the current NFT owner nor its active operator');
+    }
+    const contract = this.ctx.addresses?.agenticID;
+    const chainId = this.ctx.chain?.id;
+    if (!contract || !isAddress(contract) || !Number.isSafeInteger(chainId) || chainId <= 0) {
+      throw new Error('operator lifecycle requires an AgenticID contract and chain');
+    }
+    return { owner: state.owner, binding: {
+      chain_id: chainId, contract, seal_id: sealId, operator_version: state.version,
+    } };
+  }
+
+  /** Whether the connected wallet is this agent's effective, paying operator. */
+  async isRuntimeOperator(sealId: `0x${string}`): Promise<boolean> {
+    return !!(await this.runtimeAuthority(sealId)).binding;
+  }
+
+  /** Public deployment routing, for callers that only retain the agent's seal. */
+  async currentSandboxId(sealId: `0x${string}`): Promise<string | null> {
+    const res = await fetch(`${this.baseUrl()}/deployment/${sealId}`, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) throw new Error(`/deployment/${sealId} failed: HTTP ${res.status}`);
+    const row = await res.json() as { sandbox_id?: string | null };
+    return row.sandbox_id || null;
   }
 
   /**
@@ -1031,7 +1147,9 @@ export class AttestorClient {
       envelopeTtlSec?: number;
     },
   ): Promise<void> {
-    const { account } = requireWallet(this.ctx);
+    const authority = await this.runtimeAuthority(params.sealId);
+    const operator = !!authority.binding;
+    if (operator) assertOperatorComputeOptions(params);
     const ttl = params.envelopeTtlSec ?? 180;
     // `reset`, OR a first-time `start` of a never-provisioned (mint-only)
     // agent: both spin a FRESH container via the `create` envelope. A `start`
@@ -1039,7 +1157,7 @@ export class AttestorClient {
     const create = op === 'reset' || (op === 'start' && !params.sandboxId);
     if (!create && !params.sandboxId) throw new Error(`${op}: sandboxId is required`);
     const requestKey = carriesRequestKey(params);
-    if (create && params.provider && params.provider !== '0g-compute' && !requestKey && !params.keyInCredentials) {
+    if (create && !operator && params.provider && params.provider !== '0g-compute' && !requestKey && !params.keyInCredentials) {
       throw new SecretEnvRefusedError('invalid_input', `reset/start for ${params.provider} requires its API key`);
     }
     // Every boot a start or reset brings about is served the agent's settings
@@ -1055,7 +1173,7 @@ export class AttestorClient {
           ? "pick the sealed image and check the agent's settings"
           : "check the agent's settings",
       );
-      seed = this.defaultSettingsFor(row);
+      seed = operator ? null : this.defaultSettingsFor(row);
       if (seed && params.provider && params.provider !== seed.provider) {
         throw new Error(
           `${op}: agent ${params.sealId} has no settings document and could boot with no model; ` +
@@ -1089,14 +1207,14 @@ export class AttestorClient {
           : {}),
       };
     }
-    await params.beforeWrite?.();
+    if (!operator) await params.beforeWrite?.();
     if (seed) {
       await storeDefaultSettings(
         { setSettings: (sealId, settings, opts) => this.setSettings({ sealId, settings, baseVersion: opts.baseVersion }) },
         params.sealId,
       );
     }
-    const envelope = await this.signEnvelope(action, resourceId, payload, ttl);
+    const envelope = await this.signEnvelope(action, resourceId, payload, ttl, authority.binding);
     // A no-sandboxId `start` still POSTs /start; the attestor dispatches on the
     // envelope action (create → fresh provision, start → resume).
     const path = op === 'reset' ? '/reset' : `/${op}`;
@@ -1106,7 +1224,7 @@ export class AttestorClient {
       // `framework` rides along so the attestor can keep the row's recorded
       // framework in sync when a reset switches harness (review #154 F1) —
       // optional; old attestors ignore unknown fields.
-      body: JSON.stringify({ seal_id: params.sealId, owner: account.address, sandbox_envelope: envelope, ...(params.framework ? { framework: params.framework } : {}) }),
+      body: JSON.stringify({ seal_id: params.sealId, owner: authority.owner, sandbox_envelope: envelope, ...(params.framework ? { framework: params.framework } : {}) }),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');

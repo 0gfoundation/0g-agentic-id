@@ -210,7 +210,8 @@ impl Watcher {
                 .deployments
                 .boot_authorization(d.seal_id)
                 .await?
-                .is_some_and(|a| a.enabled && a.owner.is_some()),
+                .is_some_and(|a| a.enabled && a.owner.is_some())
+                || self.deployments.operator_grant(d.seal_id).await?.is_some(),
             None => false,
         };
         let live_owner = if managed {
@@ -223,6 +224,11 @@ impl Watcher {
             ev.to
         };
         self.deployments.set_owner(ev.tokenId, live_owner).await?;
+        // Revoke by the outgoing owner even when ownership has already
+        // returned to that address before the indexer observes the event.
+        self.deployments
+            .invalidate_operator_for_transfer(ev.tokenId, ev.from)
+            .await?;
         // A new ownership: credential sets are signed per epoch, so the
         // previous owner's set can never be served again, and it is dropped.
         if let Some(d) = self.deployments.get_by_agent_id(ev.tokenId).await? {
@@ -884,6 +890,45 @@ mod tests {
             ProviderBuilder::new().on_http(format!("http://{}", address).parse().unwrap()),
             task,
         )
+    }
+
+    #[tokio::test]
+    async fn late_transfer_preserves_current_owner_operator_grant_without_a_boot() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let events = Arc::new(InMemoryEventBus::new());
+        let jobs = Arc::new(InMemoryJobQueue::new());
+        let seal = B256::repeat_byte(0xaa);
+        let agent = U256::from(7);
+        let seller = Address::repeat_byte(0x11);
+        let intermediate_buyer = Address::repeat_byte(0x22);
+        let current_owner = Address::repeat_byte(0x99);
+        seed_bound(&deployments, seal, agent, seller);
+        // The latest buyer has delegated before the indexer catches up, but
+        // has not provisioned a runtime yet. Grant history still requires a
+        // live owner lookup instead of trusting this older Transfer event.
+        deployments.compare_and_swap_operator(seal, 0,
+            attestor_shared::auth::operator::OperatorGrant {
+                version: 1,
+                owner: current_owner,
+                signed_message_b64: String::new(),
+                signature: Bytes::new(),
+            },
+        ).await.unwrap().unwrap();
+        assert!(deployments.boot_authorization(seal).await.unwrap().is_none());
+        let mut w = test_watcher(deployments.clone(), events, jobs.clone());
+        let (provider, rpc) = serve_owner(current_owner).await;
+        w.provider = provider;
+        w.on_transfer(AgenticID::Transfer {
+            from: seller,
+            to: intermediate_buyer,
+            tokenId: agent,
+        }, 100).await.unwrap();
+        rpc.await.unwrap();
+        assert_eq!(deployments.get(seal).await.unwrap().unwrap().owner, current_owner);
+        let grant = deployments.operator_grant(seal).await.unwrap().unwrap();
+        assert_eq!(grant.owner, current_owner);
+        assert_eq!(grant.version, 1, "a later owner's grant must remain effective");
+        assert!(jobs.submitted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

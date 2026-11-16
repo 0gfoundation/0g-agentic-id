@@ -248,6 +248,107 @@ pub trait SandboxClient: Send + Sync {
 // ── Deployment repository ───────────────────────────────────────────────
 #[async_trait]
 pub trait DeploymentRepo: Send + Sync {
+    // Owner-signed runtime delegation and generation-fenced compute control.
+    async fn operator_grant(
+        &self,
+        _seal_id: SealId,
+    ) -> anyhow::Result<Option<crate::auth::operator::OperatorGrant>> {
+        Ok(None)
+    }
+
+    async fn invalidate_operator_for_transfer(
+        &self,
+        _agent_id: AgentId,
+        _previous_owner: Address,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn compare_and_swap_operator(
+        &self,
+        _seal_id: SealId,
+        _base_version: i64,
+        _grant: crate::auth::operator::OperatorGrant,
+    ) -> anyhow::Result<Option<crate::auth::operator::OperatorUpdate>> {
+        anyhow::bail!("operator delegation storage is not implemented")
+    }
+
+    async fn pending_operator_teardowns(&self) -> anyhow::Result<Vec<(SealId, String)>> {
+        Ok(Vec::new())
+    }
+
+    async fn complete_operator_teardown(
+        &self,
+        _seal_id: SealId,
+        _sandbox_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("operator teardown storage is not implemented")
+    }
+
+    async fn enqueue_operator_teardown(
+        &self,
+        _seal_id: SealId,
+        _sandbox_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("operator teardown storage is not implemented")
+    }
+
+    async fn prepare_operator_boot(
+        &self,
+        _seal_id: SealId,
+        _ticket: Option<[u8; 32]>,
+        _owner: Address,
+        _operator: Address,
+        _operator_version: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        anyhow::bail!("operator boot authorization is not implemented")
+    }
+
+    /// Resume only the exact sandbox and boot revision inspected by the caller.
+    /// A replacement or role change must leave its complete boot state intact.
+    async fn prepare_status_resume(
+        &self,
+        _seal_id: SealId,
+        _expected_sandbox: &str,
+        _expected_generation: i64,
+        _owner: Address,
+    ) -> anyhow::Result<Option<i64>> {
+        anyhow::bail!("owner resume fencing is not implemented")
+    }
+
+    async fn prepare_operator_resume(
+        &self,
+        _seal_id: SealId,
+        _expected_sandbox: &str,
+        _expected_generation: i64,
+        _owner: Address,
+        _operator: Address,
+        _operator_version: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        anyhow::bail!("operator resume fencing is not implemented")
+    }
+
+    async fn bind_runtime_sandbox(
+        &self,
+        _seal_id: SealId,
+        _sandbox_id: String,
+        _generation: i64,
+        _pin: Option<Vec<u8>>,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("runtime sandbox generation binding is not implemented")
+    }
+
+    async fn transition_runtime(
+        &self,
+        _seal_id: SealId,
+        _expected_sandbox: Option<&str>,
+        _expected_generation: Option<i64>,
+        _stage: StageStatus,
+        _deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("runtime transition generation fencing is not implemented")
+    }
+
     async fn insert(&self, deployment: &Deployment) -> anyhow::Result<()>;
     async fn get(&self, seal_id: SealId) -> anyhow::Result<Option<Deployment>>;
     async fn get_by_agent_id(&self, agent_id: AgentId) -> anyhow::Result<Option<Deployment>>;

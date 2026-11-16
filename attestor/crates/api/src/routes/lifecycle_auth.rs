@@ -22,6 +22,7 @@
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use attestor_shared::auth::operator::{LifecyclePermission, RuntimePrincipal};
 use attestor_shared::sandbox::verify_envelope;
 use attestor_shared::{Deployment, SandboxEnvelope};
 
@@ -53,6 +54,78 @@ pub(super) async fn authorize_lifecycle(
     if envelope.wallet_address != owner {
         return Err(ApiError::unauthorized(
             "envelope signer is not the current owner",
+        ));
+    }
+    Ok(())
+}
+
+/// Runtime control may be delegated, whereas asset/settings mutations and
+/// deployment recovery keep their owner-only authorization above.
+pub(super) async fn authorize_runtime_lifecycle(
+    state: &AppState,
+    d: &Deployment,
+    envelope: &SandboxEnvelope,
+    permission: LifecyclePermission,
+) -> ApiResult<RuntimePrincipal> {
+    attestor_shared::auth::operator::authorize_runtime(
+        state.chain.as_ref(),
+        state.crypto.as_ref(),
+        state.deployments.as_ref(),
+        state.cfg.chain_id,
+        state.cfg.agentic_id_addr,
+        d,
+        envelope,
+        permission,
+    )
+    .await
+    .map_err(|e| ApiError::unauthorized(format!("runtime authorization: {e}")))
+}
+
+/// Delegating compute management does not let an operator change the agent's
+/// framework or select a different runtime image. The worker repeats this
+/// validation against its configuration immediately before creating compute.
+pub(super) fn validate_operator_create(
+    state: &AppState,
+    deployment: &Deployment,
+    principal: &RuntimePrincipal,
+    framework: Option<&str>,
+    payload: &serde_json::Value,
+) -> ApiResult<()> {
+    if principal.actor == principal.owner {
+        return Ok(());
+    }
+    if framework.is_some_and(|fw| deployment.framework.as_deref() != Some(fw)) {
+        return Err(ApiError::forbidden(
+            "an operator cannot change the agent's framework",
+        ));
+    }
+    attestor_shared::auth::operator::validate_operator_payload(payload)
+        .map_err(|e| ApiError::forbidden(format!("operator provisioning: {e}")))?;
+    let framework = deployment.framework.as_deref().ok_or_else(|| {
+        ApiError::forbidden("operator provisioning requires the agent's recorded framework")
+    })?;
+    let entry = state
+        .cfg
+        .frameworks
+        .iter()
+        .find(|entry| entry.name == framework)
+        .ok_or_else(|| {
+            ApiError::forbidden("operator provisioning requires a supported agent framework")
+        })?;
+    let snapshot = entry
+        .image
+        .as_deref()
+        .unwrap_or(&state.cfg.sandbox_snapshot);
+    let object = payload
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("operator create payload must be an object"))?;
+    if object.get("snapshot").and_then(|value| value.as_str()) != Some(snapshot)
+        || object
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("image") || key.eq_ignore_ascii_case("volumes"))
+    {
+        return Err(ApiError::forbidden(
+            "operator provisioning must use the agent's configured sealed snapshot without image overrides or volumes",
         ));
     }
     Ok(())
