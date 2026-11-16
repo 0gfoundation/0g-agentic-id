@@ -332,25 +332,29 @@ func AgentCommand(ctx context.Context, name string, args ...string) (*exec.Cmd, 
 	return cmd, nil
 }
 
+// BelowAgentHome reports whether dir, an absolute and clean path, is the
+// agent's home or lies below it.
+func BelowAgentHome(dir string) bool {
+	home := AgentHome()
+	return filepath.IsAbs(dir) && filepath.Clean(dir) == dir && (dir == home || strings.HasPrefix(dir, home+"/"))
+}
+
 // AgentBackground is AgentCommand for a long-running process sealed keeps for
 // the agent (a backend it registered with a start command): it starts in dir,
 // which must lie below the agent's home (the home when empty), gets env on
 // top of AgentCommand's PATH and HOME, and runs in a process group of its
-// own, which cancelling ctx kills whole. The working directory is entered by
-// the child after it has become the agent user, so dir is resolved with the
-// agent's rights, never root's. Without the split a dir is refused.
+// own, which cancelling ctx kills whole. With the split the child enters the
+// working directory after it has become the agent user, so dir is resolved
+// with the agent's rights, never root's; without it the child, like the
+// agent, runs as sealed.
 func AgentBackground(ctx context.Context, dir string, env []string, name string, args ...string) (*exec.Cmd, error) {
 	cmd, err := AgentCommand(ctx, name, args...)
 	if err != nil {
 		return nil, err
 	}
 	if dir != "" {
-		home := AgentHome()
-		if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir || (dir != home && !strings.HasPrefix(dir, home+"/")) {
+		if !BelowAgentHome(dir) {
 			return nil, fmt.Errorf("directory %s is not below the agent's home", dir)
-		}
-		if cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential == nil {
-			return nil, fmt.Errorf("directory %s: no agent account to run as", dir)
 		}
 		cmd.Dir = dir
 	}

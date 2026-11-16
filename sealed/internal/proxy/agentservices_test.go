@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,7 +22,8 @@ import (
 
 func TestValidateStart(t *testing.T) {
 	home := privsep.AgentHome()
-	ok := []*ServiceStart{nil, {Command: "python3", Args: []string{"server.py"}}, {Command: "node", Dir: home}, {Command: "node", Dir: home + "/site"}}
+	ok := []*ServiceStart{nil, {Command: "sh", Args: []string{"server.sh"}}, {Command: "sh", Dir: home}, {Command: "sh", Dir: home + "/site"},
+		{Command: home + "/bin/serve"}}
 	for _, s := range ok {
 		if err := validateStart(s); err != nil {
 			t.Errorf("%+v refused: %v", s, err)
@@ -30,12 +33,16 @@ func TestValidateStart(t *testing.T) {
 		{Command: ""},
 		{Command: "a\x00b"},
 		{Command: strings.Repeat("a", maxStartCommand+1)},
-		{Command: "node", Args: make([]string, maxStartArgs+1)},
-		{Command: "node", Args: []string{"a\x00"}},
-		{Command: "node", Dir: "site"},
-		{Command: "node", Dir: "/etc"},
-		{Command: "node", Dir: home + "/../etc"},
-		{Command: "node", Dir: home + "x"},
+		{Command: "sh", Args: make([]string, maxStartArgs+1)},
+		{Command: "sh", Args: []string{"a\x00"}},
+		{Command: "sh", Dir: "site"},
+		{Command: "sh", Dir: "/etc"},
+		{Command: "sh", Dir: home + "/../etc"},
+		{Command: "sh", Dir: home + "x"},
+		{Command: "bin/serve"},                  // relative: nothing sealed could resolve
+		{Command: "./serve"},                    // likewise
+		{Command: home + "/bin/../serve"},       // not clean
+		{Command: "no-such-command-sealed-xyz"}, // not a system command
 	}
 	for _, s := range bad {
 		if err := validateStart(s); err == nil {
@@ -55,6 +62,26 @@ func register(t *testing.T, s *Server, entries []ServiceEntry) map[string]any {
 	var got map[string]any
 	_ = json.Unmarshal(out.Body.Bytes(), &got)
 	return got
+}
+
+func TestOneStartCommandPerBackend(t *testing.T) {
+	a := &ServiceStart{Command: "sh", Args: []string{"a.sh"}}
+	b := &ServiceStart{Command: "sh", Args: []string{"b.sh"}}
+	two := []ServiceEntry{
+		{Path: "/api/a", Method: "GET", Backend: "http://127.0.0.1:8090", Start: a},
+		{Path: "/api/b", Method: "GET", Backend: "http://localhost:8090", Start: b},
+	}
+	if _, err := validateServices(two, fieldLimits{}); err == nil {
+		t.Fatal("two start commands for one backend accepted")
+	}
+	two[1].Start = a
+	if _, err := validateServices(two, fieldLimits{}); err != nil {
+		t.Fatalf("one start command named twice refused: %v", err)
+	}
+	two[1].Start = nil
+	if _, err := validateServices(two, fieldLimits{}); err != nil {
+		t.Fatalf("an entry without a start command on a started backend refused: %v", err)
+	}
 }
 
 func TestAgentInterfacesKeptAcrossRestart(t *testing.T) {
@@ -83,6 +110,25 @@ func TestAgentInterfacesKeptAcrossRestart(t *testing.T) {
 	}
 	if _, err := os.Stat(state); !os.IsNotExist(err) {
 		t.Fatalf("file of another binding kept: %v", err)
+	}
+	// A saved entry that no longer passes registration is dropped on its own.
+	bad, _ := json.Marshal(agentServiceFile{V: 1, Binding: rt.Binding, Services: []ServiceEntry{
+		{Path: "/api/report", Method: "GET", Backend: "http://127.0.0.1:8090"},
+		{Path: "/hello/x", Method: "GET", Backend: "http://127.0.0.1:8091"},
+	}})
+	if err := os.WriteFile(state, bad, 0600); err != nil {
+		t.Fatal(err)
+	}
+	partly := &Server{}
+	partly.RestoreAgentServices(rt)
+	if _, ok := partly.matchService("/api/report"); !ok {
+		t.Fatal("a valid entry dropped with an invalid one")
+	}
+	if got := partly.getServices(); len(got) != 1 {
+		t.Fatalf("restored %d entries, want 1", len(got))
+	}
+	if b, _ := os.ReadFile(state); strings.Contains(string(b), "/hello/x") {
+		t.Fatal("the dropped entry is still saved")
 	}
 	// Before RestoreAgentServices a registration is not written anywhere.
 	unbound := &Server{}
@@ -124,44 +170,115 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// TestHelperBackend is the backend sealed starts in
-// TestBackendStartedAndRestarted: it answers one request, then exits.
+// TestHelperBackend is the backend sealed starts in the tests below, on the
+// port SEALED_HELPER_BACKEND names. SEALED_HELPER_MODE: "" answers one
+// request, then exits; "serve" serves until killed; "fail" writes an error and
+// exits 3; "fork" starts a "serve" child, which stays in the process group
+// sealed made for the start command, waits until it answers, and exits.
 func TestHelperBackend(t *testing.T) {
 	port := os.Getenv("SEALED_HELPER_BACKEND")
 	if port == "" {
 		return
 	}
+	switch os.Getenv("SEALED_HELPER_MODE") {
+	case "fail":
+		fmt.Fprintln(os.Stderr, "boom: no module named server")
+		os.Exit(3)
+	case "fork":
+		child := exec.Command(os.Args[0], "-test.run=^TestHelperBackend$")
+		child.Env = append(os.Environ(), "SEALED_HELPER_MODE=serve")
+		child.Stdout, child.Stderr = os.Stdout, os.Stderr
+		if err := child.Start(); err != nil {
+			os.Exit(4)
+		}
+		for i := 0; i < 200 && !backendAnswers("127.0.0.1:"+port); i++ {
+			time.Sleep(25 * time.Millisecond)
+		}
+		os.Exit(0)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
 	if err != nil {
 		os.Exit(3)
 	}
+	fmt.Println("listening on", port)
 	served := make(chan struct{})
+	var once sync.Once
 	go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "pid %d", os.Getpid())
-		close(served)
+		once.Do(func() { close(served) })
 	}))
+	if os.Getenv("SEALED_HELPER_MODE") == "serve" {
+		select {}
+	}
 	<-served
 	time.Sleep(100 * time.Millisecond)
 	os.Exit(0)
 }
 
-func TestBackendStartedAndRestarted(t *testing.T) {
+// fastSupervision makes the supervisors check and restart within a test.
+func fastSupervision(t *testing.T) {
+	saved := [3]time.Duration{backendCheckEvery, backendFirstDelay, backendMaxDelay}
+	backendCheckEvery, backendFirstDelay, backendMaxDelay = 50*time.Millisecond, 50*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { backendCheckEvery, backendFirstDelay, backendMaxDelay = saved[0], saved[1], saved[2] })
+}
+
+// helperServer is a server whose start commands run TestHelperBackend in mode
+// on port; stateFile empty puts the state in a temporary directory.
+func helperServer(t *testing.T, port int, mode, stateFile string) (*Server, *ServiceStart) {
+	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Skip("no test executable path")
 	}
-	saved := [3]time.Duration{backendCheckEvery, backendFirstDelay, backendMaxDelay}
-	backendCheckEvery, backendFirstDelay, backendMaxDelay = 50*time.Millisecond, 50*time.Millisecond, 200*time.Millisecond
-	t.Cleanup(func() { backendCheckEvery, backendFirstDelay, backendMaxDelay = saved[0], saved[1], saved[2] })
+	// With the agent account the start command runs as the agent, who cannot
+	// enter go test's build directory: run a copy it can.
+	b, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp("", "sealed-helper-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	exe = filepath.Join(dir, "helper.test")
+	if err := os.WriteFile(exe, b, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if stateFile == "" {
+		stateFile = filepath.Join(t.TempDir(), "s.json")
+	}
+	s := &Server{}
+	s.RestoreAgentServices(AgentServiceRuntime{StateFile: stateFile, Binding: "b",
+		Env: []string{"SEALED_HELPER_BACKEND=" + strconv.Itoa(port), "SEALED_HELPER_MODE=" + mode}})
+	t.Cleanup(s.StopAgentServices)
+	return s, &ServiceStart{Command: exe, Args: []string{"-test.run=^TestHelperBackend$"}}
+}
 
+func listServices(t *testing.T, s *Server) (out struct {
+	Services []ServiceEntry  `json:"services"`
+	Backends []BackendStatus `json:"backends"`
+}) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.handleServices(rec, httptest.NewRequest("GET", "/services", nil))
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("GET /services: %v %s", err, rec.Body.String())
+	}
+	return out
+}
+
+func TestBackendStartedAndRestarted(t *testing.T) {
+	fastSupervision(t)
 	port := freePort(t)
 	url := "http://127.0.0.1:" + strconv.Itoa(port) + "/api/x"
-	s := &Server{}
-	s.RestoreAgentServices(AgentServiceRuntime{StateFile: filepath.Join(t.TempDir(), "s.json"), Binding: "b", Env: []string{"SEALED_HELPER_BACKEND=" + strconv.Itoa(port)}})
-	t.Cleanup(s.StopAgentServices)
-	register(t, s, []ServiceEntry{{Path: "/api/x", Method: "GET", Backend: "http://127.0.0.1:" + strconv.Itoa(port),
-		Start: &ServiceStart{Command: exe, Args: []string{"-test.run=^TestHelperBackend$"}}}})
+	s, start := helperServer(t, port, "", "")
+	register(t, s, []ServiceEntry{{Path: "/api/x", Method: "GET", Backend: "http://127.0.0.1:" + strconv.Itoa(port), Start: start}})
 
+	var err error
 	var first string
 	waitFor(t, "the started backend", func() bool { first, err = get(url); return err == nil })
 	// That backend exits after one answer; sealed starts it again.
@@ -177,6 +294,58 @@ func TestBackendStartedAndRestarted(t *testing.T) {
 	if _, err := get(url); err == nil {
 		t.Fatal("backend still answers after its interface was removed")
 	}
+}
+
+func TestOneBackendForPathsSharingIt(t *testing.T) {
+	fastSupervision(t)
+	port := freePort(t)
+	backend := "http://127.0.0.1:" + strconv.Itoa(port)
+	s, start := helperServer(t, port, "serve", "")
+	register(t, s, []ServiceEntry{
+		{Path: "/api/a", Method: "GET", Backend: backend, Start: start},
+		{Path: "/api/b", Method: "GET", Backend: "http://localhost:" + strconv.Itoa(port), Start: start},
+	})
+	waitFor(t, "the backend", func() bool { _, err := get(backend + "/api/a"); return err == nil })
+	got := listServices(t, s).Backends
+	if len(s.keeper.sups) != 1 || len(got) != 1 || len(got[0].Paths) != 2 || got[0].Starts != 1 || got[0].State != backendRunning {
+		t.Fatalf("one backend, two paths, one start expected: %+v", got)
+	}
+}
+
+func TestBackendOutputAndExitShown(t *testing.T) {
+	fastSupervision(t)
+	port := freePort(t)
+	s, start := helperServer(t, port, "fail", "")
+	register(t, s, []ServiceEntry{{Path: "/api/x", Method: "GET", Backend: "http://127.0.0.1:" + strconv.Itoa(port), Start: start}})
+	waitFor(t, "the failure shown", func() bool {
+		b := listServices(t, s).Backends
+		return len(b) == 1 && b[0].LastExit == "exit status 3" && strings.Contains(b[0].Output, "boom: no module named server")
+	})
+}
+
+func TestBackendKeptWhenTheListCannotBeWritten(t *testing.T) {
+	fastSupervision(t)
+	port := freePort(t)
+	backend := "http://127.0.0.1:" + strconv.Itoa(port)
+	s, start := helperServer(t, port, "serve", filepath.Join(t.TempDir(), "missing", "s.json"))
+	if got := register(t, s, []ServiceEntry{{Path: "/api/x", Method: "GET", Backend: backend, Start: start}}); got["warning"] == nil {
+		t.Fatal("no warning that the list is not kept")
+	}
+	waitFor(t, "the backend", func() bool { _, err := get(backend + "/api/x"); return err == nil })
+}
+
+func TestServerForkedByTheStartCommandStoppedWithIt(t *testing.T) {
+	fastSupervision(t)
+	port := freePort(t)
+	backend := "http://127.0.0.1:" + strconv.Itoa(port)
+	s, start := helperServer(t, port, "fork", "")
+	register(t, s, []ServiceEntry{{Path: "/api/x", Method: "GET", Backend: backend, Start: start}})
+	waitFor(t, "the forked server", func() bool {
+		b := listServices(t, s).Backends
+		return len(b) == 1 && b[0].State == backendAnswering
+	})
+	register(t, s, nil)
+	waitFor(t, "the forked server stopped", func() bool { _, err := get(backend + "/api/x"); return err != nil })
 }
 
 func TestBackendLeftToTheAgentWhileItAnswers(t *testing.T) {

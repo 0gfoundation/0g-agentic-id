@@ -1073,7 +1073,9 @@ func startAgent(
 	// The agent's interfaces (backends it registers over the sign socket)
 	// come back after a restart, under the same owner and seal: the list is
 	// kept in sealed's state directory, and a backend registered with a
-	// start command runs again as the agent, with the agent's environment.
+	// start command runs again as the agent, with PATH, HOME, the credential
+	// proxy's settings and the agent's public facts below (not the
+	// framework's own variables).
 	agentEnv := credRT.CredentialEnv()
 	if publicURL != "" {
 		agentEnv = append(agentEnv, "AGENT_PUBLIC_URL="+publicURL)

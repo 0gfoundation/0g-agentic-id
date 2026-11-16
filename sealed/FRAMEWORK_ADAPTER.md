@@ -841,7 +841,12 @@ You get these for free; design your framework's surface assuming them:
   `version` it runs and its `release` audit path; MCP_SERVICES.md). sealed
   keeps the agent interfaces across restarts of the container, bound to the
   owner and the seal, and runs the backend of one registered with a `start`
-  command itself, as the agent user, starting it again whenever it exits.
+  command itself, as the agent user, starting it again whenever it exits:
+  with `PATH`, `HOME`, the credential proxy's settings, `AGENT_PUBLIC_URL`,
+  `SEAL_SIGN_SOCK` and `AGENT_SEAL` (not the framework's own variables), in a
+  process group of its own that sealed kills when the entry is removed or
+  changed. One backend address has one start command; `GET /services`
+  reports each such backend's state, starts, last exit and last output.
 - **`POST /_seal/auth`** — the owner-auth flow of §5.7.
 - **`unix:///run/seal-sign.sock`** — `POST /sign/personal_sign`,
   `/sign/typed_data`, `/sign/transaction`; container-local only. This is

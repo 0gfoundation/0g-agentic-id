@@ -127,7 +127,7 @@ func (s *Server) signTools() []sealmcp.Tool {
 		},
 		{
 			Name:        "seal_services",
-			Description: "List the services you registered, as the runtime serves them under your public URL.",
+			Description: "List the services you registered, as the runtime serves them under your public URL, and how each backend the runtime runs for you is doing: state, starts, how it last ended and its last output.",
 			Schema:      object(map[string]any{}),
 			Method:      http.MethodGet,
 			Path:        "/services",
@@ -136,7 +136,9 @@ func (s *Server) signTools() []sealmcp.Tool {
 			Name: "seal_register_service",
 			Description: "Register your public services: each entry maps a public path under /api/ to a backend you run on loopback; the runtime serves it under your public URL and signs its responses when the runtime has a serve-proof validator. " +
 				"The list replaces the one registered before. The runtime keeps it across restarts of this container (not across a reset or a transfer). " +
-				"Give an entry a start command and the runtime runs that backend itself, as you, with your environment, and starts it again whenever it exits or the container restarts; then do not start it yourself.",
+				"Give an entry a start command and the runtime runs that backend itself, as you, and starts it again whenever it exits or the container restarts; then do not start it yourself. " +
+				"The backend gets PATH, HOME, the credential proxy's settings, AGENT_PUBLIC_URL, SEAL_SIGN_SOCK and AGENT_SEAL, not your framework's own variables; it runs in a process group of its own, which the runtime stops with the entry, so keep the server in it (no setsid or daemon manager). " +
+				"One backend address has one start command. seal_services shows how it is doing and its last output.",
 			Schema: object(map[string]any{
 				"services": map[string]any{
 					"type":        "array",
@@ -149,7 +151,7 @@ func (s *Server) signTools() []sealmcp.Tool {
 						"input_example": str("A literal JSON body example, if the route takes one."),
 						"transport":     str("\"mcp\" when the backend is an MCP server (register POST; GET/DELETE also forward); omit for plain HTTP."),
 						"start": object(map[string]any{
-							"command": str("The program, e.g. python3 or node, or an absolute path."),
+							"command": str("A system command, e.g. python3 or node, or the absolute path of a program of your own."),
 							"args":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Its arguments."},
 							"dir":     str("Absolute working directory below your home; your home when omitted."),
 						}, "command"),

@@ -8,18 +8,19 @@
 // [[credential:<name>]] placeholder typed into a page is filled for the hosts
 // and positions the owner allowed, as for the agent's other requests. The
 // proxy's address and per-boot password come from HTTPS_PROXY, which DSH passes
-// to stdio servers. Chromium trusts the proxy's per-boot CA by the fingerprint
-// of its public key (--ignore-certificate-errors-spki-list), on top of the
-// system roots; no other certificate error is ignored. Chromium's own process
+// to stdio servers, with the proxy's per-boot CA in NODE_EXTRA_CA_CERTS.
+// Chromium trusts that CA by the fingerprint of its public key
+// (--ignore-certificate-errors-spki-list), on top of the system roots; no
+// other certificate error is ignored. Chromium's own process
 // sandbox needs user namespaces the sandbox container does not grant, so it
 // runs without it, inside the agent's container.
 import { spawn } from 'node:child_process'
 import { X509Certificate, createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const CREDENTIAL_CA = '/etc/seal/credential-ca.pem'
+const CREDENTIAL_CA = process.env.NODE_EXTRA_CA_CERTS || '/etc/seal/credential-ca.pem'
 const args = ['--disable-dev-shm-usage']
 const launchOptions = { executablePath: '/usr/bin/chromium', headless: true, chromiumSandbox: false, args }
 
@@ -35,14 +36,17 @@ if (proxy) {
   try {
     const spki = new X509Certificate(readFileSync(CREDENTIAL_CA)).publicKey.export({ type: 'spki', format: 'der' })
     args.push('--ignore-certificate-errors-spki-list=' + createHash('sha256').update(spki).digest('base64'))
-  } catch {
+  } catch (err) {
     // No credential CA this boot: hosts the proxy terminates fail TLS; the
     // rest are tunnelled with their own certificates and work.
+    process.stderr.write(`sealed-browser-mcp: no credential CA (${CREDENTIAL_CA}: ${err.message}); hosts the credential proxy fills fail TLS\n`)
   }
 }
 
-// The configuration holds the proxy password, so it lives in a 0700 directory.
+// The configuration holds the proxy password, so it lives in a 0700 directory,
+// removed when the server ends.
 const dir = mkdtempSync(join(tmpdir(), 'sealed-browser-'))
+const cleanup = () => rmSync(dir, { recursive: true, force: true })
 const config = join(dir, 'config.json')
 writeFileSync(config, JSON.stringify({
   browser: { browserName: 'chromium', isolated: true, launchOptions },
@@ -51,4 +55,12 @@ writeFileSync(config, JSON.stringify({
 
 const child = spawn('playwright-mcp', ['--config', config, ...process.argv.slice(2)], { stdio: 'inherit' })
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child.kill(signal))
-child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)))
+child.on('error', (err) => {
+  cleanup()
+  process.stderr.write(`sealed-browser-mcp: cannot start playwright-mcp: ${err.message}\n`)
+  process.exit(1)
+})
+child.on('exit', (code, signal) => {
+  cleanup()
+  process.exit(code ?? (signal ? 1 : 0))
+})

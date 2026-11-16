@@ -602,6 +602,9 @@ func TestAgentBackgroundKeepsToTheAgentsHome(t *testing.T) {
 			t.Errorf("directory %q accepted", dir)
 		}
 	}
+	if cmd, err := AgentBackground(context.Background(), home+"/site", nil, "/bin/true"); err != nil || cmd.Dir != home+"/site" {
+		t.Fatalf("directory below the home: %v", err)
+	}
 	cmd, err := AgentBackground(context.Background(), "", []string{"EXTRA=1"}, "/bin/true")
 	if err != nil {
 		t.Fatal(err)
