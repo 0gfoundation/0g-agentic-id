@@ -84,6 +84,7 @@ type Server struct {
 	agentLogPath   string         // adapter's subprocess log file; empty renders "not available"
 	services       []ServiceEntry // agent-registered external services (see services.go); nil until first POST /services
 	serviceHost    *servicehost.Manager
+	keeper         agentServiceKeeper // keeps the agent's interfaces across restarts (agentservices.go)
 	strictServices bool
 	fwRoutes       []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ every framework path 404s
 

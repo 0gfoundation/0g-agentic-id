@@ -13,7 +13,8 @@ manifest 必填 `id`、`command`、`args`、`files`；可选 `worker`、`descrip
 降权后执行。源码和依赖是版本目录里的普通只读文件，该目录就是程序的工作目录（用相对路径引用）；root 不解压、不处理符号链接、不安装包。
 
 程序监听 `$MCP_SOCKET`（在它私有的 run 目录里），公开入口是
-`<sandbox-url>/api/mcp/<id>`，由 `/hello` 宣告，保留原始请求路径。沿用现有公网
+`<sandbox-url>/api/mcp/<id>`，由 `/hello` 宣告为 `kind: "hosted"`，并附它运行的 `version`
+和审计路径 `release`（`?sealed-release=1`），保留原始请求路径。沿用现有公网
 8080，不新增端口或管理入口。
 
 简单无状态服务不填 `worker`，每个 POST 启动临时沙箱。异步任务声明

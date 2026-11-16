@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -328,6 +329,37 @@ func AgentCommand(ctx context.Context, name string, args ...string) (*exec.Cmd, 
 	if Drop(cmd) && agentHomeReady() {
 		cmd.Dir = agentHomeDir
 	}
+	return cmd, nil
+}
+
+// AgentBackground is AgentCommand for a long-running process sealed keeps for
+// the agent (a backend it registered with a start command): it starts in dir,
+// which must lie below the agent's home (the home when empty), gets env on
+// top of AgentCommand's PATH and HOME, and runs in a process group of its
+// own, which cancelling ctx kills whole. The working directory is entered by
+// the child after it has become the agent user, so dir is resolved with the
+// agent's rights, never root's. Without the split a dir is refused.
+func AgentBackground(ctx context.Context, dir string, env []string, name string, args ...string) (*exec.Cmd, error) {
+	cmd, err := AgentCommand(ctx, name, args...)
+	if err != nil {
+		return nil, err
+	}
+	if dir != "" {
+		home := AgentHome()
+		if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir || (dir != home && !strings.HasPrefix(dir, home+"/")) {
+			return nil, fmt.Errorf("directory %s is not below the agent's home", dir)
+		}
+		if cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential == nil {
+			return nil, fmt.Errorf("directory %s: no agent account to run as", dir)
+		}
+		cmd.Dir = dir
+	}
+	cmd.Env = append(cmd.Env, env...)
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+	cmd.Cancel = func() error { return unix.Kill(-cmd.Process.Pid, unix.SIGKILL) }
 	return cmd, nil
 }
 

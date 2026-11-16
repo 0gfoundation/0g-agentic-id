@@ -1070,6 +1070,24 @@ func startAgent(
 			hostedServices = host
 		}
 	}
+	// The agent's interfaces (backends it registers over the sign socket)
+	// come back after a restart, under the same owner and seal: the list is
+	// kept in sealed's state directory, and a backend registered with a
+	// start command runs again as the agent, with the agent's environment.
+	agentEnv := credRT.CredentialEnv()
+	if publicURL != "" {
+		agentEnv = append(agentEnv, "AGENT_PUBLIC_URL="+publicURL)
+	}
+	agentEnv = append(agentEnv, "SEAL_SIGN_SOCK="+sealSignSockPath)
+	if agentSealAddr != "" {
+		agentEnv = append(agentEnv, "AGENT_SEAL="+agentSealAddr)
+	}
+	sealedProxy.RestoreAgentServices(proxy.AgentServiceRuntime{
+		StateFile: privsep.StateDir + "/agent-services.json",
+		Binding:   strings.ToLower(res.owner) + ":" + sealID,
+		Env:       agentEnv,
+	})
+	sealedStop.add(func(context.Context) { sealedProxy.StopAgentServices() })
 	mgr := manager.New(adapter, agent, manager.Config{
 		OnFailed: onFailed,
 		// A confirmed start, whoever brought it up, clears an earlier

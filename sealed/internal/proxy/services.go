@@ -41,6 +41,9 @@ type ServiceEntry struct {
 	// registrations name POST; the proxy also relays GET/DELETE and lets
 	// the backend return 405 when an optional method is unsupported.
 	Transport string `json:"transport,omitempty"` // "" (plain HTTP) | "mcp"
+	// Start, when set, has sealed run the backend itself and keep it
+	// running, across restarts too (agentservices.go). Never shown in /hello.
+	Start *ServiceStart `json:"start,omitempty"`
 }
 
 // reservedPrefixes are platform-owned paths an agent service may not shadow.
@@ -101,6 +104,9 @@ func validateServices(in []ServiceEntry, limits fieldLimits) ([]ServiceEntry, er
 		}
 		if e.InputExample != "" && !json.Valid([]byte(e.InputExample)) {
 			return nil, fmt.Errorf("services[%d].input_example is not valid JSON", i)
+		}
+		if err := validateStart(e.Start); err != nil {
+			return nil, fmt.Errorf("services[%d].%w", i, err)
 		}
 		switch e.Transport {
 		case "":
@@ -181,9 +187,10 @@ func (s *Server) getServices() []ServiceEntry {
 	return out
 }
 
-// servicesForHello maps the internal registry entries to the public /hello
-// shape, dropping the internal loopback backend — external callers reach a
-// service through :8080, never its backend port directly.
+// servicesForHello maps the agent's registered interfaces to the public
+// /hello shape, dropping the internal loopback backend and start command —
+// external callers reach a service through :8080, never its backend port
+// directly.
 func servicesForHello(entries []ServiceEntry) []report.Service {
 	out := make([]report.Service, 0, len(entries))
 	for _, e := range entries {
@@ -193,6 +200,7 @@ func servicesForHello(entries []ServiceEntry) []report.Service {
 			Description:  e.Description,
 			InputExample: e.InputExample,
 			Transport:    e.Transport,
+			Kind:         report.ServiceKindAgent,
 		})
 	}
 	return out
@@ -207,13 +215,34 @@ func helloSelfEntry() report.Service {
 		Path:        "/hello",
 		Method:      "GET",
 		Description: "Signed self-introduction — this agent's identity, on-chain data hashes, and its declared services.",
+		Kind:        report.ServiceKindRuntime,
 	}
 }
 
-// helloServiceList is the array /hello advertises: entry #0 (/hello itself)
-// followed by the agent-registered services.
+// helloServiceList is the array /hello advertises: entry #0 (/hello itself),
+// the agent's registered interfaces, then its hosted programs with the
+// release each one runs and where to audit it.
 func (s *Server) helloServiceList() []report.Service {
-	return append([]report.Service{helloSelfEntry()}, servicesForHello(s.getServices())...)
+	strict := s.isolatedServicePolicy()
+	s.mu.RLock()
+	agent := make([]ServiceEntry, 0, len(s.services))
+	for _, e := range s.services {
+		if !strict || !managedServicePath(e.Path) {
+			agent = append(agent, e)
+		}
+	}
+	host := s.serviceHost
+	s.mu.RUnlock()
+	out := append([]report.Service{helloSelfEntry()}, servicesForHello(agent)...)
+	if strict && host != nil {
+		for _, svc := range host.List() {
+			out = append(out, report.Service{
+				Path: svc.Path, Method: "POST", Description: svc.Description, Transport: "mcp",
+				Kind: report.ServiceKindHosted, Version: svc.Version, Release: svc.Path + "?sealed-release=1",
+			})
+		}
+	}
+	return out
 }
 
 // matchService returns the registered service whose path exactly equals the
@@ -238,6 +267,15 @@ func (s *Server) matchService(path string) (ServiceEntry, bool) {
 	return ServiceEntry{}, false
 }
 
+// serviceLimits are the registration rules of this runtime and framework.
+func (s *Server) serviceLimits() fieldLimits {
+	limits := fieldLimits{managedNamespace: s.isolatedServicePolicy()}
+	if l, ok := s.getAdapter().(framework.ServiceFieldLimiter); ok {
+		limits.description, limits.inputExample = l.ServiceFieldLimits()
+	}
+	return limits
+}
+
 // handleServices serves the agent-only registry on the internal sign socket:
 //
 //	POST /services  — replace the whole agent-registered set (overwrite
@@ -257,20 +295,25 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 			writeSignError(w, http.StatusBadRequest, "decode body: "+err.Error())
 			return
 		}
-		limits := fieldLimits{managedNamespace: s.isolatedServicePolicy()}
-		if l, ok := s.getAdapter().(framework.ServiceFieldLimiter); ok {
-			limits.description, limits.inputExample = l.ServiceFieldLimits()
-		}
-		entries, err := validateServices(body.Services, limits)
+		entries, err := validateServices(body.Services, s.serviceLimits())
 		if err != nil {
 			writeSignError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// One registration at a time, so the list kept on disk and the
+		// backends sealed runs always match the one in effect.
+		s.keeper.post.Lock()
+		defer s.keeper.post.Unlock()
 		s.mu.Lock()
 		s.services = entries
 		s.mu.Unlock()
 		logger.Logf("services: registered %d agent service(s)", len(entries))
-		writeJSON(w, http.StatusOK, map[string]any{"services": entries})
+		out := map[string]any{"services": entries}
+		if err := s.keepAgentServices(entries); err != nil {
+			logger.Logf("services: cannot keep the agent's interfaces across a restart: %v", err)
+			out["warning"] = "registered, but not kept across a restart: " + err.Error()
+		}
+		writeJSON(w, http.StatusOK, out)
 	default:
 		writeSignError(w, http.StatusMethodNotAllowed, "GET or POST only")
 	}

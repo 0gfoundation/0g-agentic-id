@@ -135,7 +135,8 @@ func (s *Server) signTools() []sealmcp.Tool {
 		{
 			Name: "seal_register_service",
 			Description: "Register your public services: each entry maps a public path under /api/ to a backend you run on loopback; the runtime serves it under your public URL and signs its responses when the runtime has a serve-proof validator. " +
-				"The list replaces the one registered before. Registration lasts until the container restarts.",
+				"The list replaces the one registered before. The runtime keeps it across restarts of this container (not across a reset or a transfer). " +
+				"Give an entry a start command and the runtime runs that backend itself, as you, with your environment, and starts it again whenever it exits or the container restarts; then do not start it yourself.",
 			Schema: object(map[string]any{
 				"services": map[string]any{
 					"type":        "array",
@@ -147,6 +148,11 @@ func (s *Server) signTools() []sealmcp.Tool {
 						"description":   str("One short sentence for /hello."),
 						"input_example": str("A literal JSON body example, if the route takes one."),
 						"transport":     str("\"mcp\" when the backend is an MCP server (register POST; GET/DELETE also forward); omit for plain HTTP."),
+						"start": object(map[string]any{
+							"command": str("The program, e.g. python3 or node, or an absolute path."),
+							"args":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Its arguments."},
+							"dir":     str("Absolute working directory below your home; your home when omitted."),
+						}, "command"),
 					}, "path", "method", "backend"),
 				},
 			}, "services"),

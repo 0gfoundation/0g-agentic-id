@@ -17,7 +17,8 @@ the release directory, the program's working directory (name them by relative
 path); root never unpacks archives, interprets symlinks or installs packages.
 
 Programs listen on `$MCP_SOCKET` (in their private run directory); the public endpoint is
-`<sandbox-url>/api/mcp/<id>`, advertised by `/hello`. The original path is kept.
+`<sandbox-url>/api/mcp/<id>`, advertised by `/hello` as `kind: "hosted"` with
+the `version` it runs and its `release` path (`?sealed-release=1`). The original path is kept.
 Publication uses the existing public 8080 and adds no port or management entry.
 
 Omit `worker` for a small stateless server: each POST starts a temporary sandbox.
