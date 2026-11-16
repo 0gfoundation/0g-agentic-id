@@ -57,7 +57,7 @@ FROM ${OPENCLAW_BASE}
 # The node this image ships comes from OPENCLAW_BASE, which can be overridden;
 # fail the build if that base carries any node other than the pinned one
 # (keep in step with images/openclaw/Dockerfile's NODE_VERSION).
-ARG NODE_VERSION=24.22.1
+ARG NODE_VERSION=24.22.3
 RUN test "$(node --version)" = "v${NODE_VERSION}"
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):
