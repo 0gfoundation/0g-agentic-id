@@ -856,17 +856,23 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         live_owner: Address,
     ) -> anyhow::Result<Option<String>> {
         let mut tx = deployment_tx(&self.pool).await?;
-        let row =
-            sqlx::query("SELECT seal_id,sandbox_id FROM deployments WHERE agent_id=$1 FOR UPDATE")
-                .bind(agent_id_to_text(&agent))
-                .fetch_optional(&mut *tx)
-                .await?;
+        let row = sqlx::query("SELECT seal_id,sandbox_id,storage_stage,mint_stage FROM deployments WHERE agent_id=$1 FOR UPDATE")
+            .bind(agent_id_to_text(&agent)).fetch_optional(&mut *tx).await?;
         let Some(row) = row else { return Ok(None) };
         let seal: Vec<u8> = row.try_get("seal_id")?;
         let sandbox: Option<String> = row.try_get("sandbox_id")?;
+        let stale_grant: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM operator_grants WHERE seal_id=$1 AND owner<>$2)",
+        )
+        .bind(&seal)
+        .bind(live_owner.as_slice())
+        .fetch_one(&mut *tx)
+        .await?;
         sqlx::query("UPDATE operator_grants SET version=version+1,transfer_invalidated=TRUE,updated_at=now() WHERE seal_id=$1 AND owner<>$2 AND NOT transfer_invalidated")
             .bind(&seal).bind(live_owner.as_slice()).execute(&mut *tx).await?;
-        let auth=sqlx::query("SELECT authorized_owner,authorized_sandbox_id,enabled FROM container_status_bindings WHERE seal_id=$1").bind(&seal).fetch_optional(&mut *tx).await?;
+        let auth = sqlx::query("SELECT authorized_owner,authorized_operator,authorized_sandbox_id,enabled FROM container_status_bindings WHERE seal_id=$1")
+            .bind(&seal).fetch_optional(&mut *tx).await?;
+        let mut retire_delegated = false;
         if let Some(auth) = auth {
             let owner: Option<Vec<u8>> = auth.try_get("authorized_owner")?;
             if owner.as_deref() == Some(live_owner.as_slice())
@@ -880,14 +886,38 @@ impl DeploymentRepo for PostgresDeploymentRepo {
                     sandbox
                 });
             }
+            retire_delegated = stale_grant
+                && owner.as_deref() != Some(live_owner.as_slice())
+                && auth
+                    .try_get::<Option<Vec<u8>>, _>("authorized_operator")?
+                    .is_some();
         }
-        sqlx::query(&format!(
-            "UPDATE deployments SET {CLEAR_CONTAINER_RECORD},updated_at=now() WHERE seal_id=$1"
-        ))
-        .bind(&seal)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1 WHERE seal_id=$1").bind(seal).execute(&mut *tx).await?;
+        if retire_delegated {
+            // An earlier indexed event may observe a later live owner before
+            // the grant owner's actual outgoing event is processed. Persist
+            // cleanup now: that later event will see transfer_invalidated.
+            if let Some(sandbox) = sandbox.as_ref().filter(|s| !s.is_empty()) {
+                sqlx::query("INSERT INTO operator_teardowns(seal_id,sandbox_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
+                    .bind(&seal).bind(sandbox).execute(&mut *tx).await?;
+            }
+            let storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
+            let mint: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
+            let phase = derive_phase(&storage, &mint, &StageStatus::NotStarted);
+            sqlx::query(&format!("UPDATE deployments SET sandbox_id=NULL,{CLEAR_CONTAINER_RECORD},provisioned_at=NULL,provision_deadline=NULL,last_heartbeat=NULL,container_stage=$2,phase=$3,updated_at=now() WHERE seal_id=$1"))
+                .bind(&seal).bind(serde_json::to_value(StageStatus::NotStarted)?).bind(phase.serde_tag()).execute(&mut *tx).await?;
+            sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1,authorized_sandbox_id=NULL,authorized_container_pubkey=NULL WHERE seal_id=$1")
+                .bind(&seal).execute(&mut *tx).await?;
+        } else {
+            // Preserve the existing owner-direct transfer behavior.
+            sqlx::query(&format!(
+                "UPDATE deployments SET {CLEAR_CONTAINER_RECORD},updated_at=now() WHERE seal_id=$1"
+            ))
+            .bind(&seal)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1 WHERE seal_id=$1")
+                .bind(&seal).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(sandbox)
     }
@@ -3421,6 +3451,126 @@ mod operator_storage_tests {
         );
     }
 
+    async fn exercise_early_transfer_cleanup(
+        repo: &dyn DeploymentRepo,
+        seal: SealId,
+        agent: AgentId,
+    ) {
+        let old_owner = Address::repeat_byte(0xa3);
+        let live_owner = Address::repeat_byte(0xb3);
+        let actor = Address::repeat_byte(0xc3);
+        let mut d = deployment(seal, agent, old_owner);
+        d.sandbox_id = None;
+        repo.insert(&d).await.unwrap();
+        repo.compare_and_swap_operator(seal, 0, grant(old_owner, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        install_test_runtime(
+            repo,
+            seal,
+            old_owner,
+            Some((actor, 1)),
+            21,
+            "early-old-operator",
+        )
+        .await;
+        repo.set_owner(agent, live_owner).await.unwrap();
+        // The older X -> A event sees live owner B before A -> B is indexed.
+        repo.invalidate_operator_for_transfer(agent, Address::repeat_byte(0xd3))
+            .await
+            .unwrap();
+        assert_eq!(repo.operator_grant(seal).await.unwrap().unwrap().version, 1);
+        assert_eq!(
+            repo.clear_container_binding(agent, live_owner)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("early-old-operator")
+        );
+        // Model failure to submit the legacy queue teardown: no job is added.
+        // The exact deletion target must already be durable in the same commit.
+        assert!(repo
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "early-old-operator".into())));
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(
+            d.sandbox_id.is_none() && d.container_record.is_none() && d.container_status.is_none()
+        );
+        assert!(d.provisioned_at.is_none() && d.provision_deadline.is_none());
+        assert!(matches!(d.container_stage, StageStatus::NotStarted));
+        let old_boot = repo.boot_authorization(seal).await.unwrap().unwrap();
+        assert!(
+            !old_boot.enabled
+                && old_boot.sandbox_id.is_none()
+                && old_boot.container_pubkey.is_none()
+        );
+        assert_eq!(repo.operator_grant(seal).await.unwrap().unwrap().version, 2);
+        // Its real outgoing event is idempotent and cannot lose the target.
+        repo.invalidate_operator_for_transfer(agent, old_owner)
+            .await
+            .unwrap();
+        assert_eq!(repo.operator_grant(seal).await.unwrap().unwrap().version, 2);
+        assert!(repo
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "early-old-operator".into())));
+        repo.compare_and_swap_operator(seal, 2, grant(live_owner, 3))
+            .await
+            .unwrap()
+            .unwrap();
+        let (replacement, _) = install_test_runtime(
+            repo,
+            seal,
+            live_owner,
+            Some((actor, 3)),
+            22,
+            "early-replacement",
+        )
+        .await;
+        repo.invalidate_operator_for_transfer(agent, old_owner)
+            .await
+            .unwrap();
+        assert!(repo
+            .clear_container_binding(agent, live_owner)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repo.boot_authorization(seal).await.unwrap().unwrap(),
+            replacement
+        );
+        repo.complete_operator_teardown(seal, "early-old-operator")
+            .await
+            .unwrap();
+        assert!(!repo
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "early-old-operator".into())));
+        assert_eq!(
+            repo.get(seal).await.unwrap().unwrap().sandbox_id.as_deref(),
+            Some("early-replacement")
+        );
+        assert_eq!(
+            repo.boot_authorization(seal).await.unwrap().unwrap(),
+            replacement
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_early_transfer_clear_persists_delegated_cleanup() {
+        exercise_early_transfer_cleanup(
+            &InMemoryDeploymentRepo::new(),
+            B256::repeat_byte(0x73),
+            U256::from(73),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn mock_stale_resume_cannot_mutate_replacement_boot() {
         exercise_stale_resume(
@@ -3466,6 +3616,14 @@ mod operator_storage_tests {
         let seal = B256::from(rand::random::<[u8; 32]>());
         let agent = U256::from_be_bytes(rand::random::<[u8; 32]>());
         exercise_operator_storage(repo.as_ref(), seal, agent).await;
+        let early_seal = B256::from(rand::random::<[u8; 32]>());
+        let early_agent = U256::from_be_bytes(rand::random::<[u8; 32]>());
+        exercise_early_transfer_cleanup(repo.as_ref(), early_seal, early_agent).await;
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(early_seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
             .bind(seal.as_slice())
             .execute(&pool)

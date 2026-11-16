@@ -1647,12 +1647,11 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         }
         d.container_stage = stage;
         d.phase = derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
-        d.provision_deadline =
-            if stopped || provisioned {
-                None
-            } else {
-                deadline
-            };
+        d.provision_deadline = if stopped || provisioned {
+            None
+        } else {
+            deadline
+        };
         d.updated_at = chrono::Utc::now();
         self.set_container_stage_calls
             .fetch_add(1, Ordering::SeqCst);
@@ -1839,9 +1838,11 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             return Ok(None);
         };
         let sandbox = d.sandbox_id.clone();
+        let mut stale_grant = false;
         if let Some(grant) = self.operator_grants.lock().unwrap().get_mut(&seal) {
+            stale_grant = grant.owner != live_owner;
             let mut invalidated = self.operator_transfer_invalidated.lock().unwrap();
-            if grant.owner != live_owner && !invalidated.contains(&seal) {
+            if stale_grant && !invalidated.contains(&seal) {
                 grant.version = grant
                     .version
                     .checked_add(1)
@@ -1849,6 +1850,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 invalidated.insert(seal);
             }
         }
+        let mut retire_delegated = false;
         if let Some(a) = self.boot_authorizations.lock().unwrap().get(&seal) {
             if a.enabled && a.owner == Some(live_owner) {
                 return Ok(if a.sandbox_id.is_some() && a.sandbox_id == sandbox {
@@ -1857,8 +1859,26 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                     sandbox
                 });
             }
+            retire_delegated = stale_grant && a.owner != Some(live_owner) && a.operator.is_some();
         }
-        self.revoke_status_boot(seal);
+        if retire_delegated {
+            if let Some(sandbox) = sandbox.as_ref().filter(|s| !s.is_empty()) {
+                self.operator_teardowns
+                    .lock()
+                    .unwrap()
+                    .insert((seal, sandbox.clone()));
+            }
+            self.retire_status_boot(seal);
+            d.sandbox_id = None;
+            d.provisioned_at = None;
+            d.provision_deadline = None;
+            d.container_stage = StageStatus::NotStarted;
+            d.phase = derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+            d.updated_at = chrono::Utc::now();
+            self.heartbeats.lock().unwrap().remove(&seal);
+        } else {
+            self.revoke_status_boot(seal);
+        }
         d.container_record = None;
         d.container_status = None;
         Ok(sandbox)
