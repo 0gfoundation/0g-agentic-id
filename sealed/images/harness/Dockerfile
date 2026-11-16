@@ -118,7 +118,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -tags harnessonly -ldflags="-s -w" -o boot
 # inside it, which is all sealed unpacks (internal/layers); anything else
 # fails the build.
 FROM debian:13-slim AS harness-package
-ARG NODE_VERSION=24.22.1
+ARG NODE_VERSION=24.22.3
 ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/31736d5b2e9efb226795641f0ca48d6f5a048872
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils python3 make g++ \
