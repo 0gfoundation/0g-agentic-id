@@ -6,6 +6,8 @@
 #
 # Contents beyond debian-slim: node, python3 (an interpreter hosted MCP
 # services may name; sealed's network adapter for it is built into sealed),
+# a browser for the owner's agent (Chromium, the Playwright MCP server and
+# sealed-browser-mcp, which the owner turns on in the agent's settings),
 # ca-certificates (chain RPC + 0G storage + router TLS), git and procps (the
 # adapter's orphan sweep), one 0g-harness
 # official version package (its locked DSH dependency tree included), the
@@ -183,6 +185,24 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
  && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
  && rm /tmp/node.tar.xz \
  && node --version && npm --version
+
+# The owner's agent's browser, off until the owner lists it in the agent's
+# settings (others.mcpServers, see images/harness/browser-mcp.mjs): Debian's
+# Chromium with Latin and CJK fonts, the Playwright MCP server at a pinned
+# version (its playwright and playwright-core are pinned exactly by it; no
+# browser download, it drives /usr/bin/chromium), and sealed-browser-mcp,
+# which starts it headless behind sealed's credential proxy. Root's, like the
+# rest of /usr: the agent can run them, not change them.
+ARG PLAYWRIGHT_MCP_VERSION=0.0.84
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends chromium fonts-liberation fonts-noto-cjk \
+ && rm -rf /var/lib/apt/lists/* \
+ && chromium --version \
+ && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install -g --no-fund --no-audit "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" \
+ && test "$(node -p "require('/usr/local/lib/node_modules/@playwright/mcp/package.json').version")" = "${PLAYWRIGHT_MCP_VERSION}" \
+ && command -v playwright-mcp
+COPY images/harness/browser-mcp.mjs /usr/local/bin/sealed-browser-mcp
+RUN chown root:root /usr/local/bin/sealed-browser-mcp && chmod 0755 /usr/local/bin/sealed-browser-mcp
 
 # The 0g-harness official version package base ships (stage 3), unpacked
 # where sealed runs it from: /opt/0g-harness/<sha256 of the package>/, root's,

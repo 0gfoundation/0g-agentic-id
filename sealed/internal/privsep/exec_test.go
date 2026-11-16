@@ -594,3 +594,25 @@ func TestBootstrapLogIsUnderStateDir(t *testing.T) {
 		t.Fatalf("logger.LogPath = %q, want it under %s", logger.LogPath, StateDir)
 	}
 }
+
+func TestAgentBackgroundKeepsToTheAgentsHome(t *testing.T) {
+	home := AgentHome()
+	for _, dir := range []string{"/etc", "relative", home + "/../etc", home + "x"} {
+		if _, err := AgentBackground(context.Background(), dir, nil, "/bin/true"); err == nil {
+			t.Errorf("directory %q accepted", dir)
+		}
+	}
+	if cmd, err := AgentBackground(context.Background(), home+"/site", nil, "/bin/true"); err != nil || cmd.Dir != home+"/site" {
+		t.Fatalf("directory below the home: %v", err)
+	}
+	cmd, err := AgentBackground(context.Background(), "", []string{"EXTRA=1"}, "/bin/true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid || cmd.Cancel == nil {
+		t.Fatal("not in a process group of its own, or not killable as a group")
+	}
+	if got := cmd.Env[len(cmd.Env)-1]; got != "EXTRA=1" {
+		t.Fatalf("extra environment not appended: %v", cmd.Env)
+	}
+}

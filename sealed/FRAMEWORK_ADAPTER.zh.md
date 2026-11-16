@@ -712,8 +712,16 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
   时不发这个头。你的上游只需在
   localhost 上提供明文 HTTP。
 - **`GET /hello`** ——签名的自我介绍:agent 身份、当前 `data_hashes`、
-  `public_url`,以及(如果 agent 通过 `POST $SEAL_SIGN_SOCK/services`
-  注册过)agent 自声明的服务列表。
+  `public_url`,以及服务列表,每项带 `kind`:`runtime`(`/hello`)、`agent`
+  (agent 接口:agent 在 loopback 上自己运行、通过 `POST $SEAL_SIGN_SOCK/services`
+  注册的后端,不是各框架的 manifest 文件)或 `hosted`(托管程序,附它运行的
+  `version` 和审计用的 `release` 路径;见 MCP_SERVICES.zh.md)。sealed 在容器
+  重启后保留 agent 接口(绑定 owner 和 seal);注册时带 `start` 命令的,sealed 以
+  agent 用户身份自己运行它的后端,退出后再次启动:环境为 `PATH`、`HOME`、凭据代理
+  的设置、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK` 和 `AGENT_SEAL`(不含框架自己的
+  变量),运行在独立的进程组里,条目被删除或修改时 sealed 杀掉整个进程组。一个后端
+  地址只有一条启动命令;`GET /services` 报告每个这样的后端的状态、启动次数、上次
+  退出原因和最近的输出。
 - **`POST /_seal/auth`** ——§5.7 的 owner 鉴权流程。
 - **`unix:///run/seal-sign.sock`** ——`POST /sign/personal_sign`、
   `/sign/typed_data`、`/sign/transaction`;仅容器内可达。agent 就是

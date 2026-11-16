@@ -1,22 +1,16 @@
 package proxy
 
-// Agent-declared external service registry.
+// Agent interfaces: the services an agent serves itself.
 //
 // An agent exposes a service by running the backend itself — a loopback
 // HTTP server inside this sandbox — and registering it here over the
 // agent-only sign socket (POST /services). sealed's :8080 proxy then
 // routes the public path to that backend and signs the response, so every
-// externally-visible service leaves through the one attributed surface.
-// This lifts service exposure OUT of the orchestration framework (it used
-// to be openclaw's in-process handlers + ~/.openclaw/services.json) and
-// into sealed, so it's framework-agnostic.
-//
-// This file is step 1: the registry + registration endpoint only. Routing
-// (:8080 dispatch) and /hello wiring land in later steps; nothing here
-// changes existing request handling yet.
-//
-// Registration is runtime state — the agent re-posts on each boot; it is
-// not chain-anchored (durable capability is still the tracked-skill path).
+// externally visible service leaves through the one attributed surface,
+// whatever the framework. sealed keeps the registered list across restarts
+// of the container and can run the backends itself (agentservices.go); it
+// is not chain-anchored, so a capability that must survive a reset or a
+// transfer lives in the agent's tracked data, which registers it again.
 
 import (
 	"encoding/json"
@@ -28,6 +22,7 @@ import (
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/report"
+	"seal-verify/internal/servicehost"
 )
 
 // ServiceEntry is one agent-declared external service.
@@ -41,6 +36,9 @@ type ServiceEntry struct {
 	// registrations name POST; the proxy also relays GET/DELETE and lets
 	// the backend return 405 when an optional method is unsupported.
 	Transport string `json:"transport,omitempty"` // "" (plain HTTP) | "mcp"
+	// Start, when set, has sealed run the backend itself and keep it
+	// running, across restarts too (agentservices.go). Never shown in /hello.
+	Start *ServiceStart `json:"start,omitempty"`
 }
 
 // reservedPrefixes are platform-owned paths an agent service may not shadow.
@@ -102,6 +100,9 @@ func validateServices(in []ServiceEntry, limits fieldLimits) ([]ServiceEntry, er
 		if e.InputExample != "" && !json.Valid([]byte(e.InputExample)) {
 			return nil, fmt.Errorf("services[%d].input_example is not valid JSON", i)
 		}
+		if err := validateStart(e.Start); err != nil {
+			return nil, fmt.Errorf("services[%d].%w", i, err)
+		}
 		switch e.Transport {
 		case "":
 		case "mcp":
@@ -115,6 +116,9 @@ func validateServices(in []ServiceEntry, limits fieldLimits) ([]ServiceEntry, er
 			return nil, fmt.Errorf("services[%d].transport %q is not a known transport (\"\" or \"mcp\")", i, e.Transport)
 		}
 		out = append(out, e)
+	}
+	if err := checkSharedStarts(out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -156,34 +160,40 @@ func validateLoopbackBackend(backend string) error {
 	return nil
 }
 
-// getServices returns a copy of the current agent-registered services.
-func (s *Server) getServices() []ServiceEntry {
+// visibleServices is what callers can reach: a copy of the agent's
+// registered interfaces (without the paths isolated hosting owns, under that
+// policy) and, under that policy, the hosted programs.
+func (s *Server) visibleServices() ([]ServiceEntry, []servicehost.Status) {
 	strict := s.isolatedServicePolicy()
 	s.mu.RLock()
-	out := make([]ServiceEntry, len(s.services))
-	copy(out, s.services)
+	agent := make([]ServiceEntry, 0, len(s.services))
+	for _, e := range s.services {
+		if !strict || !managedServicePath(e.Path) {
+			agent = append(agent, e)
+		}
+	}
 	host := s.serviceHost
 	s.mu.RUnlock()
-	if strict {
-		kept := out[:0]
-		for _, e := range out {
-			if !managedServicePath(e.Path) {
-				kept = append(kept, e)
-			}
-		}
-		out = kept
+	if !strict || host == nil {
+		return agent, nil
 	}
-	if strict && host != nil {
-		for _, svc := range host.List() {
-			out = append(out, ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description})
-		}
+	return agent, host.List()
+}
+
+// getServices returns the services callers can reach, hosted programs as
+// entries too.
+func (s *Server) getServices() []ServiceEntry {
+	out, hosted := s.visibleServices()
+	for _, svc := range hosted {
+		out = append(out, ServiceEntry{Path: svc.Path, Method: "POST", Backend: "http://localhost", Transport: "mcp", Description: svc.Description})
 	}
 	return out
 }
 
-// servicesForHello maps the internal registry entries to the public /hello
-// shape, dropping the internal loopback backend — external callers reach a
-// service through :8080, never its backend port directly.
+// servicesForHello maps the agent's registered interfaces to the public
+// /hello shape, dropping the internal loopback backend and start command —
+// external callers reach a service through :8080, never its backend port
+// directly.
 func servicesForHello(entries []ServiceEntry) []report.Service {
 	out := make([]report.Service, 0, len(entries))
 	for _, e := range entries {
@@ -193,6 +203,7 @@ func servicesForHello(entries []ServiceEntry) []report.Service {
 			Description:  e.Description,
 			InputExample: e.InputExample,
 			Transport:    e.Transport,
+			Kind:         report.ServiceKindAgent,
 		})
 	}
 	return out
@@ -207,13 +218,23 @@ func helloSelfEntry() report.Service {
 		Path:        "/hello",
 		Method:      "GET",
 		Description: "Signed self-introduction — this agent's identity, on-chain data hashes, and its declared services.",
+		Kind:        report.ServiceKindRuntime,
 	}
 }
 
-// helloServiceList is the array /hello advertises: entry #0 (/hello itself)
-// followed by the agent-registered services.
+// helloServiceList is the array /hello advertises: entry #0 (/hello itself),
+// the agent's registered interfaces, then its hosted programs with the
+// release each one runs and where to audit it.
 func (s *Server) helloServiceList() []report.Service {
-	return append([]report.Service{helloSelfEntry()}, servicesForHello(s.getServices())...)
+	agent, hosted := s.visibleServices()
+	out := append([]report.Service{helloSelfEntry()}, servicesForHello(agent)...)
+	for _, svc := range hosted {
+		out = append(out, report.Service{
+			Path: svc.Path, Method: "POST", Description: svc.Description, Transport: "mcp",
+			Kind: report.ServiceKindHosted, Version: svc.Version, Release: svc.Path + "?sealed-release=1",
+		})
+	}
+	return out
 }
 
 // matchService returns the registered service whose path exactly equals the
@@ -238,17 +259,31 @@ func (s *Server) matchService(path string) (ServiceEntry, bool) {
 	return ServiceEntry{}, false
 }
 
+// serviceLimits are the registration rules of this runtime and framework.
+func (s *Server) serviceLimits() fieldLimits {
+	limits := fieldLimits{managedNamespace: s.isolatedServicePolicy()}
+	if l, ok := s.getAdapter().(framework.ServiceFieldLimiter); ok {
+		limits.description, limits.inputExample = l.ServiceFieldLimits()
+	}
+	return limits
+}
+
 // handleServices serves the agent-only registry on the internal sign socket:
 //
 //	POST /services  — replace the whole agent-registered set (overwrite
 //	                  semantics; the complete list every time).
-//	GET  /services  — read the current set back.
+//	GET  /services  — read the current set back, with how each backend
+//	                  sealed runs is doing (agentservices.go).
 //
 // /hello (the sealed-owned default service) is never part of this set.
 func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"services": s.getServices()})
+		out := map[string]any{"services": s.getServices()}
+		if b := s.backendStatuses(); len(b) > 0 {
+			out["backends"] = b
+		}
+		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
 		var body struct {
 			Services []ServiceEntry `json:"services"`
@@ -257,20 +292,25 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 			writeSignError(w, http.StatusBadRequest, "decode body: "+err.Error())
 			return
 		}
-		limits := fieldLimits{managedNamespace: s.isolatedServicePolicy()}
-		if l, ok := s.getAdapter().(framework.ServiceFieldLimiter); ok {
-			limits.description, limits.inputExample = l.ServiceFieldLimits()
-		}
-		entries, err := validateServices(body.Services, limits)
+		entries, err := validateServices(body.Services, s.serviceLimits())
 		if err != nil {
 			writeSignError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// One registration at a time, so the list kept on disk and the
+		// backends sealed runs always match the one in effect.
+		s.keeper.post.Lock()
+		defer s.keeper.post.Unlock()
 		s.mu.Lock()
 		s.services = entries
 		s.mu.Unlock()
 		logger.Logf("services: registered %d agent service(s)", len(entries))
-		writeJSON(w, http.StatusOK, map[string]any{"services": entries})
+		out := map[string]any{"services": entries}
+		if err := s.keepAgentServices(entries); err != nil {
+			logger.Logf("services: cannot keep the agent's interfaces across a restart: %v", err)
+			out["warning"] = "registered, but not kept across a restart: " + err.Error()
+		}
+		writeJSON(w, http.StatusOK, out)
 	default:
 		writeSignError(w, http.StatusMethodNotAllowed, "GET or POST only")
 	}
