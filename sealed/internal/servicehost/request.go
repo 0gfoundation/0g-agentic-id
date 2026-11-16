@@ -30,8 +30,9 @@ const RuntimeInputHeader = "X-Seal-Runtime-Input"
 const ServiceVersionHeader = "X-Seal-Service-Version"
 const MaxRuntimeInput = 16 << 10
 const MaxWorkers = 32
-const taskDirName = ".tasks" // cannot collide with a valid published service id
-const runDirName = ".run"    // coordinator sockets; cannot collide with a service id either
+const taskDirName = ".tasks"            // cannot collide with a valid published service id
+const runDirName = ".run"               // coordinator sockets; cannot collide with a service id either
+const serviceNetDirName = ".servicenet" // network adapters (servicenet); no service id either
 
 // MaxServiceProcesses bounds the processes and threads of all service
 // processes together: each running request, execution and coordinator holds

@@ -22,6 +22,7 @@ import (
 	"seal-verify/internal/logger"
 	"seal-verify/internal/privsep"
 	"seal-verify/internal/serviceidentity"
+	"seal-verify/internal/servicenet"
 	"seal-verify/internal/servicesandbox"
 )
 
@@ -52,6 +53,7 @@ type Manager struct {
 	mu            sync.Mutex
 	base          string
 	programs      string
+	servicenet    string // the network adapters, installed from this binary
 	binding       string
 	entries       map[string]*entry
 	closed        bool
@@ -157,6 +159,15 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 		if err := privsep.MkdirAll(filepath.Join(m.programs, name), 0755); err != nil {
 			return nil, err
 		}
+	}
+	// The network adapters ship inside this binary; a copy an earlier sealed
+	// installed is replaced.
+	m.servicenet = filepath.Join(m.programs, serviceNetDirName)
+	if err := discardDir(m.servicenet); err != nil {
+		return nil, err
+	}
+	if err := servicenet.Install(m.servicenet); err != nil {
+		return nil, err
 	}
 	b, err := privsep.ReadFile(filepath.Join(base, "registry.json"), privsep.LimitConfig)
 	if err != nil && !os.IsNotExist(err) {
@@ -515,7 +526,7 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 	p := servicesandbox.Policy{
 		UID:        uid,
 		ReadExec:   append(append([]string(nil), sys.readExec...), program),
-		ReadOnly:   sys.readOnly,
+		ReadOnly:   append(append([]string(nil), sys.readOnly...), m.servicenet),
 		Devices:    sys.devices,
 		SocketDirs: []string{run},
 		ReadWrite:  []string{work, tmp},
@@ -527,19 +538,15 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 	if kind == coordinatorCommand {
 		env = append(env, "SEAL_EXEC_SOCKET="+filepath.Join(run, "control.sock"))
 	}
-	var networkBootstrap string
 	if lease.Dir != "" {
 		p.ReadExec = append(p.ReadExec, lease.Dir)
 		env = append(env, "HARNESS_RUNTIME_ROOT="+lease.Dir)
-		networkBootstrap = filepath.Join(lease.Dir, "src", "service-network.mjs")
 	}
-	bridged := false
 	if e.Manifest.Network == "egress" {
 		if err = m.startEgress(ctx, e.Manifest.EgressHosts, uid, filepath.Join(run, "egress.sock")); err != nil {
 			return nil, err
 		}
 		env = append(env, "SEAL_EGRESS_SOCKET="+filepath.Join(run, "egress.sock"))
-		bridged = true
 	}
 	// Temporary workers (requests and executions) may spend the published
 	// budget on the owner's model; the coordinator never receives the route.
@@ -549,10 +556,24 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 			return nil, rerr
 		}
 		env = append(env, "SEAL_MODEL_SOCKET="+filepath.Join(run, "model.sock"), "SEAL_MODEL_ID="+route.Route.Model, "SEAL_MODEL_API="+route.API)
-		bridged = true
+	}
+	// The interpreter loads sealed's network adapter first (servicenet).
+	adapter := interpreterRuntime(interpreter)
+	switch adapter {
+	case nodeRuntime:
+		p.Args = append(p.Args, "--import", servicenet.NodeBootstrap(m.servicenet))
+	case pythonRuntime:
+		pythonPath := servicenet.PythonPath(m.servicenet)
+		if own := e.Manifest.Env["PYTHONPATH"]; own != "" {
+			pythonPath += ":" + own
+		}
+		env = append(env, "PYTHONPATH="+pythonPath)
 	}
 	keys := make([]string, 0, len(e.Manifest.Env))
 	for k := range e.Manifest.Env {
+		if adapter == pythonRuntime && k == "PYTHONPATH" {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
@@ -560,12 +581,6 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 		env = append(env, k+"="+e.Manifest.Env[k])
 	}
 	p.Env = env
-	if bridged && e.Manifest.Command == "node" {
-		if networkBootstrap == "" {
-			return nil, fmt.Errorf("immutable Node egress bridge unavailable")
-		}
-		p.Args = append(p.Args, "--import", networkBootstrap)
-	}
 	p.Args = append(p.Args, e.Manifest.Args...)
 	p.Limits = servicesandbox.Limits{AddressSpace: uint64(e.Manifest.MemoryMB) << 20, Processes: uint64(e.Manifest.Processes), Files: 256, FileSize: 64 << 20}
 	if err = p.Validate(); err != nil {

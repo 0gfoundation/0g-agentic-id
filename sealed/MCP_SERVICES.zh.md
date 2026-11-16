@@ -9,7 +9,7 @@ owner Harness 用 DSH 原生 MCP 客户端发现 sealed 私有 sign socket 上�
 manifest 必填 `id`、`command`、`args`、`files`；可选 `worker`、`description`、
 `env`、`network`、`egress_hosts`、`memory_mb`、`resident_memory_mb`、`processes`、`inference_budget`、
 `request_timeout_seconds`。文件是 `{path,data}`，即相对路径和标准 base64。
-`env` 是持久保存的**公开配置**。command 指定镜像中的可信解释器，例如 node；代码只在
+`env` 是持久保存的**公开配置**。command 指定镜像中的可信解释器，例如 node 或 python3；代码只在
 降权后执行。源码和依赖是版本目录里的普通只读文件，该目录就是程序的工作目录（用相对路径引用）；root 不解压、不处理符号链接、不安装包。
 
 程序监听 `$MCP_SOCKET`（在它私有的 run 目录里），公开入口是
@@ -77,9 +77,15 @@ provider 不需要任何改动：dev runner（内核 6.17、Landlock ABI 7、Sys
 格式的 egress_hosts，主机名最多 253 个字符。私有 Unix HTTP/CONNECT 代理（每个身份最多 64 个连接）只允许这些目标，并拒绝私网、
 loopback、link-local、metadata IP，包括 DNS 解析结果。服务进程没有自己的网络 socket：
 sealed 在容器 loopback（owner 也共用）上的监听端口它连不到，因为 inet socket 和 TCP connect
-都被拒绝。Node 自动加载租用运行包里的引导（`$HARNESS_RUNTIME_ROOT/src/service-network.mjs`，
-Node >=24.14），把 `fetch` 以 CONNECT 隧道经 Unix 代理发出；基于 `node:http`/`https` 的客户端
-没有出口，其他语言需自行连接 Unix 代理。不继承 owner 凭证代理。
+都被拒绝。sealed 把自己的网络适配器（`internal/servicenet`，编进 sealed 程序，启动时写到
+`/var/lib/sealed-service-programs/<id>/.servicenet`，属 root、只读）加载进每个 Node 和 Python 服务进程：Node 用 `--import`，Python 用 `PYTHONPATH`，排在
+manifest 自己的 `PYTHONPATH` 之前。适配器把运行时常用的 TCP 客户端以 CONNECT 隧道经 Unix 代理发出，
+主机名交给代理解析：Node 中是所有 `node:net`/`node:tls` 连接，即 `fetch`、`node:http`/`https`、http2
+及基于它们的客户端（axios、got、ws）；Python 中是 `socket.create_connection`（urllib、http.client）、
+urllib3（requests）、asyncio（httpx、websockets）和 aiohappyeyeballs（aiohttp）。主机 `seal-model`
+走模型代理，地址在 `$SEAL_MODEL_URL`（`http://seal-model/model`）。自行创建 TCP socket 的客户端、
+用 `-S`、`-I` 或 `-E` 运行的 Python，以及其他运行时，除非自己连接 Unix 代理，否则没有出口。
+适配器只是便利，不是边界。不继承 owner 凭证代理。
 
 单进程 rlimit：虚拟地址空间（默认 8192 MiB，128–16384）、每个身份的进程和线程数（默认 64，
 1–256；命令或 worker 是 `node` 时至少 16，发布时检查）、256 描述符和单文件 64 MiB。所有服务进程合计最多 2048 个进程和线程：

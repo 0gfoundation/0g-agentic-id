@@ -1,12 +1,13 @@
 # Sealed sandbox runtime image — 0g-harness flavour.
 #
-# Per-framework image, node-only: 0g-harness
-# (github.com/0gfoundation/0g-harness) composes the DeepSeek Harness (DSH)
-# plugin tree in-process and serves the owner's /v1/ surface. No Python
-# runtime, unlike images/prime/.
+# Per-framework image: 0g-harness (github.com/0gfoundation/0g-harness)
+# composes the DeepSeek Harness (DSH) plugin tree in-process and serves the
+# owner's /v1/ surface. The harness itself runs on node.
 #
-# Contents beyond debian-slim: node, ca-certificates (chain RPC + 0G storage +
-# router TLS), git and procps (the adapter's orphan sweep), one 0g-harness
+# Contents beyond debian-slim: node, python3 (an interpreter hosted MCP
+# services may name; sealed's network adapter for it is built into sealed),
+# ca-certificates (chain RPC + 0G storage + router TLS), git and procps (the
+# adapter's orphan sweep), one 0g-harness
 # official version package (its locked DSH dependency tree included), the
 # sealed bootstrap binary, the loader that runs it (cmd/loader),
 # sealed-service-launcher (cmd/service-launcher: confines each hosted service
@@ -116,7 +117,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -tags harnessonly -ldflags="-s -w" -o boot
 # fails the build.
 FROM debian:13-slim AS harness-package
 ARG NODE_VERSION=24.22.1
-ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/e2e77658967fa1dce2741f16ebc99b957a97c1d4
+ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/a31a82469319d701c87783fedcbcc606571a2739
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
@@ -143,7 +144,7 @@ RUN npm install -g --no-fund --no-audit "${HARNESS_REF}" \
 FROM debian:13-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils \
+ && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils python3 \
  && rm -rf /var/lib/apt/lists/*
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):
@@ -214,7 +215,7 @@ COPY --from=bootstrap-builder /app/service-launcher /usr/local/bin/sealed-servic
 # and the resolved binary must be root-owned too (privsep.LookPath; the boot
 # log lists PATH entries it rejected). Fail the build, rather than the first
 # boot, when that does not hold for a command sealed needs here.
-RUN for c in npm node pkill 0g-storage-client; do \
+RUN for c in npm node python3 pkill 0g-storage-client; do \
       w="$(command -v "$c")" || { echo "$c: not on PATH" >&2; exit 1; }; \
       for p in "$(readlink -f "$w")" "$(readlink -f "$(dirname "$w")")"; do \
         while :; do \

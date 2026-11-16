@@ -11,7 +11,7 @@ A manifest requires `id`, `command`, `args`, `files`; optional fields are
 `worker`, `description`, `env`, `network`, `egress_hosts`, `memory_mb`,
 `resident_memory_mb`, `processes`, `inference_budget`, `request_timeout_seconds`. Files are `{path,data}` with relative
 paths and standard-base64 contents. `env` is durable **public configuration**.
-Commands name trusted image interpreters such as `node`; owner code executes
+Commands name trusted image interpreters such as `node` or `python3`; owner code executes
 only after privilege drop. Source/dependencies are regular read-only files in
 the release directory, the program's working directory (name them by relative
 path); root never unpacks archives, interprets symlinks or installs packages.
@@ -106,11 +106,22 @@ open connections per identity) permits only
 those destinations and rejects private, loopback, link-local and metadata IPs,
 including DNS answers. A service process has no network socket of its own:
 sealed's listeners on the container's loopback (shared with the owner) stay out
-of reach, since inet sockets and TCP connect are refused. Node automatically
-loads the leased runtime's bootstrap (`$HARNESS_RUNTIME_ROOT/src/service-network.mjs`,
-Node >=24.14), which routes `fetch` through the Unix proxy as CONNECT tunnels;
-clients built on `node:http`/`https` have no route, and other runtimes must speak
-to the Unix proxy themselves. Owner credential proxies are never inherited.
+of reach, since inet sockets and TCP connect are refused. sealed loads its
+network adapter (`internal/servicenet`, built into the sealed binary, written
+root-owned and read-only to `/var/lib/sealed-service-programs/<id>/.servicenet`
+at start) into every Node and Python
+service process: Node through `--import`, Python through `PYTHONPATH`, ahead of
+the manifest's own `PYTHONPATH`. The adapter sends the runtime's ordinary TCP
+clients through the Unix proxy as CONNECT tunnels, leaving host names for the
+proxy to resolve: in Node every `node:net`/`node:tls` connect, so `fetch`,
+`node:http`/`https`, http2 and the clients built on them (axios, got, ws); in
+Python `socket.create_connection` (urllib, http.client), urllib3 (requests),
+asyncio (httpx, websockets) and aiohappyeyeballs (aiohttp). Host `seal-model`
+goes to the model proxy, at `$SEAL_MODEL_URL` (`http://seal-model/model`). A
+client that opens its own TCP socket, Python run with `-S`, `-I` or `-E`, and
+other runtimes have no route unless they speak to the Unix proxy themselves.
+The adapter is a convenience, not a boundary. Owner credential proxies are
+never inherited.
 
 Per-process rlimits: virtual address space (8192 MiB default, 128–16384),
 processes and threads per identity (64 default, 1–256; at least 16 when the

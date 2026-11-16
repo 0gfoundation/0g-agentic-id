@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,6 +108,28 @@ func imageSystem() systemPaths {
 		}
 	})
 	return system
+}
+
+type interpreterKind int
+
+const (
+	otherRuntime interpreterKind = iota
+	nodeRuntime
+	pythonRuntime
+)
+
+var pythonInterpreter = regexp.MustCompile(`^python[0-9]*(\.[0-9]+)?$`)
+
+// interpreterRuntime names the network adapter (servicenet) the resolved
+// interpreter loads, if any.
+func interpreterRuntime(interpreter string) interpreterKind {
+	switch name := filepath.Base(interpreter); {
+	case name == "node":
+		return nodeRuntime
+	case pythonInterpreter.MatchString(name):
+		return pythonRuntime
+	}
+	return otherRuntime
 }
 
 func withinAny(p string, dirs []string) bool {
