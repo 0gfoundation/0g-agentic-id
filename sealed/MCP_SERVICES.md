@@ -72,7 +72,8 @@ not reserve CPU for sealed or the owner there (isolation/README.md):
 
 - Landlock lets it read and execute only the image's system directories, its
   release and the leased Harness runtime, read `/etc/resolv.conf`, `/etc/hosts`,
-  `/etc/ssl/certs` and `/etc/ssl/openssl.cnf` (Node exits when it exists but cannot be read), use `/dev/null`, `zero`, `full`, `random`, `urandom`,
+  `/etc/ssl/certs` and `/etc/ssl/openssl.cnf` (Node exits when it exists but cannot be read)
+  and sealed's network adapters, use `/dev/null`, `zero`, `full`, `random`, `urandom`,
   list its private run directory, create sockets and remove entries there (no
   file or link, so a socket sealed dials cannot become a link), and write (and create files,
   links and sockets in, and execute from) only its private `$HOME` and
@@ -206,9 +207,9 @@ The socket fixes the owner's currently resolved HTTPS provider/model and injects
 the real model key only inside sealed. It offers no credential lookup, signing,
 redirect following or arbitrary upstream routing; coordinators receive no socket.
 The route works with `network:"none"`. Sealed sets `SEAL_MODEL_ID` and
-`SEAL_MODEL_API`, and the Node bootstrap sets `SEAL_MODEL_URL`; Harness
-`mountServiceModel` uses a public placeholder; the real key never reaches it. Other runtimes can speak HTTP to the private
-Unix socket. These limits bound requests and requested output, not actual token
+`SEAL_MODEL_API`, and its network adapter sets `SEAL_MODEL_URL` in Node and
+Python; Harness `mountServiceModel` uses a public placeholder; the real key never
+reaches it. Other runtimes can speak HTTP to the private Unix socket. These limits bound requests and requested output, not actual token
 usage or currency spend; pricing and refunds remain application policy.
 
 Only the coordinator gets `$SEAL_EXEC_SOCKET`: POST `/executions` actions

@@ -54,7 +54,7 @@ nice 0 的进程分到的 CPU 一样多，所以 nice 在那里不能给 sealed 
 （isolation/README.zh.md）：
 
 - Landlock 只允许它读取并执行镜像的系统目录、自己的版本和租用的 Harness 运行包，读取
-  `/etc/resolv.conf`、`/etc/hosts`、`/etc/ssl/certs`、`/etc/ssl/openssl.cnf`（该文件存在却读不到时 Node 会直接退出），使用 `/dev/null`、`zero`、`full`、
+  `/etc/resolv.conf`、`/etc/hosts`、`/etc/ssl/certs`、`/etc/ssl/openssl.cnf`（该文件存在却读不到时 Node 会直接退出）和 sealed 的网络适配器，使用 `/dev/null`、`zero`、`full`、
   `random`、`urandom`，在私有 run 目录里列目录、建 socket、删除条目（不能建文件或链接，
   sealed 要连的 socket 不能被换成链接），只在自己私有的 `$HOME` 和 `$TMPDIR` 里写（以及建文件、链接、socket，
   执行其中的程序）。`/proc` 不可读，TCP bind/connect 被拒绝，抽象 Unix socket 和信号只能
@@ -141,7 +141,7 @@ Harness，不自动进模型消息，不注册到 owner credential scrubber。�
 上游失败也计数。worker 生命周期取消调用，单次响应流限 8 MiB。
 socket 固定 owner 当前解析的 HTTPS provider/model，真实模型密钥只在 sealed 内注入。
 不提供凭证查询、签名、跟随重定向或任意上游路由；协调进程拿不到该 socket。
-`network:"none"` 也可使用。sealed 设置 SEAL_MODEL_ID、SEAL_MODEL_API，Node 引导设置 SEAL_MODEL_URL；
+`network:"none"` 也可使用。sealed 设置 SEAL_MODEL_ID、SEAL_MODEL_API，其网络适配器在 Node 和 Python 中设置 SEAL_MODEL_URL；
 Harness mountServiceModel 使用公开占位符，拿不到真实密钥。其他语言可对私有 Unix socket 发 HTTP。
 这些限制约束请求和请求的输出上限，不等于实际 token 用量或货币支出额度；定价、退款仍属于应用。
 
