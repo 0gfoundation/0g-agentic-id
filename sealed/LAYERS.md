@@ -162,7 +162,8 @@ release, and hands it to the loader only if it hashes to that name.
 ## 3. Base layer
 
 Contents:
-- Debian and a pinned node;
+- Debian and a pinned node; python3; a browser for the owner's agent
+  (Chromium and the Playwright MCP server, started by `sealed-browser-mcp`);
 - the loader;
 - one official harness package with all its dependencies, a fallback for when
   no other version can be fetched.
@@ -957,4 +958,4 @@ regular files and links that stay inside it. The `harness-package` stage of
 
 ## Hosted MCP programs
 
-The owner Harness can publish and supervise independent MCP programs through sealed's private service-management tools. See [MCP_SERVICES.md](MCP_SERVICES.md) for the manifest, isolation boundary, recovery and streaming proof policy. Owner settings `others.mcpServers` configure extra native DSH MCP connections; namespaces `seal` and `seal-reveal` are reserved.
+The owner Harness can publish and supervise independent MCP programs through sealed's private service-management tools. See [MCP_SERVICES.md](MCP_SERVICES.md) for the manifest, isolation boundary, recovery and streaming proof policy. Owner settings `others.mcpServers` configure extra native DSH MCP connections; namespaces `seal` and `seal-reveal` are reserved. The image's browser is one of them, off until the owner adds `{"serverName":"browser","transport":"stdio","command":"sealed-browser-mcp"}`: the agent then gets browser tools (open, click, type, fill forms, read the page, screenshot). Chromium runs headless without its own process sandbox, which needs user namespaces the container does not grant, and its traffic goes through sealed's credential proxy: a `[[credential:<name>]]` placeholder typed into a page is filled only for the hosts and positions the owner allowed, and Chromium trusts the proxy's per-boot CA by its key alone.

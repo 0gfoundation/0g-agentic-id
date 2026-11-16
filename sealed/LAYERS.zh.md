@@ -67,7 +67,8 @@
 ## 3. base 层
 
 内容：
-- Debian 和固定版本的 node；
+- Debian 和固定版本的 node；python3；给 owner 的 agent 用的浏览器（Chromium 和 Playwright MCP
+  服务器，由 `sealed-browser-mcp` 启动）；
 - 加载器；
 - 一个官方版本的 harness 包（含全部依赖），下载不到其他版本时回退用。
 
@@ -392,4 +393,4 @@ ProvisionBoot.v2:0x<seal_id>:<generation>:<sha256(ticket) 十六进制>:<boot_id
 
 ## 托管 MCP 程序
 
-owner Harness 可以通过 sealed 的私有服务管理工具发布和托管独立 MCP 程序。[MCP_SERVICES.zh.md](MCP_SERVICES.zh.md) 说明 manifest、隔离边界、恢复与流式证明策略。owner 设置 `others.mcpServers` 配置额外的 DSH 原生 MCP 连接；`seal` 和 `seal-reveal` 是保留命名空间。
+owner Harness 可以通过 sealed 的私有服务管理工具发布和托管独立 MCP 程序。[MCP_SERVICES.zh.md](MCP_SERVICES.zh.md) 说明 manifest、隔离边界、恢复与流式证明策略。owner 设置 `others.mcpServers` 配置额外的 DSH 原生 MCP 连接；`seal` 和 `seal-reveal` 是保留命名空间。镜像自带的浏览器也是其中一个，默认关闭，owner 加上 `{"serverName":"browser","transport":"stdio","command":"sealed-browser-mcp"}` 后，agent 就有浏览器工具（打开、点击、输入、填表、读取页面、截图）。Chromium 以无头方式运行，不开它自身的进程沙箱（需要容器没有给的 user namespace），流量经 sealed 的凭证代理：在页面里输入的 `[[credential:<名字>]]` 占位符只在 owner 允许的主机和位置上被填入，Chromium 只按公钥额外信任代理每次启动生成的 CA。
