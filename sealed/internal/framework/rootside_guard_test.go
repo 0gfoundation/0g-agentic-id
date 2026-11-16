@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"seal-verify/internal/servicesandbox"
 )
 
 // sealed runs as root, and the agent process can change any tree handed to
@@ -150,13 +152,19 @@ var allowedDirectCalls = map[string]struct {
 // rootCommands is everything root executes: the functions that may call
 // privsep.RootCommand, and the binaries (string literals) each may name.
 var rootCommands = map[string][]string{
-	"internal/servicehost.Manager.command":       {"sealed-service-launcher"},
-	"internal/servicehost.ProbeIsolation":        {"sealed-service-launcher"},
-	"internal/servicehost.reapIdentity":          {"sealed-service-launcher"},
 	"internal/dataplane.downloadTo":              {"0g-storage-client"},
 	"internal/framework/openclaw.installCommand": {"npm"},
 	"internal/framework/hermes.installHermes":    {"git", "uv"},
 	"internal/framework/prime.npmGlobalRoot":     {"npm"},
+}
+
+// rootSelfModes is everything root runs of sealed's own program: the
+// functions that may call privsep.RootSelf, and the modes (string literals)
+// each may name. The hosted-service launcher is the only one.
+var rootSelfModes = map[string][]string{
+	"internal/servicehost.Manager.command": {servicesandbox.LauncherMode},
+	"internal/servicehost.ProbeIsolation":  {servicesandbox.LauncherMode},
+	"internal/servicehost.reapIdentity":    {servicesandbox.LauncherMode},
 }
 
 // rootEnvHelpers are the functions whose result a rootCommands function may
@@ -756,8 +764,8 @@ func (s *moduleScan) inspectFile(rel, pkgDir string, f *ast.File, info *types.In
 					return true
 				}
 				if call == nil {
-					if name == "RootCommand" {
-						flag("privsep.RootCommand used as a value", n)
+					if name == "RootCommand" || name == "RootSelf" {
+						flag("privsep."+name+" used as a value", n)
 					}
 					return true
 				}
@@ -1013,29 +1021,34 @@ func TestRootRunsOnlyPinnedToolchainCommands(t *testing.T) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	seen := map[string]bool{}
-	for _, fn := range keys {
-		for _, c := range s.calls[fn] {
-			if c.name != "RootCommand" {
-				continue
-			}
-			allowed, ok := rootCommands[fn]
-			switch {
-			case !ok:
-				t.Errorf("%s: %s runs a command as root (privsep.RootCommand); only the functions in rootCommands may", c.pos, fn)
-			case !c.lit:
-				t.Errorf("%s: %s passes RootCommand a non-literal command name; name the binary literally", c.pos, fn)
-			case !contains(allowed, c.arg):
-				t.Errorf("%s: %s runs %q as root; rootCommands allows it only %v", c.pos, fn, c.arg, allowed)
-			default:
-				seen[fn+" "+c.arg] = true
+	for _, rule := range []struct {
+		call, list string
+		allowed    map[string][]string
+	}{{"RootCommand", "rootCommands", rootCommands}, {"RootSelf", "rootSelfModes", rootSelfModes}} {
+		seen := map[string]bool{}
+		for _, fn := range keys {
+			for _, c := range s.calls[fn] {
+				if c.name != rule.call {
+					continue
+				}
+				allowed, ok := rule.allowed[fn]
+				switch {
+				case !ok:
+					t.Errorf("%s: %s runs a command as root (privsep.%s); only the functions in %s may", c.pos, fn, rule.call, rule.list)
+				case !c.lit:
+					t.Errorf("%s: %s passes %s a non-literal name; name it literally", c.pos, fn, rule.call)
+				case !contains(allowed, c.arg):
+					t.Errorf("%s: %s runs %q as root; %s allows it only %v", c.pos, fn, c.arg, rule.list, allowed)
+				default:
+					seen[fn+" "+c.arg] = true
+				}
 			}
 		}
-	}
-	for fn, names := range rootCommands {
-		for _, n := range names {
-			if !seen[fn+" "+n] {
-				t.Errorf("rootCommands lists %s running %q, but no such call exists; update the list", fn, n)
+		for fn, names := range rule.allowed {
+			for _, n := range names {
+				if !seen[fn+" "+n] {
+					t.Errorf("%s lists %s running %q, but no such call exists; update the list", rule.list, fn, n)
+				}
 			}
 		}
 	}

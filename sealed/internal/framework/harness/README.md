@@ -132,8 +132,9 @@ commit, as long as the chain still holds what this container last committed
 - **`tool-cordis`**: in-process tool definition, unaudited and gone on restart.
 - **The DSH `sandbox` stack**: the owner Harness uses local executors behind
   privsep's kernel UID boundary. Hosted programs run under sealed's own
-  confinement (a service UID, Landlock, seccomp: `sealed/isolation/README.md`);
-  the Harness image includes that launcher.
+  confinement (a service UID, Landlock, seccomp: `sealed/isolation/README.md`),
+  started by sealed's own program in its launcher mode, so the launcher is
+  always the build of the sealed that runs it.
 - **`web`, `e2b`, persistent `terminal`, `goals`, `agent-presets`,
   continuable subagents**: capability surface deferred (see below).
 

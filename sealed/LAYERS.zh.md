@@ -17,7 +17,7 @@
 
 ### sealed
 
-- **内容**：sealed 程序，含全部 adapter、平台说明、doctrine 和 provider 注册表。
+- **内容**：sealed 程序，含全部 adapter、平台说明、doctrine、provider 注册表，以及限制托管程序的 launcher（sealed 以 launcher 模式运行自己的可执行文件：`sealed/isolation/README.zh.md`）。
 - **职能**：中立层。保管 agent 和 owner 彼此不能拿到的东西（身份私钥、数据密钥、owner 托付的凭证、聊天令牌）；掌握入口、推理、出站、签名四个通道；执行不能交给 harness 的规则（4.3）；跟踪和上传 iData；签 ServeProof。
 - **谁定**：项目方。
 - **加载和校验**：base 不带 sealed。加载器从信任合约的 sealed 名单里选一个版本（第 3 节），按哈希从公开的制品发布处下载（第 10 节）；换版本时，由正在运行的 sealed 在链上确认目标版本在名单里，下载后交给加载器。加载器每次执行 sealed 之前，都核对它的哈希，并在链上查它在不在这张名单里。attestor 每次下发私钥前复查。
@@ -72,7 +72,7 @@
 - sealed 要用的工具：git、procps、0g-storage-client（编镜像时 sealed 的 `go.mod` 固定的那个版本；要用别的版本的 sealed，就要新镜像）；
 - 加载器。
 
-base 不带 sealed，也不带 harness 包：两者都按信任合约的名单从制品发布处取（第 10 节）。新镜像的容器启动之前，能在它上面跑的 sealed 和 harness 包要先发布、登记（第 8 节）。
+base 不带 sealed，也不带 harness 包：两者都按信任合约的名单从制品发布处取（第 10 节）。新镜像的容器启动之前，能在它上面跑的 sealed 和 harness 包要先发布、登记（第 8 节）。托管程序的 launcher 也不在 base 里：它是 sealed 程序的一部分，随 sealed 版本一起换。
 
 加载器（`sealed/cmd/loader`）只做四件事：
 1. 启动后先加固自己：不可 dump，设置 `no_new_privs`，和 sealed 一样。
@@ -305,6 +305,7 @@ salt(root) = HMAC-SHA256(数据密钥, "AgentDNA.Commitment.v1" ‖ 0x00 ‖ 角
 所以镜像只在其余部分都就位时运行：
 - 链上的 AgenticID（1.4.0 及以后）指向信任合约。别的链上，加载器什么都不执行，并记日志说明需要它；
 - 制品发布处有已发布、已登记的 sealed 程序和 harness 包。没有登记的 sealed，加载器什么都不执行；没有登记的 harness 包，sealed 退出，加载器过一阵再启动它；之后登记的版本两者都会用上；
+- 登记的 sealed 自带托管程序的 launcher。launcher 并入 sealed 之前编译的 sealed 会去找 `sealed-service-launcher` 命令，这个镜像里没有：agent 照常运行，但托管程序报告隔离不可用。带 launcher 的 sealed 登记之后，这些版本要撤下；
 - attestor 在 `GET /provision` 的回答里声明分层流程（`"layered": true`，第 10 节）。没有声明时，sealed 什么都不申请就退出，加载器过一阵再启动它。
 
 ### 中立代理：可以单独发布

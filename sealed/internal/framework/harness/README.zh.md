@@ -68,7 +68,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 
 - **`settings-file`**:它会热加载,把 `$DSH_HOME/settings.yaml` 叠在组合之上。挂了它,agent 改一下这个文件,就能给自己塞一条任意的推理路由。我们的做法是:Start 之前,由适配器按 owner 的 settings 文档把模型选择渲染成 `SEAL_MODEL_*` 环境变量,传给 harness(`settings.go`)。不存在 `settings.yaml` 这个文件。
 - **`tool-cordis`**:让 agent 在进程内自定义工具。这些工具没法审计,重启还会丢。
-- **DSH `sandbox` 那一套**：owner Harness 使用本地执行器，隔离边界由 privsep 的内核 UID 提供；托管程序由 sealed 自己限制（服务 UID、Landlock、seccomp：`sealed/isolation/README.zh.md`），Harness 镜像包含对应启动器。
+- **DSH `sandbox` 那一套**：owner Harness 使用本地执行器，隔离边界由 privsep 的内核 UID 提供；托管程序由 sealed 自己限制（服务 UID、Landlock、seccomp：`sealed/isolation/README.zh.md`），由 sealed 程序自身以启动器模式启动，启动器总是运行它的那个 sealed 的同一构建。
 - **`web`、`e2b`、常驻 `terminal`、`goals`、`agent-presets`、可续聊的子 agent**:这些能力暂不提供,见下面的档位规划。
 
 **owner 可调的**:settings 文档的 `others` 段 → `SEAL_HARNESS_*` 环境变量。什么都不填,就是出厂组合。推送一次配置,下次 spawn 时生效:重启的是进程,不是容器。

@@ -215,6 +215,25 @@ func RootCommand(ctx context.Context, name string, args ...string) (*exec.Cmd, e
 	return cmd, nil
 }
 
+// RootSelf is RootCommand for this program's own executable (os.Executable)
+// with mode as its first argument: sealed runs the code it carries for
+// another role this way (the hosted-service launcher,
+// servicesandbox.LauncherMode), so that code is always the build of the
+// sealed that runs it. The executable is checked like an absolute
+// RootCommand path: a root-owned regular file in root-only directories (the
+// loader's state directory, or /bootstrap). Which modes may be run, and from
+// where, is fixed by the root-side guard test (rootSelfModes).
+func RootSelf(ctx context.Context, mode string, args ...string) (*exec.Cmd, error) {
+	if mode == "" || strings.ContainsAny(mode, "/\x00") {
+		return nil, fmt.Errorf("privsep: RootSelf takes a bare mode, got %q", mode)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("privsep: this program's executable: %w", err)
+	}
+	return RootCommand(ctx, self, append([]string{mode}, args...)...)
+}
+
 // RootDir sets the working directory of cmd, a RootCommand, to dir after
 // checking that dir resolves to a directory which, with every directory
 // above it, is owned by root and writable by nobody else.

@@ -57,6 +57,7 @@ import (
 	"seal-verify/internal/scrub"
 	"seal-verify/internal/secretenv"
 	"seal-verify/internal/servicehost"
+	"seal-verify/internal/servicesandbox"
 	"seal-verify/internal/settings"
 	"seal-verify/internal/state"
 	"seal-verify/internal/uploader"
@@ -106,6 +107,16 @@ type storageDescription struct {
 }
 
 func main() {
+	// The sealed program is also the trusted launcher of hosted service
+	// processes: servicehost starts this executable as root with
+	// servicesandbox.LauncherMode first (privsep.RootSelf), so the launcher
+	// is always this build. That run is dispatched before anything else, so
+	// it registers no adapter, hardens nothing, logs nothing and touches none
+	// of sealed's state; the launcher refuses to run unless it is root.
+	if len(os.Args) > 1 && os.Args[1] == servicesandbox.LauncherMode {
+		os.Exit(servicesandbox.Launch(os.Args[2:]))
+	}
+
 	// Register the adapters this build bundles (adapters.go, or
 	// adapters_harnessonly.go for the 0g-harness image). Which one this
 	// deployment uses is resolved after the chain bootstrap, from the

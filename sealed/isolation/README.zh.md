@@ -2,9 +2,8 @@
 
 [English](README.md)
 
-sealed 在 agent 自己的沙箱里运行每个托管服务进程（`internal/servicesandbox`，由
-`sealed-service-launcher` 启动），不用 namespace，不需要 provider 六项以外的 capability，
-也不改 provider：
+sealed 在 agent 自己的沙箱里运行每个托管服务进程（`internal/servicesandbox`），不用 namespace，
+不需要 provider 六项以外的 capability，也不改 provider：
 
 | 机制 | 限制内容 |
 | --- | --- |
@@ -21,6 +20,10 @@ sealed 在 agent 自己的沙箱里运行每个托管服务进程（`internal/se
 进程对外只有 Unix socket：sealed 交给它的那些（出网代理，只到发布的主机，以 CONNECT 隧道；
 每个任务的模型代理），以及文件权限本身允许它连接的路径型 socket，Landlock 不管这类 socket。sealed 自己在容器 loopback（owner 也共用）上的监听端口它连不到，因为 inet
 socket 和 TCP connect 都被拒绝。
+
+launcher 就是 sealed 程序自身：sealed 以 root 运行自己的可执行文件，第一个参数是
+`sealed-service-launcher`（`privsep.RootSelf`），`main` 在做任何其他事之前把这次运行交给
+launcher。所以每个 sealed 版本运行的都是和它一起编译的 launcher。
 
 ## 在 dev runner 上的实测（2026-11-13）
 

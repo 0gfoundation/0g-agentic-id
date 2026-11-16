@@ -15,10 +15,11 @@
 # chain, downloads the version to run from the official `artifacts` release,
 # checks that it hashes to its listed name and runs it; that sealed installs
 # the harness package the harness list names the same way, into
-# /opt/0g-harness/<sha256>/ (root's, read-only to the agent). The image also
-# carries sealed-service-launcher (cmd/service-launcher: confines each hosted
-# service process). The image hash covers base and the loader; what runs on
-# top is what the chain lists.
+# /opt/0g-harness/<sha256>/ (root's, read-only to the agent). The sealed
+# program is also the launcher that confines each hosted service process (it
+# runs its own executable in launcher mode, internal/servicesandbox), so a
+# sealed version always runs with its own launcher. The image hash covers base
+# and the loader; what runs on top is what the chain lists.
 #
 # This file builds both of them too. The sealed program (stage 2) and the
 # harness package (stage 3) are exported, put on the `artifacts` release
@@ -58,6 +59,11 @@
 #      run only on the node they were built for. List them before its image
 #      boots; a listed package that does not start on a base is recorded as
 #      failed in that container, and the next listed one starts.
+#   4. The listed sealed carries the hosted-service launcher (it runs itself
+#      in launcher mode; this image has no separate launcher). A sealed built
+#      before that runs here without hosted programs, which report isolation
+#      unavailable: delist those versions once one with the launcher is
+#      listed.
 # Hashes are listed through the registry's owner, the environment's Timelock:
 # a scheduled operation that takes effect after its delay (one day on
 # mainnet, none on testnet and dev); delisting is immediate, by the owner or
@@ -99,7 +105,6 @@ COPY *.go ./
 COPY internal/ ./internal/
 COPY cmd/ ./cmd/
 RUN CGO_ENABLED=0 GOOS=linux go build -tags harnessonly -ldflags="-s -w" -o bootstrap . \
- && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o service-launcher ./cmd/service-launcher \
  && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o loader ./cmd/loader \
  && echo "sealed program sha256 $(sha256sum bootstrap | cut -d' ' -f1)"
 
@@ -224,7 +229,6 @@ RUN install -d -o root -g root -m 0755 /opt/0g-harness
 
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
 COPY --from=bootstrap-builder /app/loader /loader
-COPY --from=bootstrap-builder /app/service-launcher /usr/local/bin/sealed-service-launcher
 
 # sealed resolves every command it runs by name — as root (RootCommand) and
 # as the agent (AgentCommand, Sweep) alike — only through PATH directories

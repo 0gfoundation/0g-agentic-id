@@ -36,7 +36,9 @@ only base, sealed and the official harness get fields of their own.
 ### sealed
 
 - **Contents**: the sealed program, with every adapter, the platform doc, the
-  doctrine and the provider registry.
+  doctrine, the provider registry and the launcher that confines hosted
+  programs (sealed runs its own executable in launcher mode:
+  `sealed/isolation/README.md`).
 - **Role**: the neutral layer. It holds what the agent and the owner must not
   get from each other (the identity key, the data key, owner-entrusted
   credentials, the chat token); it controls the entry, inference, egress and
@@ -169,6 +171,8 @@ Contents:
 Base carries no sealed and no harness package: both come from the trust
 registry's lists and the artifacts release (§10). Before a new image boots, a
 sealed and a harness package that run on it are published and listed (§8).
+Nor does it carry a launcher for hosted programs: that is part of the sealed
+program, so it changes with the sealed version.
 
 The loader (`sealed/cmd/loader`) does four things:
 1. Hardens itself first: non-dumpable and `no_new_privs`, like sealed.
@@ -758,6 +762,11 @@ So the image runs only where the rest is in place:
   and listed. Without a listed sealed the loader runs nothing; without a
   listed harness package sealed exits, and the loader starts it again later;
   both pick up a version listed afterwards;
+- a listed sealed that carries the hosted-program launcher. A sealed built
+  before the launcher moved into it looks for a `sealed-service-launcher`
+  command, which this image does not have: the agent runs, but hosted
+  programs report isolation unavailable. Such versions are delisted once a
+  sealed with the launcher is listed;
 - an attestor that declares the layered flow in its `GET /provision` answer
   (`"layered": true`, §10). Without it sealed claims nothing and exits, and the
   loader starts it again later.

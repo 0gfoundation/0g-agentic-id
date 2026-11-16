@@ -144,6 +144,8 @@ func withinAny(p string, dirs []string) bool {
 // ProbeIsolation runs the trusted launcher's probe: it confines itself at a
 // service identity and checks that Landlock and the seccomp filter refuse
 // what they must. It never relaxes capabilities or the provider's policy.
+// The launcher is sealed's own program (privsep.RootSelf with
+// servicesandbox.LauncherMode), so it is always the build of this sealed.
 func ProbeIsolation(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -153,9 +155,9 @@ func ProbeIsolation(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	cmd, err := privsep.RootCommand(ctx, "sealed-service-launcher", "probe")
+	cmd, err := privsep.RootSelf(ctx, "sealed-service-launcher", "probe")
 	if err != nil {
-		return fmt.Errorf("%w: trusted service launcher is required: %v", ErrIsolationUnavailable, err)
+		return fmt.Errorf("%w: trusted service launcher (sealed's own program) cannot run: %v", ErrIsolationUnavailable, err)
 	}
 	// Probe diagnostics are bounded by this fixed trusted command and contain
 	// no owner state or task input. Keep the concrete denial actionable.

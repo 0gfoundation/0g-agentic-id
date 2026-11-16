@@ -588,7 +588,7 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 	}
 	// Only the trusted launcher executes as root; it drops to the service
 	// identity, then sets the rlimits, before the interpreter runs.
-	cmd, err := privsep.RootCommand(ctx, "sealed-service-launcher", p.LauncherArgs()...)
+	cmd, err := privsep.RootSelf(ctx, "sealed-service-launcher", p.LauncherArgs()...)
 	if err != nil {
 		return nil, err
 	}
