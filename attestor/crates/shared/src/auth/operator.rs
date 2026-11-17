@@ -3,10 +3,10 @@
 
 use super::{verify_eip191_envelope, Canonical};
 use crate::{
-    sandbox::verify_envelope, ChainClient, CryptoModule, Deployment, DeploymentRepo,
+    sandbox::verify_envelope, ChainClient, Config, CryptoModule, Deployment, DeploymentRepo,
     SandboxEnvelope, SealId,
 };
-use alloy::primitives::{Address, Bytes};
+use alloy::primitives::{Address, Bytes, B256};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,6 +22,16 @@ pub struct OperatorDirective {
     pub allow_recreate: bool,
     pub expires_at: i64,
     pub issued_at: i64,
+    #[serde(default)]
+    pub checkpoint: Option<OperatorCheckpoint>,
+}
+
+/// A canonical block known to the signer before authorizing a new grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCheckpoint {
+    pub number: u64,
+    pub hash: B256,
 }
 
 impl Canonical for OperatorDirective {
@@ -65,6 +75,39 @@ pub enum LifecyclePermission {
     Recreate,
 }
 
+/// The API and queued worker use the same first-provision boundary, including
+/// conservative handling of an inconsistent or historically imported row.
+pub fn create_permission(deployment: &Deployment) -> LifecyclePermission {
+    if deployment.sandbox_id.as_deref().unwrap_or("").is_empty()
+        && deployment.provisioned_at.is_none()
+    {
+        LifecyclePermission::Provision
+    } else {
+        LifecyclePermission::Recreate
+    }
+}
+
+/// Dependency outages must remain distinguishable from an invalid grant or
+/// signature at the HTTP boundary. All variants still fail closed.
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeAuthorizationError {
+    #[error("{0}")]
+    Denied(anyhow::Error),
+    #[error("owner_of: {0}")]
+    ChainUnavailable(#[source] anyhow::Error),
+    #[error("runtime authorization storage: {0}")]
+    StoreUnavailable(#[source] anyhow::Error),
+}
+
+impl RuntimeAuthorizationError {
+    fn classify(error: anyhow::Error) -> Self {
+        match error.downcast::<Self>() {
+            Ok(error) => error,
+            Err(error) => Self::Denied(error),
+        }
+    }
+}
+
 /// Compute delegation does not confer image, process or owner-configuration
 /// control. The attestor injects all runtime wiring after validating this
 /// small request surface; SDK inference credentials are the only allowed env.
@@ -98,6 +141,32 @@ pub fn validate_operator_payload(payload: &serde_json::Value) -> anyhow::Result<
             "pass one inference credential format"
         );
     }
+    Ok(())
+}
+
+/// Both acceptance and execution validate the current configured image. The
+/// worker must repeat this after queueing because deployment/config may change.
+pub fn validate_operator_snapshot(
+    cfg: &Config,
+    framework: Option<&str>,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    validate_operator_payload(payload)?;
+    let framework = framework.ok_or_else(|| {
+        anyhow::anyhow!("operator provisioning requires the agent's recorded framework")
+    })?;
+    let entry = cfg
+        .frameworks
+        .iter()
+        .find(|entry| entry.name == framework)
+        .ok_or_else(|| {
+            anyhow::anyhow!("operator provisioning requires a supported agent framework")
+        })?;
+    let snapshot = entry.image.as_deref().unwrap_or(&cfg.sandbox_snapshot);
+    anyhow::ensure!(
+        payload.get("snapshot").and_then(|value| value.as_str()) == Some(snapshot),
+        "operator provisioning must use the agent's configured sealed snapshot"
+    );
     Ok(())
 }
 
@@ -186,7 +255,45 @@ pub fn verify_operator_grant(
     Ok(d)
 }
 
+/// Legacy stored grants have no anchor and retain their conservative transfer
+/// invalidation. New grants must additionally survive canonical-history checks.
+pub async fn validate_operator_checkpoint(
+    chain: &dyn ChainClient,
+    agent: crate::AgentId,
+    directive: &OperatorDirective,
+) -> Result<(), RuntimeAuthorizationError> {
+    if let Some(checkpoint) = directive.checkpoint.as_ref() {
+        let owner = chain
+            .owner_at_checkpoint(agent, checkpoint)
+            .await
+            .map_err(RuntimeAuthorizationError::ChainUnavailable)?;
+        if owner != Some(directive.owner) {
+            return Err(RuntimeAuthorizationError::Denied(anyhow::anyhow!(
+                "operator checkpoint is not canonical or names a different owner"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub async fn authorize_runtime(
+    chain: &dyn ChainClient,
+    crypto: &dyn CryptoModule,
+    repo: &dyn DeploymentRepo,
+    chain_id: u64,
+    contract: Address,
+    d: &Deployment,
+    envelope: &SandboxEnvelope,
+    permission: LifecyclePermission,
+) -> Result<RuntimePrincipal, RuntimeAuthorizationError> {
+    authorize_runtime_inner(
+        chain, crypto, repo, chain_id, contract, d, envelope, permission,
+    )
+    .await
+    .map_err(RuntimeAuthorizationError::classify)
+}
+
+async fn authorize_runtime_inner(
     chain: &dyn ChainClient,
     crypto: &dyn CryptoModule,
     repo: &dyn DeploymentRepo,
@@ -197,7 +304,9 @@ pub async fn authorize_runtime(
     permission: LifecyclePermission,
 ) -> anyhow::Result<RuntimePrincipal> {
     let message = verify_envelope(envelope, crypto)?;
-    let owner = live_owner(chain, d).await?;
+    let owner = live_owner(chain, d)
+        .await
+        .map_err(RuntimeAuthorizationError::ChainUnavailable)?;
     let actor = envelope.wallet_address;
     let expected_action = match permission {
         LifecyclePermission::Resume => "start",
@@ -219,11 +328,16 @@ pub async fn authorize_runtime(
             d.agent_id.is_some(),
             "operator cannot authorize an unminted agent"
         );
-        let grant = repo.operator_grant(d.seal_id).await?.ok_or_else(|| {
-            anyhow::anyhow!("signer is neither current owner nor an authorized operator")
-        })?;
+        let grant = repo
+            .operator_grant(d.seal_id)
+            .await
+            .map_err(RuntimeAuthorizationError::StoreUnavailable)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("signer is neither current owner nor an authorized operator")
+            })?;
         let directive =
             verify_operator_grant(&grant, owner, chain_id, contract, d.seal_id, crypto)?;
+        validate_operator_checkpoint(chain, d.agent_id.unwrap(), &directive).await?;
         anyhow::ensure!(
             directive.operator == Some(actor),
             "signer is not the authorized operator"
@@ -236,7 +350,7 @@ pub async fn authorize_runtime(
         }
         if permission == LifecyclePermission::Provision {
             anyhow::ensure!(
-                d.sandbox_id.as_deref().unwrap_or("").is_empty(),
+                create_permission(d) == LifecyclePermission::Provision,
                 "existing sandbox requires recreate permission"
             );
         }
@@ -280,7 +394,11 @@ pub async fn authorize_runtime(
                     "runtime envelope addresses a different sandbox"
                 );
             }
-            if let Some(boot) = repo.boot_authorization(d.seal_id).await? {
+            if let Some(boot) = repo
+                .boot_authorization(d.seal_id)
+                .await
+                .map_err(RuntimeAuthorizationError::StoreUnavailable)?
+            {
                 anyhow::ensure!(
                     boot.owner == Some(owner),
                     "sandbox belongs to a previous agent owner"
@@ -304,6 +422,52 @@ pub async fn authorize_runtime(
     Ok(principal)
 }
 
+/// Recheck authority after a provider operation without expiring a request
+/// that was valid when it was submitted. The caller separately fences the
+/// captured boot generation and sandbox mapping when committing its result.
+pub async fn revalidate_runtime_principal(
+    chain: &dyn ChainClient,
+    crypto: &dyn CryptoModule,
+    repo: &dyn DeploymentRepo,
+    chain_id: u64,
+    contract: Address,
+    d: &Deployment,
+    principal: &RuntimePrincipal,
+) -> Result<(), RuntimeAuthorizationError> {
+    async {
+        let owner = live_owner(chain, d)
+            .await
+            .map_err(RuntimeAuthorizationError::ChainUnavailable)?;
+        anyhow::ensure!(owner == principal.owner, "runtime owner changed");
+        if let Some(version) = principal.operator_version {
+            anyhow::ensure!(
+                d.agent_id.is_some(),
+                "operator cannot authorize an unminted agent"
+            );
+            let grant = repo
+                .operator_grant(d.seal_id)
+                .await
+                .map_err(RuntimeAuthorizationError::StoreUnavailable)?
+                .ok_or_else(|| anyhow::anyhow!("runtime operator authorization is missing"))?;
+            let directive =
+                verify_operator_grant(&grant, owner, chain_id, contract, d.seal_id, crypto)?;
+            validate_operator_checkpoint(chain, d.agent_id.unwrap(), &directive).await?;
+            anyhow::ensure!(
+                grant.version == version && directive.operator == Some(principal.actor),
+                "runtime operator authorization changed"
+            );
+        } else {
+            anyhow::ensure!(
+                principal.actor == owner,
+                "runtime signer is not the current owner"
+            );
+        }
+        Ok(())
+    }
+    .await
+    .map_err(RuntimeAuthorizationError::classify)
+}
+
 /// Every key-delivery and authenticated status path checks the operator
 /// revision as well as NFT ownership. Old containers cannot renew a receipt
 /// after their delegation expires or is revoked.
@@ -315,30 +479,41 @@ pub async fn validate_boot_operator(
     contract: Address,
     d: &Deployment,
     boot: &super::status::BootAuthorization,
-) -> anyhow::Result<()> {
-    let owner = live_owner(chain, d).await?;
-    anyhow::ensure!(
-        boot.enabled && boot.owner == Some(owner),
-        "boot belongs to a previous owner or was revoked"
-    );
-    if let Some(actor) = boot.operator {
-        let grant = repo
-            .operator_grant(d.seal_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("boot operator authorization is missing"))?;
-        let directive =
-            verify_operator_grant(&grant, owner, chain_id, contract, d.seal_id, crypto)?;
+) -> Result<(), RuntimeAuthorizationError> {
+    async {
+        let owner = live_owner(chain, d)
+            .await
+            .map_err(RuntimeAuthorizationError::ChainUnavailable)?;
         anyhow::ensure!(
-            directive.operator == Some(actor) && boot.operator_version == Some(grant.version),
-            "boot operator authorization changed"
+            boot.enabled && boot.owner == Some(owner),
+            "boot belongs to a previous owner or was revoked"
         );
-    } else {
-        anyhow::ensure!(
-            boot.operator_version.is_none(),
-            "inconsistent boot operator binding"
-        );
+        if let Some(actor) = boot.operator {
+            let grant = repo
+                .operator_grant(d.seal_id)
+                .await
+                .map_err(RuntimeAuthorizationError::StoreUnavailable)?
+                .ok_or_else(|| anyhow::anyhow!("boot operator authorization is missing"))?;
+            let directive =
+                verify_operator_grant(&grant, owner, chain_id, contract, d.seal_id, crypto)?;
+            let agent = d
+                .agent_id
+                .ok_or_else(|| anyhow::anyhow!("operator cannot authorize an unminted agent"))?;
+            validate_operator_checkpoint(chain, agent, &directive).await?;
+            anyhow::ensure!(
+                directive.operator == Some(actor) && boot.operator_version == Some(grant.version),
+                "boot operator authorization changed"
+            );
+        } else {
+            anyhow::ensure!(
+                boot.operator_version.is_none(),
+                "inconsistent boot operator binding"
+            );
+        }
+        Ok(())
     }
-    Ok(())
+    .await
+    .map_err(RuntimeAuthorizationError::classify)
 }
 
 #[cfg(test)]

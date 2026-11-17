@@ -77,12 +77,8 @@ pub async fn handle(
     // comes from the live NFT owner's versioned grant, not req.owner.
     let permission = if action == "start" {
         LifecyclePermission::Resume
-    } else if d.sandbox_id.as_deref().map(str::is_empty).unwrap_or(true)
-        && d.provisioned_at.is_none()
-    {
-        LifecyclePermission::Provision
     } else {
-        LifecyclePermission::Recreate
+        attestor_shared::auth::operator::create_permission(&d)
     };
     let principal =
         authorize_runtime_lifecycle(&state, &d, &req.sandbox_envelope, permission).await?;

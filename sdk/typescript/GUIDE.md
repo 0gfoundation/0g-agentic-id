@@ -214,25 +214,26 @@ await ag.agent.balanceOf(owner);            // → 5n       agents owned by `own
 const agentSeal = await ag.agent.getAgentSeal(agentId);
 await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → tx hash "0x…"
 
-// runtime start / stop / reset (owner-signed; on-chain identity preserved):
+// runtime start / stop / reset (owner or appointed operator; identity preserved):
 await ag.agent.stop(sealId, sandboxId);     // stop a running container
 await ag.agent.start(sealId, sandboxId);    // resume a STOPPED container
-await ag.agent.start(sealId, { apiKey });   // FIRST provision: bring a mint-only /
-                                            // never-provisioned agent online with a fresh
-                                            // container (apiKey: see "The model key" below).
-                                            // The semantic counterpart to a sandbox-less
-                                            // deploy; distinct from reset ("recreate an
-                                            // EXISTING one").
+await ag.agent.start(sealId, { apiKey });   // owner: resume the mapped sandbox, or first
+                                            // provision when there is no mapping.
+                                            // A failed resume never implicitly creates
+                                            // another paid sandbox; use reset explicitly.
+                                            // apiKey: see "The model key" below.
 await ag.agent.reset(sealId, { apiKey });   // recreate an EXISTING container: re-read iData
                                             // from chain, reselect the framework adapter.
                                             // sealedImage optional.
 // A booting agent with no settings document uses the model pinned in its minted
-// persona, which leaves the chain at its first commit. So start and reset of an
+// persona, which leaves the chain at its first commit. So OWNER start and reset of an
 // agent that has no document and is a clone or has provisioned before first
 // store DEFAULT_PERSONA_INFERENCE (0g-compute) as its settings: one more owner
 // signature, after every check that can refuse the call; an existing document is
 // never replaced. To start such an agent on another provider, write its settings
 // (setSettings) first. The CLI's reset applies the same rule (needsDefaultSettings).
+// Operators call start(sealId)/stop(sealId) after owner configuration; they cannot
+// supply model-key options or write settings/credentials. See OPERATORS.md.
 await ag.agent.listDeployments();
 // → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError,
 //      containerStatus }, …]

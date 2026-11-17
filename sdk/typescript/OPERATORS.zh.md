@@ -57,7 +57,10 @@ owner 调用保留原有的模型密钥存储和默认 settings 初始化行为�
 ## 授权范围与更新
 
 `getOperator(sealId)` 是公开查询，返回 `owner`、有效 `operator`、`version`、
-`expiresAt` 和 `allowRecreate`。授权过期或 NFT 转移后，`operator` 为 `null`。
+`expiresAt`、`allowRecreate`，以及包含区块高度和 hash 的块末 `checkpoint`。
+授权过期或 NFT 转移后，`operator` 为 `null`。尚未 mint 时，GET 返回 deployment
+owner，operator 与 checkpoint 均为 `null`；已有 owner stop/reset/retry 流程仍然可用，
+但写入 operator 授权必须等 agent mint 完成并获得 checkpoint。
 
 ```ts
 const grant = await owner.agent.getOperator(sealId);
@@ -80,6 +83,18 @@ await owner.agent.revokeOperator(sealId);
 请求不会因同一钱包被重新授权而恢复有效。执行前会再次检查授权；已经发送给
 provider 的操作仍可能完成。
 
+更新或撤销授权时，owner 的签名覆盖 GET 返回的原始 checkpoint。SDK 会拒绝不安全的
+JavaScript 区块整数、格式不正确的 hash 和缺失 checkpoint，不会自行补造。
+这需要 RPC 能提供 canonical 区块 hash 和历史 owner 查询。
+锚定在区块 `H` 结束时的授权，不会被迟到的 `H` 或更早区块中的 indexer 事件删除；
+`H` 之后的所有权转移在被 indexer 索引后使它失效。转出后又转回同一钱包的撤权
+依赖 indexer 追上进度，实时 owner 检查本身无法识别这种往返。
+没有签名 checkpoint 的旧存储证明按保守规则处理，不会给旧证明附加未经签名的锚点。
+
+每次生命周期调用只解析一次 operator 身份和 deployment，并在该次请求内复用这些
+数据来选择沙盒、规划仅 owner 可执行的模型操作。下一次调用会重新读取，
+不跨调用缓存授权；API 和 worker 仍各自执行授权检查。
+
 默认授权允许首次 provision 和正常起停；替换已有运行环境需要 `allowRecreate`。
 NFT 转移、owner settings、credentials、clone、retry 和 operator 管理仍归 owner。
 NFT 转移会使原 owner 的委托和启动授权失效。
@@ -90,6 +105,9 @@ operator 签署运行请求并支付沙盒费用，启动授权仍记录真正�
 `/provision` 保留 provider v3 certificate、已绑定容器身份与启动证明等检查，
 operator 钱包签名不能替代这些证明。agent 密钥只加密给验证过的容器，owner 的
 credentials 仍通过既有 provision 通道交付。
+
+已受理的 create 完成时，worker 会重新检查 owner、授权和 boot generation；
+不会仅因原始请求 envelope 已过期就丢弃创建结果。
 
 本功能增加委托授权，不增加空闲调度或常驻唤醒网关。stop 保持现有语义，
 不增加停机前最终状态同步，也不保证没有任务正在运行。应用需要在请求停机前

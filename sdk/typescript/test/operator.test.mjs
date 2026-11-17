@@ -12,25 +12,29 @@ const SEAL = `0x${'44'.repeat(32)}`;
 const CONTRACT = '0x0000000000000000000000000000000000000055';
 const PROVIDER = '0x0000000000000000000000000000000000000066';
 const SEAL_ADDR = '0x0000000000000000000000000000000000000077';
+const CHECKPOINT = { number: 123, hash: `0x${'cd'.repeat(32)}` };
 
 async function server(t, initial = {}) {
   const state = {
     owner: OWNER.address, operator: OPERATOR.address, version: 4, allow_recreate: false,
-    expires_at: 0, sandbox_id: null, sandbox_controller: null, ...initial,
+    expires_at: 0, sandbox_id: null, sandbox_controller: null, checkpoint: CHECKPOINT, ...initial,
   };
-  const puts = [], posts = [], signed = [];
+  const puts = [], posts = [], signed = [], reads = [];
   let putStatus = 200;
+  let getStatus = 200;
   let lifecycleStatus = 202;
   const http = createServer((req, res) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
       const url = new URL(req.url, 'http://fixture');
+      if (req.method === 'GET') reads.push(url.pathname);
       const json = (code, value) => {
         res.writeHead(code, { 'content-type': 'application/json' });
         res.end(JSON.stringify(value));
       };
-      if (req.method === 'GET' && url.pathname === '/operator') return json(200, state);
+      if (req.method === 'GET' && url.pathname === '/operator') return getStatus === 200
+        ? json(200, state) : json(getStatus, { error: 'operator lookup unavailable' });
       if (req.method === 'PUT' && url.pathname === '/operator') {
         const body = JSON.parse(Buffer.concat(chunks).toString());
         puts.push(body);
@@ -46,7 +50,7 @@ async function server(t, initial = {}) {
         return json(200, { seal_id: SEAL, framework: 'openclaw', sandbox_id: state.sandbox_id,
           provisioned_at: state.sandbox_id ? '2026-11-01T00:00:00Z' : null,
           // An owner start would seed settings; an operator must never do so.
-          clone_params: { source_agent_id: '1' }, settings_version: 0 });
+          clone_params: { source_agent_id: '1' }, settings_version: state.settings_version ?? 0 });
       }
       if (req.method === 'GET' && url.pathname === '/config') return json(200, {
         sandbox_snapshot: 'sealed-image', sandbox_provider_addr: PROVIDER,
@@ -73,8 +77,9 @@ async function server(t, initial = {}) {
       throw new Error(`unexpected chain call ${functionName}`);
     } },
   });
-  return { state, puts, posts, signed, base, client: (account) => new AttestorClient(ctx(account)),
-    failPut: (code) => { putStatus = code; }, failLifecycle: (code) => { lifecycleStatus = code; } };
+  return { state, puts, posts, signed, reads, base, client: (account) => new AttestorClient(ctx(account)),
+    failPut: (code) => { putStatus = code; }, failGet: (code) => { getStatus = code; },
+    failLifecycle: (code) => { lifecycleStatus = code; } };
 }
 
 function envelope(post) {
@@ -92,7 +97,7 @@ test('owner appoints and revokes an operator with domain-separated CAS signature
   assert.deepEqual(document, {
     domain: OPERATOR_DOMAIN, chain_id: 16602, contract: CONTRACT, seal_id: SEAL,
     owner: OWNER.address, base_version: 4, operator: OTHER.address, allow_recreate: true,
-    expires_at: expiry, issued_at: document.issued_at,
+    expires_at: expiry, issued_at: document.issued_at, checkpoint: CHECKPOINT,
   });
   assert.equal(await recoverMessageAddress({ message, signature: put.signature }), OWNER.address);
   assert.equal(updated.operator, OTHER.address);
@@ -105,6 +110,7 @@ test('owner appoints and revokes an operator with domain-separated CAS signature
   assert.equal(revoke.operator, null);
   assert.equal(revoke.allow_recreate, false);
   assert.equal(revoke.expires_at, 0);
+  assert.deepEqual(revoke.checkpoint, CHECKPOINT);
   assert.equal(revoked.operator, null);
 });
 
@@ -118,6 +124,36 @@ test('an operator cannot appoint itself; invalid grants and stale writes never s
   await assert.rejects(f.client(OWNER).setOperator(SEAL, OPERATOR.address, { baseVersion: 1 }), OperatorConflictError);
   assert.equal(f.puts.length, 1);
   assert.equal(f.signed.length, 1);
+});
+
+test('grant writes require and sign the exact checkpoint supplied by the lookup', async (t) => {
+  const f = await server(t, { checkpoint: null });
+  const c = f.client(OWNER);
+  assert.equal((await c.getOperator(SEAL)).checkpoint, null);
+  await assert.rejects(c.setOperator(SEAL, OPERATOR.address), /ownership checkpoint/);
+  assert.equal(f.signed.length, 0);
+  assert.equal(f.puts.length, 0);
+  const checkpoint = { number: 456, hash: `0x${'ef'.repeat(32)}` };
+  f.state.checkpoint = checkpoint;
+  await c.setOperator(SEAL, OPERATOR.address);
+  const document = JSON.parse(Buffer.from(f.puts[0].signed_message_b64, 'base64').toString());
+  assert.deepEqual(document.checkpoint, checkpoint);
+});
+
+test('unsafe checkpoint numbers and malformed block hashes are rejected before signing', async (t) => {
+  const f = await server(t);
+  const c = f.client(OWNER);
+  for (const checkpoint of [
+    { number: Number.MAX_SAFE_INTEGER + 1, hash: CHECKPOINT.hash },
+    { number: -1, hash: CHECKPOINT.hash },
+    { number: 1.5, hash: CHECKPOINT.hash },
+    { number: 123, hash: '0x1234' },
+  ]) {
+    f.state.checkpoint = checkpoint;
+    await assert.rejects(c.setOperator(SEAL, OPERATOR.address), /invalid authorization summary/);
+  }
+  assert.equal(f.signed.length, 0);
+  assert.equal(f.puts.length, 0);
 });
 
 test('operator pays under its signature while boot authority stays bound to the NFT owner', async (t) => {
@@ -155,6 +191,17 @@ test('operator lifecycle refuses owner configuration options before any write or
   assert.equal(f.posts.length, 0);
 });
 
+test('operator lifecycle never runs the owner-only model planning callback', async (t) => {
+  const f = await server(t);
+  let planned = false;
+  await f.client(OPERATOR).lifecycle('start', { sealId: SEAL, prepareModelKey: async () => {
+    planned = true;
+    throw new Error('owner callback must not run');
+  } });
+  assert.equal(planned, false);
+  assert.deepEqual(f.posts.map((p) => p.path), ['/start']);
+});
+
 test('operator facade never reads or writes the owner credential set', async (t) => {
   const f = await server(t, { allow_recreate: true });
   const ag = new AgentDNA({ attestorUrl: f.base, account: OPERATOR, addresses: { agenticID: CONTRACT } });
@@ -167,9 +214,54 @@ test('operator facade never reads or writes the owner credential set', async (t)
   await ag.agent.reset(SEAL);
   await assert.rejects(ag.agent.start(SEAL, { apiKey: 'fixture-model-key' }), /compute only/);
   await assert.rejects(ag.agent.reset(SEAL, { sealedModelKey: { provider: 'openai' } }), /compute only/);
+  await assert.rejects(ag.agent.start(SEAL, { keepStoredModelKey: true }), /compute only/);
   assert.deepEqual(readsOrWrites, []);
   assert.deepEqual(f.posts.map((p) => p.path), ['/start', '/reset']);
   for (const post of f.posts) assert.equal(post.body.sandbox_envelope.wallet_address, OPERATOR.address);
+});
+
+test('owner pre-mint stop, reset and retry accept a non-delegated summary without a checkpoint', async (t) => {
+  const f = await server(t, { operator: null, version: 0, checkpoint: null,
+    sandbox_id: 'pre-mint-sandbox', settings_version: 1 });
+  const ag = new AgentDNA({ attestorUrl: f.base, account: OWNER, addresses: { agenticID: CONTRACT } });
+  await ag.agent.stop(SEAL);
+  await ag.agent.reset(SEAL);
+  await ag.agent.retry(SEAL);
+  assert.deepEqual(f.posts.map((p) => p.path), ['/stop', '/reset', '/retry']);
+  for (const post of f.posts.slice(0, 2)) {
+    const { env, message } = envelope(post);
+    assert.equal(env.wallet_address, OWNER.address);
+    assert.equal(JSON.parse(message).agentic_id, undefined);
+  }
+});
+
+test('owner compatibility only tolerates an absent operator endpoint, not arbitrary lookup errors', async (t) => {
+  const f = await server(t, { operator: null, settings_version: 1 });
+  const c = f.client(OWNER);
+  for (const code of [400, 500]) {
+    f.failGet(code);
+    await assert.rejects(c.lifecycle('stop', { sealId: SEAL, sandboxId: 'sandbox' }), /operator failed/);
+  }
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.signed.length, 0);
+  f.failGet(404);
+  await c.lifecycle('stop', { sealId: SEAL, sandboxId: 'sandbox' });
+  assert.equal(f.posts[0].path, '/stop');
+});
+
+test('each lifecycle call reads authority and deployment once, without caching across calls', async (t) => {
+  for (const account of [OWNER, OPERATOR]) {
+    for (const action of ['start', 'reset', 'stop']) {
+      const f = await server(t, { sandbox_id: 'current-runtime', settings_version: 1 });
+      const ag = new AgentDNA({ attestorUrl: f.base, account, addresses: { agenticID: CONTRACT } });
+      await ag.agent[action](SEAL);
+      assert.equal(f.reads.filter((p) => p === '/operator').length, 1, `${account.address} ${action}: one authority read`);
+      assert.equal(f.reads.filter((p) => p.startsWith('/deployment/')).length, 1, `${action}: one deployment read`);
+      await ag.agent[action](SEAL);
+      assert.equal(f.reads.filter((p) => p === '/operator').length, 2, `${action}: re-read authority on next call`);
+      assert.equal(f.reads.filter((p) => p.startsWith('/deployment/')).length, 2, `${action}: re-read deployment on next call`);
+    }
+  }
 });
 
 test('every operator request binds the current grant version; revoked and expired operators sign nothing', async (t) => {

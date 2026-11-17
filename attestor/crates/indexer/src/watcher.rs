@@ -40,6 +40,7 @@ type HttpProvider = RootProvider<Http<Client>>;
 pub struct Watcher {
     provider: HttpProvider,
     contract_addr: Address,
+    chain_id: u64,
     /// Canonical ERC-8004 registry the AgenticID contract is bound to. After
     /// binding, Registered / URIUpdated are emitted here, not on contract_addr.
     canonical_addr: Address,
@@ -71,12 +72,15 @@ impl Watcher {
         Ok(Self {
             provider,
             contract_addr: cfg.agentic_id_addr,
+            chain_id: cfg.chain_id,
             canonical_addr: cfg.canonical_addr,
             crypto,
             deployments,
             events,
             jobs,
-            credentials: attestor_shared::credentials_repo::PostgresCredentialRepo::new(pool.clone()),
+            credentials: attestor_shared::credentials_repo::PostgresCredentialRepo::new(
+                pool.clone(),
+            ),
             pool,
             http: reqwest::Client::new(),
             start_block: cfg.indexer_start_block,
@@ -128,14 +132,78 @@ impl Watcher {
             "fetched logs"
         );
 
-        for log in &logs {
-            if let Err(e) = self.handle_log(log).await {
-                tracing::warn!(error = %e, "log handler failed");
-            }
-        }
+        // Failed ownership/checkpoint reads must retry the range. Advancing
+        // past one would permanently miss the outgoing owner's ABA revocation.
+        self.process_logs(&logs).await?;
 
         save_checkpoint(&self.pool, CHECKPOINT_NAME, to_block as i64).await?;
         Ok(logs.len())
+    }
+
+    async fn process_logs(&self, logs: &[alloy::rpc::types::Log]) -> anyhow::Result<()> {
+        for log in logs {
+            self.handle_log(log).await?;
+        }
+        Ok(())
+    }
+
+    async fn invalidate_transfer_grant(
+        &self,
+        agent: AgentId,
+        previous_owner: Address,
+        event_block: u64,
+    ) -> anyhow::Result<()> {
+        // Canonicality is checked before the mutation. A version CAS makes a
+        // concurrent new grant retry instead of inheriting the old decision.
+        for _ in 0..8 {
+            let Some(deployment) = self.deployments.get_by_agent_id(agent).await? else {
+                return Ok(());
+            };
+            let Some(grant) = self.deployments.operator_grant(deployment.seal_id).await? else {
+                return Ok(());
+            };
+            let checkpoint =
+                attestor_shared::repo::signed_operator_checkpoint(&grant, deployment.seal_id);
+            let canonical = if let Some(checkpoint) = checkpoint {
+                let scoped = attestor_shared::auth::operator::verify_operator_directive(
+                    &grant.signed_message_b64,
+                    grant.signature.as_ref(),
+                    grant.owner,
+                    self.chain_id,
+                    self.contract_addr,
+                    deployment.seal_id,
+                    self.crypto.as_ref(),
+                )
+                .is_ok();
+                if scoped
+                    && attestor_shared::chain::operator_checkpoint_is_canonical(
+                        &self.provider,
+                        &checkpoint,
+                    )
+                    .await?
+                {
+                    Some(checkpoint)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if self
+                .deployments
+                .invalidate_operator_for_transfer_at(
+                    agent,
+                    previous_owner,
+                    event_block,
+                    grant.version,
+                    canonical,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("operator grant changed repeatedly during transfer processing")
     }
 
     async fn handle_log(&self, log: &alloy::rpc::types::Log) -> anyhow::Result<()> {
@@ -206,12 +274,13 @@ impl Watcher {
             return Ok(());
         }
         let managed = match self.deployments.get_by_agent_id(ev.tokenId).await? {
-            Some(d) => self
-                .deployments
-                .boot_authorization(d.seal_id)
-                .await?
-                .is_some_and(|a| a.enabled && a.owner.is_some())
-                || self.deployments.operator_grant(d.seal_id).await?.is_some(),
+            Some(d) => {
+                self.deployments
+                    .boot_authorization(d.seal_id)
+                    .await?
+                    .is_some_and(|a| a.enabled && a.owner.is_some())
+                    || self.deployments.operator_grant(d.seal_id).await?.is_some()
+            }
             None => false,
         };
         let live_owner = if managed {
@@ -226,18 +295,17 @@ impl Watcher {
         self.deployments.set_owner(ev.tokenId, live_owner).await?;
         // Revoke by the outgoing owner even when ownership has already
         // returned to that address before the indexer observes the event.
-        self.deployments
-            .invalidate_operator_for_transfer(ev.tokenId, ev.from)
+        self.invalidate_transfer_grant(ev.tokenId, ev.from, block)
             .await?;
-        // A new ownership: credential sets are signed per epoch, so the
-        // previous owner's set can never be served again, and it is dropped.
+        // Advancing the ownership epoch and dropping its old credentials are
+        // one operation. Retrying this range must not clear a fresh set that
+        // the owner stored for an epoch already processed successfully.
         if let Some(d) = self.deployments.get_by_agent_id(ev.tokenId).await? {
-            if let Err(e) = self.credentials.set_epoch(d.seal_id, block as i64).await {
-                tracing::warn!(seal_id = ?d.seal_id, error = %e, "transfer: credential epoch update failed");
-            }
-            if let Err(e) = self.credentials.clear(d.seal_id).await {
-                tracing::warn!(seal_id = ?d.seal_id, error = %e, "transfer: credential clear failed");
-            }
+            let epoch = i64::try_from(block)
+                .map_err(|_| anyhow::anyhow!("ownership block exceeds epoch range"))?;
+            self.credentials
+                .advance_ownership_epoch(d.seal_id, epoch)
+                .await?;
         }
         // Drop the container pubkey binding so the prior owner's resumed
         // container (reused SANDBOX_SEAL_KEY, stale attestation) can no longer
@@ -686,6 +754,7 @@ mod tests {
         Watcher {
             provider,
             contract_addr: Address::ZERO,
+            chain_id: 16602,
             canonical_addr: Address::ZERO,
             crypto: Arc::new(RealCrypto::new_for_test([0u8; 32])),
             deployments,
@@ -892,6 +961,392 @@ mod tests {
         )
     }
 
+    async fn serve_checkpoint_rpc(
+        owner: Address,
+        checkpoint: attestor_shared::auth::operator::OperatorCheckpoint,
+        canonical: bool,
+        fail_block: bool,
+    ) -> (HttpProvider, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let request = loop {
+                    let mut b = [0; 4096];
+                    let n = stream.read(&mut b).await.unwrap();
+                    assert!(n > 0);
+                    raw.extend_from_slice(&b[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        if let Ok(value) =
+                            serde_json::from_slice::<serde_json::Value>(&raw[pos + 4..])
+                        {
+                            break value;
+                        }
+                    }
+                };
+                let id = request["id"].clone();
+                let response = match request["method"].as_str().unwrap() {
+                    "eth_call" => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":format!("0x{}{}","00".repeat(12),hex::encode(owner))})
+                    }
+                    "eth_getBlockByNumber" if fail_block => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":"checkpoint RPC unavailable"}})
+                    }
+                    "eth_getBlockByNumber" => {
+                        let mut block =
+                            alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+                        block.header.number = checkpoint.number;
+                        block.header.hash = if canonical {
+                            checkpoint.hash
+                        } else {
+                            B256::repeat_byte(0xff)
+                        };
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":block})
+                    }
+                    method => panic!("unexpected method {method}"),
+                };
+                let body = response.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+            }
+        });
+        (
+            ProviderBuilder::new().on_http(format!("http://{address}").parse().unwrap()),
+            task,
+        )
+    }
+
+    async fn checkpoint_runtime() -> (
+        Watcher,
+        Arc<InMemoryDeploymentRepo>,
+        Arc<InMemoryJobQueue>,
+        Address,
+        SealId,
+        AgentId,
+        attestor_shared::auth::status::BootAuthorization,
+    ) {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+        use attestor_shared::auth::operator::{OperatorCheckpoint, OperatorGrant};
+        use base64::Engine as _;
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let jobs = Arc::new(InMemoryJobQueue::new());
+        let owner_key = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x16)).unwrap();
+        let owner = owner_key.address();
+        let seal = B256::repeat_byte(0xa6);
+        let agent = U256::from(16);
+        let actor = Address::repeat_byte(0xb6);
+        seed_bound(&deployments, seal, agent, owner);
+        let record = deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .container_record
+            .unwrap();
+        let proof = serde_json::to_vec(&serde_json::json!({
+            "domain":"AgenticID.Operator.v1","chain_id":16602,"contract":Address::ZERO,
+            "seal_id":seal,"owner":owner,"base_version":0,"operator":actor,
+            "allow_recreate":false,"expires_at":0,"issued_at":Utc::now().timestamp(),
+            "checkpoint":OperatorCheckpoint {number:102,hash:B256::repeat_byte(0xa2)},
+        }))
+        .unwrap();
+        let signature: Vec<u8> = owner_key
+            .sign_hash_sync(&B256::from(attestor_shared::sandbox::eip191_digest(&proof)))
+            .unwrap()
+            .into();
+        deployments
+            .compare_and_swap_operator(
+                seal,
+                0,
+                OperatorGrant {
+                    version: 1,
+                    owner,
+                    signed_message_b64: base64::engine::general_purpose::STANDARD.encode(proof),
+                    signature: signature.into(),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        deployments
+            .complete_operator_teardown(seal, "sb-1")
+            .await
+            .unwrap();
+        let generation = deployments
+            .prepare_operator_boot(seal, Some([6; 32]), owner, actor, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        deployments
+            .bind_runtime_sandbox(
+                seal,
+                "new-after-aba".into(),
+                generation,
+                Some(record.pubkey.to_vec()),
+            )
+            .await
+            .unwrap();
+        let claim = attestor_shared::auth::status::BootClaim {
+            generation,
+            ticket_hash: [6; 32],
+            boot_id: B256::repeat_byte(6),
+            started_at: Utc::now().timestamp(),
+        };
+        assert!(deployments
+            .bind_status_boot(seal, &record, [6; 32], None, &claim)
+            .await
+            .unwrap());
+        let boot = deployments.boot_authorization(seal).await.unwrap().unwrap();
+        let watcher = test_watcher(
+            deployments.clone(),
+            Arc::new(InMemoryEventBus::new()),
+            jobs.clone(),
+        );
+        (watcher, deployments, jobs, owner, seal, agent, boot)
+    }
+
+    #[tokio::test]
+    async fn retried_transfer_preserves_credentials_written_for_the_current_epoch() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let events = Arc::new(InMemoryEventBus::new());
+        let jobs = Arc::new(InMemoryJobQueue::new());
+        let seal = B256::repeat_byte(0xae);
+        let agent = U256::from(17);
+        let seller = Address::repeat_byte(0x11);
+        let buyer = Address::repeat_byte(0x22);
+        seed_bound(&deployments, seal, agent, seller);
+        let watcher = test_watcher(deployments, events, jobs);
+        let event = || AgenticID::Transfer {
+            from: seller,
+            to: buyer,
+            tokenId: agent,
+        };
+        watcher.on_transfer(event(), 100).await.unwrap();
+        assert_eq!(watcher.credentials.epoch(seal).await.unwrap(), 100);
+        watcher
+            .credentials
+            .put(
+                seal,
+                buyer,
+                100,
+                0,
+                serde_json::json!({"current":"owner credentials"}),
+                serde_json::json!({"rt":{"value":"owner writeback"}}),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        watcher.credentials.set_pending(seal, 2).await.unwrap();
+        assert!(watcher
+            .credentials
+            .claim_reminder(seal, "rt", 1, 1_900_000_000)
+            .await
+            .unwrap());
+        let stored = watcher.credentials.get(seal).await.unwrap().unwrap();
+        // A later log in this range failed its RPC read. Replaying this
+        // already successful Transfer must leave current-epoch writes alone.
+        watcher.on_transfer(event(), 100).await.unwrap();
+        let replayed = watcher.credentials.get(seal).await.unwrap().unwrap();
+        assert_eq!(replayed.owner_epoch, 100);
+        assert_eq!(replayed.version, stored.version);
+        assert_eq!(replayed.document, stored.document);
+        assert_eq!(replayed.writebacks, stored.writebacks);
+        assert_eq!(
+            watcher.credentials.pending_counts(&[seal]).await.unwrap()[0].pending,
+            2
+        );
+        assert!(!watcher
+            .credentials
+            .claim_reminder(seal, "rt", 1, 1_900_000_000)
+            .await
+            .unwrap());
+        // The next genuine ownership epoch still clears all previous state.
+        watcher
+            .on_transfer(
+                AgenticID::Transfer {
+                    from: buyer,
+                    to: seller,
+                    tokenId: agent,
+                },
+                101,
+            )
+            .await
+            .unwrap();
+        assert_eq!(watcher.credentials.epoch(seal).await.unwrap(), 101);
+        assert!(watcher.credentials.get(seal).await.unwrap().is_none());
+        assert!(watcher
+            .credentials
+            .pending_counts(&[seal])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(watcher
+            .credentials
+            .claim_reminder(seal, "rt", 1, 1_900_000_000)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn delayed_transfer_preserves_new_same_owner_checkpoint_runtime() {
+        use attestor_shared::auth::operator::OperatorCheckpoint;
+        let (mut watcher, deployments, jobs, owner, seal, agent, boot) = checkpoint_runtime().await;
+        let checkpoint = OperatorCheckpoint {
+            number: 102,
+            hash: B256::repeat_byte(0xa2),
+        };
+        for block in [101, 102] {
+            let (provider, rpc) = serve_checkpoint_rpc(owner, checkpoint, true, false).await;
+            watcher.provider = provider;
+            watcher
+                .on_transfer(
+                    AgenticID::Transfer {
+                        from: owner,
+                        to: Address::repeat_byte(0xb1),
+                        tokenId: agent,
+                    },
+                    block,
+                )
+                .await
+                .unwrap();
+            rpc.await.unwrap();
+            assert_eq!(
+                deployments
+                    .operator_grant(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version,
+                1
+            );
+            assert_eq!(
+                deployments.boot_authorization(seal).await.unwrap().unwrap(),
+                boot
+            );
+            assert_eq!(
+                deployments
+                    .get(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .sandbox_id
+                    .as_deref(),
+                Some("new-after-aba")
+            );
+            assert!(deployments
+                .pending_operator_teardowns()
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(jobs.submitted.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rpc_failure_aborts_log_range_before_checkpoint_advance() {
+        use attestor_shared::auth::operator::OperatorCheckpoint;
+        let (mut watcher, deployments, _, owner, seal, agent, boot) = checkpoint_runtime().await;
+        watcher.canonical_addr = Address::repeat_byte(0x99);
+        let (provider, rpc) = serve_checkpoint_rpc(
+            owner,
+            OperatorCheckpoint {
+                number: 102,
+                hash: B256::repeat_byte(0xa2),
+            },
+            true,
+            true,
+        )
+        .await;
+        watcher.provider = provider;
+        let event = AgenticID::Transfer {
+            from: owner,
+            to: Address::repeat_byte(0xb1),
+            tokenId: agent,
+        };
+        let log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: event.encode_log_data(),
+            },
+            block_number: Some(101),
+            ..Default::default()
+        };
+        // tick awaits this range before save_checkpoint. Its error is propagated,
+        // not swallowed, so no database checkpoint write can be reached.
+        assert!(watcher.process_logs(&[log]).await.is_err());
+        rpc.await.unwrap();
+        assert_eq!(
+            deployments
+                .operator_grant(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+        assert_eq!(
+            deployments.boot_authorization(seal).await.unwrap().unwrap(),
+            boot
+        );
+        assert!(deployments
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn noncanonical_checkpoint_does_not_exempt_an_outgoing_grant() {
+        use attestor_shared::auth::operator::OperatorCheckpoint;
+        let (mut watcher, deployments, _, owner, seal, agent, _) = checkpoint_runtime().await;
+        let (provider, rpc) = serve_checkpoint_rpc(
+            owner,
+            OperatorCheckpoint {
+                number: 102,
+                hash: B256::repeat_byte(0xa2),
+            },
+            false,
+            false,
+        )
+        .await;
+        watcher.provider = provider;
+        watcher
+            .on_transfer(
+                AgenticID::Transfer {
+                    from: owner,
+                    to: Address::repeat_byte(0xb1),
+                    tokenId: agent,
+                },
+                101,
+            )
+            .await
+            .unwrap();
+        rpc.await.unwrap();
+        assert_eq!(
+            deployments
+                .operator_grant(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            2
+        );
+        assert!(deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .sandbox_id
+            .is_none());
+        assert!(deployments
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "new-after-aba".into())));
+    }
+
     #[tokio::test]
     async fn late_transfer_preserves_current_owner_operator_grant_without_a_boot() {
         let deployments = Arc::new(InMemoryDeploymentRepo::new());
@@ -906,28 +1361,49 @@ mod tests {
         // The latest buyer has delegated before the indexer catches up, but
         // has not provisioned a runtime yet. Grant history still requires a
         // live owner lookup instead of trusting this older Transfer event.
-        deployments.compare_and_swap_operator(seal, 0,
-            attestor_shared::auth::operator::OperatorGrant {
-                version: 1,
-                owner: current_owner,
-                signed_message_b64: String::new(),
-                signature: Bytes::new(),
-            },
-        ).await.unwrap().unwrap();
-        assert!(deployments.boot_authorization(seal).await.unwrap().is_none());
+        deployments
+            .compare_and_swap_operator(
+                seal,
+                0,
+                attestor_shared::auth::operator::OperatorGrant {
+                    version: 1,
+                    owner: current_owner,
+                    signed_message_b64: String::new(),
+                    signature: Bytes::new(),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deployments
+            .boot_authorization(seal)
+            .await
+            .unwrap()
+            .is_none());
         let mut w = test_watcher(deployments.clone(), events, jobs.clone());
         let (provider, rpc) = serve_owner(current_owner).await;
         w.provider = provider;
-        w.on_transfer(AgenticID::Transfer {
-            from: seller,
-            to: intermediate_buyer,
-            tokenId: agent,
-        }, 100).await.unwrap();
+        w.on_transfer(
+            AgenticID::Transfer {
+                from: seller,
+                to: intermediate_buyer,
+                tokenId: agent,
+            },
+            100,
+        )
+        .await
+        .unwrap();
         rpc.await.unwrap();
-        assert_eq!(deployments.get(seal).await.unwrap().unwrap().owner, current_owner);
+        assert_eq!(
+            deployments.get(seal).await.unwrap().unwrap().owner,
+            current_owner
+        );
         let grant = deployments.operator_grant(seal).await.unwrap().unwrap();
         assert_eq!(grant.owner, current_owner);
-        assert_eq!(grant.version, 1, "a later owner's grant must remain effective");
+        assert_eq!(
+            grant.version, 1,
+            "a later owner's grant must remain effective"
+        );
         assert!(jobs.submitted.lock().unwrap().is_empty());
     }
 

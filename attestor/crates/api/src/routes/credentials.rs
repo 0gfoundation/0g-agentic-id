@@ -272,7 +272,7 @@ pub async fn handle_writeback(
                 &auth,
             )
             .await
-            .map_err(|e| ApiError::forbidden(format!("boot authorization: {e}")))?;
+            .map_err(super::lifecycle_auth::boot_authorization_error)?;
         }
     }
     let boot = state.credentials.current_boot_id(req.seal_id).await?;

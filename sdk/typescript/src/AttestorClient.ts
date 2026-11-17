@@ -486,16 +486,23 @@ export class AttestorClient {
     const body = await res.json() as {
       owner: Address; operator: Address | null; version: number; allow_recreate: boolean;
       expires_at: number;
+      checkpoint?: { number?: unknown; hash?: unknown } | null;
     };
+    const checkpoint = body.checkpoint;
     if (!isAddress(body.owner) || (body.operator !== null && !isAddress(body.operator)) ||
         !Number.isSafeInteger(body.version) || body.version < 0 ||
         !Number.isSafeInteger(body.expires_at) || body.expires_at < 0 ||
-        typeof body.allow_recreate !== 'boolean') {
+        typeof body.allow_recreate !== 'boolean' ||
+        (checkpoint != null && (!Number.isSafeInteger(checkpoint.number) || Number(checkpoint.number) < 0 ||
+          typeof checkpoint.hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(checkpoint.hash)))) {
       throw new Error('/operator returned an invalid authorization summary');
     }
     return {
       sealId, owner: getAddress(body.owner), operator: body.operator === null ? null : getAddress(body.operator),
       version: body.version, allowRecreate: body.allow_recreate, expiresAt: body.expires_at,
+      checkpoint: checkpoint == null ? null : {
+        number: checkpoint.number as number, hash: checkpoint.hash as `0x${string}`,
+      },
     };
   }
 
@@ -514,6 +521,9 @@ export class AttestorClient {
     const { account, walletClient } = requireWallet(this.ctx);
     const current = await this.getOperator(sealId);
     if (getAddress(account.address) !== current.owner) throw new Error('operator authorization requires the current NFT owner');
+    if (!current.checkpoint) {
+      throw new Error('operator authorization requires a minted agent and an ownership checkpoint from the attestor');
+    }
     const base = opts.baseVersion ?? current.version;
     const expiry = operator === null ? 0 : opts.expiresAt ?? 0;
     if (!Number.isSafeInteger(base) || base < 0) throw new Error('operator baseVersion must be a nonnegative safe integer');
@@ -533,6 +543,7 @@ export class AttestorClient {
       owner: account.address, base_version: base, operator,
       allow_recreate: operator === null ? false : opts.allowRecreate ?? false,
       expires_at: expiry, issued_at: Math.floor(Date.now() / 1000),
+      checkpoint: current.checkpoint,
     });
     const signature = await walletClient.signMessage({ account, message: canonical });
     const res = await fetch(`${this.baseUrl()}/operator`, {
@@ -1116,6 +1127,8 @@ export class AttestorClient {
     params: {
       sealId: `0x${string}`;
       sandboxId?: string;
+      /** Resolve the current mapping inside this request, without a second deployment read. */
+      resolveSandbox?: boolean;
       /** Framework name for `reset`/first `start` — the SDK resolves its
        *  sealed image from GET /config's frameworks[] (same as deploy), so a
        *  non-default framework doesn't need `sealedImage` passed. */
@@ -1136,6 +1149,10 @@ export class AttestorClient {
       /** Run once every check that can refuse has passed, before the first
        *  write or signature (the model key going into the credential set). */
       beforeWrite?: () => Promise<void>;
+      /** SDK owner-only model-key planning after runtime identity has been resolved. Never run for an operator. */
+      prepareModelKey?: () => Promise<{ keyInCredentials: boolean; beforeWrite?: () => Promise<void> }>;
+      /** Original facade options, checked without running owner callbacks for an operator. */
+      operatorOptions?: Parameters<typeof assertOperatorComputeOptions>[0];
       /** LEGACY(model-key): the key already sealed to this agent (the value
        *  {@link sealApiKey} returned, e.g. on an integrator's server), in place
        *  of `apiKey`: signed verbatim as `SEAL_SECRET_ENV`, so the key never
@@ -1147,17 +1164,33 @@ export class AttestorClient {
       envelopeTtlSec?: number;
     },
   ): Promise<void> {
-    const authority = await this.runtimeAuthority(params.sealId);
+    // Resolve identity and deployment once for this call. Never reuse a grant
+    // across calls; API and worker still revalidate at their own boundaries.
+    const deploymentPurpose = op === 'stop' ? 'resolve the sandbox'
+      : (op === 'reset' || !params.sandboxId) && !params.sealedImage && !params.framework
+        ? "pick the sealed image and check the agent's settings" : "check the agent's settings";
+    const [authority, row] = await Promise.all([
+      this.runtimeAuthority(params.sealId),
+      op !== 'stop' || (params.resolveSandbox && !params.sandboxId)
+        ? this.deploymentRow(params.sealId, deploymentPurpose)
+        : Promise.resolve(undefined),
+    ]);
     const operator = !!authority.binding;
-    if (operator) assertOperatorComputeOptions(params);
+    if (operator) {
+      assertOperatorComputeOptions(params);
+      assertOperatorComputeOptions(params.operatorOptions ?? {});
+    }
+    const keyPlan = operator ? undefined : await params.prepareModelKey?.();
+    const keyInCredentials = keyPlan?.keyInCredentials ?? params.keyInCredentials;
+    const sandboxId = params.sandboxId ?? (params.resolveSandbox ? row?.sandbox_id as string | undefined : undefined);
     const ttl = params.envelopeTtlSec ?? 180;
     // `reset`, OR a first-time `start` of a never-provisioned (mint-only)
     // agent: both spin a FRESH container via the `create` envelope. A `start`
     // WITH a sandboxId resumes an existing (stopped) container instead.
-    const create = op === 'reset' || (op === 'start' && !params.sandboxId);
-    if (!create && !params.sandboxId) throw new Error(`${op}: sandboxId is required`);
+    const create = op === 'reset' || (op === 'start' && !sandboxId);
+    if (!create && !sandboxId) throw new Error(`${op}: sandboxId is required`);
     const requestKey = carriesRequestKey(params);
-    if (create && !operator && params.provider && params.provider !== '0g-compute' && !requestKey && !params.keyInCredentials) {
+    if (create && !operator && params.provider && params.provider !== '0g-compute' && !requestKey && !keyInCredentials) {
       throw new SecretEnvRefusedError('invalid_input', `reset/start for ${params.provider} requires its API key`);
     }
     // Every boot a start or reset brings about is served the agent's settings
@@ -1165,15 +1198,8 @@ export class AttestorClient {
     // one stored first (see needsDefaultSettings). The row is read, and every
     // check below that can refuse runs, before anything is written or signed.
     let seed: { provider: string; model: string } | null = null;
-    let row: Record<string, unknown> | undefined;
     if (op !== 'stop') {
-      row = await this.deploymentRow(
-        params.sealId,
-        create && !params.sealedImage && !params.framework
-          ? "pick the sealed image and check the agent's settings"
-          : "check the agent's settings",
-      );
-      seed = operator ? null : this.defaultSettingsFor(row);
+      seed = operator ? null : this.defaultSettingsFor(row!);
       if (seed && params.provider && params.provider !== seed.provider) {
         throw new Error(
           `${op}: agent ${params.sealId} has no settings document and could boot with no model; ` +
@@ -1182,7 +1208,7 @@ export class AttestorClient {
       }
     }
     let action: string = op;
-    let resourceId = params.sandboxId ?? '';
+    let resourceId = sandboxId ?? '';
     let payload: Record<string, unknown> = {};
     if (create) {
       const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId, row);
@@ -1207,7 +1233,10 @@ export class AttestorClient {
           : {}),
       };
     }
-    if (!operator) await params.beforeWrite?.();
+    if (!operator) {
+      await params.beforeWrite?.();
+      await keyPlan?.beforeWrite?.();
+    }
     if (seed) {
       await storeDefaultSettings(
         { setSettings: (sealId, settings, opts) => this.setSettings({ sealId, settings, baseVersion: opts.baseVersion }) },

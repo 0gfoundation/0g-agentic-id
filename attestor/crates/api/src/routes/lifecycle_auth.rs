@@ -22,7 +22,9 @@
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use attestor_shared::auth::operator::{LifecyclePermission, RuntimePrincipal};
+use attestor_shared::auth::operator::{
+    LifecyclePermission, RuntimeAuthorizationError, RuntimePrincipal,
+};
 use attestor_shared::sandbox::verify_envelope;
 use attestor_shared::{Deployment, SandboxEnvelope};
 
@@ -78,7 +80,30 @@ pub(super) async fn authorize_runtime_lifecycle(
         permission,
     )
     .await
-    .map_err(|e| ApiError::unauthorized(format!("runtime authorization: {e}")))
+    .map_err(runtime_authorization_error)
+}
+
+pub(super) fn runtime_authorization_error(error: RuntimeAuthorizationError) -> ApiError {
+    match error {
+        RuntimeAuthorizationError::Denied(error) => {
+            ApiError::unauthorized(format!("runtime authorization: {error}"))
+        }
+        RuntimeAuthorizationError::ChainUnavailable(error) => {
+            ApiError::unavailable(format!("runtime owner verification unavailable: {error}"))
+        }
+        RuntimeAuthorizationError::StoreUnavailable(error) => {
+            ApiError::internal(format!("runtime authorization storage: {error}"))
+        }
+    }
+}
+
+pub(super) fn boot_authorization_error(error: RuntimeAuthorizationError) -> ApiError {
+    match error {
+        RuntimeAuthorizationError::Denied(error) => {
+            ApiError::forbidden(format!("boot authorization: {error}"))
+        }
+        error => runtime_authorization_error(error),
+    }
 }
 
 /// Delegating compute management does not let an operator change the agent's
@@ -99,34 +124,32 @@ pub(super) fn validate_operator_create(
             "an operator cannot change the agent's framework",
         ));
     }
-    attestor_shared::auth::operator::validate_operator_payload(payload)
-        .map_err(|e| ApiError::forbidden(format!("operator provisioning: {e}")))?;
-    let framework = deployment.framework.as_deref().ok_or_else(|| {
-        ApiError::forbidden("operator provisioning requires the agent's recorded framework")
-    })?;
-    let entry = state
-        .cfg
-        .frameworks
-        .iter()
-        .find(|entry| entry.name == framework)
-        .ok_or_else(|| {
-            ApiError::forbidden("operator provisioning requires a supported agent framework")
-        })?;
-    let snapshot = entry
-        .image
-        .as_deref()
-        .unwrap_or(&state.cfg.sandbox_snapshot);
-    let object = payload
-        .as_object()
-        .ok_or_else(|| ApiError::bad_request("operator create payload must be an object"))?;
-    if object.get("snapshot").and_then(|value| value.as_str()) != Some(snapshot)
-        || object
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("image") || key.eq_ignore_ascii_case("volumes"))
-    {
-        return Err(ApiError::forbidden(
-            "operator provisioning must use the agent's configured sealed snapshot without image overrides or volumes",
+    attestor_shared::auth::operator::validate_operator_snapshot(
+        &state.cfg,
+        deployment.framework.as_deref(),
+        payload,
+    )
+    .map_err(|error| ApiError::forbidden(format!("operator provisioning: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn dependency_outages_are_not_reported_as_invalid_authorization() {
+        let rpc = runtime_authorization_error(RuntimeAuthorizationError::ChainUnavailable(
+            anyhow::anyhow!("RPC unavailable"),
         ));
+        assert_eq!(rpc.status, StatusCode::SERVICE_UNAVAILABLE);
+        let storage = runtime_authorization_error(RuntimeAuthorizationError::StoreUnavailable(
+            anyhow::anyhow!("database unavailable"),
+        ));
+        assert_eq!(storage.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let denied = runtime_authorization_error(RuntimeAuthorizationError::Denied(
+            anyhow::anyhow!("operator authorization expired"),
+        ));
+        assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
     }
-    Ok(())
 }

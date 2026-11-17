@@ -3,7 +3,13 @@ import type { Address, Hash } from 'viem';
 /** Owner-signed, agent-scoped runtime delegation (not an NFT approval). */
 export const OPERATOR_DOMAIN = 'AgenticID.Operator.v1';
 
-/** Public operator and current runtime routing information. */
+/** End-of-block ownership checkpoint covered by the owner's grant signature. */
+export interface OperatorCheckpoint {
+  number: number;
+  hash: Hash;
+}
+
+/** Public operator authorization information, resolved against live ownership. */
 export interface OperatorState {
   sealId: Hash;
   owner: Address;
@@ -12,6 +18,8 @@ export interface OperatorState {
   allowRecreate: boolean;
   /** Unix seconds; 0 means until replaced or revoked. */
   expiresAt: number;
+  /** Null before mint or on an attestor that cannot anchor a new grant. */
+  checkpoint: OperatorCheckpoint | null;
 }
 
 export interface OperatorOptions {

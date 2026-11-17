@@ -47,7 +47,7 @@ export { ReputationClient, MAX_ABS_FEEDBACK_VALUE } from './ReputationClient';
 export { AttestorClient, CLONE_DOMAIN, CLONE_CONTRACT_DOMAIN, DEPLOY_DOMAIN, b64encode } from './AttestorClient';
 export type { CloneParams, DeployParams, IDataInput, DeployCloneResponse } from './AttestorClient';
 export { OPERATOR_DOMAIN, OperatorConflictError } from './Operators';
-export type { OperatorState, OperatorOptions, RuntimeBinding } from './Operators';
+export type { OperatorState, OperatorOptions, OperatorCheckpoint, RuntimeBinding } from './Operators';
 // Sealed secret env (issue #166): the inference key sealed to the agent's
 // agentSeal key instead of riding the signed envelope in clear.
 export { SECRET_ENV_SCHEME, SECRET_ENV_VAR, SecretEnvRefusedError, sealSecretEnv } from './secretEnv';

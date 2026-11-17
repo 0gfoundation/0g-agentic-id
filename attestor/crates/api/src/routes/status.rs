@@ -85,7 +85,7 @@ pub async fn handle(
                 &auth,
             )
             .await
-            .map_err(|e| ApiError::forbidden(format!("boot authorization: {e}")))?;
+            .map_err(super::lifecycle_auth::boot_authorization_error)?;
         }
     }
 

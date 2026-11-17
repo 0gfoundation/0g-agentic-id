@@ -220,7 +220,7 @@ async fn provision(
             &auth,
         )
         .await
-        .map_err(|e| ApiError::forbidden(format!("boot authorization: {e}")))?;
+        .map_err(super::lifecycle_auth::boot_authorization_error)?;
     }
     *authorized = Some(auth.generation);
 
@@ -925,6 +925,7 @@ pub(crate) mod tests {
             "allow_recreate": false,
             "expires_at": 0,
             "issued_at": Utc::now().timestamp(),
+            "checkpoint": state.chain.operator_checkpoint().await.unwrap(),
         });
         let bytes = serde_json::to_vec(&canonical).unwrap();
         let signature = owner

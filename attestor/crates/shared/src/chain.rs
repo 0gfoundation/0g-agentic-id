@@ -14,8 +14,10 @@
 //! `NonceFiller`, `ChainIdFiller` and `WalletFiller`. Gas limit is
 //! estimated explicitly before each tx.
 
+use crate::auth::operator::OperatorCheckpoint;
 use crate::traits::ChainClient;
 use crate::types::*;
+use alloy::eips::{BlockId, BlockNumberOrTag, RpcBlockHash};
 use alloy::network::{Ethereum, EthereumWallet, Network, TransactionBuilder};
 use alloy::primitives::B256;
 use alloy::primitives::{Address, Bytes, TxHash, U256};
@@ -180,7 +182,8 @@ pub async fn check_verified_feedback_anchor(
                 reason = format!("{e:#}");
                 if attempt < ANCHOR_READ_ATTEMPTS {
                     tracing::warn!(attempt, error = %reason, "getIdentityRegistry() read failed; retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                        .await;
                 }
             }
         }
@@ -252,6 +255,24 @@ impl NonceManager for PendingNonceManager {
     {
         provider.get_transaction_count(address).pending().await
     }
+}
+
+/// A checkpoint is a complete, already-existing block-end view. Hash checks
+/// distinguish reorged/absent anchors from RPC failures without trusting clocks.
+pub async fn operator_checkpoint_is_canonical<T, P>(
+    provider: &P,
+    checkpoint: &OperatorCheckpoint,
+) -> anyhow::Result<bool>
+where
+    T: Transport + Clone,
+    P: Provider<T>,
+{
+    let block = provider
+        .get_block_by_number(BlockNumberOrTag::Number(checkpoint.number), false)
+        .await?;
+    Ok(block.is_some_and(|block| {
+        block.header.hash == checkpoint.hash && block.header.number == checkpoint.number
+    }))
 }
 
 /// Real chain client backed by alloy. Generic over Transport and Provider.
@@ -549,6 +570,49 @@ where
     async fn owner_of(&self, agent_id: AgentId) -> anyhow::Result<Address> {
         let c = AgenticID::new(self.contract_addr, self.provider.clone());
         Ok(c.ownerOf(agent_id).call().await?._0)
+    }
+
+    async fn operator_checkpoint(&self) -> anyhow::Result<OperatorCheckpoint> {
+        let block = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Latest, false)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("latest operator checkpoint is unavailable"))?;
+        Ok(OperatorCheckpoint {
+            number: block.header.number,
+            hash: block.header.hash,
+        })
+    }
+
+    async fn owner_at_checkpoint(
+        &self,
+        agent: AgentId,
+        checkpoint: &OperatorCheckpoint,
+    ) -> anyhow::Result<Option<Address>> {
+        if !operator_checkpoint_is_canonical(&self.provider, checkpoint).await? {
+            return Ok(None);
+        }
+        let contract = AgenticID::new(self.contract_addr, self.provider.clone());
+        // Bind eth_call to the same block hash, including a canonicality
+        // requirement, so a reorg between reads cannot substitute another state.
+        match contract
+            .ownerOf(agent)
+            .block(BlockId::Hash(RpcBlockHash::from_hash(
+                checkpoint.hash,
+                Some(true),
+            )))
+            .call()
+            .await
+        {
+            Ok(owner) => Ok(Some(owner._0)),
+            // A canonical block can precede this token's mint. A definite
+            // contract revert makes that checkpoint invalid; unavailable
+            // historical state or other RPC failures remain dependency errors.
+            Err(alloy::contract::Error::TransportError(error)) if is_execution_revert(&error) => {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn clone_authorizer_of(&self, agent_id: AgentId) -> anyhow::Result<Address> {
@@ -912,6 +976,18 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
+        let (url, served, _, server) = jsonrpc_peer_with_requests(answers).await;
+        (url, served, server)
+    }
+
+    async fn jsonrpc_peer_with_requests(
+        answers: Vec<serde_json::Value>,
+    ) -> (
+        reqwest::Url,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap())
@@ -919,6 +995,8 @@ mod tests {
             .unwrap();
         let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = served.clone();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
         let server = tokio::spawn(async move {
             for answer in answers {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -943,6 +1021,7 @@ mod tests {
                 let request: serde_json::Value =
                     serde_json::from_slice(&bytes[body_at..body_at + body_len]).unwrap();
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                recorded.lock().unwrap().push(request.clone());
                 let mut reply = serde_json::json!({"jsonrpc": "2.0", "id": request["id"]});
                 reply
                     .as_object_mut()
@@ -956,7 +1035,7 @@ mod tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
         });
-        (url, served, server)
+        (url, served, requests, server)
     }
 
     fn chain_at(url: reqwest::Url) -> Arc<impl ChainClient> {
@@ -966,6 +1045,145 @@ mod tests {
         );
         let pool = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
         AlloyChain::new(provider, AGENTIC_ID, Address::ZERO, 1, 2, None, pool)
+    }
+
+    fn checkpoint_block(checkpoint: OperatorCheckpoint) -> serde_json::Value {
+        let mut block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+        block.header.number = checkpoint.number;
+        block.header.hash = checkpoint.hash;
+        serde_json::json!({"result":block})
+    }
+
+    #[tokio::test]
+    async fn operator_checkpoint_binds_historical_owner_to_canonical_block_hash() {
+        let checkpoint = OperatorCheckpoint {
+            number: 123,
+            hash: B256::repeat_byte(0x71),
+        };
+        let owner = Address::repeat_byte(0x72);
+        let (url, served, requests, server) = jsonrpc_peer_with_requests(vec![
+            checkpoint_block(checkpoint),
+            checkpoint_block(checkpoint),
+            serde_json::json!({"result":format!("0x{}",hex::encode(owner.into_word()))}),
+        ])
+        .await;
+        let chain = chain_at(url);
+        assert_eq!(chain.operator_checkpoint().await.unwrap(), checkpoint);
+        assert_eq!(
+            chain
+                .owner_at_checkpoint(U256::from(7), &checkpoint)
+                .await
+                .unwrap(),
+            Some(owner)
+        );
+        server.await.unwrap();
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0]["method"], "eth_getBlockByNumber");
+        assert_eq!(requests[0]["params"], serde_json::json!(["latest", false]));
+        assert_eq!(requests[1]["method"], "eth_getBlockByNumber");
+        assert_eq!(requests[1]["params"], serde_json::json!(["0x7b", false]));
+        assert_eq!(requests[2]["method"], "eth_call");
+        assert_eq!(
+            requests[2]["params"][0]["to"],
+            serde_json::json!(AGENTIC_ID)
+        );
+        assert_eq!(
+            requests[2]["params"][1],
+            serde_json::json!({"blockHash":checkpoint.hash,"requireCanonical":true})
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_owner_revert_is_invalid_but_rpc_failures_remain_errors() {
+        let checkpoint = OperatorCheckpoint {
+            number: 123,
+            hash: B256::repeat_byte(0x73),
+        };
+        for (code, message, revert) in [
+            (3, "execution reverted", true),
+            (-32000, "execution reverted: ERC721NonexistentToken", true),
+            (-32603, "internal error", false),
+            (
+                -32000,
+                "missing trie node: historical state unavailable",
+                false,
+            ),
+        ] {
+            let (url, served, requests, server) = jsonrpc_peer_with_requests(vec![
+                checkpoint_block(checkpoint),
+                serde_json::json!({"error":{"code":code,"message":message,"data":"0x"}}),
+            ])
+            .await;
+            let result = chain_at(url)
+                .owner_at_checkpoint(U256::from(7), &checkpoint)
+                .await;
+            if revert {
+                assert_eq!(result.unwrap(), None, "{message}");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{message} must not become an authorization rejection"
+                );
+            }
+            server.await.unwrap();
+            assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests[0]["method"], "eth_getBlockByNumber");
+            assert_eq!(requests[1]["method"], "eth_call");
+            assert_eq!(
+                requests[1]["params"][1],
+                serde_json::json!({"blockHash":checkpoint.hash,"requireCanonical":true})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn noncanonical_or_missing_checkpoint_never_calls_historical_owner() {
+        let checkpoint = OperatorCheckpoint {
+            number: 123,
+            hash: B256::repeat_byte(0x74),
+        };
+        for answer in [
+            checkpoint_block(OperatorCheckpoint {
+                number: checkpoint.number,
+                hash: B256::repeat_byte(0x75),
+            }),
+            checkpoint_block(OperatorCheckpoint {
+                number: 124,
+                hash: checkpoint.hash,
+            }),
+            serde_json::json!({"result":null}),
+        ] {
+            let (url, served, requests, server) = jsonrpc_peer_with_requests(vec![answer]).await;
+            assert_eq!(
+                chain_at(url)
+                    .owner_at_checkpoint(U256::from(7), &checkpoint)
+                    .await
+                    .unwrap(),
+                None
+            );
+            server.await.unwrap();
+            assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                requests.lock().unwrap()[0]["method"],
+                "eth_getBlockByNumber"
+            );
+        }
+        let (url, served, requests, server) = jsonrpc_peer_with_requests(vec![
+            serde_json::json!({"error":{"code":-32603,"message":"internal error"}}),
+        ])
+        .await;
+        assert!(chain_at(url)
+            .owner_at_checkpoint(U256::from(7), &checkpoint)
+            .await
+            .is_err());
+        server.await.unwrap();
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            requests.lock().unwrap()[0]["method"],
+            "eth_getBlockByNumber"
+        );
     }
 
     /// AgenticID before 1.4.0 has no `trustRegistry()`: 0G answers the call

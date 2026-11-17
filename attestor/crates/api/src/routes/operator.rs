@@ -4,7 +4,10 @@
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use alloy::primitives::{Address, Bytes};
-use attestor_shared::auth::operator::{verify_operator_directive, OperatorGrant};
+use attestor_shared::auth::operator::{
+    validate_operator_checkpoint, verify_operator_directive, OperatorCheckpoint, OperatorGrant,
+    RuntimeAuthorizationError,
+};
 use attestor_shared::{Deployment, SealId};
 use axum::extract::{Query, State};
 use axum::Json;
@@ -34,6 +37,7 @@ pub struct OperatorSummary {
     pub version: i64,
     pub expires_at: i64,
     pub allow_recreate: bool,
+    pub checkpoint: Option<OperatorCheckpoint>,
 }
 
 async fn load(state: &AppState, seal_id: SealId) -> ApiResult<(Deployment, Address)> {
@@ -42,12 +46,7 @@ async fn load(state: &AppState, seal_id: SealId) -> ApiResult<(Deployment, Addre
         .get(seal_id)
         .await?
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
-    let agent = deployment.agent_id.ok_or_else(|| {
-        ApiError::bad_request("an operator can be appointed only after the agent is minted")
-    })?;
-    let owner = state
-        .chain
-        .owner_of(agent)
+    let owner = attestor_shared::auth::operator::live_owner(state.chain.as_ref(), &deployment)
         .await
         .map_err(|e| ApiError::internal(format!("owner_of: {e}")))?;
     Ok((deployment, owner))
@@ -57,7 +56,17 @@ pub async fn handle_get(
     State(state): State<AppState>,
     Query(query): Query<ReadParams>,
 ) -> ApiResult<Json<OperatorSummary>> {
-    let (_, owner) = load(&state, query.seal_id).await?;
+    let (deployment, owner) = load(&state, query.seal_id).await?;
+    let checkpoint =
+        if deployment.agent_id.is_some() {
+            Some(
+                state.chain.operator_checkpoint().await.map_err(|error| {
+                    ApiError::unavailable(format!("operator checkpoint: {error}"))
+                })?,
+            )
+        } else {
+            None
+        };
     let grant = state.deployments.operator_grant(query.seal_id).await?;
     let mut summary = OperatorSummary {
         seal_id: query.seal_id,
@@ -66,7 +75,11 @@ pub async fn handle_get(
         version: grant.as_ref().map_or(0, |grant| grant.version),
         expires_at: 0,
         allow_recreate: false,
+        checkpoint,
     };
+    if deployment.agent_id.is_none() {
+        return Ok(Json(summary));
+    }
     if let Some(grant) = grant {
         // A seller's old grant and a corrupted/foreign record grant no
         // authority. Preserve the stored version so the current owner can
@@ -83,6 +96,19 @@ pub async fn handle_get(
             query.seal_id,
             state.crypto.as_ref(),
         ) {
+            match validate_operator_checkpoint(
+                state.chain.as_ref(),
+                deployment.agent_id.unwrap(),
+                &directive,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(RuntimeAuthorizationError::Denied(_)) => return Ok(Json(summary)),
+                Err(error) => {
+                    return Err(super::lifecycle_auth::runtime_authorization_error(error))
+                }
+            }
             if directive.base_version.checked_add(1) == Some(grant.version) {
                 summary.expires_at = directive.expires_at;
                 if directive.expires_at == 0 || directive.expires_at > Utc::now().timestamp() {
@@ -100,7 +126,10 @@ pub async fn handle_set(
     State(state): State<AppState>,
     Json(request): Json<WriteRequest>,
 ) -> ApiResult<Json<OperatorSummary>> {
-    let (_, owner) = load(&state, request.seal_id).await?;
+    let (deployment, owner) = load(&state, request.seal_id).await?;
+    let agent = deployment.agent_id.ok_or_else(|| {
+        ApiError::bad_request("an operator can be appointed only after the agent is minted")
+    })?;
     let directive = verify_operator_directive(
         &request.signed_message_b64,
         request.signature.as_ref(),
@@ -111,6 +140,14 @@ pub async fn handle_set(
         state.crypto.as_ref(),
     )
     .map_err(|e| ApiError::unauthorized(format!("operator authorization: {e}")))?;
+    if directive.checkpoint.is_none() {
+        return Err(ApiError::bad_request(
+            "operator directive must include a chain checkpoint",
+        ));
+    }
+    validate_operator_checkpoint(state.chain.as_ref(), agent, &directive)
+        .await
+        .map_err(super::lifecycle_auth::runtime_authorization_error)?;
     let now = Utc::now().timestamp();
     if now.abs_diff(directive.issued_at) > 300 {
         return Err(ApiError::unauthorized(
@@ -173,6 +210,7 @@ pub async fn handle_set(
         version: update.version,
         expires_at: directive.expires_at,
         allow_recreate: directive.allow_recreate,
+        checkpoint: directive.checkpoint,
     }))
 }
 
@@ -194,7 +232,10 @@ mod tests {
     use axum::http::StatusCode;
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
     use serde_json::{json, Value};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
 
     /// Distinct owner/operator balances catch accidentally charging or gating
     /// compute against the NFT owner while preserving real owner lookups.
@@ -203,6 +244,7 @@ mod tests {
         funded: Address,
         balance_queries: Mutex<Vec<Address>>,
         acknowledgement_queries: Mutex<Vec<Address>>,
+        owner_rpc_fails: AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -217,7 +259,21 @@ mod tests {
             self.inner.get_agent_id_by_seal_id(seal).await
         }
         async fn owner_of(&self, id: AgentId) -> anyhow::Result<Address> {
+            anyhow::ensure!(
+                !self.owner_rpc_fails.load(Ordering::SeqCst),
+                "owner RPC unavailable"
+            );
             self.inner.owner_of(id).await
+        }
+        async fn operator_checkpoint(&self) -> anyhow::Result<OperatorCheckpoint> {
+            self.inner.operator_checkpoint().await
+        }
+        async fn owner_at_checkpoint(
+            &self,
+            id: AgentId,
+            checkpoint: &OperatorCheckpoint,
+        ) -> anyhow::Result<Option<Address>> {
+            self.inner.owner_at_checkpoint(id, checkpoint).await
         }
         async fn is_valid_framework_hash(&self, hash: ImageHash) -> anyhow::Result<bool> {
             self.inner.is_valid_framework_hash(hash).await
@@ -289,6 +345,7 @@ mod tests {
             funded,
             balance_queries: Mutex::new(Vec::new()),
             acknowledgement_queries: Mutex::new(Vec::new()),
+            owner_rpc_fails: AtomicBool::new(false),
         });
         s.state.cfg.tapp_registry_addr = Address::repeat_byte(1);
         s.state.cfg.app_id = Some("attestor".into());
@@ -462,6 +519,7 @@ mod tests {
             "allow_recreate": recreate,
             "expires_at": 0,
             "issued_at": Utc::now().timestamp(),
+            "checkpoint": {"number":1,"hash":B256::repeat_byte(1)},
         })
     }
 
@@ -551,6 +609,243 @@ mod tests {
         .0;
         assert_eq!(summary.operator, None);
         assert_eq!(summary.version, 2);
+    }
+
+    #[tokio::test]
+    async fn premint_operator_query_returns_owner_but_cannot_appoint_an_operator() {
+        let s = setup();
+        let mut deployment = s.deployments.get(s.seal_id).await.unwrap().unwrap();
+        deployment.agent_id = None;
+        s.deployments.insert(&deployment).await.unwrap();
+        s.chain.set_owner_of(Address::ZERO);
+        let summary = handle_get(
+            State(s.state.clone()),
+            Query(ReadParams { seal_id: s.seal_id }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(summary.owner, s.owner);
+        assert_eq!(summary.operator, None);
+        assert_eq!(summary.checkpoint, None);
+        assert_eq!(summary.version, 0);
+        let error = handle_set(
+            State(s.state.clone()),
+            Json(request(
+                &s,
+                &OWNER_KEY,
+                &directive(&s, 0, Some(s.operator), false),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(s
+            .deployments
+            .operator_grant(s.seal_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn new_operator_writes_require_a_canonical_owner_checkpoint() {
+        let s = setup();
+        let summary = handle_get(
+            State(s.state.clone()),
+            Query(ReadParams { seal_id: s.seal_id }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            summary.checkpoint,
+            Some(s.chain.operator_checkpoint().await.unwrap())
+        );
+        for checkpoint in [Value::Null, json!({"number":1,"hash":B256::repeat_byte(2)})] {
+            let mut value = directive(&s, 0, Some(s.operator), false);
+            value["checkpoint"] = checkpoint;
+            let error = handle_set(
+                State(s.state.clone()),
+                Json(request(&s, &OWNER_KEY, &value)),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.status.is_client_error());
+            assert!(s
+                .deployments
+                .operator_grant(s.seal_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        s.chain
+            .set_checkpoint_owner(Some(Address::repeat_byte(0x99)));
+        let error = handle_set(
+            State(s.state.clone()),
+            Json(request(
+                &s,
+                &OWNER_KEY,
+                &directive(&s, 0, Some(s.operator), false),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(s
+            .deployments
+            .operator_grant(s.seal_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn grant_checkpoint_reorg_is_rejected_by_reads_and_runtime_authorization() {
+        let s = setup();
+        appoint(&s, 0, false).await;
+        s.chain.set_operator_checkpoint(OperatorCheckpoint {
+            number: 1,
+            hash: B256::repeat_byte(2),
+        });
+        let summary = handle_get(
+            State(s.state.clone()),
+            Query(ReadParams { seal_id: s.seal_id }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(summary.operator, None);
+        assert_eq!(summary.version, 1);
+        let error =
+            super::super::start::handle(State(s.state.clone()), Json(lifecycle(&s, "create", 1)))
+                .await
+                .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rpc_failure_is_not_mistaken_for_an_invalid_grant() {
+        let s = setup();
+        appoint(&s, 0, false).await;
+        s.chain.set_checkpoint_owner_failure(true);
+        let error =
+            super::super::start::handle(State(s.state.clone()), Json(lifecycle(&s, "create", 1)))
+                .await
+                .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        let error = handle_set(
+            State(s.state.clone()),
+            Json(request(&s, &OWNER_KEY, &directive(&s, 1, None, false))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unchanged_canonical_checkpoint_allows_a_queued_principal_to_be_revalidated() {
+        use attestor_shared::auth::operator::{
+            authorize_runtime, revalidate_runtime_principal, LifecyclePermission,
+        };
+        let s = setup();
+        appoint(&s, 0, false).await;
+        let deployment = s.deployments.get(s.seal_id).await.unwrap().unwrap();
+        let request = lifecycle(&s, "create", 1);
+        let principal = authorize_runtime(
+            s.chain.as_ref(),
+            s.state.crypto.as_ref(),
+            s.deployments.as_ref(),
+            s.state.cfg.chain_id,
+            s.state.cfg.agentic_id_addr,
+            &deployment,
+            &request.sandbox_envelope,
+            LifecyclePermission::Provision,
+        )
+        .await
+        .unwrap();
+        revalidate_runtime_principal(
+            s.chain.as_ref(),
+            s.state.crypto.as_ref(),
+            s.deployments.as_ref(),
+            s.state.cfg.chain_id,
+            s.state.cfg.agentic_id_addr,
+            &deployment,
+            &principal,
+        )
+        .await
+        .unwrap();
+        s.chain.set_checkpoint_owner(None);
+        let error = revalidate_runtime_principal(
+            s.chain.as_ref(),
+            s.state.crypto.as_ref(),
+            s.deployments.as_ref(),
+            s.state.cfg.chain_id,
+            s.state.cfg.agentic_id_addr,
+            &deployment,
+            &principal,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, RuntimeAuthorizationError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn runtime_owner_rpc_failure_is_a_service_failure_not_bad_authorization() {
+        let mut s = setup();
+        appoint(&s, 0, false).await;
+        let operator = s.operator;
+        let chain = enable_payer_checks(&mut s, operator);
+        chain.owner_rpc_fails.store(true, Ordering::SeqCst);
+        let error =
+            super::super::start::handle(State(s.state.clone()), Json(lifecycle(&s, "create", 1)))
+                .await
+                .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_mapping_with_provision_history_requires_recreate_permission() {
+        use attestor_shared::auth::operator::{create_permission, LifecyclePermission};
+        let s = setup();
+        appoint(&s, 0, false).await;
+        let mut deployment = s.deployments.get(s.seal_id).await.unwrap().unwrap();
+        assert_eq!(
+            create_permission(&deployment),
+            LifecyclePermission::Provision
+        );
+        deployment.provisioned_at = Some(Utc::now());
+        assert_eq!(
+            create_permission(&deployment),
+            LifecyclePermission::Recreate
+        );
+        s.deployments.insert(&deployment).await.unwrap();
+        let error =
+            super::super::start::handle(State(s.state.clone()), Json(lifecycle(&s, "create", 1)))
+                .await
+                .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shared_operator_snapshot_policy_covers_framework_images_and_default_fallback() {
+        use attestor_shared::auth::operator::validate_operator_snapshot;
+        let mut cfg = test_config();
+        let payload = json!({"snapshot": cfg.sandbox_snapshot, "sealed":true});
+        validate_operator_snapshot(&cfg, Some("openclaw"), &payload).unwrap();
+        assert!(validate_operator_snapshot(&cfg, None, &payload).is_err());
+        assert!(validate_operator_snapshot(&cfg, Some("unknown"), &payload).is_err());
+        cfg.frameworks[0].image = Some("framework-image".into());
+        assert!(validate_operator_snapshot(&cfg, Some("openclaw"), &payload).is_err());
+        let valid = json!({"snapshot":"framework-image", "sealed":true});
+        validate_operator_snapshot(&cfg, Some("openclaw"), &valid).unwrap();
+        let mut overridden = valid;
+        overridden["image"] = json!("another-image");
+        assert!(validate_operator_snapshot(&cfg, Some("openclaw"), &overridden).is_err());
     }
 
     #[tokio::test]

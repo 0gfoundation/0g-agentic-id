@@ -75,6 +75,54 @@ impl PostgresDeploymentRepo {
         Arc::new(Self { pool })
     }
 
+    async fn invalidate_transfer(
+        &self,
+        agent: AgentId,
+        previous_owner: Address,
+        fence: Option<(u64, i64, Option<crate::auth::operator::OperatorCheckpoint>)>,
+    ) -> anyhow::Result<bool> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        let row = sqlx::query("SELECT seal_id,sandbox_id,storage_stage,mint_stage FROM deployments WHERE agent_id=$1 FOR UPDATE")
+            .bind(agent_id_to_text(&agent)).fetch_optional(&mut *tx).await?;
+        let Some(row) = row else {
+            return Ok(true);
+        };
+        let seal: Vec<u8> = row.try_get("seal_id")?;
+        if let Some((event_block, expected_version, canonical)) = fence {
+            let current = sqlx::query("SELECT version,owner,signed_message_b64,signature FROM operator_grants WHERE seal_id=$1")
+                .bind(&seal).fetch_optional(&mut *tx).await?;
+            let Some(current) = current else {
+                return Ok(true);
+            };
+            let grant = crate::auth::operator::OperatorGrant {
+                version: current.try_get("version")?,
+                owner: Address::from_slice(&current.try_get::<Vec<u8>, _>("owner")?),
+                signed_message_b64: current.try_get("signed_message_b64")?,
+                signature: current.try_get::<Vec<u8>, _>("signature")?.into(),
+            };
+            if grant.version != expected_version {
+                return Ok(false);
+            }
+            if let Some(checkpoint) = signed_operator_checkpoint(&grant, B256::from_slice(&seal)) {
+                if canonical == Some(checkpoint) && event_block <= checkpoint.number {
+                    tx.commit().await?;
+                    return Ok(true);
+                }
+            }
+        }
+        let invalidated = sqlx::query("UPDATE operator_grants SET version=version+1,transfer_invalidated=TRUE,updated_at=now() WHERE seal_id=$1 AND owner=$2 AND NOT transfer_invalidated")
+            .bind(&seal).bind(previous_owner.as_slice()).execute(&mut *tx).await?.rows_affected();
+        if invalidated != 0 {
+            let delegated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM container_status_bindings WHERE seal_id=$1 AND authorized_owner=$2 AND authorized_operator IS NOT NULL)")
+                .bind(&seal).bind(previous_owner.as_slice()).fetch_one(&mut *tx).await?;
+            if delegated {
+                retire_runtime(&mut tx, &seal, &row).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     async fn prepare_runtime_boot(
         &self,
         seal: SealId,
@@ -166,6 +214,59 @@ fn agent_id_from_text(s: &str) -> anyhow::Result<AgentId> {
 /// Clears the current container's record and, with it, the last status it
 /// reported.
 const CLEAR_CONTAINER_RECORD: &str = "container_pubkey=NULL,container_image_hash=NULL,provider_chain_id=NULL,provider_registry_address=NULL,provider_app_id=NULL,provider_registered_at=NULL,provider_signer=NULL,container_status=NULL";
+
+/// Read the checkpoint from the owner's original proof, never an unsigned
+/// database timestamp. A malformed, invalidated or unsigned record receives
+/// the conservative legacy transfer behavior.
+pub fn signed_operator_checkpoint(
+    grant: &crate::auth::operator::OperatorGrant,
+    seal: SealId,
+) -> Option<crate::auth::operator::OperatorCheckpoint> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&grant.signed_message_b64)
+        .ok()?;
+    let directive: crate::auth::operator::OperatorDirective =
+        serde_json::from_slice(&bytes).ok()?;
+    if directive.domain != "AgenticID.Operator.v1"
+        || directive.seal_id != seal
+        || directive.owner != grant.owner
+        || directive.base_version.checked_add(1) != Some(grant.version)
+        || crate::crypto::recover_prehash_signer(
+            &crate::sandbox::eip191_digest(&bytes),
+            grant.signature.as_ref(),
+        )
+        .ok()?
+            != grant.owner
+    {
+        return None;
+    }
+    directive.checkpoint
+}
+
+/// Commit the exact cleanup target and all runtime retirement state together.
+/// Callers hold the deployment row before touching grants, boots or the outbox.
+async fn retire_runtime(
+    tx: &mut Transaction<'_, Postgres>,
+    seal: &[u8],
+    row: &sqlx::postgres::PgRow,
+) -> anyhow::Result<()> {
+    if let Some(sandbox) = row
+        .try_get::<Option<String>, _>("sandbox_id")?
+        .filter(|s| !s.is_empty())
+    {
+        sqlx::query("INSERT INTO operator_teardowns(seal_id,sandbox_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
+            .bind(seal).bind(sandbox).execute(&mut **tx).await?;
+    }
+    let storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
+    let mint: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
+    let phase = derive_phase(&storage, &mint, &StageStatus::NotStarted);
+    sqlx::query(&format!("UPDATE deployments SET sandbox_id=NULL,{CLEAR_CONTAINER_RECORD},provisioned_at=NULL,provision_deadline=NULL,last_heartbeat=NULL,container_stage=$2,phase=$3,updated_at=now() WHERE seal_id=$1"))
+        .bind(seal).bind(serde_json::to_value(StageStatus::NotStarted)?).bind(phase.serde_tag()).execute(&mut **tx).await?;
+    sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1,authorized_sandbox_id=NULL,authorized_container_pubkey=NULL WHERE seal_id=$1")
+        .bind(seal).execute(&mut **tx).await?;
+    Ok(())
+}
 
 fn record_column<'r, T: sqlx::Decode<'r, Postgres> + sqlx::Type<Postgres>>(
     row: &'r sqlx::postgres::PgRow,
@@ -303,38 +404,34 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         agent: AgentId,
         previous_owner: Address,
     ) -> anyhow::Result<()> {
-        let mut tx = deployment_tx(&self.pool).await?;
-        let row = sqlx::query("SELECT seal_id,sandbox_id,storage_stage,mint_stage FROM deployments WHERE agent_id=$1 FOR UPDATE")
-            .bind(agent_id_to_text(&agent)).fetch_optional(&mut *tx).await?;
-        let Some(row) = row else { return Ok(()) };
-        let seal: Vec<u8> = row.try_get("seal_id")?;
-        let invalidated = sqlx::query("UPDATE operator_grants SET version=version+1,transfer_invalidated=TRUE,updated_at=now() WHERE seal_id=$1 AND owner=$2 AND NOT transfer_invalidated")
-            .bind(&seal).bind(previous_owner.as_slice()).execute(&mut *tx).await?.rows_affected();
-        if invalidated == 0 {
-            tx.commit().await?;
-            return Ok(());
-        }
-        let delegated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM container_status_bindings WHERE seal_id=$1 AND authorized_owner=$2 AND authorized_operator IS NOT NULL)")
-            .bind(&seal).bind(previous_owner.as_slice()).fetch_one(&mut *tx).await?;
-        if delegated {
-            let sandbox = row
-                .try_get::<Option<String>, _>("sandbox_id")?
-                .filter(|s| !s.is_empty());
-            if let Some(sandbox) = sandbox {
-                sqlx::query("INSERT INTO operator_teardowns(seal_id,sandbox_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
-                    .bind(&seal).bind(sandbox).execute(&mut *tx).await?;
-            }
-            let storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
-            let mint: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
-            let phase = derive_phase(&storage, &mint, &StageStatus::NotStarted);
-            sqlx::query(&format!("UPDATE deployments SET sandbox_id=NULL,{CLEAR_CONTAINER_RECORD},provisioned_at=NULL,provision_deadline=NULL,last_heartbeat=NULL,container_stage=$2,phase=$3,updated_at=now() WHERE seal_id=$1"))
-                .bind(&seal).bind(serde_json::to_value(StageStatus::NotStarted)?).bind(phase.serde_tag())
-                .execute(&mut *tx).await?;
-            sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1,authorized_sandbox_id=NULL,authorized_container_pubkey=NULL WHERE seal_id=$1")
-                .bind(&seal).execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        Ok(())
+        self.invalidate_transfer(agent, previous_owner, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn invalidate_operator_for_transfer_at(
+        &self,
+        agent: AgentId,
+        previous_owner: Address,
+        event_block: u64,
+        expected_version: i64,
+        canonical_checkpoint: Option<crate::auth::operator::OperatorCheckpoint>,
+    ) -> anyhow::Result<bool> {
+        self.invalidate_transfer(
+            agent,
+            previous_owner,
+            Some((event_block, expected_version, canonical_checkpoint)),
+        )
+        .await
+    }
+
+    async fn runtime_generation(&self, seal: SealId) -> anyhow::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar("SELECT generation FROM container_status_bindings WHERE seal_id=$1")
+                .bind(seal.as_slice())
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     async fn compare_and_swap_operator(
@@ -375,25 +472,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .bind(seal.as_slice()).bind(version).bind(grant.owner.as_slice())
         .bind(grant.signed_message_b64).bind(grant.signature.as_ref())
         .execute(&mut *tx).await?;
-        if let Some(id) = &retired_sandbox_id {
-            sqlx::query(
-                "INSERT INTO operator_teardowns(seal_id,sandbox_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
-            )
-            .bind(seal.as_slice()).bind(id).execute(&mut *tx).await?;
-        }
-        let storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
-        let mint: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
-        let stage = StageStatus::NotStarted;
-        let phase = derive_phase(&storage, &mint, &stage);
-        sqlx::query(
-            &format!("UPDATE deployments SET sandbox_id=NULL,{CLEAR_CONTAINER_RECORD},provisioned_at=NULL,provision_deadline=NULL,last_heartbeat=NULL,container_stage=$2,phase=$3,updated_at=now() WHERE seal_id=$1"),
-        )
-        .bind(seal.as_slice()).bind(serde_json::to_value(stage)?).bind(phase.serde_tag())
-        .execute(&mut *tx).await?;
-        sqlx::query(
-            "UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1,authorized_sandbox_id=NULL,authorized_container_pubkey=NULL WHERE seal_id=$1",
-        )
-        .bind(seal.as_slice()).execute(&mut *tx).await?;
+        retire_runtime(&mut tx, seal.as_slice(), &row).await?;
         tx.commit().await?;
         Ok(Some(crate::auth::operator::OperatorUpdate {
             version,
@@ -565,8 +644,9 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             }
             (Some(expected), Some(boot)) => {
                 boot.try_get::<i64, _>("generation")? == expected
-                    && boot.try_get::<bool, _>("enabled")?
-                    && boot.try_get::<Option<Vec<u8>>, _>("ticket_hash")?.is_some()
+                    && (matches!(stage, StageStatus::Stopped { .. })
+                        || (boot.try_get::<bool, _>("enabled")?
+                            && boot.try_get::<Option<Vec<u8>>, _>("ticket_hash")?.is_some()))
             }
             _ => false,
         };
@@ -893,20 +973,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
                     .is_some();
         }
         if retire_delegated {
-            // An earlier indexed event may observe a later live owner before
-            // the grant owner's actual outgoing event is processed. Persist
-            // cleanup now: that later event will see transfer_invalidated.
-            if let Some(sandbox) = sandbox.as_ref().filter(|s| !s.is_empty()) {
-                sqlx::query("INSERT INTO operator_teardowns(seal_id,sandbox_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
-                    .bind(&seal).bind(sandbox).execute(&mut *tx).await?;
-            }
-            let storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
-            let mint: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
-            let phase = derive_phase(&storage, &mint, &StageStatus::NotStarted);
-            sqlx::query(&format!("UPDATE deployments SET sandbox_id=NULL,{CLEAR_CONTAINER_RECORD},provisioned_at=NULL,provision_deadline=NULL,last_heartbeat=NULL,container_stage=$2,phase=$3,updated_at=now() WHERE seal_id=$1"))
-                .bind(&seal).bind(serde_json::to_value(StageStatus::NotStarted)?).bind(phase.serde_tag()).execute(&mut *tx).await?;
-            sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1,authorized_sandbox_id=NULL,authorized_container_pubkey=NULL WHERE seal_id=$1")
-                .bind(&seal).execute(&mut *tx).await?;
+            retire_runtime(&mut tx, &seal, &row).await?;
         } else {
             // Preserve the existing owner-direct transfer behavior.
             sqlx::query(&format!(
@@ -3571,6 +3638,233 @@ mod operator_storage_tests {
         .await;
     }
 
+    fn checkpoint_grant(
+        seal: SealId,
+        version: i64,
+        checkpoint: Option<crate::auth::operator::OperatorCheckpoint>,
+    ) -> OperatorGrant {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+        use base64::Engine as _;
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x15)).unwrap();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "domain":"AgenticID.Operator.v1", "chain_id":16602, "contract":Address::ZERO,
+            "seal_id":seal, "owner":signer.address(), "base_version":version-1,
+            "operator":Address::repeat_byte(0x25), "allow_recreate":false, "expires_at":0,
+            "issued_at":Utc::now().timestamp(), "checkpoint":checkpoint,
+        }))
+        .unwrap();
+        let sig: Vec<u8> = signer
+            .sign_hash_sync(&B256::from(crate::sandbox::eip191_digest(&bytes)))
+            .unwrap()
+            .into();
+        OperatorGrant {
+            owner: signer.address(),
+            version,
+            signed_message_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            signature: sig.into(),
+        }
+    }
+
+    async fn exercise_checkpoint_transfers(
+        repo: &dyn DeploymentRepo,
+        seal: SealId,
+        agent: AgentId,
+    ) {
+        use crate::auth::operator::OperatorCheckpoint;
+        let first = OperatorCheckpoint {
+            number: 100,
+            hash: B256::repeat_byte(0xa0),
+        };
+        let returned = OperatorCheckpoint {
+            number: 102,
+            hash: B256::repeat_byte(0xa2),
+        };
+        let owner = checkpoint_grant(seal, 1, Some(first)).owner;
+        let actor = Address::repeat_byte(0x25);
+        let mut d = deployment(seal, agent, owner);
+        d.sandbox_id = None;
+        repo.insert(&d).await.unwrap();
+        repo.compare_and_swap_operator(seal, 0, checkpoint_grant(seal, 1, Some(first)))
+            .await
+            .unwrap()
+            .unwrap();
+        install_test_runtime(repo, seal, owner, Some((actor, 1)), 31, "before-aba").await;
+        // Live ownership has returned to A. Its old checkpoint still precedes
+        // A's outgoing transfer, so the old delegation must remain revocable.
+        assert!(repo
+            .invalidate_operator_for_transfer_at(agent, owner, 101, 1, Some(first))
+            .await
+            .unwrap());
+        assert_eq!(repo.operator_grant(seal).await.unwrap().unwrap().version, 2);
+        assert!(repo
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "before-aba".into())));
+        repo.compare_and_swap_operator(seal, 2, checkpoint_grant(seal, 3, Some(returned)))
+            .await
+            .unwrap()
+            .unwrap();
+        let (replacement, report) =
+            install_test_runtime(repo, seal, owner, Some((actor, 3)), 32, "after-aba").await;
+        // Both a previous block's outgoing event and every Transfer within
+        // H itself precede the new owner-signed block-end view.
+        for event in [101, 102] {
+            assert!(repo
+                .invalidate_operator_for_transfer_at(agent, owner, event, 3, Some(returned))
+                .await
+                .unwrap());
+            assert!(repo
+                .clear_container_binding(agent, owner)
+                .await
+                .unwrap()
+                .is_none());
+            assert_runtime_untouched(repo, seal, &replacement, 32, &report).await;
+        }
+        assert!(!repo
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "after-aba".into())));
+        // A canonicality decision made for a superseded grant cannot retire
+        // the replacement; the indexer has to re-read and re-check its proof.
+        assert!(!repo
+            .invalidate_operator_for_transfer_at(agent, owner, 103, 1, None)
+            .await
+            .unwrap());
+        assert_eq!(
+            repo.boot_authorization(seal).await.unwrap().unwrap(),
+            replacement
+        );
+        // A reorged checkpoint receives no exemption from an outgoing event.
+        assert!(repo
+            .invalidate_operator_for_transfer_at(agent, owner, 101, 3, None)
+            .await
+            .unwrap());
+        assert_eq!(repo.operator_grant(seal).await.unwrap().unwrap().version, 4);
+        assert!(repo
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "after-aba".into())));
+        // Legacy signed grants without a checkpoint retain conservative ABA
+        // invalidation. They cannot be server-upgraded to a fresh anchor.
+        repo.compare_and_swap_operator(seal, 4, checkpoint_grant(seal, 5, None))
+            .await
+            .unwrap()
+            .unwrap();
+        install_test_runtime(repo, seal, owner, Some((actor, 5)), 33, "legacy-aba").await;
+        assert!(repo
+            .invalidate_operator_for_transfer_at(agent, owner, 1, 5, Some(returned))
+            .await
+            .unwrap());
+        assert_eq!(repo.operator_grant(seal).await.unwrap().unwrap().version, 6);
+        assert!(repo
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "legacy-aba".into())));
+    }
+
+    #[tokio::test]
+    async fn mock_transfer_checkpoint_preserves_new_aba_grant() {
+        exercise_checkpoint_transfers(
+            &InMemoryDeploymentRepo::new(),
+            B256::repeat_byte(0x74),
+            U256::from(74),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stopped_bookkeeping_accepts_only_unchanged_disabled_or_legacy_revision() {
+        let repo = InMemoryDeploymentRepo::new();
+        let seal = B256::repeat_byte(0x75);
+        let owner = Address::repeat_byte(0xa5);
+        repo.seed(deployment(seal, U256::from(75), owner));
+        let (boot, _) = install_test_runtime(&repo, seal, owner, None, 35, "stopped-runtime").await;
+        repo.set_container_stage(
+            seal,
+            StageStatus::Stopped {
+                at: Utc::now(),
+                reason: "container_report".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let revision = repo.runtime_generation(seal).await.unwrap().unwrap();
+        assert!(revision > boot.generation);
+        assert!(!repo
+            .transition_runtime(
+                seal,
+                Some("stopped-runtime"),
+                Some(revision),
+                StageStatus::Submitted {
+                    tx_hash: None,
+                    at: Utc::now()
+                },
+                None
+            )
+            .await
+            .unwrap());
+        assert!(!repo
+            .transition_runtime(
+                seal,
+                Some("stopped-runtime"),
+                Some(revision),
+                StageStatus::Failed {
+                    at: Utc::now(),
+                    reason: "failure".into()
+                },
+                None
+            )
+            .await
+            .unwrap());
+        let stopped = StageStatus::Stopped {
+            at: Utc::now(),
+            reason: "user_stop".into(),
+        };
+        assert!(!repo
+            .transition_runtime(
+                seal,
+                Some("different"),
+                Some(revision),
+                stopped.clone(),
+                None
+            )
+            .await
+            .unwrap());
+        assert!(!repo
+            .transition_runtime(
+                seal,
+                Some("stopped-runtime"),
+                Some(boot.generation),
+                stopped.clone(),
+                None
+            )
+            .await
+            .unwrap());
+        assert!(repo
+            .transition_runtime(
+                seal,
+                Some("stopped-runtime"),
+                Some(revision),
+                stopped.clone(),
+                None
+            )
+            .await
+            .unwrap());
+        let legacy = B256::repeat_byte(0x76);
+        repo.seed(deployment(legacy, U256::from(76), owner));
+        repo.status_bindings.lock().unwrap().insert(legacy, [6; 32]);
+        assert_eq!(repo.runtime_generation(legacy).await.unwrap(), Some(0));
+        assert!(repo
+            .transition_runtime(legacy, Some("old-runtime"), Some(0), stopped, None)
+            .await
+            .unwrap());
+        assert!(!repo.status_bindings.lock().unwrap().contains_key(&legacy));
+    }
+
     #[tokio::test]
     async fn mock_stale_resume_cannot_mutate_replacement_boot() {
         exercise_stale_resume(
@@ -3619,6 +3913,49 @@ mod operator_storage_tests {
         let early_seal = B256::from(rand::random::<[u8; 32]>());
         let early_agent = U256::from_be_bytes(rand::random::<[u8; 32]>());
         exercise_early_transfer_cleanup(repo.as_ref(), early_seal, early_agent).await;
+        let checkpoint_seal = B256::from(rand::random::<[u8; 32]>());
+        let checkpoint_agent = U256::from_be_bytes(rand::random::<[u8; 32]>());
+        exercise_checkpoint_transfers(repo.as_ref(), checkpoint_seal, checkpoint_agent).await;
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(checkpoint_seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy_seal = B256::from(rand::random::<[u8; 32]>());
+        repo.insert(&deployment(
+            legacy_seal,
+            U256::from_be_bytes(rand::random::<[u8; 32]>()),
+            Address::ZERO,
+        ))
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO container_status_bindings(seal_id,binding_hash,generation,enabled) VALUES($1,$2,77,FALSE)").bind(legacy_seal.as_slice()).bind([9u8;32].as_slice()).execute(&pool).await.unwrap();
+        assert_eq!(
+            repo.runtime_generation(legacy_seal).await.unwrap(),
+            Some(77)
+        );
+        assert!(repo
+            .transition_runtime(
+                legacy_seal,
+                Some("old-runtime"),
+                Some(77),
+                StageStatus::Stopped {
+                    at: Utc::now(),
+                    reason: "user_stop".into()
+                },
+                None
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            repo.runtime_generation(legacy_seal).await.unwrap(),
+            Some(78)
+        );
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(legacy_seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
             .bind(early_seal.as_slice())
             .execute(&pool)

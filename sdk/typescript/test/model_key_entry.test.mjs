@@ -31,8 +31,10 @@ function agentApi({ stored = [], failSet = false, failSetOnce = false, refuse = 
     currentSandboxId: async () => null,
     lifecycle: async (op, p) => {
       if (refuse) throw new Error('refused by a check');
+      const key = await p.prepareModelKey?.();
       await p.beforeWrite?.();
-      calls.push(['lifecycle', op, p]);
+      await key?.beforeWrite?.();
+      calls.push(['lifecycle', op, { ...p, ...key }]);
     },
     retry: async (p) => { await p.beforeWrite?.(); calls.push(['retry', p]); },
     setSettings: async (p) => { calls.push(['setSettings', p.settings.provider]); return { version: 2 }; },

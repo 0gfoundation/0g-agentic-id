@@ -16,6 +16,21 @@ pub trait ChainClient: Send + Sync {
 
     async fn get_agent_id_by_seal_id(&self, seal_id: SealId) -> anyhow::Result<Option<AgentId>>;
     async fn owner_of(&self, agent_id: AgentId) -> anyhow::Result<Address>;
+    async fn operator_checkpoint(
+        &self,
+    ) -> anyhow::Result<crate::auth::operator::OperatorCheckpoint> {
+        anyhow::bail!("operator chain checkpoints are not implemented")
+    }
+    /// None means the block is absent or no longer canonical. RPC failures
+    /// remain errors so callers cannot confuse unavailability with rejection.
+    async fn owner_at_checkpoint(
+        &self,
+        _agent: AgentId,
+        _checkpoint: &crate::auth::operator::OperatorCheckpoint,
+    ) -> anyhow::Result<Option<Address>> {
+        anyhow::bail!("historical operator ownership is not implemented")
+    }
+
     async fn is_valid_framework_hash(&self, hash: ImageHash) -> anyhow::Result<bool>;
     async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool>;
 
@@ -262,6 +277,24 @@ pub trait DeploymentRepo: Send + Sync {
         _previous_owner: Address,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// A canonical signed block-end checkpoint protects only the revision
+    /// inspected by the indexer. False asks it to re-read after a concurrent CAS.
+    async fn invalidate_operator_for_transfer_at(
+        &self,
+        _agent: AgentId,
+        _previous_owner: Address,
+        _event_block: u64,
+        _expected_version: i64,
+        _canonical_checkpoint: Option<crate::auth::operator::OperatorCheckpoint>,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("checkpoint-aware operator transfer invalidation is not implemented")
+    }
+
+    /// Includes disabled and legacy binding rows whose ticket is NULL.
+    async fn runtime_generation(&self, _seal: SealId) -> anyhow::Result<Option<i64>> {
+        anyhow::bail!("runtime revision reads are not implemented")
     }
 
     async fn compare_and_swap_operator(

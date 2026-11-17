@@ -1,7 +1,10 @@
 //! Job handlers. Worker core logic.
 
 use alloy::primitives::{Address, Bytes, B256};
-use attestor_shared::auth::operator::{authorize_runtime, LifecyclePermission, RuntimePrincipal};
+use attestor_shared::auth::operator::{
+    authorize_runtime, create_permission, revalidate_runtime_principal,
+    validate_operator_snapshot, LifecyclePermission, RuntimePrincipal,
+};
 use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
     auth::status::NOT_RESUMABLE,
@@ -94,20 +97,7 @@ async fn authorize_job(
         LifecyclePermission::Provision | LifecyclePermission::Recreate
     ) {
         let message = attestor_shared::sandbox::verify_envelope(envelope, ctx.crypto.as_ref())?;
-        let framework = d.framework.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("operator provisioning requires the agent's recorded framework")
-        })?;
-        let entry = ctx
-            .cfg
-            .frameworks
-            .iter()
-            .find(|f| f.name == framework)
-            .ok_or_else(|| anyhow::anyhow!("unsupported agent framework"))?;
-        let image = entry.image.as_deref().unwrap_or(&ctx.cfg.sandbox_snapshot);
-        anyhow::ensure!(
-            message.payload.get("snapshot").and_then(|v| v.as_str()) == Some(image),
-            "operator must use the configured image for the agent's framework"
-        );
+        validate_operator_snapshot(&ctx.cfg, d.framework.as_deref(), &message.payload)?;
     }
     Ok(principal)
 }
@@ -135,13 +125,24 @@ async fn prepare_runtime_boot(
 async fn bind_created_runtime(
     ctx: &Ctx,
     seal: SealId,
-    envelope: &SandboxEnvelope,
-    permission: LifecyclePermission,
     principal: RuntimePrincipal,
     response: &attestor_shared::SandboxCreateResponse,
     generation: i64,
 ) -> anyhow::Result<()> {
-    authorize_job(ctx, seal, envelope, permission).await?;
+    // The provider accepted the signed request before creating compute. Its
+    // envelope can expire while that create is in flight; only current runtime
+    // authority and this boot's generation decide whether the result may bind.
+    let deployment = ctx.deployments.get(seal).await?
+        .ok_or_else(|| anyhow::anyhow!("unknown runtime deployment"))?;
+    revalidate_runtime_principal(
+        ctx.chain.as_ref(),
+        ctx.crypto.as_ref(),
+        ctx.deployments.as_ref(),
+        ctx.cfg.chain_id,
+        ctx.cfg.agentic_id_addr,
+        &deployment,
+        &principal,
+    ).await?;
     if principal.operator_version.is_some() {
         anyhow::ensure!(
             response.container_pubkey.is_some(),
@@ -608,11 +609,10 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             )
             .await?;
             let sandbox_id = deployment.as_ref().and_then(|d| d.sandbox_id.clone());
-            let generation = ctx
-                .deployments
-                .boot_authorization(seal_id)
-                .await?
-                .map(|b| b.generation);
+            // A stop can finish a disabled or pre-ticket boot too. Capture
+            // its actual row revision so the completion cannot affect a newer
+            // boot, while still recording the provider's successful stop.
+            let generation = ctx.deployments.runtime_generation(seal_id).await?;
             if let Err(e) = ctx.sandbox.stop(seal_id, &sandbox_envelope).await {
                 let msg = e.to_string();
                 let already_stopped = msg.contains("not started")
@@ -1088,11 +1088,8 @@ async fn handle_sandbox_recreate(
     // best-effort orphan cleanup at the end of this handler.
     let deployment = ctx.deployments.get(seal_id).await?;
     let old_sandbox_id = deployment.as_ref().and_then(|d| d.sandbox_id.clone());
-    let permission = if old_sandbox_id.as_deref().unwrap_or("").is_empty() {
-        LifecyclePermission::Provision
-    } else {
-        LifecyclePermission::Recreate
-    };
+    let permission = create_permission(deployment.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("unknown runtime deployment"))?);
     let principal = authorize_job(ctx, seal_id, &envelope, permission).await?;
 
     // Spawn the new sandbox. On failure we keep the old sandbox_id in
@@ -1197,7 +1194,7 @@ async fn handle_sandbox_recreate(
     // certified in this response.
     warn_uncertified_create(seal_id, &resp);
     if let Err(e) = bind_created_runtime(
-        ctx, seal_id, &envelope, permission, principal, &resp, generation,
+        ctx, seal_id, principal, &resp, generation,
     )
     .await
     {
@@ -2371,8 +2368,6 @@ async fn run_container_track(
     if let Err(e) = bind_created_runtime(
         ctx,
         seal_id,
-        envelope,
-        LifecyclePermission::Provision,
         principal,
         &resp,
         generation,
@@ -3035,6 +3030,69 @@ mod tests {
                 "provider": Address::repeat_byte(9), "resource_id": resource,
             }),
         )
+    }
+
+    #[tokio::test]
+    async fn operator_create_completion_survives_request_expiry_but_not_revocation() {
+        let (t, owner, operator) = operator_fixture().await;
+        let seal = dummy_seal();
+        let mut canonical = attestor_shared::sandbox::verify_envelope(
+            &operator_envelope(&t, "create", "", 1),
+            t.ctx.crypto.as_ref(),
+        )
+        .unwrap();
+        canonical.expires_at = Utc::now().timestamp() + 2;
+        let envelope = sign_operator_json(OP_KEY, serde_json::to_value(canonical).unwrap());
+        let principal = authorize_job(&t.ctx, seal, &envelope, LifecyclePermission::Provision)
+            .await
+            .unwrap();
+        assert_eq!(principal.owner, owner);
+        assert_eq!(principal.actor, operator);
+        let generation = prepare_runtime_boot(&t.ctx, seal, Some([7; 32]), principal)
+            .await
+            .unwrap()
+            .unwrap();
+        let response = t.ctx.sandbox.create(seal, &envelope, None).await.unwrap();
+        // The provider has accepted the request; only its response/persistence
+        // is delayed beyond the signed envelope's validity window.
+        tokio::time::sleep(std::time::Duration::from_millis(2050)).await;
+        assert!(
+            authorize_job(&t.ctx, seal, &envelope, LifecyclePermission::Provision)
+                .await
+                .is_err(),
+            "an expired request cannot start new work"
+        );
+        bind_created_runtime(&t.ctx, seal, principal, &response, generation)
+            .await
+            .expect("accepted create may finish after its request expires");
+        assert_eq!(
+            t.deployments
+                .get(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .sandbox_id
+                .as_deref(),
+            Some(response.id.as_str())
+        );
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+
+        // Request expiry is different from losing the delegation: revocation
+        // must still prevent this same paid response from renewing authority.
+        install_operator(&t, 1, None, false, 0).await;
+        assert!(
+            bind_created_runtime(&t.ctx, seal, principal, &response, generation)
+                .await
+                .is_err()
+        );
+        assert!(t
+            .deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .sandbox_id
+            .is_none());
     }
 
     #[tokio::test]
@@ -5950,6 +6008,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_stop_records_completion_for_disabled_and_legacy_boots() {
+        for legacy in [false, true] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_confirmed_deployment(&t, seal, 105, "sb-old-boot").await;
+            if legacy {
+                t.deployments
+                    .boot_authorizations
+                    .lock()
+                    .unwrap()
+                    .remove(&seal);
+                t.deployments
+                    .status_bindings
+                    .lock()
+                    .unwrap()
+                    .insert(seal, [9; 32]);
+            } else {
+                t.deployments
+                    .set_container_stage(
+                        seal,
+                        StageStatus::Failed {
+                            at: Utc::now(),
+                            reason: "provision failed before owner stopped compute".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    !t.deployments
+                        .boot_authorization(seal)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .enabled
+                );
+            }
+            run_stop(&t, seal)
+                .await
+                .expect("the provider stopped the current sandbox");
+            assert_eq!(t.sandbox.stop_calls.load(Ordering::SeqCst), 1);
+            let deployment = t.deployments.get(seal).await.unwrap().unwrap();
+            assert!(
+                matches!(deployment.container_stage,
+                StageStatus::Stopped { ref reason, .. } if reason == "user_stop"),
+                "legacy={legacy}: {:?}",
+                deployment.container_stage
+            );
+            assert!(t.events.events.lock().unwrap().iter().any(|event|
+                matches!(event, WsEvent::ContainerStopped { seal_id, .. } if *seal_id == seal)));
+        }
+    }
+
+    #[tokio::test]
     async fn sandbox_stop_proceeds_when_confirmed() {
         // Confirmed (running) → legitimate stop request.
         let t = make_test_ctx();
@@ -7000,6 +7111,10 @@ mod tests {
             None,
             None,
         );
+        // This is a pre-mint owner create: the authenticated signer must be
+        // the deployment's recorded owner during the completion recheck too.
+        t.deployments.by_seal.lock().unwrap().get_mut(&seal).unwrap().owner =
+            dummy_envelope("create").wallet_address;
         run_container_track(&t.ctx, seal, &dummy_envelope("create"))
             .await
             .expect("ok");

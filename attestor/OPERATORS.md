@@ -9,8 +9,11 @@ contract change is needed. See the [SDK workflow](../sdk/typescript/OPERATORS.md
 
 `GET /operator?seal_id=0x...` returns public metadata only: `seal_id`, the live
 NFT `owner`, effective `operator` (or null), `version`, `expires_at` and
-`allow_recreate`. It never returns owner signatures, credentials or container
-proof material. An expired, revoked or previous-owner grant is ineffective.
+`allow_recreate`, plus `checkpoint: {number, hash}` for the end of a canonical
+block. Before mint, GET reports the deployment owner with no operator or
+checkpoint; existing owner lifecycle and retry requests remain usable. It never
+returns owner signatures, credentials or container proof material. An expired,
+revoked or previous-owner grant is ineffective.
 
 `PUT /operator` accepts `{seal_id, signed_message_b64, signature}`. The current
 NFT owner signs the exact JSON bytes with EIP-191. The signed directive contains:
@@ -25,8 +28,13 @@ NFT owner signs the exact JSON bytes with EIP-191. The signed directive contains
 | `allow_recreate` | Permit replacing an existing runtime; default false |
 | `expires_at` | Unix seconds, or 0 for no time limit |
 | `issued_at` | Unix seconds within five minutes of the write |
+| `checkpoint` | Non-null `{number, hash}` from GET, included in the owner's signature |
 
-The owner signs a new directive for every change. A version conflict is HTTP
+The agent must be minted before PUT, including revocation. The owner signs a new
+directive for every change, covering the exact checkpoint returned by GET. Its
+block hash must still be canonical and its end-of-block owner must equal the
+current owner. The RPC must support canonical block and historical owner queries.
+A version conflict is HTTP
 409 and must be resolved by reading again, never silently retrying an old write.
 Every successful write, including renewal or revocation, retires the current
 runtime and clears its sandbox mapping. The appropriate controller must create
@@ -51,11 +59,16 @@ IDs go to a durable cleanup outbox, including orphan IDs learned when a create
 finishes after revocation. The worker retries every 60 seconds. The attestor
 needs its existing provider admin permission to delete those old sandboxes; failed
 deletions remain queued. Only captured old IDs are cleaned up, not a replacement.
+An accepted create's completion rechecks owner, grant and boot generation; the
+original request envelope expiring alone does not discard the result.
 
-Live owner checks reject another owner's grant immediately. Indexed Transfer
-events also revoke the outgoing owner's grant so ownership A → B → A does not
-reactivate the old delegation. With a delayed indexer, a grant newly signed after
-such a round trip may conservatively need to be signed again once events catch up.
+Live owner checks reject another owner's grant immediately. The signed checkpoint
+anchors the grant to an ownership epoch: a delayed Transfer event at or before
+block `H` does not revoke a new grant signed against the end of `H`. An indexed
+ownership transfer after `H` invalidates it. Revocation after A → B → A depends
+on the indexer catching up; live owner checks alone cannot detect that round trip.
+Previously stored proofs without a signed checkpoint retain conservative legacy
+handling; no unsigned checkpoint is retrofitted onto them.
 
 Expiry rejects future operator calls and renewal of provisioning/status/writeback
 authority; it is not an automatic shutdown timer. Revocation cannot erase an

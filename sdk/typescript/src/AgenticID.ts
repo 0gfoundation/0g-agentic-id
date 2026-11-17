@@ -185,8 +185,8 @@ export class AgentApi {
    * the key a running container got with its own create does not count, as
    * the new container will not have it.
    */
-  private async modelKeyPlan(sealId: Hash, opts: ModelKeyLifecycleOpts): Promise<{ keyInCredentials: boolean; beforeWrite?: () => Promise<void> }> {
-    if (await this.attestor.isRuntimeOperator(sealId)) {
+  private async modelKeyPlan(sealId: Hash, opts: ModelKeyLifecycleOpts, ownerResolved = false): Promise<{ keyInCredentials: boolean; beforeWrite?: () => Promise<void> }> {
+    if (!ownerResolved && await this.attestor.isRuntimeOperator(sealId)) {
       assertOperatorComputeOptions(opts);
       // Owner-provisioned credentials reach the runtime through /provision.
       // The operator neither reads nor writes the owner's credential set.
@@ -1205,9 +1205,7 @@ export class AgentApi {
 
   /** Stop a running sandbox with its controller wallet (the owner or appointed, paying operator). */
   async stop(sealId: Hash, sandboxId?: string): Promise<void> {
-    const id = sandboxId ?? await this.attestor.currentSandboxId(sealId);
-    if (!id) throw new Error('stop: agent has no sandbox');
-    await this.attestor.lifecycle('stop', { sealId, sandboxId: id });
+    await this.attestor.lifecycle('stop', { sealId, sandboxId, resolveSandbox: !sandboxId });
   }
   /**
    * Bring an agent online with its owner or appointed operator wallet.
@@ -1237,12 +1235,13 @@ export class AgentApi {
   start(sealId: Hash, opts?: ModelKeyLifecycleOpts): Promise<void>;
   async start(sealId: Hash, arg?: string | ModelKeyLifecycleOpts): Promise<void> {
     if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
-    const sandboxId = await this.attestor.currentSandboxId(sealId);
-    const key = await this.modelKeyPlan(sealId, arg ?? {});
     // `framework` resolves the right sealed image for a first provision (a
     // mint-only hermes/prime agent otherwise boots the default snapshot) —
     // same resolution deploy/reset use. (review #154 opportunity)
-    return this.attestor.lifecycle('start', { sealId, ...(sandboxId ? { sandboxId } : {}), provider: arg?.provider ?? arg?.sealedModelKey?.provider, framework: arg?.framework, sealedImage: arg?.sealedImage, ...requestKey(arg ?? {}), ...key });
+    return this.attestor.lifecycle('start', { sealId, resolveSandbox: true,
+      provider: arg?.provider ?? arg?.sealedModelKey?.provider, framework: arg?.framework, sealedImage: arg?.sealedImage,
+      ...requestKey(arg ?? {}), operatorOptions: arg ?? {},
+      prepareModelKey: () => this.modelKeyPlan(sealId, arg ?? {}, true) });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
@@ -1267,8 +1266,10 @@ export class AgentApi {
    * with {@link setSettings} first.
    */
   async reset(sealId: Hash, opts?: ModelKeyLifecycleOpts): Promise<void> {
-    const key = await this.modelKeyPlan(sealId, opts ?? {});
-    return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider ?? opts?.sealedModelKey?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, ...requestKey(opts ?? {}), ...key });
+    return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider ?? opts?.sealedModelKey?.provider,
+      framework: opts?.framework, sealedImage: opts?.sealedImage, ...requestKey(opts ?? {}),
+      operatorOptions: opts ?? {},
+      prepareModelKey: () => this.modelKeyPlan(sealId, opts ?? {}, true) });
   }
 
   /**
