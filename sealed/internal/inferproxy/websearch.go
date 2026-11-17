@@ -42,9 +42,10 @@ type WebSearch struct {
 	Model   string
 }
 
-// anthropicVersion is the anthropic-version header of a model-run search, as
-// the web search tool's documentation sends it.
-const anthropicVersion = "2026-10-21"
+// anthropicVersion is the anthropic-version header of a model-run search:
+// the one the Anthropic SDK sends on every Messages call (@anthropic-ai/sdk
+// 0.129.0, which the harness's own Anthropic model calls use).
+const anthropicVersion = "2023-06-01"
 
 // anthropicSearchTool is the basic web search server tool: Claude calls it
 // directly (no dynamic filtering, which would need code execution), at most
