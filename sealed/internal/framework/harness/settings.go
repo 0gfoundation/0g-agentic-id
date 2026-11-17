@@ -69,6 +69,11 @@ type harnessKnobs struct {
 	MaxParallelToolCalls int
 	// MCPServers are owner-selected DSH stdio/Streamable HTTP connections.
 	MCPServers string
+	// ModelImages says whether the owner's model takes images: nil leaves
+	// it to pi-ai's catalog (a model on a declared route, the 0G router's
+	// among them, is then text-only). No metadata sealed reads says what a
+	// gateway's model accepts, so the owner declares it.
+	ModelImages *bool
 }
 
 // defaultKnobs is the shipped composition, i.e. what an empty overlay must
@@ -120,6 +125,14 @@ func parseKnobs(raw json.RawMessage) harnessKnobs {
 	parseBoolKnob(fields, "toolJobs", &k.ToolJobs, d.ToolJobs)
 	parseBoolKnob(fields, "subagents", &k.Subagents, d.Subagents)
 	parseBoolKnob(fields, "schedule", &k.Schedule, d.Schedule)
+	if v, ok := fields["modelImages"]; ok {
+		var b bool
+		if err := json.Unmarshal(v, &b); err != nil {
+			logger.Logf("harness.RenderSettings: modelImages=%s is not a boolean (%v); leaving it to the model catalog", v, err)
+		} else {
+			k.ModelImages = &b
+		}
+	}
 	if raw, ok := fields["mcpServers"]; ok {
 		var servers []map[string]any
 		if err := json.Unmarshal(raw, &servers); err == nil && len(servers) <= 16 {
@@ -247,6 +260,9 @@ func settingsEnv(s settings.Resolved, k harnessKnobs) []string {
 	env["SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS"] = strconv.Itoa(k.MaxParallelToolCalls)
 	if k.MCPServers != "" {
 		env["SEAL_MCP_SERVERS"] = k.MCPServers
+	}
+	if k.ModelImages != nil {
+		env["SEAL_HARNESS_MODEL_IMAGES"] = boolEnv(*k.ModelImages)
 	}
 
 	env["SEAL_MODEL_PROVIDER"] = s.Provider

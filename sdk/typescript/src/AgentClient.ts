@@ -140,6 +140,33 @@ export interface ChatMessage {
 }
 
 /**
+ * An image sent with a message (`images` on {@link AgentClient.chat} /
+ * {@link AgentClient.chatStream}): PNG, JPEG, WebP or GIF, its bytes in
+ * base64. 0g-harness takes at most 8 per message, 10 MiB each and 32 MiB
+ * together; other frameworks may ignore or refuse them.
+ */
+export interface ChatImage {
+  mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
+  data: string;
+}
+
+/**
+ * What the agent's runtime says about a message it took (`onNotice`). Today
+ * one thing: the owner's model cannot view images, so the images were saved
+ * as files in the agent's `~/uploads` instead (0g-harness).
+ */
+export interface ChatNotice {
+  imagesSavedAsFiles?: string[];
+}
+
+/** A file the owner sent ({@link AgentClient.uploadFile}): where it landed. */
+export interface UploadedFile {
+  /** Absolute path in the agent's container (under `~/uploads`). */
+  path: string;
+  bytes: number;
+}
+
+/**
  * Snapshot of one long-running task (a "response" in OpenAI Responses API
  * terms) on the agent. Returned by {@link AgentClient.task} /
  * {@link AgentClient.cancelTask}.
@@ -150,6 +177,8 @@ export interface AgentTask {
   /** Assistant text produced so far (full text once completed). */
   output_text: string;
   error?: { message: string };
+  /** Runtime notices about the message that opened it (0g-harness). */
+  harness?: { images_saved_as_files?: string[] };
 }
 
 export interface ChatCompletion {
@@ -320,7 +349,14 @@ export interface AgentClient {
    * the agent; the completion is reassembled before returning, so the shape is
    * a plain {@link ChatCompletion}.
    */
-  chat?(messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }): Promise<ChatCompletion>;
+  chat?(messages: ChatMessage[], opts?: {
+    model?: string;
+    signal?: AbortSignal;
+    /** Images sent with the last user message (see {@link ChatImage}). */
+    images?: ChatImage[];
+    /** The runtime's notices about this message (see {@link ChatNotice}). */
+    onNotice?: (notice: ChatNotice) => void;
+  }): Promise<ChatCompletion>;
   /**
    * Like {@link chat}, but yields each content delta as it is generated — for
    * a live-typing UI. Present under the same conditions as `chat`.
@@ -336,6 +372,10 @@ export interface AgentClient {
   chatStream?(messages: ChatMessage[], opts?: {
     model?: string;
     signal?: AbortSignal;
+    /** Images sent with the last user message (see {@link ChatImage}). */
+    images?: ChatImage[];
+    /** The runtime's notices about this message (see {@link ChatNotice}). */
+    onNotice?: (notice: ChatNotice) => void;
     /** Tool-activity progress, when the agent's bridge streams it (SSE
      *  ": activity tool/call <name>" comments — 0g-harness does). Labels like
      *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
@@ -448,6 +488,14 @@ export interface AgentClient {
    * a `kind: "schedules"` route and this handle holds the owner token.
    */
   schedules?(): Promise<{ enabled: boolean; data: AgentSchedule[] }>;
+  /**
+   * Send the agent a file: it lands under the agent's `~/uploads` (a new
+   * name, never over an existing file; container-local, lost on a reset),
+   * and the agent reads it with its own tools — tell it the returned path.
+   * At most 25 MiB. Present only when the agent declares a `kind: "files"`
+   * route (0g-harness) and this handle holds the owner token.
+   */
+  uploadFile?(name: string, data: Uint8Array): Promise<UploadedFile>;
 }
 
 /** Longest-prefix match over declared routes, or undefined if none match. */
@@ -541,17 +589,56 @@ function chunkDelta(chunk: Record<string, unknown>): { role?: string; content: s
 }
 
 /** Fold an SSE chat stream into a single reassembled {@link ChatCompletion}. */
-async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<ChatCompletion> {
+async function collectChatStream(body: ReadableStream<Uint8Array>, onComment?: (c: string) => void): Promise<ChatCompletion> {
   let content = '';
   let role = 'assistant';
   let last: Record<string, unknown> = {};
-  for await (const chunk of iterSseChunks(body)) {
+  for await (const chunk of iterSseChunks(body, onComment)) {
     last = chunk;
     const d = chunkDelta(chunk);
     if (d.role) role = d.role;
     content += d.content;
   }
   return { ...last, choices: [{ message: { role, content } }] } as ChatCompletion;
+}
+
+// Base64 without Node's Buffer, so the module runs in browsers too.
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+const imageUrl = (im: ChatImage): string => `data:${im.mediaType};base64,${im.data}`;
+
+/**
+ * The messages with `images` on the last user message, in the request's own
+ * shape: chat/completions `image_url` parts, or Responses `input_text` /
+ * `input_image` parts. No images: the messages as they are.
+ */
+export function withImages(messages: ChatMessage[], images: ChatImage[] | undefined, shape: 'chat' | 'responses'): unknown[] {
+  if (!images?.length) return messages;
+  let i = messages.length - 1;
+  while (i >= 0 && messages[i].role !== 'user') i--;
+  const text = i >= 0 ? messages[i].content : '';
+  const content = shape === 'chat'
+    ? [{ type: 'text', text }, ...images.map((im) => ({ type: 'image_url', image_url: { url: imageUrl(im) } }))]
+    : [{ type: 'input_text', text }, ...images.map((im) => ({ type: 'input_image', image_url: imageUrl(im) }))];
+  const out: unknown[] = messages.slice();
+  if (i >= 0) out[i] = { role: 'user', content };
+  else out.push({ role: 'user', content });
+  return out;
+}
+
+/** The notice an SSE comment carries (`: notice images_saved_as_files [...]`), if any. */
+function noticeOf(comment: string): ChatNotice | undefined {
+  const m = /^notice images_saved_as_files (\[.*\])$/.exec(comment);
+  if (!m) return undefined;
+  try {
+    const paths = JSON.parse(m[1]) as unknown;
+    if (Array.isArray(paths) && paths.every((p) => typeof p === 'string')) return { imagesSavedAsFiles: paths.map((p) => plainText(p)) };
+  } catch { /* not a notice */ }
+  return undefined;
 }
 
 /**
@@ -678,8 +765,10 @@ export function makeAgentClient(params: {
   // deploy. There's no framework-agnostic default (/hello doesn't declare it),
   // so omit the field when the caller doesn't set one rather than sending a
   // bogus value the framework rejects.
-  const chatBody = (messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }) =>
-    JSON.stringify(opts?.model ? { model: opts.model, messages, stream: true } : { messages, stream: true });
+  const chatBody = (messages: ChatMessage[], opts?: { model?: string; images?: ChatImage[] }) => {
+    const sent = withImages(messages, opts?.images, 'chat');
+    return JSON.stringify(opts?.model ? { model: opts.model, messages: sent, stream: true } : { messages: sent, stream: true });
+  };
 
   const chat = routes.find((r) => r.kind === 'chat');
   if (chat && canAuth) {
@@ -719,9 +808,11 @@ export function makeAgentClient(params: {
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const ct = r.headers.get('content-type') ?? '';
       if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
-        return (await r.json()) as ChatCompletion; // server didn't stream → plain JSON
+        const full = (await r.json()) as ChatCompletion & { harness?: { images_saved_as_files?: string[] } };
+        if (full.harness?.images_saved_as_files) opts?.onNotice?.({ imagesSavedAsFiles: full.harness.images_saved_as_files });
+        return full; // server didn't stream → plain JSON
       }
-      return collectChatStream(r.body);
+      return collectChatStream(r.body, opts?.onNotice ? (c) => { const n = noticeOf(c); if (n) opts.onNotice!(n); } : undefined);
     };
 
     client.chatStream = async function* (messages, opts) {
@@ -750,8 +841,12 @@ export function makeAgentClient(params: {
       // (feedback.md F15)
       let sawContent = false;
       let streamErr: string | null = null;
-      const onComment = opts?.onActivity
-        ? (c: string): void => { if (c.startsWith('activity ')) opts.onActivity!(plainText(c.slice(9))); }
+      const onComment = opts?.onActivity || opts?.onNotice
+        ? (c: string): void => {
+          if (c.startsWith('activity ')) opts.onActivity?.(plainText(c.slice(9)));
+          const n = noticeOf(c);
+          if (n) opts.onNotice?.(n);
+        }
         : undefined;
       let lastThinkingAt = 0;
       const thinking = (): void => {
@@ -1015,7 +1110,7 @@ export function makeAgentClient(params: {
       // returns the id in milliseconds, so every long-lived byte after that
       // travels on a GET we can always resume by id. One extra round trip
       // buys the guarantee that a task is never lost to a dropped connection.
-      const payload: Record<string, unknown> = { input: messages };
+      const payload: Record<string, unknown> = { input: withImages(messages, opts?.images, 'responses') };
       if (opts?.model) payload.model = opts.model;
       if (opts?.thinking) payload.reasoning = { effort: opts.thinking };
       const r = await doFetch(rPrefix, {
@@ -1027,6 +1122,8 @@ export function makeAgentClient(params: {
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const submitted = (await r.json()) as AgentTask;
       if (!submitted?.id) throw new Error('chat: the agent accepted the task but returned no id');
+      const saved = submitted.harness?.images_saved_as_files;
+      if (Array.isArray(saved) && saved.length) opts?.onNotice?.({ imagesSavedAsFiles: saved.map((p) => plainText(String(p))) });
       // A task id is a name to re-attach with: one that is not a plain
       // identifier is not handed out to be printed.
       if (TASK_ID.test(submitted.id)) opts?.onTask?.(submitted.id);
@@ -1115,6 +1212,11 @@ export function makeAgentClient(params: {
       const j = await getJSON<{ enabled?: boolean; data?: AgentSchedule[] }>('schedules', schedulesBase);
       return { enabled: j.enabled !== false, data: j.data ?? [] };
     };
+  }
+
+  const filesBase = ownerBase('files');
+  if (filesBase) {
+    client.uploadFile = (name, data) => postJSON<UploadedFile>('uploadFile', filesBase, { name, content_base64: bytesToBase64(data) });
   }
 
   const eventsBase = ownerBase('events');

@@ -68,7 +68,7 @@
 
 内容：
 - Debian 和固定版本的 node；python3；给 owner 的 agent 用的浏览器（Chromium 和 Playwright MCP
-  服务器，由 `sealed-browser-mcp` 启动）；
+  服务器，由 `sealed-browser-mcp` 启动）；读 owner 上传的 PDF 用的 `pdftotext`（poppler-utils）；
 - 加载器；
 - 一个官方版本的 harness 包（含全部依赖），下载不到其他版本时回退用。
 

@@ -622,5 +622,10 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			get("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/cancel")),
 		route("/v1/schedules", "schedules", "Reminders the agent set for itself: GET /v1/schedules (enabled:false unless the owner's `schedule` knob is on).",
 			get("/v1/schedules"), framework.Endpoint{Method: http.MethodDelete, Path: "/v1/schedules/{id}"}),
+		// Owner files: written by the harness (the agent user) to a new name
+		// under ~/uploads, where the agent reads them. Images ride the chat
+		// and Responses messages themselves.
+		route("/v1/files", "files", "Owner file upload: POST /v1/files {name, content_base64} → {path, bytes}; the file lands under the agent's ~/uploads (container-local, not tracked), at most 25 MiB.",
+			post("/v1/files")),
 	}
 }

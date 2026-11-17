@@ -9,7 +9,7 @@
 # a browser for the owner's agent (Chromium, the Playwright MCP server and
 # sealed-browser-mcp, which the owner turns on in the agent's settings),
 # ca-certificates (chain RPC + 0G storage + router TLS), git and procps (the
-# adapter's orphan sweep), one 0g-harness
+# adapter's orphan sweep), poppler-utils (pdftotext, for uploaded PDFs), one 0g-harness
 # official version package (its locked DSH dependency tree included), the
 # sealed bootstrap binary, the loader that runs it (cmd/loader),
 # sealed-service-launcher (cmd/service-launcher: confines each hosted service
@@ -145,8 +145,11 @@ RUN npm install -g --no-fund --no-audit "${HARNESS_REF}" \
 # Stage 4 — runtime.
 FROM debian:13-slim
 
+# poppler-utils: pdftotext and pdfinfo, so the agent reads the PDFs its
+# owner uploads (POST /v1/files lands them in ~/uploads).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils python3 \
+ && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils python3 poppler-utils \
+ && command -v pdftotext \
  && rm -rf /var/lib/apt/lists/*
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):

@@ -211,6 +211,29 @@ func TestRenderSettings_SubagentsAndScheduleKnobs(t *testing.T) {
 	}
 }
 
+// modelImages reaches the harness only when the owner set it: unset leaves
+// the answer to the model catalog, and a value that is not a boolean is
+// dropped, not fatal.
+func TestRenderSettings_ModelImagesKnob(t *testing.T) {
+	catalogServer(t, reasoningModel("glm-5.3"))
+	for _, c := range []struct {
+		overlay string
+		want    string
+		set     bool
+	}{
+		{`{}`, "", false},
+		{`{"modelImages":true}`, "1", true},
+		{`{"modelImages":false}`, "0", true},
+		{`{"modelImages":"yes"}`, "", false},
+	} {
+		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.overlay)})
+		got, ok := env["SEAL_HARNESS_MODEL_IMAGES"]
+		if ok != c.set || got != c.want {
+			t.Errorf("%s → SEAL_HARNESS_MODEL_IMAGES=%q (set %v), want %q (set %v)", c.overlay, got, ok, c.want, c.set)
+		}
+	}
+}
+
 // One policy for every way an overlay can be wrong. The first cut clamped an
 // out-of-range value ("a typo must not brick an agent") but returned an error
 // for a wrongly-typed one — and that error comes out of RenderSettings, which

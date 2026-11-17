@@ -37,7 +37,7 @@ harness 做三件事:
 - 把这段对话和它的轮次记录存在一起(`../../CONVERSATION.zh.md`);
 - 把每一轮的输出交给开启这一轮的一方。owner 开启的轮次,交给 owner 的那个请求;agent 自己开启的轮次(后台任务结束、提醒到点),进收件箱。
 
-`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后四种,对它们没有任何改变。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。
+`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`、`files`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后五种,对它们没有任何改变。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。
 
 harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)和 `skills/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
 
@@ -51,6 +51,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | 推理 | `dsh-llm-pi-ai`(路由由适配器按 owner 的 settings 渲染好传进去)、`dsh-credentials-local` |
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | 文件读写 | `dsh-fs-local` + `dsh-tool-fs` |
+| owner 发的图片和文件 | `dsh-attachment-local`（owner 发的图片规整后存在 `$DSH_HOME/attachments` 下，不进链；同时让 `read_image` 可用）。owner 上传的文件（`POST /v1/files`）放在 `~/uploads`，不进链；镜像带 `pdftotext`，用来读其中的 PDF |
 | 技能 | `dsh-skill-filesystem`(对应 `skills/` 这个 iData role:agent 自己装的,会上链) |
 | 上下文余量 | `dsh-token-meter` + `dsh-compaction-basic` |
 | 循环兜底 | `dsh-tool-call-timeout-policy` |
@@ -79,6 +80,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | `subagents` | `false` | 打开 `subagent` 工具:主 agent 派出去在后台跑的只读助手(会同时打开任务工具) |
 | `schedule` | `false` | 打开 `schedule_create` / `schedule_list` / `schedule_delete`:agent 给自己设的提醒 |
 | `maxParallelToolCalls` | `1` | 模型一步里最多同时运行几个工具调用。只对声明了可以并发的工具生效：`read`、`read_image`、`subagent`。`bash`、`write`、`edit`、`seal_*` 工具以及任务和提醒工具总是单独运行，等前面的调用结束才开始 |
+| `modelImages` | 不设置 | owner 的模型能不能看图（`true`/`false`）。不设置时按 pi-ai 的模型目录，0G router 上的模型只收文字。能看图时 owner 发的图片交给模型；不能时每张图存到 `~/uploads`，并告诉 agent 它看不到 |
 
 这里填错,不会让 agent 起不来。`RenderSettings` 每次 spawn 前都会运行,要是在这里报错,agent 就开不了机,而不是"这次推送被拒"。所以解析不了或超出范围的值,一律退回出厂默认值,在日志里说明,其他开关照常生效(`settings.go`)。
 
