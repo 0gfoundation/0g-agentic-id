@@ -39,7 +39,7 @@ harness 做三件事:
 
 `FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后四种,对它们没有任何改变。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。
 
-harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)和 `skills/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
+harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)、`skills/` 和 `memory/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
 
 ## 当前组合
 
@@ -52,6 +52,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | 文件读写 | `dsh-fs-local` + `dsh-tool-fs` |
 | 技能 | `dsh-skill-filesystem`(对应 `skills/` 这个 iData role:agent 自己装的,会上链) |
+| 长期记忆 | harness 自己的系统提示段(`src/memory.mjs`):说明和 `MEMORY.md` 索引,每个模型步骤都重新读取;记忆文件是 `memory/` 这个 iData role(`memory.go`):每条记忆一个 `<name>.md`,直接放在 `$DSH_HOME/memory/` 里,会上链 |
 | 上下文余量 | `dsh-token-meter` + `dsh-compaction-basic` |
 | 循环兜底 | `dsh-tool-call-timeout-policy` |
 | 后台任务(打开 `toolJobs` 时) | `dsh-tool-jobs`:命令可以放到后台跑;agent 空闲时任务结束,会开启新的一轮,这一轮的回复进收件箱 |
@@ -103,5 +104,4 @@ privsep 让框架子进程以低权限的 `agent` 用户运行。把它和 seale
 
 其他还没做的:
 - 把 `~/.dsh/AGENTS.md` 做成 persona role;
-- 加一个 `memory/` DirectoryManifest role;
 - 补上 e2b 工具沙盒,它是 habitat 模型里"工具沙盒"那一侧。

@@ -211,7 +211,7 @@ attestor's stop/start remains.
 
 The last three keep the disk: turns and background tasks in progress stop,
 while the conversation, inbox and reminders live on disk and survive. So do
-the persona and skills the agent changed after its last commit: sealed keeps,
+the persona, skills and memory the agent changed after its last commit: sealed keeps,
 on disk and root-only, the version this container last had in sync with the
 chain, and when on the next boot the chain has not moved but the disk has, it
 keeps the disk and lets the watcher commit it, instead of restoring the chain
@@ -506,7 +506,7 @@ encode it into normal-looking traffic. The channels:
   and credentials sealed fills in can write data to allowed hosts.
 - Data inside signed transactions. Transactions are public, and the signing
   policy can limit which kinds are signed but not data encoded in parameters.
-- Model requests themselves carry the persona and skills. With the owner's own
+- Model requests themselves carry the persona, the skills and the memory index. With the owner's own
   provider account, what the provider sees is outside the platform's control.
 
 What the owner can never get is the agent identity key and the data key: the

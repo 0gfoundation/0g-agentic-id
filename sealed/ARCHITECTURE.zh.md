@@ -530,7 +530,7 @@ adapter 同时把自家那份摘掉了，理由见 §5（"什么是 iData，什�
 | openclaw（`openclaw.go:164`） | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `openclaw.json` |
 | hermes（`hermes.go:143`） | `framework`、`SOUL.md`、`memories/`、`skills/` | `config.yaml` |
 | prime-agent（`prime.go:162`） | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `models.json` |
-| 0g-harness（`harness.go:167`） | `framework`、`APPEND_SYSTEM.md`、`skills/` | `settings.yaml` |
+| 0g-harness（`harness.go:200`） | `framework`、`APPEND_SYSTEM.md`、`skills/`、`memory/` | `settings.yaml` |
 
 四个都收敛成同一个形状 —— *binding + persona + memory + skills* —— 这个形状以前被
 各框架的配置文件挡住了。
