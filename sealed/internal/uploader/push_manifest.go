@@ -35,6 +35,7 @@ func (u *Uploader) pushManifest(
 	plaintext []byte,
 	dataKey []byte,
 	oldEntry *chain.IntelligentData,
+	basis string,
 ) (chain.IntelligentData, error) {
 	newManifest, err := manifest.Unmarshal(plaintext)
 	if err != nil {
@@ -63,6 +64,12 @@ func (u *Uploader) pushManifest(
 				continue
 			}
 		}
+		// Uploaded by an earlier attempt that did not reach the chain.
+		if ptr, ok := u.pending.blob(role, e.Path, basis, e.ContentHash); ok {
+			e.StoragePtr = ptr
+			reused++
+			continue
+		}
 		content, err := u.adapter.LoadEntry(ctx, role, e.Path)
 		if err != nil {
 			return chain.IntelligentData{}, fmt.Errorf("LoadEntry[%s] %s: %w", role, e.Path, err)
@@ -79,6 +86,7 @@ func (u *Uploader) pushManifest(
 			RootHash: "0x" + hex.EncodeToString(root[:]),
 			Size:     len(ct),
 		}
+		u.pending.keepBlob(role, e.Path, basis, e.ContentHash, e.StoragePtr)
 		fresh++
 	}
 
