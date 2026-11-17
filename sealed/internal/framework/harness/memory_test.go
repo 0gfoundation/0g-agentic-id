@@ -164,3 +164,88 @@ func TestRestoreReplacesALinkedMemoryDir(t *testing.T) {
 		t.Fatalf("memory/ is not a real directory: %v", err)
 	}
 }
+
+// memory-public/ is the public level: the same shape as memory/, its own
+// directory, empty by default and restored empty for an agent minted before
+// it existed.
+func TestPublicMemoryRole(t *testing.T) {
+	dshHome = t.TempDir()
+	a := New()
+	ctx := context.Background()
+	found := false
+	for _, r := range a.Roles() {
+		if r.Name == "memory-public/" {
+			found = r.Shape == framework.DirectoryManifest
+		}
+	}
+	if !found {
+		t.Fatal("memory-public/ is not a declared DirectoryManifest role")
+	}
+	if !a.KeepsUncommitted("memory-public/") {
+		t.Fatal("memory-public/ is the agent's own writing: a boot must keep its uncommitted changes")
+	}
+	if err := a.Restore(ctx, "memory-public/", nil); err != nil {
+		t.Fatalf("Restore(memory-public/, nil): %v", err)
+	}
+	if fi, err := os.Stat(publicMemoryDir()); err != nil || !fi.IsDir() {
+		t.Fatalf("memory-public/ not created: %v", err)
+	}
+	if got, _ := a.EvolutionFor(ctx, "memory-public/"); !bytes.Equal(got, a.Defaults("memory-public/")) {
+		t.Fatalf("EvolutionFor(memory-public/) after an empty restore = %q, want the default", got)
+	}
+	// A public memory and a private one land in their own directories, and
+	// each role carries only its own.
+	if err := a.RestoreEntry(ctx, "memory-public/", "faq.md", []byte("---\nname: faq\n---\npublic\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RestoreEntry(ctx, "memory/", "plan.md", []byte("---\nname: plan\n---\nprivate\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(publicMemoryDir(), "faq.md")); err != nil {
+		t.Fatalf("public entry not in memory-public/: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(memoryDir(), "faq.md")); err == nil {
+		t.Fatal("public entry leaked into memory/")
+	}
+	pub, err := a.EvolutionFor(ctx, "memory-public/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := manifest.Unmarshal(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Entries) != 1 || m.Entries[0].Path != "faq.md" {
+		t.Fatalf("memory-public/ manifest = %+v, want only faq.md", m.Entries)
+	}
+	if got, err := a.LoadEntry(ctx, "memory-public/", "faq.md"); err != nil || !bytes.Contains(got, []byte("public")) {
+		t.Fatalf("LoadEntry(memory-public/, faq.md) = %q, %v", got, err)
+	}
+	if _, err := a.LoadEntry(ctx, "memory-public/", "../memory/plan.md"); err == nil {
+		t.Fatal("a public entry path left its role")
+	}
+}
+
+// The harness learns the NFT owner from SEAL_OWNER, lowercased; without a
+// known owner the variable is not set.
+func TestBridgeEnvOwner(t *testing.T) {
+	has := func(env []string, want string) bool {
+		for _, e := range env {
+			if e == want {
+				return true
+			}
+		}
+		return false
+	}
+	be := bridgeEnv{token: "tok"}
+	be.rt.Owner = "0xABCDEF0000000000000000000000000000000001"
+	if !has(be.environ(), "SEAL_OWNER=0xabcdef0000000000000000000000000000000001") {
+		t.Fatal("SEAL_OWNER missing or not lowercased")
+	}
+	be.rt.Owner = ""
+	for _, e := range be.environ() {
+		if len(e) > 11 && e[:11] == "SEAL_OWNER=" {
+			t.Fatalf("SEAL_OWNER set without an owner: %q", e)
+		}
+	}
+}

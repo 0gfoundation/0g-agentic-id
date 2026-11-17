@@ -172,7 +172,15 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		if upstream == "" {
 			upstream = ep.BaseURL
 		}
-		route.SetRoute(inferproxy.Route{Upstream: upstream, Headers: inferenceHeaders(ep.Format, apiKey), Model: model, System: doc})
+		r := inferproxy.Route{Upstream: upstream, Headers: inferenceHeaders(ep.Format, apiKey), Model: model, System: doc}
+		// The 0G router also serves a web search under the same key: the
+		// route lets web/search through to it, and the harness's web_search
+		// posts there (src/web.mjs). Other providers have none.
+		if provider == inference.ZGComputeProvider && rendered.knobs.WebTools {
+			r.WebSearch = &inferproxy.WebSearch{URL: inferproxy.WebSearchURL(upstream), Headers: map[string]string{"Authorization": "Bearer " + apiKey}}
+			be.webSearchURL = route.BaseURL() + "/v1/web/search"
+		}
+		route.SetRoute(r)
 		be.apiKey, be.modelBaseURL, be.modelAPI = routedKeyPlaceholder, route.BaseURL(), wireAPI(ep.Format)
 		inferURL = ep.BaseURL
 	} else {
@@ -268,6 +276,9 @@ type bridgeEnv struct {
 	// modelAPI, when set, replaces the rendered SEAL_MODEL_API: the wire
 	// protocol of the endpoint the inference route forwards to.
 	modelAPI string
+	// webSearchURL, when set, is where the harness's web_search posts: the
+	// inference route's web/search (0G router only).
+	webSearchURL string
 }
 
 // modelEndpoint is the endpoint sealed's inference route forwards the
@@ -358,6 +369,9 @@ func (be bridgeEnv) environ() []string {
 		// layer), so the key never touches a credentials file.
 		env = append(env, "SEAL_MODEL_API_KEY="+be.apiKey)
 	}
+	if be.webSearchURL != "" {
+		env = append(env, "SEAL_HARNESS_WEB_SEARCH_URL="+be.webSearchURL)
+	}
 	// Public on-chain facts the agent (and seal-tools) benefit from knowing.
 	if be.rt.PublicURL != "" {
 		env = append(env, "AGENT_PUBLIC_URL="+be.rt.PublicURL)
@@ -367,6 +381,12 @@ func (be bridgeEnv) environ() []string {
 	}
 	if be.rt.AgentSeal != "" {
 		env = append(env, "AGENT_SEAL="+be.rt.AgentSeal)
+	}
+	// The NFT owner at this boot (a public chain fact): a memory item is
+	// trusted only while its trusted_by names this address, so after a
+	// transfer what the previous owner confirmed is reference only.
+	if be.rt.Owner != "" {
+		env = append(env, "SEAL_OWNER="+strings.ToLower(be.rt.Owner))
 	}
 	return append(env, be.rt.CredentialEnv()...)
 }
@@ -618,13 +638,18 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			get("/v1/inbox"), post("/v1/inbox/ack")),
 		route("/v1/events", "events", "Server-sent feed of turn, inbox, activity and schedule changes, resumable from a cursor: GET /v1/events?after=N.",
 			get("/v1/events")),
-		// What runs or ran. "Task" is kept for zgh-style tasks (a unit of
-		// work with its own session, state and outcome); /v1/tasks stays,
-		// as the deprecated alias of this list, until it names them.
+		// What runs or ran: turns, background commands, subagents.
 		route("/v1/activities", "activities", "Turns, background commands and subagents, with who did each: GET /v1/activities, GET /v1/activities/{id}, POST /v1/activities/{id}/cancel (id `all` cancels everything running).",
 			get("/v1/activities"), get("/v1/activities/{id}"), post("/v1/activities/{id}/cancel")),
-		route("/v1/tasks", "tasks", "Deprecated alias of /v1/activities (same answers, with Deprecation: true), until /v1/tasks names zgh-style tasks: GET /v1/tasks, GET /v1/tasks/{id}, POST /v1/tasks/{id}/cancel.",
-			get("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/cancel")),
+		// zgh-style tasks: a piece of work the owner hands the agent, with
+		// its own session, workspace, state and outcome records. The feed's
+		// own kind, task-feed, tells a client that /v1/tasks names these
+		// tasks: before them, a runtime declared kind "tasks" for the
+		// activity list's old name.
+		route("/v1/tasks", "tasks", "Owner tasks (zgh's task model): POST /v1/tasks {prompt, id?, title?, workspace?: {dir}, instructions?, outcome_tools?, metadata?} → 201 (an id taken → 409 id-taken); GET /v1/tasks?state=&metadata.K=V; GET /v1/tasks/{id} → {state: queued|working|idle|needs-input|done|failed|archived, outcome, records, runs, …}; POST /v1/tasks/{id}/input {text, mode: steer|next} → 202 {delivery}; POST /v1/tasks/{id}/cancel; POST /v1/tasks/{id}/archive; GET /v1/tasks/{id}/events (SSE). The agent records each run's outcome with raise_question, request_action or report_complete; at most four tasks run at once.",
+			get("/v1/tasks"), post("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/input"), post("/v1/tasks/{id}/cancel"), post("/v1/tasks/{id}/archive"), get("/v1/tasks/{id}/events")),
+		route("/v1/task-feed", "task-feed", "Server-sent feed of every task's changes: one `task` event per task not archived, then `ready`, then one `task` event per change.",
+			get("/v1/task-feed")),
 		route("/v1/schedules", "schedules", "Reminders the agent set for itself: GET /v1/schedules (enabled:false unless the owner's `schedule` knob is on).",
 			get("/v1/schedules"), framework.Endpoint{Method: http.MethodDelete, Path: "/v1/schedules/{id}"}),
 		// Long-term memory upkeep on the owner's request: one consolidation
@@ -644,5 +669,9 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 		// ordinary turn when no owner turn is running.
 		route("/v1/steer", "steer", "Owner text for the running turn: POST /v1/steer {text} → {merged:true, id, turn} (read before the turn's next model call) or {merged:false, queued} (no owner turn running: an ordinary turn); GET /v1/steer/{id} → {state, turn}.",
 			post("/v1/steer"), get("/v1/steer/{id}")),
+		// The owner's other conversations (zgh-style sessions): each its own
+		// history, all sharing persona, skills, memory and credentials.
+		route("/v1/sessions", "sessions", "Owner sessions: GET /v1/sessions; POST /v1/sessions {title?, fork?, at?, resume?} → 201 {id}; GET /v1/sessions/{id}; POST /v1/sessions/{id}/prompt {text, mode: next|steer} → 202 {id: response id}; GET /v1/sessions/{id}/events?after=N (SSE); POST /v1/sessions/{id}/cancel. owner-chat is the default session behind /v1/chat/completions and /v1/responses.",
+			get("/v1/sessions"), post("/v1/sessions"), get("/v1/sessions/{id}"), post("/v1/sessions/{id}/prompt"), get("/v1/sessions/{id}/events"), post("/v1/sessions/{id}/cancel")),
 	}
 }

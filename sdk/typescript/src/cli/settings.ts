@@ -106,7 +106,7 @@ export function parseAssignments(args: string[]): Assignment[] {
 }
 
 /** `others` keys only the 0g-harness adapter reads (sealed `harness/settings.go`). */
-export const HARNESS_ONLY_KEYS = ['toolJobs', 'subagents', 'schedule', 'maxParallelToolCalls', 'modelImages', 'memoryExtract', 'memoryTidy'] as const;
+export const HARNESS_ONLY_KEYS = ['toolJobs', 'subagents', 'schedule', 'maxParallelToolCalls', 'modelImages', 'memoryExtract', 'memoryExtractMinMessages', 'memoryInlineBytes', 'memoryRecall', 'memoryTidy', 'webTools'] as const;
 
 /**
  * Whether `framework` names the 0g-harness adapter. `dsh` is its name before

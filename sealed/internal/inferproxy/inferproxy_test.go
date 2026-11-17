@@ -180,3 +180,79 @@ func TestServerForwards(t *testing.T) {
 		t.Fatalf("without the token: %d", resp.StatusCode)
 	}
 }
+
+// web/search passes only where the route has a search URL: the query alone,
+// with the route's search headers, no model and no platform text.
+func TestServerWebSearch(t *testing.T) {
+	var got struct {
+		path, auth, ctype string
+		body              []byte
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.path, got.auth, got.ctype = r.URL.RequestURI(), r.Header.Get("Authorization"), r.Header.Get("Content-Type")
+		got.body, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"results":[]}`)
+	}))
+	defer upstream.Close()
+	s, err := Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func(path, body string) (int, string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, s.BaseURL()+path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer framework-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, string(b)
+	}
+
+	// A route without a search URL (a native provider): refused.
+	s.SetRoute(Route{Upstream: upstream.URL + "/v1", Headers: map[string]string{"Authorization": "Bearer {placeholder}"}, Model: "m", System: "PLATFORM"})
+	if code, _ := post("/v1/web/search", `{"query":"x"}`); code != http.StatusNotFound {
+		t.Fatalf("without a search URL: %d", code)
+	}
+
+	route := Route{Upstream: upstream.URL + "/v1", Headers: map[string]string{"Authorization": "Bearer {placeholder}"}, Model: "m", System: "PLATFORM",
+		WebSearch: &WebSearch{URL: WebSearchURL(upstream.URL + "/v1"), Headers: map[string]string{"Authorization": "Bearer {placeholder}"}}}
+	s.SetRoute(route)
+	for _, path := range []string{"/web/search", "/v1/web/search"} {
+		code, body := post(path, `{"query":"zero gravity","model":"other","count":50}`)
+		if code != http.StatusOK || body != `{"results":[]}` {
+			t.Fatalf("%s: %d %q", path, code, body)
+		}
+		if got.path != "/v1/web/search" || got.auth != "Bearer {placeholder}" || got.ctype != "application/json" || string(got.body) != `{"query":"zero gravity"}` {
+			t.Fatalf("%s: upstream got %s %q %q %s", path, got.path, got.auth, got.ctype, got.body)
+		}
+	}
+	for _, bad := range []string{`{}`, `{"query":""}`, `{"query":"   "}`, `{"query":7}`, `not json`, `{"query":"` + strings.Repeat("q", maxSearchQuery+1) + `"}`} {
+		if code, _ := post("/v1/web/search", bad); code != http.StatusBadRequest {
+			t.Errorf("%s: %d, want 400", bad, code)
+		}
+	}
+	if code, _ := post("/v1/web/search", `{"query":"`+strings.Repeat("q", maxSearchBody)+`"}`); code != http.StatusRequestEntityTooLarge {
+		t.Errorf("oversized body: %d", code)
+	}
+	req, _ := http.NewRequest(http.MethodGet, s.BaseURL()+"/v1/web/search", nil)
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET web/search: %v %v", resp, err)
+	}
+}
+
+func TestWebSearchURL(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://router-api.0g.ai/v1":                           "https://router-api.0g.ai/v1/web/search",
+		"https://router-api.0g.ai":                              "https://router-api.0g.ai/v1/web/search",
+		"https://router-api.0g.ai/":                             "https://router-api.0g.ai/v1/web/search",
+		"http://127.0.0.1:9/explicit/https/router-api.0g.ai/v1": "http://127.0.0.1:9/explicit/https/router-api.0g.ai/v1/web/search",
+	} {
+		if got := WebSearchURL(in); got != want {
+			t.Errorf("%s → %s, want %s", in, got, want)
+		}
+	}
+}

@@ -43,7 +43,14 @@ func TestConformance(t *testing.T) {
 				Role: "memory/",
 				Files: map[string][]byte{
 					"MEMORY.md":      []byte("- [Owner prefers short answers](owner-style.md) — answer length\n"),
-					"owner-style.md": []byte("---\nname: owner-style\ndescription: how the owner wants answers\ntype: feedback\nsource: owner\n---\n\nShort answers, conclusion first.\n"),
+					"owner-style.md": []byte("---\nname: owner-style\ndescription: how the owner wants answers\ntype: feedback\ntrusted_by: 0x00000000000000000000000000000000000000aa\n---\n\nShort answers, conclusion first.\n"),
+				},
+			},
+			{
+				Role: "memory-public/",
+				Files: map[string][]byte{
+					"MEMORY.md":      []byte("- [Product FAQ](product-faq.md) — common questions about the product\n"),
+					"product-faq.md": []byte("---\nname: product-faq\ndescription: common questions about the product\ntype: reference\ntrusted_by: 0x00000000000000000000000000000000000000aa\n---\n\nThe agent answers in English or Chinese.\n"),
 				},
 			},
 		},

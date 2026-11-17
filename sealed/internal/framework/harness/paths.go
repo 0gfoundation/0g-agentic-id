@@ -92,6 +92,8 @@ func skillsDir() string { return dshHome + "/skills" }
 
 func memoryDir() string { return dshHome + "/memory" }
 
+func publicMemoryDir() string { return dshHome + "/memory-public" }
+
 // appendSystemPath holds the owner persona, injected by the harness into
 // ctx.systemPrompt at boot (see spawn.go) — DSH has no native
 // append-system-prompt-from-file convention the way prime-agent does, so

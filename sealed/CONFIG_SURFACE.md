@@ -132,7 +132,11 @@ owner's model on every request, appends the agent doc to the system prompt
 and sets the key (`harness/spawn.go` `modelEndpoint`). It forwards model calls
 only, by exact path under the route's base URL: POST `chat/completions`,
 `messages` and `responses`, GET `models`, each with or without a leading `/v1`
-(`inferproxy.endpoint`). Only a provider sealed knows no endpoint of is still
+(`inferproxy.endpoint`). On the 0G router (`0g-compute`) with the owner's
+`webTools` switch on, it also forwards POST `web/search` (the harness's
+`web_search`): a `{"query"}` body only, rebuilt, with the key set and no model
+or agent doc (`inferproxy` `webSearch`); for any other provider that path
+answers 404. Only a provider sealed knows no endpoint of is still
 dialled by the harness itself. The other three frameworks keep their own
 wiring for native providers.
 
@@ -792,7 +796,7 @@ What that table exposed, and what became of it:
 | openclaw | `framework`, `openclaw.json`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` (`openclaw/openclaw.go:164`) |
 | hermes | `framework`, `config.yaml`, `SOUL.md`, `memories/`, `skills/` | `framework`, `SOUL.md`, `memories/`, `skills/` (`hermes/hermes.go:143`) |
 | prime-agent | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `models.json`, `skills/` | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` (`prime/prime.go:162`) |
-| 0g-harness | `framework`, `APPEND_SYSTEM.md`, `settings.yaml`, `skills/` | `framework`, `APPEND_SYSTEM.md`, `skills/`, `memory/` (`harness/harness.go:200`) |
+| 0g-harness | `framework`, `APPEND_SYSTEM.md`, `settings.yaml`, `skills/` | `framework`, `APPEND_SYSTEM.md`, `skills/`, `memory/`, `memory-public/` (`harness/harness.go:208`) |
 
 No config role anywhere. All four reduce to *reader + persona + memory +
 skills* — a shape the per-framework config files were hiding.

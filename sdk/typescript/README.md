@@ -360,7 +360,7 @@ if (box.data.length) await agent.ackInbox!(box.data[box.data.length - 1].seq);  
 for await (const e of agent.events!({ after: box.cursor, signal })) { /* inbox.message, turn.*, activity.updated, … */ }
 await agent.activities!();                        // turns, commands, subagents: who did each, who asked
 await agent.stopActivity!('subagent-1');          // one of them; stopAllActivities() for everything running
-// (tasks()/stopTask() are their deprecated names: "task" is kept for zgh-style tasks)
+// (tasks()/stopTask() are their deprecated names; zgh-style tasks are createTask() and friends, below)
 await agent.schedules!();                         // reminders the agent set for itself
 
 // Images and files (0g-harness). Images ride the message (PNG/JPEG/WebP/GIF,
@@ -376,6 +376,22 @@ for await (const d of agent.chatStream!([{ role: 'user', content: `read ${path};
 // Steer the running turn (0g-harness, kind "steer"): read before its next model call.
 const r = await agent.steer!('use the v2 API instead');  // { merged: true, id, turn } | { merged: false, queued, reason }
 if (r.merged) console.log((await agent.steerState!(r.id!)).state);   // pending | merged | turn | dropped
+
+// The owner's sessions (0g-harness, kind "sessions"): each its own conversation,
+// sharing persona, skills and memory. owner-chat is the default one behind chatStream.
+const s = await agent.createSession!({ title: 'research' });   // or { fork: 'owner-chat', at?: n }
+const p = await agent.promptSession!(s.id, 'look into X');     // { merged, id: response id, session }; mode 'steer' reaches a running turn
+for await (const d of agent.followTask!(p.id)) process.stdout.write(d);
+await agent.sessions!();                          // owner-chat and the rest, newest first
+await agent.cancelSession!(s.id);                 // stop its running turn
+
+// Tasks (0g-harness, kinds "tasks" + "task-feed", zgh's task model): a piece of work
+// in a session and workspace of its own, ending each run with an outcome record.
+const { task, created } = await agent.createTask!({ prompt: 'migrate the db', id: 'task-migrate-1' });  // id taken → created: false
+const t = await agent.getTask!(task.id);          // state: queued | working | idle | needs-input | done | failed | archived; records, outcome
+await agent.taskInput!(task.id, 'use option a');  // answers open questions; steers a working run ({ mode: 'next' }: its next turn)
+for await (const e of agent.taskFeed!({ signal })) { /* { type: 'task', task } … { type: 'ready' } … */ }
+await agent.cancelTaskRun!(task.id);              // stop the run; archiveTask() puts it away
 
 // opinionated shortcuts over client():
 const auth = await ag.agent.authenticate(agentId);   // mints the owner token up front (needs a wallet)

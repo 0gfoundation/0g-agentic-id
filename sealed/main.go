@@ -39,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 
+	"seal-verify/internal/agentdata"
 	"seal-verify/internal/attestorhttp"
 	"seal-verify/internal/chain"
 	"seal-verify/internal/config"
@@ -993,6 +994,22 @@ func startAgent(
 		currentStatus.SettingsIssue(fmt.Sprintf("owner settings unusable (%v); write the agent's settings (provider and model)", err))
 	}
 
+	// The agent's committed data for hosted programs that ask for it
+	// (servicehost agent_data): kept per committed version, built after every
+	// confirmed commit and on boot (internal/agentdata).
+	var agentData *agentdata.Provider
+	if adapter.Name() == "0g-harness" || adapter.Name() == "dsh" {
+		agentData = agentdata.New(privsep.StateDir+"/agent-data", idata, func(role string) (string, string) {
+			e := agent.ChainEntry(role)
+			return e.ContentHash, e.DataHash
+		})
+	}
+	observeCommit := func(dim string) {
+		if agentData != nil {
+			go agentData.Observe(context.Background(), dim)
+		}
+	}
+
 	// The record of what this container has in sync with the chain starts
 	// from what Phase A and B seeded, and follows every confirmed commit.
 	if keeper != nil {
@@ -1002,7 +1019,17 @@ func startAgent(
 			inSync[r.Name] = agent.ChainEntry(r.Name).ContentHash
 		}
 		synced.setAll(inSync)
-		agent.SetChainUploadHook(synced.set)
+		agent.SetChainUploadHook(func(dim, contentHash string) {
+			synced.set(dim, contentHash)
+			observeCommit(dim)
+		})
+	} else if agentData != nil {
+		agent.SetChainUploadHook(func(dim, _ string) { observeCommit(dim) })
+	}
+	if agentData != nil {
+		for _, role := range []string{agentdata.RolePersona, agentdata.RoleSkills, agentdata.RolePublicMemory} {
+			observeCommit(role)
+		}
 	}
 
 	// Build the uploader. The watcher tick handler reuses this single
@@ -1062,6 +1089,15 @@ func startAgent(
 				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 				defer cancel()
 				return lr.acquireServiceRuntime(ctx, harness)
+			},
+			Owner: strings.ToLower(res.owner),
+			AgentData: func(ctx context.Context, g servicehost.AgentDataGrant) ([]servicehost.AgentDataPart, func(), error) {
+				if agentData == nil {
+					return nil, nil, fmt.Errorf("agent data is unavailable for this framework")
+				}
+				ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				return agentData.Parts(ctx, g)
 			},
 		})
 		if err != nil {

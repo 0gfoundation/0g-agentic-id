@@ -196,6 +196,113 @@ export interface SteerResult {
   reason?: string;
 }
 
+/** One of the owner's sessions on 0g-harness (zgh-style; {@link AgentClient.sessions}). */
+export interface AgentSession {
+  id: string;
+  object?: 'session';
+  /** owner: the default `owner-chat`; session: one the owner opened; task: a task's session. */
+  kind: 'owner' | 'session' | 'task';
+  title: string;
+  /** running: a turn is open. idle: loaded. stored: unloaded, resumes on its next prompt. */
+  state: 'running' | 'idle' | 'stored';
+  created_at: number;
+  updated_at: number;
+  forked_from?: string;
+}
+
+/** What {@link AgentClient.promptSession} did with a message. */
+export interface SessionPromptResult {
+  /** false: the message is the session's next turn, record `id` (follow it
+   *  with {@link AgentClient.followTask}). true (mode steer): read in the
+   *  running turn `turn`, before its next model call; `id` is the steer's id. */
+  merged: boolean;
+  id: string;
+  session?: string;
+  turn?: string;
+  /** Why a steer was queued instead (no turn running). */
+  reason?: string;
+}
+
+/** A task's state on 0g-harness (zgh's task model; {@link AgentClient.getTask}). */
+export type HarnessTaskState = 'queued' | 'working' | 'idle' | 'needs-input' | 'done' | 'failed' | 'archived';
+
+/**
+ * One outcome record a task's agent made: `raise_question` and
+ * `request_action` end in `needs-input` and close when the owner answers;
+ * `report_complete` ends in `done` and closes when the next run starts.
+ * `arguments` is the agent's own text: clean it before printing it.
+ */
+export interface HarnessTaskRecord {
+  id: number;
+  run: number;
+  tool: string;
+  ends_in: 'needs-input' | 'done';
+  closes_on: 'answer' | 'next-run';
+  arguments: Record<string, unknown>;
+  at: number;
+  state: 'open' | 'closed';
+  closed?: { how: string; at: number };
+}
+
+/** What the task feed carries of a task ({@link AgentClient.taskFeed}). */
+export interface HarnessTaskSummary {
+  id: string;
+  state: HarnessTaskState;
+  /** For `failed`: `error` (the last turn failed, or the watchdog stopped the run) or `interrupted` (a restart). */
+  reason: string | null;
+  /** The latest run's records. */
+  outcome: HarnessTaskRecord[];
+  /** The done record that sealed a working run, else null. */
+  sealed: number | null;
+  /** The records still open. */
+  records: HarnessTaskRecord[];
+  runs: { count: number; last?: { started_at: number; ended_at?: number; end?: string; error?: string; records: number } };
+  updated_at: number;
+  /** In the feed: what changed (`created`, `run-started`, `recorded`, `input`, `run-ended`, `cancelled`, `archived`). */
+  change?: string;
+}
+
+/** A task on 0g-harness: a piece of work with its own session, workspace, state and outcome records. */
+export interface HarnessTask extends HarnessTaskSummary {
+  object?: 'task';
+  title: string;
+  prompt: string;
+  workspace: { path: string };
+  session_id: string;
+  /** Inputs waiting for the next run. */
+  pending: number;
+  outcome_tools: string[];
+  metadata: Record<string, unknown>;
+  created_at: number;
+  queued_at?: number;
+}
+
+/** What {@link AgentClient.createTask} takes. */
+export interface CreateTaskOptions {
+  prompt: string;
+  /** `task-` and 1 to 63 lowercase letters, digits or `-`: makes the create idempotent. */
+  id?: string;
+  title?: string;
+  /** An existing directory under the agent's home; default `~/tasks/<id>`. */
+  workspace?: { dir: string };
+  /** Added to the task agent's system prompt. */
+  instructions?: string;
+  /** true (all built-ins, the default), false (none), or built-in names. */
+  outcome_tools?: boolean | string[];
+  metadata?: Record<string, unknown>;
+}
+
+/** What {@link AgentClient.taskInput} did with the input. */
+export interface TaskInputResult extends HarnessTask {
+  /** current-run: steered into the running turn (`steer` is its id), or the run's next turn.
+   *  next-run: the run is sealed by a done record. queued: it starts or waits for a run. */
+  delivery: 'current-run' | 'next-run' | 'queued';
+  steer?: string;
+}
+
+/** One event of {@link AgentClient.taskFeed}: a task's state, or `ready` once every task was sent. */
+export type HarnessTaskFeedEvent = { type: 'task'; task: HarnessTaskSummary } | { type: 'ready' };
+
 /** What became of a steered text ({@link AgentClient.steerState}). */
 export interface SteerState {
   id: string;
@@ -563,6 +670,57 @@ export interface AgentClient {
    * handle holds the owner token.
    */
   steer?(text: string): Promise<SteerResult>;
+  /**
+   * The owner's sessions, most recently used first (0g-harness, kind
+   * `sessions`): `owner-chat` (the default, behind chat/Responses) and the
+   * ones the owner opened. Each is its own conversation; all share the
+   * agent's persona, skills, memory and credentials.
+   */
+  sessions?(): Promise<AgentSession[]>;
+  /** One session. Present with {@link sessions}. */
+  session?(id: string): Promise<AgentSession>;
+  /**
+   * Open a session: fresh, or a `fork` of another session's history (its
+   * first `at` events when given). `resume` loads an existing one instead.
+   * Present with {@link sessions}.
+   */
+  createSession?(opts?: { title?: string; fork?: string; at?: number; resume?: string }): Promise<AgentSession>;
+  /**
+   * Send a session a message: its next turn (`mode: 'next'`, the default),
+   * or a steer into its running turn (`'steer'`). Present with {@link sessions}.
+   */
+  promptSession?(id: string, text: string, opts?: { mode?: 'next' | 'steer' }): Promise<SessionPromptResult>;
+  /** Stop a session's running turn. Present with {@link sessions}. */
+  cancelSession?(id: string): Promise<{ cancelled: string | null; session: string }>;
+  /**
+   * Hand the agent a task (0g-harness, zgh's task model): it runs in a
+   * session and workspace of its own and ends each run with an outcome
+   * record. With an `id` already taken, the existing task comes back with
+   * `created: false`. Present only when the agent declares the `tasks` and
+   * `task-feed` kinds and this handle holds the owner token.
+   */
+  createTask?(opts: CreateTaskOptions): Promise<{ task: HarnessTask; created: boolean }>;
+  /** Tasks, newest first; `state` and `metadata` filter. Present with {@link createTask}. */
+  listTasks?(opts?: { state?: HarnessTaskState | HarnessTaskState[]; metadata?: Record<string, string>; limit?: number }): Promise<HarnessTask[]>;
+  /** One task. Present with {@link createTask}. */
+  getTask?(id: string): Promise<HarnessTask>;
+  /**
+   * Input for a task: to a resting task it starts a run; to a working one
+   * `mode: 'steer'` (the default) reaches the running turn and `'next'` is
+   * the run's next turn (the next run's once a done record sealed it). It
+   * answers the task's open questions. Present with {@link createTask}.
+   */
+  taskInput?(id: string, text: string, opts?: { mode?: 'steer' | 'next' }): Promise<TaskInputResult>;
+  /** Stop a task's run (or take it out of the queue); input waiting is dropped. Present with {@link createTask}. */
+  cancelTaskRun?(id: string): Promise<HarnessTask>;
+  /** Archive a task: stopped, records closed, agent disposed; its workspace stays. Present with {@link createTask}. */
+  archiveTask?(id: string): Promise<HarnessTask>;
+  /**
+   * Every task's changes: one `task` event per task not archived, then
+   * `ready`, then one per change. One connection: it ends when the stream
+   * does (reconnect and re-read on `ready`). Present with {@link createTask}.
+   */
+  taskFeed?(opts?: { signal?: AbortSignal }): AsyncGenerator<HarnessTaskFeedEvent>;
   /** What became of a text {@link steer} merged. Present with {@link steer}. */
   steerState?(id: string): Promise<SteerState>;
   /**
@@ -1295,11 +1453,14 @@ export function makeAgentClient(params: {
     client.ackInbox = (through) => postJSON('ackInbox', `${inboxBase}/ack`, { through });
   }
 
-  // The activity list: /v1/activities, or /v1/tasks, its deprecated alias,
-  // on a runtime from before the rename. A newer sealed can run an older
-  // harness package, which answers 404 on /v1/activities: then the alias.
+  // The activity list: /v1/activities, or /v1/tasks, its old name, on a
+  // runtime from before the rename. A newer sealed can run an older harness
+  // package, which answers 404 on /v1/activities: then the old name. A
+  // runtime that declares `task-feed` serves zgh-style tasks on /v1/tasks
+  // instead (below), so there is no old name to fall back to.
+  const taskFeedBase = ownerBase('task-feed');
   const activitiesBase = ownerBase('activities');
-  const legacyTasksBase = ownerBase('tasks');
+  const legacyTasksBase = taskFeedBase ? undefined : ownerBase('tasks');
   if (activitiesBase || legacyTasksBase) {
     let base = (activitiesBase ?? legacyTasksBase) as string;
     const activityCall = async <T>(what: string, rest: string, post = false): Promise<T> => {
@@ -1364,6 +1525,70 @@ export function makeAgentClient(params: {
   if (steerBase) {
     client.steer = (text) => postJSON<SteerResult>('steer', steerBase, { text });
     client.steerState = (id) => getJSON<SteerState>('steerState', `${steerBase}/${encodeURIComponent(id)}`);
+  }
+
+  const sessionsBase = ownerBase('sessions');
+  if (sessionsBase) {
+    const sid = (id: string): string => {
+      // owner-chat, an owner session, a task, or a session a schedule opened (DSH's `session-…` ids).
+      if (!/^(owner-chat|(sess|task)-[a-z0-9][a-z0-9-]{0,62}|session-[a-z0-9][a-z0-9-]{0,90})$/.test(id)) throw new Error(`not a session id: ${plainText(id)}`);
+      return `${sessionsBase}/${id}`;
+    };
+    const clean = (s: AgentSession): AgentSession => ({ ...s, title: plainText(String(s.title ?? '')) });
+    client.sessions = async () => ((await getJSON<{ data?: AgentSession[] }>('sessions', sessionsBase)).data ?? []).map(clean);
+    client.session = async (id) => clean(await getJSON<AgentSession>('session', sid(id)));
+    client.createSession = async (opts = {}) => clean(await postJSON<AgentSession>('createSession', sessionsBase, opts));
+    client.promptSession = (id, text, opts = {}) => postJSON<SessionPromptResult>('promptSession', `${sid(id)}/prompt`, { text, ...(opts.mode ? { mode: opts.mode } : {}) });
+    client.cancelSession = (id) => postJSON<{ cancelled: string | null; session: string }>('cancelSession', `${sid(id)}/cancel`);
+  }
+
+  // zgh-style tasks: /v1/tasks with the `task-feed` kind beside it (an older
+  // runtime's `tasks` kind alone is the activity list's old name).
+  const tasksBase = taskFeedBase ? ownerBase('tasks') : undefined;
+  if (tasksBase && taskFeedBase) {
+    const tid = (id: string): string => {
+      // A task's id, or a scheduled task's (the session id a schedule gave it).
+      if (!/^(task-[a-z0-9][a-z0-9-]{0,62}|session-[a-z0-9][a-z0-9-]{0,90})$/.test(id)) throw new Error(`not a task id: ${plainText(id)}`);
+      return `${tasksBase}/${id}`;
+    };
+    const clean = <T extends { title?: string }>(t: T): T => (t && typeof t.title === 'string' ? { ...t, title: plainText(t.title) } : t);
+    client.createTask = async (opts) => {
+      const r = await doFetch(tasksBase, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(opts) });
+      const text = await r.text();
+      let body: { error?: { code?: string }; task?: HarnessTask } | HarnessTask | undefined;
+      try { body = JSON.parse(text); } catch { body = undefined; }
+      if (r.status === 201 && body) return { task: clean(body as HarnessTask), created: true };
+      const taken = body as { error?: { code?: string }; task?: HarnessTask } | undefined;
+      if (r.status === 409 && taken?.error?.code === 'id-taken' && taken.task) return { task: clean(taken.task), created: false };
+      throw new Error(`createTask: HTTP ${r.status}: ${plainText(text)}`);
+    };
+    client.listTasks = async (opts = {}) => {
+      const q = new URLSearchParams();
+      for (const st of opts.state === undefined ? [] : Array.isArray(opts.state) ? opts.state : [opts.state]) q.append('state', st);
+      for (const [k, v] of Object.entries(opts.metadata ?? {})) q.set(`metadata.${k}`, v);
+      if (opts.limit !== undefined) q.set('limit', String(opts.limit));
+      const qs = q.toString();
+      return ((await getJSON<{ data?: HarnessTask[] }>('listTasks', `${tasksBase}${qs ? `?${qs}` : ''}`)).data ?? []).map(clean);
+    };
+    client.getTask = async (id) => clean(await getJSON<HarnessTask>('getTask', tid(id)));
+    client.taskInput = async (id, text, opts = {}) => clean(await postJSON<TaskInputResult>('taskInput', `${tid(id)}/input`, { text, ...(opts.mode ? { mode: opts.mode } : {}) }));
+    client.cancelTaskRun = async (id) => clean(await postJSON<HarnessTask>('cancelTaskRun', `${tid(id)}/cancel`));
+    client.archiveTask = async (id) => clean(await postJSON<HarnessTask>('archiveTask', `${tid(id)}/archive`));
+    client.taskFeed = async function* (opts) {
+      const res = await doFetch(taskFeedBase, opts?.signal ? { signal: opts.signal } : undefined);
+      if (!res.ok) throw new Error(`taskFeed: HTTP ${res.status}: ${plainText(await res.text())}`);
+      if (!res.body) throw new Error('taskFeed: expected an SSE stream from the task-feed route');
+      try {
+        for await (const chunk of iterSseChunks(res.body)) {
+          const { __sseEvent, ...data } = chunk as Record<string, unknown> & { __sseEvent?: string };
+          if (__sseEvent === 'ready') yield { type: 'ready' };
+          else if (__sseEvent === 'task' && typeof data.id === 'string') yield { type: 'task', task: data as unknown as HarnessTaskSummary };
+        }
+      } catch (err) {
+        if (opts?.signal?.aborted) return;
+        throw err;
+      }
+    };
   }
 
   const eventsBase = ownerBase('events');

@@ -68,6 +68,8 @@ type Manager struct {
 	receiptsReady func() bool
 	runtime       func(context.Context) (RuntimeLease, error)
 	model         func(context.Context) (ModelRoute, error)
+	agentData     AgentDataProvider
+	owner         string
 	watcher       *resourceWatcher
 	probeMu       sync.Mutex
 	probeAt       time.Time
@@ -92,6 +94,14 @@ type Options struct {
 	EgressDial     func(context.Context, string, string) (net.Conn, error)
 	AcquireRuntime func(context.Context) (RuntimeLease, error)
 	ModelRoute     func(context.Context) (ModelRoute, error)
+	// AgentData gives temporary workers of a release with an agent_data
+	// grant the agent's committed data; nil refuses such workers.
+	AgentData AgentDataProvider
+	// Owner is the NFT owner this container serves (lowercase 0x address;
+	// a container never serves a later owner). Workers that read agent data
+	// get it as SEAL_OWNER, to tell memories this owner confirmed from
+	// inherited ones.
+	Owner string
 	// Only Go test fixtures may bypass the confinement probe and runtime pin.
 	// No HTTP, env or manifest field can enable this; production leaves it false.
 	SkipResourceLimitsForTests bool
@@ -137,6 +147,8 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 	m := &Manager{base: base, binding: binding, entries: map[string]*entry{}, workers: map[uint32]*worker{}, executions: map[string]*execution{}, executionKeys: map[string]string{}, stopGC: make(chan struct{}), pendingInputs: map[string]pendingInput{}, quarantined: quarantined}
 	m.runtime = opts.AcquireRuntime
 	m.model = opts.ModelRoute
+	m.agentData = opts.AgentData
+	m.owner = opts.Owner
 	m.skipResourceLimitsForTests = opts.SkipResourceLimitsForTests
 	m.egressDial = opts.EgressDial
 	if m.egressDial == nil {
@@ -557,6 +569,19 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 		}
 		env = append(env, "SEAL_MODEL_SOCKET="+filepath.Join(run, "model.sock"), "SEAL_MODEL_ID="+route.Route.Model, "SEAL_MODEL_API="+route.API)
 	}
+	// Temporary workers of a release that asks for agent data read a copy
+	// of the agent's committed data, staged here and fixed for their life,
+	// and learn the owner whose confirmations make a memory trusted; the
+	// coordinator never receives either.
+	var agentData []AgentDataVersion
+	if kind != coordinatorCommand && e.Manifest.AgentData != nil {
+		dst := filepath.Join(taskDir, "agent-data")
+		if agentData, err = m.stageAgentDataFor(ctx, *e.Manifest.AgentData, dst); err != nil {
+			return nil, err
+		}
+		p.ReadOnly = append(p.ReadOnly, dst)
+		env = append(env, m.agentDataEnv(dst)...)
+	}
 	// The interpreter loads sealed's network adapter first (servicenet).
 	adapter := interpreterRuntime(interpreter)
 	switch adapter {
@@ -594,7 +619,7 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 	}
 	// The run directory is counted too: each entry is at least one block, so
 	// sockets left there cannot pile up inodes unseen.
-	c := &isolatedCommand{Cmd: cmd, uid: uid, runtimeHash: lease.Hash, release: lease.Release, watcher: m.watcher,
+	c := &isolatedCommand{Cmd: cmd, uid: uid, runtimeHash: lease.Hash, agentData: agentData, release: lease.Release, watcher: m.watcher,
 		limits: limits{residentBytes: int64(e.Manifest.ResidentMemoryMB) << 20, diskDirs: []string{work, tmp, run}, diskBytes: 2 * temporaryFilesystemBytes}}
 	if kind == coordinatorCommand {
 		// The coordinator's work directory is its durable business state.

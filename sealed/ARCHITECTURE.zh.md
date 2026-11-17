@@ -530,7 +530,7 @@ adapter 同时把自家那份摘掉了，理由见 §5（"什么是 iData，什�
 | openclaw（`openclaw.go:164`） | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `openclaw.json` |
 | hermes（`hermes.go:143`） | `framework`、`SOUL.md`、`memories/`、`skills/` | `config.yaml` |
 | prime-agent（`prime.go:162`） | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `models.json` |
-| 0g-harness（`harness.go:200`） | `framework`、`APPEND_SYSTEM.md`、`skills/`、`memory/` | `settings.yaml` |
+| 0g-harness（`harness.go:208`） | `framework`、`APPEND_SYSTEM.md`、`skills/`、`memory/`、`memory-public/` | `settings.yaml` |
 
 四个都收敛成同一个形状 —— *binding + persona + memory + skills* —— 这个形状以前被
 各框架的配置文件挡住了。
@@ -572,7 +572,7 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 | `/v1/*` | 用户、owner | framework chat API，反代到 gateway(bearer 鉴权;响应一律不带 proof 签名——这是 owner↔agent 的操控通道);未声明的路径一律 404——没有 catch-all 转发 |
 | `/api/*` | 外部调用方 | agent 注册的服务(精确路径,经 sign socket 的 `/services` 注册),反代到 agent 的 loopback backend;响应先缓冲再带 proof 签名(`X-Agent-Proof`),backend 发 SSE 也一样 |
 | `/v1/responses*` | owner | 长任务面(OpenAI Responses 子集):turn 归属服务端 id、断线不死、`starting_after` 续播、`POST /{id}/cancel` 停止。框架声明了 `kind:"responses"` 路由时由其 bridge 原生提供(prime、0g-harness),否则由 sealed proxy 在框架自身 chat API 之前**合成**(openclaw、hermes)——见 `internal/proxy/responses.go` |
-| `/v1/inbox`、`/v1/events`、`/v1/activities`、`/v1/tasks`、`/v1/schedules`、`/v1/files`、`/v1/memory`、`/v1/steer` | owner | 仅 0g-harness(声明为 kind `inbox` / `events` / `activities` / `tasks` / `schedules` / `files` / `memory` / `steer`):agent 自己开的 turn 说的话(后台任务结束、提醒到点)、可续接的实时事件流(turn、活动、inbox、提醒的变化)、每个 turn / 后台命令 / subagent 及其执行者(`/v1/activities`;`/v1/tasks` 是它的旧名,已弃用,保留到它改用来指 zgh 式任务为止)、agent 设的提醒,以及把文件上传到 agent 的文件收件箱 `~/inbox`(不是消息收件箱 `/v1/inbox`)、下载 agent 放进 `~/outbox` 的文件(或 `~/inbox` 里 owner 自己的文件),按需整理一次长期记忆(`POST /v1/memory/tidy`),以及 owner 给正在运行的那一轮的话(`POST /v1/steer`,在这一轮下一次调用模型之前读到;没有 owner 的轮次在运行时作为普通轮次排队)。其他框架都不声明,SDK 只在声明了的 agent 上提供这些方法(`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
+| `/v1/inbox`、`/v1/events`、`/v1/activities`、`/v1/tasks`、`/v1/task-feed`、`/v1/schedules`、`/v1/files`、`/v1/memory`、`/v1/steer`、`/v1/sessions` | owner | 仅 0g-harness(声明为 kind `inbox` / `events` / `activities` / `tasks` / `task-feed` / `schedules` / `files` / `memory` / `steer` / `sessions`):agent 自己开的 turn 说的话(后台任务结束、提醒到点)、可续接的实时事件流(turn、活动、inbox、提醒的变化)、每个 turn / 后台命令 / subagent 及其执行者(`/v1/activities`)、owner 的任务(照 zgh 的任务模型:一件有自己会话和工作区、以结果记录收尾的工作)及其变化的事件流、owner 的其他会话、agent 设的提醒,以及把文件上传到 agent 的文件收件箱 `~/inbox`(不是消息收件箱 `/v1/inbox`)、下载 agent 放进 `~/outbox` 的文件(或 `~/inbox` 里 owner 自己的文件),按需整理一次长期记忆(`POST /v1/memory/tidy`),以及 owner 给正在运行的那一轮的话(`POST /v1/steer`,在这一轮下一次调用模型之前读到;没有 owner 的轮次在运行时作为普通轮次排队)。其他框架都不声明,SDK 只在声明了的 agent 上提供这些方法(`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
 | `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
 | `/log/agent` + `/log/agent.html` | 运维 | agent 子进程的 stdout/stderr（实时）;路径经 adapter 的 `SubprocessLogPath()` 解析。`/log/openclaw`（`.html`）作为 legacy 别名保留 |
 | `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名；永不签裸 hash，也永不签 EIP-191 version `0x00` —— serve-proof 所在的域，见下）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）+ `/settings`（agent 自己提配置变更 —— 见下）+ `/harness/restart` 和 `/mcp`（只有 0g-harness：重启 harness，以及把上面这些端点和凭据 socket 的端点作为 MCP 工具提供；取值 socket 自己提供它的工具）|

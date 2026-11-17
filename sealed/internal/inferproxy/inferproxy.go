@@ -16,6 +16,12 @@
 // POST chat/completions, messages and responses, and GET models, each with
 // or without a leading /v1 (an OpenAI-wire client's base URL ends in /v1, an
 // Anthropic-wire one's does not). Responses stream back as they arrive.
+//
+// One more call passes where the route has one (Route.WebSearch, set only
+// for the 0G router): POST web/search, the router's web search. Its body is
+// rebuilt as {"query"} alone, with no model and no platform text, and goes
+// to the search URL with the route's credential headers, the same way and
+// through the same credential proxy as a model call.
 package inferproxy
 
 import (
@@ -49,7 +55,23 @@ type Route struct {
 	Model string
 	// System is appended to every model request's system prompt.
 	System string
+	// WebSearch, when set, lets web/search through to the provider's web
+	// search (the 0G router's /v1/web/search). nil: web/search is refused.
+	WebSearch *WebSearch
 }
+
+// WebSearch is where a web search goes and the headers it carries (the
+// route's credential, as a bearer token).
+type WebSearch struct {
+	URL     string
+	Headers map[string]string
+}
+
+// maxSearchBody bounds a web search request; maxSearchQuery bounds its query.
+const (
+	maxSearchBody  = 16 << 10
+	maxSearchQuery = 1000
+)
 
 // Server is the proxy. One per sealed process; Route changes as the
 // owner's settings do (SetRoute).
@@ -108,6 +130,7 @@ var endpoints = map[string]string{
 	"POST /messages":         "messages",
 	"POST /responses":        "responses",
 	"GET /models":            "models",
+	"POST /web/search":       "websearch",
 }
 
 // endpoint names the model call a request path is, "" for anything else:
@@ -137,6 +160,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	kind := endpoint(r.Method, rest)
 	if kind == "" {
 		http.Error(w, "only model calls pass the inference route", http.StatusNotFound)
+		return
+	}
+	if kind == "websearch" {
+		s.webSearch(w, r, route)
 		return
 	}
 
@@ -199,6 +226,76 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	flushCopy(w, resp.Body)
+}
+
+// webSearch forwards one web search: the query alone, to the route's search
+// URL with its headers; the framework's own headers stay behind except
+// Accept and User-Agent.
+func (s *Server) webSearch(w http.ResponseWriter, r *http.Request, route *Route) {
+	if route.WebSearch == nil || route.WebSearch.URL == "" {
+		http.Error(w, "web search is not available on this inference route", http.StatusNotFound)
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxSearchBody+1))
+	if err != nil {
+		http.Error(w, "read request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(raw) > maxSearchBody {
+		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	var req struct {
+		Query *string `json:"query"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil || req.Query == nil || strings.TrimSpace(*req.Query) == "" || len([]rune(*req.Query)) > maxSearchQuery {
+		http.Error(w, fmt.Sprintf(`a web search is {"query": "<1..%d characters>"}`, maxSearchQuery), http.StatusBadRequest)
+		return
+	}
+	body := mustJSON(map[string]string{"query": *req.Query})
+	up, err := http.NewRequestWithContext(r.Context(), http.MethodPost, route.WebSearch.URL, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "build request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	up.ContentLength = int64(len(body))
+	up.Header.Set("Content-Type", "application/json")
+	for _, k := range []string{"Accept", "User-Agent"} {
+		if v := r.Header.Get(k); v != "" {
+			up.Header.Set(k, v)
+		}
+	}
+	for k, v := range route.WebSearch.Headers {
+		up.Header.Set(k, v)
+	}
+	resp, err := s.client.Do(up)
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		http.Error(w, "web search: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for k, vs := range resp.Header {
+		if hopHeader(k) || strings.EqualFold(k, "Content-Length") {
+			continue
+		}
+		w.Header()[k] = vs
+	}
+	w.WriteHeader(resp.StatusCode)
+	flushCopy(w, resp.Body)
+}
+
+// WebSearchURL is the 0G router's web search under a model route's base URL
+// (the router's /v1/web/search): an OpenAI-wire base URL already ends in /v1,
+// an Anthropic-wire one does not.
+func WebSearchURL(upstream string) string {
+	base := strings.TrimRight(upstream, "/")
+	if strings.HasSuffix(base, "/v1") {
+		return base + "/web/search"
+	}
+	return base + "/v1/web/search"
 }
 
 // headerValue looks a header up by name in any case.

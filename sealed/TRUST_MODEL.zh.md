@@ -393,6 +393,17 @@ intelligent data 属于 **agent 自己** —— 自创建起就封在 TEE 内 �
 `agentSeal`，`update` 就保持 owner 门禁。这跟一个自主的、常驻 TEE 的
 seal-bound agent 是两种不同的产品，选哪个就是选哪种信任模型。
 
+**转让时 0g-harness agent 的记忆怎么交接。** 记忆角色（`memory/` 私有，
+`memory-public/` 公开）随 agent 一起走，可信度不跟着走。每条记忆写明确认它
+的 owner（`trusted_by`），harness 把不是当前 owner 确认的记忆（sealed 把启动
+时从链上读到的 owner 作为 `SEAL_OWNER` 传入）当作参考：只是背景知识，从不当
+作指令执行，也从不作为付款、签名、交易或向外发送数据的依据。新 owner 要用自
+己的原话明确采纳一条继承来的记忆（`memory_confirm`）。harness 的记忆工具、提
+取和整理从不改写参考记忆，也不提高它的可信度；模型不按参考记忆行事是模型遵守
+的规则，不是密码学保证（0g-harness README 的长期记忆一节）。读取公开记忆的
+托管程序（`agent_data`）拿到同一个 `SEAL_OWNER`，harness 的读取器在那里同样
+标出继承来的记忆（MCP_SERVICES.zh.md 的 agent 数据一节）。
+
 ---
 
 ## 所有权变更时 `dataKey` 的原子转移
@@ -1079,7 +1090,8 @@ agentSeal，并绑定 owner、agent、链和条目名；整个凭据集由 owner
 - **模型看到什么。** 每次模型调用都经 sealed 的推理代理：按 owner 设置的模型名，发到
   owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方
   地址），并把平台说明（身份、doctrine）放在系统提示末尾。只放行模型调用，按精确路径
-  （chat/completions、messages、responses、模型列表）。分层流程下 serve-proof 只有 v2，
+  （chat/completions、messages、responses、模型列表），0G router 上还有它的网页搜索
+  （`web/search`，只带查询词）。分层流程下 serve-proof 只有 v2，
   否则不出。v2 serve-proof 的
   `inference_url` 和 `model` 说明推理代理往哪里转发、用哪个模型名，不证明某条回答出自这个
   模型：harness 可以不经模型生成回答。agent 的进程绕过推理代理自己连模型，只能靠出站限制挡
