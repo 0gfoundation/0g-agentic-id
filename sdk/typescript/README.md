@@ -377,6 +377,14 @@ for await (const d of agent.chatStream!([{ role: 'user', content: `read ${path};
 const r = await agent.steer!('use the v2 API instead');  // { merged: true, id, turn } | { merged: false, queued, reason }
 if (r.merged) console.log((await agent.steerState!(r.id!)).state);   // pending | merged | turn | dropped
 
+// The owner's sessions (0g-harness, kind "sessions"): each its own conversation,
+// sharing persona, skills and memory. owner-chat is the default one behind chatStream.
+const s = await agent.createSession!({ title: 'research' });   // or { fork: 'owner-chat', at?: n }
+const p = await agent.promptSession!(s.id, 'look into X');     // { merged, id: response id, session }; mode 'steer' reaches a running turn
+for await (const d of agent.followTask!(p.id)) process.stdout.write(d);
+await agent.sessions!();                          // owner-chat and the rest, newest first
+await agent.cancelSession!(s.id);                 // stop its running turn
+
 // opinionated shortcuts over client():
 const auth = await ag.agent.authenticate(agentId);   // mints the owner token up front (needs a wallet)
 const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (never attaches a token)

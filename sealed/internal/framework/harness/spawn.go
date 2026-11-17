@@ -644,5 +644,9 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 		// ordinary turn when no owner turn is running.
 		route("/v1/steer", "steer", "Owner text for the running turn: POST /v1/steer {text} → {merged:true, id, turn} (read before the turn's next model call) or {merged:false, queued} (no owner turn running: an ordinary turn); GET /v1/steer/{id} → {state, turn}.",
 			post("/v1/steer"), get("/v1/steer/{id}")),
+		// The owner's other conversations (zgh-style sessions): each its own
+		// history, all sharing persona, skills, memory and credentials.
+		route("/v1/sessions", "sessions", "Owner sessions: GET /v1/sessions; POST /v1/sessions {title?, fork?, at?, resume?} → 201 {id}; GET /v1/sessions/{id}; POST /v1/sessions/{id}/prompt {text, mode: next|steer} → 202 {id: response id}; GET /v1/sessions/{id}/events?after=N (SSE); POST /v1/sessions/{id}/cancel. owner-chat is the default session behind /v1/chat/completions and /v1/responses.",
+			get("/v1/sessions"), post("/v1/sessions"), get("/v1/sessions/{id}"), post("/v1/sessions/{id}/prompt"), get("/v1/sessions/{id}/events"), post("/v1/sessions/{id}/cancel")),
 	}
 }

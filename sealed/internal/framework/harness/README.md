@@ -90,15 +90,21 @@ The harness then does three things:
   inbox: for example when a background job finishes or a reminder comes due.
 
 `FrameworkRoutes()` advertises the surface on `/hello`, one kind per
-capability: `chat`, `responses`, `inbox`, `events`, `activities`, `tasks`, `schedules`, `files`, `memory`, `steer`. A
+capability: `chat`, `responses`, `inbox`, `events`, `activities`, `tasks`, `schedules`, `files`, `memory`, `steer`, `sessions`. A
 client enables a feature only on the kinds an agent declares. The other
-frameworks declare none of the last eight, and nothing about them changes.
+frameworks declare none of the last nine, and nothing about them changes.
 `activities` is the list of what runs or ran (turns, background commands,
 subagents); `tasks` is its deprecated alias, kept until `/v1/tasks` names
 zgh-style tasks (a unit of work with its own session, state and outcome).
 `steer` is the owner's word for the turn already running: the harness reads it
 before that turn's next model call, and queues it as an ordinary turn when no
 owner turn is running.
+`sessions` are the owner's other conversations (zgh-style): fresh, forked from
+another session's log, or resumed; each prompt is the session's next turn or
+a steer into its running one, and each has its own event stream. Every
+session is the same agent with the same owner (persona, skills, memory, home
+and credentials are shared); `owner-chat` is the default one behind `chat`
+and `responses` (CONVERSATION.md invariant 2).
 Each route lists its exact endpoints, those of the harness's protocol v1
 (`routes_test.go`), and sealed's proxy forwards nothing else: an unlisted
 path gets 404, an unlisted method 405.

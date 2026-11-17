@@ -196,6 +196,33 @@ export interface SteerResult {
   reason?: string;
 }
 
+/** One of the owner's sessions on 0g-harness (zgh-style; {@link AgentClient.sessions}). */
+export interface AgentSession {
+  id: string;
+  object?: 'session';
+  /** owner: the default `owner-chat`; session: one the owner opened; task: a task's session. */
+  kind: 'owner' | 'session' | 'task';
+  title: string;
+  /** running: a turn is open. idle: loaded. stored: unloaded, resumes on its next prompt. */
+  state: 'running' | 'idle' | 'stored';
+  created_at: number;
+  updated_at: number;
+  forked_from?: string;
+}
+
+/** What {@link AgentClient.promptSession} did with a message. */
+export interface SessionPromptResult {
+  /** false: the message is the session's next turn, record `id` (follow it
+   *  with {@link AgentClient.followTask}). true (mode steer): read in the
+   *  running turn `turn`, before its next model call; `id` is the steer's id. */
+  merged: boolean;
+  id: string;
+  session?: string;
+  turn?: string;
+  /** Why a steer was queued instead (no turn running). */
+  reason?: string;
+}
+
 /** What became of a steered text ({@link AgentClient.steerState}). */
 export interface SteerState {
   id: string;
@@ -563,6 +590,28 @@ export interface AgentClient {
    * handle holds the owner token.
    */
   steer?(text: string): Promise<SteerResult>;
+  /**
+   * The owner's sessions, most recently used first (0g-harness, kind
+   * `sessions`): `owner-chat` (the default, behind chat/Responses) and the
+   * ones the owner opened. Each is its own conversation; all share the
+   * agent's persona, skills, memory and credentials.
+   */
+  sessions?(): Promise<AgentSession[]>;
+  /** One session. Present with {@link sessions}. */
+  session?(id: string): Promise<AgentSession>;
+  /**
+   * Open a session: fresh, or a `fork` of another session's history (its
+   * first `at` events when given). `resume` loads an existing one instead.
+   * Present with {@link sessions}.
+   */
+  createSession?(opts?: { title?: string; fork?: string; at?: number; resume?: string }): Promise<AgentSession>;
+  /**
+   * Send a session a message: its next turn (`mode: 'next'`, the default),
+   * or a steer into its running turn (`'steer'`). Present with {@link sessions}.
+   */
+  promptSession?(id: string, text: string, opts?: { mode?: 'next' | 'steer' }): Promise<SessionPromptResult>;
+  /** Stop a session's running turn. Present with {@link sessions}. */
+  cancelSession?(id: string): Promise<{ cancelled: string | null; session: string }>;
   /** What became of a text {@link steer} merged. Present with {@link steer}. */
   steerState?(id: string): Promise<SteerState>;
   /**
@@ -1364,6 +1413,20 @@ export function makeAgentClient(params: {
   if (steerBase) {
     client.steer = (text) => postJSON<SteerResult>('steer', steerBase, { text });
     client.steerState = (id) => getJSON<SteerState>('steerState', `${steerBase}/${encodeURIComponent(id)}`);
+  }
+
+  const sessionsBase = ownerBase('sessions');
+  if (sessionsBase) {
+    const sid = (id: string): string => {
+      if (!/^(owner-chat|(sess|task)-[a-z0-9][a-z0-9-]{0,62})$/.test(id)) throw new Error(`not a session id: ${plainText(id)}`);
+      return `${sessionsBase}/${id}`;
+    };
+    const clean = (s: AgentSession): AgentSession => ({ ...s, title: plainText(String(s.title ?? '')) });
+    client.sessions = async () => ((await getJSON<{ data?: AgentSession[] }>('sessions', sessionsBase)).data ?? []).map(clean);
+    client.session = async (id) => clean(await getJSON<AgentSession>('session', sid(id)));
+    client.createSession = async (opts = {}) => clean(await postJSON<AgentSession>('createSession', sessionsBase, opts));
+    client.promptSession = (id, text, opts = {}) => postJSON<SessionPromptResult>('promptSession', `${sid(id)}/prompt`, { text, ...(opts.mode ? { mode: opts.mode } : {}) });
+    client.cancelSession = (id) => postJSON<{ cancelled: string | null; session: string }>('cancelSession', `${sid(id)}/cancel`);
   }
 
   const eventsBase = ownerBase('events');

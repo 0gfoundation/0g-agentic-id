@@ -42,7 +42,7 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/activities', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/sessions', '/activities', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -1039,6 +1039,57 @@ interface Session {
   currentTask?: string | null;
   /** Files and images `/attach` staged for the next message. */
   attached?: Staged[];
+  /** The owner session chat goes to (0g-harness `/sessions`); absent = the
+   *  default `owner-chat`. */
+  sessionId?: string;
+  sessionTitle?: string;
+}
+
+/** The session the prompt names, when chat goes to one other than owner-chat. */
+function sessionLabel(s: Session): string {
+  if (!s.sessionId) return '';
+  const t = s.sessionTitle ? cleanCell(s.sessionTitle).slice(0, 24) : s.sessionId.slice(0, 13);
+  return ` [${t}]`;
+}
+
+/**
+ * One chat turn in a non-default owner session (0g-harness `/sessions`): the
+ * message is the session's next turn, followed live; Esc stops it. Files
+ * staged with /attach are uploaded and named in the text; images go only to
+ * owner-chat.
+ */
+async function chatInSession(s: Session, line: string, irq: Interrupt): Promise<void> {
+  const client = s.client!;
+  let sent = line;
+  if (s.attached?.length) {
+    if (s.attached.some((a) => !!a.image)) { out('images go with owner-chat messages only — /sessions default, or /attach clear\n'); return; }
+    try {
+      ({ text: sent } = await prepareAttachments(s.attached, line, client, (a, path) => out(`uploaded ${cleanCell(a.name)} → ${cleanCell(path)}\n`)));
+    } catch (e) {
+      out(`not sent: ${cleanCell((e as Error).message)} — the attachments stay staged (/attach lists them)\n`);
+      return;
+    }
+    s.attached = [];
+  }
+  const sid = s.sessionId!;
+  const r = await client.promptSession!(sid, sent);
+  const ac = new AbortController();
+  irq.streaming = ac;
+  out('agent> ');
+  let reply = '';
+  try {
+    for await (const d of client.followTask!(r.id, { signal: ac.signal })) { reply += d; out(cleanStream(d)); }
+    if (reply && !reply.endsWith('\n')) out('\n');
+  } catch (e) {
+    if (ac.signal.aborted) {
+      await client.cancelSession!(sid).catch(() => undefined);
+      out('\n⏹ interrupted — the turn stopped\n');
+    } else {
+      out(`\n(turn failed: ${cleanCell((e as Error).message)})\n`);
+    }
+  } finally {
+    irq.streaming = null;
+  }
 }
 
 /** (Re)establish the connection half of a session from a running URL. */
@@ -2839,7 +2890,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /activities /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /sessions /activities /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -2900,6 +2951,13 @@ const L2_HELP_FULL = `session commands
                           the harness process (the conversation stays), or
                           sealed itself (the agent is away for about one
                           start); either picks up version changes. 0g-harness
+  /sessions               on 0g-harness: your sessions (* = the one chat goes
+                          to). /sessions new [title] opens one and switches to
+                          it; /sessions switch <id|title> switches; /sessions
+                          fork [id] copies a session's history into a new one;
+                          /sessions default goes back to owner-chat. Every
+                          session shares the agent's memory, skills and
+                          persona; only the conversation is its own
   /activities             on 0g-harness: everything that runs or ran on the
                           agent — your turns, the turns it opened itself,
                           background commands and subagents — with who did
@@ -3080,11 +3138,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     let asMessage = false;
     if (queued.length) {
       line = queued.shift()!;
-      out(`\nagent ${s.agentId} › ${line}\n`);
+      out(`\nagent ${s.agentId}${sessionLabel(s)} › ${line}\n`);
     } else {
       atPrompt = true;
       try {
-        const q = `\nagent ${s.agentId} › `;
+        const q = `\nagent ${s.agentId}${sessionLabel(s)} › `;
         const entry = (ask as Ask).message ? await (ask as Ask).message!(q) : { text: await ((ask as Ask).main ?? ask)(q), multi: false, pasted: false };
         line = entry.text.trim();
         asMessage = entry.multi || entry.pasted;
@@ -3359,6 +3417,39 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             ? '  this framework also takes it per message, so your next message uses it already\n'
             : '  /reset applies it now; otherwise it lands at the agent\'s next boot\n');
         }
+        continue;
+      }
+      if (line === '/sessions' || line.startsWith('/sessions ')) {
+        if (!s.client?.sessions) { out('(this agent has no sessions — only 0g-harness does)\n'); continue; }
+        const [, sub = '', ...rest] = line.split(/\s+/);
+        const arg = rest.join(' ').trim();
+        if (!sub || sub === 'list') {
+          const list = await s.client.sessions();
+          const cur = s.sessionId ?? 'owner-chat';
+          for (const x of list) {
+            out(`${x.id === cur ? '*' : ' '} ${x.id.padEnd(42)} ${x.state.padEnd(8)} ${cleanCell(x.title || (x.kind === 'owner' ? 'owner chat' : ''))}\n`);
+          }
+          out('/sessions new [title] · switch <id|title> · fork [id] · default\n');
+          continue;
+        }
+        if (sub === 'new' || sub === 'fork') {
+          const src = sub === 'fork' ? (arg || s.sessionId || 'owner-chat') : undefined;
+          const made = await s.client.createSession!({ ...(sub === 'new' && arg ? { title: arg } : {}), ...(src ? { fork: src } : {}) });
+          s.sessionId = made.id; s.sessionTitle = made.title || (src ? `fork of ${src}` : '');
+          out(`→ ${made.id}${src ? ` (history of ${src})` : ''}: chat now goes to this session\n`);
+          continue;
+        }
+        if (sub === 'default') { s.sessionId = undefined; s.sessionTitle = undefined; out('→ owner-chat\n'); continue; }
+        if (sub === 'switch') {
+          if (!arg) { out('usage: /sessions switch <id|title>\n'); continue; }
+          const list = await s.client.sessions();
+          const hit = list.find((x) => x.id === arg) ?? list.filter((x) => x.id.startsWith(arg) || x.title.toLowerCase().includes(arg.toLowerCase()))[0];
+          if (!hit) { out(`no session matches ${cleanCell(arg)}\n`); continue; }
+          s.sessionId = hit.id === 'owner-chat' ? undefined : hit.id; s.sessionTitle = hit.title;
+          out(`→ ${hit.id}${hit.title ? ` (${cleanCell(hit.title)})` : ''}\n`);
+          continue;
+        }
+        out('usage: /sessions [list | new [title] | switch <id|title> | fork [id] | default]\n');
         continue;
       }
       if (line === '/activities' || line === '/tasks') {
@@ -3647,6 +3738,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
 
     // a chat turn (interruptible)
     if (!s.client) { out(`agent is ${s.phase} — /start or /reset before chatting\n`); continue; }
+    if (s.sessionId && s.client.promptSession && s.client.followTask) {
+      await chatInSession(s, line, irq);
+      continue;
+    }
     if (!s.client.chatStream) { out('(chat unavailable on this agent)\n'); continue; }
     // Attachments go with this message: images inside it, other files
     // uploaded first and named in its text. A failed upload sends nothing

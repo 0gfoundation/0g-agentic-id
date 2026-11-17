@@ -20,7 +20,7 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 			{Path: "~/.dsh/memory/<name>.md and ~/.dsh/memory/MEMORY.md", Note: "your long-term memory: one Markdown file per memory, directly in that directory, and the MEMORY.md index, which is in your context every turn. It survives restarts, resets and rebuilds, and goes with you to a new owner on a transfer. Subdirectories, dotfiles and empty files are not tracked"},
 		},
 		Untracked: []platform.PathNote{
-			{Note: "any session/conversation log this container's composition may write — that is turn-by-turn history, not your identity, and it is deliberately not chain-tracked here"},
+			{Note: "every session/conversation log this container's composition writes — the owner may talk to you in several sessions (and run tasks, each in a session of its own); each is its own conversation, and all of them share your persona, skills and long-term memory. Logs are turn-by-turn history, not your identity, and deliberately not chain-tracked: what one session should know in another belongs in memory"},
 			{Note: "`~/.dsh/.credentials.yaml` and any credential file — secrets never reach chain"},
 			{Path: "~/inbox/", Note: "files your owner sends you (and images your model cannot view) land here; read them with your own tools. Container-local: a reset loses them, so keep what must last in a tracked place"},
 			{Path: "~/outbox/", Note: "files you hand to your owner go here, directly in the directory (no subdirectories); your owner downloads them. Container-local: a reset loses them, so what must last belongs in memory or a skill"},

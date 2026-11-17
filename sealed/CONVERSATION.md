@@ -30,16 +30,22 @@ onboarding copy.
    not the proxy (a proxy that re-implements session management is a second,
    lossy source of truth), not the client (a window, not a store). A starting
    framework resumes the persisted conversation if one exists.
-2. **Exactly ONE conversation per agent.** Fixed identity (0g-harness hardcodes
-   `SessionId('owner-chat')`). A second conversation is never enabled — a
-   security decision, not a simplification: cross-session isolation would rest
-   on unaudited upstream code, and shared long-term memory defeats it anyway.
-   Matches the single-driver seat (CONFIG_SURFACE §8.1): one agent, one
-   timeline, one driver. 0g-harness's subagents (an owner switch) run in sessions of
-   their own and are not a second conversation: one-shot workers for the same
-   owner, in memory only, never persisted, never addressable by a client, with
-   tools to read and nothing else. What they find reaches the one
-   conversation as a notice, and the agent's own turns carry it to the owner.
+2. **One default conversation per agent; further sessions are the OWNER's,
+   on 0g-harness only.** The default has a fixed identity (`owner-chat`) and
+   sits behind the stateful doors (chat/completions, Responses); the other
+   adapters keep exactly that one. 0g-harness lets the owner open more
+   sessions (`/v1/sessions`, zgh-style: fresh, a fork of another session's
+   log, or resumed) and runs each task (`/v1/tasks`) in a session of its own.
+   They are not an isolation boundary and are not offered to anyone but the
+   owner: every session is the same agent with the same owner, sharing
+   persona, skills, long-term memory, home and credentials — only the
+   conversation is its own. One driver seat (CONFIG_SURFACE §8.1) covers them
+   all. A caller who is not the owner never reaches a session: services and
+   hosted programs answer them (MCP_SERVICES.md). 0g-harness's subagents (an
+   owner switch) run in sessions of their own that are not owner sessions:
+   one-shot workers in memory only, never persisted, never addressable by a
+   client, with tools to read and nothing else; what they find reaches their
+   parent session as a notice.
 3. **Stored on the container's writable layer, in an UNTRACKED path** —
    off-chain by construction: outside every chain-tracked role, so no watcher
    tick commits it and no transfer conveys it. Guaranteed by construction,
@@ -274,8 +280,8 @@ Source-verified traps, recorded:
 - **No chain storage** — working context, not an asset; durable knowledge
   flows through the memory roles, and a conversation on chain would convey on
   transfer (wrong for private chat).
-- **No multi-session, no selector, no `previous_response_id` addressing** —
-  invariant 2.
+- **No `previous_response_id` addressing, and no sessions for anyone but the
+  owner** — invariant 2; a session is addressed by its id on `/v1/sessions`.
 - **No platform compaction** — the harness compacts the MODEL CONTEXT itself
   (append a `compaction` entry, move the leaf; the file keeps prior entries,
   so nothing is destructively lost). The file only grows *between rotations*;
