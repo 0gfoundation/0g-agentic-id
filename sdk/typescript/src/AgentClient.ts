@@ -227,12 +227,13 @@ export interface ChatCompletion {
 }
 
 /**
- * One unit of work on the agent, as its task list shows it
- * ({@link AgentClient.tasks}): a turn of its conversation, a background
+ * One thing that runs or ran on the agent, as its activity list shows it
+ * ({@link AgentClient.activities}): a turn of its conversation, a background
  * command, or a subagent. `actor` says who does the work, `trigger` who asked
- * for it.
+ * for it. ("Task" is kept for zgh-style tasks: a unit of work with its own
+ * session, state and outcome.)
  */
-export interface AgentTaskInfo {
+export interface AgentActivityInfo {
   /** A turn: `resp_…` (the id {@link AgentClient.task} and
    *  {@link AgentClient.followTask} take). A command: `bash-N`. A subagent:
    *  `subagent-N`. */
@@ -244,7 +245,7 @@ export interface AgentTaskInfo {
   /** Who asked. A turn: `user` | `job` | `schedule` | `plugin`. A command or
    *  a subagent: `agent` (the main agent started it). */
   trigger: string;
-  /** What the task is: the prompt, the job notice, the reminder's text. */
+  /** What the activity is: the prompt, the job notice, the reminder's text. */
   label: string;
   /** Unix seconds. */
   created_at: number;
@@ -254,16 +255,22 @@ export interface AgentTaskInfo {
   detail?: string;
   /** Notices that reached the agent while this turn ran, merged into it. */
   merged_notices?: string[];
-  /** {@link AgentClient.taskInfo} only: a turn's text, or a finished
+  /** {@link AgentClient.activity} only: a turn's text, or a finished
    *  subagent's final answer. A command's output is never returned. */
   output_text?: string;
 }
 
-/** What stopping one task did ({@link AgentClient.stopTask}). */
-export interface AgentTaskStop {
+/** @deprecated Renamed {@link AgentActivityInfo}. */
+export type AgentTaskInfo = AgentActivityInfo;
+
+/** What stopping one activity did ({@link AgentClient.stopActivity}). */
+export interface AgentActivityStop {
   id: string;
   outcome: 'cancelled' | 'already-finished' | 'not-running';
 }
+
+/** @deprecated Renamed {@link AgentActivityStop}. */
+export type AgentTaskStop = AgentActivityStop;
 
 /**
  * The words of a turn the agent opened itself (a background job finished, a
@@ -319,8 +326,8 @@ export interface AgentSchedule {
  *
  * | type | data |
  * |---|---|
- * | `turn.queued` / `turn.started` / `turn.completed` / `turn.failed` / `turn.cancelled` | an {@link AgentTaskInfo} (a turn) |
- * | `task.updated` | an {@link AgentTaskInfo} (a command or a subagent) |
+ * | `turn.queued` / `turn.started` / `turn.completed` / `turn.failed` / `turn.cancelled` | an {@link AgentActivityInfo} (a turn) |
+ * | `activity.updated` | an {@link AgentActivityInfo} (a command or a subagent); a runtime from before the rename sends it as `task.updated` |
  * | `inbox.message` | an {@link AgentInboxMessage} |
  * | `inbox.read` | `{ read_through }` |
  * | `schedule.changed` | `{ operation: "create" \| "delete" \| "dispatch", id }` |
@@ -328,7 +335,7 @@ export interface AgentSchedule {
  *
  * `reset` means the agent could not serve the position asked for (it is
  * older than the agent's in-memory window, or from before a `/clear`):
- * re-read the inbox, tasks and schedules; the feed carries on from `cursor`.
+ * re-read the inbox, activities and schedules; the feed carries on from `cursor`.
  * A type this list does not name is passed through as it came.
  */
 export interface AgentEvent {
@@ -505,23 +512,34 @@ export interface AgentClient {
    * Everything running or that has run on the agent, newest first: turns,
    * background commands and subagents, with who does each (`actor`) and who
    * asked (`trigger`). `status` filters: `"active"` (queued or running) or one
-   * status name. Present only when the agent declares a `kind: "tasks"` route
-   * and this handle holds the owner token.
+   * status name. Present only when the agent declares a `kind: "activities"`
+   * route (or, on a runtime from before the rename, `kind: "tasks"`) and this
+   * handle holds the owner token. Reads `/v1/activities`, and the deprecated
+   * `/v1/tasks` when an older harness answers 404 there.
    */
-  tasks?(opts?: { status?: string; limit?: number }): Promise<AgentTaskInfo[]>;
-  /** One task of {@link tasks}, by id, with its `output_text` where there
-   *  is one. Present under the same conditions as {@link tasks}. */
-  taskInfo?(id: string): Promise<AgentTaskInfo>;
+  activities?(opts?: { status?: string; limit?: number }): Promise<AgentActivityInfo[]>;
+  /** One activity of {@link activities}, by id, with its `output_text` where
+   *  there is one. Present under the same conditions as {@link activities}. */
+  activity?(id: string): Promise<AgentActivityInfo>;
   /**
-   * Stop one task of {@link tasks}: a turn is cancelled (a queued one never
-   * starts), a command or subagent is killed. Already-executed actions are
-   * not rolled back. Present under the same conditions as {@link tasks}.
+   * Stop one activity of {@link activities}: a turn is cancelled (a queued
+   * one never starts), a command or subagent is killed. Already-executed
+   * actions are not rolled back. Present under the same conditions as
+   * {@link activities}.
    */
-  stopTask?(id: string): Promise<AgentTaskStop>;
+  stopActivity?(id: string): Promise<AgentActivityStop>;
   /** Stop everything: queued turns first, then the running turn, then every
    *  running command and subagent. Present under the same conditions as
-   *  {@link tasks}. */
-  stopAllTasks?(): Promise<AgentTaskStop[]>;
+   *  {@link activities}. */
+  stopAllActivities?(): Promise<AgentActivityStop[]>;
+  /** @deprecated Renamed {@link activities}. */
+  tasks?(opts?: { status?: string; limit?: number }): Promise<AgentActivityInfo[]>;
+  /** @deprecated Renamed {@link activity}. */
+  taskInfo?(id: string): Promise<AgentActivityInfo>;
+  /** @deprecated Renamed {@link stopActivity}. */
+  stopTask?(id: string): Promise<AgentActivityStop>;
+  /** @deprecated Renamed {@link stopAllActivities}. */
+  stopAllTasks?(): Promise<AgentActivityStop[]>;
   /**
    * The reminders the agent set for itself. `enabled: false` means the
    * agent's reminders are switched off. Present only when the agent declares
@@ -1240,7 +1258,7 @@ export function makeAgentClient(params: {
     };
   }
 
-  // ── The agent's own work: inbox, live feed, tasks, reminders ─────────────
+  // ── The agent's own work: inbox, live feed, activities, reminders ────────
   //
   // An agent that works in the background (commands, subagents, reminders)
   // also opens turns by itself, and their words belong to no chat request.
@@ -1277,18 +1295,37 @@ export function makeAgentClient(params: {
     client.ackInbox = (through) => postJSON('ackInbox', `${inboxBase}/ack`, { through });
   }
 
-  const tasksBase = ownerBase('tasks');
-  if (tasksBase) {
-    client.tasks = async (opts) =>
-      (await getJSON<{ data: AgentTaskInfo[] }>('tasks', `${tasksBase}${query({ status: opts?.status, limit: opts?.limit })}`)).data;
-    client.taskInfo = (id) => getJSON<AgentTaskInfo>('taskInfo', `${tasksBase}/${encodeURIComponent(id)}`);
-    client.stopTask = async (id) => {
-      // `all` is a different request with a different answer.
-      if (id === 'all') throw new Error('stopTask: "all" is stopAllTasks()');
-      return postJSON<AgentTaskStop>('stopTask', `${tasksBase}/${encodeURIComponent(id)}/cancel`);
+  // The activity list: /v1/activities, or /v1/tasks, its deprecated alias,
+  // on a runtime from before the rename. A newer sealed can run an older
+  // harness package, which answers 404 on /v1/activities: then the alias.
+  const activitiesBase = ownerBase('activities');
+  const legacyTasksBase = ownerBase('tasks');
+  if (activitiesBase || legacyTasksBase) {
+    let base = (activitiesBase ?? legacyTasksBase) as string;
+    const activityCall = async <T>(what: string, rest: string, post = false): Promise<T> => {
+      const send = (b: string) => doFetch(`${b}${rest}`, post ? { method: 'POST' } : undefined);
+      let r = await send(base);
+      if (r.status === 404 && base === activitiesBase && legacyTasksBase) {
+        const old = await send(legacyTasksBase);
+        if (old.status !== 404) { base = legacyTasksBase; r = old; }
+      }
+      if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${plainText(await r.text())}`);
+      return (await r.json()) as T;
     };
-    client.stopAllTasks = async () =>
-      (await postJSON<{ data: AgentTaskStop[] }>('stopAllTasks', `${tasksBase}/all/cancel`)).data;
+    client.activities = async (opts) =>
+      (await activityCall<{ data: AgentActivityInfo[] }>('activities', query({ status: opts?.status, limit: opts?.limit }))).data;
+    client.activity = (id) => activityCall<AgentActivityInfo>('activity', `/${encodeURIComponent(id)}`);
+    client.stopActivity = async (id) => {
+      // `all` is a different request with a different answer.
+      if (id === 'all') throw new Error('stopActivity: "all" is stopAllActivities()');
+      return activityCall<AgentActivityStop>('stopActivity', `/${encodeURIComponent(id)}/cancel`, true);
+    };
+    client.stopAllActivities = async () =>
+      (await activityCall<{ data: AgentActivityStop[] }>('stopAllActivities', '/all/cancel', true)).data;
+    client.tasks = client.activities;
+    client.taskInfo = client.activity;
+    client.stopTask = client.stopActivity;
+    client.stopAllTasks = client.stopAllActivities;
   }
 
   const schedulesBase = ownerBase('schedules');

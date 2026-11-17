@@ -353,13 +353,14 @@ await agent.cancelTask!(taskId);                  // stop the turn
 
 // The agent's own work (0g-harness): turns it opens by itself (a background job
 // finished, a reminder came due) and what runs in the background. Each method
-// is present only when /hello declares its kind (inbox / events / tasks /
+// is present only when /hello declares its kind (inbox / events / activities /
 // schedules) and this handle holds the owner key:
 const box = await agent.inbox!();                 // unread messages + the cursor
 if (box.data.length) await agent.ackInbox!(box.data[box.data.length - 1].seq);  // read, for every client
-for await (const e of agent.events!({ after: box.cursor, signal })) { /* inbox.message, turn.*, task.updated, … */ }
-await agent.tasks!();                             // turns, commands, subagents: who did each, who asked
-await agent.stopTask!('subagent-1');              // one task; stopAllTasks() for everything running
+for await (const e of agent.events!({ after: box.cursor, signal })) { /* inbox.message, turn.*, activity.updated, … */ }
+await agent.activities!();                        // turns, commands, subagents: who did each, who asked
+await agent.stopActivity!('subagent-1');          // one of them; stopAllActivities() for everything running
+// (tasks()/stopTask() are their deprecated names: "task" is kept for zgh-style tasks)
 await agent.schedules!();                         // reminders the agent set for itself
 
 // Images and files (0g-harness). Images ride the message (PNG/JPEG/WebP/GIF,

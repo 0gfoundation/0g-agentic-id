@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
-import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentTaskInfo, AgentTaskStop, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
+import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentActivityInfo, AgentActivityStop, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
 import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
@@ -42,7 +42,7 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/activities', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -277,16 +277,16 @@ function span(seconds: number): string {
   return `${Math.floor(s / 86400)}d`;
 }
 
-/** Who asked for a task, as /tasks shows it. */
+/** Who asked for an activity, as /activities shows it. */
 const ASKED_BY: Record<string, string> = { user: 'you', job: 'job', schedule: 'reminder', plugin: 'plugin', agent: 'agent' };
 
 /**
- * The /tasks table over the agent's own task list: BY is who does the work
+ * The /activities table over the agent's activity list: BY is who does the work
  * (the main agent or a subagent), FOR is who asked (you, a finished job, a
  * reminder, the agent itself). Ids print whole: they are what /result and
  * /cancel take. Exported for the tests.
  */
-export function renderTaskTable(tasks: AgentTaskInfo[], nowMs: number): string[] {
+export function renderActivityTable(tasks: AgentActivityInfo[], nowMs: number): string[] {
   const idw = Math.max(2, ...tasks.map((t) => cleanCell(t.id).length)) + 2;
   const head = `  ${'ID'.padEnd(idw)}${'STATUS'.padEnd(13)}${'BY'.padEnd(10)}${'FOR'.padEnd(10)}${'AGE'.padEnd(6)}WHAT`;
   return [
@@ -325,8 +325,8 @@ export function renderSchedules(list: AgentSchedule[], nowMs: number): string[] 
   });
 }
 
-/** What stopping a task did, in words. */
-const STOP_OUTCOME: Record<AgentTaskStop['outcome'], string> = {
+/** What stopping an activity did, in words. */
+const STOP_OUTCOME: Record<AgentActivityStop['outcome'], string> = {
   cancelled: 'stopped',
   'already-finished': 'already finished',
   'not-running': 'not running',
@@ -2839,7 +2839,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /tasks /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /activities /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -2900,13 +2900,14 @@ const L2_HELP_FULL = `session commands
                           the harness process (the conversation stays), or
                           sealed itself (the agent is away for about one
                           start); either picks up version changes. 0g-harness
-  /tasks                  on 0g-harness: everything that runs or ran on the
+  /activities             on 0g-harness: everything that runs or ran on the
                           agent — your turns, the turns it opened itself,
                           background commands and subagents — with who did
-                          each (BY) and who asked (FOR). Elsewhere: this
-                          session's long tasks with live status — on agents
-                          with the responses transport a chat turn survives
-                          dropped connections and keeps running
+                          each (BY) and who asked (FOR)
+  /tasks                  elsewhere: this session's long tasks with live
+                          status — on agents with the responses transport a
+                          chat turn survives dropped connections and keeps
+                          running. On 0g-harness the same as /activities
   /result [id]            re-attach to a task (default: latest): prints a
                           finished one, follows a running one live; on
                           0g-harness also a subagent's answer or a command's
@@ -2920,8 +2921,8 @@ const L2_HELP_FULL = `session commands
                           (newest first); with an id, just that one —
                           /result <id> adopts an id into the session first.
                           Session memory starts empty after a CLI restart or
-                          /back + use. On 0g-harness an id can be any task
-                          /tasks lists, and /cancel all stops everything
+                          /back + use. On 0g-harness an id can be anything
+                          /activities lists, and /cancel all stops everything
                           running on the agent
   /inbox [all]            what the agent said on its own (0g-harness): a
                           background job finished, a reminder came due. It
@@ -3360,17 +3361,18 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         }
         continue;
       }
-      if (line === '/tasks') {
-        // An agent with its own task list (0g-harness) answers for everything that
-        // runs on it: every turn, yours and the ones it opened itself, and
-        // every background command and subagent, with who did each.
-        if (s.client?.tasks) {
-          const list = await s.client.tasks({ limit: 30 });
+      if (line === '/activities' || line === '/tasks') {
+        // An agent with an activity list (0g-harness) answers for everything
+        // that runs on it: every turn, yours and the ones it opened itself,
+        // and every background command and subagent, with who did each.
+        if (s.client?.activities) {
+          const list = await s.client.activities({ limit: 30 });
           if (!list.length) { out('nothing has run on this agent yet\n'); continue; }
-          for (const l of renderTaskTable(list, Date.now())) out(`${l}\n`);
+          for (const l of renderActivityTable(list, Date.now())) out(`${l}\n`);
           out('/result <id> shows one · /cancel <id> stops one · /cancel all stops everything running\n');
           continue;
         }
+        if (line === '/activities') { out('(this agent has no activity list — /tasks shows this session\'s long tasks)\n'); continue; }
         // Long-task surface (responses transport). The list is this session's
         // memory of submitted ids; status is fetched live from the agent.
         if (!s.client?.task) { out('(this agent has no task surface — chat turns are connection-bound here)\n'); continue; }
@@ -3396,10 +3398,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
       if (line === '/result' || line.startsWith('/result ')) {
         // A background command or a subagent is not a turn: its record is
-        // the task list's, and it has no stream to follow.
+        // the activity list's, and it has no stream to follow.
         const named = line.split(/\s+/)[1];
-        if (named && s.client?.taskInfo) {
-          const t = await s.client.taskInfo(named).catch(() => null);
+        if (named && s.client?.activity) {
+          const t = await s.client.activity(named).catch(() => null);
           if (t && t.type !== 'turn') {
             out(`${cleanCell(t.id)} — ${cleanCell(t.status)} · by ${cleanCell(t.actor)} · ${cleanCell(t.label)}\n`);
             if (t.output_text) out(`${cleanStream(t.output_text)}\n`);
@@ -3458,12 +3460,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // survival is the feature). /cancel is the explicit brake: by id, or
         // everything in flight this session knows.
         let id = line.split(/\s+/)[1];
-        // An agent with its own task list (0g-harness) stops any of its tasks by id
+        // An agent with an activity list (0g-harness) stops any activity by id
         // (a turn, a background command, a subagent), and all of them at once.
-        if (id && s.client.stopTask && s.client.stopAllTasks) {
+        if (id && s.client.stopActivity && s.client.stopAllActivities) {
           for (;;) {
             try {
-              const stopped = id === 'all' ? await s.client.stopAllTasks() : [await s.client.stopTask(id)];
+              const stopped = id === 'all' ? await s.client.stopAllActivities() : [await s.client.stopActivity(id)];
               if (!stopped.length) out('nothing running\n');
               for (const x of stopped) out(`⏹ ${cleanCell(x.id)} — ${STOP_OUTCOME[x.outcome] ?? x.outcome}\n`);
               break;

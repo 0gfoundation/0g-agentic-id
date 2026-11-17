@@ -616,9 +616,14 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			post("/v1/responses"), get("/v1/responses/{id}"), post("/v1/responses/{id}/cancel")),
 		route("/v1/inbox", "inbox", "Messages from turns the agent opened itself — a background job finishing, a reminder coming due: GET /v1/inbox?after=N, POST /v1/inbox/ack {through}.",
 			get("/v1/inbox"), post("/v1/inbox/ack")),
-		route("/v1/events", "events", "Server-sent feed of turn, inbox, task and schedule changes, resumable from a cursor: GET /v1/events?after=N.",
+		route("/v1/events", "events", "Server-sent feed of turn, inbox, activity and schedule changes, resumable from a cursor: GET /v1/events?after=N.",
 			get("/v1/events")),
-		route("/v1/tasks", "tasks", "Turns, background commands and subagents, with who did each: GET /v1/tasks, GET /v1/tasks/{id}, POST /v1/tasks/{id}/cancel (id `all` cancels everything running).",
+		// What runs or ran. "Task" is kept for zgh-style tasks (a unit of
+		// work with its own session, state and outcome); /v1/tasks stays,
+		// as the deprecated alias of this list, until it names them.
+		route("/v1/activities", "activities", "Turns, background commands and subagents, with who did each: GET /v1/activities, GET /v1/activities/{id}, POST /v1/activities/{id}/cancel (id `all` cancels everything running).",
+			get("/v1/activities"), get("/v1/activities/{id}"), post("/v1/activities/{id}/cancel")),
+		route("/v1/tasks", "tasks", "Deprecated alias of /v1/activities (same answers, with Deprecation: true), until /v1/tasks names zgh-style tasks: GET /v1/tasks, GET /v1/tasks/{id}, POST /v1/tasks/{id}/cancel.",
 			get("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/cancel")),
 		route("/v1/schedules", "schedules", "Reminders the agent set for itself: GET /v1/schedules (enabled:false unless the owner's `schedule` knob is on).",
 			get("/v1/schedules"), framework.Endpoint{Method: http.MethodDelete, Path: "/v1/schedules/{id}"}),
