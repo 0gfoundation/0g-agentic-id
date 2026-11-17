@@ -711,17 +711,24 @@ sandbox 对账（见 attestor README）：sandbox 处于 started 但 `/healthz` 
 包括 agentSeal 钱包没 gas（gas 不足 → `chain.Update` tx 进不去 → Apply
 失败），所以钱包余额这种事也归它管。
 
-Apply 的三种结果对应三种 severity：
+提交失败从不报 `error`：agent 本身在运行、能应答，只是最新的数据还没上链；报
+`error` 会让 attestor 把它显示为离线（容器阶段失败），CLI 也就不让聊天。Apply 的结果：
 
-| Apply 结果 | severity | 上报时机 | 失败计数 |
+| Apply 结果 | 状态 | 上报时机 | 失败计数 |
 |---|---|---|---|
-| **成功**（drift 上链了，或无 drift）| `running` | 不立刻上报，等 runHeartbeat 复读 | 累计错误清零 |
-| **失败，owner-recoverable** —— 典型：agentSeal 钱包没 gas、API key 配错、provider rate limit | `warning` | 第一次出现**立刻**上报，不等心跳 | **不**累加（这不是系统故障，是 owner 自己得处理的事）|
-| **失败，系统级** —— 典型：0g-storage 上传超时、RPC 异常、indexer 不可达 | `error` | 累计 **5 次连续** Apply 失败才升级到 error 上报，避免单次网络抖动误判 | 累加，恢复后清零 |
+| **成功**（drift 上链了，或无 drift）| `running` | 状态变回时上报 | 清零；重试退避重新开始 |
+| **失败，owner 能处理** —— 典型：agentSeal 钱包没 gas | `warning`，"agent data not committed to chain: …" | **立刻** | 计数 |
+| **失败，其他** —— 典型：0g-storage 上传超时、RPC 异常、indexer 不可达 | `warning`，"agent data not committed to chain (N attempts): …" | **连续 5 次**失败后，避免单次网络抖动显示出来 | 计数 |
 
-`status.go::severityOf` 是把具体 error 字符串翻译到这三种 severity 的分类器
-（认 "insufficient funds" → `warning`、"connection refused" → `error`、etc.）。
-分类失败兜底 `error`。
+`status.go::severityOf` 把 owner 能处理的原因（"insufficient funds"、seal 钱包自己
+那笔交易不带数据的回滚）和其他原因分开；`commitretry.go::commitFailureStatus`
+把两者都变成 warning。
+
+重试会退避（`commitretry.go`）：同一份内容连续失败 n 次后，下次尝试等 30 秒·2^(n-1)，
+最多 30 分钟；有新内容要提交时下一个 tick 就试，成功后重新开始。重试只上传失败的那次
+还没传的部分（`internal/uploader/pending.go`）：后面的上传或 update 失败之前已经传上去
+的 blob 会被复用，链上还没有的角色沿用当时生成的 data key，所以每个 blob 只付一次钱。
+这些只记在本次启动的内存里。
 
 ### `runHeartbeat` 的 5min ticker
 

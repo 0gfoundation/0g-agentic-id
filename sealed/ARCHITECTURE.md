@@ -818,18 +818,28 @@ includes things like agentSeal wallet running out of gas
 (insufficient gas → `chain.Update` tx won't go in → Apply fails), so
 wallet balance falls under its scope too.
 
-Apply's three outcomes correspond to three severities:
+A failed commit is never an `error`: the agent runs and answers, only its
+latest data is not on chain yet, and an `error` report would make the
+attestor show it offline (its container stage failed) and the CLI refuse to
+chat. Apply's outcomes:
 
-| Apply outcome | severity | When reported | Failure counter |
+| Apply outcome | status | When reported | Failure counter |
 |---|---|---|---|
-| **success** (drift on chain, or no drift) | `running` | not reported immediately; runHeartbeat will replay it | accumulated errors cleared |
-| **failure, owner-recoverable** — typical: agentSeal wallet out of gas, wrong API key, provider rate limit | `warning` | reported **immediately** on first occurrence, doesn't wait for heartbeat | **does not** accumulate (not a system failure, the owner has to handle it) |
-| **failure, system-level** — typical: 0g-storage upload timeout, RPC anomaly, indexer unreachable | `error` | escalates to error only after **5 consecutive** Apply failures, to avoid single-network-jitter misjudgments | accumulates; clears on recovery |
+| **success** (drift on chain, or no drift) | `running` | reported on the transition back | cleared; the retry backoff starts over |
+| **failure, owner-recoverable** — typical: agentSeal wallet out of gas | `warning`, "agent data not committed to chain: …" | **immediately** | counted |
+| **failure, other** — typical: 0g-storage upload timeout, RPC anomaly, indexer unreachable | `warning`, "agent data not committed to chain (N attempts): …" | after **5 consecutive** failures, so a single network blip does not show | counted |
 
-`status.go::severityOf` is the classifier that maps a specific error
-string to one of these three severities — recognizing "insufficient
-funds" → `warning`, "connection refused" → `error`, and so on. The
-classification fallback is `error`.
+`status.go::severityOf` tells the owner-recoverable causes ("insufficient
+funds", a data-less revert of the seal wallet's own transaction) from the
+rest; `commitretry.go::commitFailureStatus` turns either into the warning.
+
+Retries back off (`commitretry.go`): after n consecutive failures of the same
+content the next attempt waits 30 s·2^(n-1), at most 30 min; new content to
+commit is tried on the next tick, and a success starts over. A retry uploads
+only what the failed attempt did not (`internal/uploader/pending.go`): the
+blobs an attempt uploaded before a later upload or the update failed are
+reused, with the data key minted for a role not yet on chain, so each blob
+is paid for once. This is kept in memory for the boot.
 
 ### `runHeartbeat`'s 5-min ticker
 

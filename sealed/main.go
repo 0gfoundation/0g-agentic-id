@@ -1549,13 +1549,12 @@ func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte,
 //     next watcher tick re-detects divergence (chainSnapshot stays
 //     stale, currentSnapshot still differs) and Apply re-runs naturally.
 //
-// All errors are logged. Error classification follows severityOf:
-//   - "warning" (owner-recoverable, e.g. insufficient funds): reported
-//     to the attestor immediately on first occurrence so the UI can
-//     surface the owner-action prompt without delay; the failure
-//     counter is NOT advanced (it's not a system failure).
-//   - "error" (genuine system failure): reported after failureEscalateAt
-//     consecutive Apply failures so transient blips don't false-alarm.
+// All errors are logged. A failed commit makes the status a "warning", never
+// an "error" (commitFailureStatus): the agent runs; only its data is not on
+// chain yet. An owner-recoverable cause (the seal wallet cannot pay) shows at
+// once; any other after failureEscalateAt consecutive failures, so a
+// transient blip does not show. Retries of the same content back off
+// (commitretry.go); new content is tried at once.
 const failureEscalateAt = 5
 
 var consecutiveApplyFailures int
@@ -1639,34 +1638,30 @@ func handleDrift(
 	// zero — a death loop of "10 OKs + 1 kill" with no progress to chain.
 	// Inheriting ctx (watchCtx) here is effectively unbounded, gated only
 	// by the per-blob timeout downstream.
-	if err := upload.Apply(ctx, plaintexts); err != nil {
-		sev := severityOf(err)
-		summary := summarizeError(err)
-		logger.Logf("drift: upload.Apply: %v (severity=%s)", err, sev)
-
-		if sev == "warning" {
-			// Owner-recoverable. Don't count it toward the system-failure
-			// threshold (a chronically-unfunded agent shouldn't ratchet
-			// up consecutiveApplyFailures forever). Push the status
-			// immediately on the first transition so the UI prompts the
-			// owner without waiting for the next heartbeat.
-			if prev := currentStatus.Set("warning", summary); prev != "warning" {
-				level, msg := currentStatus.Get()
-				report.Status(attestorURL, agentSealPriv, sealID, level, msg, binding)
-			}
-			return
-		}
-
-		// Real system error: keep the 5-failure threshold to ride out
-		// transient network / chain blips.
-		consecutiveApplyFailures++
-		if consecutiveApplyFailures == failureEscalateAt {
-			msg := fmt.Sprintf("upload.Apply failed %d times: %s", failureEscalateAt, summary)
-			currentStatus.Set("error", msg)
-			report.Status(attestorURL, agentSealPriv, sealID, "error", msg, binding)
+	key := driftKey(plaintexts)
+	if wait, first := commitRetry.Wait(time.Now(), key); wait > 0 {
+		if first {
+			logger.Logf("drift: the last commit of this content failed; the next attempt is in %s", wait.Round(time.Second))
 		}
 		return
 	}
+	if err := upload.Apply(ctx, plaintexts); err != nil {
+		consecutiveApplyFailures++
+		next := commitRetry.Failed(time.Now(), key)
+		level, msg := commitFailureStatus(err, consecutiveApplyFailures)
+		logger.Logf("drift: upload.Apply: %v (failure %d; next attempt in %s unless the content changes)", err, consecutiveApplyFailures, next)
+		if level == "" {
+			return
+		}
+		// Push the status on the transition so the owner sees it without
+		// waiting for the next heartbeat; later failures only update it.
+		if prev := currentStatus.Set(level, msg); prev != level {
+			level, msg := currentStatus.Get()
+			report.Status(attestorURL, agentSealPriv, sealID, level, msg, binding)
+		}
+		return
+	}
+	commitRetry.Succeeded()
 	consecutiveApplyFailures = 0
 	// Success: if we were previously in warning / error, push a "running"
 	// status now so the UI clears without waiting for the next heartbeat.

@@ -108,7 +108,8 @@ only base, sealed and the official harness get fields of their own.
 - **In the ServeProof**: through `dataHashes` (ciphertext roots), as before. A
   verifier finds the entry on chain by it, then reads the entry's salted
   plaintext commitment (§7.1).
-- **Update**: changes most often. The watcher commits changes every 30 s; when
+- **Update**: changes most often. The watcher commits changes every 30 s (a
+  failing commit retries with backoff, up to every 30 min); when
   a change applies is up to the harness, e.g. the persona is read when the
   harness starts.
 

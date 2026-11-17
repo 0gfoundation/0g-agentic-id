@@ -49,7 +49,7 @@
 - **谁定**：mint 时 owner 给初始值，之后由 agent 自己写；owner 想改，经聊天让 agent 改。
 - **加载和校验**：sealed 从链上恢复、解密到磁盘，harness 读取。不设白名单，完整性靠链上的 `dataHash`。
 - **进 ServeProof**：照旧经 `dataHashes`（密文根哈希）。验证方按它找到链上条目，再读条目里加盐的明文承诺（7.1）。
-- **更新**：变动最频繁。检测器每 30 秒把变化提交上链；什么时候生效由 harness 决定，比如人设在 harness 启动时读入。
+- **更新**：变动最频繁。检测器每 30 秒把变化提交上链（提交失败时退避重试，最长 30 分钟一次）；什么时候生效由 harness 决定，比如人设在 harness 启动时读入。
 
 本文的全部改动只用于 0g-harness，包括分层、sealed 和 harness 名单、ServeProof v2、不许导出的规则和服务字段上限。openclaw、hermes 和 prime-agent 继续用现在的单一镜像，ServeProof 和行为都不变（兼容要求见第 8 节）。四个框架共用的只有信任合约：它接管 AgenticID 原有的 attestor 名单和镜像名单，内容和行为不变（第 10 节）。
 

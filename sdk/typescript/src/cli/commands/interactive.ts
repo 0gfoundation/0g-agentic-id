@@ -2691,6 +2691,14 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   return s;
 }
 
+/** The reason of a container's last `warning` report, cleaned for one line;
+ *  null for any other report or none. */
+export function warningOf(status: { level: string; reason: string | null } | null | undefined): string | null {
+  if (!status || status.level !== 'warning' || !status.reason) return null;
+  const line = status.reason.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+  return line.length > 200 ? `${line.slice(0, 199)}…` : line;
+}
+
 async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask: (q: string) => Promise<string>): Promise<Session> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listDeployments();
@@ -2727,8 +2735,9 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
       ? ag.agent.runtimeCosts(BigInt(agentId)).then((rc) => rc.sealGasWei).catch(() => null)
       : Promise.resolve(null),
     // Ownership up front, so owner-only commands can refuse plainly instead
-    // of failing phase checks or bouncing off the attestor's auth later.
-    ag.agent.listMyDeployments().then((rs) => rs.some((r) => r.sealId === row.sealId)).catch(() => undefined),
+    // of failing phase checks or bouncing off the attestor's auth later. The
+    // owner's row also carries the container's last status report.
+    ag.agent.listMyDeployments().then((rs) => rs.find((r) => r.sealId === row.sealId) ?? false).catch(() => undefined),
   ]);
   // The session is the owner's cockpit — a foreign agent's public surface is
   // L1 `hello <id>`. Undetermined ownership (listing fetch failed) enters
@@ -2744,6 +2753,11 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   if (s.url) fields.push(`url      ${s.url}`);
   fields.push(`sealId   ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}`);
   if (gasWei != null) fields.push(`gas      ${og(gasWei)} (agentSeal — fund with /topup)`);
+  // A running agent can still report a warning, e.g. its data not reaching
+  // chain because the agentSeal wallet cannot pay: say so where the owner
+  // looks first.
+  const warning = mine ? warningOf(mine.containerStatus) : null;
+  if (warning) fields.push(`warning  ${warning}`);
   if (s.phase === 'running' && s.url) {
     fields.push('type to chat · /help for commands · Esc interrupts a turn');
   } else {
