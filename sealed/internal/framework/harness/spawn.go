@@ -627,10 +627,13 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 		route("/v1/memory", "memory", "Long-term memory upkeep: POST /v1/memory/tidy runs one consolidation pass now (merge duplicates, drop stale memories), only while no turn runs.",
 			post("/v1/memory/tidy")),
 		// Owner files: written by the harness (the agent user) to a new name
-		// under ~/uploads, where the agent reads them. Images ride the chat
-		// and Responses messages themselves.
-		route("/v1/files", "files", "Owner file upload: POST /v1/files {name, content_base64} → {path, bytes}; the file lands under the agent's ~/uploads (container-local, not tracked), at most 25 MiB.",
-			post("/v1/files")),
+		// in the file inbox ~/inbox, where the agent reads them; and the way
+		// back, the files the agent puts in ~/outbox (or the owner's own, in
+		// ~/inbox), which the owner downloads. The file inbox is not the
+		// message inbox above. Images ride the chat and Responses messages
+		// themselves.
+		route("/v1/files", "files", "Owner files: POST /v1/files {name, content_base64} → {path, bytes} lands a file in the agent's file inbox ~/inbox (not the message inbox /v1/inbox), at most 25 MiB; GET /v1/files?dir=outbox|inbox lists, GET /v1/files/{outbox|inbox}/{name} downloads (at most 50 MiB) what the agent put in ~/outbox or what the owner sent. Both directories are container-local, not tracked.",
+			post("/v1/files"), get("/v1/files"), get("/v1/files/{id}/{id}")),
 		// The owner's word for the turn already running: read before that
 		// turn's next model call (DSH next-step input); queued as an
 		// ordinary turn when no owner turn is running.

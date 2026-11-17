@@ -146,7 +146,7 @@ RUN npm install -g --no-fund --no-audit "${HARNESS_REF}" \
 FROM debian:13-slim
 
 # poppler-utils: pdftotext and pdfinfo, so the agent reads the PDFs its
-# owner uploads (POST /v1/files lands them in ~/uploads).
+# owner uploads (POST /v1/files lands them in the file inbox ~/inbox).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils python3 poppler-utils \
  && command -v pdftotext \

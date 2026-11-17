@@ -51,7 +51,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | 推理 | `dsh-llm-pi-ai`(路由由适配器按 owner 的 settings 渲染好传进去)、`dsh-credentials-local` |
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | 文件读写 | `dsh-fs-local` + `dsh-tool-fs` |
-| owner 发的图片和文件 | `dsh-attachment-local`（owner 发的图片规整后存在 agent 家目录的 `~/.dsh-attachments` 下，不进链；同时让 `read_image` 可用）。owner 上传的文件（`POST /v1/files`）放在 `~/uploads`，不进链；镜像带 `pdftotext`，用来读其中的 PDF |
+| owner 发的图片和文件 | `dsh-attachment-local`（owner 发的图片规整后存在 agent 家目录的 `~/.dsh-attachments` 下，不进链；同时让 `read_image` 可用）。owner 上传的文件（`POST /v1/files`）放在文件收件箱 `~/inbox`（不是消息收件箱 `/v1/inbox`），不进链；镜像带 `pdftotext`，用来读其中的 PDF。agent 交给 owner 的文件放在 `~/outbox`，不进链；owner 列出并下载（`GET /v1/files`、`GET /v1/files/{outbox|inbox}/{name}`，最多 50 MiB），某一轮在那里新增或改动了文件时会告诉 owner（`harness.outbox_files`） |
 | 技能 | `dsh-skill-filesystem`(对应 `skills/` 这个 iData role:agent 自己装的,会上链) |
 | 长期记忆 | harness 自己的系统提示段(`src/memory.mjs`):说明和 `MEMORY.md` 索引,每个模型步骤都重新读取;记忆文件是 `memory/` 这个 iData role(`memory.go`):每条记忆一个 `<name>.md`,直接放在 `$DSH_HOME/memory/` 里,会上链;上链的副本里凭据值换成占位符,格式可识别的秘密换成 `[redacted:<类型>]`(`../../../CREDENTIALS.zh.md`「范围之外」);agent 空闲时不定期整理一次(`src/memory-tidy.mjs`,开关 `memoryTidy`),也可以用 `POST /v1/memory/tidy`(kind `memory`)立刻整理 |
 | 上下文余量 | `dsh-token-meter` + `dsh-compaction-basic` |
@@ -81,7 +81,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | `subagents` | `false` | 打开 `subagent` 工具:主 agent 派出去在后台跑的只读助手(会同时打开任务工具) |
 | `schedule` | `false` | 打开 `schedule_create` / `schedule_list` / `schedule_delete`:agent 给自己设的提醒 |
 | `maxParallelToolCalls` | `1` | 模型一步里最多同时运行几个工具调用。只对声明了可以并发的工具生效：`read`、`read_image`、`subagent`。`bash`、`write`、`edit`、`seal_*` 工具以及任务和提醒工具总是单独运行，等前面的调用结束才开始 |
-| `modelImages` | 不设置 | 覆盖 owner 的模型能不能看图（`true`/`false`）。不设置时由服务商的模型列表决定（0G router 上是 `architecture.input_modalities`：glm-5.3 只收文字，glm-5.3-flash 能看图）；列表里没写时按 pi-ai 的模型目录。能看图时 owner 发的图片交给模型；不能时每张图存到 `~/uploads`，并告诉 agent 它看不到 |
+| `modelImages` | 不设置 | 覆盖 owner 的模型能不能看图（`true`/`false`）。不设置时由服务商的模型列表决定（0G router 上是 `architecture.input_modalities`：glm-5.3 只收文字，glm-5.3-flash 能看图）；列表里没写时按 pi-ai 的模型目录。能看图时 owner 发的图片交给模型；不能时每张图存到 `~/inbox`，并告诉 agent 它看不到 |
 | `memoryExtract` | `true` | owner 对话压缩之前，harness 调用一次模型，把即将被摘要的那段对话里值得长期保留的内容写进长期记忆（0g-harness `src/memory-extract.mjs`）；设为 `false` 关闭。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT`。 |
 | `memoryTidy` | `true` | agent 空闲时，harness 不定期调用一次模型整理长期记忆：合并重复的，删掉过时或被推翻的（0g-harness `src/memory-tidy.mjs`；距上次整理 24 小时且记忆有变化时到期，索引接近上限时提前）；设为 `false` 关闭自动整理，`POST /v1/memory/tidy` 仍可按需整理一次。渲染为 `SEAL_HARNESS_MEMORY_TIDY`。 |
 

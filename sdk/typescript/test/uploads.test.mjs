@@ -55,10 +55,10 @@ test('uploadFile: only on a declared files route, with a way to authenticate', (
 });
 
 test('uploadFile posts the name and the bytes in base64', async () => {
-  const agent = await mockAgent((req, res) => json(res, 201, { path: '/home/agent/uploads/notes.txt', bytes: 5 }));
+  const agent = await mockAgent((req, res) => json(res, 201, { path: '/home/agent/inbox/notes.txt', bytes: 5 }));
   try {
     const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS, token: 't' });
-    assert.deepEqual(await c.uploadFile('notes.txt', new TextEncoder().encode('hello')), { path: '/home/agent/uploads/notes.txt', bytes: 5 });
+    assert.deepEqual(await c.uploadFile('notes.txt', new TextEncoder().encode('hello')), { path: '/home/agent/inbox/notes.txt', bytes: 5 });
     assert.equal(agent.seen[0].url, '/v1/files');
     assert.deepEqual(agent.seen[0].body, { name: 'notes.txt', content_base64: Buffer.from('hello').toString('base64') });
   } finally {
@@ -81,7 +81,7 @@ test('responses transport: images in the submit, the notice from the record', as
   const agent = await mockAgent((req, res) => {
     const path = req.url.split('?')[0];
     if (req.method === 'POST' && path === '/v1/responses') {
-      return json(res, 200, { id: 'resp_01', object: 'response', status: 'queued', output_text: '', harness: { images_saved_as_files: ['/home/agent/uploads/image-1.png'] } });
+      return json(res, 200, { id: 'resp_01', object: 'response', status: 'queued', output_text: '', harness: { images_saved_as_files: ['/home/agent/inbox/image-1.png'] } });
     }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.end(`id: 1\nevent: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', sequence_number: 1, response: { id: 'resp_01', status: 'completed', output_text: 'seen' } })}\n\n`);
@@ -92,7 +92,7 @@ test('responses transport: images in the submit, the notice from the record', as
     let text = '';
     for await (const d of c.chatStream([{ role: 'user', content: 'what is it' }], { images: [IMAGE], onNotice: (n) => notices.push(n) })) text += d;
     assert.equal(text, 'seen');
-    assert.deepEqual(notices, [{ imagesSavedAsFiles: ['/home/agent/uploads/image-1.png'] }]);
+    assert.deepEqual(notices, [{ imagesSavedAsFiles: ['/home/agent/inbox/image-1.png'] }]);
     const submit = agent.seen.find((r) => r.method === 'POST');
     assert.equal(submit.body.input[0].content[1].type, 'input_image');
   } finally {
@@ -103,7 +103,7 @@ test('responses transport: images in the submit, the notice from the record', as
 test('chat transport: images as image_url parts, the notice from the SSE comment', async () => {
   const agent = await mockAgent((req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
-    res.write(': notice images_saved_as_files ["/home/agent/uploads/image-1.png"]\n\n');
+    res.write(': notice images_saved_as_files ["/home/agent/inbox/image-1.png"]\n\n');
     res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n\n`);
     res.end('data: [DONE]\n\n');
   });
@@ -113,7 +113,7 @@ test('chat transport: images as image_url parts, the notice from the SSE comment
     let text = '';
     for await (const d of c.chatStream([{ role: 'user', content: 'x' }], { images: [IMAGE], onNotice: (n) => notices.push(n) })) text += d;
     assert.equal(text, 'ok');
-    assert.deepEqual(notices, [{ imagesSavedAsFiles: ['/home/agent/uploads/image-1.png'] }]);
+    assert.deepEqual(notices, [{ imagesSavedAsFiles: ['/home/agent/inbox/image-1.png'] }]);
     assert.equal(agent.seen[0].body.messages[0].content[1].type, 'image_url');
   } finally {
     agent.stop();
@@ -145,10 +145,10 @@ test('/attach: images by their bytes, limits when staged, files uploaded and nam
   assert.throws(() => stageFile(join(dir, 'missing'), staged), /no such file/);
 
   const uploads = [];
-  const client = { uploadFile: async (name, data) => { uploads.push([name, Buffer.from(data).toString()]); return { path: `/home/agent/uploads/${name}`, bytes: data.length }; } };
+  const client = { uploadFile: async (name, data) => { uploads.push([name, Buffer.from(data).toString()]); return { path: `/home/agent/inbox/${name}`, bytes: data.length }; } };
   const sent = await prepareAttachments(staged, 'please read', client);
   assert.deepEqual(uploads, [['report.pdf', '%PDF-1.4 tiny']]);
-  assert.equal(sent.text, 'please read\n[file uploaded: /home/agent/uploads/report.pdf]');
+  assert.equal(sent.text, 'please read\n[file uploaded: /home/agent/inbox/report.pdf]');
   assert.deepEqual(sent.images, [{ mediaType: 'image/png', data: PNG.toString('base64') }]);
   await assert.rejects(prepareAttachments(staged, 'x', {}), /takes no files/);
 
