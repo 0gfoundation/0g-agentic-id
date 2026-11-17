@@ -27,7 +27,7 @@
 
 ## 进程
 
-`spawn.go` 以 agent 用户身份运行 `node /opt/0g-harness/<sha256>/bin/0g-harness.mjs`(没有包的镜像上是 `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`),监听本机回环端口 8794,环境变量由 `environ()` 生成。这些环境变量的约定写在 harness 的 `docs/PROTOCOL.md` 里。
+`spawn.go` 以 agent 用户身份运行 `node /opt/0g-harness/<sha256>/bin/0g-harness.mjs`(没有包的镜像上是 `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`),监听本机回环端口 8794,环境变量由 `environ()` 生成。这些环境变量的约定写在 harness 的 `docs/PROTOCOL.md` 里。其中 `SEAL_OWNER` 是启动时从链上读到的 owner(小写),harness 拿它核对每条记忆的 `trusted_by`。
 
 - 只要 sealed 知道 provider 的 endpoint,harness 就通过 sealed 的推理代理(`internal/inferproxy`,一个回环地址)调用模型:注册表里的 managed provider,以及 `openai` 和 `anthropic`(sealed 固定的官方 endpoint)。代理写上 owner 的模型,在 system prompt 末尾附上 agent doc,并设置密钥;harness 手里只有占位符(`../../CONFIG_SURFACE.zh.md` §3、§7)。模型走 0G router(`0g-compute`)且 `webTools` 打开时，代理还为 `web_search` 转发 `POST /v1/web/search`：只收 `{"query"}` 请求体，重新组装后设置密钥，不写模型名，也不附 agent doc(`inferproxy` `webSearch`)；harness 从 `SEAL_HARNESS_WEB_SEARCH_URL` 拿到这个地址。
 - harness 在 `/v1/*` 上检查它自己的 token(`SEAL_BRIDGE_TOKEN`)。owner 从 `/_seal/auth` 拿到的是另一个 token,sealed 的 proxy 在请求进来时把它换成 harness 的,所以 harness 运行的任何东西都看不到 owner 的 token。
@@ -39,7 +39,7 @@ harness 做三件事:
 
 `FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`activities`、`tasks`、`task-feed`、`schedules`、`files`、`memory`、`steer`、`sessions`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后十种,对它们没有任何改变。`activities` 是正在运行和运行过的活动列表(轮次、后台命令、子 agent)。`tasks` 是 zgh 式任务:owner 交给 agent 的一件工作,在自己的会话和工作区(默认 `~/tasks/<id>`)里运行,最多同时四件,以 agent 记下的结果收尾(`raise_question`、`request_action`、`report_complete`);状态有 queued、working、idle、needs-input、done、failed、archived。`task-feed` 是任务变化的事件流;声明了这个 kind,客户端也就知道 `/v1/tasks` 指的是这种任务(更早的运行时曾用 kind `tasks` 声明活动列表的旧名)。`steer` 是 owner 给正在运行的那一轮的话:harness 在这一轮下一次调用模型之前读到它;没有 owner 的轮次在运行时,它作为普通轮次排队。`sessions` 是 owner 的其他对话(照 zgh):新开、从另一个会话的记录分叉、或恢复;每次发消息要么是这个会话的下一轮,要么插进它正在跑的一轮;每个会话有自己的事件流。所有会话都是同一个 agent、同一个 owner(人设、skills、记忆、家目录和凭据共用);`owner-chat` 是 `chat` 和 `responses` 背后的默认会话(CONVERSATION.zh.md 不变量 2)。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。
 
-harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)、`skills/` 和 `memory/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
+harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)、`skills/`、`memory/` 和 `memory-public/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
 
 ## 当前组合
 
@@ -53,7 +53,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | 文件读写 | `dsh-fs-local` + `dsh-tool-fs` |
 | owner 发的图片和文件 | `dsh-attachment-local`（owner 发的图片规整后存在 agent 家目录的 `~/.dsh-attachments` 下，不进链；同时让 `read_image` 可用）。owner 上传的文件（`POST /v1/files`）放在文件收件箱 `~/inbox`（不是消息收件箱 `/v1/inbox`），不进链；镜像带 `pdftotext`，用来读其中的 PDF。agent 交给 owner 的文件放在 `~/outbox`，不进链；owner 列出并下载（`GET /v1/files`、`GET /v1/files/{outbox|inbox}/{name}`，最多 50 MiB），某一轮在那里新增或改动了文件时会告诉 owner（`harness.outbox_files`） |
 | 技能 | `dsh-skill-filesystem`(对应 `skills/` 这个 iData role:agent 自己装的,会上链) |
-| 长期记忆 | harness 自己的系统提示段(`src/memory.mjs`):说明和 `MEMORY.md` 索引,每个模型步骤都重新读取;记忆文件是 `memory/` 这个 iData role(`memory.go`):每条记忆一个 `<name>.md`,直接放在 `$DSH_HOME/memory/` 里,会上链;上链的副本里凭据值换成占位符,格式可识别的秘密换成 `[redacted:<类型>]`(`../../../CREDENTIALS.zh.md`「范围之外」);agent 空闲时不定期整理一次(`src/memory-tidy.mjs`,开关 `memoryTidy`),也可以用 `POST /v1/memory/tidy`(kind `memory`)立刻整理 |
+| 长期记忆 | harness 自己的系统提示段(`src/memory.mjs`):说明,以及正文合计不超过 `memoryInlineBytes` 时的每条完整记忆,超过时改为两个 `MEMORY.md` 索引,每个模型步骤都重新读取;记忆文件是两个 iData role(`memory.go`):`memory/`(私有,只在 owner 的会话和任务里用)和 `memory-public/`(公开,只在 owner 明确要求时写入):每条记忆一个 `<name>.md`,直接放在 `$DSH_HOME/memory/` 或 `$DSH_HOME/memory-public/` 里,会上链;每条记忆的 `trusted_by` 写明确认它的 owner,不是当前 owner(`SEAL_OWNER`)确认的只作参考;上链的副本里凭据值换成占位符,格式可识别的秘密换成 `[redacted:<类型>]`(`../../../CREDENTIALS.zh.md`「范围之外」);agent 空闲时不定期整理一次(`src/memory-tidy.mjs`,开关 `memoryTidy`),也可以用 `POST /v1/memory/tidy`(kind `memory`)立刻整理 |
 | 上下文余量 | `dsh-token-meter` + `dsh-compaction-basic` |
 | 循环兜底 | `dsh-tool-call-timeout-policy` |
 | 后台任务(打开 `toolJobs` 时) | `dsh-tool-jobs`:命令可以放到后台跑;agent 空闲时任务结束,会开启新的一轮,这一轮的回复进收件箱 |
@@ -84,9 +84,10 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | `modelImages` | 不设置 | 覆盖 owner 的模型能不能看图（`true`/`false`）。不设置时由服务商的模型列表决定（0G router 上是 `architecture.input_modalities`：glm-5.3 只收文字，glm-5.3-flash 能看图）；列表里没写时按 pi-ai 的模型目录。能看图时 owner 发的图片交给模型；不能时每张图存到 `~/inbox`，并告诉 agent 它看不到 |
 | `memoryExtract` | `true` | owner 会话压缩之前，以及某一轮没存记忆、且新消息够多之后，harness 调用一次模型，把这些消息里值得长期保留的内容写进长期记忆（0g-harness `src/memory-extract.mjs`）；设为 `false` 两者都关闭。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT`。 |
 | `memoryExtractMinMessages` | `6` | 某一轮没存记忆时，自上次提取以来 owner 和 agent 的新消息至少要有多少条，才读一遍找记忆（1 到 1000）。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT_MIN_MESSAGES`。 |
-| `memoryRecall` | `true` | 记忆超过 30 条后，每条 owner 消息之前，harness 调用一次模型挑出最多 5 条有用的记忆，把正文放在消息前面（0g-harness `src/memory-recall.mjs`）；设为 `false` 关闭。渲染为 `SEAL_HARNESS_MEMORY_RECALL`。 |
-| `memoryTidy` | `true` | agent 空闲时，harness 不定期调用一次模型整理长期记忆：合并重复的，删掉过时或被推翻的（0g-harness `src/memory-tidy.mjs`；距上次整理 24 小时且记忆有变化时到期，索引接近上限时提前）；设为 `false` 关闭自动整理，`POST /v1/memory/tidy` 仍可按需整理一次。渲染为 `SEAL_HARNESS_MEMORY_TIDY`。 |
+| `memoryRecall` | `true` | 超过 `memoryInlineBytes` 后，每条 owner 消息之前，harness 调用一次模型挑出最多 5 条有用的记忆，把正文放在消息前面（0g-harness `src/memory-recall.mjs`）；设为 `false` 关闭。渲染为 `SEAL_HARNESS_MEMORY_RECALL`。 |
+| `memoryTidy` | `true` | agent 空闲时，harness 不定期为每个记忆角色调用一次模型，整理这个角色里当前 owner 可信的记忆：合并重复的，删掉过时或被推翻的，从不在两个角色之间移动（0g-harness `src/memory-tidy.mjs`；距上次整理 24 小时且记忆有变化时到期，某个索引接近上限时提前）；设为 `false` 关闭自动整理，`POST /v1/memory/tidy` 仍可按需整理一次。渲染为 `SEAL_HARNESS_MEMORY_TIDY`。 |
 | `webTools` | `true` | 打开 `web_fetch` 工具（把一个公网 http(s) 页面读成文本；私网和回环地址拒绝，DNS 解析之后也查；经凭证代理出站）；模型走 0G router（`0g-compute`）时还打开 `web_search`（经推理代理调 router 的 `/v1/web/search`，按次计费，记在 owner 的 0G Compute key 上）（0g-harness `src/web.mjs`）；设为 `false` 两个都关。渲染为 `SEAL_HARNESS_WEB`。 |
+| `memoryInlineBytes` | `8192` | 两个记忆角色的正文合计不超过这个字节数时，每条记忆整条放进系统提示，不做回忆；超过时放索引并回忆（256 到 65536）。渲染为 `SEAL_HARNESS_MEMORY_INLINE_BYTES`。 |
 
 这里填错,不会让 agent 起不来。`RenderSettings` 每次 spawn 前都会运行,要是在这里报错,agent 就开不了机,而不是"这次推送被拒"。所以解析不了或超出范围的值,一律退回出厂默认值,在日志里说明,其他开关照常生效(`settings.go`)。
 

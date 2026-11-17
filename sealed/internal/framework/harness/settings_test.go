@@ -190,6 +190,7 @@ func TestRenderSettings_DefaultKnobsAreTheShippedComposition(t *testing.T) {
 		"SEAL_HARNESS_MEMORY_RECALL":               "1",
 		"SEAL_HARNESS_MEMORY_EXTRACT_MIN_MESSAGES": "6",
 		"SEAL_HARNESS_WEB":                         "1",
+		"SEAL_HARNESS_MEMORY_INLINE_BYTES":         "8192",
 	} {
 		if env[k] != want {
 			t.Errorf("%s = %q, want %q (the shipped default)", k, env[k], want)
@@ -708,6 +709,24 @@ func TestRenderSettings_WebTools(t *testing.T) {
 		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.others)})
 		if got := env["SEAL_HARNESS_WEB"]; got != c.want {
 			t.Errorf("others %s → SEAL_HARNESS_WEB=%q, want %q", c.others, got, c.want)
+		}
+	}
+}
+
+// The inline size takes a whole number from 256 to 65536; anything else keeps
+// the default.
+func TestRenderSettings_MemoryInlineBytes(t *testing.T) {
+	catalogServer(t, reasoningModel("glm-5.3"))
+	for _, c := range []struct{ others, want string }{
+		{`{}`, "8192"},
+		{`{"memoryInlineBytes":4096}`, "4096"},
+		{`{"memoryInlineBytes":100}`, "8192"},
+		{`{"memoryInlineBytes":1000000}`, "8192"},
+		{`{"memoryInlineBytes":"lots"}`, "8192"},
+	} {
+		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.others)})
+		if got := env["SEAL_HARNESS_MEMORY_INLINE_BYTES"]; got != c.want {
+			t.Errorf("others %s → SEAL_HARNESS_MEMORY_INLINE_BYTES=%q, want %q", c.others, got, c.want)
 		}
 	}
 }

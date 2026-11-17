@@ -796,7 +796,7 @@ What that table exposed, and what became of it:
 | openclaw | `framework`, `openclaw.json`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` (`openclaw/openclaw.go:164`) |
 | hermes | `framework`, `config.yaml`, `SOUL.md`, `memories/`, `skills/` | `framework`, `SOUL.md`, `memories/`, `skills/` (`hermes/hermes.go:143`) |
 | prime-agent | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `models.json`, `skills/` | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` (`prime/prime.go:162`) |
-| 0g-harness | `framework`, `APPEND_SYSTEM.md`, `settings.yaml`, `skills/` | `framework`, `APPEND_SYSTEM.md`, `skills/`, `memory/` (`harness/harness.go:200`) |
+| 0g-harness | `framework`, `APPEND_SYSTEM.md`, `settings.yaml`, `skills/` | `framework`, `APPEND_SYSTEM.md`, `skills/`, `memory/`, `memory-public/` (`harness/harness.go:208`) |
 
 No config role anywhere. All four reduce to *reader + persona + memory +
 skills* — a shape the per-framework config files were hiding.

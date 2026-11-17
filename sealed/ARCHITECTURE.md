@@ -604,7 +604,7 @@ the reason in §5 ("What is iData, and what is a deployment parameter"):
 | openclaw (`openclaw.go:164`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `openclaw.json` |
 | hermes (`hermes.go:143`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `config.yaml` |
 | prime-agent (`prime.go:162`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `models.json` |
-| 0g-harness (`harness.go:200`) | `framework`, `APPEND_SYSTEM.md`, `skills/`, `memory/` | `settings.yaml` |
+| 0g-harness (`harness.go:208`) | `framework`, `APPEND_SYSTEM.md`, `skills/`, `memory/`, `memory-public/` | `settings.yaml` |
 
 All four reduce to the same shape — *binding + persona + memory + skills* —
 which the per-framework config files were obscuring.
