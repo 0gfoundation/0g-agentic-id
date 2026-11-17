@@ -19,6 +19,7 @@ func TestFrameworkRoutesAdvertiseTheHarnessSurface(t *testing.T) {
 		"/v1/events":    "events",
 		"/v1/tasks":     "tasks",
 		"/v1/schedules": "schedules",
+		"/v1/files":     "files",
 	}
 	routes := New().FrameworkRoutes()
 	if len(routes) != len(want) {

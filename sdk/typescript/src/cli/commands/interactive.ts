@@ -2675,9 +2675,9 @@ const L2_HELP_FULL = `session commands
   /schedules              the reminders the agent set for itself
                           (0g-harness)
   /attach [path …|clear]  files and images for your next message (0g-harness):
-                          an image goes with the message (its model must take
-                          images — /settings others={"modelImages":true}; else
-                          it is saved as a file the agent is told about), any
+                          an image goes with the message (when the model takes
+                          images, as its provider's model list says — else it
+                          is saved as a file the agent is told about), any
                           other file is uploaded to the agent's ~/uploads first
                           and the message names its path. Bare lists what is
                           staged. Images: 8 per message, 10 MiB each, 32 MiB
@@ -3439,7 +3439,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           onNotice: (n: ChatNotice): void => {
             if (n.imagesSavedAsFiles?.length) {
               clearActivity();
-              out(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map(cleanCell).join(', ')}; the "modelImages" switch in /settings others says whether it can)\n`);
+              out(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map(cleanCell).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);
             }
           },
           // Responses transport only: remember the server-side task id, so

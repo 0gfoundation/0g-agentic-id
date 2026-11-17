@@ -69,10 +69,9 @@ type harnessKnobs struct {
 	MaxParallelToolCalls int
 	// MCPServers are owner-selected DSH stdio/Streamable HTTP connections.
 	MCPServers string
-	// ModelImages says whether the owner's model takes images: nil leaves
-	// it to pi-ai's catalog (a model on a declared route, the 0G router's
-	// among them, is then text-only). No metadata sealed reads says what a
-	// gateway's model accepts, so the owner declares it.
+	// ModelImages is the owner's override of whether the model takes
+	// images, for a provider whose model list says nothing about it. Nil:
+	// the provider's catalog decides (settingsEnv).
 	ModelImages *bool
 }
 
@@ -128,7 +127,7 @@ func parseKnobs(raw json.RawMessage) harnessKnobs {
 	if v, ok := fields["modelImages"]; ok {
 		var b bool
 		if err := json.Unmarshal(v, &b); err != nil {
-			logger.Logf("harness.RenderSettings: modelImages=%s is not a boolean (%v); leaving it to the model catalog", v, err)
+			logger.Logf("harness.RenderSettings: modelImages=%s is not a boolean (%v); leaving it to the provider's catalog", v, err)
 		} else {
 			k.ModelImages = &b
 		}
@@ -261,8 +260,13 @@ func settingsEnv(s settings.Resolved, k harnessKnobs) []string {
 	if k.MCPServers != "" {
 		env["SEAL_MCP_SERVERS"] = k.MCPServers
 	}
+	// Whether the model takes images: the owner's override, else what the
+	// provider's model list says (`architecture.input_modalities` on the 0G
+	// router). Neither: unset, and the harness leaves it to pi-ai's catalog.
 	if k.ModelImages != nil {
 		env["SEAL_HARNESS_MODEL_IMAGES"] = boolEnv(*k.ModelImages)
+	} else if takes, known := s.Facts.TakesImages(); known {
+		env["SEAL_HARNESS_MODEL_IMAGES"] = boolEnv(takes)
 	}
 
 	env["SEAL_MODEL_PROVIDER"] = s.Provider

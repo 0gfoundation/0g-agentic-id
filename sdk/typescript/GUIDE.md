@@ -940,8 +940,9 @@ A 0g-harness agent also takes **images and files** from its owner. Images ride
 a message: `chat` / `chatStream` take `images: [{ mediaType, data }]` (PNG, JPEG,
 WebP or GIF, base64; at most 8 per message, 10 MiB each, 32 MiB together),
 sent on the last user message in the transport's own shape. Whether the model
-sees them is the owner's `others.modelImages` switch (unset: the model catalog
-decides, and a model on the 0G router is text-only). A model that cannot view
+sees them is what the provider's model list says (the 0G router's
+`architecture.input_modalities`: glm-5.3 takes text only, glm-5.3-flash images
+too); the owner's `others.modelImages` overrides it. A model that cannot view
 images gets each one saved as a file in the agent's `~/uploads` instead; the
 `onNotice` callback receives `{ imagesSavedAsFiles: [paths] }`. Any other file
 goes through `uploadFile(name, bytes)` (present when `/hello` declares kind

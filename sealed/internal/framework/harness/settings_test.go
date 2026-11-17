@@ -211,25 +211,35 @@ func TestRenderSettings_SubagentsAndScheduleKnobs(t *testing.T) {
 	}
 }
 
-// modelImages reaches the harness only when the owner set it: unset leaves
-// the answer to the model catalog, and a value that is not a boolean is
-// dropped, not fatal.
-func TestRenderSettings_ModelImagesKnob(t *testing.T) {
-	catalogServer(t, reasoningModel("glm-5.3"))
+// Whether the model takes images: the provider's catalog
+// (architecture.input_modalities) decides, and `others.modelImages` overrides
+// it; with neither the variable is unset and the harness leaves it to
+// pi-ai's catalog. A value that is not a boolean is dropped, not fatal.
+func TestRenderSettings_ModelImages(t *testing.T) {
+	withInput := func(id string, input ...string) map[string]any {
+		e := reasoningModel(id)
+		e["architecture"] = map[string]any{"input_modalities": input}
+		return e
+	}
 	for _, c := range []struct {
+		name    string
+		entry   map[string]any
 		overlay string
 		want    string
 		set     bool
 	}{
-		{`{}`, "", false},
-		{`{"modelImages":true}`, "1", true},
-		{`{"modelImages":false}`, "0", true},
-		{`{"modelImages":"yes"}`, "", false},
+		{"catalog silent", reasoningModel("m"), `{}`, "", false},
+		{"catalog text-only", withInput("m", "text"), `{}`, "0", true},
+		{"catalog images", withInput("m", "text", "image"), `{}`, "1", true},
+		{"owner override on a silent catalog", reasoningModel("m"), `{"modelImages":true}`, "1", true},
+		{"owner override beats the catalog", withInput("m", "text", "image"), `{"modelImages":false}`, "0", true},
+		{"a non-boolean override is dropped", withInput("m", "text", "image"), `{"modelImages":"yes"}`, "1", true},
 	} {
-		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.overlay)})
+		catalogServer(t, c.entry)
+		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "m", Others: json.RawMessage(c.overlay)})
 		got, ok := env["SEAL_HARNESS_MODEL_IMAGES"]
 		if ok != c.set || got != c.want {
-			t.Errorf("%s → SEAL_HARNESS_MODEL_IMAGES=%q (set %v), want %q (set %v)", c.overlay, got, ok, c.want, c.set)
+			t.Errorf("%s → SEAL_HARNESS_MODEL_IMAGES=%q (set %v), want %q (set %v)", c.name, got, ok, c.want, c.set)
 		}
 	}
 }
