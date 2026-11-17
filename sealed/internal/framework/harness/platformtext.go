@@ -17,10 +17,13 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 		Tracked: []platform.PathNote{
 			{Path: "~/.dsh/skills/<name>/ or <name>.md", Note: "your installed skills — durable capabilities you can invoke by name across sessions. A skill you write and never save here does not survive this container's next restart"},
 			{Path: "~/.dsh/APPEND_SYSTEM.md", Note: "your persona / standing instructions, injected into your system prompt every session"},
+			{Path: "~/.dsh/memory/<name>.md and ~/.dsh/memory/MEMORY.md", Note: "your long-term memory: one Markdown file per memory, directly in that directory, and the MEMORY.md index, which is in your context every turn. It survives restarts, resets and rebuilds, and goes with you to a new owner on a transfer. Subdirectories, dotfiles and empty files are not tracked"},
 		},
 		Untracked: []platform.PathNote{
 			{Note: "any session/conversation log this container's composition may write — that is turn-by-turn history, not your identity, and it is deliberately not chain-tracked here"},
 			{Note: "`~/.dsh/.credentials.yaml` and any credential file — secrets never reach chain"},
+			{Path: "~/inbox/", Note: "files your owner sends you (and images your model cannot view) land here; read them with your own tools. Container-local: a reset loses them, so keep what must last in a tracked place"},
+			{Path: "~/outbox/", Note: "files you hand to your owner go here, directly in the directory (no subdirectories); your owner downloads them. Container-local: a reset loses them, so what must last belongs in memory or a skill"},
 			{Note: "`~/.dsh/AGENTS.md` — this container mounts nothing that reads it, and no role carries it. Writing one is not how you change your standing instructions here; `APPEND_SYSTEM.md` above is"},
 			{Note: "your model and inference route — not a file in this home at all. Your owner sets them, and the platform applies them to this container's composition at every boot"},
 			{Note: "your own source checkout, if this deployment exposes one to you (DSH's self-referential toolset can name where its own code lives) — this platform does not yet track agent edits to framework code, only to your data. Treat any such edit as living only in this container until that changes"},
@@ -28,6 +31,7 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 		DurableHints: []platform.DurableHint{
 			{Ask: "Give yourself a new capability", Place: "a skill under `~/.dsh/skills/<name>/` (a `SKILL.md`) or `~/.dsh/skills/<name>.md`"},
 			{Ask: "Change how you always behave", Place: "`~/.dsh/APPEND_SYSTEM.md`"},
+			{Ask: "Remember this long-term", Place: "a file under `~/.dsh/memory/` and its line in `~/.dsh/memory/MEMORY.md`"},
 		},
 		VersionScheme: "0g-harness versions",
 		Versions:      supportedVersions,

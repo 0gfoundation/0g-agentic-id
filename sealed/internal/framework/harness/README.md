@@ -90,9 +90,12 @@ The harness then does three things:
   inbox: for example when a background job finishes or a reminder comes due.
 
 `FrameworkRoutes()` advertises the surface on `/hello`, one kind per
-capability: `chat`, `responses`, `inbox`, `events`, `tasks`, `schedules`. A
+capability: `chat`, `responses`, `inbox`, `events`, `tasks`, `schedules`, `files`, `memory`, `steer`. A
 client enables a feature only on the kinds an agent declares. The other
-frameworks declare none of the last four, and nothing about them changes.
+frameworks declare none of the last seven, and nothing about them changes.
+`steer` is the owner's word for the turn already running: the harness reads it
+before that turn's next model call, and queues it as an ordinary turn when no
+owner turn is running.
 Each route lists its exact endpoints, those of the harness's protocol v1
 (`routes_test.go`), and sealed's proxy forwards nothing else: an unlisted
 path gets 404, an unlisted method 405.
@@ -100,9 +103,9 @@ path gets 404, an unlisted method 405.
 The harness can ask sealed to restart it (`POST /harness/restart` on the sign
 socket): sealed stops the process and starts it again from the package it is
 set to run (`../../LAYERS.md` §5.3). A boot keeps the persona
-(`APPEND_SYSTEM.md`) and the `skills/` the agent changed after its last
-commit, as long as the chain still holds what this container last committed
-(`../../LAYERS.md` §3).
+(`APPEND_SYSTEM.md`), the `skills/` and the `memory/` the agent changed after
+its last commit, as long as the chain still holds what this container last
+committed (`../../LAYERS.md` §3).
 
 ## Current composition
 
@@ -114,7 +117,9 @@ commit, as long as the chain still holds what this container last committed
 | inference | `dsh-llm-pi-ai` (route rendered from the owner's settings by the adapter), `dsh-credentials-local` |
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | filesystem | `dsh-fs-local` + `dsh-tool-fs` |
+| owner images and files | `dsh-attachment-local` (the owner's images, normalized, below `~/.dsh-attachments` in the agent's home, untracked; it also enables `read_image`). Files the owner uploads (`POST /v1/files`) land in the file inbox `~/inbox` (not the message inbox `/v1/inbox`), untracked; the image ships `pdftotext` for PDFs among them. Files the agent hands over go in `~/outbox`, untracked; the owner lists and downloads them (`GET /v1/files`, `GET /v1/files/{outbox|inbox}/{name}`, at most 50 MiB), and a turn that leaves new or changed files there says so (`harness.outbox_files`) |
 | skills | `dsh-skill-filesystem` (the `skills/` iData role — agent-installed, chain-tracked) |
+| long-term memory | the harness's own system-prompt section (`src/memory.mjs`): the guidance and the `MEMORY.md` index, read at every model step; the memory files are the `memory/` iData role (`memory.go`) — one `<name>.md` per memory directly in `$DSH_HOME/memory/`, chain-tracked; the committed copy carries placeholders for credential values and `[redacted:<kind>]` for secrets of a known format (`../../../CREDENTIALS.md`, What is outside); consolidated now and then while the agent is idle (`src/memory-tidy.mjs`, switch `memoryTidy`), or now on `POST /v1/memory/tidy` (kind `memory`) |
 | context headroom | `dsh-token-meter` + `dsh-compaction-basic` |
 | loop hygiene | `dsh-tool-call-timeout-policy` |
 | background jobs (`toolJobs` on) | `dsh-tool-jobs`: commands run in the background; a job finishing while the agent is idle opens a turn, whose reply goes to the inbox |
@@ -150,6 +155,9 @@ container does not.
 | `subagents` | `false` | the `subagent` tool: read-only helpers the main agent runs in the background (turns the job tools on with it) |
 | `schedule` | `false` | `schedule_create` / `schedule_list` / `schedule_delete`: reminders the agent sets for itself |
 | `maxParallelToolCalls` | `1` | tool calls one model step may run at once. It applies only to the tools that declare themselves safe to run together: `read`, `read_image` and `subagent`. `bash`, `write`, `edit`, the `seal_*` tools and the job and schedule tools always run alone, after the calls before them finish |
+| `modelImages` | unset | overrides whether the owner's model takes images (`true`/`false`). Unset: the provider's model list decides (`architecture.input_modalities` on the 0G router: glm-5.3 text only, glm-5.3-flash with images), and where it says nothing, pi-ai's catalog. With images the owner's images reach the model; without, each is saved in `~/inbox` and the agent is told it cannot view it |
+| `memoryExtract` | `true` | before a compaction of the owner's conversation, the harness makes one model call that writes long-term memory from the span about to be summarized (0g-harness `src/memory-extract.mjs`); `false` turns it off. Rendered as `SEAL_HARNESS_MEMORY_EXTRACT`. |
+| `memoryTidy` | `true` | now and then, while the agent is idle, the harness makes one model call that consolidates long-term memory: merges duplicates, drops what is stale or contradicted (0g-harness `src/memory-tidy.mjs`; due 24 h after the last pass once the memories changed, or sooner when the index nears its cap); `false` turns the automatic pass off, and `POST /v1/memory/tidy` still runs one on request. Rendered as `SEAL_HARNESS_MEMORY_TIDY`. |
 
 A bad value here never fails a boot. `RenderSettings` runs before every spawn,
 so an error would mean an agent that cannot start, not a rejected push. So an
@@ -203,5 +211,4 @@ composition. Larger capability changes take the shape of tiers:
 
 Other deferred items:
 - `~/.dsh/AGENTS.md` as a persona role;
-- a `memory/` DirectoryManifest role;
 - the e2b tool sandbox, as the "tool sandbox" side of the habitat model.

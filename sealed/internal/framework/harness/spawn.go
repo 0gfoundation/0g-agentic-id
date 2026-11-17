@@ -622,5 +622,22 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			get("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/cancel")),
 		route("/v1/schedules", "schedules", "Reminders the agent set for itself: GET /v1/schedules (enabled:false unless the owner's `schedule` knob is on).",
 			get("/v1/schedules"), framework.Endpoint{Method: http.MethodDelete, Path: "/v1/schedules/{id}"}),
+		// Long-term memory upkeep on the owner's request: one consolidation
+		// pass now (the automatic one follows others.memoryTidy).
+		route("/v1/memory", "memory", "Long-term memory upkeep: POST /v1/memory/tidy runs one consolidation pass now (merge duplicates, drop stale memories), only while no turn runs.",
+			post("/v1/memory/tidy")),
+		// Owner files: written by the harness (the agent user) to a new name
+		// in the file inbox ~/inbox, where the agent reads them; and the way
+		// back, the files the agent puts in ~/outbox (or the owner's own, in
+		// ~/inbox), which the owner downloads. The file inbox is not the
+		// message inbox above. Images ride the chat and Responses messages
+		// themselves.
+		route("/v1/files", "files", "Owner files: POST /v1/files {name, content_base64} → {path, bytes} lands a file in the agent's file inbox ~/inbox (not the message inbox /v1/inbox), at most 25 MiB; GET /v1/files?dir=outbox|inbox lists, GET /v1/files/{outbox|inbox}/{name} downloads (at most 50 MiB) what the agent put in ~/outbox or what the owner sent. Both directories are container-local, not tracked.",
+			post("/v1/files"), get("/v1/files"), get("/v1/files/{id}/{id}")),
+		// The owner's word for the turn already running: read before that
+		// turn's next model call (DSH next-step input); queued as an
+		// ordinary turn when no owner turn is running.
+		route("/v1/steer", "steer", "Owner text for the running turn: POST /v1/steer {text} → {merged:true, id, turn} (read before the turn's next model call) or {merged:false, queued} (no owner turn running: an ordinary turn); GET /v1/steer/{id} → {state, turn}.",
+			post("/v1/steer"), get("/v1/steer/{id}")),
 	}
 }

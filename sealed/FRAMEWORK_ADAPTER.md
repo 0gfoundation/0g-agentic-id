@@ -221,7 +221,7 @@ Conventions and rules:
   | openclaw (`openclaw.go:164`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `~/.openclaw/openclaw.json`, re-rendered every spawn |
   | hermes (`hermes.go:143`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `~/.hermes/config.yaml`, re-rendered every spawn |
   | prime-agent (`prime.go:162`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `~/.prime/agent/models.json`, re-rendered every spawn |
-  | 0g-harness (`harness.go:167`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | none — the harness's process environment |
+  | 0g-harness (`harness.go:200`) | `framework`, `APPEND_SYSTEM.md`, `skills/`, `memory/` | none — the harness's process environment |
 
   `openclaw.json`, `config.yaml`, `models.json` and `settings.yaml` were all
   roles until the owner's settings document became the pin's durable home.
@@ -1599,6 +1599,17 @@ retired role's pin).
    (`<name>.md`) — this role tracks both entry shapes. The provider's own
    reserved child (`.system`) is excluded, the same pattern hermes uses for
    `skills/.bundled_manifest`.
+5. **`memory/`** — `DirectoryManifest` over `$DSH_HOME/memory/`, the agent's
+   long-term memory: one `<name>.md` per memory directly in the directory,
+   plus the `MEMORY.md` index, one file entry each — hermes's `memories/`
+   shape. Subdirectories, dotfiles, links and empty files are not tracked
+   (`harness/memory.go`). DSH has no memory of its own; the harness keeps the
+   index in the model's context through its own system-prompt section, read
+   at every model step (0g-harness `src/memory.mjs`). An agent minted before
+   the role existed has no such chain entry: bootstrap round B lands the
+   empty default, which equals the empty directory's evolution, so nothing is
+   committed until the agent writes a memory. Like the persona and skills it
+   is the agent's own writing (`KeepsUncommitted`).
 
 **What a fifth data point taught about scope, before any code was written.**
 DSH is the first framework here whose own designers explicitly *invite*

@@ -141,7 +141,7 @@ func TestUploadsCarryCommitments(t *testing.T) {
 			t.Fatalf("leaf commitments %+v, want %+v", d.Commitments, want)
 		}
 
-		dir, err := u.pushManifest(context.Background(), "skills/", plain, key, nil)
+		dir, err := u.pushManifest(context.Background(), "skills/", plain, key, nil, "")
 		if err != nil {
 			t.Fatal(err)
 		}

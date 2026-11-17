@@ -140,6 +140,73 @@ export interface ChatMessage {
 }
 
 /**
+ * An image sent with a message (`images` on {@link AgentClient.chat} /
+ * {@link AgentClient.chatStream}): PNG, JPEG, WebP or GIF, its bytes in
+ * base64. 0g-harness takes at most 8 per message, 10 MiB each and 32 MiB
+ * together; other frameworks may ignore or refuse them.
+ */
+export interface ChatImage {
+  mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
+  data: string;
+}
+
+/**
+ * What the agent's runtime says about a message it took (`onNotice`,
+ * 0g-harness): the owner's model cannot view images, so the images were saved
+ * as files in the agent's file inbox `~/inbox` instead; or the turn left files new or
+ * changed in the agent's `~/outbox`, for the owner to download
+ * ({@link AgentClient.downloadFile}).
+ */
+export interface ChatNotice {
+  imagesSavedAsFiles?: string[];
+  /** Names of files in the outbox (`downloadFile('outbox', name)`). */
+  outboxFiles?: string[];
+}
+
+/** A file the owner can download ({@link AgentClient.listFiles}). */
+export interface AgentFile {
+  name: string;
+  bytes: number;
+  /** ISO 8601. */
+  mtime: string;
+  /** Hex; given for files up to 4 MiB. */
+  sha256?: string;
+}
+
+/** Where a download comes from: what the agent handed over, or what the owner uploaded. */
+export type AgentFileDir = 'outbox' | 'inbox';
+
+/** A file the owner sent ({@link AgentClient.uploadFile}): where it landed. */
+export interface UploadedFile {
+  /** Absolute path in the agent's container (in its file inbox, `~/inbox`). */
+  path: string;
+  bytes: number;
+}
+
+/** What {@link AgentClient.steer} did with the owner's text. */
+export interface SteerResult {
+  /** true: read in the running owner turn `turn`, before its next model
+   *  call. false: no owner turn was running, so it is an ordinary turn,
+   *  `queued` (follow it like any response); `reason` says why. */
+  merged: boolean;
+  /** The steered message's id, for {@link AgentClient.steerState} (merged only). */
+  id?: string;
+  turn?: string;
+  queued?: string;
+  reason?: string;
+}
+
+/** What became of a steered text ({@link AgentClient.steerState}). */
+export interface SteerState {
+  id: string;
+  /** pending: not read yet. merged: read in `turn`. turn: the turn it was
+   *  meant for ended first, so it opened `turn`, an owner turn of its own.
+   *  dropped: an interrupt came first. */
+  state: 'pending' | 'merged' | 'turn' | 'dropped';
+  turn: string;
+}
+
+/**
  * Snapshot of one long-running task (a "response" in OpenAI Responses API
  * terms) on the agent. Returned by {@link AgentClient.task} /
  * {@link AgentClient.cancelTask}.
@@ -150,6 +217,8 @@ export interface AgentTask {
   /** Assistant text produced so far (full text once completed). */
   output_text: string;
   error?: { message: string };
+  /** Runtime notices about the message that opened it (0g-harness). */
+  harness?: { images_saved_as_files?: string[]; outbox_files?: string[] };
 }
 
 export interface ChatCompletion {
@@ -320,7 +389,14 @@ export interface AgentClient {
    * the agent; the completion is reassembled before returning, so the shape is
    * a plain {@link ChatCompletion}.
    */
-  chat?(messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }): Promise<ChatCompletion>;
+  chat?(messages: ChatMessage[], opts?: {
+    model?: string;
+    signal?: AbortSignal;
+    /** Images sent with the last user message (see {@link ChatImage}). */
+    images?: ChatImage[];
+    /** The runtime's notices about this message (see {@link ChatNotice}). */
+    onNotice?: (notice: ChatNotice) => void;
+  }): Promise<ChatCompletion>;
   /**
    * Like {@link chat}, but yields each content delta as it is generated — for
    * a live-typing UI. Present under the same conditions as `chat`.
@@ -336,6 +412,10 @@ export interface AgentClient {
   chatStream?(messages: ChatMessage[], opts?: {
     model?: string;
     signal?: AbortSignal;
+    /** Images sent with the last user message (see {@link ChatImage}). */
+    images?: ChatImage[];
+    /** The runtime's notices about this message (see {@link ChatNotice}). */
+    onNotice?: (notice: ChatNotice) => void;
     /** Tool-activity progress, when the agent's bridge streams it (SSE
      *  ": activity tool/call <name>" comments — 0g-harness does). Labels like
      *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
@@ -448,6 +528,36 @@ export interface AgentClient {
    * a `kind: "schedules"` route and this handle holds the owner token.
    */
   schedules?(): Promise<{ enabled: boolean; data: AgentSchedule[] }>;
+  /**
+   * Send the agent a file: it lands in the agent's file inbox `~/inbox` (a new
+   * name, never over an existing file; container-local, lost on a reset),
+   * and the agent reads it with its own tools — tell it the returned path.
+   * At most 25 MiB. Present only when the agent declares a `kind: "files"`
+   * route (0g-harness) and this handle holds the owner token.
+   */
+  uploadFile?(name: string, data: Uint8Array): Promise<UploadedFile>;
+  /**
+   * The owner's word for the turn already running: the agent reads it before
+   * that turn's next model call — when the current model answer or tool call
+   * finishes, not in the middle of a long command. With no owner turn
+   * running it is queued as an ordinary turn (`merged: false`). Present only
+   * when the agent declares a `kind: "steer"` route (0g-harness) and this
+   * handle holds the owner token.
+   */
+  steer?(text: string): Promise<SteerResult>;
+  /** What became of a text {@link steer} merged. Present with {@link steer}. */
+  steerState?(id: string): Promise<SteerState>;
+  /**
+   * The files the owner can download, newest first: what the agent put in its
+   * `~/outbox` (the default) or what the owner sent (`'inbox'`, the file inbox
+   * `~/inbox` — not the message inbox, {@link AgentClient.inbox}). Both are
+   * container-local and lost on a reset. Present only when the agent declares
+   * a `kind: "files"` route (0g-harness) and this handle holds the owner token;
+   * an agent whose runtime predates downloads answers with an error saying so.
+   */
+  listFiles?(dir?: AgentFileDir): Promise<AgentFile[]>;
+  /** One file's bytes (at most 50 MiB). See {@link AgentClient.listFiles}. */
+  downloadFile?(dir: AgentFileDir, name: string): Promise<Uint8Array>;
 }
 
 /** Longest-prefix match over declared routes, or undefined if none match. */
@@ -541,17 +651,71 @@ function chunkDelta(chunk: Record<string, unknown>): { role?: string; content: s
 }
 
 /** Fold an SSE chat stream into a single reassembled {@link ChatCompletion}. */
-async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<ChatCompletion> {
+async function collectChatStream(body: ReadableStream<Uint8Array>, onComment?: (c: string) => void): Promise<ChatCompletion> {
   let content = '';
   let role = 'assistant';
   let last: Record<string, unknown> = {};
-  for await (const chunk of iterSseChunks(body)) {
+  for await (const chunk of iterSseChunks(body, onComment)) {
     last = chunk;
     const d = chunkDelta(chunk);
     if (d.role) role = d.role;
     content += d.content;
   }
   return { ...last, choices: [{ message: { role, content } }] } as ChatCompletion;
+}
+
+// Base64 without Node's Buffer, so the module runs in browsers too.
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+const imageUrl = (im: ChatImage): string => `data:${im.mediaType};base64,${im.data}`;
+
+/**
+ * The messages with `images` on the last user message, in the request's own
+ * shape: chat/completions `image_url` parts, or Responses `input_text` /
+ * `input_image` parts. No images: the messages as they are.
+ */
+export function withImages(messages: ChatMessage[], images: ChatImage[] | undefined, shape: 'chat' | 'responses'): unknown[] {
+  if (!images?.length) return messages;
+  let i = messages.length - 1;
+  while (i >= 0 && messages[i].role !== 'user') i--;
+  const text = i >= 0 ? messages[i].content : '';
+  const content = shape === 'chat'
+    ? [{ type: 'text', text }, ...images.map((im) => ({ type: 'image_url', image_url: { url: imageUrl(im) } }))]
+    : [{ type: 'input_text', text }, ...images.map((im) => ({ type: 'input_image', image_url: imageUrl(im) }))];
+  const out: unknown[] = messages.slice();
+  if (i >= 0) out[i] = { role: 'user', content };
+  else out.push({ role: 'user', content });
+  return out;
+}
+
+/** The notice an SSE comment carries (`: notice images_saved_as_files [...]`, `: notice outbox_files [...]`), if any. */
+function noticeOf(comment: string): ChatNotice | undefined {
+  const m = /^notice (images_saved_as_files|outbox_files) (\[.*\])$/.exec(comment);
+  if (!m) return undefined;
+  try {
+    const items = JSON.parse(m[2]) as unknown;
+    if (!Array.isArray(items) || !items.every((p) => typeof p === 'string')) return undefined;
+    const clean = items.map((p) => plainText(p));
+    return m[1] === 'outbox_files' ? { outboxFiles: clean } : { imagesSavedAsFiles: clean };
+  } catch { /* not a notice */ }
+  return undefined;
+}
+
+/** The notice a buffered reply or a Responses record carries in `harness`, if any. */
+function harnessNotice(harness: AgentTask['harness'] | undefined): ChatNotice | undefined {
+  if (!harness) return undefined;
+  const n: ChatNotice = {};
+  const strings = (v: unknown): string[] | undefined =>
+    Array.isArray(v) && v.length && v.every((p) => typeof p === 'string') ? v.map((p) => plainText(p)) : undefined;
+  const images = strings(harness.images_saved_as_files);
+  const outbox = strings(harness.outbox_files);
+  if (images) n.imagesSavedAsFiles = images;
+  if (outbox) n.outboxFiles = outbox;
+  return images || outbox ? n : undefined;
 }
 
 /**
@@ -678,8 +842,10 @@ export function makeAgentClient(params: {
   // deploy. There's no framework-agnostic default (/hello doesn't declare it),
   // so omit the field when the caller doesn't set one rather than sending a
   // bogus value the framework rejects.
-  const chatBody = (messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }) =>
-    JSON.stringify(opts?.model ? { model: opts.model, messages, stream: true } : { messages, stream: true });
+  const chatBody = (messages: ChatMessage[], opts?: { model?: string; images?: ChatImage[] }) => {
+    const sent = withImages(messages, opts?.images, 'chat');
+    return JSON.stringify(opts?.model ? { model: opts.model, messages: sent, stream: true } : { messages: sent, stream: true });
+  };
 
   const chat = routes.find((r) => r.kind === 'chat');
   if (chat && canAuth) {
@@ -719,9 +885,12 @@ export function makeAgentClient(params: {
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const ct = r.headers.get('content-type') ?? '';
       if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
-        return (await r.json()) as ChatCompletion; // server didn't stream → plain JSON
+        const full = (await r.json()) as ChatCompletion & { harness?: AgentTask['harness'] };
+        const n = harnessNotice(full.harness);
+        if (n) opts?.onNotice?.(n);
+        return full; // server didn't stream → plain JSON
       }
-      return collectChatStream(r.body);
+      return collectChatStream(r.body, opts?.onNotice ? (c) => { const n = noticeOf(c); if (n) opts.onNotice!(n); } : undefined);
     };
 
     client.chatStream = async function* (messages, opts) {
@@ -750,8 +919,12 @@ export function makeAgentClient(params: {
       // (feedback.md F15)
       let sawContent = false;
       let streamErr: string | null = null;
-      const onComment = opts?.onActivity
-        ? (c: string): void => { if (c.startsWith('activity ')) opts.onActivity!(plainText(c.slice(9))); }
+      const onComment = opts?.onActivity || opts?.onNotice
+        ? (c: string): void => {
+          if (c.startsWith('activity ')) opts.onActivity?.(plainText(c.slice(9)));
+          const n = noticeOf(c);
+          if (n) opts.onNotice?.(n);
+        }
         : undefined;
       let lastThinkingAt = 0;
       const thinking = (): void => {
@@ -874,6 +1047,7 @@ export function makeAgentClient(params: {
       startingAfter?: number;
       signal?: AbortSignal;
       onActivity?: (label: string) => void;
+      onNotice?: (notice: ChatNotice) => void;
     }): AsyncGenerator<string> {
       const id = args.id;
       let seq = args.startingAfter ?? 0;
@@ -995,6 +1169,11 @@ export function makeAgentClient(params: {
         }
       }
 
+      // Notices known only when the turn ends (files it left in the outbox).
+      {
+        const n = harnessNotice(terminal.harness);
+        if (n?.outboxFiles) args.onNotice?.({ outboxFiles: n.outboxFiles });
+      }
       if (terminal.status === 'failed') {
         throw new Error(`chat: ${plainText(terminal.error?.message ?? 'task failed')}`);
       }
@@ -1015,7 +1194,7 @@ export function makeAgentClient(params: {
       // returns the id in milliseconds, so every long-lived byte after that
       // travels on a GET we can always resume by id. One extra round trip
       // buys the guarantee that a task is never lost to a dropped connection.
-      const payload: Record<string, unknown> = { input: messages };
+      const payload: Record<string, unknown> = { input: withImages(messages, opts?.images, 'responses') };
       if (opts?.model) payload.model = opts.model;
       if (opts?.thinking) payload.reasoning = { effort: opts.thinking };
       const r = await doFetch(rPrefix, {
@@ -1027,6 +1206,8 @@ export function makeAgentClient(params: {
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const submitted = (await r.json()) as AgentTask;
       if (!submitted?.id) throw new Error('chat: the agent accepted the task but returned no id');
+      const saved = harnessNotice(submitted.harness)?.imagesSavedAsFiles;
+      if (saved) opts?.onNotice?.({ imagesSavedAsFiles: saved });
       // A task id is a name to re-attach with: one that is not a plain
       // identifier is not handed out to be printed.
       if (TASK_ID.test(submitted.id)) opts?.onTask?.(submitted.id);
@@ -1035,6 +1216,7 @@ export function makeAgentClient(params: {
         startingAfter: 0,
         signal: opts?.signal,
         onActivity: wrapActivity(opts?.onActivity),
+        onNotice: opts?.onNotice,
       });
     };
 
@@ -1115,6 +1297,36 @@ export function makeAgentClient(params: {
       const j = await getJSON<{ enabled?: boolean; data?: AgentSchedule[] }>('schedules', schedulesBase);
       return { enabled: j.enabled !== false, data: j.data ?? [] };
     };
+  }
+
+  const filesBase = ownerBase('files');
+  if (filesBase) {
+    client.uploadFile = (name, data) => postJSON<UploadedFile>('uploadFile', filesBase, { name, content_base64: bytesToBase64(data) });
+    // Downloads share the files route; an agent whose runtime predates them
+    // does not list the GET endpoints, and the proxy answers 404.
+    const noDownloads = (what: string, status: number, text: string): Error =>
+      status === 404 && /no route|not found|404/i.test(text) && !/no file /.test(text)
+        ? new Error(`${what}: this agent's runtime does not serve downloads (update the agent)`)
+        : new Error(`${what}: HTTP ${status}: ${plainText(text)}`);
+    client.listFiles = async (dir = 'outbox') => {
+      const r = await doFetch(`${filesBase}${query({ dir })}`);
+      if (!r.ok) throw noDownloads('listFiles', r.status, await r.text());
+      const j = (await r.json()) as { data?: AgentFile[] };
+      return (j.data ?? []).map((f) => ({ ...f, name: plainText(String(f.name)) }));
+    };
+    client.downloadFile = async (dir, name) => {
+      if (dir !== 'outbox' && dir !== 'inbox') throw new Error('downloadFile: dir is outbox or inbox');
+      if (!name || name.includes('/') || name.includes('\\') || name.startsWith('.')) throw new Error('downloadFile: a file name is one path segment, without a leading dot');
+      const r = await doFetch(`${filesBase}/${dir}/${encodeURIComponent(name)}`);
+      if (!r.ok) throw noDownloads('downloadFile', r.status, await r.text());
+      return new Uint8Array(await r.arrayBuffer());
+    };
+  }
+
+  const steerBase = ownerBase('steer');
+  if (steerBase) {
+    client.steer = (text) => postJSON<SteerResult>('steer', steerBase, { text });
+    client.steerState = (id) => getJSON<SteerState>('steerState', `${steerBase}/${encodeURIComponent(id)}`);
   }
 
   const eventsBase = ownerBase('events');

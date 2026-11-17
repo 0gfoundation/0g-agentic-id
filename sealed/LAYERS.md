@@ -108,7 +108,8 @@ only base, sealed and the official harness get fields of their own.
 - **In the ServeProof**: through `dataHashes` (ciphertext roots), as before. A
   verifier finds the entry on chain by it, then reads the entry's salted
   plaintext commitment (§7.1).
-- **Update**: changes most often. The watcher commits changes every 30 s; when
+- **Update**: changes most often. The watcher commits changes every 30 s (a
+  failing commit retries with backoff, up to every 30 min); when
   a change applies is up to the harness, e.g. the persona is read when the
   harness starts.
 
@@ -164,6 +165,7 @@ release, and hands it to the loader only if it hashes to that name.
 Contents:
 - Debian and a pinned node; python3; a browser for the owner's agent
   (Chromium and the Playwright MCP server, started by `sealed-browser-mcp`);
+  `pdftotext` (poppler-utils) for the PDFs the owner uploads;
 - the loader;
 - one official harness package with all its dependencies, a fallback for when
   no other version can be fetched.
@@ -211,7 +213,7 @@ attestor's stop/start remains.
 
 The last three keep the disk: turns and background tasks in progress stop,
 while the conversation, inbox and reminders live on disk and survive. So do
-the persona and skills the agent changed after its last commit: sealed keeps,
+the persona, skills and memory the agent changed after its last commit: sealed keeps,
 on disk and root-only, the version this container last had in sync with the
 chain, and when on the next boot the chain has not moved but the disk has, it
 keeps the disk and lets the watcher commit it, instead of restoring the chain
@@ -506,7 +508,7 @@ encode it into normal-looking traffic. The channels:
   and credentials sealed fills in can write data to allowed hosts.
 - Data inside signed transactions. Transactions are public, and the signing
   policy can limit which kinds are signed but not data encoded in parameters.
-- Model requests themselves carry the persona and skills. With the owner's own
+- Model requests themselves carry the persona, the skills and the memory index. With the owner's own
   provider account, what the provider sees is outside the platform's control.
 
 What the owner can never get is the agent identity key and the data key: the

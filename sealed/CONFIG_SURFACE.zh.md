@@ -616,7 +616,7 @@ attestor 已存的文档。
 | openclaw | `framework`、`openclaw.json`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/`(`openclaw/openclaw.go:164`) |
 | hermes | `framework`、`config.yaml`、`SOUL.md`、`memories/`、`skills/` | `framework`、`SOUL.md`、`memories/`、`skills/`(`hermes/hermes.go:143`) |
 | prime-agent | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`models.json`、`skills/` | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/`(`prime/prime.go:162`) |
-| 0g-harness | `framework`、`APPEND_SYSTEM.md`、`settings.yaml`、`skills/` | `framework`、`APPEND_SYSTEM.md`、`skills/`(`harness/harness.go:167`) |
+| 0g-harness | `framework`、`APPEND_SYSTEM.md`、`settings.yaml`、`skills/` | `framework`、`APPEND_SYSTEM.md`、`skills/`、`memory/`(`harness/harness.go:200`) |
 
 **没有任何配置角色。**四家统一收敛成「读法 + 人格 + 记忆 + 技能」—— 这个共性以前被各家
 形状各异的配置文件盖住了。

@@ -39,6 +39,13 @@ func TestConformance(t *testing.T) {
 					"reading-notes.md": []byte("---\nname: reading-notes\n---\n\nSummarize a document into three bullets.\n"),
 				},
 			},
+			{
+				Role: "memory/",
+				Files: map[string][]byte{
+					"MEMORY.md":      []byte("- [Owner prefers short answers](owner-style.md) — answer length\n"),
+					"owner-style.md": []byte("---\nname: owner-style\ndescription: how the owner wants answers\ntype: feedback\nsource: owner\n---\n\nShort answers, conclusion first.\n"),
+				},
+			},
 		},
 	})
 }

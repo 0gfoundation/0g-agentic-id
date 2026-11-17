@@ -139,7 +139,7 @@ func (r *Registry) Resolve(ctx context.Context, provider, model string) (ModelFa
 	selected:
 		// An OpenAI /models response may contain IDs only. Absence of capability
 		// metadata means unknown, not an instruction to clear a reasoning bound.
-		facts = ModelFacts{ContextWindow: entry.ContextLength, MaxTokens: entry.MaxCompletionTokens, CatalogSourced: entry.SupportedParameters != nil}
+		facts = ModelFacts{ContextWindow: entry.ContextLength, MaxTokens: entry.MaxCompletionTokens, CatalogSourced: entry.SupportedParameters != nil, InputModalities: entry.inputModalities()}
 		for _, parameter := range entry.SupportedParameters {
 			if parameter == "reasoning_effort" {
 				facts.SupportsReasoningEffort = true

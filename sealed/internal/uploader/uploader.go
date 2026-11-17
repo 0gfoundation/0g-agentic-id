@@ -22,9 +22,9 @@
 //  7. agent.RecordChainUpload for every role whose state changed.
 //
 // Failures: any error (encrypt, 0g-storage upload, chain.Update) returns
-// without mutating state. The next watcher tick re-detects divergence
-// (chainSnapshot stays stale, current still differs) and Apply re-runs
-// naturally — no special retry path needed.
+// without mutating the agent's state. The next watcher tick re-detects
+// divergence (chainSnapshot stays stale, current still differs) and Apply
+// re-runs, reusing what the failed attempt already uploaded (pending.go).
 package uploader
 
 import (
@@ -125,6 +125,10 @@ type Uploader struct {
 	// plaintextCommitments puts a salted plaintext commitment into every
 	// entry this uploader writes (commitments.go).
 	plaintextCommitments bool
+
+	// pending keeps what an attempt that did not reach the chain already
+	// uploaded, for the next attempt to reuse (pending.go).
+	pending pendingUploads
 }
 
 // SetCommitGate installs commitGate. Call it before the first Apply.

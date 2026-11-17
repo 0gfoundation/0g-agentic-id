@@ -9,7 +9,7 @@
 # a browser for the owner's agent (Chromium, the Playwright MCP server and
 # sealed-browser-mcp, which the owner turns on in the agent's settings),
 # ca-certificates (chain RPC + 0G storage + router TLS), git and procps (the
-# adapter's orphan sweep), one 0g-harness
+# adapter's orphan sweep), poppler-utils (pdftotext, for uploaded PDFs), one 0g-harness
 # official version package (its locked DSH dependency tree included), the
 # sealed bootstrap binary, the loader that runs it (cmd/loader),
 # sealed-service-launcher (cmd/service-launcher: confines each hosted service
@@ -119,7 +119,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -tags harnessonly -ldflags="-s -w" -o boot
 # fails the build.
 FROM debian:13-slim AS harness-package
 ARG NODE_VERSION=24.22.3
-ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/31736d5b2e9efb226795641f0ca48d6f5a048872
+ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/b58213cafd541711f613baf27a6cfcfc0015e814
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
@@ -145,8 +145,11 @@ RUN npm install -g --no-fund --no-audit "${HARNESS_REF}" \
 # Stage 4 — runtime.
 FROM debian:13-slim
 
+# poppler-utils: pdftotext and pdfinfo, so the agent reads the PDFs its
+# owner uploads (POST /v1/files lands them in the file inbox ~/inbox).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils python3 \
+ && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils python3 poppler-utils \
+ && command -v pdftotext \
  && rm -rf /var/lib/apt/lists/*
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):

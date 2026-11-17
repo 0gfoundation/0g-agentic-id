@@ -37,9 +37,9 @@ harness 做三件事:
 - 把这段对话和它的轮次记录存在一起(`../../CONVERSATION.zh.md`);
 - 把每一轮的输出交给开启这一轮的一方。owner 开启的轮次,交给 owner 的那个请求;agent 自己开启的轮次(后台任务结束、提醒到点),进收件箱。
 
-`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后四种,对它们没有任何改变。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。
+`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`、`files`、`memory`、`steer`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后七种,对它们没有任何改变。`steer` 是 owner 给正在运行的那一轮的话:harness 在这一轮下一次调用模型之前读到它;没有 owner 的轮次在运行时,它作为普通轮次排队。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。
 
-harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)和 `skills/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
+harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)、`skills/` 和 `memory/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
 
 ## 当前组合
 
@@ -51,7 +51,9 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | 推理 | `dsh-llm-pi-ai`(路由由适配器按 owner 的 settings 渲染好传进去)、`dsh-credentials-local` |
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | 文件读写 | `dsh-fs-local` + `dsh-tool-fs` |
+| owner 发的图片和文件 | `dsh-attachment-local`（owner 发的图片规整后存在 agent 家目录的 `~/.dsh-attachments` 下，不进链；同时让 `read_image` 可用）。owner 上传的文件（`POST /v1/files`）放在文件收件箱 `~/inbox`（不是消息收件箱 `/v1/inbox`），不进链；镜像带 `pdftotext`，用来读其中的 PDF。agent 交给 owner 的文件放在 `~/outbox`，不进链；owner 列出并下载（`GET /v1/files`、`GET /v1/files/{outbox|inbox}/{name}`，最多 50 MiB），某一轮在那里新增或改动了文件时会告诉 owner（`harness.outbox_files`） |
 | 技能 | `dsh-skill-filesystem`(对应 `skills/` 这个 iData role:agent 自己装的,会上链) |
+| 长期记忆 | harness 自己的系统提示段(`src/memory.mjs`):说明和 `MEMORY.md` 索引,每个模型步骤都重新读取;记忆文件是 `memory/` 这个 iData role(`memory.go`):每条记忆一个 `<name>.md`,直接放在 `$DSH_HOME/memory/` 里,会上链;上链的副本里凭据值换成占位符,格式可识别的秘密换成 `[redacted:<类型>]`(`../../../CREDENTIALS.zh.md`「范围之外」);agent 空闲时不定期整理一次(`src/memory-tidy.mjs`,开关 `memoryTidy`),也可以用 `POST /v1/memory/tidy`(kind `memory`)立刻整理 |
 | 上下文余量 | `dsh-token-meter` + `dsh-compaction-basic` |
 | 循环兜底 | `dsh-tool-call-timeout-policy` |
 | 后台任务(打开 `toolJobs` 时) | `dsh-tool-jobs`:命令可以放到后台跑;agent 空闲时任务结束,会开启新的一轮,这一轮的回复进收件箱 |
@@ -79,6 +81,9 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | `subagents` | `false` | 打开 `subagent` 工具:主 agent 派出去在后台跑的只读助手(会同时打开任务工具) |
 | `schedule` | `false` | 打开 `schedule_create` / `schedule_list` / `schedule_delete`:agent 给自己设的提醒 |
 | `maxParallelToolCalls` | `1` | 模型一步里最多同时运行几个工具调用。只对声明了可以并发的工具生效：`read`、`read_image`、`subagent`。`bash`、`write`、`edit`、`seal_*` 工具以及任务和提醒工具总是单独运行，等前面的调用结束才开始 |
+| `modelImages` | 不设置 | 覆盖 owner 的模型能不能看图（`true`/`false`）。不设置时由服务商的模型列表决定（0G router 上是 `architecture.input_modalities`：glm-5.3 只收文字，glm-5.3-flash 能看图）；列表里没写时按 pi-ai 的模型目录。能看图时 owner 发的图片交给模型；不能时每张图存到 `~/inbox`，并告诉 agent 它看不到 |
+| `memoryExtract` | `true` | owner 对话压缩之前，harness 调用一次模型，把即将被摘要的那段对话里值得长期保留的内容写进长期记忆（0g-harness `src/memory-extract.mjs`）；设为 `false` 关闭。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT`。 |
+| `memoryTidy` | `true` | agent 空闲时，harness 不定期调用一次模型整理长期记忆：合并重复的，删掉过时或被推翻的（0g-harness `src/memory-tidy.mjs`；距上次整理 24 小时且记忆有变化时到期，索引接近上限时提前）；设为 `false` 关闭自动整理，`POST /v1/memory/tidy` 仍可按需整理一次。渲染为 `SEAL_HARNESS_MEMORY_TIDY`。 |
 
 这里填错,不会让 agent 起不来。`RenderSettings` 每次 spawn 前都会运行,要是在这里报错,agent 就开不了机,而不是"这次推送被拒"。所以解析不了或超出范围的值,一律退回出厂默认值,在日志里说明,其他开关照常生效(`settings.go`)。
 
@@ -103,5 +108,4 @@ privsep 让框架子进程以低权限的 `agent` 用户运行。把它和 seale
 
 其他还没做的:
 - 把 `~/.dsh/AGENTS.md` 做成 persona role;
-- 加一个 `memory/` DirectoryManifest role;
 - 补上 e2b 工具沙盒,它是 habitat 模型里"工具沙盒"那一侧。

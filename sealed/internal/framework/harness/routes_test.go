@@ -19,6 +19,9 @@ func TestFrameworkRoutesAdvertiseTheHarnessSurface(t *testing.T) {
 		"/v1/events":    "events",
 		"/v1/tasks":     "tasks",
 		"/v1/schedules": "schedules",
+		"/v1/files":     "files",
+		"/v1/memory":    "memory",
+		"/v1/steer":     "steer",
 	}
 	routes := New().FrameworkRoutes()
 	if len(routes) != len(want) {
@@ -65,6 +68,13 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/tasks", "POST", "/v1/tasks/all/cancel"},
 		{"/v1/schedules", "GET", "/v1/schedules"},
 		{"/v1/schedules", "DELETE", "/v1/schedules/s1"},
+		{"/v1/files", "POST", "/v1/files"},
+		{"/v1/memory", "POST", "/v1/memory/tidy"},
+		{"/v1/steer", "POST", "/v1/steer"},
+		{"/v1/steer", "GET", "/v1/steer/4d2c0e3a-0b7e-4c1f-9a51-3f0b2a7c9e10"},
+		{"/v1/files", "GET", "/v1/files"},
+		{"/v1/files", "GET", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "GET", "/v1/files/inbox/notes.txt"},
 		{"/v1/", "OPTIONS", "/v1/chat/completions"},
 	}
 	for _, f := range forwarded {
@@ -80,6 +90,11 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/tasks", "POST", "/v1/tasks/a/b/cancel"},
 		{"/v1/tasks", "GET", "/v1/tasks/"},
 		{"/v1/inbox", "GET", "/v1/inbox/all"},
+		{"/v1/files", "POST", "/v1/files/x"},
+		{"/v1/files", "GET", "/v1/files/outbox"},
+		{"/v1/files", "GET", "/v1/files/outbox/a/b"},
+		{"/v1/files", "DELETE", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "POST", "/v1/files/outbox/report.pdf"},
 	}
 	for _, f := range refused {
 		if ok, _ := routes[f.prefix].Allows(f.method, f.path); ok {

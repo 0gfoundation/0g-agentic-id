@@ -318,6 +318,21 @@ var (
 	latestSelector        = crypto.Keccak256([]byte("latest(bytes32)"))[:4]
 )
 
+// BalanceAndGasPrice returns addr's balance and the gas price the chain
+// suggests now (what Update would pay), for telling a commit the seal wallet
+// cannot pay from another failure.
+func (c *Client) BalanceAndGasPrice(ctx context.Context, addr common.Address) (*big.Int, *big.Int, error) {
+	balance, err := c.eth.BalanceAt(ctx, addr, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("balance of %s: %w", addr.Hex(), err)
+	}
+	price, err := c.eth.SuggestGasPrice(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("suggest gas price: %w", err)
+	}
+	return balance, price, nil
+}
+
 // TrustRegistry reads AgenticID.trustRegistry(): the contract that holds the
 // deployer's trust decisions, the code lists among them. An AgenticID before
 // 1.4.0 has no such function; that, and the zero address, are errors.

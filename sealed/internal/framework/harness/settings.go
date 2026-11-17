@@ -69,12 +69,25 @@ type harnessKnobs struct {
 	MaxParallelToolCalls int
 	// MCPServers are owner-selected DSH stdio/Streamable HTTP connections.
 	MCPServers string
+	// ModelImages is the owner's override of whether the model takes
+	// images, for a provider whose model list says nothing about it. Nil:
+	// the provider's catalog decides (settingsEnv).
+	ModelImages *bool
+	// MemoryExtract has the harness write long-term memory from the span
+	// a compaction is about to summarize: one model call per compaction
+	// (0g-harness src/memory-extract.mjs). On unless the owner turns it off.
+	MemoryExtract bool
+	// MemoryTidy has the harness consolidate long-term memory now and then
+	// while the agent is idle: one model call per pass, merging duplicates
+	// and dropping what is stale (0g-harness src/memory-tidy.mjs). On unless
+	// the owner turns it off.
+	MemoryTidy bool
 }
 
 // defaultKnobs is the shipped composition, i.e. what an empty overlay must
 // yield.
 func defaultKnobs() harnessKnobs {
-	return harnessKnobs{ToolJobs: false, Subagents: false, Schedule: false, MaxParallelToolCalls: 1}
+	return harnessKnobs{ToolJobs: false, Subagents: false, Schedule: false, MaxParallelToolCalls: 1, MemoryExtract: true, MemoryTidy: true}
 }
 
 // parseBoolKnob reads one boolean knob. A value that is not a boolean costs
@@ -120,6 +133,16 @@ func parseKnobs(raw json.RawMessage) harnessKnobs {
 	parseBoolKnob(fields, "toolJobs", &k.ToolJobs, d.ToolJobs)
 	parseBoolKnob(fields, "subagents", &k.Subagents, d.Subagents)
 	parseBoolKnob(fields, "schedule", &k.Schedule, d.Schedule)
+	parseBoolKnob(fields, "memoryExtract", &k.MemoryExtract, d.MemoryExtract)
+	parseBoolKnob(fields, "memoryTidy", &k.MemoryTidy, d.MemoryTidy)
+	if v, ok := fields["modelImages"]; ok {
+		var b bool
+		if err := json.Unmarshal(v, &b); err != nil {
+			logger.Logf("harness.RenderSettings: modelImages=%s is not a boolean (%v); leaving it to the provider's catalog", v, err)
+		} else {
+			k.ModelImages = &b
+		}
+	}
 	if raw, ok := fields["mcpServers"]; ok {
 		var servers []map[string]any
 		if err := json.Unmarshal(raw, &servers); err == nil && len(servers) <= 16 {
@@ -244,9 +267,19 @@ func settingsEnv(s settings.Resolved, k harnessKnobs) []string {
 	env["SEAL_HARNESS_TOOL_JOBS"] = boolEnv(k.ToolJobs)
 	env["SEAL_HARNESS_SUBAGENTS"] = boolEnv(k.Subagents)
 	env["SEAL_HARNESS_SCHEDULE"] = boolEnv(k.Schedule)
+	env["SEAL_HARNESS_MEMORY_EXTRACT"] = boolEnv(k.MemoryExtract)
+	env["SEAL_HARNESS_MEMORY_TIDY"] = boolEnv(k.MemoryTidy)
 	env["SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS"] = strconv.Itoa(k.MaxParallelToolCalls)
 	if k.MCPServers != "" {
 		env["SEAL_MCP_SERVERS"] = k.MCPServers
+	}
+	// Whether the model takes images: the owner's override, else what the
+	// provider's model list says (`architecture.input_modalities` on the 0G
+	// router). Neither: unset, and the harness leaves it to pi-ai's catalog.
+	if k.ModelImages != nil {
+		env["SEAL_HARNESS_MODEL_IMAGES"] = boolEnv(*k.ModelImages)
+	} else if takes, known := s.Facts.TakesImages(); known {
+		env["SEAL_HARNESS_MODEL_IMAGES"] = boolEnv(takes)
 	}
 
 	env["SEAL_MODEL_PROVIDER"] = s.Provider

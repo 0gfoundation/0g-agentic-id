@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
-import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentTaskInfo, AgentTaskStop, ChatMessage } from '../../AgentClient';
+import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentTaskInfo, AgentTaskStop, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
 import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
@@ -33,6 +33,8 @@ import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOw
 import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
+import { completePath, describeStaged, prepareAttachments, stageFile, type Staged } from '../attach';
+import { parseDownloadName, renderFiles, saveDownload } from '../download';
 import { pandaLines, svgPixelLines } from '../logo';
 import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
 import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePlan, applyResetInference, readDeploymentFacts, requiresProviderReset, deployWithInference } from '../inference';
@@ -40,7 +42,7 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -463,7 +465,12 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/settings': ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness='],
   '/restart': ['harness', 'sealed'],
   '/cred': CRED_SUBS,
+  '/files': ['inbox'],
+  // What the outbox held when /files listed it or a turn reported it.
+  '/download': () => outboxNames,
 };
+/** The outbox names last seen in this session (/files, a turn's notice), for completion. */
+let outboxNames: string[] = [];
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
 
 const YES_NO = ['yes', 'no'];
@@ -580,6 +587,12 @@ export function completeLine(
     if (words.length <= 1 && !hits.length) return [CRED_SUBS, word];
     return [hits, word];
   }
+  // `/attach <path …>`: the path being typed, from the local filesystem.
+  if (cmd === '/attach') {
+    const hits = completePath(word);
+    if (!rest.includes(' ') && rest && 'clear'.startsWith(rest)) hits.unshift('clear');
+    return [hits, word];
+  }
   const cand = state.args[cmd];
   const list = typeof cand === 'function' ? cand() : (cand ?? []);
   const hits = list.filter((c) => c.startsWith(rest));
@@ -672,52 +685,254 @@ function containerUrl(sandboxId: string, proxy: string): string {
 }
 const og = (wei: bigint | null | undefined): string => (wei == null ? 'n/a' : `${(Number(wei) / 1e18).toFixed(6)} OG`);
 /** The shell's question: the answer to q. fresh asks for a line typed after
- *  q is shown (see run); main is the shell's own prompt; cancel rejects the
- *  question waiting, if any other than the prompt, and says whether it did. */
+ *  q is shown (see run); main is the shell's own prompt; message is the agent
+ *  prompt, whose answer may span lines; cancel rejects the question waiting,
+ *  if any other than a prompt, and says whether it did. */
 type Ask = ((q: string) => Promise<string>) & {
   fresh?: (q: string) => Promise<string>;
   main?: (q: string) => Promise<string>;
+  message?: (q: string) => Promise<Entry>;
   cancel?: () => boolean;
+  /** While no question is up (a turn runs), hand each finished entry to
+   *  `take` first: true means it took it, false that it waits for the next
+   *  prompt as before. null stops. */
+  whileBusy?: (take: ((e: Entry) => boolean) | null) => void;
+  /** Put an entry back to wait for the next prompt. */
+  later?: (e: Entry) => void;
 };
+
+/** What the owner entered: its text (newlines kept), whether it spans lines,
+ *  and whether any of it was pasted. An agent message that spans lines or was
+ *  pasted is never a command. */
+export type Entry = { text: string; multi: boolean; pasted: boolean };
+
+/** Whether an entry finished during a turn goes into that turn (steer): any
+ *  message, but not an empty line or a command typed alone on its line —
+ *  those wait for the next prompt, as before. */
+export function steerable(e: Entry): boolean {
+  const t = e.text.trim();
+  if (!t) return false;
+  return e.multi || e.pasted || !t.startsWith('/');
+}
 
 /** An answer to a signing question this soon after it is shown was typed before it. */
 const READ_MS = 300;
+/** The prompt of a message's next line. */
+const CONT = '… ';
+/** The terminal's bracketed paste mode (xterm): on, off. */
+const PASTE_ON = '\x1b[?2004h';
+const PASTE_OFF = '\x1b[?2004l';
+/** On a terminal that does not mark pastes: a chunk that comes within this
+ *  long of a pasted one is still that paste (a long paste arrives in several
+ *  reads; an Enter typed after it comes much later). */
+const PASTE_GAP_MS = 30;
+/** A question answered yes or no. */
+const YES_NO_QUESTION = /\[(?:y\/n|y)\]/i;
+
+type Key = { name?: string; meta?: boolean; ctrl?: boolean; sequence?: string };
+type KeySource = { on(ev: 'keypress', f: (s: string | undefined, key: Key | undefined) => void): unknown };
 
 /**
- * The shell's `ask` as a line QUEUE, not rl.question: lines that arrive while
- * no question is pending (piped input racing the ~4s async banner) used to be
+ * The shell's `ask` as a QUEUE, not rl.question: lines that arrive while no
+ * question is pending (piped input racing the ~4s async banner) used to be
  * consumed by readline with no listener and silently dropped — commands
- * vanished with exit 0 (feedback.md F5). Buffer them instead. ask.fresh is
- * for a question whose answer signs something: on a terminal (tty), what was
- * typed before it is shown (during a turn, say) is not its answer — neither
- * a whole line, nor keys not yet sent with Enter, nor a line that comes in
- * too soon after it to have been typed for it. A terminal whose line editing
- * the shell does not do (its output is redirected) holds such keys itself,
- * so there it is not asked at all.
+ * vanished with exit 0 (feedback.md F5). Buffer them instead.
+ *
+ * ask.fresh is for a question whose answer signs something: on a terminal
+ * (tty), what was typed before it is shown (during a turn, say) is not its
+ * answer — neither a whole line, nor keys not yet sent with Enter, nor a line
+ * that comes in too soon after it to have been typed for it, nor a paste. A
+ * terminal whose line editing the shell does not do (its output is
+ * redirected) holds such keys itself, so there it is not asked at all.
+ *
+ * Several lines, on a terminal (keys, the session's keypresses: given, the
+ * shell does it): ask.message (the agent prompt) takes a message of several
+ * lines. A paste is one block, newlines kept, sent with the next Enter: the
+ * terminal marks it (bracketed paste, which run turns on), or, where it does
+ * not, lines that come in one read, or reads close behind a pasted one, are
+ * one. A line ending in \ and Option/Alt+Enter go on to a new line. Lines
+ * already entered are not edited again (readline edits one line). Every other
+ * question takes one line: several pasted lines are not its answer, and a
+ * paste does not answer a yes/no question. Without keys (piped input) every
+ * line is one answer, as before.
  */
 export function lineQueue(
   rl: {
-    on(ev: 'line', f: (l: string) => void): unknown; on(ev: 'close', f: () => void): unknown; setPrompt(q: string): void; prompt(): void;
+    on(ev: 'line', f: (l: string) => void): unknown; on(ev: 'close', f: () => void): unknown; setPrompt(q: string): void; prompt(preserveCursor?: boolean): void;
     terminal?: boolean;
   },
   tty: () => boolean,
+  keys?: KeySource,
 ): Ask {
-  const pendingLines: string[] = [];
-  const waiters: Array<{ res: (s: string) => void; rej: (e: Error) => void; main: boolean }> = [];
+  type Kind = 'q' | 'main' | 'message';
+  const pending: Entry[] = [];
+  const waiters: Array<{ res: (e: Entry) => void; rej: (e: Error) => void; kind: Kind; q: string }> = [];
+  const edit = rl as { line?: unknown; cursor?: unknown; prevRows?: unknown; history?: unknown };
   // readline keeps keys typed so far as the line being edited (and would
   // show them after the next question, ready for Enter), and its offset from
   // the last redraw (which would move that question up over lines printed
   // since).
   const clearEdit = (): void => {
-    const edit = rl as { line?: unknown; cursor?: unknown; prevRows?: unknown };
     if (typeof edit.line === 'string') edit.line = '';
     if (typeof edit.cursor === 'number') edit.cursor = 0;
     if (typeof edit.prevRows === 'number') edit.prevRows = 0;
   };
+  const editLine = (): string => (typeof edit.line === 'string' ? edit.line : '');
+
+  let draft: string[] = []; // a message's lines before its last Enter
+  let draftPasted = false;
+  let touched = false; // the line being edited holds pasted characters
+  let pasting = false; // between the terminal's paste-start and paste-end
+  let pasteLines: string[] = [];
+  const multiline = (): boolean => !!keys && rl.terminal !== false && tty();
+  const messageHere = (): boolean => !waiters[0] || waiters[0].kind === 'message';
+
+  const accepts = (w: { kind: Kind; q: string }, e: Entry): string | null => {
+    if (w.kind === 'message') return null;
+    if (e.multi) return w.kind === 'main' ? 'several lines are not a command' : 'several lines are an answer only at the agent prompt';
+    if (e.pasted && YES_NO_QUESTION.test(w.q)) return 'a paste does not answer a yes/no question';
+    return null;
+  };
+  let busy: ((e: Entry) => boolean) | null = null;
+  const deliver = (e: Entry): void => {
+    const w = waiters[0];
+    if (!w) {
+      if (busy && busy(e)) return;
+      pending.push(e);
+      return;
+    }
+    const refused = accepts(w, e);
+    if (refused) {
+      out(`  (${refused}: type it)\n`);
+      rl.setPrompt(w.q);
+      rl.prompt();
+      return;
+    }
+    waiters.shift();
+    w.res(e);
+  };
+  // The next line of a message: under its own prompt, when a prompt is up
+  // (typed during a turn, it waits for the agent prompt, which shows it).
+  const goOn = (): void => {
+    if (!waiters[0]) return;
+    rl.setPrompt(CONT);
+    rl.prompt(true);
+  };
+  // A line the owner ended with Enter (or, without keys, any line).
+  const entered = (l: string): void => {
+    if (multiline() && messageHere() && l.endsWith('\\')) {
+      draft.push(l.slice(0, -1));
+      draftPasted ||= touched;
+      touched = false;
+      goOn();
+      return;
+    }
+    if (draft.length) {
+      const text = [...draft, l].join('\n');
+      const pasted = draftPasted || touched;
+      draft = [];
+      draftPasted = false;
+      touched = false;
+      deliver({ text, multi: true, pasted });
+      return;
+    }
+    const pasted = touched;
+    touched = false;
+    deliver({ text: l, multi: false, pasted });
+  };
+  // A paste of whole lines has ended; the rest of it, if any, is the line
+  // being edited.
+  const pasted = (lines: string[]): void => {
+    touched = true;
+    if (!lines.length) return; // within one line: readline holds it as typed
+    const tail = editLine();
+    const w = waiters[0];
+    if (w && w.kind !== 'message') {
+      // One line and its newline: as if typed (a pasted key, an address).
+      if (lines.length === 1 && !tail) { touched = false; deliver({ text: lines[0], multi: false, pasted: true }); return; }
+      clearEdit();
+      out(`\n  (${w.kind === 'main' ? 'several pasted lines are not a command' : 'several pasted lines are an answer only at the agent prompt'}: type it)\n`);
+      touched = false;
+      rl.setPrompt(w.q);
+      rl.prompt();
+      return;
+    }
+    draft.push(...lines);
+    draftPasted = true;
+    if (!w) return; // during a turn: the agent prompt shows it
+    // The pasted lines are on the screen as readline echoed them; say how it
+    // is sent, then the line being edited goes on under the next-line prompt.
+    if (tail) term('\r\x1b[K');
+    // The last pasted line, when no newline ended it, is the line being edited.
+    const n = draft.length + (tail ? 1 : 0);
+    out(`  [pasted ${n} line${n === 1 ? '' : 's'} · Enter sends]\n`);
+    rl.setPrompt(CONT);
+    if (typeof edit.cursor === 'number') edit.cursor = tail.length;
+    if (typeof edit.prevRows === 'number') edit.prevRows = 0;
+    rl.prompt(true);
+  };
+
+  // Reads: every keypress and line of one read of stdin comes in one go, so
+  // a read is a chunk until the next microtask. On a terminal that does not
+  // mark pastes, lines in one chunk (or one line with more typed behind it)
+  // are a paste; a chunk close behind a pasted one is still that paste.
+  let chunk: { open: boolean; lines: string[]; more: boolean } = { open: false, lines: [], more: false };
+  let lastPasteAt = 0;
+  const endChunk = (): void => {
+    const { lines, more } = chunk;
+    chunk = { open: false, lines: [], more: false };
+    if (!lines.length) return;
+    const now = Date.now();
+    if (lines.length > 1 || more || now - lastPasteAt < PASTE_GAP_MS) {
+      lastPasteAt = now;
+      pasted(lines);
+      return;
+    }
+    entered(lines[0]);
+  };
+  const inChunk = (): void => {
+    if (chunk.open) return;
+    chunk.open = true;
+    queueMicrotask(endChunk);
+  };
+  keys?.on('keypress', (s, key) => {
+    if (!multiline()) return;
+    if (key?.name === 'paste-start') { pasting = true; pasteLines = []; return; }
+    if (key?.name === 'paste-end') {
+      pasting = false;
+      const lines = pasteLines;
+      pasteLines = [];
+      lastPasteAt = Date.now();
+      pasted(lines);
+      return;
+    }
+    if (pasting) return;
+    inChunk();
+    if ((key?.name === 'return' || key?.name === 'enter') && key.meta) {
+      // Option/Alt+Enter: a new line in a message (readline ignores the key).
+      if (!messageHere()) return;
+      draft.push(editLine());
+      draftPasted ||= touched;
+      touched = false;
+      clearEdit();
+      if (!waiters[0]) return;
+      out('\n');
+      goOn();
+      return;
+    }
+    if (chunk.lines.length && s && !key?.ctrl && !key?.meta && s >= ' ') chunk.more = true;
+  });
+
   rl.on('line', (l) => {
-    const w = waiters.shift();
-    if (w) w.res(l);
-    else pendingLines.push(l);
+    if (!multiline()) { entered(l); return; }
+    if (pasting) {
+      pasteLines.push(l);
+      // A pasted line is not a line the owner entered: keep it out of ↑.
+      if (Array.isArray(edit.history) && edit.history[0] === l) edit.history.shift();
+      return;
+    }
+    inChunk();
+    chunk.lines.push(l);
   });
   let stdinClosed = false;
   rl.on('close', () => {
@@ -728,23 +943,32 @@ export function lineQueue(
       w.rej(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
     }
   });
-  const wait = (q: string, main: boolean): Promise<string> => {
-    const buffered = pendingLines.shift();
-    if (buffered !== undefined) {
-      out(`${q}${buffered}\n`); // keep the transcript readable in pipes/logs
+  const wait = (q: string, kind: Kind): Promise<Entry> => {
+    for (let buffered = pending.shift(); buffered !== undefined; buffered = pending.shift()) {
+      const refused = accepts({ kind, q }, buffered);
+      if (refused) { out(`  (an earlier entry was dropped: ${refused})\n`); continue; }
+      out(`${q}${buffered.text}\n`); // keep the transcript readable in pipes/logs
       return Promise.resolve(buffered);
     }
     if (stdinClosed) {
       return Promise.reject(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
     }
+    if (kind === 'message' && draft.length) {
+      // A message begun during the turn: show what it holds so far.
+      out(`${q}${draft.join('\n')}\n`);
+      q = CONT;
+    }
     rl.setPrompt(q);
-    rl.prompt();
-    return new Promise((res, rej) => waiters.push({ res, rej, main }));
+    rl.prompt(kind === 'message' && q === CONT);
+    return new Promise((res, rej) => waiters.push({ res, rej, kind, q }));
   };
-  const ask: Ask = (q: string): Promise<string> => wait(q, false);
-  ask.main = (q: string): Promise<string> => wait(q, true);
+  const ask: Ask = (q: string): Promise<string> => wait(q, 'q').then((e) => e.text);
+  ask.main = (q: string): Promise<string> => wait(q, 'main').then((e) => e.text);
+  ask.message = (q: string): Promise<Entry> => wait(q, 'message');
+  ask.whileBusy = (take) => { busy = take; };
+  ask.later = (e) => { pending.push(e); };
   ask.cancel = (): boolean => {
-    const i = waiters.findIndex((w) => !w.main);
+    const i = waiters.findIndex((w) => w.kind === 'q');
     if (i < 0) return false;
     const [w] = waiters.splice(i, 1);
     clearEdit();
@@ -757,11 +981,18 @@ export function lineQueue(
       throw new Error('a question that signs is asked only when the session\'s output is a terminal: answer with /cred pending, then /cred approve <id> or /cred deny <id>');
     }
     for (;;) {
-      pendingLines.length = 0;
+      pending.length = 0;
+      draft = [];
+      draftPasted = false;
+      touched = false;
       clearEdit();
       const shown = Date.now();
-      const a = await ask(q);
-      if (!a.trim() || Date.now() - shown >= READ_MS) return a;
+      const a = await wait(q, 'q');
+      if (a.pasted && a.text.trim()) {
+        out('  (a paste is not an answer to this question: type it)\n');
+        continue;
+      }
+      if (!a.text.trim() || Date.now() - shown >= READ_MS) return a.text;
       out('  (that came in before the question could be read: answer again)\n');
     }
   };
@@ -806,6 +1037,8 @@ interface Session {
   thinking?: 'low' | 'high' | 'max';
   /** Task id of the chat turn currently in flight (responses transport). */
   currentTask?: string | null;
+  /** Files and images `/attach` staged for the next message. */
+  attached?: Staged[];
 }
 
 /** (Re)establish the connection half of a session from a running URL. */
@@ -1056,7 +1289,15 @@ export async function run(ctx: CommandContext): Promise<void> {
       completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor }),
   });
   activeRl = rl;
-  const ask = lineQueue(rl, () => !!process.stdin.isTTY);
+  const ask = lineQueue(rl, () => !!process.stdin.isTTY, process.stdin);
+  // Bracketed paste: the terminal marks a paste, so its lines stay one
+  // message (lineQueue). Off again on every way out — exit, Ctrl-C twice, a
+  // crash (the exit event), SIGTERM — so the owner's shell is not left in it.
+  if (rl.terminal) {
+    term(PASTE_ON);
+    process.on('exit', () => term(PASTE_OFF));
+    process.once('SIGTERM', () => process.exit(143));
+  }
   const irq: Interrupt = { streaming: null, brake: null };
 
   let lastSigint = 0;
@@ -2478,6 +2719,14 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   return s;
 }
 
+/** The reason of a container's last `warning` report, cleaned for one line;
+ *  null for any other report or none. */
+export function warningOf(status: { level: string; reason: string | null } | null | undefined): string | null {
+  if (!status || status.level !== 'warning' || !status.reason) return null;
+  const line = status.reason.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+  return line.length > 200 ? `${line.slice(0, 199)}…` : line;
+}
+
 async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask: (q: string) => Promise<string>): Promise<Session> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listDeployments();
@@ -2514,8 +2763,9 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
       ? ag.agent.runtimeCosts(BigInt(agentId)).then((rc) => rc.sealGasWei).catch(() => null)
       : Promise.resolve(null),
     // Ownership up front, so owner-only commands can refuse plainly instead
-    // of failing phase checks or bouncing off the attestor's auth later.
-    ag.agent.listMyDeployments().then((rs) => rs.some((r) => r.sealId === row.sealId)).catch(() => undefined),
+    // of failing phase checks or bouncing off the attestor's auth later. The
+    // owner's row also carries the container's last status report.
+    ag.agent.listMyDeployments().then((rs) => rs.find((r) => r.sealId === row.sealId) ?? false).catch(() => undefined),
   ]);
   // The session is the owner's cockpit — a foreign agent's public surface is
   // L1 `hello <id>`. Undetermined ownership (listing fetch failed) enters
@@ -2531,6 +2781,11 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   if (s.url) fields.push(`url      ${s.url}`);
   fields.push(`sealId   ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}`);
   if (gasWei != null) fields.push(`gas      ${og(gasWei)} (agentSeal — fund with /topup)`);
+  // A running agent can still report a warning, e.g. its data not reaching
+  // chain because the agentSeal wallet cannot pay: say so where the owner
+  // looks first.
+  const warning = mine ? warningOf(mine.containerStatus) : null;
+  if (warning) fields.push(`warning  ${warning}`);
   if (s.phase === 'running' && s.url) {
     fields.push('type to chat · /help for commands · Esc interrupts a turn');
   } else {
@@ -2584,12 +2839,22 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /tasks /result /cancel /inbox /schedules /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /tasks /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
                           turn in flight (the runtime cancels server-side);
                           at a question a command asks, they cancel it
+  (several lines)         a paste stays one message, sent with the next
+                          Enter and never run as a command; a line ending
+                          in \\ or Option/Alt+Enter goes on to a new line.
+                          Lines already entered are not edited again
+  (typing while it works) 0g-harness: a message you finish while the agent
+                          works goes into its turn, read before its next
+                          model call ("↳ inserted", then "(read)"); not in
+                          the middle of a long command. If the turn ends
+                          first, it runs as a turn of its own, shown here.
+                          A command alone on its line waits for the prompt
   (bare Enter)            refresh this agent's phase/url from the attestor
   /hello                  identity, routes/services, serve-proof verification
   /balance                this agent's agentSeal gas + the account prepaid
@@ -2665,6 +2930,21 @@ const L2_HELP_FULL = `session commands
                           Bare: unread messages; all: the read ones too
   /schedules              the reminders the agent set for itself
                           (0g-harness)
+  /attach [path …|clear]  files and images for your next message (0g-harness):
+                          an image goes with the message (when the model takes
+                          images, as its provider's model list says — else it
+                          is saved as a file the agent is told about), any
+                          other file is uploaded to the agent's ~/inbox first
+                          and the message names its path. Bare lists what is
+                          staged. Images: 8 per message, 10 MiB each, 32 MiB
+                          together; a file: 25 MiB
+  /files [inbox]          the files the agent left for you in its ~/outbox (or,
+                          with inbox, the ones you sent, in its ~/inbox — not
+                          the message /inbox) — container-local,
+                          lost on a reset (0g-harness)
+  /download <name> [path] save one to the current directory (or path); never
+                          overwrites: a taken name gets -1, -2, … Names from
+                          your own files: inbox/<name>. At most 50 MiB
   /agentlog [n]           agent process log, last n lines (owner-only)
   /signatures [n]         what the agent signed as itself and what the runtime refused, last n (owner-only; 0g-harness)
   /startuplog [n]         sealed runtime startup log, last n lines
@@ -2794,13 +3074,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
     }
     let line: string;
+    // A message of several lines, or a pasted one, goes to the agent as it
+    // is: never a command, whatever its first line starts with.
+    let asMessage = false;
     if (queued.length) {
       line = queued.shift()!;
       out(`\nagent ${s.agentId} › ${line}\n`);
     } else {
       atPrompt = true;
       try {
-        line = (await ((ask as Ask).main ?? ask)(`\nagent ${s.agentId} › `)).trim();
+        const q = `\nagent ${s.agentId} › `;
+        const entry = (ask as Ask).message ? await (ask as Ask).message!(q) : { text: await ((ask as Ask).main ?? ask)(q), multi: false, pasted: false };
+        line = entry.text.trim();
+        asMessage = entry.multi || entry.pasted;
       } finally {
         atPrompt = false;
       }
@@ -2811,6 +3097,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       try { await refreshSession(s); } catch { out(`  phase   ${s.phase} (refresh failed — attestor unreachable)\n`); }
       continue;
     }
+    commands: {
+    if (asMessage) break commands;
     if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
     if (line === '/quit' || line === '/exit') { process.exit(0); }
     if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
@@ -3301,6 +3589,50 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out('to remove one, ask the agent to\n');
         continue;
       }
+      if (line === '/attach' || line.startsWith('/attach ')) {
+        if (!s.client) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
+        if (!s.client.uploadFile) { out('(this agent takes no files or images: its framework has no upload route — 0g-harness does)\n'); continue; }
+        const staged = (s.attached ??= []);
+        const args = tokenize(line.slice('/attach'.length).trim());
+        if (!args.length) {
+          out(staged.length ? `attached to your next message:\n${describeStaged(staged).map(cleanCell).join('\n')}\n(/attach clear drops them)\n` : 'nothing attached — /attach <path …> adds files or images to your next message\n');
+          continue;
+        }
+        if (args.length === 1 && args[0] === 'clear') { staged.length = 0; out('attachments dropped\n'); continue; }
+        for (const a of args) {
+          try {
+            const one = stageFile(a, staged);
+            staged.push(one);
+            out(`attached ${cleanCell(one.name)} (${one.image ? 'image, goes with the message' : 'file, uploaded when you send'})\n`);
+          } catch (err) {
+            out(`not attached: ${cleanCell((err as Error).message)}\n`);
+          }
+        }
+        if (staged.length) out('your next message carries them\n');
+        continue;
+      }
+      if (line === '/files' || line.startsWith('/files ') || line === '/download' || line.startsWith('/download ')) {
+        if (!s.client) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
+        if (!s.client.listFiles || !s.client.downloadFile) { out('(this agent hands over no files: its framework has no files route — 0g-harness does)\n'); continue; }
+        if (line === '/files' || line.startsWith('/files ')) {
+          const which = line.slice('/files'.length).trim();
+          if (which && which !== 'inbox' && which !== 'outbox') { out('usage: /files [inbox]\n'); continue; }
+          const dir = which === 'inbox' ? 'inbox' : 'outbox';
+          const files = await s.client.listFiles(dir);
+          if (dir === 'outbox') outboxNames = files.map((f) => f.name);
+          if (!files.length) { out(dir === 'outbox' ? 'the outbox is empty — ask the agent to put a file in ~/outbox for you\n' : 'the file inbox is empty\n'); continue; }
+          for (const l of renderFiles(files)) out(`${cleanCell(l)}\n`);
+          out(`/download ${dir === 'inbox' ? 'inbox/' : ''}<name> saves one here\n`);
+          continue;
+        }
+        const args = tokenize(line.slice('/download'.length).trim());
+        if (!args.length || args.length > 2) { out('usage: /download <name> [local path]\n'); continue; }
+        const { dir, name } = parseDownloadName(args[0]);
+        const bytes = await s.client.downloadFile(dir, name);
+        const saved = saveDownload(bytes, name, args[1]);
+        out(`saved ${cleanCell(name)} (${bytes.length} bytes) → ${cleanCell(saved)}\n`);
+        continue;
+      }
       if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
     } catch (e) {
       // Show the remedy too: an error whose whole point is "do this instead"
@@ -3309,15 +3641,33 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (isCancelled(e)) { out('cancelled\n'); continue; }
       out(`error: ${ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`); continue;
     }
+    } // commands
 
     // a chat turn (interruptible)
     if (!s.client) { out(`agent is ${s.phase} — /start or /reset before chatting\n`); continue; }
     if (!s.client.chatStream) { out('(chat unavailable on this agent)\n'); continue; }
-    messages.push({ role: 'user', content: line });
+    // Attachments go with this message: images inside it, other files
+    // uploaded first and named in its text. A failed upload sends nothing
+    // and keeps them staged.
+    let sent = line;
+    let images: ChatImage[] = [];
+    if (s.attached?.length) {
+      try {
+        ({ text: sent, images } = await prepareAttachments(s.attached, line, s.client, (a, path) => out(`uploaded ${cleanCell(a.name)} → ${cleanCell(path)}\n`)));
+      } catch (e) {
+        out(`not sent: ${cleanCell((e as Error).message)} — the attachments stay staged (/attach lists them)\n`);
+        continue;
+      }
+      s.attached = [];
+    }
+    messages.push({ role: 'user', content: sent });
     // `model` is a per-framework selector some gateways require (openclaw
     // does; 0g-harness and the prime bridge ignore it). Send it when known, omit it
     // otherwise — and only if the framework rejects that, ask once and retry.
     let retriedWithPick = false;
+    // Inserted texts this turn did not read: each runs as a turn of its own
+    // on the agent, followed here once this turn ends.
+    const afterTurn: string[] = [];
     for (;;) {
       const ac = new AbortController();
       irq.streaming = ac;
@@ -3352,8 +3702,40 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         term(`\r\x1b[2K  ${cleanCell(`${SPIN[spin]} ${status}… (${secs}s · esc to interrupt)`)}`);
         statusShown = true;
       };
+      // Steering (0g-harness, on a terminal): a message the owner finishes
+      // while the turn runs goes into it, read before its next model call. A
+      // command alone on its line, or an empty Enter, waits for the next
+      // prompt as before.
+      const steered: string[] = []; // inserted into this turn, not read yet
+      const steer = s.client.steer && process.stdin.isTTY ? s.client.steer : undefined;
+      if (steer) {
+        (ask as Ask).whileBusy?.((e) => {
+          if (!steerable(e)) return false;
+          clearActivity();
+          out('\n↳ inserted — the agent reads it at its next step\n');
+          steer(e.text).then(
+            (r) => {
+              if (r.merged && r.id) { steered.push(r.id); return; }
+              if (r.queued) afterTurn.push(r.queued);
+              out(`(${cleanCell(r.reason ?? 'no turn of yours is running')} — it goes as a turn of its own)\n`);
+            },
+            (err: Error) => {
+              out(`(not inserted: ${cleanCell(err.message)} — it waits for the next prompt)\n`);
+              (ask as Ask).later?.(e);
+            },
+          );
+          return true;
+        });
+      }
       const onActivity = process.stdout.isTTY
         ? (label: string): void => {
+            if (label === 'steer received') {
+              // The agent read an inserted message.
+              clearActivity();
+              out('  ↳ (read)\n');
+              steered.shift();
+              return;
+            }
             // "did work this turn" detector, across bridges' label dialects:
             // 0g-harness "tool/call bash", prime "tool_execution_start — bash" /
             // "bash_command_start", hermes "tool/call web_search". Thinking
@@ -3382,6 +3764,18 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           ...(s.thinking ? { thinking: s.thinking } : {}),
           signal: ac.signal,
           ...(onActivity ? { onActivity } : {}),
+          ...(images.length ? { images } : {}),
+          onNotice: (n: ChatNotice): void => {
+            if (n.imagesSavedAsFiles?.length) {
+              clearActivity();
+              out(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map(cleanCell).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);
+            }
+            if (n.outboxFiles?.length) {
+              clearActivity();
+              outboxNames = [...new Set([...n.outboxFiles, ...outboxNames])];
+              out(`\n(the agent left ${n.outboxFiles.length === 1 ? 'a file' : 'files'} for you: ${n.outboxFiles.map(cleanCell).join(', ')} — /download <name> saves ${n.outboxFiles.length === 1 ? 'it' : 'one'} here)\n`);
+            }
+          },
           // Responses transport only: remember the server-side task id, so
           // Esc cancels THIS task and /tasks//result can re-attach to it.
           onTask: (id: string): void => {
@@ -3452,6 +3846,20 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         clearActivity();
         irq.streaming = null;
         s.currentTask = null;
+        (ask as Ask).whileBusy?.(null);
+      }
+      // Inserted but not read: the turn ended first, so the agent runs it as
+      // a turn of its own (an interrupt drops it instead).
+      if (!interrupted && s.client?.steerState) {
+        for (const id of steered) {
+          let st: SteerState | null = null;
+          for (let i = 0; i < 20; i++) {
+            st = await s.client.steerState(id).catch(() => null);
+            if (!st || st.state !== 'pending') break;
+            await new Promise((r) => setTimeout(r, 150));
+          }
+          if (st?.state === 'turn') afterTurn.push(st.turn);
+        }
       }
       if (failure && !s.framework && !retriedWithPick) {
         out(`\n(chat failed: ${cleanCell(failure)})\nthis framework may need a model selector — pick it:\n`);
@@ -3486,6 +3894,23 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       out('\n');
       messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
       break;
+    }
+    for (const id of afterTurn) {
+      (s.tasks ??= []).push({ id, prompt: '(inserted)', at: Date.now() });
+      if (!s.client?.followTask) { out(`(your inserted message runs as ${id} — /result ${id} shows it)\n`); continue; }
+      out(`(your inserted message runs as a turn of its own, ${id})\nagent> `);
+      const fac = new AbortController();
+      irq.streaming = fac;
+      try {
+        for await (const delta of s.client.followTask(id, { signal: fac.signal })) out(cleanStream(delta));
+        out('\n');
+      } catch (e) {
+        out(fac.signal.aborted
+          ? `\n(stopped watching — it continues; /result ${id} re-attaches, /cancel ${id} stops it)\n`
+          : `\n(${cleanCell((e as Error).message)})\n`);
+      } finally {
+        irq.streaming = null;
+      }
     }
   }
   } finally {
