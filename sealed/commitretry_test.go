@@ -149,8 +149,9 @@ func TestRevertedCommitWithEnoughFundsKeepsTheCountRule(t *testing.T) {
 	}
 }
 
-// A balance that cannot be read changes nothing: the count rule stands. An
-// error that already says funds is not read for.
+// A balance that cannot be read changes nothing: the error's own grading
+// stands (the count rule; an insufficient-funds error warns at once with its
+// own text).
 func TestCommitFundsReadFailureFallsBack(t *testing.T) {
 	failing := func(context.Context, error) (uploader.WalletFunds, error) {
 		return uploader.WalletFunds{}, errors.New("dial tcp: connection refused")
@@ -161,14 +162,28 @@ func TestCommitFundsReadFailureFallsBack(t *testing.T) {
 	if level, _ := commitFailureStatus(reverted, 1, ""); level != "" {
 		t.Errorf("first failure shown after a failed read: %q", level)
 	}
-	read := false
-	spy := func(context.Context, error) (uploader.WalletFunds, error) {
-		read = true
-		return uploader.WalletFunds{}, nil
+	funds := errors.New("0g-storage upload: insufficient funds for gas * price + value: have 0 want 30733644962")
+	if short := fundsShortfall(context.Background(), failing, funds); short != "" {
+		t.Errorf("a failed read reported short: %q", short)
 	}
-	funds := errors.New("0g-storage upload: insufficient funds for gas * price + value")
-	if short := fundsShortfall(context.Background(), spy, funds); short != "" || read {
-		t.Errorf("an insufficient-funds error was read for: %q, read %v", short, read)
+	if level, msg := commitFailureStatus(funds, 1, ""); level != "warning" || !strings.Contains(msg, "insufficient funds") {
+		t.Errorf("an insufficient-funds failure without a balance read: %q %q", level, msg)
+	}
+}
+
+// An insufficient-funds error is read for too: the owner sees the wallet and
+// what a commit needs, not the storage client's "want <storage fee in wei>".
+func TestInsufficientFundsShowsTheWalletAndTheNeed(t *testing.T) {
+	funds := errors.New("drift: upload.Apply: upload framework: 0g-storage upload: insufficient funds for gas * price + value: have 0 want 30733644962")
+	short := fundsShortfall(context.Background(), readsWallet(big.NewInt(0)), funds)
+	for _, want := range []string{sealWallet.Hex(), "has 0.00 OG", "about 0.90 OG is needed"} {
+		if !strings.Contains(short, want) {
+			t.Errorf("%q lacks %q", short, want)
+		}
+	}
+	level, msg := commitFailureStatus(funds, 1, short)
+	if level != "warning" || msg != short || strings.Contains(msg, "30733644962") {
+		t.Errorf("first failure: %q %q; want the wallet message at once", level, msg)
 	}
 }
 

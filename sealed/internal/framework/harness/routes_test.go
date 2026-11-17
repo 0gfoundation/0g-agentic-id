@@ -20,6 +20,7 @@ func TestFrameworkRoutesAdvertiseTheHarnessSurface(t *testing.T) {
 		"/v1/tasks":     "tasks",
 		"/v1/schedules": "schedules",
 		"/v1/files":     "files",
+		"/v1/memory":    "memory",
 	}
 	routes := New().FrameworkRoutes()
 	if len(routes) != len(want) {
@@ -67,6 +68,7 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/schedules", "GET", "/v1/schedules"},
 		{"/v1/schedules", "DELETE", "/v1/schedules/s1"},
 		{"/v1/files", "POST", "/v1/files"},
+		{"/v1/memory", "POST", "/v1/memory/tidy"},
 		{"/v1/", "OPTIONS", "/v1/chat/completions"},
 	}
 	for _, f := range forwarded {

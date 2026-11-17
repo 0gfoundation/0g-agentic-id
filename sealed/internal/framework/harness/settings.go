@@ -77,12 +77,17 @@ type harnessKnobs struct {
 	// a compaction is about to summarize: one model call per compaction
 	// (0g-harness src/memory-extract.mjs). On unless the owner turns it off.
 	MemoryExtract bool
+	// MemoryTidy has the harness consolidate long-term memory now and then
+	// while the agent is idle: one model call per pass, merging duplicates
+	// and dropping what is stale (0g-harness src/memory-tidy.mjs). On unless
+	// the owner turns it off.
+	MemoryTidy bool
 }
 
 // defaultKnobs is the shipped composition, i.e. what an empty overlay must
 // yield.
 func defaultKnobs() harnessKnobs {
-	return harnessKnobs{ToolJobs: false, Subagents: false, Schedule: false, MaxParallelToolCalls: 1, MemoryExtract: true}
+	return harnessKnobs{ToolJobs: false, Subagents: false, Schedule: false, MaxParallelToolCalls: 1, MemoryExtract: true, MemoryTidy: true}
 }
 
 // parseBoolKnob reads one boolean knob. A value that is not a boolean costs
@@ -129,6 +134,7 @@ func parseKnobs(raw json.RawMessage) harnessKnobs {
 	parseBoolKnob(fields, "subagents", &k.Subagents, d.Subagents)
 	parseBoolKnob(fields, "schedule", &k.Schedule, d.Schedule)
 	parseBoolKnob(fields, "memoryExtract", &k.MemoryExtract, d.MemoryExtract)
+	parseBoolKnob(fields, "memoryTidy", &k.MemoryTidy, d.MemoryTidy)
 	if v, ok := fields["modelImages"]; ok {
 		var b bool
 		if err := json.Unmarshal(v, &b); err != nil {
@@ -262,6 +268,7 @@ func settingsEnv(s settings.Resolved, k harnessKnobs) []string {
 	env["SEAL_HARNESS_SUBAGENTS"] = boolEnv(k.Subagents)
 	env["SEAL_HARNESS_SCHEDULE"] = boolEnv(k.Schedule)
 	env["SEAL_HARNESS_MEMORY_EXTRACT"] = boolEnv(k.MemoryExtract)
+	env["SEAL_HARNESS_MEMORY_TIDY"] = boolEnv(k.MemoryTidy)
 	env["SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS"] = strconv.Itoa(k.MaxParallelToolCalls)
 	if k.MCPServers != "" {
 		env["SEAL_MCP_SERVERS"] = k.MCPServers

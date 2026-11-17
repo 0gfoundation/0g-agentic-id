@@ -652,7 +652,7 @@ container's `:8080`.
 | `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth; responses never proof-signed — the owner↔agent steering channel); every undeclared path 404s — there is no catch-all relay |
 | `/api/*` | external callers | agent-registered services (exact path, registered over the sign socket's `/services`), reverse-proxied to the agent's loopback backend; responses buffered and proof-signed (`X-Agent-Proof`), even when the backend emits SSE |
 | `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, 0g-harness), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |
-| `/v1/inbox`, `/v1/events`, `/v1/tasks`, `/v1/schedules`, `/v1/files` | owner | 0g-harness only (declared as the kinds `inbox` / `events` / `tasks` / `schedules` / `files`): the words of turns the agent opened itself (a background job finished, a reminder came due), a resumable live feed of turn, task, inbox and reminder changes, every turn, background command and subagent with who did it, the agent's reminders, and file upload into the agent's `~/uploads`. The other frameworks declare none of them, and the SDK offers them only where they are declared (`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
+| `/v1/inbox`, `/v1/events`, `/v1/tasks`, `/v1/schedules`, `/v1/files`, `/v1/memory` | owner | 0g-harness only (declared as the kinds `inbox` / `events` / `tasks` / `schedules` / `files` / `memory`): the words of turns the agent opened itself (a background job finished, a reminder came due), a resumable live feed of turn, task, inbox and reminder changes, every turn, background command and subagent with who did it, the agent's reminders, file upload into the agent's `~/uploads`, and a long-term memory consolidation pass on request (`POST /v1/memory/tidy`). The other frameworks declare none of them, and the SDK offers them only where they are declared (`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
 | `/log/agent` + `/log/agent.html` | ops | agent subprocess stdout/stderr (live); path resolved via the adapter's `SubprocessLogPath()`. `/log/openclaw`(`.html`) survives as a legacy alias |
 | `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`; never a raw hash and never EIP-191 version `0x00`, the serve-proof's domain — see below) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) + `/harness/restart` and `/mcp` (0g-harness only: a restart of the harness, and the same endpoints and the credential socket's as MCP tools; the reveal socket serves its own) |
@@ -831,14 +831,16 @@ chat. Apply's outcomes:
 
 `status.go::severityOf` tells the owner-recoverable causes ("insufficient
 funds", a data-less revert of the seal wallet's own transaction) from the
-rest; `commitretry.go::commitFailureStatus` turns either into the warning. A
-failure whose error names no cause is checked against the seal wallet
-(`fundsShortfall`): when its balance is under the failed step's gas (a storage
-submit 450k, an update 350k, the largest measured on Galileo, rounded up) at
-the current gas price, it is the funds case at once, and the warning names
-the wallet and both amounts ("the agent's wallet 0x… has 0.10 OG, about
-0.90 OG is needed for its next transaction"). If the balance cannot be read,
-the count rule stands.
+rest; `commitretry.go::commitFailureStatus` turns either into the warning.
+Every failure is also checked against the seal wallet (`fundsShortfall`):
+when its balance is under the failed step's gas (a storage submit 450k, an
+update 350k, the largest measured on Galileo, rounded up) at the current gas
+price, it is the funds case at once, and the warning names the wallet and
+both amounts ("the agent's wallet 0x… has 0.10 OG, about 0.90 OG is needed
+for its next transaction"). That covers a failure whose error names no
+cause, and replaces an "insufficient funds" error's own amount, which is the
+blob's storage fee (a few wei), not what a commit needs. If the balance
+cannot be read, the error's own grading stands.
 
 Retries back off (`commitretry.go`): after n consecutive failures of the same
 content the next attempt waits 30 s·2^(n-1), at most 30 min; new content to
