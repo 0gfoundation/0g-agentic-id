@@ -74,9 +74,19 @@ type harnessKnobs struct {
 	// the provider's catalog decides (settingsEnv).
 	ModelImages *bool
 	// MemoryExtract has the harness write long-term memory from the span
-	// a compaction is about to summarize: one model call per compaction
-	// (0g-harness src/memory-extract.mjs). On unless the owner turns it off.
+	// a compaction is about to summarize, and after a turn that saved
+	// nothing once enough is new: one model call per pass (0g-harness
+	// src/memory-extract.mjs). On unless the owner turns it off.
 	MemoryExtract bool
+	// MemoryExtractMinMessages is how many of the owner's and the agent's
+	// messages must be new before a turn that saved nothing is read for
+	// memories (1 to 1000).
+	MemoryExtractMinMessages int
+	// MemoryRecall has the harness, once there are more than 30 memories,
+	// pick up to 5 for each owner message with one model call and put their
+	// bodies ahead of it (0g-harness src/memory-recall.mjs). On unless the
+	// owner turns it off.
+	MemoryRecall bool
 	// MemoryTidy has the harness consolidate long-term memory now and then
 	// while the agent is idle: one model call per pass, merging duplicates
 	// and dropping what is stale (0g-harness src/memory-tidy.mjs). On unless
@@ -87,7 +97,7 @@ type harnessKnobs struct {
 // defaultKnobs is the shipped composition, i.e. what an empty overlay must
 // yield.
 func defaultKnobs() harnessKnobs {
-	return harnessKnobs{ToolJobs: false, Subagents: false, Schedule: false, MaxParallelToolCalls: 1, MemoryExtract: true, MemoryTidy: true}
+	return harnessKnobs{ToolJobs: false, Subagents: false, Schedule: false, MaxParallelToolCalls: 1, MemoryExtract: true, MemoryExtractMinMessages: 6, MemoryRecall: true, MemoryTidy: true}
 }
 
 // parseBoolKnob reads one boolean knob. A value that is not a boolean costs
@@ -135,6 +145,15 @@ func parseKnobs(raw json.RawMessage) harnessKnobs {
 	parseBoolKnob(fields, "schedule", &k.Schedule, d.Schedule)
 	parseBoolKnob(fields, "memoryExtract", &k.MemoryExtract, d.MemoryExtract)
 	parseBoolKnob(fields, "memoryTidy", &k.MemoryTidy, d.MemoryTidy)
+	parseBoolKnob(fields, "memoryRecall", &k.MemoryRecall, d.MemoryRecall)
+	if v, ok := fields["memoryExtractMinMessages"]; ok {
+		n := d.MemoryExtractMinMessages
+		if err := json.Unmarshal(v, &n); err != nil || n < 1 || n > 1000 {
+			logger.Logf("harness.RenderSettings: memoryExtractMinMessages=%s is not a whole number from 1 to 1000; using %d", v, d.MemoryExtractMinMessages)
+			n = d.MemoryExtractMinMessages
+		}
+		k.MemoryExtractMinMessages = n
+	}
 	if v, ok := fields["modelImages"]; ok {
 		var b bool
 		if err := json.Unmarshal(v, &b); err != nil {
@@ -269,6 +288,8 @@ func settingsEnv(s settings.Resolved, k harnessKnobs) []string {
 	env["SEAL_HARNESS_SCHEDULE"] = boolEnv(k.Schedule)
 	env["SEAL_HARNESS_MEMORY_EXTRACT"] = boolEnv(k.MemoryExtract)
 	env["SEAL_HARNESS_MEMORY_TIDY"] = boolEnv(k.MemoryTidy)
+	env["SEAL_HARNESS_MEMORY_RECALL"] = boolEnv(k.MemoryRecall)
+	env["SEAL_HARNESS_MEMORY_EXTRACT_MIN_MESSAGES"] = strconv.Itoa(k.MemoryExtractMinMessages)
 	env["SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS"] = strconv.Itoa(k.MaxParallelToolCalls)
 	if k.MCPServers != "" {
 		env["SEAL_MCP_SERVERS"] = k.MCPServers

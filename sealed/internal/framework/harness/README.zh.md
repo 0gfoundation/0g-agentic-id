@@ -82,7 +82,9 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | `schedule` | `false` | 打开 `schedule_create` / `schedule_list` / `schedule_delete`:agent 给自己设的提醒 |
 | `maxParallelToolCalls` | `1` | 模型一步里最多同时运行几个工具调用。只对声明了可以并发的工具生效：`read`、`read_image`、`subagent`。`bash`、`write`、`edit`、`seal_*` 工具以及任务和提醒工具总是单独运行，等前面的调用结束才开始 |
 | `modelImages` | 不设置 | 覆盖 owner 的模型能不能看图（`true`/`false`）。不设置时由服务商的模型列表决定（0G router 上是 `architecture.input_modalities`：glm-5.3 只收文字，glm-5.3-flash 能看图）；列表里没写时按 pi-ai 的模型目录。能看图时 owner 发的图片交给模型；不能时每张图存到 `~/inbox`，并告诉 agent 它看不到 |
-| `memoryExtract` | `true` | owner 对话压缩之前，harness 调用一次模型，把即将被摘要的那段对话里值得长期保留的内容写进长期记忆（0g-harness `src/memory-extract.mjs`）；设为 `false` 关闭。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT`。 |
+| `memoryExtract` | `true` | owner 会话压缩之前，以及某一轮没存记忆、且新消息够多之后，harness 调用一次模型，把这些消息里值得长期保留的内容写进长期记忆（0g-harness `src/memory-extract.mjs`）；设为 `false` 两者都关闭。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT`。 |
+| `memoryExtractMinMessages` | `6` | 某一轮没存记忆时，自上次提取以来 owner 和 agent 的新消息至少要有多少条，才读一遍找记忆（1 到 1000）。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT_MIN_MESSAGES`。 |
+| `memoryRecall` | `true` | 记忆超过 30 条后，每条 owner 消息之前，harness 调用一次模型挑出最多 5 条有用的记忆，把正文放在消息前面（0g-harness `src/memory-recall.mjs`）；设为 `false` 关闭。渲染为 `SEAL_HARNESS_MEMORY_RECALL`。 |
 | `memoryTidy` | `true` | agent 空闲时，harness 不定期调用一次模型整理长期记忆：合并重复的，删掉过时或被推翻的（0g-harness `src/memory-tidy.mjs`；距上次整理 24 小时且记忆有变化时到期，索引接近上限时提前）；设为 `false` 关闭自动整理，`POST /v1/memory/tidy` 仍可按需整理一次。渲染为 `SEAL_HARNESS_MEMORY_TIDY`。 |
 
 这里填错,不会让 agent 起不来。`RenderSettings` 每次 spawn 前都会运行,要是在这里报错,agent 就开不了机,而不是"这次推送被拒"。所以解析不了或超出范围的值,一律退回出厂默认值,在日志里说明,其他开关照常生效(`settings.go`)。
