@@ -187,6 +187,7 @@ func TestRenderSettings_DefaultKnobsAreTheShippedComposition(t *testing.T) {
 		"SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS": "1",
 		"SEAL_HARNESS_MEMORY_EXTRACT":          "1",
 		"SEAL_HARNESS_MEMORY_TIDY":             "1",
+		"SEAL_HARNESS_WEB":                     "1",
 	} {
 		if env[k] != want {
 			t.Errorf("%s = %q, want %q (the shipped default)", k, env[k], want)
@@ -663,6 +664,25 @@ func TestRenderSettings_MemoryTidy(t *testing.T) {
 		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.others)})
 		if got := env["SEAL_HARNESS_MEMORY_TIDY"]; got != c.want {
 			t.Errorf("others %s → SEAL_HARNESS_MEMORY_TIDY=%q, want %q", c.others, got, c.want)
+		}
+	}
+}
+
+// The owner turns the web tools off with others.webTools=false; a value that
+// is not a boolean keeps them on.
+func TestRenderSettings_WebTools(t *testing.T) {
+	catalogServer(t, reasoningModel("glm-5.3"))
+	for _, c := range []struct {
+		others, want string
+	}{
+		{`{"webTools":false}`, "0"},
+		{`{"webTools":true}`, "1"},
+		{`{"webTools":"off"}`, "1"},
+		{`{}`, "1"},
+	} {
+		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.others)})
+		if got := env["SEAL_HARNESS_WEB"]; got != c.want {
+			t.Errorf("others %s → SEAL_HARNESS_WEB=%q, want %q", c.others, got, c.want)
 		}
 	}
 }

@@ -82,12 +82,16 @@ type harnessKnobs struct {
 	// and dropping what is stale (0g-harness src/memory-tidy.mjs). On unless
 	// the owner turns it off.
 	MemoryTidy bool
+	// WebTools gives the agent web_fetch, and web_search where its model's
+	// route has a search (the 0G router; spawn.go). On unless the owner turns
+	// it off.
+	WebTools bool
 }
 
 // defaultKnobs is the shipped composition, i.e. what an empty overlay must
 // yield.
 func defaultKnobs() harnessKnobs {
-	return harnessKnobs{ToolJobs: false, Subagents: false, Schedule: false, MaxParallelToolCalls: 1, MemoryExtract: true, MemoryTidy: true}
+	return harnessKnobs{ToolJobs: false, Subagents: false, Schedule: false, MaxParallelToolCalls: 1, MemoryExtract: true, MemoryTidy: true, WebTools: true}
 }
 
 // parseBoolKnob reads one boolean knob. A value that is not a boolean costs
@@ -135,6 +139,7 @@ func parseKnobs(raw json.RawMessage) harnessKnobs {
 	parseBoolKnob(fields, "schedule", &k.Schedule, d.Schedule)
 	parseBoolKnob(fields, "memoryExtract", &k.MemoryExtract, d.MemoryExtract)
 	parseBoolKnob(fields, "memoryTidy", &k.MemoryTidy, d.MemoryTidy)
+	parseBoolKnob(fields, "webTools", &k.WebTools, d.WebTools)
 	if v, ok := fields["modelImages"]; ok {
 		var b bool
 		if err := json.Unmarshal(v, &b); err != nil {
@@ -204,6 +209,7 @@ func parseKnobs(raw json.RawMessage) harnessKnobs {
 type renderedSettings struct {
 	resolved settings.Resolved
 	env      []string // KEY=VALUE, sorted; see settingsEnv
+	knobs    harnessKnobs
 }
 
 // RenderSettings implements framework.Framework.
@@ -233,7 +239,7 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 	env := settingsEnv(s, knobs)
 
 	a.mu.Lock()
-	a.rendered = &renderedSettings{resolved: s, env: env}
+	a.rendered = &renderedSettings{resolved: s, env: env, knobs: knobs}
 	a.mu.Unlock()
 
 	level, decided := s.Effort()
@@ -269,6 +275,7 @@ func settingsEnv(s settings.Resolved, k harnessKnobs) []string {
 	env["SEAL_HARNESS_SCHEDULE"] = boolEnv(k.Schedule)
 	env["SEAL_HARNESS_MEMORY_EXTRACT"] = boolEnv(k.MemoryExtract)
 	env["SEAL_HARNESS_MEMORY_TIDY"] = boolEnv(k.MemoryTidy)
+	env["SEAL_HARNESS_WEB"] = boolEnv(k.WebTools)
 	env["SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS"] = strconv.Itoa(k.MaxParallelToolCalls)
 	if k.MCPServers != "" {
 		env["SEAL_MCP_SERVERS"] = k.MCPServers

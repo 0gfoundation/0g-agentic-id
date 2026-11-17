@@ -172,7 +172,15 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		if upstream == "" {
 			upstream = ep.BaseURL
 		}
-		route.SetRoute(inferproxy.Route{Upstream: upstream, Headers: inferenceHeaders(ep.Format, apiKey), Model: model, System: doc})
+		r := inferproxy.Route{Upstream: upstream, Headers: inferenceHeaders(ep.Format, apiKey), Model: model, System: doc}
+		// The 0G router also serves a web search under the same key: the
+		// route lets web/search through to it, and the harness's web_search
+		// posts there (src/web.mjs). Other providers have none.
+		if provider == inference.ZGComputeProvider && rendered.knobs.WebTools {
+			r.WebSearch = &inferproxy.WebSearch{URL: inferproxy.WebSearchURL(upstream), Headers: map[string]string{"Authorization": "Bearer " + apiKey}}
+			be.webSearchURL = route.BaseURL() + "/v1/web/search"
+		}
+		route.SetRoute(r)
 		be.apiKey, be.modelBaseURL, be.modelAPI = routedKeyPlaceholder, route.BaseURL(), wireAPI(ep.Format)
 		inferURL = ep.BaseURL
 	} else {
@@ -268,6 +276,9 @@ type bridgeEnv struct {
 	// modelAPI, when set, replaces the rendered SEAL_MODEL_API: the wire
 	// protocol of the endpoint the inference route forwards to.
 	modelAPI string
+	// webSearchURL, when set, is where the harness's web_search posts: the
+	// inference route's web/search (0G router only).
+	webSearchURL string
 }
 
 // modelEndpoint is the endpoint sealed's inference route forwards the
@@ -357,6 +368,9 @@ func (be bridgeEnv) environ() []string {
 		// Resolved by ctx.credentials from the process env (top, read-only
 		// layer), so the key never touches a credentials file.
 		env = append(env, "SEAL_MODEL_API_KEY="+be.apiKey)
+	}
+	if be.webSearchURL != "" {
+		env = append(env, "SEAL_HARNESS_WEB_SEARCH_URL="+be.webSearchURL)
 	}
 	// Public on-chain facts the agent (and seal-tools) benefit from knowing.
 	if be.rt.PublicURL != "" {

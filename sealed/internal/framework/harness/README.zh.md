@@ -29,7 +29,7 @@
 
 `spawn.go` 以 agent 用户身份运行 `node /opt/0g-harness/<sha256>/bin/0g-harness.mjs`(没有包的镜像上是 `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`),监听本机回环端口 8794,环境变量由 `environ()` 生成。这些环境变量的约定写在 harness 的 `docs/PROTOCOL.md` 里。
 
-- 只要 sealed 知道 provider 的 endpoint,harness 就通过 sealed 的推理代理(`internal/inferproxy`,一个回环地址)调用模型:注册表里的 managed provider,以及 `openai` 和 `anthropic`(sealed 固定的官方 endpoint)。代理写上 owner 的模型,在 system prompt 末尾附上 agent doc,并设置密钥;harness 手里只有占位符(`../../CONFIG_SURFACE.zh.md` §3、§7)。
+- 只要 sealed 知道 provider 的 endpoint,harness 就通过 sealed 的推理代理(`internal/inferproxy`,一个回环地址)调用模型:注册表里的 managed provider,以及 `openai` 和 `anthropic`(sealed 固定的官方 endpoint)。代理写上 owner 的模型,在 system prompt 末尾附上 agent doc,并设置密钥;harness 手里只有占位符(`../../CONFIG_SURFACE.zh.md` §3、§7)。模型走 0G router(`0g-compute`)且 `webTools` 打开时，代理还为 `web_search` 转发 `POST /v1/web/search`：只收 `{"query"}` 请求体，重新组装后设置密钥，不写模型名，也不附 agent doc(`inferproxy` `webSearch`)；harness 从 `SEAL_HARNESS_WEB_SEARCH_URL` 拿到这个地址。
 - harness 在 `/v1/*` 上检查它自己的 token(`SEAL_BRIDGE_TOKEN`)。owner 从 `/_seal/auth` 拿到的是另一个 token,sealed 的 proxy 在请求进来时把它换成 harness 的,所以 harness 运行的任何东西都看不到 owner 的 token。
 
 harness 做三件事:
@@ -80,10 +80,11 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | `toolJobs` | `false` | 命令可以放到后台跑(`run_in_background`),并提供 `job_*` 工具 |
 | `subagents` | `false` | 打开 `subagent` 工具:主 agent 派出去在后台跑的只读助手(会同时打开任务工具) |
 | `schedule` | `false` | 打开 `schedule_create` / `schedule_list` / `schedule_delete`:agent 给自己设的提醒 |
-| `maxParallelToolCalls` | `1` | 模型一步里最多同时运行几个工具调用。只对声明了可以并发的工具生效：`read`、`read_image`、`subagent`。`bash`、`write`、`edit`、`seal_*` 工具以及任务和提醒工具总是单独运行，等前面的调用结束才开始 |
+| `maxParallelToolCalls` | `1` | 模型一步里最多同时运行几个工具调用。只对声明了可以并发的工具生效：`read`、`read_image`、`web_search`、`web_fetch`、`subagent`。`bash`、`write`、`edit`、`seal_*` 工具以及任务和提醒工具总是单独运行，等前面的调用结束才开始 |
 | `modelImages` | 不设置 | 覆盖 owner 的模型能不能看图（`true`/`false`）。不设置时由服务商的模型列表决定（0G router 上是 `architecture.input_modalities`：glm-5.3 只收文字，glm-5.3-flash 能看图）；列表里没写时按 pi-ai 的模型目录。能看图时 owner 发的图片交给模型；不能时每张图存到 `~/inbox`，并告诉 agent 它看不到 |
 | `memoryExtract` | `true` | owner 对话压缩之前，harness 调用一次模型，把即将被摘要的那段对话里值得长期保留的内容写进长期记忆（0g-harness `src/memory-extract.mjs`）；设为 `false` 关闭。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT`。 |
 | `memoryTidy` | `true` | agent 空闲时，harness 不定期调用一次模型整理长期记忆：合并重复的，删掉过时或被推翻的（0g-harness `src/memory-tidy.mjs`；距上次整理 24 小时且记忆有变化时到期，索引接近上限时提前）；设为 `false` 关闭自动整理，`POST /v1/memory/tidy` 仍可按需整理一次。渲染为 `SEAL_HARNESS_MEMORY_TIDY`。 |
+| `webTools` | `true` | 打开 `web_fetch` 工具（把一个公网 http(s) 页面读成文本；私网和回环地址拒绝，DNS 解析之后也查；经凭证代理出站）；模型走 0G router（`0g-compute`）时还打开 `web_search`（经推理代理调 router 的 `/v1/web/search`，按次计费，记在 owner 的 0G Compute key 上）（0g-harness `src/web.mjs`）；设为 `false` 两个都关。渲染为 `SEAL_HARNESS_WEB`。 |
 
 这里填错,不会让 agent 起不来。`RenderSettings` 每次 spawn 前都会运行,要是在这里报错,agent 就开不了机,而不是"这次推送被拒"。所以解析不了或超出范围的值,一律退回出厂默认值,在日志里说明,其他开关照常生效(`settings.go`)。
 

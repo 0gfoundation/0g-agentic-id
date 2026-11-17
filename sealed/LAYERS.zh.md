@@ -122,8 +122,8 @@ owner 可以直接重启 harness 或 sealed（`POST /_seal/restart`，第 10 节
 ### 4.2 中立代理
 
 1. **入口**：外部只能连 8080。sealed 只转发清单里的 harness 路由和方法。清单写在 sealed 的 adapter 里，harness 不能自己加。对外服务的响应签 ServeProof。
-2. **推理**：harness 只能经 sealed 调模型。sealed 代填 key，只转发到 owner 设置的路由，模型名也按 owner 的设置，并在每个模型请求里放入平台说明和 doctrine。harness 改了自己的代码，也去不掉这两样。只放行模型调用，按路由下的精确路径：`chat/completions`、`messages`、`responses` 和模型列表。
-3. **出站**：harness 除调模型以外的外发请求，比如搜网页、调第三方 API、装依赖，也经过 sealed，由 sealed 代填凭证、按白名单放行。这一条依赖网络层能拦住 harness 绕过 sealed 直连外网（见第 9 节）。
+2. **推理**：harness 只能经 sealed 调模型。sealed 代填 key，只转发到 owner 设置的路由，模型名也按 owner 的设置，并在每个模型请求里放入平台说明和 doctrine。harness 改了自己的代码，也去不掉这两样。只放行模型调用，按路由下的精确路径：`chat/completions`、`messages`、`responses` 和模型列表；0G router 上还有它的网页搜索（`web/search`，只带查询词，不写模型名，也不放平台说明）。
+3. **出站**：harness 除调模型以外的外发请求，比如读网页、调第三方 API、装依赖，也经过 sealed，由 sealed 代填凭证、按白名单放行。这一条依赖网络层能拦住 harness 绕过 sealed 直连外网（见第 9 节）。
 4. **签名**：签名 socket 只签三种格式：personal_sign、EIP-712 和交易；不签任意哈希，也签不了 ServeProof 所在的那一类。三种格式之内，它拒签发往 AgenticID `update` 或 `updateAt` 的交易（iData 由 drift watcher 提交），并把签出的每个签名和拒绝的每个请求记下来给 owner 看。其余能签什么，由签名策略决定（第 9 节第 4 条）。
 
 签名 socket 和凭据 socket 的端点也作为 MCP 工具提供（socket 上的 `POST /mcp`）。工具定义在 sealed 里，经对应端点执行，harness 挂载即可，不会多出 socket 不允许的事。
@@ -307,7 +307,7 @@ salt(root) = HMAC-SHA256(数据密钥, "AgentDNA.Commitment.v1" ‖ 0x00 ‖ 角
 ### 中立代理：可以单独发布
 
 harness 只跑官方版本，原来写在 harness 里的规则都还在，所以中立代理不必和第一步同一个版本发布：
-- 推理代理覆盖所有 provider：sealed 在本机回环端口开推理代理，作为 harness 的模型地址；每个请求按 owner 设置的模型名转发到 owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方地址，第 7 节），key 由凭证代理在出去时代填，harness 拿到的 key 是个占位值；只放行 chat/completions、messages、responses 和模型列表这几类调用，按精确路径；
+- 推理代理覆盖所有 provider：sealed 在本机回环端口开推理代理，作为 harness 的模型地址；每个请求按 owner 设置的模型名转发到 owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方地址，第 7 节），key 由凭证代理在出去时代填，harness 拿到的 key 是个占位值；只放行 chat/completions、messages、responses 和模型列表这几类调用，按精确路径，0G router 上还放行它的网页搜索（`web/search`）；
 - doctrine 由推理代理注入：平台说明（含 doctrine）放在每个模型请求的系统提示末尾，sealed 不再给 0g-harness 写 `/run` 下的平台说明文件；
 - 令牌不交给 harness：owner 经 `/_seal/auth` 拿到的令牌和 harness 校验的令牌是两个，proxy 在入口核对 owner 的令牌，换成 harness 的再转发；
 - 0g-harness 的路由逐条列出：方法加路径，按 harness 协议第 1 版，清单以外的请求返回 404；
