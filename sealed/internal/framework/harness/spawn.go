@@ -622,6 +622,10 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			get("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/cancel")),
 		route("/v1/schedules", "schedules", "Reminders the agent set for itself: GET /v1/schedules (enabled:false unless the owner's `schedule` knob is on).",
 			get("/v1/schedules"), framework.Endpoint{Method: http.MethodDelete, Path: "/v1/schedules/{id}"}),
+		// Long-term memory upkeep on the owner's request: one consolidation
+		// pass now (the automatic one follows others.memoryTidy).
+		route("/v1/memory", "memory", "Long-term memory upkeep: POST /v1/memory/tidy runs one consolidation pass now (merge duplicates, drop stale memories), only while no turn runs.",
+			post("/v1/memory/tidy")),
 		// Owner files: written by the harness (the agent user) to a new name
 		// under ~/uploads, where the agent reads them. Images ride the chat
 		// and Responses messages themselves.

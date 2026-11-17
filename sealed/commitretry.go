@@ -125,19 +125,22 @@ func commitFailureStatus(err error, consecutive int, short string) (level, messa
 	return "warning", fmt.Sprintf("agent data not committed to chain (%d attempts): %s", consecutive, summary)
 }
 
-// fundsShortfall says, for a failed commit whose error does not name the
-// cause, whether the seal wallet cannot pay the step it failed at. A wallet
-// short of gas does not always fail as "insufficient funds": on Galileo at
-// 2000 gwei a storage submit's gas estimate came back as a bare
-// "execution reverted" (dev, 2026-11-17, 0.1041 OG against ~0.9 OG needed),
-// which counted as an "other" failure and showed only at the fifth, about
-// ten minutes later with the backoff. read is the uploader's FundsFor. ""
-// when the wallet holds enough, the error already says funds (severityOf), or
-// the read fails: the count rule then stands.
+// fundsShortfall says whether the seal wallet cannot pay the step a commit
+// failed at, as the owner should read it: the wallet, what it holds, and
+// about what the next transaction needs. It is asked for every failure:
+//   - A wallet short of gas does not always fail as "insufficient funds": on
+//     Galileo at 2000 gwei a storage submit's gas estimate came back as a
+//     bare "execution reverted" (dev, 2026-11-17, 0.1041 OG against ~0.9 OG
+//     needed), which counted as an "other" failure and showed only at the
+//     fifth, about ten minutes later with the backoff.
+//   - An "insufficient funds" error names the wrong amount: the storage
+//     client's "have 0 want 30733644962" is the blob's storage fee (about
+//     3e-8 OG), not the ~1.5 OG of gas a commit needs (dev, 2026-11-17).
+//
+// read is the uploader's FundsFor. "" when the wallet holds enough or the
+// read fails: the error's own grading then stands (severityOf, the count
+// rule).
 func fundsShortfall(ctx context.Context, read func(context.Context, error) (uploader.WalletFunds, error), err error) string {
-	if severityOf(err) == "warning" {
-		return ""
-	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	f, rerr := read(ctx, err)

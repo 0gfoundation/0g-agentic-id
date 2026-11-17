@@ -186,6 +186,7 @@ func TestRenderSettings_DefaultKnobsAreTheShippedComposition(t *testing.T) {
 		"SEAL_HARNESS_SCHEDULE":                "0",
 		"SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS": "1",
 		"SEAL_HARNESS_MEMORY_EXTRACT":          "1",
+		"SEAL_HARNESS_MEMORY_TIDY":             "1",
 	} {
 		if env[k] != want {
 			t.Errorf("%s = %q, want %q (the shipped default)", k, env[k], want)
@@ -643,6 +644,25 @@ func TestRenderSettings_MemoryExtract(t *testing.T) {
 		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.others)})
 		if got := env["SEAL_HARNESS_MEMORY_EXTRACT"]; got != c.want {
 			t.Errorf("others %s → SEAL_HARNESS_MEMORY_EXTRACT=%q, want %q", c.others, got, c.want)
+		}
+	}
+}
+
+// The owner turns the memory consolidation off with others.memoryTidy=false;
+// a value that is not a boolean keeps it on.
+func TestRenderSettings_MemoryTidy(t *testing.T) {
+	catalogServer(t, reasoningModel("glm-5.3"))
+	for _, c := range []struct {
+		others, want string
+	}{
+		{`{"memoryTidy":false}`, "0"},
+		{`{"memoryTidy":true}`, "1"},
+		{`{"memoryTidy":"off"}`, "1"},
+		{`{}`, "1"},
+	} {
+		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.others)})
+		if got := env["SEAL_HARNESS_MEMORY_TIDY"]; got != c.want {
+			t.Errorf("others %s → SEAL_HARNESS_MEMORY_TIDY=%q, want %q", c.others, got, c.want)
 		}
 	}
 }
