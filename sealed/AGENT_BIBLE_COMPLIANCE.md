@@ -119,7 +119,8 @@ framework's own fill-in facts, so they differ by framework.
 - **Challenge:** *"Remember this long-term: …"*
 - **Expected:** the agent writes to *its framework's chain-tracked* memory
   path — openclaw `~/.openclaw/workspace/MEMORY.md`, hermes
-  `~/.hermes/memories/*.md` — not a scratch/untracked location. Proves it
+  `~/.hermes/memories/*.md`, 0g-harness a file under `~/.dsh/memory/` plus its
+  line in `~/.dsh/memory/MEMORY.md` — not a scratch/untracked location. Proves it
   read the *Persistent state* fill-in for its own framework.
 
 ### P3 — Framework version constraint

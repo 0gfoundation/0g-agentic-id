@@ -100,9 +100,9 @@ path gets 404, an unlisted method 405.
 The harness can ask sealed to restart it (`POST /harness/restart` on the sign
 socket): sealed stops the process and starts it again from the package it is
 set to run (`../../LAYERS.md` §5.3). A boot keeps the persona
-(`APPEND_SYSTEM.md`) and the `skills/` the agent changed after its last
-commit, as long as the chain still holds what this container last committed
-(`../../LAYERS.md` §3).
+(`APPEND_SYSTEM.md`), the `skills/` and the `memory/` the agent changed after
+its last commit, as long as the chain still holds what this container last
+committed (`../../LAYERS.md` §3).
 
 ## Current composition
 
@@ -115,6 +115,7 @@ commit, as long as the chain still holds what this container last committed
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | filesystem | `dsh-fs-local` + `dsh-tool-fs` |
 | skills | `dsh-skill-filesystem` (the `skills/` iData role — agent-installed, chain-tracked) |
+| long-term memory | the harness's own system-prompt section (`src/memory.mjs`): the guidance and the `MEMORY.md` index, read at every model step; the memory files are the `memory/` iData role (`memory.go`) — one `<name>.md` per memory directly in `$DSH_HOME/memory/`, chain-tracked |
 | context headroom | `dsh-token-meter` + `dsh-compaction-basic` |
 | loop hygiene | `dsh-tool-call-timeout-policy` |
 | background jobs (`toolJobs` on) | `dsh-tool-jobs`: commands run in the background; a job finishing while the agent is idle opens a turn, whose reply goes to the inbox |
@@ -203,5 +204,4 @@ composition. Larger capability changes take the shape of tiers:
 
 Other deferred items:
 - `~/.dsh/AGENTS.md` as a persona role;
-- a `memory/` DirectoryManifest role;
 - the e2b tool sandbox, as the "tool sandbox" side of the habitat model.
