@@ -13,15 +13,16 @@ import (
 // token, and none may be signed (the owner's steering channel never is).
 func TestFrameworkRoutesAdvertiseTheHarnessSurface(t *testing.T) {
 	want := map[string]string{
-		"/v1/":          "chat",
-		"/v1/responses": "responses",
-		"/v1/inbox":     "inbox",
-		"/v1/events":    "events",
-		"/v1/tasks":     "tasks",
-		"/v1/schedules": "schedules",
-		"/v1/files":     "files",
-		"/v1/memory":    "memory",
-		"/v1/steer":     "steer",
+		"/v1/":           "chat",
+		"/v1/responses":  "responses",
+		"/v1/inbox":      "inbox",
+		"/v1/events":     "events",
+		"/v1/activities": "activities",
+		"/v1/tasks":      "tasks",
+		"/v1/schedules":  "schedules",
+		"/v1/files":      "files",
+		"/v1/memory":     "memory",
+		"/v1/steer":      "steer",
 	}
 	routes := New().FrameworkRoutes()
 	if len(routes) != len(want) {
@@ -63,6 +64,9 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/inbox", "GET", "/v1/inbox"},
 		{"/v1/inbox", "POST", "/v1/inbox/ack"},
 		{"/v1/events", "GET", "/v1/events"},
+		{"/v1/activities", "GET", "/v1/activities"},
+		{"/v1/activities", "GET", "/v1/activities/bash-1"},
+		{"/v1/activities", "POST", "/v1/activities/all/cancel"},
 		{"/v1/tasks", "GET", "/v1/tasks"},
 		{"/v1/tasks", "GET", "/v1/tasks/bash-1"},
 		{"/v1/tasks", "POST", "/v1/tasks/all/cancel"},
@@ -87,6 +91,8 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/", "POST", "/v1/export"},
 		{"/v1/", "GET", "/v1/chat/completions"},
 		{"/v1/responses", "DELETE", "/v1/responses/resp_1"},
+		{"/v1/activities", "POST", "/v1/activities/a/b/cancel"},
+		{"/v1/activities", "GET", "/v1/activities/"},
 		{"/v1/tasks", "POST", "/v1/tasks/a/b/cancel"},
 		{"/v1/tasks", "GET", "/v1/tasks/"},
 		{"/v1/inbox", "GET", "/v1/inbox/all"},

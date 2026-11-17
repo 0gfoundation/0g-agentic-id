@@ -31,7 +31,7 @@ import {
   printAbovePrompt,
   renderInboxMessage,
   renderSchedules,
-  renderTaskTable,
+  renderActivityTable,
 } from '../dist/cli/commands/interactive.js';
 import { assertOthersFitFramework, isHarnessFramework, parseAssignments } from '../dist/cli/settings.js';
 
@@ -40,10 +40,11 @@ const HARNESS_ROUTES = [
   { prefix: '/v1/responses', kind: 'responses', auth: 'bearer', signed: false },
   { prefix: '/v1/inbox', kind: 'inbox', auth: 'bearer', signed: false },
   { prefix: '/v1/events', kind: 'events', auth: 'bearer', signed: false },
+  { prefix: '/v1/activities', kind: 'activities', auth: 'bearer', signed: false },
   { prefix: '/v1/tasks', kind: 'tasks', auth: 'bearer', signed: false },
   { prefix: '/v1/schedules', kind: 'schedules', auth: 'bearer', signed: false },
 ];
-const WORK_METHODS = ['inbox', 'ackInbox', 'events', 'tasks', 'taskInfo', 'stopTask', 'stopAllTasks', 'schedules'];
+const WORK_METHODS = ['inbox', 'ackInbox', 'events', 'activities', 'activity', 'stopActivity', 'stopAllActivities', 'tasks', 'taskInfo', 'stopTask', 'stopAllTasks', 'schedules'];
 
 /** Mock agent: `handle(req, body, res, seen)` answers; `seen` records requests. */
 async function mockAgent(handle) {
@@ -99,17 +100,17 @@ test('without a way to authenticate, the declared kinds attach nothing', () => {
 
 // ── 2. requests and answers ─────────────────────────────────────────────────
 
-test('inbox, ack, tasks, task info, stop, stop all, schedules: the protocol requests', async () => {
+test('inbox, ack, activities, activity, stop, stop all, schedules: the protocol requests', async () => {
   const agent = await mockAgent((req, body, res) => {
     const path = req.url.split('?')[0];
     if (req.method === 'GET' && path === '/v1/inbox') {
       return json(res, 200, { object: 'list', unread: 1, read_through: 3, cursor: 9, data: [{ seq: 4, id: 'resp_a', trigger: 'job', label: 'bash x', status: 'completed', text: 'done', created_at: 1 }] });
     }
     if (req.method === 'POST' && path === '/v1/inbox/ack') return json(res, 200, { read_through: JSON.parse(body).through, unread: 0 });
-    if (req.method === 'GET' && path === '/v1/tasks') return json(res, 200, { object: 'list', data: [{ id: 'bash-1', type: 'command', status: 'in_progress', actor: 'agent', trigger: 'agent', label: 'npm test', created_at: 1 }] });
-    if (req.method === 'GET' && path === '/v1/tasks/subagent-2') return json(res, 200, { id: 'subagent-2', type: 'subagent', status: 'completed', actor: 'subagent', trigger: 'agent', label: 'read docs', created_at: 1, output_text: 'summary' });
-    if (req.method === 'POST' && path === '/v1/tasks/bash-1/cancel') return json(res, 200, { id: 'bash-1', outcome: 'cancelled' });
-    if (req.method === 'POST' && path === '/v1/tasks/all/cancel') return json(res, 200, { object: 'list', data: [{ id: 'resp_b', outcome: 'cancelled' }] });
+    if (req.method === 'GET' && path === '/v1/activities') return json(res, 200, { object: 'list', data: [{ id: 'bash-1', type: 'command', status: 'in_progress', actor: 'agent', trigger: 'agent', label: 'npm test', created_at: 1 }] });
+    if (req.method === 'GET' && path === '/v1/activities/subagent-2') return json(res, 200, { id: 'subagent-2', type: 'subagent', status: 'completed', actor: 'subagent', trigger: 'agent', label: 'read docs', created_at: 1, output_text: 'summary' });
+    if (req.method === 'POST' && path === '/v1/activities/bash-1/cancel') return json(res, 200, { id: 'bash-1', outcome: 'cancelled' });
+    if (req.method === 'POST' && path === '/v1/activities/all/cancel') return json(res, 200, { object: 'list', data: [{ id: 'resp_b', outcome: 'cancelled' }] });
     if (req.method === 'GET' && path === '/v1/schedules') return json(res, 200, { object: 'list', enabled: false, data: [] });
     return json(res, 404, { error: { message: `no route for ${req.method} ${path}` } });
   });
@@ -120,22 +121,23 @@ test('inbox, ack, tasks, task info, stop, stop all, schedules: the protocol requ
     assert.equal(page.cursor, 9);
     assert.equal(page.data[0].text, 'done');
     assert.deepEqual(await c.ackInbox(4), { read_through: 4, unread: 0 });
-    assert.deepEqual((await c.tasks({ status: 'active' })).map((t) => t.id), ['bash-1']);
-    assert.equal((await c.taskInfo('subagent-2')).output_text, 'summary');
-    assert.deepEqual(await c.stopTask('bash-1'), { id: 'bash-1', outcome: 'cancelled' });
-    assert.deepEqual(await c.stopAllTasks(), [{ id: 'resp_b', outcome: 'cancelled' }]);
+    assert.deepEqual((await c.activities({ status: 'active' })).map((t) => t.id), ['bash-1']);
+    assert.equal((await c.activity('subagent-2')).output_text, 'summary');
+    assert.deepEqual(await c.stopActivity('bash-1'), { id: 'bash-1', outcome: 'cancelled' });
+    assert.deepEqual(await c.stopAllActivities(), [{ id: 'resp_b', outcome: 'cancelled' }]);
     assert.deepEqual(await c.schedules(), { enabled: false, data: [] });
-    await assert.rejects(c.taskInfo('bash-9'), /taskInfo: HTTP 404/);
+    await assert.rejects(c.activity('bash-9'), /activity: HTTP 404/);
 
     const urls = agent.seen.map((r) => `${r.method} ${r.url}`);
     assert.deepEqual(urls, [
       'GET /v1/inbox?after=0&limit=5',
       'POST /v1/inbox/ack',
-      'GET /v1/tasks?status=active',
-      'GET /v1/tasks/subagent-2',
-      'POST /v1/tasks/bash-1/cancel',
-      'POST /v1/tasks/all/cancel',
+      'GET /v1/activities?status=active',
+      'GET /v1/activities/subagent-2',
+      'POST /v1/activities/bash-1/cancel',
+      'POST /v1/activities/all/cancel',
       'GET /v1/schedules',
+      'GET /v1/activities/bash-9',
       'GET /v1/tasks/bash-9',
     ]);
     assert.equal(agent.seen[1].body, '{"through":4}');
@@ -145,12 +147,52 @@ test('inbox, ack, tasks, task info, stop, stop all, schedules: the protocol requ
   }
 });
 
-test('stopTask("all") is refused without a request: it is stopAllTasks()', async () => {
+test('stopActivity("all") is refused without a request: it is stopAllActivities()', async () => {
   const agent = await mockAgent((req, body, res) => json(res, 200, {}));
   try {
     const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS_ROUTES, token: 'tok' });
-    await assert.rejects(c.stopTask('all'), /stopAllTasks/);
+    await assert.rejects(c.stopActivity('all'), /stopAllActivities/);
+    await assert.rejects(c.stopTask('all'), /stopAllActivities/);
     assert.equal(agent.seen.length, 0);
+  } finally {
+    agent.stop();
+  }
+});
+
+test('an older harness without /v1/activities: the deprecated /v1/tasks answers, and the client stays on it', async () => {
+  const agent = await mockAgent((req, body, res) => {
+    const path = req.url.split('?')[0];
+    if (path.startsWith('/v1/activities')) return json(res, 404, { error: { message: `no route for ${req.method} ${path}` } });
+    if (req.method === 'GET' && path === '/v1/tasks') return json(res, 200, { object: 'list', data: [{ id: 'resp_a', type: 'turn', status: 'completed', actor: 'agent', trigger: 'user', label: 'hi', created_at: 1 }] });
+    if (req.method === 'POST' && path === '/v1/tasks/resp_a/cancel') return json(res, 200, { id: 'resp_a', outcome: 'already-finished' });
+    return json(res, 404, { error: { message: 'no' } });
+  });
+  try {
+    const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS_ROUTES, token: 'tok' });
+    assert.deepEqual((await c.activities()).map((t) => t.id), ['resp_a']);
+    assert.deepEqual(await c.stopActivity('resp_a'), { id: 'resp_a', outcome: 'already-finished' });
+    assert.deepEqual(agent.seen.map((r) => `${r.method} ${r.url}`), [
+      'GET /v1/activities',
+      'GET /v1/tasks',
+      'POST /v1/tasks/resp_a/cancel',
+    ]);
+  } finally {
+    agent.stop();
+  }
+});
+
+test('a runtime that declares only kind "tasks" (before the rename) is served through /v1/tasks', async () => {
+  const agent = await mockAgent((req, body, res) => {
+    const path = req.url.split('?')[0];
+    if (req.method === 'GET' && path === '/v1/tasks') return json(res, 200, { object: 'list', data: [] });
+    return json(res, 404, { error: { message: 'no' } });
+  });
+  try {
+    const routes = HARNESS_ROUTES.filter((r) => r.kind !== 'activities');
+    const c = makeAgentClient({ base: agent.base, services: [], routes, token: 'tok' });
+    assert.deepEqual(await c.activities(), []);
+    assert.deepEqual(await c.tasks(), []);
+    assert.deepEqual(agent.seen.map((r) => r.url), ['/v1/tasks', '/v1/tasks']);
   } finally {
     agent.stop();
   }
@@ -519,7 +561,7 @@ test('without a terminal a notice is just written', () => {
 
 test('/tasks table: who did it and who asked, ids whole, labels cleaned', () => {
   const now = 1_000_000_000;
-  const lines = renderTaskTable([
+  const lines = renderActivityTable([
     { id: 'resp_0123456789abcdef01234567', type: 'turn', status: 'in_progress', actor: 'agent', trigger: 'user', label: 'summarize the repo', created_at: now / 1000 - 12 },
     { id: 'subagent-1', type: 'subagent', status: 'completed', actor: 'subagent', trigger: 'agent', label: 'review \u001b[31mtests\u001b[0m', created_at: now / 1000 - 300 },
     { id: 'resp_ffffffffffffffffffffffff', type: 'turn', status: 'completed', actor: 'agent', trigger: 'schedule', label: 'stand-up', created_at: now / 1000 - 7200 },

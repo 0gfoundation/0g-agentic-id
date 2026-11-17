@@ -31,7 +31,7 @@ export type { ContainerStatus, DeployAccepted, WaitLevel, ModelKeyLifecycleOpts 
 export { makeAgentClient } from './AgentClient';
 export type {
   AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask,
-  AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
+  AgentActivityInfo, AgentActivityStop, AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
   ChatImage, ChatNotice, UploadedFile, SteerResult, SteerState, AgentFile, AgentFileDir,
 } from './AgentClient';
 export { mcpServices, withImages } from './AgentClient';
