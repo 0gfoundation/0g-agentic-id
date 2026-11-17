@@ -43,6 +43,7 @@ type isolatedCommand struct {
 	*exec.Cmd
 	uid              uint32
 	runtimeHash      string
+	agentData        []AgentDataVersion // the agent data versions staged for it
 	release          func()
 	limits           limits
 	cleanupResource  func(context.Context) error // private lifecycle hook; production reaps the identity
