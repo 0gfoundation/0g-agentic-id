@@ -32,7 +32,7 @@ export { makeAgentClient } from './AgentClient';
 export type {
   AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask,
   AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
-  ChatImage, ChatNotice, UploadedFile,
+  ChatImage, ChatNotice, UploadedFile, SteerResult, SteerState,
 } from './AgentClient';
 export { mcpServices, withImages } from './AgentClient';
 export { defaultIData, DEFAULT_PERSONA_INFERENCE, deploymentFactsOf, needsDefaultSettings, storeDefaultSettings } from './AttestorClient';

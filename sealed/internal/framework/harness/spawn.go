@@ -631,5 +631,10 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 		// and Responses messages themselves.
 		route("/v1/files", "files", "Owner file upload: POST /v1/files {name, content_base64} → {path, bytes}; the file lands under the agent's ~/uploads (container-local, not tracked), at most 25 MiB.",
 			post("/v1/files")),
+		// The owner's word for the turn already running: read before that
+		// turn's next model call (DSH next-step input); queued as an
+		// ordinary turn when no owner turn is running.
+		route("/v1/steer", "steer", "Owner text for the running turn: POST /v1/steer {text} → {merged:true, id, turn} (read before the turn's next model call) or {merged:false, queued} (no owner turn running: an ordinary turn); GET /v1/steer/{id} → {state, turn}.",
+			post("/v1/steer"), get("/v1/steer/{id}")),
 	}
 }

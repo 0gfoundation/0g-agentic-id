@@ -37,7 +37,7 @@ harness 做三件事:
 - 把这段对话和它的轮次记录存在一起(`../../CONVERSATION.zh.md`);
 - 把每一轮的输出交给开启这一轮的一方。owner 开启的轮次,交给 owner 的那个请求;agent 自己开启的轮次(后台任务结束、提醒到点),进收件箱。
 
-`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`、`files`、`memory`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后六种,对它们没有任何改变。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。
+`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`、`files`、`memory`、`steer`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后七种,对它们没有任何改变。`steer` 是 owner 给正在运行的那一轮的话:harness 在这一轮下一次调用模型之前读到它;没有 owner 的轮次在运行时,它作为普通轮次排队。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。
 
 harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)、`skills/` 和 `memory/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
 
