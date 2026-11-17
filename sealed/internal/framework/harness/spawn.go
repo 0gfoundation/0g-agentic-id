@@ -181,6 +181,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 			be.webSearchURL = route.BaseURL() + "/v1/web/search"
 		}
 		route.SetRoute(r)
+		be.docRouted = true
 		be.apiKey, be.modelBaseURL, be.modelAPI = routedKeyPlaceholder, route.BaseURL(), wireAPI(ep.Format)
 		inferURL = ep.BaseURL
 	} else {
@@ -273,6 +274,9 @@ type bridgeEnv struct {
 	// agentDoc is the path of the agent doc file, "" when the doc rides the
 	// inference route instead.
 	agentDoc string
+	// docRouted is true when the agent doc rides the inference route (sealed
+	// adds it to every model request), so the harness has no file to read.
+	docRouted bool
 	// modelAPI, when set, replaces the rendered SEAL_MODEL_API: the wire
 	// protocol of the endpoint the inference route forwards to.
 	modelAPI string
@@ -346,6 +350,9 @@ func (be bridgeEnv) environ() []string {
 	}
 	if be.agentDoc != "" {
 		env = append(env, "SEAL_AGENT_DOC="+be.agentDoc)
+	}
+	if be.docRouted {
+		env = append(env, "SEAL_AGENT_DOC_ROUTE=inference")
 	}
 	// Everything the owner's settings decide (pin, endpoint, reasoning bound,
 	// composition knobs) — rendered once, deterministically, before Start.

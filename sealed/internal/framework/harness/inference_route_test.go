@@ -32,6 +32,25 @@ func TestBridgeEnvAgentDocOnlyAsAFile(t *testing.T) {
 	}
 }
 
+// When the doc rides the inference route the harness is told so, and only
+// then: it has no file to read and must not warn the doc is absent.
+func TestBridgeEnvSaysWhenTheDocIsRouted(t *testing.T) {
+	routed := func(env []string) bool {
+		for _, kv := range env {
+			if kv == "SEAL_AGENT_DOC_ROUTE=inference" {
+				return true
+			}
+		}
+		return false
+	}
+	if !routed(bridgeEnv{token: "tok", docRouted: true}.environ()) {
+		t.Error("SEAL_AGENT_DOC_ROUTE missing on the inference route")
+	}
+	if routed(bridgeEnv{token: "tok", agentDoc: agentDocPath()}.environ()) {
+		t.Error("SEAL_AGENT_DOC_ROUTE set with a doc file")
+	}
+}
+
 // The inference route carries the key the way each wire takes it.
 func TestInferenceHeaders(t *testing.T) {
 	if h := inferenceHeaders(inference.WireOpenAI, "k"); len(h) != 1 || h["Authorization"] != "Bearer k" {

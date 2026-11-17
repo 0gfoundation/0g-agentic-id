@@ -928,9 +928,9 @@ for await (const e of agent.events!({ after: box.cursor, signal })) {
 }
 
 const running = await agent.activities!({ status: 'active' });
-// every turn (yours and the agent's), command (bash-N) and subagent (subagent-N):
+// every turn (yours and the agent's), command (bash-<hex>) and subagent (its session id, a UUID):
 // actor = who does the work (agent | subagent), trigger = who asked
-await agent.activity!('subagent-1');      // includes a finished subagent's answer
+await agent.activity!(running[0].id);     // a finished subagent's entry includes its answer
 await agent.stopActivity!('bash-2');      // a turn is cancelled, a command or subagent is killed
 await agent.stopAllActivities!();         // everything running
 // tasks/taskInfo/stopTask/stopAllTasks are the deprecated names of these; "task"
