@@ -79,11 +79,23 @@ Nothing outside that allowlist is settable by anyone. Measured code decides:
   `anthropic` at their official endpoints, fixed in sealed. The route names
   the owner's model, appends the agent doc to the system prompt and sets the
   key; the harness holds a placeholder (`../../CONFIG_SURFACE.md` §3, §7).
-  On the 0G router (`0g-compute`) with `webTools` on, the route also forwards
-  `POST /v1/web/search` for `web_search`: it takes only a `{"query"}` body,
-  rebuilds it and sets the key, with no model and no agent doc
-  (`inferproxy` `webSearch`); the harness gets its address as
-  `SEAL_HARNESS_WEB_SEARCH_URL`.
+  With `webTools` on and the owner's search service payable, the route also
+  serves `POST /v1/web/search` for `web_search`: it takes only a `{"query"}`
+  body and sends it to that service with no agent doc (`inferproxy`
+  `websearch.go`), answering in the 0G router's result shape; the harness
+  gets its address as `SEAL_HARNESS_WEB_SEARCH_URL`.
+- The owner's further subagent models (`subagentModels`) are routes of the
+  same proxy (`modelroutes.go`): a model on the main model's own endpoint and
+  key is one more model the main route takes; any other is a named route
+  under `/p/<id>` with its own upstream, key and models. Each route pins its
+  models and carries the agent doc; a named route refuses any other model
+  name. The harness gets them as `SEAL_HARNESS_MODEL_ROUTES` (no keys).
+- One rule decides how the search service and each further model are paid:
+  the main model's provider with no credential named uses the model key; a
+  named owner credential goes through the credential proxy as its
+  placeholder, which the proxy fills only on the hosts and in the positions
+  the owner allowed; otherwise the search or model is not offered, and the
+  log says why.
 - The harness checks its own token on `/v1/*` (`SEAL_BRIDGE_TOKEN`). The
   owner gets a different one from `/_seal/auth`, and sealed's proxy swaps it
   for the harness's on the way in, so nothing the harness runs sees the
@@ -182,7 +194,10 @@ container does not.
 | `memoryExtractMinMessages` | `6` | how many of the owner's and the agent's messages must be new since the last pass before a turn that saved nothing is read for memories (1 to 1000). Rendered as `SEAL_HARNESS_MEMORY_EXTRACT_MIN_MESSAGES`. |
 | `memoryRecall` | `true` | above `memoryInlineBytes`, before each owner message the harness makes one model call that picks up to 5 memories whose bodies will help and puts them ahead of the message (0g-harness `src/memory-recall.mjs`); `false` turns it off. Rendered as `SEAL_HARNESS_MEMORY_RECALL`. |
 | `memoryTidy` | `true` | now and then, while the agent is idle, the harness makes one model call per memory role that consolidates that role's memories the current owner trusts: merges duplicates, drops what is stale or contradicted, never moves anything between the roles (0g-harness `src/memory-tidy.mjs`; due 24 h after the last pass once the memories changed, or sooner when an index nears its cap); `false` turns the automatic pass off, and `POST /v1/memory/tidy` still runs one on request. Rendered as `SEAL_HARNESS_MEMORY_TIDY`. |
-| `webTools` | `true` | the `web_fetch` tool (one public http(s) page as text; private and loopback addresses refused, also after DNS; out through the credential proxy) and, when the model is on the 0G router (`0g-compute`), `web_search` (the router's `/v1/web/search` through the inference route, billed per search to the owner's 0G Compute key) (0g-harness `src/web.mjs`); `false` turns both off. Rendered as `SEAL_HARNESS_WEB`. |
+| `webTools` | `true` | the `web_fetch` tool (one public http(s) page as text; private and loopback addresses refused, also after DNS; out through the credential proxy) and `web_search` through the service `webSearch` picks (0g-harness `src/web.mjs`); `false` turns both off. Rendered as `SEAL_HARNESS_WEB`. |
+| `webSearch` | `{"service":"0g-router"}` | `{"service", "credential"?, "model"?}`. `service`: `0g-router` (the router's result list), `openai` (one Responses call with the `web_search` tool) or `anthropic` (one Messages call with the `web_search_20250305` server tool), whose answer comes back first and its sources after it; `off` removes `web_search`. Paid with the model key when the model's provider is that service and no `credential` is named, else with the named owner credential, which must allow the service's host and key header. `model` runs an `openai`/`anthropic` search; default: the main model when it is on that provider. The provider registry's `webSearch` field says which service each provider's key pays (`0g-agentdna providers`). |
+| `subagentModels` | none | further models subagents may name, at most 8 `{"provider", "model", "credential"?}`, paid by the same rule as `webSearch`; the main model is always offered. Needs `subagents`. A malformed list is dropped whole. |
+| `subagentDefault` | the main model | `{"provider", "model"}`: what a subagent runs on when the call names no model; the main model or one of `subagentModels`, else ignored. |
 | `memoryInlineBytes` | `8192` | up to this many bytes of memory bodies (both memory roles) every memory is in the system prompt whole and there is no recall; above it, the indexes and recall (256 to 65536). Rendered as `SEAL_HARNESS_MEMORY_INLINE_BYTES`. |
 
 A bad value here never fails a boot. `RenderSettings` runs before every spawn,

@@ -97,6 +97,7 @@ export function parseAssignments(args: string[]): Assignment[] {
           remedy: FRAMEWORK_QUOTING,
         });
       }
+      assertHarnessKnobShapes(parsed);
       out.push({ key, value: parsed });
       continue;
     }
@@ -106,7 +107,81 @@ export function parseAssignments(args: string[]): Assignment[] {
 }
 
 /** `others` keys only the 0g-harness adapter reads (sealed `harness/settings.go`). */
-export const HARNESS_ONLY_KEYS = ['toolJobs', 'subagents', 'schedule', 'maxParallelToolCalls', 'modelImages', 'memoryExtract', 'memoryExtractMinMessages', 'memoryInlineBytes', 'memoryRecall', 'memoryTidy', 'webTools'] as const;
+export const HARNESS_ONLY_KEYS = ['toolJobs', 'subagents', 'schedule', 'maxParallelToolCalls', 'modelImages', 'memoryExtract', 'memoryExtractMinMessages', 'memoryInlineBytes', 'memoryRecall', 'memoryTidy', 'webTools', 'webSearch', 'subagentModels', 'subagentDefault'] as const;
+
+/** Search services `others.webSearch.service` may name (sealed `inference.SearchServices`), and `off`. */
+export const WEB_SEARCH_SERVICES = ['0g-router', 'openai', 'anthropic', 'off'] as const;
+/** At most this many `others.subagentModels` (sealed `maxSubagentModels`). */
+export const MAX_SUBAGENT_MODELS = 8;
+const PROVIDER_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$/;
+const CREDENTIAL_NAME = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+
+function knobError(message: string): CliError {
+  return new CliError('BAD_FLAG', message, {
+    remedy:
+      'others={"webSearch":{"service":"0g-router|openai|anthropic|off","credential":"<name>","model":"<id>"},' +
+      '"subagentModels":[{"provider":"<id>","model":"<id>","credential":"<name>"}],"subagentDefault":{"provider":"<id>","model":"<id>"}}',
+  });
+}
+
+function onlyKeys(v: unknown, keys: string[]): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).every((k) => keys.includes(k));
+}
+
+/**
+ * Check the shape of the 0g-harness model knobs in `others`, before anything
+ * is signed, the way sealed reads them (`harness/settings.go`): sealed would
+ * drop a malformed one at boot and log why; here the owner hears it first.
+ */
+export function assertHarnessKnobShapes(others: unknown): void {
+  if (!others || typeof others !== 'object' || Array.isArray(others)) return;
+  const o = others as Record<string, unknown>;
+  if ('webSearch' in o) {
+    const ws = o.webSearch;
+    if (!onlyKeys(ws, ['service', 'credential', 'model']) || !(WEB_SEARCH_SERVICES as readonly unknown[]).includes(ws.service)) {
+      throw knobError(`webSearch must be {"service": ${WEB_SEARCH_SERVICES.join('|')}, "credential"?, "model"?}`);
+    }
+    if (ws.credential !== undefined && (typeof ws.credential !== 'string' || !CREDENTIAL_NAME.test(ws.credential))) throw knobError('webSearch.credential must name a credential');
+    if (ws.model !== undefined && (typeof ws.model !== 'string' || !MODEL_ID.test(ws.model))) throw knobError('webSearch.model must be a model id');
+    if (ws.model !== undefined && ws.service !== 'openai' && ws.service !== 'anthropic') throw knobError('webSearch.model applies only to the openai and anthropic services');
+  }
+  if ('subagentModels' in o) {
+    const list = o.subagentModels;
+    if (!Array.isArray(list) || list.length > MAX_SUBAGENT_MODELS) throw knobError(`subagentModels must be an array of at most ${MAX_SUBAGENT_MODELS} models`);
+    const seen = new Set<string>();
+    for (const m of list) {
+      if (!onlyKeys(m, ['provider', 'model', 'credential']) || typeof m.provider !== 'string' || !PROVIDER_ID.test(m.provider) ||
+          typeof m.model !== 'string' || !MODEL_ID.test(m.model) ||
+          (m.credential !== undefined && (typeof m.credential !== 'string' || !CREDENTIAL_NAME.test(m.credential)))) {
+        throw knobError('each subagentModels entry is {"provider", "model", "credential"?}');
+      }
+      const key = `${m.provider}\0${m.model}\0${m.credential ?? ''}`;
+      if (seen.has(key)) throw knobError(`subagentModels repeats ${m.provider}/${m.model}`);
+      seen.add(key);
+    }
+  }
+  if ('subagentDefault' in o) {
+    const d = o.subagentDefault;
+    if (!onlyKeys(d, ['provider', 'model']) || typeof d.provider !== 'string' || !PROVIDER_ID.test(d.provider) || typeof d.model !== 'string' || !MODEL_ID.test(d.model)) {
+      throw knobError('subagentDefault must be {"provider", "model"}');
+    }
+  }
+}
+
+/**
+ * Refuse a subagentDefault that is neither the document's model nor one of
+ * its subagentModels: sealed would ignore it and default to the main model.
+ */
+export function assertSubagentDefaultOffered(next: SettingsDoc): void {
+  const others = next.others as Record<string, unknown> | undefined;
+  const d = others?.subagentDefault as { provider?: string; model?: string } | undefined;
+  if (!d || typeof d !== 'object') return;
+  const list = Array.isArray(others?.subagentModels) ? (others!.subagentModels as Array<{ provider?: string; model?: string }>) : [];
+  const isMain = d.model === next.model && (d.provider === next.provider || (!next.provider && d.provider === '0g-compute'));
+  if (isMain || list.some((m) => m.provider === d.provider && m.model === d.model)) return;
+  throw knobError(`subagentDefault ${d.provider}/${d.model} is neither the agent's model nor one of subagentModels`);
+}
 
 /**
  * Whether `framework` names the 0g-harness adapter. `dsh` is its name before

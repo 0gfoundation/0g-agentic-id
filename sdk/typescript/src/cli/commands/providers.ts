@@ -11,6 +11,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   if (ctx.json) emitOk(current);
   else {
     print(`provider registry version ${current.version}`);
-    for (const provider of current.providers) print(`${provider.id}\t${provider.name}\t${provider.formats.join(', ')}`);
+    print('id\tname\tformats\tweb search');
+    for (const provider of current.providers) print(`${provider.id}\t${provider.name}\t${provider.formats.join(', ')}\t${provider.webSearch ?? '-'}`);
   }
 }

@@ -301,8 +301,10 @@ updates need none.
    name, and puts the platform doc and the doctrine into every model request.
    The harness cannot remove either by changing its own code. Only model calls
    pass, by exact path under the route: `chat/completions`, `messages` and
-   `responses`, and the model list; on the 0G router, also its web search
-   (`web/search`, a query only, with no model or platform doc).
+   `responses`, and the model list; also the web search of the service the
+   owner picks (`web/search`, a query only, with no platform doc). The
+   owner's further subagent models are routes of their own, each pinning its
+   models and carrying the platform doc.
 3. **Egress**: the harness's other outbound requests, such as fetching web pages,
    third-party APIs and dependency installs, also go through sealed, which fills
    in credentials and lets listed destinations through. This depends on the
@@ -757,8 +759,10 @@ hold, so the neutral proxies need not ship with step one:
   their official addresses fixed in sealed, §7) with the model name the
   owner's settings pin, the credential proxy fills the key on the way out, and
   the harness holds a placeholder for a key. Only chat/completions,
-  messages, responses and model-list calls pass, by exact path, and on the
-  0G router its web search (`web/search`);
+  messages, responses and model-list calls pass, by exact path, and the web
+  search of the owner's chosen service (`web/search`); the owner's further
+  subagent models are named routes of the same proxy, each with its own key
+  and models;
 - the doctrine injected by the inference proxy: the platform doc, doctrine
   included, goes at the end of every model request's system prompt, and sealed
   no longer writes the `/run` platform-doc file for 0g-harness;

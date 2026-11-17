@@ -1090,8 +1090,9 @@ agentSeal，并绑定 owner、agent、链和条目名；整个凭据集由 owner
 - **模型看到什么。** 每次模型调用都经 sealed 的推理代理：按 owner 设置的模型名，发到
   owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方
   地址），并把平台说明（身份、doctrine）放在系统提示末尾。只放行模型调用，按精确路径
-  （chat/completions、messages、responses、模型列表），0G router 上还有它的网页搜索
-  （`web/search`，只带查询词）。分层流程下 serve-proof 只有 v2，
+  （chat/completions、messages、responses、模型列表），还有 owner 选的搜索服务的网页搜索
+  （`web/search`，只带查询词）。owner 给子 agent 提供的其他模型是同一代理上的路由，各自固定模型，
+  也都带平台说明。分层流程下 serve-proof 只有 v2，
   否则不出。v2 serve-proof 的
   `inference_url` 和 `model` 说明推理代理往哪里转发、用哪个模型名，不证明某条回答出自这个
   模型：harness 可以不经模型生成回答。agent 的进程绕过推理代理自己连模型，只能靠出站限制挡

@@ -83,7 +83,9 @@ await ag.admin.updateProviders(edited.providers, { baseVersion: edited.version }
 仅返回 ID 的目录表示模型能力未知。协议限于已实现的 OpenAI/Anthropic 接线；
 其他协议或特殊鉴权仍需改代码发版。endpoint 和目录必须为 HTTPS，不含内嵌凭据、
 query 或 fragment。兼容参数仅作用于对应 provider；新增托管服务不继承 compute
-的元数据或路由猜测。名单必须保留 `0g-compute`。仅 `openai`、`anthropic` 可标记
+的元数据或路由猜测。可选的 `webSearch` 写明该 provider 的 key 能付哪个网页搜索服务：
+`0g-router`、`openai` 或 `anthropic`（由 sealed 的推理代理调用；0g-harness 的 owner 用
+`others.webSearch` 选择）。它不计入路由哈希，加上它不会让已封存的 key 需要重新授权。名单必须保留 `0g-compute`。仅 `openai`、`anthropic` 可标记
 native，使用框架自身接线，不设置自定义 endpoint。
 
 ## 发布 API

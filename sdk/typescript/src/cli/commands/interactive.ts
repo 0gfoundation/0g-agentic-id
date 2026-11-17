@@ -28,7 +28,7 @@ import { CliError, cancelled, isCancelled } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
-import { applyAssignments, assertModelPresent, assertOthersFitFramework, assertVersionsFitFramework, isHarnessFramework, parseAssignments, renderListedVersions, renderSettings } from '../settings';
+import { applyAssignments, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework, isHarnessFramework, parseAssignments, renderListedVersions, renderSettings } from '../settings';
 import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOwnerOp, ensureModelKey } from '../credentials';
 import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
@@ -2353,6 +2353,7 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
   // A document with no model is the one the container hard-fails on and
   // last-known-good cannot cover — refuse before signing, and say so.
   assertModelPresent(next, current !== null);
+  assertSubagentDefaultOffered(next);
   const providerChanged = changesProvider(current, next);
   // The agent takes the switch only with a key for the new provider in its
   // credential set; an image from before model keys in the set takes it at

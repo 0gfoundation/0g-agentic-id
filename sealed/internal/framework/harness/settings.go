@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
@@ -96,16 +99,124 @@ type harnessKnobs struct {
 	// and dropping what is stale (0g-harness src/memory-tidy.mjs). On unless
 	// the owner turns it off.
 	MemoryTidy bool
-	// WebTools gives the agent web_fetch, and web_search where its model's
-	// route has a search (the 0G router; spawn.go). On unless the owner turns
-	// it off.
+	// WebTools gives the agent web_fetch, and web_search where WebSearch
+	// can be reached (modelroutes.go). On unless the owner turns it off.
 	WebTools bool
+	// WebSearch is the search service web_search uses and how it is paid
+	// (others.webSearch; modelroutes.go). Default: the 0G router, on the model
+	// key when the model is on the router.
+	WebSearch webSearchKnob
+	// SubagentModels are the further models the owner offers subagents
+	// (others.subagentModels; modelroutes.go), at most maxSubagentModels.
+	SubagentModels []modelRouteKnob
+	// SubagentDefault is the route a subagent runs on when the call names
+	// none (others.subagentDefault): the main model or one of
+	// SubagentModels. Nil: the main model.
+	SubagentDefault *routeRef
+}
+
+// webSearchKnob is others.webSearch: {"service", "credential"?, "model"?}.
+type webSearchKnob struct {
+	// Service is one of inference.SearchServices, or "off".
+	Service string `json:"service"`
+	// Credential names the owner credential that pays the service; empty:
+	// the model key, when the model's provider pays that service.
+	Credential string `json:"credential,omitempty"`
+	// Model runs an OpenAI or Anthropic search; empty: the main model, when
+	// it is on that provider.
+	Model string `json:"model,omitempty"`
+}
+
+// modelRouteKnob is one entry of others.subagentModels.
+type modelRouteKnob struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	// Credential names the owner credential that pays this model; empty:
+	// the model key, which only the main model's provider takes.
+	Credential string `json:"credential,omitempty"`
+}
+
+// routeRef names one provider/model pair (others.subagentDefault).
+type routeRef struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+}
+
+// maxSubagentModels bounds others.subagentModels.
+const maxSubagentModels = 8
+
+// searchOff is the webSearch service that turns web_search off.
+const searchOff = "off"
+
+var (
+	knobProviderRe   = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
+	knobModelRe      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$`)
+	knobCredentialRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
+)
+
+// parseWebSearch reads others.webSearch; nil when it is not valid.
+func parseWebSearch(v json.RawMessage) (*webSearchKnob, string) {
+	var k webSearchKnob
+	dec := json.NewDecoder(bytes.NewReader(v))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&k); err != nil {
+		return nil, "not an object of service, credential and model"
+	}
+	if k.Service != searchOff && !inference.KnownSearchService(k.Service) {
+		return nil, "service must be one of " + strings.Join(append(append([]string{}, inference.SearchServices...), searchOff), ", ")
+	}
+	if k.Credential != "" && !knobCredentialRe.MatchString(k.Credential) {
+		return nil, "credential is not a credential name"
+	}
+	if k.Model != "" && !knobModelRe.MatchString(k.Model) {
+		return nil, "model is not a model id"
+	}
+	if k.Model != "" && k.Service != inference.SearchOpenAI && k.Service != inference.SearchAnthropic {
+		return nil, "model applies only to the openai and anthropic services"
+	}
+	return &k, ""
+}
+
+// parseSubagentModels reads others.subagentModels; nil when it is not valid.
+func parseSubagentModels(v json.RawMessage) ([]modelRouteKnob, string) {
+	var list []modelRouteKnob
+	dec := json.NewDecoder(bytes.NewReader(v))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&list); err != nil {
+		return nil, "not an array of {provider, model, credential}"
+	}
+	if len(list) > maxSubagentModels {
+		return nil, fmt.Sprintf("more than %d models", maxSubagentModels)
+	}
+	seen := map[string]bool{}
+	for _, m := range list {
+		if !knobProviderRe.MatchString(m.Provider) || !knobModelRe.MatchString(m.Model) || (m.Credential != "" && !knobCredentialRe.MatchString(m.Credential)) {
+			return nil, "an entry needs a provider id, a model id and, optionally, a credential name"
+		}
+		key := m.Provider + "\x00" + m.Model + "\x00" + m.Credential
+		if seen[key] {
+			return nil, "an entry is repeated"
+		}
+		seen[key] = true
+	}
+	return list, ""
+}
+
+// parseRouteRef reads others.subagentDefault; nil when it is not valid.
+func parseRouteRef(v json.RawMessage) (*routeRef, string) {
+	var r routeRef
+	dec := json.NewDecoder(bytes.NewReader(v))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&r); err != nil || !knobProviderRe.MatchString(r.Provider) || !knobModelRe.MatchString(r.Model) {
+		return nil, "not an object of provider and model"
+	}
+	return &r, ""
 }
 
 // defaultKnobs is the shipped composition, i.e. what an empty overlay must
 // yield.
 func defaultKnobs() harnessKnobs {
-	return harnessKnobs{ToolJobs: false, Subagents: false, Schedule: false, MaxParallelToolCalls: 1, MemoryExtract: true, MemoryExtractMinMessages: 6, MemoryRecall: true, MemoryInlineBytes: 8 * 1024, MemoryTidy: true, WebTools: true}
+	return harnessKnobs{ToolJobs: false, Subagents: false, Schedule: false, MaxParallelToolCalls: 1, MemoryExtract: true, MemoryExtractMinMessages: 6, MemoryRecall: true, MemoryInlineBytes: 8 * 1024, MemoryTidy: true, WebTools: true, WebSearch: webSearchKnob{Service: inference.SearchZGRouter}}
 }
 
 // parseBoolKnob reads one boolean knob. A value that is not a boolean costs
@@ -171,6 +282,27 @@ func parseKnobs(raw json.RawMessage) harnessKnobs {
 		k.MemoryExtractMinMessages = n
 	}
 	parseBoolKnob(fields, "webTools", &k.WebTools, d.WebTools)
+	if v, ok := fields["webSearch"]; ok {
+		if ws, why := parseWebSearch(v); ws != nil {
+			k.WebSearch = *ws
+		} else {
+			logger.Logf("harness.RenderSettings: webSearch is not valid (%s); using the 0G router", why)
+		}
+	}
+	if v, ok := fields["subagentModels"]; ok {
+		if list, why := parseSubagentModels(v); list != nil {
+			k.SubagentModels = list
+		} else {
+			logger.Logf("harness.RenderSettings: subagentModels is not valid (%s); subagents run on the main model only", why)
+		}
+	}
+	if v, ok := fields["subagentDefault"]; ok {
+		if ref, why := parseRouteRef(v); ref != nil {
+			k.SubagentDefault = ref
+		} else {
+			logger.Logf("harness.RenderSettings: subagentDefault is not valid (%s); subagents default to the main model", why)
+		}
+	}
 	if v, ok := fields["modelImages"]; ok {
 		var b bool
 		if err := json.Unmarshal(v, &b); err != nil {
@@ -267,6 +399,10 @@ type renderedSettings struct {
 // on one.
 func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error {
 	knobs := parseKnobs(s.Others)
+	if d := knobs.SubagentDefault; d != nil && !(d.Provider == s.Provider && d.Model == s.Model) && !offersRef(knobs.SubagentModels, *d) {
+		logger.Logf("harness.RenderSettings: subagentDefault %s/%s is neither the main model nor in subagentModels; subagents default to the main model", d.Provider, d.Model)
+		knobs.SubagentDefault = nil
+	}
 	env := settingsEnv(s, knobs)
 
 	a.mu.Lock()
@@ -399,6 +535,16 @@ func wireAPI(f inference.WireFormat) string {
 		return "anthropic-messages"
 	}
 	return "openai-completions"
+}
+
+// offersRef reports whether list names ref's provider and model.
+func offersRef(list []modelRouteKnob, ref routeRef) bool {
+	for _, m := range list {
+		if m.Provider == ref.Provider && m.Model == ref.Model {
+			return true
+		}
+	}
+	return false
 }
 
 func boolEnv(b bool) string {

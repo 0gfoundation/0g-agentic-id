@@ -1,13 +1,9 @@
 package harness
 
 import (
-	"context"
-	"encoding/json"
-	"net/http"
 	"strings"
 	"testing"
 
-	"seal-verify/internal/framework"
 	"seal-verify/internal/inference"
 	"seal-verify/internal/settings"
 )
@@ -98,8 +94,8 @@ func TestBridgeEnvThroughTheRoute(t *testing.T) {
 	}
 }
 
-// The search endpoint reaches the harness only when Start set one (a model
-// on the 0G router with the web tools on).
+// The search endpoint reaches the harness only when Start set one (a search
+// service the owner's settings can pay; modelroutes_test.go).
 func TestBridgeEnvWebSearch(t *testing.T) {
 	has := func(env []string) string {
 		for _, kv := range env {
@@ -114,46 +110,5 @@ func TestBridgeEnvWebSearch(t *testing.T) {
 	}
 	if got := has(bridgeEnv{token: "tok", webSearchURL: "http://127.0.0.1:1/t/v1/web/search"}.environ()); got != "http://127.0.0.1:1/t/v1/web/search" {
 		t.Fatalf("search URL %q", got)
-	}
-}
-
-// Start lets web/search through the inference route only for a model on the
-// 0G router with the web tools on: a malformed search is then refused as
-// such (400), and everywhere else the path does not exist (404). No request
-// leaves the box: the body is checked before anything is forwarded.
-func TestStart_WebSearchOnlyForTheRouter(t *testing.T) {
-	catalogServer(t, reasoningModel("glm-5.3"))
-	for _, c := range []struct {
-		name     string
-		doc      settings.Doc
-		wantCode int
-	}{
-		{"0g router, web tools on", settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3"}, http.StatusBadRequest},
-		{"0g router, web tools off", settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(`{"webTools":false}`)}, http.StatusNotFound},
-		{"a native provider", settings.Doc{Provider: "openai", Model: "gpt-x"}, http.StatusNotFound},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			a := New()
-			dshHome = t.TempDir()
-			if err := a.RenderSettings(context.Background(), settings.Resolve(context.Background(), c.doc, "")); err != nil {
-				t.Fatalf("RenderSettings: %v", err)
-			}
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			_, _ = a.Start(ctx, framework.RuntimeContext{APIKey: "k"})
-			defer func() { _ = a.Stop(context.Background(), 0) }()
-			route, err := a.inferenceRoute()
-			if err != nil {
-				t.Fatal(err)
-			}
-			resp, err := http.Post(route.BaseURL()+"/v1/web/search", "application/json", strings.NewReader(`{}`))
-			if err != nil {
-				t.Fatal(err)
-			}
-			resp.Body.Close()
-			if resp.StatusCode != c.wantCode {
-				t.Fatalf("web/search: %d, want %d", resp.StatusCode, c.wantCode)
-			}
-		})
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/url"
 	"regexp"
 	"slices"
 	"sort"
@@ -78,6 +79,18 @@ var (
 
 // Placeholder renders the placeholder for name.
 func Placeholder(name string) string { return "[[credential:" + name + "]]" }
+
+// ExplicitURL is target, an https URL with no query, reached through the
+// proxy's explicit form under prefix (http://127.0.0.1:<port>/<token>):
+// prefix/https/<host><path>. A request there goes to target with its
+// placeholders filled as for any request to that host.
+func ExplicitURL(prefix, target string) (string, error) {
+	u, err := url.Parse(target)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.RawQuery != "" || u.User != nil {
+		return "", fmt.Errorf("credproxy: %q is not an https base URL", target)
+	}
+	return strings.TrimRight(prefix, "/") + "/https/" + u.Host + strings.TrimSuffix(u.EscapedPath(), "/"), nil
+}
 
 // ValidName reports whether name fits the placeholder grammar.
 func ValidName(name string) bool { return nameRe.MatchString(name) }

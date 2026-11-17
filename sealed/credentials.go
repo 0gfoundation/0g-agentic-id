@@ -209,6 +209,10 @@ func credHold(store *credentials.Store, explicit string) func(name, baseURL stri
 		if err != nil || u.Scheme != "https" || u.Host == "" || u.RawQuery != "" {
 			return "", "", fmt.Errorf("credentials: %q is not an https base URL", baseURL)
 		}
+		proxied, err := credproxy.ExplicitURL(explicit, baseURL)
+		if err != nil {
+			return "", "", fmt.Errorf("credentials: %w", err)
+		}
 		e := &credproxy.Entry{Name: "sealed:" + name, Hosts: []string{u.Host}, Use: credproxy.UseInject, Value: value}
 		for header, template := range headers {
 			e.Positions = append(e.Positions, credproxy.Position{Kind: credproxy.PosHeader, Name: header, Template: template})
@@ -218,7 +222,7 @@ func credHold(store *credentials.Store, explicit string) func(name, baseURL stri
 		} else if err != nil {
 			return "", "", err
 		}
-		return explicit + "/https/" + u.Host + strings.TrimSuffix(u.EscapedPath(), "/"), credproxy.Placeholder(e.Name), nil
+		return proxied, credproxy.Placeholder(e.Name), nil
 	}
 }
 

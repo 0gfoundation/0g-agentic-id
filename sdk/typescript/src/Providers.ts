@@ -23,7 +23,13 @@ export interface InferenceProvider {
   modelCatalog?: string;
   models?: InferenceModel[];
   compatibility?: Record<string, boolean | string>;
+  /** The web search service this provider's key pays for (sealed `inference.SearchServices`); not routing, outside {@link routeHash}. */
+  webSearch?: WebSearchService;
 }
+
+/** Web search services sealed's inference route can call. */
+export const WEB_SEARCH_SERVICES = ['0g-router', 'openai', 'anthropic'] as const;
+export type WebSearchService = (typeof WEB_SEARCH_SERVICES)[number];
 
 /** Offline/built-in seed. Instance registries discover operator-published definitions. */
 export function listInferenceProviders(): InferenceProvider[] {
@@ -98,6 +104,7 @@ export function validateProvider(provider: InferenceProvider): void {
       Object.keys(provider.endpoints ?? {}).length !== provider.formats.length ||
       provider.formats.some((format) => !validURL(provider.endpoints?.[format] ?? ''))) throw new Error('invalid managed provider endpoints');
   if (provider.modelCatalog && !validURL(provider.modelCatalog)) throw new Error('invalid provider model catalog');
+  if (provider.webSearch !== undefined && !(WEB_SEARCH_SERVICES as readonly string[]).includes(provider.webSearch)) throw new Error('invalid provider web search service');
 }
 
 export interface ProviderRegistrySnapshot {

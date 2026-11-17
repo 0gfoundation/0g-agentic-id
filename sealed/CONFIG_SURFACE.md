@@ -132,11 +132,16 @@ owner's model on every request, appends the agent doc to the system prompt
 and sets the key (`harness/spawn.go` `modelEndpoint`). It forwards model calls
 only, by exact path under the route's base URL: POST `chat/completions`,
 `messages` and `responses`, GET `models`, each with or without a leading `/v1`
-(`inferproxy.endpoint`). On the 0G router (`0g-compute`) with the owner's
-`webTools` switch on, it also forwards POST `web/search` (the harness's
-`web_search`): a `{"query"}` body only, rebuilt, with the key set and no model
-or agent doc (`inferproxy` `webSearch`); for any other provider that path
-answers 404. Only a provider sealed knows no endpoint of is still
+(`inferproxy.endpoint`). With the owner's `webTools` switch on and the
+search service `others.webSearch` picks payable, it also serves POST
+`web/search` (the harness's `web_search`): a `{"query"}` body only, sent with
+no agent doc to the 0G router's search, or as one OpenAI or Anthropic model
+call with that provider's web search tool, and answered in the router's
+result shape (`inferproxy` `websearch.go`); otherwise that path answers 404.
+The further models `others.subagentModels` offers are routes of the same
+proxy: one more model on the main route when it shares the main model's
+endpoint and key, else a named route under `/p/<id>` with its own upstream,
+key and models (`harness/modelroutes.go`). Only a provider sealed knows no endpoint of is still
 dialled by the harness itself. The other three frameworks keep their own
 wiring for native providers.
 
