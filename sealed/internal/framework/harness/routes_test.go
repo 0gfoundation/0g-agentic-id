@@ -76,6 +76,7 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/tasks", "POST", "/v1/tasks/task-1/cancel"},
 		{"/v1/tasks", "POST", "/v1/tasks/task-1/archive"},
 		{"/v1/tasks", "GET", "/v1/tasks/task-1/events"},
+		{"/v1/tasks", "GET", "/v1/tasks/session-0b6e2c1a-5f3d-4b8e-9c21-7a4d0e9f1b23"},
 		{"/v1/task-feed", "GET", "/v1/task-feed"},
 		{"/v1/schedules", "GET", "/v1/schedules"},
 		{"/v1/schedules", "DELETE", "/v1/schedules/s1"},
@@ -91,6 +92,7 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/sessions", "GET", "/v1/sessions/sess-1"},
 		{"/v1/sessions", "POST", "/v1/sessions/owner-chat/prompt"},
 		{"/v1/sessions", "GET", "/v1/sessions/sess-1/events"},
+		{"/v1/sessions", "POST", "/v1/sessions/session-0b6e2c1a-5f3d-4b8e-9c21-7a4d0e9f1b23/prompt"},
 		{"/v1/sessions", "POST", "/v1/sessions/sess-1/cancel"},
 		{"/v1/", "OPTIONS", "/v1/chat/completions"},
 	}

@@ -94,6 +94,8 @@ test('tasks: create, id taken, list, get, input, cancel, archive and the feed hi
     ]);
     assert.deepEqual(seen[4].body, { text: 'answer', mode: 'next' });
     await assert.rejects(() => c.getTask('../activities'), /not a task id/);
+    // A task a schedule created has the session id the schedule gave it.
+    assert.equal((await c.getTask('session-0b6e2c1a-5f3d-4b8e-9c21-7a4d0e9f1b23')).id, 'task-a1');
   } finally {
     srv.closeAllConnections?.(); srv.close();
   }

@@ -168,7 +168,7 @@ container does not.
 |---|---|---|
 | `toolJobs` | `false` | background commands (`run_in_background`) and the `job_*` tools |
 | `subagents` | `false` | the `subagent` tool: read-only helpers the main agent runs in the background (turns the job tools on with it) |
-| `schedule` | `false` | `schedule_create` / `schedule_list` / `schedule_delete`: reminders the agent sets for itself |
+| `schedule` | `false` | `schedule_create` / `schedule_list` / `schedule_view` / `schedule_edit`, `schedule_create_task` and `schedule_runs`: reminders and scheduled work the agent sets for itself, delivered to the session that set it, to a new session, or as a new task at each occurrence; a reminder a task sets for itself starts a run of it |
 | `maxParallelToolCalls` | `1` | tool calls one model step may run at once. It applies only to the tools that declare themselves safe to run together: `read`, `read_image` and `subagent`. `bash`, `write`, `edit`, the `seal_*` tools and the job and schedule tools always run alone, after the calls before them finish |
 | `modelImages` | unset | overrides whether the owner's model takes images (`true`/`false`). Unset: the provider's model list decides (`architecture.input_modalities` on the 0G router: glm-5.3 text only, glm-5.3-flash with images), and where it says nothing, pi-ai's catalog. With images the owner's images reach the model; without, each is saved in `~/inbox` and the agent is told it cannot view it |
 | `memoryExtract` | `true` | before a compaction of an owner session, and after a turn that saved nothing once enough is new, the harness makes one model call that writes long-term memory from those messages (0g-harness `src/memory-extract.mjs`); `false` turns both off. Rendered as `SEAL_HARNESS_MEMORY_EXTRACT`. |

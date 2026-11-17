@@ -35,7 +35,8 @@ onboarding copy.
    sits behind the stateful doors (chat/completions, Responses); the other
    adapters keep exactly that one. 0g-harness lets the owner open more
    sessions (`/v1/sessions`, zgh-style: fresh, a fork of another session's
-   log, or resumed) and runs each task (`/v1/tasks`) in a session of its own.
+   log, or resumed) and runs each task (`/v1/tasks`) in a session of its own;
+   a schedule may open either (a new session, or a new task, at a delivery).
    They are not an isolation boundary and are not offered to anyone but the
    owner: every session is the same agent with the same owner, sharing
    persona, skills, long-term memory, home and credentials — only the

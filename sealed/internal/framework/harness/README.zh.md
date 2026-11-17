@@ -79,7 +79,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 |---|---|---|
 | `toolJobs` | `false` | 命令可以放到后台跑(`run_in_background`),并提供 `job_*` 工具 |
 | `subagents` | `false` | 打开 `subagent` 工具:主 agent 派出去在后台跑的只读助手(会同时打开任务工具) |
-| `schedule` | `false` | 打开 `schedule_create` / `schedule_list` / `schedule_delete`:agent 给自己设的提醒 |
+| `schedule` | `false` | 打开 `schedule_create` / `schedule_list` / `schedule_view` / `schedule_edit`、`schedule_create_task` 和 `schedule_runs`:agent 给自己设的提醒和定时工作,投给设它的会话、一个新会话,或每次到点新建一个任务;任务给自己设的提醒到点时会启动它的一次运行 |
 | `maxParallelToolCalls` | `1` | 模型一步里最多同时运行几个工具调用。只对声明了可以并发的工具生效：`read`、`read_image`、`subagent`。`bash`、`write`、`edit`、`seal_*` 工具以及任务和提醒工具总是单独运行，等前面的调用结束才开始 |
 | `modelImages` | 不设置 | 覆盖 owner 的模型能不能看图（`true`/`false`）。不设置时由服务商的模型列表决定（0G router 上是 `architecture.input_modalities`：glm-5.3 只收文字，glm-5.3-flash 能看图）；列表里没写时按 pi-ai 的模型目录。能看图时 owner 发的图片交给模型；不能时每张图存到 `~/inbox`，并告诉 agent 它看不到 |
 | `memoryExtract` | `true` | owner 会话压缩之前，以及某一轮没存记忆、且新消息够多之后，harness 调用一次模型，把这些消息里值得长期保留的内容写进长期记忆（0g-harness `src/memory-extract.mjs`）；设为 `false` 两者都关闭。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT`。 |

@@ -3570,7 +3570,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // An id, or a unique start of one (with or without `task-`).
         const resolve = async (arg: string | undefined): Promise<string | null> => {
           if (!arg) { out('which task? give its id (/tasks lists them)\n'); return null; }
-          if (/^task-[a-z0-9][a-z0-9-]{0,62}$/.test(arg)) return arg;
+          if (/^(task-[a-z0-9][a-z0-9-]{0,62}|session-[a-z0-9][a-z0-9-]{0,90})$/.test(arg)) return arg;
           const hits = (await c.listTasks!({ limit: 500 })).filter((t) => t.id.startsWith(arg) || t.id.startsWith(`task-${arg}`));
           if (hits.length === 1) return hits[0].id;
           out(hits.length ? `${hits.length} tasks start with ${cleanCell(arg)} — give more of the id\n` : `no task ${cleanCell(arg)}\n`);

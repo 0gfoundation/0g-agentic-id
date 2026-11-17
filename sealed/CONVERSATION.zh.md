@@ -26,7 +26,8 @@ settings 推送、每次 `/think` 都是 Stop+Start(`manager.Reload`),崩溃走�
 2. **每个 agent 有一条默认对话;其他会话只属于 OWNER,且只在 0g-harness 上有。**
    默认对话身份固定(`owner-chat`),在有状态的入口(chat/completions、Responses)后面;
    其他适配器只有这一条。0g-harness 允许 owner 再开会话(`/v1/sessions`,照 zgh:新开、
-   分叉另一个会话的记录、或恢复),每个 task(`/v1/tasks`)也各跑在自己的会话里。
+   分叉另一个会话的记录、或恢复),每个 task(`/v1/tasks`)也各跑在自己的会话里;
+   定时调度到点时也可以开新会话或新任务。
    这些会话不是隔离边界,也只给 owner 用:每个会话都是同一个 agent、同一个 owner,
    共用人设、skills、长期记忆、家目录和凭据——只有对话是各自的。一个驾驶座
    (CONFIG_SURFACE §8.1)覆盖全部会话。不是 owner 的调用方碰不到会话:回答他们的是

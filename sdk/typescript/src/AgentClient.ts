@@ -1530,7 +1530,8 @@ export function makeAgentClient(params: {
   const sessionsBase = ownerBase('sessions');
   if (sessionsBase) {
     const sid = (id: string): string => {
-      if (!/^(owner-chat|(sess|task)-[a-z0-9][a-z0-9-]{0,62})$/.test(id)) throw new Error(`not a session id: ${plainText(id)}`);
+      // owner-chat, an owner session, a task, or a session a schedule opened (DSH's `session-…` ids).
+      if (!/^(owner-chat|(sess|task)-[a-z0-9][a-z0-9-]{0,62}|session-[a-z0-9][a-z0-9-]{0,90})$/.test(id)) throw new Error(`not a session id: ${plainText(id)}`);
       return `${sessionsBase}/${id}`;
     };
     const clean = (s: AgentSession): AgentSession => ({ ...s, title: plainText(String(s.title ?? '')) });
@@ -1546,7 +1547,8 @@ export function makeAgentClient(params: {
   const tasksBase = taskFeedBase ? ownerBase('tasks') : undefined;
   if (tasksBase && taskFeedBase) {
     const tid = (id: string): string => {
-      if (!/^task-[a-z0-9][a-z0-9-]{0,62}$/.test(id)) throw new Error(`not a task id: ${plainText(id)}`);
+      // A task's id, or a scheduled task's (the session id a schedule gave it).
+      if (!/^(task-[a-z0-9][a-z0-9-]{0,62}|session-[a-z0-9][a-z0-9-]{0,90})$/.test(id)) throw new Error(`not a task id: ${plainText(id)}`);
       return `${tasksBase}/${id}`;
     };
     const clean = <T extends { title?: string }>(t: T): T => (t && typeof t.title === 'string' ? { ...t, title: plainText(t.title) } : t);
