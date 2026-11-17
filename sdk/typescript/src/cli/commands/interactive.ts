@@ -672,52 +672,232 @@ function containerUrl(sandboxId: string, proxy: string): string {
 }
 const og = (wei: bigint | null | undefined): string => (wei == null ? 'n/a' : `${(Number(wei) / 1e18).toFixed(6)} OG`);
 /** The shell's question: the answer to q. fresh asks for a line typed after
- *  q is shown (see run); main is the shell's own prompt; cancel rejects the
- *  question waiting, if any other than the prompt, and says whether it did. */
+ *  q is shown (see run); main is the shell's own prompt; message is the agent
+ *  prompt, whose answer may span lines; cancel rejects the question waiting,
+ *  if any other than a prompt, and says whether it did. */
 type Ask = ((q: string) => Promise<string>) & {
   fresh?: (q: string) => Promise<string>;
   main?: (q: string) => Promise<string>;
+  message?: (q: string) => Promise<Entry>;
   cancel?: () => boolean;
 };
 
+/** What the owner entered: its text (newlines kept), whether it spans lines,
+ *  and whether any of it was pasted. An agent message that spans lines or was
+ *  pasted is never a command. */
+export type Entry = { text: string; multi: boolean; pasted: boolean };
+
 /** An answer to a signing question this soon after it is shown was typed before it. */
 const READ_MS = 300;
+/** The prompt of a message's next line. */
+const CONT = '… ';
+/** The terminal's bracketed paste mode (xterm): on, off. */
+const PASTE_ON = '\x1b[?2004h';
+const PASTE_OFF = '\x1b[?2004l';
+/** On a terminal that does not mark pastes: a chunk that comes within this
+ *  long of a pasted one is still that paste (a long paste arrives in several
+ *  reads; an Enter typed after it comes much later). */
+const PASTE_GAP_MS = 30;
+/** A question answered yes or no. */
+const YES_NO_QUESTION = /\[(?:y\/n|y)\]/i;
+
+type Key = { name?: string; meta?: boolean; ctrl?: boolean; sequence?: string };
+type KeySource = { on(ev: 'keypress', f: (s: string | undefined, key: Key | undefined) => void): unknown };
 
 /**
- * The shell's `ask` as a line QUEUE, not rl.question: lines that arrive while
- * no question is pending (piped input racing the ~4s async banner) used to be
+ * The shell's `ask` as a QUEUE, not rl.question: lines that arrive while no
+ * question is pending (piped input racing the ~4s async banner) used to be
  * consumed by readline with no listener and silently dropped — commands
- * vanished with exit 0 (feedback.md F5). Buffer them instead. ask.fresh is
- * for a question whose answer signs something: on a terminal (tty), what was
- * typed before it is shown (during a turn, say) is not its answer — neither
- * a whole line, nor keys not yet sent with Enter, nor a line that comes in
- * too soon after it to have been typed for it. A terminal whose line editing
- * the shell does not do (its output is redirected) holds such keys itself,
- * so there it is not asked at all.
+ * vanished with exit 0 (feedback.md F5). Buffer them instead.
+ *
+ * ask.fresh is for a question whose answer signs something: on a terminal
+ * (tty), what was typed before it is shown (during a turn, say) is not its
+ * answer — neither a whole line, nor keys not yet sent with Enter, nor a line
+ * that comes in too soon after it to have been typed for it, nor a paste. A
+ * terminal whose line editing the shell does not do (its output is
+ * redirected) holds such keys itself, so there it is not asked at all.
+ *
+ * Several lines, on a terminal (keys, the session's keypresses: given, the
+ * shell does it): ask.message (the agent prompt) takes a message of several
+ * lines. A paste is one block, newlines kept, sent with the next Enter: the
+ * terminal marks it (bracketed paste, which run turns on), or, where it does
+ * not, lines that come in one read, or reads close behind a pasted one, are
+ * one. A line ending in \ and Option/Alt+Enter go on to a new line. Lines
+ * already entered are not edited again (readline edits one line). Every other
+ * question takes one line: several pasted lines are not its answer, and a
+ * paste does not answer a yes/no question. Without keys (piped input) every
+ * line is one answer, as before.
  */
 export function lineQueue(
   rl: {
-    on(ev: 'line', f: (l: string) => void): unknown; on(ev: 'close', f: () => void): unknown; setPrompt(q: string): void; prompt(): void;
+    on(ev: 'line', f: (l: string) => void): unknown; on(ev: 'close', f: () => void): unknown; setPrompt(q: string): void; prompt(preserveCursor?: boolean): void;
     terminal?: boolean;
   },
   tty: () => boolean,
+  keys?: KeySource,
 ): Ask {
-  const pendingLines: string[] = [];
-  const waiters: Array<{ res: (s: string) => void; rej: (e: Error) => void; main: boolean }> = [];
+  type Kind = 'q' | 'main' | 'message';
+  const pending: Entry[] = [];
+  const waiters: Array<{ res: (e: Entry) => void; rej: (e: Error) => void; kind: Kind; q: string }> = [];
+  const edit = rl as { line?: unknown; cursor?: unknown; prevRows?: unknown; history?: unknown };
   // readline keeps keys typed so far as the line being edited (and would
   // show them after the next question, ready for Enter), and its offset from
   // the last redraw (which would move that question up over lines printed
   // since).
   const clearEdit = (): void => {
-    const edit = rl as { line?: unknown; cursor?: unknown; prevRows?: unknown };
     if (typeof edit.line === 'string') edit.line = '';
     if (typeof edit.cursor === 'number') edit.cursor = 0;
     if (typeof edit.prevRows === 'number') edit.prevRows = 0;
   };
+  const editLine = (): string => (typeof edit.line === 'string' ? edit.line : '');
+
+  let draft: string[] = []; // a message's lines before its last Enter
+  let draftPasted = false;
+  let touched = false; // the line being edited holds pasted characters
+  let pasting = false; // between the terminal's paste-start and paste-end
+  let pasteLines: string[] = [];
+  const multiline = (): boolean => !!keys && rl.terminal !== false && tty();
+  const messageHere = (): boolean => !waiters[0] || waiters[0].kind === 'message';
+
+  const accepts = (w: { kind: Kind; q: string }, e: Entry): string | null => {
+    if (w.kind === 'message') return null;
+    if (e.multi) return w.kind === 'main' ? 'several lines are not a command' : 'several lines are an answer only at the agent prompt';
+    if (e.pasted && YES_NO_QUESTION.test(w.q)) return 'a paste does not answer a yes/no question';
+    return null;
+  };
+  const deliver = (e: Entry): void => {
+    const w = waiters[0];
+    if (!w) { pending.push(e); return; }
+    const refused = accepts(w, e);
+    if (refused) {
+      out(`  (${refused}: type it)\n`);
+      rl.setPrompt(w.q);
+      rl.prompt();
+      return;
+    }
+    waiters.shift();
+    w.res(e);
+  };
+  // The next line of a message: under its own prompt, when a prompt is up
+  // (typed during a turn, it waits for the agent prompt, which shows it).
+  const goOn = (): void => {
+    if (!waiters[0]) return;
+    rl.setPrompt(CONT);
+    rl.prompt(true);
+  };
+  // A line the owner ended with Enter (or, without keys, any line).
+  const entered = (l: string): void => {
+    if (multiline() && messageHere() && l.endsWith('\\')) {
+      draft.push(l.slice(0, -1));
+      draftPasted ||= touched;
+      touched = false;
+      goOn();
+      return;
+    }
+    if (draft.length) {
+      const text = [...draft, l].join('\n');
+      const pasted = draftPasted || touched;
+      draft = [];
+      draftPasted = false;
+      touched = false;
+      deliver({ text, multi: true, pasted });
+      return;
+    }
+    const pasted = touched;
+    touched = false;
+    deliver({ text: l, multi: false, pasted });
+  };
+  // A paste of whole lines has ended; the rest of it, if any, is the line
+  // being edited.
+  const pasted = (lines: string[]): void => {
+    touched = true;
+    if (!lines.length) return; // within one line: readline holds it as typed
+    const tail = editLine();
+    const w = waiters[0];
+    if (w && w.kind !== 'message') {
+      // One line and its newline: as if typed (a pasted key, an address).
+      if (lines.length === 1 && !tail) { touched = false; deliver({ text: lines[0], multi: false, pasted: true }); return; }
+      clearEdit();
+      out(`\n  (${w.kind === 'main' ? 'several pasted lines are not a command' : 'several pasted lines are an answer only at the agent prompt'}: type it)\n`);
+      touched = false;
+      rl.setPrompt(w.q);
+      rl.prompt();
+      return;
+    }
+    draft.push(...lines);
+    draftPasted = true;
+    if (!w) return; // during a turn: the agent prompt shows it
+    // The pasted lines are on the screen as readline echoed them; say how it
+    // is sent, then the line being edited goes on under the next-line prompt.
+    if (tail) term('\r\x1b[K');
+    out(`  [pasted ${draft.length} line${draft.length === 1 ? '' : 's'} · Enter sends]\n`);
+    rl.setPrompt(CONT);
+    if (typeof edit.cursor === 'number') edit.cursor = tail.length;
+    if (typeof edit.prevRows === 'number') edit.prevRows = 0;
+    rl.prompt(true);
+  };
+
+  // Reads: every keypress and line of one read of stdin comes in one go, so
+  // a read is a chunk until the next microtask. On a terminal that does not
+  // mark pastes, lines in one chunk (or one line with more typed behind it)
+  // are a paste; a chunk close behind a pasted one is still that paste.
+  let chunk: { open: boolean; lines: string[]; more: boolean } = { open: false, lines: [], more: false };
+  let lastPasteAt = 0;
+  const endChunk = (): void => {
+    const { lines, more } = chunk;
+    chunk = { open: false, lines: [], more: false };
+    if (!lines.length) return;
+    const now = Date.now();
+    if (lines.length > 1 || more || now - lastPasteAt < PASTE_GAP_MS) {
+      lastPasteAt = now;
+      pasted(lines);
+      return;
+    }
+    entered(lines[0]);
+  };
+  const inChunk = (): void => {
+    if (chunk.open) return;
+    chunk.open = true;
+    queueMicrotask(endChunk);
+  };
+  keys?.on('keypress', (s, key) => {
+    if (!multiline()) return;
+    if (key?.name === 'paste-start') { pasting = true; pasteLines = []; return; }
+    if (key?.name === 'paste-end') {
+      pasting = false;
+      const lines = pasteLines;
+      pasteLines = [];
+      lastPasteAt = Date.now();
+      pasted(lines);
+      return;
+    }
+    if (pasting) return;
+    inChunk();
+    if ((key?.name === 'return' || key?.name === 'enter') && key.meta) {
+      // Option/Alt+Enter: a new line in a message (readline ignores the key).
+      if (!messageHere()) return;
+      draft.push(editLine());
+      draftPasted ||= touched;
+      touched = false;
+      clearEdit();
+      if (!waiters[0]) return;
+      out('\n');
+      goOn();
+      return;
+    }
+    if (chunk.lines.length && s && !key?.ctrl && !key?.meta && s >= ' ') chunk.more = true;
+  });
+
   rl.on('line', (l) => {
-    const w = waiters.shift();
-    if (w) w.res(l);
-    else pendingLines.push(l);
+    if (!multiline()) { entered(l); return; }
+    if (pasting) {
+      pasteLines.push(l);
+      // A pasted line is not a line the owner entered: keep it out of ↑.
+      if (Array.isArray(edit.history) && edit.history[0] === l) edit.history.shift();
+      return;
+    }
+    inChunk();
+    chunk.lines.push(l);
   });
   let stdinClosed = false;
   rl.on('close', () => {
@@ -728,23 +908,30 @@ export function lineQueue(
       w.rej(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
     }
   });
-  const wait = (q: string, main: boolean): Promise<string> => {
-    const buffered = pendingLines.shift();
-    if (buffered !== undefined) {
-      out(`${q}${buffered}\n`); // keep the transcript readable in pipes/logs
+  const wait = (q: string, kind: Kind): Promise<Entry> => {
+    for (let buffered = pending.shift(); buffered !== undefined; buffered = pending.shift()) {
+      const refused = accepts({ kind, q }, buffered);
+      if (refused) { out(`  (an earlier entry was dropped: ${refused})\n`); continue; }
+      out(`${q}${buffered.text}\n`); // keep the transcript readable in pipes/logs
       return Promise.resolve(buffered);
     }
     if (stdinClosed) {
       return Promise.reject(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
     }
+    if (kind === 'message' && draft.length) {
+      // A message begun during the turn: show what it holds so far.
+      out(`${q}${draft.join('\n')}\n`);
+      q = CONT;
+    }
     rl.setPrompt(q);
-    rl.prompt();
-    return new Promise((res, rej) => waiters.push({ res, rej, main }));
+    rl.prompt(kind === 'message' && q === CONT);
+    return new Promise((res, rej) => waiters.push({ res, rej, kind, q }));
   };
-  const ask: Ask = (q: string): Promise<string> => wait(q, false);
-  ask.main = (q: string): Promise<string> => wait(q, true);
+  const ask: Ask = (q: string): Promise<string> => wait(q, 'q').then((e) => e.text);
+  ask.main = (q: string): Promise<string> => wait(q, 'main').then((e) => e.text);
+  ask.message = (q: string): Promise<Entry> => wait(q, 'message');
   ask.cancel = (): boolean => {
-    const i = waiters.findIndex((w) => !w.main);
+    const i = waiters.findIndex((w) => w.kind === 'q');
     if (i < 0) return false;
     const [w] = waiters.splice(i, 1);
     clearEdit();
@@ -757,11 +944,18 @@ export function lineQueue(
       throw new Error('a question that signs is asked only when the session\'s output is a terminal: answer with /cred pending, then /cred approve <id> or /cred deny <id>');
     }
     for (;;) {
-      pendingLines.length = 0;
+      pending.length = 0;
+      draft = [];
+      draftPasted = false;
+      touched = false;
       clearEdit();
       const shown = Date.now();
-      const a = await ask(q);
-      if (!a.trim() || Date.now() - shown >= READ_MS) return a;
+      const a = await wait(q, 'q');
+      if (a.pasted && a.text.trim()) {
+        out('  (a paste is not an answer to this question: type it)\n');
+        continue;
+      }
+      if (!a.text.trim() || Date.now() - shown >= READ_MS) return a.text;
       out('  (that came in before the question could be read: answer again)\n');
     }
   };
@@ -1056,7 +1250,15 @@ export async function run(ctx: CommandContext): Promise<void> {
       completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor }),
   });
   activeRl = rl;
-  const ask = lineQueue(rl, () => !!process.stdin.isTTY);
+  const ask = lineQueue(rl, () => !!process.stdin.isTTY, process.stdin);
+  // Bracketed paste: the terminal marks a paste, so its lines stay one
+  // message (lineQueue). Off again on every way out — exit, Ctrl-C twice, a
+  // crash (the exit event), SIGTERM — so the owner's shell is not left in it.
+  if (rl.terminal) {
+    term(PASTE_ON);
+    process.on('exit', () => term(PASTE_OFF));
+    process.once('SIGTERM', () => process.exit(143));
+  }
   const irq: Interrupt = { streaming: null, brake: null };
 
   let lastSigint = 0;
@@ -2590,6 +2792,10 @@ const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
                           turn in flight (the runtime cancels server-side);
                           at a question a command asks, they cancel it
+  (several lines)         a paste stays one message, sent with the next
+                          Enter and never run as a command; a line ending
+                          in \\ or Option/Alt+Enter goes on to a new line.
+                          Lines already entered are not edited again
   (bare Enter)            refresh this agent's phase/url from the attestor
   /hello                  identity, routes/services, serve-proof verification
   /balance                this agent's agentSeal gas + the account prepaid
@@ -2794,13 +3000,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
     }
     let line: string;
+    // A message of several lines, or a pasted one, goes to the agent as it
+    // is: never a command, whatever its first line starts with.
+    let asMessage = false;
     if (queued.length) {
       line = queued.shift()!;
       out(`\nagent ${s.agentId} › ${line}\n`);
     } else {
       atPrompt = true;
       try {
-        line = (await ((ask as Ask).main ?? ask)(`\nagent ${s.agentId} › `)).trim();
+        const q = `\nagent ${s.agentId} › `;
+        const entry = (ask as Ask).message ? await (ask as Ask).message!(q) : { text: await ((ask as Ask).main ?? ask)(q), multi: false, pasted: false };
+        line = entry.text.trim();
+        asMessage = entry.multi || entry.pasted;
       } finally {
         atPrompt = false;
       }
@@ -2811,6 +3023,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       try { await refreshSession(s); } catch { out(`  phase   ${s.phase} (refresh failed — attestor unreachable)\n`); }
       continue;
     }
+    commands: {
+    if (asMessage) break commands;
     if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
     if (line === '/quit' || line === '/exit') { process.exit(0); }
     if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
@@ -3309,6 +3523,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (isCancelled(e)) { out('cancelled\n'); continue; }
       out(`error: ${ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`); continue;
     }
+    } // commands
 
     // a chat turn (interruptible)
     if (!s.client) { out(`agent is ${s.phase} — /start or /reset before chatting\n`); continue; }
