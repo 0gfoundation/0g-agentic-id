@@ -151,17 +151,34 @@ export interface ChatImage {
 }
 
 /**
- * What the agent's runtime says about a message it took (`onNotice`). Today
- * one thing: the owner's model cannot view images, so the images were saved
- * as files in the agent's `~/uploads` instead (0g-harness).
+ * What the agent's runtime says about a message it took (`onNotice`,
+ * 0g-harness): the owner's model cannot view images, so the images were saved
+ * as files in the agent's file inbox `~/inbox` instead; or the turn left files new or
+ * changed in the agent's `~/outbox`, for the owner to download
+ * ({@link AgentClient.downloadFile}).
  */
 export interface ChatNotice {
   imagesSavedAsFiles?: string[];
+  /** Names of files in the outbox (`downloadFile('outbox', name)`). */
+  outboxFiles?: string[];
 }
+
+/** A file the owner can download ({@link AgentClient.listFiles}). */
+export interface AgentFile {
+  name: string;
+  bytes: number;
+  /** ISO 8601. */
+  mtime: string;
+  /** Hex; given for files up to 4 MiB. */
+  sha256?: string;
+}
+
+/** Where a download comes from: what the agent handed over, or what the owner uploaded. */
+export type AgentFileDir = 'outbox' | 'inbox';
 
 /** A file the owner sent ({@link AgentClient.uploadFile}): where it landed. */
 export interface UploadedFile {
-  /** Absolute path in the agent's container (under `~/uploads`). */
+  /** Absolute path in the agent's container (in its file inbox, `~/inbox`). */
   path: string;
   bytes: number;
 }
@@ -178,7 +195,7 @@ export interface AgentTask {
   output_text: string;
   error?: { message: string };
   /** Runtime notices about the message that opened it (0g-harness). */
-  harness?: { images_saved_as_files?: string[] };
+  harness?: { images_saved_as_files?: string[]; outbox_files?: string[] };
 }
 
 export interface ChatCompletion {
@@ -489,13 +506,24 @@ export interface AgentClient {
    */
   schedules?(): Promise<{ enabled: boolean; data: AgentSchedule[] }>;
   /**
-   * Send the agent a file: it lands under the agent's `~/uploads` (a new
+   * Send the agent a file: it lands in the agent's file inbox `~/inbox` (a new
    * name, never over an existing file; container-local, lost on a reset),
    * and the agent reads it with its own tools — tell it the returned path.
    * At most 25 MiB. Present only when the agent declares a `kind: "files"`
    * route (0g-harness) and this handle holds the owner token.
    */
   uploadFile?(name: string, data: Uint8Array): Promise<UploadedFile>;
+  /**
+   * The files the owner can download, newest first: what the agent put in its
+   * `~/outbox` (the default) or what the owner sent (`'inbox'`, the file inbox
+   * `~/inbox` — not the message inbox, {@link AgentClient.inbox}). Both are
+   * container-local and lost on a reset. Present only when the agent declares
+   * a `kind: "files"` route (0g-harness) and this handle holds the owner token;
+   * an agent whose runtime predates downloads answers with an error saying so.
+   */
+  listFiles?(dir?: AgentFileDir): Promise<AgentFile[]>;
+  /** One file's bytes (at most 50 MiB). See {@link AgentClient.listFiles}. */
+  downloadFile?(dir: AgentFileDir, name: string): Promise<Uint8Array>;
 }
 
 /** Longest-prefix match over declared routes, or undefined if none match. */
@@ -630,15 +658,30 @@ export function withImages(messages: ChatMessage[], images: ChatImage[] | undefi
   return out;
 }
 
-/** The notice an SSE comment carries (`: notice images_saved_as_files [...]`), if any. */
+/** The notice an SSE comment carries (`: notice images_saved_as_files [...]`, `: notice outbox_files [...]`), if any. */
 function noticeOf(comment: string): ChatNotice | undefined {
-  const m = /^notice images_saved_as_files (\[.*\])$/.exec(comment);
+  const m = /^notice (images_saved_as_files|outbox_files) (\[.*\])$/.exec(comment);
   if (!m) return undefined;
   try {
-    const paths = JSON.parse(m[1]) as unknown;
-    if (Array.isArray(paths) && paths.every((p) => typeof p === 'string')) return { imagesSavedAsFiles: paths.map((p) => plainText(p)) };
+    const items = JSON.parse(m[2]) as unknown;
+    if (!Array.isArray(items) || !items.every((p) => typeof p === 'string')) return undefined;
+    const clean = items.map((p) => plainText(p));
+    return m[1] === 'outbox_files' ? { outboxFiles: clean } : { imagesSavedAsFiles: clean };
   } catch { /* not a notice */ }
   return undefined;
+}
+
+/** The notice a buffered reply or a Responses record carries in `harness`, if any. */
+function harnessNotice(harness: AgentTask['harness'] | undefined): ChatNotice | undefined {
+  if (!harness) return undefined;
+  const n: ChatNotice = {};
+  const strings = (v: unknown): string[] | undefined =>
+    Array.isArray(v) && v.length && v.every((p) => typeof p === 'string') ? v.map((p) => plainText(p)) : undefined;
+  const images = strings(harness.images_saved_as_files);
+  const outbox = strings(harness.outbox_files);
+  if (images) n.imagesSavedAsFiles = images;
+  if (outbox) n.outboxFiles = outbox;
+  return images || outbox ? n : undefined;
 }
 
 /**
@@ -808,8 +851,9 @@ export function makeAgentClient(params: {
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const ct = r.headers.get('content-type') ?? '';
       if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
-        const full = (await r.json()) as ChatCompletion & { harness?: { images_saved_as_files?: string[] } };
-        if (full.harness?.images_saved_as_files) opts?.onNotice?.({ imagesSavedAsFiles: full.harness.images_saved_as_files });
+        const full = (await r.json()) as ChatCompletion & { harness?: AgentTask['harness'] };
+        const n = harnessNotice(full.harness);
+        if (n) opts?.onNotice?.(n);
         return full; // server didn't stream → plain JSON
       }
       return collectChatStream(r.body, opts?.onNotice ? (c) => { const n = noticeOf(c); if (n) opts.onNotice!(n); } : undefined);
@@ -969,6 +1013,7 @@ export function makeAgentClient(params: {
       startingAfter?: number;
       signal?: AbortSignal;
       onActivity?: (label: string) => void;
+      onNotice?: (notice: ChatNotice) => void;
     }): AsyncGenerator<string> {
       const id = args.id;
       let seq = args.startingAfter ?? 0;
@@ -1090,6 +1135,11 @@ export function makeAgentClient(params: {
         }
       }
 
+      // Notices known only when the turn ends (files it left in the outbox).
+      {
+        const n = harnessNotice(terminal.harness);
+        if (n?.outboxFiles) args.onNotice?.({ outboxFiles: n.outboxFiles });
+      }
       if (terminal.status === 'failed') {
         throw new Error(`chat: ${plainText(terminal.error?.message ?? 'task failed')}`);
       }
@@ -1122,8 +1172,8 @@ export function makeAgentClient(params: {
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const submitted = (await r.json()) as AgentTask;
       if (!submitted?.id) throw new Error('chat: the agent accepted the task but returned no id');
-      const saved = submitted.harness?.images_saved_as_files;
-      if (Array.isArray(saved) && saved.length) opts?.onNotice?.({ imagesSavedAsFiles: saved.map((p) => plainText(String(p))) });
+      const saved = harnessNotice(submitted.harness)?.imagesSavedAsFiles;
+      if (saved) opts?.onNotice?.({ imagesSavedAsFiles: saved });
       // A task id is a name to re-attach with: one that is not a plain
       // identifier is not handed out to be printed.
       if (TASK_ID.test(submitted.id)) opts?.onTask?.(submitted.id);
@@ -1132,6 +1182,7 @@ export function makeAgentClient(params: {
         startingAfter: 0,
         signal: opts?.signal,
         onActivity: wrapActivity(opts?.onActivity),
+        onNotice: opts?.onNotice,
       });
     };
 
@@ -1217,6 +1268,25 @@ export function makeAgentClient(params: {
   const filesBase = ownerBase('files');
   if (filesBase) {
     client.uploadFile = (name, data) => postJSON<UploadedFile>('uploadFile', filesBase, { name, content_base64: bytesToBase64(data) });
+    // Downloads share the files route; an agent whose runtime predates them
+    // does not list the GET endpoints, and the proxy answers 404.
+    const noDownloads = (what: string, status: number, text: string): Error =>
+      status === 404 && /no route|not found|404/i.test(text) && !/no file /.test(text)
+        ? new Error(`${what}: this agent's runtime does not serve downloads (update the agent)`)
+        : new Error(`${what}: HTTP ${status}: ${plainText(text)}`);
+    client.listFiles = async (dir = 'outbox') => {
+      const r = await doFetch(`${filesBase}${query({ dir })}`);
+      if (!r.ok) throw noDownloads('listFiles', r.status, await r.text());
+      const j = (await r.json()) as { data?: AgentFile[] };
+      return (j.data ?? []).map((f) => ({ ...f, name: plainText(String(f.name)) }));
+    };
+    client.downloadFile = async (dir, name) => {
+      if (dir !== 'outbox' && dir !== 'inbox') throw new Error('downloadFile: dir is outbox or inbox');
+      if (!name || name.includes('/') || name.includes('\\') || name.startsWith('.')) throw new Error('downloadFile: a file name is one path segment, without a leading dot');
+      const r = await doFetch(`${filesBase}/${dir}/${encodeURIComponent(name)}`);
+      if (!r.ok) throw noDownloads('downloadFile', r.status, await r.text());
+      return new Uint8Array(await r.arrayBuffer());
+    };
   }
 
   const eventsBase = ownerBase('events');

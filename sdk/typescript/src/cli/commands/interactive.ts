@@ -34,6 +34,7 @@ import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../mod
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { completePath, describeStaged, prepareAttachments, stageFile, type Staged } from '../attach';
+import { parseDownloadName, renderFiles, saveDownload } from '../download';
 import { pandaLines, svgPixelLines } from '../logo';
 import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
 import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePlan, applyResetInference, readDeploymentFacts, requiresProviderReset, deployWithInference } from '../inference';
@@ -41,7 +42,7 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/attach', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -464,7 +465,12 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/settings': ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness='],
   '/restart': ['harness', 'sealed'],
   '/cred': CRED_SUBS,
+  '/files': ['inbox'],
+  // What the outbox held when /files listed it or a turn reported it.
+  '/download': () => outboxNames,
 };
+/** The outbox names last seen in this session (/files, a turn's notice), for completion. */
+let outboxNames: string[] = [];
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
 
 const YES_NO = ['yes', 'no'];
@@ -2811,7 +2817,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /tasks /result /cancel /inbox /schedules /attach /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /tasks /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -2900,10 +2906,17 @@ const L2_HELP_FULL = `session commands
                           an image goes with the message (when the model takes
                           images, as its provider's model list says — else it
                           is saved as a file the agent is told about), any
-                          other file is uploaded to the agent's ~/uploads first
+                          other file is uploaded to the agent's ~/inbox first
                           and the message names its path. Bare lists what is
                           staged. Images: 8 per message, 10 MiB each, 32 MiB
                           together; a file: 25 MiB
+  /files [inbox]          the files the agent left for you in its ~/outbox (or,
+                          with inbox, the ones you sent, in its ~/inbox — not
+                          the message /inbox) — container-local,
+                          lost on a reset (0g-harness)
+  /download <name> [path] save one to the current directory (or path); never
+                          overwrites: a taken name gets -1, -2, … Names from
+                          your own files: inbox/<name>. At most 50 MiB
   /agentlog [n]           agent process log, last n lines (owner-only)
   /signatures [n]         what the agent signed as itself and what the runtime refused, last n (owner-only; 0g-harness)
   /startuplog [n]         sealed runtime startup log, last n lines
@@ -3570,6 +3583,28 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (staged.length) out('your next message carries them\n');
         continue;
       }
+      if (line === '/files' || line.startsWith('/files ') || line === '/download' || line.startsWith('/download ')) {
+        if (!s.client) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
+        if (!s.client.listFiles || !s.client.downloadFile) { out('(this agent hands over no files: its framework has no files route — 0g-harness does)\n'); continue; }
+        if (line === '/files' || line.startsWith('/files ')) {
+          const which = line.slice('/files'.length).trim();
+          if (which && which !== 'inbox' && which !== 'outbox') { out('usage: /files [inbox]\n'); continue; }
+          const dir = which === 'inbox' ? 'inbox' : 'outbox';
+          const files = await s.client.listFiles(dir);
+          if (dir === 'outbox') outboxNames = files.map((f) => f.name);
+          if (!files.length) { out(dir === 'outbox' ? 'the outbox is empty — ask the agent to put a file in ~/outbox for you\n' : 'the file inbox is empty\n'); continue; }
+          for (const l of renderFiles(files)) out(`${cleanCell(l)}\n`);
+          out(`/download ${dir === 'inbox' ? 'inbox/' : ''}<name> saves one here\n`);
+          continue;
+        }
+        const args = tokenize(line.slice('/download'.length).trim());
+        if (!args.length || args.length > 2) { out('usage: /download <name> [local path]\n'); continue; }
+        const { dir, name } = parseDownloadName(args[0]);
+        const bytes = await s.client.downloadFile(dir, name);
+        const saved = saveDownload(bytes, name, args[1]);
+        out(`saved ${cleanCell(name)} (${bytes.length} bytes) → ${cleanCell(saved)}\n`);
+        continue;
+      }
       if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
     } catch (e) {
       // Show the remedy too: an error whose whole point is "do this instead"
@@ -3671,6 +3706,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             if (n.imagesSavedAsFiles?.length) {
               clearActivity();
               out(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map(cleanCell).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);
+            }
+            if (n.outboxFiles?.length) {
+              clearActivity();
+              outboxNames = [...new Set([...n.outboxFiles, ...outboxNames])];
+              out(`\n(the agent left ${n.outboxFiles.length === 1 ? 'a file' : 'files'} for you: ${n.outboxFiles.map(cleanCell).join(', ')} — /download <name> saves ${n.outboxFiles.length === 1 ? 'it' : 'one'} here)\n`);
             }
           },
           // Responses transport only: remember the server-side task id, so

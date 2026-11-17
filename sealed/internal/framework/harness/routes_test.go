@@ -67,6 +67,9 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/schedules", "GET", "/v1/schedules"},
 		{"/v1/schedules", "DELETE", "/v1/schedules/s1"},
 		{"/v1/files", "POST", "/v1/files"},
+		{"/v1/files", "GET", "/v1/files"},
+		{"/v1/files", "GET", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "GET", "/v1/files/inbox/notes.txt"},
 		{"/v1/", "OPTIONS", "/v1/chat/completions"},
 	}
 	for _, f := range forwarded {
@@ -82,8 +85,11 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/tasks", "POST", "/v1/tasks/a/b/cancel"},
 		{"/v1/tasks", "GET", "/v1/tasks/"},
 		{"/v1/inbox", "GET", "/v1/inbox/all"},
-		{"/v1/files", "GET", "/v1/files"},
 		{"/v1/files", "POST", "/v1/files/x"},
+		{"/v1/files", "GET", "/v1/files/outbox"},
+		{"/v1/files", "GET", "/v1/files/outbox/a/b"},
+		{"/v1/files", "DELETE", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "POST", "/v1/files/outbox/report.pdf"},
 	}
 	for _, f := range refused {
 		if ok, _ := routes[f.prefix].Allows(f.method, f.path); ok {
