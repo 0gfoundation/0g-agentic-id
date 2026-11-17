@@ -70,7 +70,9 @@ Nothing outside that allowlist is settable by anyone. Measured code decides:
   user, on loopback port 8794 (on an image without packages,
   `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`).
 - It passes the environment `environ()` builds. The contract is the harness's
-  `docs/PROTOCOL.md`.
+  `docs/PROTOCOL.md`. It includes `SEAL_OWNER`, the owner read from chain at
+  boot (lowercased), against which the harness checks each memory's
+  `trusted_by`.
 - The harness calls the model through sealed's inference route
   (`internal/inferproxy`), a loopback address, for every provider sealed
   knows the endpoint of: the registry's managed providers, and `openai` and
@@ -118,7 +120,7 @@ path gets 404, an unlisted method 405.
 The harness can ask sealed to restart it (`POST /harness/restart` on the sign
 socket): sealed stops the process and starts it again from the package it is
 set to run (`../../LAYERS.md` §5.3). A boot keeps the persona
-(`APPEND_SYSTEM.md`), the `skills/` and the `memory/` the agent changed after
+(`APPEND_SYSTEM.md`), the `skills/`, `memory/` and `memory-public/` the agent changed after
 its last commit, as long as the chain still holds what this container last
 committed (`../../LAYERS.md` §3).
 
@@ -134,7 +136,7 @@ committed (`../../LAYERS.md` §3).
 | filesystem | `dsh-fs-local` + `dsh-tool-fs` |
 | owner images and files | `dsh-attachment-local` (the owner's images, normalized, below `~/.dsh-attachments` in the agent's home, untracked; it also enables `read_image`). Files the owner uploads (`POST /v1/files`) land in the file inbox `~/inbox` (not the message inbox `/v1/inbox`), untracked; the image ships `pdftotext` for PDFs among them. Files the agent hands over go in `~/outbox`, untracked; the owner lists and downloads them (`GET /v1/files`, `GET /v1/files/{outbox|inbox}/{name}`, at most 50 MiB), and a turn that leaves new or changed files there says so (`harness.outbox_files`) |
 | skills | `dsh-skill-filesystem` (the `skills/` iData role — agent-installed, chain-tracked) |
-| long-term memory | the harness's own system-prompt section (`src/memory.mjs`): the guidance and the `MEMORY.md` index, read at every model step; the memory files are the `memory/` iData role (`memory.go`) — one `<name>.md` per memory directly in `$DSH_HOME/memory/`, chain-tracked; the committed copy carries placeholders for credential values and `[redacted:<kind>]` for secrets of a known format (`../../../CREDENTIALS.md`, What is outside); consolidated now and then while the agent is idle (`src/memory-tidy.mjs`, switch `memoryTidy`), or now on `POST /v1/memory/tidy` (kind `memory`) |
+| long-term memory | the harness's own system-prompt section (`src/memory.mjs`): the guidance and, up to `memoryInlineBytes` of bodies, every memory whole, above it the two `MEMORY.md` indexes, read at every model step; the memory files are two iData roles (`memory.go`), `memory/` (private: the owner's sessions and tasks only) and `memory-public/` (public: written only on the owner's explicit request) — one `<name>.md` per memory directly in `$DSH_HOME/memory/` or `$DSH_HOME/memory-public/`, chain-tracked; each memory's `trusted_by` names the owner who confirmed it, and one not confirmed by the current owner (`SEAL_OWNER`) is reference only; the committed copy carries placeholders for credential values and `[redacted:<kind>]` for secrets of a known format (`../../../CREDENTIALS.md`, What is outside); consolidated now and then while the agent is idle (`src/memory-tidy.mjs`, switch `memoryTidy`), or now on `POST /v1/memory/tidy` (kind `memory`) |
 | context headroom | `dsh-token-meter` + `dsh-compaction-basic` |
 | loop hygiene | `dsh-tool-call-timeout-policy` |
 | background jobs (`toolJobs` on) | `dsh-tool-jobs`: commands run in the background; a job finishing while the agent is idle opens a turn, whose reply goes to the inbox |
@@ -173,8 +175,9 @@ container does not.
 | `modelImages` | unset | overrides whether the owner's model takes images (`true`/`false`). Unset: the provider's model list decides (`architecture.input_modalities` on the 0G router: glm-5.3 text only, glm-5.3-flash with images), and where it says nothing, pi-ai's catalog. With images the owner's images reach the model; without, each is saved in `~/inbox` and the agent is told it cannot view it |
 | `memoryExtract` | `true` | before a compaction of an owner session, and after a turn that saved nothing once enough is new, the harness makes one model call that writes long-term memory from those messages (0g-harness `src/memory-extract.mjs`); `false` turns both off. Rendered as `SEAL_HARNESS_MEMORY_EXTRACT`. |
 | `memoryExtractMinMessages` | `6` | how many of the owner's and the agent's messages must be new since the last pass before a turn that saved nothing is read for memories (1 to 1000). Rendered as `SEAL_HARNESS_MEMORY_EXTRACT_MIN_MESSAGES`. |
-| `memoryRecall` | `true` | once there are more than 30 memories, before each owner message the harness makes one model call that picks up to 5 whose bodies will help and puts them ahead of the message (0g-harness `src/memory-recall.mjs`); `false` turns it off. Rendered as `SEAL_HARNESS_MEMORY_RECALL`. |
-| `memoryTidy` | `true` | now and then, while the agent is idle, the harness makes one model call that consolidates long-term memory: merges duplicates, drops what is stale or contradicted (0g-harness `src/memory-tidy.mjs`; due 24 h after the last pass once the memories changed, or sooner when the index nears its cap); `false` turns the automatic pass off, and `POST /v1/memory/tidy` still runs one on request. Rendered as `SEAL_HARNESS_MEMORY_TIDY`. |
+| `memoryInlineBytes` | `8192` | up to this many bytes of memory bodies (both memory roles) every memory is in the system prompt whole and there is no recall; above it, the indexes and recall (256 to 65536). Rendered as `SEAL_HARNESS_MEMORY_INLINE_BYTES`. |
+| `memoryRecall` | `true` | above `memoryInlineBytes`, before each owner message the harness makes one model call that picks up to 5 memories whose bodies will help and puts them ahead of the message (0g-harness `src/memory-recall.mjs`); `false` turns it off. Rendered as `SEAL_HARNESS_MEMORY_RECALL`. |
+| `memoryTidy` | `true` | now and then, while the agent is idle, the harness makes one model call per memory role that consolidates that role's memories the current owner trusts: merges duplicates, drops what is stale or contradicted, never moves anything between the roles (0g-harness `src/memory-tidy.mjs`; due 24 h after the last pass once the memories changed, or sooner when an index nears its cap); `false` turns the automatic pass off, and `POST /v1/memory/tidy` still runs one on request. Rendered as `SEAL_HARNESS_MEMORY_TIDY`. |
 
 A bad value here never fails a boot. `RenderSettings` runs before every spawn,
 so an error would mean an agent that cannot start, not a rejected push. So an

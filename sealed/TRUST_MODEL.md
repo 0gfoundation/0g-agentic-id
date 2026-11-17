@@ -463,6 +463,19 @@ self-minted (`register()`) agent has no `agentSeal`, so `update` stays
 owner-gated. That is a different product from an autonomous, TEE-resident
 seal-bound agent, and the choice between them is the choice of trust model.
 
+**What a transfer conveys of a 0g-harness agent's memory.** The memory roles
+(`memory/`, private, and `memory-public/`, public) go with the agent; trust
+does not. Each memory names the owner who confirmed it (`trusted_by`), and
+the harness treats one confirmed by anyone but the current owner (sealed
+passes the owner it read from chain at boot as `SEAL_OWNER`) as reference:
+background knowledge, never followed as an instruction and never the basis
+for a payment, a signature, a transaction or sending data out. The new owner
+adopts an inherited memory explicitly (`memory_confirm`, on their own
+words). The harness's memory tools, extraction and consolidation never
+rewrite a reference item or raise its trust; that the model does not act on
+one is a rule the model applies, not a cryptographic guarantee (0g-harness
+README, Long-term memory).
+
 ---
 
 ## `dataKey` atomic transfer on ownership change

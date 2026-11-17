@@ -17,7 +17,8 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 		Tracked: []platform.PathNote{
 			{Path: "~/.dsh/skills/<name>/ or <name>.md", Note: "your installed skills — durable capabilities you can invoke by name across sessions. A skill you write and never save here does not survive this container's next restart"},
 			{Path: "~/.dsh/APPEND_SYSTEM.md", Note: "your persona / standing instructions, injected into your system prompt every session"},
-			{Path: "~/.dsh/memory/<name>.md and ~/.dsh/memory/MEMORY.md", Note: "your long-term memory: one Markdown file per memory, directly in that directory, and the MEMORY.md index, which is in your context every turn. It survives restarts, resets and rebuilds, and goes with you to a new owner on a transfer. Subdirectories, dotfiles and empty files are not tracked"},
+			{Path: "~/.dsh/memory/<name>.md and ~/.dsh/memory/MEMORY.md", Note: "your private long-term memory: one Markdown file per memory, directly in that directory, and its MEMORY.md index. Used only in your owner's own sessions and tasks. It survives restarts, resets and rebuilds, and goes with you to a new owner on a transfer. Subdirectories, dotfiles and empty files are not tracked"},
+			{Path: "~/.dsh/memory-public/<name>.md and ~/.dsh/memory-public/MEMORY.md", Note: "your public long-term memory, the same layout: knowledge that may also be used outside your owner's sessions. A memory goes here only when your owner explicitly asks. Tracked and transferred like the private one"},
 		},
 		Untracked: []platform.PathNote{
 			{Note: "every session/conversation log this container's composition writes — the owner may talk to you in several sessions (and run tasks, each in a session of its own); each is its own conversation, and all of them share your persona, skills and long-term memory. Logs are turn-by-turn history, not your identity, and deliberately not chain-tracked: what one session should know in another belongs in memory"},
@@ -32,7 +33,7 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 		DurableHints: []platform.DurableHint{
 			{Ask: "Give yourself a new capability", Place: "a skill under `~/.dsh/skills/<name>/` (a `SKILL.md`) or `~/.dsh/skills/<name>.md`"},
 			{Ask: "Change how you always behave", Place: "`~/.dsh/APPEND_SYSTEM.md`"},
-			{Ask: "Remember this long-term", Place: "a file under `~/.dsh/memory/` and its line in `~/.dsh/memory/MEMORY.md`"},
+			{Ask: "Remember this long-term", Place: "a file under `~/.dsh/memory/` (or `~/.dsh/memory-public/` when your owner says it may be shared) and its line in that folder's `MEMORY.md`; your memory tools do both"},
 		},
 		VersionScheme: "0g-harness versions",
 		Versions:      supportedVersions,

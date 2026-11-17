@@ -33,10 +33,13 @@
 //	                agent-owned state we track.
 //	skills/         DirectoryManifest — agent-installed skills under
 //	                $DSH_HOME/skills/ (skills.go)
-//	memory/         DirectoryManifest — the agent's long-term memory, one
-//	                Markdown file per memory plus the MEMORY.md index under
-//	                $DSH_HOME/memory/ (memory.go); the harness keeps the
-//	                index in the model's context every turn
+//	memory/         DirectoryManifest — the agent's private long-term memory,
+//	                one Markdown file per memory plus the MEMORY.md index
+//	                under $DSH_HOME/memory/ (memory.go); used only in the
+//	                owner's own sessions and tasks
+//	memory-public/  DirectoryManifest — the agent's public long-term memory,
+//	                the same shape under $DSH_HOME/memory-public/; it may
+//	                also be used outside the owner's sessions
 //
 // There is no config role: the inference pin is not chain state but the
 // owner's settings document, rendered into the harness's environment at every
@@ -208,6 +211,7 @@ func (a *Adapter) Roles() []framework.RoleSpec {
 		{Name: "APPEND_SYSTEM.md", Shape: framework.Leaf},
 		{Name: "skills/", Shape: framework.DirectoryManifest},
 		{Name: "memory/", Shape: framework.DirectoryManifest},
+		{Name: "memory-public/", Shape: framework.DirectoryManifest},
 	}
 }
 
@@ -226,7 +230,7 @@ func (a *Adapter) Defaults(role string) []byte {
 		return b
 	case "APPEND_SYSTEM.md":
 		return nil
-	case "skills/", "memory/":
+	case "skills/", "memory/", "memory-public/":
 		b, err := manifest.New().Marshal()
 		if err != nil {
 			return nil
@@ -246,8 +250,8 @@ func (a *Adapter) Restore(ctx context.Context, role string, plaintext []byte) er
 		return a.restoreAppendSystem(plaintext)
 	case "skills/":
 		return a.restoreManifestDir(role, skillsDir(), plaintext)
-	case "memory/":
-		return a.restoreManifestDir(role, memoryDir(), plaintext)
+	case "memory/", "memory-public/":
+		return a.restoreManifestDir(role, memoryRoleDir(role), plaintext)
 	}
 	// Unknown roles are not an error: bootstrap routes them to HandleLegacy.
 	logger.Logf("harness.Restore: ignoring unknown role %q", role)
@@ -322,8 +326,8 @@ func (a *Adapter) EvolutionFor(ctx context.Context, role string) ([]byte, error)
 		return a.evoAppendSystem()
 	case "skills/":
 		return a.evoSkills()
-	case "memory/":
-		return a.evoMemory()
+	case "memory/", "memory-public/":
+		return a.evoMemory(role)
 	}
 	return nil, framework.ErrUnsupportedDim
 }
@@ -365,7 +369,7 @@ func (a *Adapter) CommitsPlaintext() bool { return true }
 // own writing, so a boot keeps what it changed after its last commit
 // (framework.UncommittedKeeper). The framework binding is not.
 func (a *Adapter) KeepsUncommitted(role string) bool {
-	return role == "APPEND_SYSTEM.md" || role == "skills/" || role == "memory/"
+	return role == "APPEND_SYSTEM.md" || role == "skills/" || role == "memory/" || role == "memory-public/"
 }
 
 // LoadEntry returns one manifest entry's plaintext. Must hash to exactly the
@@ -374,8 +378,8 @@ func (a *Adapter) LoadEntry(ctx context.Context, role, path string) ([]byte, err
 	switch role {
 	case "skills/":
 		return a.loadEntrySkills(path)
-	case "memory/":
-		return a.loadEntryMemory(path)
+	case "memory/", "memory-public/":
+		return a.loadEntryMemory(role, path)
 	}
 	return nil, framework.ErrUnsupportedDim
 }
@@ -385,8 +389,8 @@ func (a *Adapter) RestoreEntry(ctx context.Context, role, path string, plaintext
 	switch role {
 	case "skills/":
 		return a.restoreEntrySkills(path, plaintext)
-	case "memory/":
-		return a.restoreEntryMemory(path, plaintext)
+	case "memory/", "memory-public/":
+		return a.restoreEntryMemory(role, path, plaintext)
 	}
 	return framework.ErrUnsupportedDim
 }

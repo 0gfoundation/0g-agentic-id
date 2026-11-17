@@ -56,7 +56,7 @@ onboarding copy.
    expressible) — each adapter's `paths.go` records the classification.
 4. **A container recreate clears it — by design.** `reset` means "fresh
    start"; what should survive is already distilled into the chain-tracked
-   memory roles (MEMORY.md / memories/ / harness_state.json / memory/). The conversation
+   memory roles (MEMORY.md / memories/ / harness_state.json / memory/ / memory-public/). The conversation
    is working context, not an asset.
 5. **`/clear`: wipe it without a recreate.** Owner-signed, the settings-push
    grammar. Fresh conversation; the file is deleted. Its gentler sibling

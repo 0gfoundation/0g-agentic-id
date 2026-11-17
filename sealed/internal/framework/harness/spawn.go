@@ -368,6 +368,12 @@ func (be bridgeEnv) environ() []string {
 	if be.rt.AgentSeal != "" {
 		env = append(env, "AGENT_SEAL="+be.rt.AgentSeal)
 	}
+	// The NFT owner at this boot (a public chain fact): a memory item is
+	// trusted only while its trusted_by names this address, so after a
+	// transfer what the previous owner confirmed is reference only.
+	if be.rt.Owner != "" {
+		env = append(env, "SEAL_OWNER="+strings.ToLower(be.rt.Owner))
+	}
 	return append(env, be.rt.CredentialEnv()...)
 }
 
