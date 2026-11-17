@@ -77,6 +77,11 @@ Nothing outside that allowlist is settable by anyone. Measured code decides:
   `anthropic` at their official endpoints, fixed in sealed. The route names
   the owner's model, appends the agent doc to the system prompt and sets the
   key; the harness holds a placeholder (`../../CONFIG_SURFACE.md` §3, §7).
+  On the 0G router (`0g-compute`) with `webTools` on, the route also forwards
+  `POST /v1/web/search` for `web_search`: it takes only a `{"query"}` body,
+  rebuilds it and sets the key, with no model and no agent doc
+  (`inferproxy` `webSearch`); the harness gets its address as
+  `SEAL_HARNESS_WEB_SEARCH_URL`.
 - The harness checks its own token on `/v1/*` (`SEAL_BRIDGE_TOKEN`). The
   owner gets a different one from `/_seal/auth`, and sealed's proxy swaps it
   for the harness's on the way in, so nothing the harness runs sees the
@@ -169,12 +174,13 @@ container does not.
 | `toolJobs` | `false` | background commands (`run_in_background`) and the `job_*` tools |
 | `subagents` | `false` | the `subagent` tool: read-only helpers the main agent runs in the background (turns the job tools on with it) |
 | `schedule` | `false` | `schedule_create` / `schedule_list` / `schedule_view` / `schedule_edit`, `schedule_create_task` and `schedule_runs`: reminders and scheduled work the agent sets for itself, delivered to the session that set it, to a new session, or as a new task at each occurrence; a reminder a task sets for itself starts a run of it |
-| `maxParallelToolCalls` | `1` | tool calls one model step may run at once. It applies only to the tools that declare themselves safe to run together: `read`, `read_image` and `subagent`. `bash`, `write`, `edit`, the `seal_*` tools and the job and schedule tools always run alone, after the calls before them finish |
+| `maxParallelToolCalls` | `1` | tool calls one model step may run at once. It applies only to the tools that declare themselves safe to run together: `read`, `read_image`, `web_search`, `web_fetch` and `subagent`. `bash`, `write`, `edit`, the `seal_*` tools and the job and schedule tools always run alone, after the calls before them finish |
 | `modelImages` | unset | overrides whether the owner's model takes images (`true`/`false`). Unset: the provider's model list decides (`architecture.input_modalities` on the 0G router: glm-5.3 text only, glm-5.3-flash with images), and where it says nothing, pi-ai's catalog. With images the owner's images reach the model; without, each is saved in `~/inbox` and the agent is told it cannot view it |
 | `memoryExtract` | `true` | before a compaction of an owner session, and after a turn that saved nothing once enough is new, the harness makes one model call that writes long-term memory from those messages (0g-harness `src/memory-extract.mjs`); `false` turns both off. Rendered as `SEAL_HARNESS_MEMORY_EXTRACT`. |
 | `memoryExtractMinMessages` | `6` | how many of the owner's and the agent's messages must be new since the last pass before a turn that saved nothing is read for memories (1 to 1000). Rendered as `SEAL_HARNESS_MEMORY_EXTRACT_MIN_MESSAGES`. |
 | `memoryRecall` | `true` | once there are more than 30 memories, before each owner message the harness makes one model call that picks up to 5 whose bodies will help and puts them ahead of the message (0g-harness `src/memory-recall.mjs`); `false` turns it off. Rendered as `SEAL_HARNESS_MEMORY_RECALL`. |
 | `memoryTidy` | `true` | now and then, while the agent is idle, the harness makes one model call that consolidates long-term memory: merges duplicates, drops what is stale or contradicted (0g-harness `src/memory-tidy.mjs`; due 24 h after the last pass once the memories changed, or sooner when the index nears its cap); `false` turns the automatic pass off, and `POST /v1/memory/tidy` still runs one on request. Rendered as `SEAL_HARNESS_MEMORY_TIDY`. |
+| `webTools` | `true` | the `web_fetch` tool (one public http(s) page as text; private and loopback addresses refused, also after DNS; out through the credential proxy) and, when the model is on the 0G router (`0g-compute`), `web_search` (the router's `/v1/web/search` through the inference route, billed per search to the owner's 0G Compute key) (0g-harness `src/web.mjs`); `false` turns both off. Rendered as `SEAL_HARNESS_WEB`. |
 
 A bad value here never fails a boot. `RenderSettings` runs before every spawn,
 so an error would mean an agent that cannot start, not a rejected push. So an

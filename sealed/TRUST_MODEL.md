@@ -1332,7 +1332,8 @@ check rests on:
   registry address, openai and anthropic at their official addresses fixed in
   sealed) with the model the owner's settings pin, and appends the platform
   doc (identity, doctrine) to its system prompt. Only model calls pass, by
-  exact path (chat/completions, messages, responses, the model list). Under
+  exact path (chat/completions, messages, responses, the model list), and on
+  the 0G router its web search (`web/search`, a query only). Under
   the layered flow every serve-proof is v2 or none. A v2 serve-proof's
   `inference_url` and `model` say where the route forwarded and with which
   model name; they do not prove that an answer came from that model, since
