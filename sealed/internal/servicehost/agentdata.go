@@ -2,7 +2,7 @@ package servicehost
 
 // Agent data: a release can ask for read-only copies of the agent's own
 // committed data, so the program can work as the agent (its persona, its
-// skills and the memories it chose to make public) inside the isolation.
+// skills and its public long-term memory) inside the isolation.
 //
 // The grant is part of the published manifest, so callers who audit the
 // release see that it reads agent data. Every temporary worker (a one-shot
@@ -10,7 +10,10 @@ package servicehost
 // worker starts and fixed for its whole life: the agent's later commits never
 // change what a running job reads. The copy is the version committed on chain
 // (scrubbed of credential values and known-format secrets, as committed), never
-// uncommitted edits, and only memories the agent marked `visibility: public`.
+// uncommitted edits. Public memory is the agent's memory-public/ role whole;
+// the private memory/ role is never staged. Workers also get SEAL_OWNER, the
+// owner this container serves, so a reader can tell the memories that owner
+// confirmed (`trusted_by`) from those inherited from an earlier owner.
 // Coordinators get none. Owner-private memory, the conversation, the agent's
 // inbox/outbox and home, credentials and the sign socket stay out of reach.
 // An execution's status, and so its signed receipt, names the versions it
@@ -61,9 +64,11 @@ func (g AgentDataGrant) Kinds() []string {
 // AgentDataVersion names the committed version of one kind of agent data a
 // job read. ContentHash and DataHash are the role's chain pins (sha256 of the
 // committed plaintext, and the 0G storage root the AgenticID entry holds), both
-// empty when the role was never committed. SnapshotHash is the sha256 over the
-// files the job could read (AgentDataListingHash); for public memory it
-// covers only the public subset and the index built from it.
+// empty when the role was never committed; they are what a caller checks
+// against the chain. SnapshotHash is the sha256 over the files the job could
+// read (AgentDataListingHash): the same set the pins name, hashed file by file,
+// so whoever holds the plaintext files (the job's own copy, or the role's
+// files) can check it without the iData manifest format.
 type AgentDataVersion struct {
 	Kind         string `json:"kind"`
 	ContentHash  string `json:"content_hash,omitempty"`
@@ -93,7 +98,7 @@ const (
 // agentDataDir names the subdirectory of a kind in the job's copy.
 func agentDataDir(kind string) string {
 	if kind == AgentDataPublicMemory {
-		return "memory"
+		return "memory-public"
 	}
 	return kind
 }
@@ -187,6 +192,17 @@ func copyTree(src, dst string, bytesLeft, filesLeft *int64, dirs *[]string) erro
 		}
 	}
 	return nil
+}
+
+// agentDataEnv is what a worker reading agent data at dir is told: where
+// the copy is, and the owner this container serves (SEAL_OWNER), against
+// whom each memory's `trusted_by` is checked.
+func (m *Manager) agentDataEnv(dir string) []string {
+	env := []string{"SEAL_AGENT_DATA=" + dir}
+	if m.owner != "" {
+		env = append(env, "SEAL_OWNER="+m.owner)
+	}
+	return env
 }
 
 // stageAgentDataFor asks the provider for the grant's parts and stages them

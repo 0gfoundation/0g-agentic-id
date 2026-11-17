@@ -400,7 +400,9 @@ seal-bound agent 是两种不同的产品，选哪个就是选哪种信任模型
 作指令执行，也从不作为付款、签名、交易或向外发送数据的依据。新 owner 要用自
 己的原话明确采纳一条继承来的记忆（`memory_confirm`）。harness 的记忆工具、提
 取和整理从不改写参考记忆，也不提高它的可信度；模型不按参考记忆行事是模型遵守
-的规则，不是密码学保证（0g-harness README 的长期记忆一节）。
+的规则，不是密码学保证（0g-harness README 的长期记忆一节）。读取公开记忆的
+托管程序（`agent_data`）拿到同一个 `SEAL_OWNER`，harness 的读取器在那里同样
+标出继承来的记忆（MCP_SERVICES.zh.md 的 agent 数据一节）。
 
 ---
 

@@ -1,6 +1,7 @@
 // Package agentdata keeps the agent's committed data for hosted programs
 // that ask for it (servicehost agent_data): the persona, the skills and the
-// memories the agent marked public, each at the version committed on chain.
+// public long-term memory (the memory-public/ role whole), each at the
+// version committed on chain.
 //
 // The provider keeps one directory per kind and committed version under
 // sealed's root-only state directory, built from the agent's files when they
@@ -9,8 +10,9 @@
 // confirmed commit and on boot (Observe), and when a job asks for a version it
 // has not built yet. When the files have moved on and the committed version
 // was never built here, it refuses the job (ErrNotReady) rather than serve an
-// uncommitted edit; the next commit builds it. Public memory is filtered
-// before anything is written: a private memory never enters this directory.
+// uncommitted edit; the next commit builds it. The private memory/ role is
+// never read: no kind maps to it, so a private memory never enters this
+// directory.
 package agentdata
 
 import (
@@ -35,15 +37,15 @@ import (
 
 // Roles of the 0g-harness adapter each kind comes from.
 const (
-	RolePersona = "APPEND_SYSTEM.md"
-	RoleSkills  = "skills/"
-	RoleMemory  = "memory/"
+	RolePersona      = "APPEND_SYSTEM.md"
+	RoleSkills       = "skills/"
+	RolePublicMemory = "memory-public/"
 )
 
 var roleOf = map[string]string{
 	servicehost.AgentDataPersona:      RolePersona,
 	servicehost.AgentDataSkills:       RoleSkills,
-	servicehost.AgentDataPublicMemory: RoleMemory,
+	servicehost.AgentDataPublicMemory: RolePublicMemory,
 }
 
 // ErrNotReady: the committed version is not built in this container and the
@@ -149,7 +151,7 @@ func (p *Provider) versionLocked(ctx context.Context, kind string) (string, serv
 	files := map[string][]byte{}
 	if contentHash != "" {
 		var err error
-		if files, err = p.committedFiles(ctx, kind, role, contentHash); err != nil {
+		if files, err = p.committedFiles(ctx, role, contentHash); err != nil {
 			return "", servicehost.AgentDataVersion{}, err
 		}
 	}
@@ -163,8 +165,9 @@ func (p *Provider) versionLocked(ctx context.Context, kind string) (string, serv
 }
 
 // committedFiles reads the role from the agent's files, provided they hold
-// the committed version, as the files a job sees (kind's view).
-func (p *Provider) committedFiles(ctx context.Context, kind, role, contentHash string) (map[string][]byte, error) {
+// the committed version, as the files a job sees: every entry of the role (a
+// directory entry unpacked into its files).
+func (p *Provider) committedFiles(ctx context.Context, role, contentHash string) (map[string][]byte, error) {
 	top, err := p.src.EvolutionFor(ctx, role)
 	if err != nil {
 		return nil, err
@@ -187,9 +190,6 @@ func (p *Provider) committedFiles(ctx context.Context, kind, role, contentHash s
 		if e.IsHeld() {
 			continue
 		}
-		if kind == servicehost.AgentDataPublicMemory && (e.Kind != manifest.EntryFile || !strings.HasSuffix(e.Path, ".md") || e.Path == "MEMORY.md") {
-			continue
-		}
 		b, err := p.src.LoadEntry(ctx, role, e.Path)
 		if err != nil {
 			return nil, err
@@ -198,10 +198,6 @@ func (p *Provider) committedFiles(ctx context.Context, kind, role, contentHash s
 			return nil, ErrNotReady // the files moved on while being read
 		}
 		switch {
-		case kind == servicehost.AgentDataPublicMemory:
-			if Public(b) {
-				files[e.Path] = b
-			}
 		case e.Kind == manifest.EntryDir:
 			tree, err := p.unpackToMap(b)
 			if err != nil {
@@ -213,9 +209,6 @@ func (p *Provider) committedFiles(ctx context.Context, kind, role, contentHash s
 		default:
 			files[e.Path] = b
 		}
-	}
-	if kind == servicehost.AgentDataPublicMemory && len(files) > 0 {
-		files["MEMORY.md"] = PublicIndex(files)
 	}
 	return files, nil
 }

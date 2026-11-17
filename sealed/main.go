@@ -1027,7 +1027,7 @@ func startAgent(
 		agent.SetChainUploadHook(func(dim, _ string) { observeCommit(dim) })
 	}
 	if agentData != nil {
-		for _, role := range []string{agentdata.RolePersona, agentdata.RoleSkills, agentdata.RoleMemory} {
+		for _, role := range []string{agentdata.RolePersona, agentdata.RoleSkills, agentdata.RolePublicMemory} {
 			observeCommit(role)
 		}
 	}
@@ -1090,6 +1090,7 @@ func startAgent(
 				defer cancel()
 				return lr.acquireServiceRuntime(ctx, harness)
 			},
+			Owner: strings.ToLower(res.owner),
 			AgentData: func(ctx context.Context, g servicehost.AgentDataGrant) ([]servicehost.AgentDataPart, func(), error) {
 				if agentData == nil {
 					return nil, nil, fmt.Errorf("agent data is unavailable for this framework")

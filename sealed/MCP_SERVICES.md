@@ -182,9 +182,15 @@ then reads, at `$SEAL_AGENT_DATA`:
 
 - `persona/APPEND_SYSTEM.md`: the agent's persona;
 - `skills/`: its skills, as files (a skill directory unpacked);
-- `memory/`: only the memories whose front matter says `visibility: public`,
-  and a `MEMORY.md` index built from them;
+- `memory-public/`: the agent's public long-term memory, its committed
+  `memory-public/` role whole (one file per memory and the role's own
+  `MEMORY.md` index). The private `memory/` role is never staged;
 - `versions.json`: the version of each kind it holds.
+
+Those workers also get `SEAL_OWNER`, the NFT owner this container serves
+(lowercase). Each memory names the owner who confirmed it (`trusted_by`); one
+confirmed by an earlier owner is inherited and only a reference, never a basis
+for action.
 
 Each kind is the version committed on chain, as committed: scrubbed of the
 credential values sealed holds and of secrets of a known format, never an edit
@@ -203,13 +209,16 @@ socket stay out of reach.
 A version is `{kind, content_hash, data_hash, snapshot_hash, files}`:
 `content_hash` and `data_hash` are the role's chain pins (sha256 of the
 committed plaintext, and the 0G storage root its AgenticID entry holds; empty
-when never committed), and `snapshot_hash` is sha256 over `path NUL sha256 LF`
-of the files the job could read, sorted by path (for public memory, only the
-public subset and its index). An execution's status carries them as
-`agent_data`, and so does its receipt: a caller can later tell which code and
-which data produced a result. Harness `runServiceAgent({agentData: true})`
-mounts the persona, the skills and the public memory (its index plus a
-read-only `agent_memory_read` tool) into the task's agent loop.
+when never committed; for public memory, the `memory-public/` role's own), and
+`snapshot_hash` is sha256 over `path NUL sha256 LF` of the files the job could
+read, sorted by path. The pins are what a caller checks against the chain;
+`snapshot_hash` names the same files, hashed one by one, so whoever holds the
+plaintext files can check it without the iData manifest format. An execution's
+status carries them as `agent_data`, and so does its receipt: a caller can
+later tell which code and which data produced a result. Harness
+`runServiceAgent({agentData: true})` mounts the persona, the skills and the
+public memory (its index plus a read-only `agent_memory_read` tool) into the
+task's agent loop, marking each inherited memory as reference only.
 
 ### v1 limits
 
@@ -218,10 +227,14 @@ read-only `agent_memory_read` tool) into the task's agent loop.
   version from 0G storage. When this container never built the committed
   version and the files have moved past it (for instance a restart with edits
   not yet committed), workers that need it are refused until the next commit.
-- **Public is set by a direct write.** A memory enters or leaves the public
-  view only when its file is written with or without `visibility: public` and
-  committed. 0g-harness memory extraction and tidy never add or remove the
-  marker.
+- **Public is a folder.** A memory is public exactly when it is in
+  `memory-public/` and committed, and the whole committed folder is mounted;
+  there is no per-memory selection. 0g-harness writes there only on the
+  owner's explicit request: extraction writes private memories only, and tidy
+  works inside each folder, never moving a memory between them.
+- **Trust is the reader's check.** Inherited memories are mounted too. sealed
+  passes `SEAL_OWNER`; a reader that does not compare it with `trusted_by`
+  treats every memory alike.
 - **Skills are all or nothing.** `skills` grants every committed skill; there
   is no per-skill selection.
 - **The persona is whole.** `persona` grants the whole committed

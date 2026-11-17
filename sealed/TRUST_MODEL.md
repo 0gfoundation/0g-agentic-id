@@ -474,7 +474,9 @@ adopts an inherited memory explicitly (`memory_confirm`, on their own
 words). The harness's memory tools, extraction and consolidation never
 rewrite a reference item or raise its trust; that the model does not act on
 one is a rule the model applies, not a cryptographic guarantee (0g-harness
-README, Long-term memory).
+README, Long-term memory). Hosted programs that read the public memory
+(`agent_data`) get the same `SEAL_OWNER`, and the harness's reader marks
+inherited items there too (MCP_SERVICES.md, Agent data).
 
 ---
 

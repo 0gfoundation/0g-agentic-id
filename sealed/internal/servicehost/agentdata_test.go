@@ -1,7 +1,9 @@
 package servicehost
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,11 +113,98 @@ func TestStageAgentDataIsAReadOnlyCopy(t *testing.T) {
 	}
 }
 
+// A worker reading agent data learns the owner its memories' trust is
+// checked against; the staged copy's place comes first.
+func TestAgentDataEnvNamesTheOwner(t *testing.T) {
+	const owner = "0xabcdef0000000000000000000000000000000001"
+	got := (&Manager{owner: owner}).agentDataEnv("/task/agent-data")
+	if strings.Join(got, " ") != "SEAL_AGENT_DATA=/task/agent-data SEAL_OWNER="+owner {
+		t.Fatalf("env %v", got)
+	}
+	if got := (&Manager{}).agentDataEnv("/d"); len(got) != 1 {
+		t.Fatalf("an empty owner was passed: %v", got)
+	}
+}
+
 // A temporary worker of a release with the grant is refused when the
 // runtime has no provider, never started without its data.
 func TestAgentDataWithoutAProviderFailsTheWorker(t *testing.T) {
 	m := &Manager{}
 	if _, err := m.stageAgentDataFor(t.Context(), AgentDataGrant{Persona: true}, filepath.Join(t.TempDir(), "a")); err == nil {
 		t.Fatal("staged agent data without a provider")
+	}
+}
+
+const agentDataFixture = `import os,sys,json,http.server,socket
+sys.stdin.read()
+class Handler(http.server.BaseHTTPRequestHandler):
+ def log_message(self,*args): pass
+ def do_POST(self):
+  self.rfile.read(int(self.headers.get('content-length',0)))
+  root=os.environ.get('SEAL_AGENT_DATA','')
+  out={'owner':os.environ.get('SEAL_OWNER'),'kinds':sorted(os.listdir(root)) if root else [],
+   'memory':sorted(os.listdir(os.path.join(root,'memory-public'))) if root else []}
+  self.send_response(200);self.end_headers();self.wfile.write(json.dumps(out).encode())
+class Server(http.server.HTTPServer):
+ address_family=socket.AF_UNIX
+ def server_bind(self): self.socket.bind(self.server_address);self.server_name='task';self.server_port=0
+Server(os.environ['MCP_SOCKET'],Handler).serve_forever()
+`
+
+// A request worker of a release granted public memory reads the staged
+// memory-public/ copy and learns the owner (SEAL_OWNER) that decides which
+// of those memories are trusted.
+func TestAgentDataWorkerGetsPublicMemoryAndOwner(t *testing.T) {
+	root(t)
+	if os.Getenv("SEALED_SERVICE_TESTS") != "1" {
+		t.Skip("set SEALED_SERVICE_TESTS=1 as root on a kernel with Landlock ABI 6")
+	}
+	src := t.TempDir()
+	for name, body := range map[string]string{"MEMORY.md": "- [freeze](freeze.md) — release freeze\n", "freeze.md": "---\nname: freeze\n---\nfreeze starts 2026-11-24\n"} {
+		if err := os.WriteFile(filepath.Join(src, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const owner = "0xabcdef0000000000000000000000000000000001"
+	var asked AgentDataGrant
+	m, err := NewWithOptions(filepath.Join(t.TempDir(), "services"), owner+":identity", Options{
+		SkipResourceLimitsForTests: true,
+		Owner:                      owner,
+		AgentData: func(_ context.Context, g AgentDataGrant) ([]AgentDataPart, func(), error) {
+			asked = g
+			return []AgentDataPart{{Dir: src, Version: AgentDataVersion{Kind: AgentDataPublicMemory, ContentHash: "c", DataHash: "0xd", SnapshotHash: "s", Files: 2}}}, func() {}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+	man := manifest("task", agentDataFixture)
+	man.AgentData = &AgentDataGrant{PublicMemory: true}
+	if _, err := m.Publish(man); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Start(man.ID); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := m.HTTPClient("task").Do(taskRequest(context.Background(), "x", 0, testServiceVersion(m, "task")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var got struct {
+		Owner  string
+		Kinds  []string
+		Memory []string
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("status %d body %q: %v", resp.StatusCode, body, err)
+	}
+	if !asked.PublicMemory || asked.Persona || asked.Skills {
+		t.Fatalf("grant asked %+v", asked)
+	}
+	if got.Owner != owner || strings.Join(got.Kinds, ",") != "memory-public,versions.json" || strings.Join(got.Memory, ",") != "MEMORY.md,freeze.md" {
+		t.Fatalf("worker saw %+v", got)
 	}
 }

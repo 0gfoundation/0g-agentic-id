@@ -124,8 +124,12 @@ agent 自己数据的只读副本。这项授权是 manifest 的一部分，会�
 
 - `persona/APPEND_SYSTEM.md`：agent 的人设；
 - `skills/`：它的 skills，按文件展开（skill 目录会解包）；
-- `memory/`：只有 front matter 写了 `visibility: public` 的记忆，以及据此生成的 `MEMORY.md` 索引；
+- `memory-public/`：agent 的公开长期记忆，即已提交的 `memory-public/` 角色整份（每条记忆一个文件，
+  加上角色自己的 `MEMORY.md` 索引）。私有的 `memory/` 角色从不放进副本；
 - `versions.json`：每类数据的版本。
+
+这些 worker 还会拿到 `SEAL_OWNER`，即本容器服务的 NFT owner（小写）。每条记忆写明确认它的 owner
+（`trusted_by`）；由之前的 owner 确认的记忆是继承来的，只作参考，不能作为行动依据。
 
 每类都是链上提交的版本，内容和提交时一样：已清除 sealed 持有的凭据值和已知格式的秘密，绝不是
 尚未提交的修改。sealed 在自己的状态目录里保留各个已提交版本，在 agent 的文件正好是已提交版本时
@@ -137,18 +141,23 @@ owner 的私人记忆、对话、agent 的 inbox/outbox 和家目录、owner 凭
 
 版本是 `{kind, content_hash, data_hash, snapshot_hash, files}`：`content_hash` 和
 `data_hash` 是角色在链上的固定值（已提交明文的 sha256，以及 AgenticID 条目里的 0G 存储根；
-从未提交时为空），`snapshot_hash` 是任务能读到的文件按路径排序后 `path NUL sha256 LF` 的
-sha256（公开记忆只算公开部分和它的索引）。执行状态用 `agent_data` 带上这些版本，执行证明也带上：
-调用方事后能确认是哪份代码加哪份数据得出的结果。Harness 的 `runServiceAgent({agentData: true})`
-会把人设、skills 和公开记忆（索引加只读工具 `agent_memory_read`）装进任务的 agent 循环。
+从未提交时为空；公开记忆就是 `memory-public/` 角色自己的值），`snapshot_hash` 是任务能读到的
+文件按路径排序后 `path NUL sha256 LF` 的 sha256。调用方拿链上固定值对照链；`snapshot_hash`
+指向同一批文件、逐个文件哈希，持有明文文件的人不需要 iData manifest 格式就能核对。执行状态用
+`agent_data` 带上这些版本，执行证明也带上：调用方事后能确认是哪份代码加哪份数据得出的结果。
+Harness 的 `runServiceAgent({agentData: true})` 会把人设、skills 和公开记忆（索引加只读工具
+`agent_memory_read`）装进任务的 agent 循环，并把每条继承来的记忆标成仅供参考。
 
 ### v1 限制
 
 - **只给临时 worker。** 版本的协调进程拿不到 agent 数据。
 - **只从 agent 的文件生成。** sealed 不从 0G 存储下载已提交版本。如果本容器从未生成过已提交版本、
   而文件已经改过（例如重启时还有未提交的修改），需要它的 worker 会被拒绝，直到下一次提交。
-- **公开与否靠直接写入。** 记忆只有在文件写入时带上或去掉 `visibility: public` 并提交后，才会进入或
-  离开公开视图。0g-harness 的记忆提取和整理从不添加或去掉这个标记。
+- **公开按文件夹划分。** 记忆在 `memory-public/` 里并已提交，才算公开；挂载的是整份已提交的文件夹，
+  不能逐条选择。0g-harness 只在 owner 明确要求时写入这里：记忆提取只写私有记忆，整理只在各自的
+  文件夹内进行，从不在两个文件夹之间移动记忆。
+- **可信度由读取方判断。** 继承来的记忆也会挂载。sealed 传入 `SEAL_OWNER`；读取方如果不拿它和
+  `trusted_by` 比较，就会把所有记忆一样对待。
 - **skills 全给或不给。** `skills` 授权全部已提交的 skills，不能逐个选择。
 - **人设整份给出。** `persona` 授权整份已提交的 `APPEND_SYSTEM.md`，每个版本单独的授权是唯一的控制。
 - **`snapshot_hash` 依赖签名。** 调用方可以拿 `content_hash` 和 `data_hash` 对照链上，但没有明文

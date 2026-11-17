@@ -69,6 +69,7 @@ type Manager struct {
 	runtime       func(context.Context) (RuntimeLease, error)
 	model         func(context.Context) (ModelRoute, error)
 	agentData     AgentDataProvider
+	owner         string
 	watcher       *resourceWatcher
 	probeMu       sync.Mutex
 	probeAt       time.Time
@@ -96,6 +97,11 @@ type Options struct {
 	// AgentData gives temporary workers of a release with an agent_data
 	// grant the agent's committed data; nil refuses such workers.
 	AgentData AgentDataProvider
+	// Owner is the NFT owner this container serves (lowercase 0x address;
+	// a container never serves a later owner). Workers that read agent data
+	// get it as SEAL_OWNER, to tell memories this owner confirmed from
+	// inherited ones.
+	Owner string
 	// Only Go test fixtures may bypass the confinement probe and runtime pin.
 	// No HTTP, env or manifest field can enable this; production leaves it false.
 	SkipResourceLimitsForTests bool
@@ -142,6 +148,7 @@ func NewWithOptions(base, binding string, opts Options) (*Manager, error) {
 	m.runtime = opts.AcquireRuntime
 	m.model = opts.ModelRoute
 	m.agentData = opts.AgentData
+	m.owner = opts.Owner
 	m.skipResourceLimitsForTests = opts.SkipResourceLimitsForTests
 	m.egressDial = opts.EgressDial
 	if m.egressDial == nil {
@@ -563,8 +570,9 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 		env = append(env, "SEAL_MODEL_SOCKET="+filepath.Join(run, "model.sock"), "SEAL_MODEL_ID="+route.Route.Model, "SEAL_MODEL_API="+route.API)
 	}
 	// Temporary workers of a release that asks for agent data read a copy
-	// of the agent's committed data, staged here and fixed for their life;
-	// the coordinator never receives it.
+	// of the agent's committed data, staged here and fixed for their life,
+	// and learn the owner whose confirmations make a memory trusted; the
+	// coordinator never receives either.
 	var agentData []AgentDataVersion
 	if kind != coordinatorCommand && e.Manifest.AgentData != nil {
 		dst := filepath.Join(taskDir, "agent-data")
@@ -572,7 +580,7 @@ func (m *Manager) command(ctx context.Context, e *entry, uid uint32, taskDir str
 			return nil, err
 		}
 		p.ReadOnly = append(p.ReadOnly, dst)
-		env = append(env, "SEAL_AGENT_DATA="+dst)
+		env = append(env, m.agentDataEnv(dst)...)
 	}
 	// The interpreter loads sealed's network adapter first (servicenet).
 	adapter := interpreterRuntime(interpreter)

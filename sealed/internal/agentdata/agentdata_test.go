@@ -63,12 +63,8 @@ func (f *fakeAgent) commit(t *testing.T, role string) {
 
 func (f *fakeAgent) pins(role string) (string, string) { return f.chain[role][0], f.chain[role][1] }
 
-func memoryFile(name, visibility, body string) []byte {
-	v := ""
-	if visibility != "" {
-		v = "visibility: " + visibility + "\n"
-	}
-	return []byte("---\nname: " + name + "\ndescription: about " + name + "\ntype: project\nsource: owner\n" + v + "---\n\n" + body + "\n")
+func memoryFile(name, trustedBy, body string) []byte {
+	return []byte("---\nname: " + name + "\ndescription: about " + name + "\ntype: project\ntrusted_by: " + trustedBy + "\n---\n\n" + body + "\n")
 }
 
 func readTree(t *testing.T, dir string) map[string]string {
@@ -89,33 +85,50 @@ func readTree(t *testing.T, dir string) map[string]string {
 	return out
 }
 
-func TestPublicMemoryOnly(t *testing.T) {
+// Public memory is the memory-public/ role whole, as committed (its own
+// MEMORY.md included, every memory whoever confirmed it), cited by that
+// role's chain pins. The private memory/ role is never read.
+func TestPublicMemoryIsThePublicRole(t *testing.T) {
 	f := newFake()
-	f.entries[RoleMemory] = map[string][]byte{
-		"owner-salary.md":   memoryFile("owner-salary", "", "PRIVATE-FACT"),
-		"release-freeze.md": memoryFile("release-freeze", "public", "freeze starts 2026-11-24"),
-		"quoted.md":         memoryFile("quoted", `"public"`, "also public"),
-		"other.md":          memoryFile("other", "private", "PRIVATE-TOO"),
-		"MEMORY.md":         []byte("- [owner-salary](owner-salary.md) — PRIVATE-INDEX\n"),
+	const owner, earlier = "0xabcdef0000000000000000000000000000000001", "0x1111111111111111111111111111111111111111"
+	f.entries["memory/"] = map[string][]byte{
+		"owner-salary.md": memoryFile("owner-salary", owner, "PRIVATE-FACT"),
+		"MEMORY.md":       []byte("- [owner-salary](owner-salary.md) — PRIVATE-INDEX\n"),
 	}
-	f.commit(t, RoleMemory)
+	f.commit(t, "memory/")
+	f.entries[RolePublicMemory] = map[string][]byte{
+		"release-freeze.md": memoryFile("release-freeze", owner, "freeze starts 2026-11-24"),
+		"inherited.md":      memoryFile("inherited", earlier, "from the previous owner"),
+		"MEMORY.md":         []byte("- [release-freeze](release-freeze.md) — about release-freeze\n- [inherited](inherited.md) — about inherited\n"),
+	}
+	f.commit(t, RolePublicMemory)
 	base := t.TempDir()
 	p := New(base, f, f.pins)
+	p.Observe(context.Background(), "memory/") // no kind maps to the private role
 	parts, release, err := p.Parts(context.Background(), servicehost.AgentDataGrant{PublicMemory: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer release()
 	got := readTree(t, parts[0].Dir)
-	if len(got) != 3 || !strings.Contains(got["release-freeze.md"], "2026-11-24") || got["quoted.md"] == "" {
+	want := f.entries[RolePublicMemory]
+	if len(got) != len(want) {
 		t.Fatalf("public memory view: %v", got)
 	}
-	if !strings.Contains(got["MEMORY.md"], "[release-freeze](release-freeze.md) — about release-freeze") || strings.Contains(got["MEMORY.md"], "PRIVATE") {
-		t.Fatalf("public index: %q", got["MEMORY.md"])
+	for path, b := range want {
+		if got[path] != string(b) {
+			t.Fatalf("%s: got %q, want the committed file", path, got[path])
+		}
 	}
 	v := parts[0].Version
-	if v.Kind != servicehost.AgentDataPublicMemory || v.Files != 3 || v.ContentHash != f.chain[RoleMemory][0] || v.DataHash != f.chain[RoleMemory][1] {
-		t.Fatalf("version %+v", v)
+	if v.Kind != servicehost.AgentDataPublicMemory || v.Files != 3 || v.ContentHash != f.chain[RolePublicMemory][0] || v.DataHash != f.chain[RolePublicMemory][1] {
+		t.Fatalf("version %+v, want the memory-public/ pins %v", v, f.chain[RolePublicMemory])
+	}
+	if v.ContentHash == f.chain["memory/"][0] {
+		t.Fatal("cited the private role's pins")
+	}
+	if v.SnapshotHash != servicehost.AgentDataListingHash(want) {
+		t.Fatal("snapshot hash is not over the role's files")
 	}
 	// No private memory is ever written below the provider's directory.
 	for path, content := range readTree(t, base) {
@@ -241,21 +254,5 @@ func TestLeasedVersionIsKept(t *testing.T) {
 	p.Observe(context.Background(), RolePersona)
 	if _, err := os.Stat(held); err == nil {
 		t.Fatal("an old version outlived its lease and the keep window")
-	}
-}
-
-func TestPublicMarker(t *testing.T) {
-	for in, want := range map[string]bool{
-		"---\nvisibility: public\n---\nx":       true,
-		"---\nvisibility: Public\n---\nx":       true,
-		"---\nvisibility: 'public'\n---\nx":     true,
-		"---\nvisibility: private\n---\nx":      false,
-		"---\nname: a\n---\nvisibility: public": false, // body, not front matter
-		"visibility: public":                    false,
-		"":                                      false,
-	} {
-		if Public([]byte(in)) != want {
-			t.Errorf("Public(%q) = %v", in, !want)
-		}
 	}
 }
