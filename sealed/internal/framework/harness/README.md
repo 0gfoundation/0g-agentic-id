@@ -153,6 +153,7 @@ container does not.
 | `schedule` | `false` | `schedule_create` / `schedule_list` / `schedule_delete`: reminders the agent sets for itself |
 | `maxParallelToolCalls` | `1` | tool calls one model step may run at once. It applies only to the tools that declare themselves safe to run together: `read`, `read_image` and `subagent`. `bash`, `write`, `edit`, the `seal_*` tools and the job and schedule tools always run alone, after the calls before them finish |
 | `modelImages` | unset | overrides whether the owner's model takes images (`true`/`false`). Unset: the provider's model list decides (`architecture.input_modalities` on the 0G router: glm-5.3 text only, glm-5.3-flash with images), and where it says nothing, pi-ai's catalog. With images the owner's images reach the model; without, each is saved under `~/uploads` and the agent is told it cannot view it |
+| `memoryExtract` | `true` | before a compaction of the owner's conversation, the harness makes one model call that writes long-term memory from the span about to be summarized (0g-harness `src/memory-extract.mjs`); `false` turns it off. Rendered as `SEAL_HARNESS_MEMORY_EXTRACT`. |
 
 A bad value here never fails a boot. `RenderSettings` runs before every spawn,
 so an error would mean an agent that cannot start, not a rejected push. So an

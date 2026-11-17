@@ -174,8 +174,9 @@ func TestRenderSettings_OverlayAppliedButPlatformWins(t *testing.T) {
 	}
 }
 
-// An empty overlay must reproduce exactly the shipped composition — every
-// knob is an owner option, off until the owner turns it on.
+// An empty overlay must reproduce exactly the shipped composition: every
+// knob is an owner option, off until the owner turns it on, except the
+// memory extraction before a compaction, on until the owner turns it off.
 func TestRenderSettings_DefaultKnobsAreTheShippedComposition(t *testing.T) {
 	catalogServer(t, reasoningModel("glm-5.3"))
 	env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3"})
@@ -184,6 +185,7 @@ func TestRenderSettings_DefaultKnobsAreTheShippedComposition(t *testing.T) {
 		"SEAL_HARNESS_SUBAGENTS":               "0",
 		"SEAL_HARNESS_SCHEDULE":                "0",
 		"SEAL_HARNESS_MAX_PARALLEL_TOOL_CALLS": "1",
+		"SEAL_HARNESS_MEMORY_EXTRACT":          "1",
 	} {
 		if env[k] != want {
 			t.Errorf("%s = %q, want %q (the shipped default)", k, env[k], want)
@@ -623,5 +625,24 @@ func TestBridgeEnv_InferenceKeyHeldBySealed(t *testing.T) {
 	// Without the proxy the key goes to the harness as before.
 	if key, base := holdInferenceKey(a.rendered.resolved.Endpoint, "sk-the-real-key", framework.RuntimeContext{}); key != "sk-the-real-key" || base != "" {
 		t.Fatalf("got %q %q", key, base)
+	}
+}
+
+// The owner turns the memory extraction off with others.memoryExtract=false;
+// a value that is not a boolean keeps it on.
+func TestRenderSettings_MemoryExtract(t *testing.T) {
+	catalogServer(t, reasoningModel("glm-5.3"))
+	for _, c := range []struct {
+		others, want string
+	}{
+		{`{"memoryExtract":false}`, "0"},
+		{`{"memoryExtract":true}`, "1"},
+		{`{"memoryExtract":"off"}`, "1"},
+		{`{}`, "1"},
+	} {
+		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.others)})
+		if got := env["SEAL_HARNESS_MEMORY_EXTRACT"]; got != c.want {
+			t.Errorf("others %s → SEAL_HARNESS_MEMORY_EXTRACT=%q, want %q", c.others, got, c.want)
+		}
 	}
 }
