@@ -9,7 +9,7 @@ process primitives, not employer accounts, business tasks or payments.
 
 A manifest requires `id`, `command`, `args`, `files`; optional fields are
 `worker`, `description`, `env`, `network`, `egress_hosts`, `memory_mb`,
-`resident_memory_mb`, `processes`, `inference_budget`, `request_timeout_seconds`. Files are `{path,data}` with relative
+`resident_memory_mb`, `processes`, `inference_budget`, `request_timeout_seconds`, `agent_data`. Files are `{path,data}` with relative
 paths and standard-base64 contents. `env` is durable **public configuration**.
 Commands name trusted image interpreters such as `node` or `python3`; owner code executes
 only after privilege drop. Source/dependencies are regular read-only files in
@@ -172,6 +172,65 @@ legacy route behavior, including their own `/api/mcp/...` registrations.
 Providers may separately configure ports at sandbox creation; publication grants
 no such authority.
 
+## Agent data
+
+A release can ask for read-only copies of the agent's own data with
+`agent_data: {persona, skills, public_memory}` (booleans; at least one). The
+grant is part of the manifest, so it changes `version` and callers auditing the
+release see it. Every temporary worker (a one-shot request or an execution)
+then reads, at `$SEAL_AGENT_DATA`:
+
+- `persona/APPEND_SYSTEM.md`: the agent's persona;
+- `skills/`: its skills, as files (a skill directory unpacked);
+- `memory/`: only the memories whose front matter says `visibility: public`,
+  and a `MEMORY.md` index built from them;
+- `versions.json`: the version of each kind it holds.
+
+Each kind is the version committed on chain, as committed: scrubbed of the
+credential values sealed holds and of secrets of a known format, never an edit
+not yet committed. sealed keeps the committed versions in its state directory,
+built from the agent's files whenever they hold the committed version (after
+every confirmed commit and on boot). A worker that needs a version this
+container never built while the files held it, because the files have moved
+on, is refused (`start_failed`) until the agent's next commit; a role never
+committed is an empty view. The copy is staged for each worker before it
+starts, root-owned and read-only under its Landlock grant, and removed with its
+task directory: later commits never change what a running job reads, and the
+job cannot change its copy. Coordinators get none. Owner-private memory, the
+conversation, the agent's inbox/outbox and home, owner credentials and the sign
+socket stay out of reach.
+
+A version is `{kind, content_hash, data_hash, snapshot_hash, files}`:
+`content_hash` and `data_hash` are the role's chain pins (sha256 of the
+committed plaintext, and the 0G storage root its AgenticID entry holds; empty
+when never committed), and `snapshot_hash` is sha256 over `path NUL sha256 LF`
+of the files the job could read, sorted by path (for public memory, only the
+public subset and its index). An execution's status carries them as
+`agent_data`, and so does its receipt: a caller can later tell which code and
+which data produced a result. Harness `runServiceAgent({agentData: true})`
+mounts the persona, the skills and the public memory (its index plus a
+read-only `agent_memory_read` tool) into the task's agent loop.
+
+### v1 limits
+
+- **Temporary workers only.** A release's coordinator never gets agent data.
+- **Built from the agent's files only.** sealed does not download a committed
+  version from 0G storage. When this container never built the committed
+  version and the files have moved past it (for instance a restart with edits
+  not yet committed), workers that need it are refused until the next commit.
+- **Public is set by a direct write.** A memory enters or leaves the public
+  view only when its file is written with or without `visibility: public` and
+  committed. 0g-harness memory extraction and tidy never add or remove the
+  marker.
+- **Skills are all or nothing.** `skills` grants every committed skill; there
+  is no per-skill selection.
+- **The persona is whole.** `persona` grants the whole committed
+  `APPEND_SYSTEM.md`; the per-release grant is the only control over it.
+- **`snapshot_hash` rests on the signature.** A caller can compare
+  `content_hash` and `data_hash` with the chain, but cannot recompute
+  `snapshot_hash` without the plaintext (iData is encrypted on 0G storage); it
+  relies on agentSeal's signature over the receipt.
+
 ## Private input and process control
 
 Callers explicitly trusting the program with plaintext can send
@@ -267,7 +326,7 @@ an anchored AgenticID serve-proof validator (`VERIFIED_FEEDBACK_ADDR`), the agen
 id, chain and identity registry. Without a validator no receipt is signed for the
 container's whole life, so a paid service, which charges for a receipted result,
 refuses work while `capabilities` reports `receipts:false`. It binds chain/registry/agent, validator, UID, source
-version, public-input/stdout SHA-256, limits and enforced isolation profile.
+version, public-input/stdout SHA-256, the agent data versions it read (`execution.agent_data`), limits and enforced isolation profile.
 `isolation.worker_runtime_hash` is the actual leased Harness package used by the worker;
 outer `harness_hash` belongs to the resident layered runtime context and may differ.
 If a layered runtime cannot name its current hashes, no execution receipt is
@@ -275,7 +334,8 @@ signed until those hashes are ready. Owner personal_sign/EIP-712/transaction too
 no arbitrary receipt-signing API.
 
 Harness `verifyExecutionReceipt` checks signature, trusted identity, isolation,
-public input and exact stdout, then derives the result from that stdout. Obtain
+public input and exact stdout, then derives the result from that stdout; given
+`agentData`, it also checks the agent data versions the job read. Obtain
 trust anchors from a verified AgenticID/TEE connection, not receipt assertions;
 pin source/runtime hashes when required. Receipts attest mechanisms/bytes, not
 business correctness, private input, payment or a separate kernel. They are not

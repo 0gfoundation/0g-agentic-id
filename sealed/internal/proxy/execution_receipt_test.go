@@ -22,7 +22,8 @@ import (
 func TestExecutionReceiptHasIndependentUnforgeableDomain(t *testing.T) {
 	s, signer := armedProxy(t, "http://localhost", testValidator)
 	code := 0
-	status := servicehost.ExecutionStatus{Handle: strings.Repeat("a", 64), Service: "report", Version: strings.Repeat("b", 64), State: "exited", ExitCode: &code, UID: 41234, StartedAt: 1, FinishedAt: 2, OutputHash: strings.Repeat("c", 64), OutputBytes: 42, OutputAvailable: true}
+	status := servicehost.ExecutionStatus{Handle: strings.Repeat("a", 64), Service: "report", Version: strings.Repeat("b", 64), State: "exited", ExitCode: &code, UID: 41234, StartedAt: 1, FinishedAt: 2, OutputHash: strings.Repeat("c", 64), OutputBytes: 42, OutputAvailable: true,
+		AgentData: []servicehost.AgentDataVersion{{Kind: servicehost.AgentDataPublicMemory, ContentHash: strings.Repeat("e", 64), DataHash: "0x" + strings.Repeat("f", 64), SnapshotHash: strings.Repeat("9", 64), Files: 3}}}
 	profile := servicehost.IsolationProfile{Driver: "landlock-v1", LandlockABI: 7, FilesystemAllowlist: true, ProcHidden: true, SignalScoped: true, AbstractSocketScoped: true, ReadOnlyCode: true, TemporaryWork: true, Network: "none"}
 	token, err := s.signExecutionReceipt(status, profile)
 	if err != nil {
@@ -41,6 +42,9 @@ func TestExecutionReceiptHasIndependentUnforgeableDomain(t *testing.T) {
 	var receipt executionReceipt
 	if err := json.Unmarshal(raw, &receipt); err != nil {
 		t.Fatal(err)
+	}
+	if len(receipt.Execution.AgentData) != 1 || receipt.Execution.AgentData[0].DataHash != "0x"+strings.Repeat("f", 64) || receipt.Execution.AgentData[0].SnapshotHash != strings.Repeat("9", 64) {
+		t.Fatalf("the receipt does not name the agent data versions the job read: %+v", receipt.Execution.AgentData)
 	}
 	if receipt.Execution.OutputAvailable || receipt.Execution.Receipt != "" {
 		t.Fatal("transient or recursive receipt fields were signed")
@@ -91,6 +95,9 @@ func TestLargestExecutionReceiptFitsTheHarnessBound(t *testing.T) {
 	status := servicehost.ExecutionStatus{Handle: strings.Repeat("a", 64), Service: strings.Repeat("s", 32), Key: "1234567890123-" + strings.Repeat("k", 48),
 		Version: strings.Repeat("b", 64), InputHash: strings.Repeat("i", 64), State: "exited", StartedAt: 1 << 62, Deadline: 1 << 62, FinishedAt: 1 << 62,
 		ExitCode: &code, Reason: "resource_cleanup_failed", OutputBytes: 1 << 20, OutputHash: strings.Repeat("c", 64), UID: 64999}
+	for _, kind := range []string{servicehost.AgentDataPersona, servicehost.AgentDataSkills, servicehost.AgentDataPublicMemory} {
+		status.AgentData = append(status.AgentData, servicehost.AgentDataVersion{Kind: kind, ContentHash: strings.Repeat("c", 64), DataHash: "0x" + strings.Repeat("d", 64), SnapshotHash: strings.Repeat("s", 64), Files: 4096})
+	}
 	hosts := make([]string, 32)
 	for i := range hosts {
 		hosts[i] = fmt.Sprintf("%0*d.example:65535", 253-8, i)

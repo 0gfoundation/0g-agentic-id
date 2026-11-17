@@ -68,7 +68,10 @@ type ExecutionStatus struct {
 	OutputHash      string `json:"output_hash,omitempty"`
 	OutputAvailable bool   `json:"output_available"`
 	UID             uint32 `json:"uid"`
-	Receipt         string `json:"receipt,omitempty"`
+	// AgentData names the committed agent data versions the worker read
+	// (a release with an agent_data grant); the receipt carries them.
+	AgentData []AgentDataVersion `json:"agent_data,omitempty"`
+	Receipt   string             `json:"receipt,omitempty"`
 }
 
 // IsolationProfile describes enforced mechanisms, not a claim that programs
@@ -432,6 +435,7 @@ func (m *Manager) spawnExecution(service, key string, input []byte, privateInput
 		return e.ExecutionStatus, fmt.Errorf("start isolated execution: %w", err)
 	}
 	e.Isolation.WorkerRuntimeHash = cmd.runtimeHash
+	e.AgentData = cmd.agentData
 	e.State = "running"
 	if err := m.persistExecutionLocked(e); err != nil {
 		e.failure = "metadata_write_failed"
