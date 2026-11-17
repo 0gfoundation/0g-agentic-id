@@ -90,9 +90,9 @@ The harness then does three things:
   inbox: for example when a background job finishes or a reminder comes due.
 
 `FrameworkRoutes()` advertises the surface on `/hello`, one kind per
-capability: `chat`, `responses`, `inbox`, `events`, `tasks`, `schedules`. A
+capability: `chat`, `responses`, `inbox`, `events`, `tasks`, `schedules`, `files`. A
 client enables a feature only on the kinds an agent declares. The other
-frameworks declare none of the last four, and nothing about them changes.
+frameworks declare none of the last five, and nothing about them changes.
 Each route lists its exact endpoints, those of the harness's protocol v1
 (`routes_test.go`), and sealed's proxy forwards nothing else: an unlisted
 path gets 404, an unlisted method 405.
@@ -114,6 +114,7 @@ committed (`../../LAYERS.md` §3).
 | inference | `dsh-llm-pi-ai` (route rendered from the owner's settings by the adapter), `dsh-credentials-local` |
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | filesystem | `dsh-fs-local` + `dsh-tool-fs` |
+| owner images and files | `dsh-attachment-local` (the owner's images, normalized, below `$DSH_HOME/attachments`, untracked; it also enables `read_image`). Files the owner uploads (`POST /v1/files`) land in `~/uploads`, untracked; the image ships `pdftotext` for PDFs among them |
 | skills | `dsh-skill-filesystem` (the `skills/` iData role — agent-installed, chain-tracked) |
 | long-term memory | the harness's own system-prompt section (`src/memory.mjs`): the guidance and the `MEMORY.md` index, read at every model step; the memory files are the `memory/` iData role (`memory.go`) — one `<name>.md` per memory directly in `$DSH_HOME/memory/`, chain-tracked |
 | context headroom | `dsh-token-meter` + `dsh-compaction-basic` |
@@ -151,6 +152,7 @@ container does not.
 | `subagents` | `false` | the `subagent` tool: read-only helpers the main agent runs in the background (turns the job tools on with it) |
 | `schedule` | `false` | `schedule_create` / `schedule_list` / `schedule_delete`: reminders the agent sets for itself |
 | `maxParallelToolCalls` | `1` | tool calls one model step may run at once. It applies only to the tools that declare themselves safe to run together: `read`, `read_image` and `subagent`. `bash`, `write`, `edit`, the `seal_*` tools and the job and schedule tools always run alone, after the calls before them finish |
+| `modelImages` | unset | overrides whether the owner's model takes images (`true`/`false`). Unset: the provider's model list decides (`architecture.input_modalities` on the 0G router: glm-5.3 text only, glm-5.3-flash with images), and where it says nothing, pi-ai's catalog. With images the owner's images reach the model; without, each is saved under `~/uploads` and the agent is told it cannot view it |
 
 A bad value here never fails a boot. `RenderSettings` runs before every spawn,
 so an error would mean an agent that cannot start, not a rejected push. So an

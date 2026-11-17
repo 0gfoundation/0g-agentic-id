@@ -164,6 +164,7 @@ release, and hands it to the loader only if it hashes to that name.
 Contents:
 - Debian and a pinned node; python3; a browser for the owner's agent
   (Chromium and the Playwright MCP server, started by `sealed-browser-mcp`);
+  `pdftotext` (poppler-utils) for the PDFs the owner uploads;
 - the loader;
 - one official harness package with all its dependencies, a fallback for when
   no other version can be fetched.

@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
-import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentTaskInfo, AgentTaskStop, ChatMessage } from '../../AgentClient';
+import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentTaskInfo, AgentTaskStop, ChatImage, ChatMessage, ChatNotice } from '../../AgentClient';
 import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
@@ -33,6 +33,7 @@ import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOw
 import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
+import { completePath, describeStaged, prepareAttachments, stageFile, type Staged } from '../attach';
 import { pandaLines, svgPixelLines } from '../logo';
 import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
 import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePlan, applyResetInference, readDeploymentFacts, requiresProviderReset, deployWithInference } from '../inference';
@@ -40,7 +41,7 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/attach', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -580,6 +581,12 @@ export function completeLine(
     if (words.length <= 1 && !hits.length) return [CRED_SUBS, word];
     return [hits, word];
   }
+  // `/attach <path …>`: the path being typed, from the local filesystem.
+  if (cmd === '/attach') {
+    const hits = completePath(word);
+    if (!rest.includes(' ') && rest && 'clear'.startsWith(rest)) hits.unshift('clear');
+    return [hits, word];
+  }
   const cand = state.args[cmd];
   const list = typeof cand === 'function' ? cand() : (cand ?? []);
   const hits = list.filter((c) => c.startsWith(rest));
@@ -806,6 +813,8 @@ interface Session {
   thinking?: 'low' | 'high' | 'max';
   /** Task id of the chat turn currently in flight (responses transport). */
   currentTask?: string | null;
+  /** Files and images `/attach` staged for the next message. */
+  attached?: Staged[];
 }
 
 /** (Re)establish the connection half of a session from a running URL. */
@@ -2584,7 +2593,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /tasks /result /cancel /inbox /schedules /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /tasks /result /cancel /inbox /schedules /attach /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -2665,6 +2674,14 @@ const L2_HELP_FULL = `session commands
                           Bare: unread messages; all: the read ones too
   /schedules              the reminders the agent set for itself
                           (0g-harness)
+  /attach [path …|clear]  files and images for your next message (0g-harness):
+                          an image goes with the message (when the model takes
+                          images, as its provider's model list says — else it
+                          is saved as a file the agent is told about), any
+                          other file is uploaded to the agent's ~/uploads first
+                          and the message names its path. Bare lists what is
+                          staged. Images: 8 per message, 10 MiB each, 32 MiB
+                          together; a file: 25 MiB
   /agentlog [n]           agent process log, last n lines (owner-only)
   /signatures [n]         what the agent signed as itself and what the runtime refused, last n (owner-only; 0g-harness)
   /startuplog [n]         sealed runtime startup log, last n lines
@@ -3301,6 +3318,28 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out('to remove one, ask the agent to\n');
         continue;
       }
+      if (line === '/attach' || line.startsWith('/attach ')) {
+        if (!s.client) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
+        if (!s.client.uploadFile) { out('(this agent takes no files or images: its framework has no upload route — 0g-harness does)\n'); continue; }
+        const staged = (s.attached ??= []);
+        const args = tokenize(line.slice('/attach'.length).trim());
+        if (!args.length) {
+          out(staged.length ? `attached to your next message:\n${describeStaged(staged).map(cleanCell).join('\n')}\n(/attach clear drops them)\n` : 'nothing attached — /attach <path …> adds files or images to your next message\n');
+          continue;
+        }
+        if (args.length === 1 && args[0] === 'clear') { staged.length = 0; out('attachments dropped\n'); continue; }
+        for (const a of args) {
+          try {
+            const one = stageFile(a, staged);
+            staged.push(one);
+            out(`attached ${cleanCell(one.name)} (${one.image ? 'image, goes with the message' : 'file, uploaded when you send'})\n`);
+          } catch (err) {
+            out(`not attached: ${cleanCell((err as Error).message)}\n`);
+          }
+        }
+        if (staged.length) out('your next message carries them\n');
+        continue;
+      }
       if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
     } catch (e) {
       // Show the remedy too: an error whose whole point is "do this instead"
@@ -3313,7 +3352,21 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // a chat turn (interruptible)
     if (!s.client) { out(`agent is ${s.phase} — /start or /reset before chatting\n`); continue; }
     if (!s.client.chatStream) { out('(chat unavailable on this agent)\n'); continue; }
-    messages.push({ role: 'user', content: line });
+    // Attachments go with this message: images inside it, other files
+    // uploaded first and named in its text. A failed upload sends nothing
+    // and keeps them staged.
+    let sent = line;
+    let images: ChatImage[] = [];
+    if (s.attached?.length) {
+      try {
+        ({ text: sent, images } = await prepareAttachments(s.attached, line, s.client, (a, path) => out(`uploaded ${cleanCell(a.name)} → ${cleanCell(path)}\n`)));
+      } catch (e) {
+        out(`not sent: ${cleanCell((e as Error).message)} — the attachments stay staged (/attach lists them)\n`);
+        continue;
+      }
+      s.attached = [];
+    }
+    messages.push({ role: 'user', content: sent });
     // `model` is a per-framework selector some gateways require (openclaw
     // does; 0g-harness and the prime bridge ignore it). Send it when known, omit it
     // otherwise — and only if the framework rejects that, ask once and retry.
@@ -3382,6 +3435,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           ...(s.thinking ? { thinking: s.thinking } : {}),
           signal: ac.signal,
           ...(onActivity ? { onActivity } : {}),
+          ...(images.length ? { images } : {}),
+          onNotice: (n: ChatNotice): void => {
+            if (n.imagesSavedAsFiles?.length) {
+              clearActivity();
+              out(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map(cleanCell).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);
+            }
+          },
           // Responses transport only: remember the server-side task id, so
           // Esc cancels THIS task and /tasks//result can re-attach to it.
           onTask: (id: string): void => {

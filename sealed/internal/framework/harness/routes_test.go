@@ -19,6 +19,7 @@ func TestFrameworkRoutesAdvertiseTheHarnessSurface(t *testing.T) {
 		"/v1/events":    "events",
 		"/v1/tasks":     "tasks",
 		"/v1/schedules": "schedules",
+		"/v1/files":     "files",
 	}
 	routes := New().FrameworkRoutes()
 	if len(routes) != len(want) {
@@ -65,6 +66,7 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/tasks", "POST", "/v1/tasks/all/cancel"},
 		{"/v1/schedules", "GET", "/v1/schedules"},
 		{"/v1/schedules", "DELETE", "/v1/schedules/s1"},
+		{"/v1/files", "POST", "/v1/files"},
 		{"/v1/", "OPTIONS", "/v1/chat/completions"},
 	}
 	for _, f := range forwarded {
@@ -80,6 +82,8 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/tasks", "POST", "/v1/tasks/a/b/cancel"},
 		{"/v1/tasks", "GET", "/v1/tasks/"},
 		{"/v1/inbox", "GET", "/v1/inbox/all"},
+		{"/v1/files", "GET", "/v1/files"},
+		{"/v1/files", "POST", "/v1/files/x"},
 	}
 	for _, f := range refused {
 		if ok, _ := routes[f.prefix].Allows(f.method, f.path); ok {

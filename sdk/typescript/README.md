@@ -362,6 +362,16 @@ await agent.tasks!();                             // turns, commands, subagents:
 await agent.stopTask!('subagent-1');              // one task; stopAllTasks() for everything running
 await agent.schedules!();                         // reminders the agent set for itself
 
+// Images and files (0g-harness). Images ride the message (PNG/JPEG/WebP/GIF,
+// base64; 8 per message, 10 MiB each). A model that cannot view images gets
+// them as files instead, and onNotice says so. uploadFile (present when /hello
+// declares kind "files") puts a file in the agent's ~/uploads; tell it the path:
+const { path } = await agent.uploadFile!('report.pdf', bytes);   // ≤ 25 MiB
+for await (const d of agent.chatStream!([{ role: 'user', content: `read ${path}; what is in this screenshot?` }], {
+  images: [{ mediaType: 'image/png', data: pngBase64 }],
+  onNotice: (n) => { if (n.imagesSavedAsFiles) console.log('model cannot see images:', n.imagesSavedAsFiles); },
+})) process.stdout.write(d);
+
 // opinionated shortcuts over client():
 const auth = await ag.agent.authenticate(agentId);   // mints the owner token up front (needs a wallet)
 const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (never attaches a token)

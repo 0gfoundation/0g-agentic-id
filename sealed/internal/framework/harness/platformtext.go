@@ -22,6 +22,7 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 		Untracked: []platform.PathNote{
 			{Note: "any session/conversation log this container's composition may write — that is turn-by-turn history, not your identity, and it is deliberately not chain-tracked here"},
 			{Note: "`~/.dsh/.credentials.yaml` and any credential file — secrets never reach chain"},
+			{Path: "~/uploads/", Note: "files your owner sends you (and images your model cannot view) land here; read them with your own tools. Container-local: a reset loses them, so keep what must last in a tracked place"},
 			{Note: "`~/.dsh/AGENTS.md` — this container mounts nothing that reads it, and no role carries it. Writing one is not how you change your standing instructions here; `APPEND_SYSTEM.md` above is"},
 			{Note: "your model and inference route — not a file in this home at all. Your owner sets them, and the platform applies them to this container's composition at every boot"},
 			{Note: "your own source checkout, if this deployment exposes one to you (DSH's self-referential toolset can name where its own code lives) — this platform does not yet track agent edits to framework code, only to your data. Treat any such edit as living only in this container until that changes"},

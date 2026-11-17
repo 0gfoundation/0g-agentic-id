@@ -211,6 +211,39 @@ func TestRenderSettings_SubagentsAndScheduleKnobs(t *testing.T) {
 	}
 }
 
+// Whether the model takes images: the provider's catalog
+// (architecture.input_modalities) decides, and `others.modelImages` overrides
+// it; with neither the variable is unset and the harness leaves it to
+// pi-ai's catalog. A value that is not a boolean is dropped, not fatal.
+func TestRenderSettings_ModelImages(t *testing.T) {
+	withInput := func(id string, input ...string) map[string]any {
+		e := reasoningModel(id)
+		e["architecture"] = map[string]any{"input_modalities": input}
+		return e
+	}
+	for _, c := range []struct {
+		name    string
+		entry   map[string]any
+		overlay string
+		want    string
+		set     bool
+	}{
+		{"catalog silent", reasoningModel("m"), `{}`, "", false},
+		{"catalog text-only", withInput("m", "text"), `{}`, "0", true},
+		{"catalog images", withInput("m", "text", "image"), `{}`, "1", true},
+		{"owner override on a silent catalog", reasoningModel("m"), `{"modelImages":true}`, "1", true},
+		{"owner override beats the catalog", withInput("m", "text", "image"), `{"modelImages":false}`, "0", true},
+		{"a non-boolean override is dropped", withInput("m", "text", "image"), `{"modelImages":"yes"}`, "1", true},
+	} {
+		catalogServer(t, c.entry)
+		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "m", Others: json.RawMessage(c.overlay)})
+		got, ok := env["SEAL_HARNESS_MODEL_IMAGES"]
+		if ok != c.set || got != c.want {
+			t.Errorf("%s → SEAL_HARNESS_MODEL_IMAGES=%q (set %v), want %q (set %v)", c.name, got, ok, c.want, c.set)
+		}
+	}
+}
+
 // One policy for every way an overlay can be wrong. The first cut clamped an
 // out-of-range value ("a typo must not brick an agent") but returned an error
 // for a wrongly-typed one — and that error comes out of RenderSettings, which
