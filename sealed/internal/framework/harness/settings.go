@@ -119,9 +119,9 @@ type harnessKnobs struct {
 type webSearchKnob struct {
 	// Service is one of inference.SearchServices, or "off".
 	Service string `json:"service"`
-	// Credential names the owner credential that pays the service; empty:
+	// CredName names the owner credential that pays the service; empty:
 	// the model key, when the model's provider pays that service.
-	Credential string `json:"credential,omitempty"`
+	CredName string `json:"credential,omitempty"`
 	// Model runs an OpenAI or Anthropic search; empty: the main model, when
 	// it is on that provider.
 	Model string `json:"model,omitempty"`
@@ -131,9 +131,9 @@ type webSearchKnob struct {
 type modelRouteKnob struct {
 	Provider string `json:"provider"`
 	Model    string `json:"model"`
-	// Credential names the owner credential that pays this model; empty:
+	// CredName names the owner credential that pays this model; empty:
 	// the model key, which only the main model's provider takes.
-	Credential string `json:"credential,omitempty"`
+	CredName string `json:"credential,omitempty"`
 }
 
 // routeRef names one provider/model pair (others.subagentDefault).
@@ -165,7 +165,7 @@ func parseWebSearch(v json.RawMessage) (*webSearchKnob, string) {
 	if k.Service != searchOff && !inference.KnownSearchService(k.Service) {
 		return nil, "service must be one of " + strings.Join(append(append([]string{}, inference.SearchServices...), searchOff), ", ")
 	}
-	if k.Credential != "" && !knobCredentialRe.MatchString(k.Credential) {
+	if k.CredName != "" && !knobCredentialRe.MatchString(k.CredName) {
 		return nil, "credential is not a credential name"
 	}
 	if k.Model != "" && !knobModelRe.MatchString(k.Model) {
@@ -190,10 +190,10 @@ func parseSubagentModels(v json.RawMessage) ([]modelRouteKnob, string) {
 	}
 	seen := map[string]bool{}
 	for _, m := range list {
-		if !knobProviderRe.MatchString(m.Provider) || !knobModelRe.MatchString(m.Model) || (m.Credential != "" && !knobCredentialRe.MatchString(m.Credential)) {
+		if !knobProviderRe.MatchString(m.Provider) || !knobModelRe.MatchString(m.Model) || (m.CredName != "" && !knobCredentialRe.MatchString(m.CredName)) {
 			return nil, "an entry needs a provider id, a model id and, optionally, a credential name"
 		}
-		key := m.Provider + "\x00" + m.Model + "\x00" + m.Credential
+		key := m.Provider + "\x00" + m.Model + "\x00" + m.CredName
 		if seen[key] {
 			return nil, "an entry is repeated"
 		}

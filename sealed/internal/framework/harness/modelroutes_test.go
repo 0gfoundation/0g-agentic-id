@@ -32,7 +32,7 @@ func TestParseRouteKnobs(t *testing.T) {
 		{`{"webSearch":"openai"}`, "0g-router", "", ""},
 	} {
 		ws := parseKnobs(json.RawMessage(c.others)).WebSearch
-		if ws.Service != c.service || ws.Credential != c.cred || ws.Model != c.model {
+		if ws.Service != c.service || ws.CredName != c.cred || ws.Model != c.model {
 			t.Errorf("%s → %+v", c.others, ws)
 		}
 	}

@@ -122,12 +122,12 @@ func planWebSearch(k harnessKnobs, keys keySource, mainEp *inference.Endpoint, m
 		return nil, "the webSearch setting is off"
 	}
 	var url, value string
-	if ws.Credential == "" && mainEp != nil && mainEp.WebSearch == ws.Service {
+	if ws.CredName == "" && mainEp != nil && mainEp.WebSearch == ws.Service {
 		url, value = searchEndpoint(ws.Service, mainBase), keys.key
-	} else if ws.Credential == "" {
+	} else if ws.CredName == "" {
 		return nil, fmt.Sprintf("the %s search needs the model on %s or a credential (webSearch.credential)", ws.Service, ws.Service)
 	} else {
-		base, val, why := keys.reach("", ws.Credential, inference.SearchBaseURL(ws.Service))
+		base, val, why := keys.reach("", ws.CredName, inference.SearchBaseURL(ws.Service))
 		if why != "" {
 			return nil, why
 		}
@@ -196,7 +196,7 @@ func planRoutes(ctx context.Context, k harnessKnobs, keys keySource, main settin
 	}
 	ids := map[string]string{} // route id → the endpoint it was opened for
 	for _, m := range k.SubagentModels {
-		if m.Provider == main.Provider && m.Model == main.Model && m.Credential == "" {
+		if m.Provider == main.Provider && m.Model == main.Model && m.CredName == "" {
 			continue // the main model is always offered
 		}
 		res, ep := resolveModel(ctx, m.Provider, m.Model, main.Thinking)
@@ -211,14 +211,14 @@ func planRoutes(ctx context.Context, k harnessKnobs, keys keySource, main settin
 		if takes, known := res.Facts.TakesImages(); known {
 			om.Images = &takes
 		}
-		if m.Credential == "" && mainEp != nil && m.Provider == main.Provider && ep.Format == mainEp.Format && ep.BaseURL == mainEp.BaseURL {
+		if m.CredName == "" && mainEp != nil && m.Provider == main.Provider && ep.Format == mainEp.Format && ep.BaseURL == mainEp.BaseURL {
 			// Same provider, endpoint and key: the main route takes it too.
 			plan.mainModels = append(plan.mainModels, m.Model)
 			om.Provider, om.BaseURL = main.Provider, mainRouteBase
 			plan.offered = append(plan.offered, om)
 			continue
 		}
-		upstream, value, why := keys.reach(m.Provider, m.Credential, ep.BaseURL)
+		upstream, value, why := keys.reach(m.Provider, m.CredName, ep.BaseURL)
 		if why != "" {
 			logger.Logf("harness: subagentModels: %s/%s not offered: %s", m.Provider, m.Model, why)
 			continue
@@ -226,8 +226,8 @@ func planRoutes(ctx context.Context, k harnessKnobs, keys keySource, main settin
 		// The route's id is the provider id the harness registers it under:
 		// never the main provider's own, and one per endpoint.
 		id := m.Provider
-		if m.Credential != "" {
-			id += "+" + m.Credential
+		if m.CredName != "" {
+			id += "+" + m.CredName
 		}
 		if id == main.Provider {
 			id += "@" + string(ep.Format)
