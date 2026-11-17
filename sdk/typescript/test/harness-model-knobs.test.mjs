@@ -8,7 +8,7 @@ import {
   HARNESS_ONLY_KEYS, MAX_SUBAGENT_MODELS, assertHarnessKnobShapes, assertOthersFitFramework,
   assertSubagentDefaultOffered, parseAssignments,
 } from '../dist/cli/settings.js';
-import { WEB_SEARCH_SERVICES, listInferenceProviders, routeHash, validateProvider } from '../dist/Providers.js';
+import { WEB_SEARCH_SERVICES, listInferenceProviders, providerWebSearch, routeHash, validateProvider } from '../dist/Providers.js';
 
 const others = (o) => parseAssignments([`others=${JSON.stringify(o)}`]);
 
@@ -67,4 +67,12 @@ test('each built-in provider names the web search service its key pays for, outs
   delete without.webSearch;
   assert.equal(routeHash(without), routeHash(byId['0g-compute']));
   assert.throws(() => validateProvider({ ...byId.openai, webSearch: 'bing' }), /web search/);
+});
+
+test('a registry without the webSearch field gets the service sealed would use', () => {
+  const stripped = listInferenceProviders().map((p) => { const q = structuredClone(p); delete q.webSearch; return q; });
+  const byId = Object.fromEntries(stripped.map((p) => [p.id, providerWebSearch(p)]));
+  assert.deepEqual(byId, { '0g-compute': '0g-router', openai: 'openai', anthropic: 'anthropic' });
+  assert.equal(providerWebSearch({ id: 'other', name: 'Other', formats: ['openai'] }), undefined);
+  assert.equal(providerWebSearch({ id: 'other', name: 'Other', formats: ['openai'], webSearch: 'openai' }), 'openai');
 });

@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"seal-verify/internal/credproxy"
 )
 
 // The web search services the main route can call for web/search. Each
@@ -207,7 +209,7 @@ func (s *Server) modelSearch(w http.ResponseWriter, r *http.Request, ws *WebSear
 		return
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		searchError(w, resp.StatusCode, ws.Service+" web search: "+upstreamMessage(answer))
+		searchError(w, resp.StatusCode, ws.Service+" web search: "+upstreamMessage(answer, resp.Header.Get(credproxy.ErrorHeader)))
 		return
 	}
 	var results []searchResult
@@ -232,14 +234,28 @@ func searchError(w http.ResponseWriter, status int, message string) {
 }
 
 // upstreamMessage is a provider error's message, bounded; never the request.
-func upstreamMessage(body []byte) string {
+// A credential proxy refusal (credproxyCode, from its credproxy.ErrorHeader)
+// answers {"code","message"} instead of a provider's {"error":{"message"}}:
+// a search paid with a named owner credential goes through that proxy, which
+// refuses locally, before anything is sent. Its message names the
+// credential, never a value.
+func upstreamMessage(body []byte, credproxyCode string) string {
 	var e struct {
 		Error struct {
 			Message string `json:"message"`
 		} `json:"error"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
 	}
 	msg := "no error message"
-	if json.Unmarshal(body, &e) == nil && e.Error.Message != "" {
+	ok := json.Unmarshal(body, &e) == nil
+	switch {
+	case credproxyCode != "":
+		msg = "the credential proxy refused it (" + credproxyCode + ")"
+		if ok && e.Message != "" {
+			msg += ": " + e.Message
+		}
+	case ok && e.Error.Message != "":
 		msg = e.Error.Message
 	}
 	if r := []rune(msg); len(r) > 300 {

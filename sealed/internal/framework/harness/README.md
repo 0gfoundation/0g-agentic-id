@@ -90,12 +90,17 @@ Nothing outside that allowlist is settable by anyone. Measured code decides:
   under `/p/<id>` with its own upstream, key and models. Each route pins its
   models and carries the agent doc; a named route refuses any other model
   name. The harness gets them as `SEAL_HARNESS_MODEL_ROUTES` (no keys).
+  The log names the first request each route forwards for a further model,
+  `inference route <id>: first request for model <model>` (`main` for the
+  main route).
 - One rule decides how the search service and each further model are paid:
   the main model's provider with no credential named uses the model key; a
   named owner credential goes through the credential proxy as its
   placeholder, which the proxy fills only on the hosts and in the positions
   the owner allowed; otherwise the search or model is not offered, and the
-  log says why.
+  log says why. A named credential is checked when a request runs: the
+  credential proxy refuses one the owner does not hold, and `web_search`
+  reports that refusal's code and message.
 - The harness checks its own token on `/v1/*` (`SEAL_BRIDGE_TOKEN`). The
   owner gets a different one from `/_seal/auth`, and sealed's proxy swaps it
   for the harness's on the way in, so nothing the harness runs sees the

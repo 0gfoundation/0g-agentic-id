@@ -112,6 +112,9 @@ type Server struct {
 	mu     sync.RWMutex
 	route  *Route
 	routes map[string]*Route // named, under /p/<id>
+	// used records each further model a route has forwarded a request for,
+	// so the log names it once (noteModel).
+	used map[string]bool
 }
 
 // Start listens on a loopback port and serves the proxy.
@@ -160,7 +163,24 @@ func (s *Server) SetRoutes(main Route, named map[string]Route) error {
 	defer s.mu.Unlock()
 	s.route = &main
 	s.routes = routes
+	s.used = map[string]bool{}
 	return nil
+}
+
+// noteModel logs, once per route setting, the first request a route
+// forwards for a model other than the main route's own: the owner's evidence
+// that a subagent's model reached its route.
+func (s *Server) noteModel(route, model string) {
+	key := route + "\x00" + model
+	s.mu.Lock()
+	first := s.used != nil && !s.used[key]
+	if first {
+		s.used[key] = true
+	}
+	s.mu.Unlock()
+	if first {
+		logger.Logf("inference route %s: first request for model %s", route, model)
+	}
 }
 
 // NamedBaseURL is the base URL of named route id.
@@ -212,7 +232,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no inference route set", http.StatusServiceUnavailable)
 		return
 	}
-	named := false
+	named, routeName := false, "main"
 	if after, ok := strings.CutPrefix(rest, "/p/"); ok {
 		seg, tail, _ := strings.Cut(after, "/")
 		id, err := url.PathUnescape(seg)
@@ -220,7 +240,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no such model route", http.StatusNotFound)
 			return
 		}
-		named, rest = true, "/"+tail
+		named, routeName, rest = true, id, "/"+tail
 	}
 	kind := endpoint(r.Method, rest)
 	if kind == "" {
@@ -252,6 +272,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			http.Error(w, fmt.Sprintf("model %q is not offered on this route", requestModel(raw)), http.StatusBadRequest)
 			return
+		}
+		if named || model != route.Model {
+			s.noteModel(routeName, model)
 		}
 		out, err := Rewrite(kind, raw, model, route.System)
 		if err != nil {

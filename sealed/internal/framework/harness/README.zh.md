@@ -30,8 +30,8 @@
 `spawn.go` 以 agent 用户身份运行 `node /opt/0g-harness/<sha256>/bin/0g-harness.mjs`(没有包的镜像上是 `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`),监听本机回环端口 8794,环境变量由 `environ()` 生成。这些环境变量的约定写在 harness 的 `docs/PROTOCOL.md` 里。其中 `SEAL_OWNER` 是启动时从链上读到的 owner(小写),harness 拿它核对每条记忆的 `trusted_by`。
 
 - 只要 sealed 知道 provider 的 endpoint,harness 就通过 sealed 的推理代理(`internal/inferproxy`,一个回环地址)调用模型:注册表里的 managed provider,以及 `openai` 和 `anthropic`(sealed 固定的官方 endpoint)。代理写上 owner 的模型,在 system prompt 末尾附上 agent doc,并设置密钥;harness 手里只有占位符(`../../CONFIG_SURFACE.zh.md` §3、§7)。`webTools` 打开、且 owner 选的搜索服务能付费时，代理还为 `web_search` 提供 `POST /v1/web/search`：只收 `{"query"}` 请求体，发给该服务，不附 agent doc(`inferproxy` `websearch.go`)，并按 0G router 的结果格式回答；harness 从 `SEAL_HARNESS_WEB_SEARCH_URL` 拿到这个地址。
-- owner 给子 agent 提供的其他模型(`subagentModels`)是同一个代理上的路由(`modelroutes.go`)：和主模型同 endpoint、同密钥的模型，由主路由多接一个模型；其余的各是 `/p/<id>` 下的一条命名路由，有自己的上游、密钥和模型。每条路由固定自己的模型并附上 agent doc；命名路由拒绝其他模型名。harness 从 `SEAL_HARNESS_MODEL_ROUTES` 拿到它们(不含密钥)。
-- 搜索服务和每个其他模型怎么付费，按同一条规则：和主模型同 provider、没指定凭据时用模型 key；指定了 owner 的凭据时，经凭证代理带上它的占位符，代理只在 owner 允许的 host 和位置上代填；都不满足就不提供，日志里写明原因。
+- owner 给子 agent 提供的其他模型(`subagentModels`)是同一个代理上的路由(`modelroutes.go`)：和主模型同 endpoint、同密钥的模型，由主路由多接一个模型；其余的各是 `/p/<id>` 下的一条命名路由，有自己的上游、密钥和模型。每条路由固定自己的模型并附上 agent doc；命名路由拒绝其他模型名。harness 从 `SEAL_HARNESS_MODEL_ROUTES` 拿到它们(不含密钥)。每条路由第一次为某个其他模型转发请求时，日志记一行 `inference route <id>: first request for model <model>`(主路由的 id 记为 `main`)。
+- 搜索服务和每个其他模型怎么付费，按同一条规则：和主模型同 provider、没指定凭据时用模型 key；指定了 owner 的凭据时，经凭证代理带上它的占位符，代理只在 owner 允许的 host 和位置上代填；都不满足就不提供，日志里写明原因。指定的凭据在请求发出时才检查：owner 没有这个凭据时凭证代理拒绝，`web_search` 返回拒绝的代码和原因。
 - harness 在 `/v1/*` 上检查它自己的 token(`SEAL_BRIDGE_TOKEN`)。owner 从 `/_seal/auth` 拿到的是另一个 token,sealed 的 proxy 在请求进来时把它换成 harness 的,所以 harness 运行的任何东西都看不到 owner 的 token。
 
 harness 做三件事:

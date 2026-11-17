@@ -231,6 +231,14 @@ func TestNamedRoutes(t *testing.T) {
 		t.Fatal("a refused model reached the named route's upstream")
 	}
 
+	// The log names each further model once per route (noteModel), never
+	// the main route's own model.
+	for key, want := range map[string]bool{"main\x00deepseek-v3": true, "openai+key\x00gpt-x": true, "openai+key\x00gpt-y": true, "main\x00glm-5.3": false} {
+		if s.used[key] != want {
+			t.Fatalf("model use %q recorded %v, want %v", key, s.used[key], want)
+		}
+	}
+
 	// No such route; no web search on a named route; bad ids are refused.
 	if code, _ := postJSON(t, s.NamedBaseURL("nope")+"/chat/completions", chat("gpt-x")); code != http.StatusNotFound {
 		t.Fatalf("unknown route: %d", code)
@@ -246,5 +254,23 @@ func TestNamedRoutes(t *testing.T) {
 	s.SetRoute(Route{Upstream: mainSrv.URL + "/v1", Model: "glm-5.3"})
 	if code, _ := postJSON(t, base+"/chat/completions", chat("gpt-x")); code != http.StatusNotFound {
 		t.Fatalf("after SetRoute: %d", code)
+	}
+}
+
+// A search paid with a named owner credential the credential proxy refuses
+// (an unknown name, a host it may not go to) reports the proxy's reason, not
+// "no error message".
+func TestUpstreamMessageCredentialRefusal(t *testing.T) {
+	body := []byte(`{"code":"unknown_entry","message":"no credential named \"no-such-cred\""}`)
+	got := upstreamMessage(body, "unknown_entry")
+	want := `the credential proxy refused it (unknown_entry): no credential named "no-such-cred"`
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if got := upstreamMessage([]byte(`{"error":{"message":"bad key"}}`), ""); got != "bad key" {
+		t.Fatalf("provider error: got %q", got)
+	}
+	if got := upstreamMessage([]byte(`not json`), ""); got != "no error message" {
+		t.Fatalf("no message: got %q", got)
 	}
 }

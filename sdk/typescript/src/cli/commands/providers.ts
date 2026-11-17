@@ -1,5 +1,6 @@
 /** Read-only discovery of the platform provider registry. */
 import { buildClient } from '../sdk';
+import { providerWebSearch } from '../../Providers';
 import { CliError } from '../errors';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
@@ -12,6 +13,6 @@ export async function run(ctx: CommandContext): Promise<void> {
   else {
     print(`provider registry version ${current.version}`);
     print('id\tname\tformats\tweb search');
-    for (const provider of current.providers) print(`${provider.id}\t${provider.name}\t${provider.formats.join(', ')}\t${provider.webSearch ?? '-'}`);
+    for (const provider of current.providers) print(`${provider.id}\t${provider.name}\t${provider.formats.join(', ')}\t${providerWebSearch(provider) ?? '-'}`);
   }
 }

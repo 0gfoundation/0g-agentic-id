@@ -117,7 +117,7 @@ Writes are a compare-and-swap like `settings` (exit 3, `CREDENTIALS_CONFLICT`). 
 
 ### `providers`
 
-Lists providers from the attestor registry (`--json` supported): id, name, formats, and the web search service each provider's key pays for (`webSearch`, `-` for none; a 0g-harness agent's `others.webSearch` picks the service). Registry publication is an operations API / SDK admin action, authorized by the attestor Tapp owner; it is not a CLI command.
+Lists providers from the attestor registry (`--json` supported): id, name, formats, and the web search service each provider's key pays for (`webSearch`; without the field, the one sealed uses: the router's for `0g-compute`, its own for native `openai` and `anthropic`; `-` for none). A 0g-harness agent's `others.webSearch` picks the service. `--json` prints the registry as published. Registry publication is an operations API / SDK admin action, authorized by the attestor Tapp owner; it is not a CLI command.
 
 ### `update`
 

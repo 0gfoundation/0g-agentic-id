@@ -31,6 +31,19 @@ export interface InferenceProvider {
 export const WEB_SEARCH_SERVICES = ['0g-router', 'openai', 'anthropic'] as const;
 export type WebSearchService = (typeof WEB_SEARCH_SERVICES)[number];
 
+/**
+ * The web search service provider's key pays for, as sealed decides it
+ * (`inference.webSearchOf`, `nativeEndpoints`): the registry's `webSearch`
+ * field, else the 0G router for `0g-compute` (a registry published before the
+ * field existed), and the provider's own service for native `openai` and
+ * `anthropic`; undefined for none.
+ */
+export function providerWebSearch(provider: InferenceProvider): WebSearchService | undefined {
+  if (provider.native && (provider.id === 'openai' || provider.id === 'anthropic')) return provider.id;
+  if (provider.webSearch) return provider.webSearch;
+  return provider.id === '0g-compute' ? '0g-router' : undefined;
+}
+
 /** Offline/built-in seed. Instance registries discover operator-published definitions. */
 export function listInferenceProviders(): InferenceProvider[] {
   return JSON.parse(JSON.stringify(definitions)) as InferenceProvider[];

@@ -168,5 +168,5 @@ export {
   sandboxServingAbi,
 } from './abi';
 
-export { listInferenceProviders, inferenceProvider, routeHash } from './Providers';
+export { listInferenceProviders, inferenceProvider, providerWebSearch, routeHash } from './Providers';
 export type { InferenceProvider, InferenceFormat, InferenceModel, ProviderRegistrySnapshot, ProviderRegistryPin } from './Providers';
