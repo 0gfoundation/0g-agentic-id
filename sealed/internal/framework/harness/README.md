@@ -90,9 +90,12 @@ The harness then does three things:
   inbox: for example when a background job finishes or a reminder comes due.
 
 `FrameworkRoutes()` advertises the surface on `/hello`, one kind per
-capability: `chat`, `responses`, `inbox`, `events`, `tasks`, `schedules`, `files`. A
+capability: `chat`, `responses`, `inbox`, `events`, `tasks`, `schedules`, `files`, `steer`. A
 client enables a feature only on the kinds an agent declares. The other
-frameworks declare none of the last five, and nothing about them changes.
+frameworks declare none of the last six, and nothing about them changes.
+`steer` is the owner's word for the turn already running: the harness reads it
+before that turn's next model call, and queues it as an ordinary turn when no
+owner turn is running.
 Each route lists its exact endpoints, those of the harness's protocol v1
 (`routes_test.go`), and sealed's proxy forwards nothing else: an unlisted
 path gets 404, an unlisted method 405.

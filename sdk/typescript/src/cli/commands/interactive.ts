@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
-import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentTaskInfo, AgentTaskStop, ChatImage, ChatMessage, ChatNotice } from '../../AgentClient';
+import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentTaskInfo, AgentTaskStop, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
 import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
@@ -687,12 +687,27 @@ type Ask = ((q: string) => Promise<string>) & {
   main?: (q: string) => Promise<string>;
   message?: (q: string) => Promise<Entry>;
   cancel?: () => boolean;
+  /** While no question is up (a turn runs), hand each finished entry to
+   *  `take` first: true means it took it, false that it waits for the next
+   *  prompt as before. null stops. */
+  whileBusy?: (take: ((e: Entry) => boolean) | null) => void;
+  /** Put an entry back to wait for the next prompt. */
+  later?: (e: Entry) => void;
 };
 
 /** What the owner entered: its text (newlines kept), whether it spans lines,
  *  and whether any of it was pasted. An agent message that spans lines or was
  *  pasted is never a command. */
 export type Entry = { text: string; multi: boolean; pasted: boolean };
+
+/** Whether an entry finished during a turn goes into that turn (steer): any
+ *  message, but not an empty line or a command typed alone on its line —
+ *  those wait for the next prompt, as before. */
+export function steerable(e: Entry): boolean {
+  const t = e.text.trim();
+  if (!t) return false;
+  return e.multi || e.pasted || !t.startsWith('/');
+}
 
 /** An answer to a signing question this soon after it is shown was typed before it. */
 const READ_MS = 300;
@@ -772,9 +787,14 @@ export function lineQueue(
     if (e.pasted && YES_NO_QUESTION.test(w.q)) return 'a paste does not answer a yes/no question';
     return null;
   };
+  let busy: ((e: Entry) => boolean) | null = null;
   const deliver = (e: Entry): void => {
     const w = waiters[0];
-    if (!w) { pending.push(e); return; }
+    if (!w) {
+      if (busy && busy(e)) return;
+      pending.push(e);
+      return;
+    }
     const refused = accepts(w, e);
     if (refused) {
       out(`  (${refused}: type it)\n`);
@@ -939,6 +959,8 @@ export function lineQueue(
   const ask: Ask = (q: string): Promise<string> => wait(q, 'q').then((e) => e.text);
   ask.main = (q: string): Promise<string> => wait(q, 'main').then((e) => e.text);
   ask.message = (q: string): Promise<Entry> => wait(q, 'message');
+  ask.whileBusy = (take) => { busy = take; };
+  ask.later = (e) => { pending.push(e); };
   ask.cancel = (): boolean => {
     const i = waiters.findIndex((w) => w.kind === 'q');
     if (i < 0) return false;
@@ -2821,6 +2843,12 @@ const L2_HELP_FULL = `session commands
                           Enter and never run as a command; a line ending
                           in \\ or Option/Alt+Enter goes on to a new line.
                           Lines already entered are not edited again
+  (typing while it works) 0g-harness: a message you finish while the agent
+                          works goes into its turn, read before its next
+                          model call ("↳ inserted", then "(read)"); not in
+                          the middle of a long command. If the turn ends
+                          first, it runs as a turn of its own, shown here.
+                          A command alone on its line waits for the prompt
   (bare Enter)            refresh this agent's phase/url from the attestor
   /hello                  identity, routes/services, serve-proof verification
   /balance                this agent's agentSeal gas + the account prepaid
@@ -3602,6 +3630,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // does; 0g-harness and the prime bridge ignore it). Send it when known, omit it
     // otherwise — and only if the framework rejects that, ask once and retry.
     let retriedWithPick = false;
+    // Inserted texts this turn did not read: each runs as a turn of its own
+    // on the agent, followed here once this turn ends.
+    const afterTurn: string[] = [];
     for (;;) {
       const ac = new AbortController();
       irq.streaming = ac;
@@ -3636,8 +3667,40 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         term(`\r\x1b[2K  ${cleanCell(`${SPIN[spin]} ${status}… (${secs}s · esc to interrupt)`)}`);
         statusShown = true;
       };
+      // Steering (0g-harness, on a terminal): a message the owner finishes
+      // while the turn runs goes into it, read before its next model call. A
+      // command alone on its line, or an empty Enter, waits for the next
+      // prompt as before.
+      const steered: string[] = []; // inserted into this turn, not read yet
+      const steer = s.client.steer && process.stdin.isTTY ? s.client.steer : undefined;
+      if (steer) {
+        (ask as Ask).whileBusy?.((e) => {
+          if (!steerable(e)) return false;
+          clearActivity();
+          out('\n↳ inserted — the agent reads it at its next step\n');
+          steer(e.text).then(
+            (r) => {
+              if (r.merged && r.id) { steered.push(r.id); return; }
+              if (r.queued) afterTurn.push(r.queued);
+              out(`(${cleanCell(r.reason ?? 'no turn of yours is running')} — it goes as a turn of its own)\n`);
+            },
+            (err: Error) => {
+              out(`(not inserted: ${cleanCell(err.message)} — it waits for the next prompt)\n`);
+              (ask as Ask).later?.(e);
+            },
+          );
+          return true;
+        });
+      }
       const onActivity = process.stdout.isTTY
         ? (label: string): void => {
+            if (label === 'steer received') {
+              // The agent read an inserted message.
+              clearActivity();
+              out('  ↳ (read)\n');
+              steered.shift();
+              return;
+            }
             // "did work this turn" detector, across bridges' label dialects:
             // 0g-harness "tool/call bash", prime "tool_execution_start — bash" /
             // "bash_command_start", hermes "tool/call web_search". Thinking
@@ -3743,6 +3806,20 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         clearActivity();
         irq.streaming = null;
         s.currentTask = null;
+        (ask as Ask).whileBusy?.(null);
+      }
+      // Inserted but not read: the turn ended first, so the agent runs it as
+      // a turn of its own (an interrupt drops it instead).
+      if (!interrupted && s.client?.steerState) {
+        for (const id of steered) {
+          let st: SteerState | null = null;
+          for (let i = 0; i < 20; i++) {
+            st = await s.client.steerState(id).catch(() => null);
+            if (!st || st.state !== 'pending') break;
+            await new Promise((r) => setTimeout(r, 150));
+          }
+          if (st?.state === 'turn') afterTurn.push(st.turn);
+        }
       }
       if (failure && !s.framework && !retriedWithPick) {
         out(`\n(chat failed: ${cleanCell(failure)})\nthis framework may need a model selector — pick it:\n`);
@@ -3777,6 +3854,23 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       out('\n');
       messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
       break;
+    }
+    for (const id of afterTurn) {
+      (s.tasks ??= []).push({ id, prompt: '(inserted)', at: Date.now() });
+      if (!s.client?.followTask) { out(`(your inserted message runs as ${id} — /result ${id} shows it)\n`); continue; }
+      out(`(your inserted message runs as a turn of its own, ${id})\nagent> `);
+      const fac = new AbortController();
+      irq.streaming = fac;
+      try {
+        for await (const delta of s.client.followTask(id, { signal: fac.signal })) out(cleanStream(delta));
+        out('\n');
+      } catch (e) {
+        out(fac.signal.aborted
+          ? `\n(stopped watching — it continues; /result ${id} re-attaches, /cancel ${id} stops it)\n`
+          : `\n(${cleanCell((e as Error).message)})\n`);
+      } finally {
+        irq.streaming = null;
+      }
     }
   }
   } finally {

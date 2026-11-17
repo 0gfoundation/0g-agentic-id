@@ -372,6 +372,10 @@ for await (const d of agent.chatStream!([{ role: 'user', content: `read ${path};
   onNotice: (n) => { if (n.imagesSavedAsFiles) console.log('model cannot see images:', n.imagesSavedAsFiles); },
 })) process.stdout.write(d);
 
+// Steer the running turn (0g-harness, kind "steer"): read before its next model call.
+const r = await agent.steer!('use the v2 API instead');  // { merged: true, id, turn } | { merged: false, queued, reason }
+if (r.merged) console.log((await agent.steerState!(r.id!)).state);   // pending | merged | turn | dropped
+
 // opinionated shortcuts over client():
 const auth = await ag.agent.authenticate(agentId);   // mints the owner token up front (needs a wallet)
 const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (never attaches a token)

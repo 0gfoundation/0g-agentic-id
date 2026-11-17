@@ -166,6 +166,29 @@ export interface UploadedFile {
   bytes: number;
 }
 
+/** What {@link AgentClient.steer} did with the owner's text. */
+export interface SteerResult {
+  /** true: read in the running owner turn `turn`, before its next model
+   *  call. false: no owner turn was running, so it is an ordinary turn,
+   *  `queued` (follow it like any response); `reason` says why. */
+  merged: boolean;
+  /** The steered message's id, for {@link AgentClient.steerState} (merged only). */
+  id?: string;
+  turn?: string;
+  queued?: string;
+  reason?: string;
+}
+
+/** What became of a steered text ({@link AgentClient.steerState}). */
+export interface SteerState {
+  id: string;
+  /** pending: not read yet. merged: read in `turn`. turn: the turn it was
+   *  meant for ended first, so it opened `turn`, an owner turn of its own.
+   *  dropped: an interrupt came first. */
+  state: 'pending' | 'merged' | 'turn' | 'dropped';
+  turn: string;
+}
+
 /**
  * Snapshot of one long-running task (a "response" in OpenAI Responses API
  * terms) on the agent. Returned by {@link AgentClient.task} /
@@ -496,6 +519,17 @@ export interface AgentClient {
    * route (0g-harness) and this handle holds the owner token.
    */
   uploadFile?(name: string, data: Uint8Array): Promise<UploadedFile>;
+  /**
+   * The owner's word for the turn already running: the agent reads it before
+   * that turn's next model call — when the current model answer or tool call
+   * finishes, not in the middle of a long command. With no owner turn
+   * running it is queued as an ordinary turn (`merged: false`). Present only
+   * when the agent declares a `kind: "steer"` route (0g-harness) and this
+   * handle holds the owner token.
+   */
+  steer?(text: string): Promise<SteerResult>;
+  /** What became of a text {@link steer} merged. Present with {@link steer}. */
+  steerState?(id: string): Promise<SteerState>;
 }
 
 /** Longest-prefix match over declared routes, or undefined if none match. */
@@ -1217,6 +1251,12 @@ export function makeAgentClient(params: {
   const filesBase = ownerBase('files');
   if (filesBase) {
     client.uploadFile = (name, data) => postJSON<UploadedFile>('uploadFile', filesBase, { name, content_base64: bytesToBase64(data) });
+  }
+
+  const steerBase = ownerBase('steer');
+  if (steerBase) {
+    client.steer = (text) => postJSON<SteerResult>('steer', steerBase, { text });
+    client.steerState = (id) => getJSON<SteerState>('steerState', `${steerBase}/${encodeURIComponent(id)}`);
   }
 
   const eventsBase = ownerBase('events');
