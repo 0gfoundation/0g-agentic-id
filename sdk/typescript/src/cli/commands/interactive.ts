@@ -837,7 +837,9 @@ export function lineQueue(
     // The pasted lines are on the screen as readline echoed them; say how it
     // is sent, then the line being edited goes on under the next-line prompt.
     if (tail) term('\r\x1b[K');
-    out(`  [pasted ${draft.length} line${draft.length === 1 ? '' : 's'} · Enter sends]\n`);
+    // The last pasted line, when no newline ended it, is the line being edited.
+    const n = draft.length + (tail ? 1 : 0);
+    out(`  [pasted ${n} line${n === 1 ? '' : 's'} · Enter sends]\n`);
     rl.setPrompt(CONT);
     if (typeof edit.cursor === 'number') edit.cursor = tail.length;
     if (typeof edit.prevRows === 'number') edit.prevRows = 0;

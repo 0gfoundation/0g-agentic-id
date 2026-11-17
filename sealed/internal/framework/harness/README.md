@@ -114,7 +114,7 @@ committed (`../../LAYERS.md` §3).
 | inference | `dsh-llm-pi-ai` (route rendered from the owner's settings by the adapter), `dsh-credentials-local` |
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | filesystem | `dsh-fs-local` + `dsh-tool-fs` |
-| owner images and files | `dsh-attachment-local` (the owner's images, normalized, below `$DSH_HOME/attachments`, untracked; it also enables `read_image`). Files the owner uploads (`POST /v1/files`) land in `~/uploads`, untracked; the image ships `pdftotext` for PDFs among them |
+| owner images and files | `dsh-attachment-local` (the owner's images, normalized, below `~/.dsh-attachments` in the agent's home, untracked; it also enables `read_image`). Files the owner uploads (`POST /v1/files`) land in `~/uploads`, untracked; the image ships `pdftotext` for PDFs among them |
 | skills | `dsh-skill-filesystem` (the `skills/` iData role — agent-installed, chain-tracked) |
 | long-term memory | the harness's own system-prompt section (`src/memory.mjs`): the guidance and the `MEMORY.md` index, read at every model step; the memory files are the `memory/` iData role (`memory.go`) — one `<name>.md` per memory directly in `$DSH_HOME/memory/`, chain-tracked; the committed copy carries placeholders for credential values and `[redacted:<kind>]` for secrets of a known format (`../../../CREDENTIALS.md`, What is outside) |
 | context headroom | `dsh-token-meter` + `dsh-compaction-basic` |

@@ -51,7 +51,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | 推理 | `dsh-llm-pi-ai`(路由由适配器按 owner 的 settings 渲染好传进去)、`dsh-credentials-local` |
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | 文件读写 | `dsh-fs-local` + `dsh-tool-fs` |
-| owner 发的图片和文件 | `dsh-attachment-local`（owner 发的图片规整后存在 `$DSH_HOME/attachments` 下，不进链；同时让 `read_image` 可用）。owner 上传的文件（`POST /v1/files`）放在 `~/uploads`，不进链；镜像带 `pdftotext`，用来读其中的 PDF |
+| owner 发的图片和文件 | `dsh-attachment-local`（owner 发的图片规整后存在 agent 家目录的 `~/.dsh-attachments` 下，不进链；同时让 `read_image` 可用）。owner 上传的文件（`POST /v1/files`）放在 `~/uploads`，不进链；镜像带 `pdftotext`，用来读其中的 PDF |
 | 技能 | `dsh-skill-filesystem`(对应 `skills/` 这个 iData role:agent 自己装的,会上链) |
 | 长期记忆 | harness 自己的系统提示段(`src/memory.mjs`):说明和 `MEMORY.md` 索引,每个模型步骤都重新读取;记忆文件是 `memory/` 这个 iData role(`memory.go`):每条记忆一个 `<name>.md`,直接放在 `$DSH_HOME/memory/` 里,会上链;上链的副本里凭据值换成占位符,格式可识别的秘密换成 `[redacted:<类型>]`(`../../../CREDENTIALS.zh.md`「范围之外」) |
 | 上下文余量 | `dsh-token-meter` + `dsh-compaction-basic` |
