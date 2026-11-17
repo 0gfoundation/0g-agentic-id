@@ -116,7 +116,7 @@ committed (`../../LAYERS.md` §3).
 | filesystem | `dsh-fs-local` + `dsh-tool-fs` |
 | owner images and files | `dsh-attachment-local` (the owner's images, normalized, below `$DSH_HOME/attachments`, untracked; it also enables `read_image`). Files the owner uploads (`POST /v1/files`) land in `~/uploads`, untracked; the image ships `pdftotext` for PDFs among them |
 | skills | `dsh-skill-filesystem` (the `skills/` iData role — agent-installed, chain-tracked) |
-| long-term memory | the harness's own system-prompt section (`src/memory.mjs`): the guidance and the `MEMORY.md` index, read at every model step; the memory files are the `memory/` iData role (`memory.go`) — one `<name>.md` per memory directly in `$DSH_HOME/memory/`, chain-tracked |
+| long-term memory | the harness's own system-prompt section (`src/memory.mjs`): the guidance and the `MEMORY.md` index, read at every model step; the memory files are the `memory/` iData role (`memory.go`) — one `<name>.md` per memory directly in `$DSH_HOME/memory/`, chain-tracked; the committed copy carries placeholders for credential values and `[redacted:<kind>]` for secrets of a known format (`../../../CREDENTIALS.md`, What is outside) |
 | context headroom | `dsh-token-meter` + `dsh-compaction-basic` |
 | loop hygiene | `dsh-tool-call-timeout-policy` |
 | background jobs (`toolJobs` on) | `dsh-tool-jobs`: commands run in the background; a job finishing while the agent is idle opens a turn, whose reply goes to the inbox |

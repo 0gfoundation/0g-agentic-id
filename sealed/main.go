@@ -777,14 +777,16 @@ func startAgent(
 	}
 
 	// What the watcher hashes and the uploader commits is scrubbed of the
-	// credential values sealed holds (internal/scrub). Built before Phase A,
-	// which reads the disk the way the watcher does to find the agent's
-	// uncommitted edits. The drift handler keeps the adapter itself: it asks
-	// it for optional interfaces.
-	var idata framework.Framework = adapter
+	// credential values sealed holds and of secrets of known formats
+	// (internal/scrub), for every framework, with or without credentials.
+	// Built before Phase A, which reads the disk the way the watcher does to
+	// find the agent's uncommitted edits. The drift handler keeps the
+	// adapter itself: it asks it for optional interfaces.
+	var heldValues scrub.Values
 	if credValues != nil {
-		idata = scrub.Wrap(adapter, credValues)
+		heldValues = credValues
 	}
+	var idata framework.Framework = scrub.Wrap(adapter, heldValues)
 
 	// An adapter whose roles keep the agent's uncommitted edits
 	// (framework.UncommittedKeeper) reads what this container last had in
