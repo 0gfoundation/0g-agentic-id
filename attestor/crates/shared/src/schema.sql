@@ -282,6 +282,11 @@ CREATE TABLE IF NOT EXISTS operator_grants (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE operator_grants ADD COLUMN IF NOT EXISTS transfer_invalidated BOOLEAN NOT NULL DEFAULT FALSE;
+-- Admission cache bound to the original proof bytes, owner and revision.
+-- This is not an attestor signature or a substitute for the owner's proof.
+ALTER TABLE operator_grants ADD COLUMN IF NOT EXISTS checkpoint_acceptance BYTEA
+    CHECK (checkpoint_acceptance IS NULL OR octet_length(checkpoint_acceptance) = 32);
+
 
 -- Revocation and the exact cleanup targets commit together. No credentials
 -- or executable queue payloads live in this outbox.
@@ -360,3 +365,23 @@ CREATE TABLE IF NOT EXISTS credential_notify (
     email      TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Recoverable public metadata failures must not hold up ownership revocations.
+-- Transfer/security failures never enter the skippable metadata path.
+CREATE TABLE IF NOT EXISTS indexer_deadletters (
+    chain_id BIGINT NOT NULL,
+    contract BYTEA NOT NULL CHECK (octet_length(contract) = 20),
+    block_hash BYTEA NOT NULL CHECK (octet_length(block_hash) = 32),
+    log_index BIGINT NOT NULL,
+    block_number BIGINT NOT NULL,
+    raw_log JSONB NOT NULL,
+    reason TEXT NOT NULL,
+    attempts BIGINT NOT NULL DEFAULT 1,
+    first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (chain_id, contract, block_hash, log_index)
+);
+
+-- Monotonic indexed ownership watermark fences grant admission against an
+-- outgoing Transfer observed while the API was still verifying its proof.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS operator_transfer_block BIGINT NOT NULL DEFAULT 0;

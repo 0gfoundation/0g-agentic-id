@@ -992,6 +992,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_operator_boot_can_provision_after_historical_state_is_pruned() {
+        let (mut state, repo, seal, owner, _) = operator_setup().await;
+        let chain = Arc::new(MockChain::new());
+        chain.set_owner_of(owner.address());
+        chain.set_checkpoint_owner_failure(true);
+        chain.set_operator_checkpoint_failure(true);
+        state.chain = chain;
+        let response = call(&state, first(&repo, seal).await).await.unwrap();
+        assert_eq!(
+            decrypt(&state, &response.encrypted_agent_seal_priv, CONTAINER_PRIV),
+            state.crypto.derive_agent_seal(seal).await.unwrap().priv_key,
+        );
+        call(&state, later(&repo, seal).await).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn revoked_operator_cannot_renew_v3_provisioning() {
         let (state, repo, seal, owner, _) = operator_setup().await;
         call(&state, first(&repo, seal).await).await.unwrap();

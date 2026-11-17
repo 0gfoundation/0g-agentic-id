@@ -6,7 +6,9 @@ use crate::{
     sandbox::verify_envelope, ChainClient, Config, CryptoModule, Deployment, DeploymentRepo,
     SandboxEnvelope, SealId,
 };
-use alloy::primitives::{Address, Bytes, B256};
+use alloy::primitives::{keccak256, Address, Bytes, B256};
+use alloy::sol_types::SolValue;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,6 +49,24 @@ pub struct OperatorGrant {
     pub owner: Address,
     pub signed_message_b64: String,
     pub signature: Bytes,
+    /// Records successful historical-owner admission for this exact grant.
+    /// This is a server-side cache, not an attestation against a malicious DB.
+    #[serde(default)]
+    pub checkpoint_acceptance: Option<B256>,
+}
+
+pub fn checkpoint_acceptance_digest(grant: &OperatorGrant) -> anyhow::Result<B256> {
+    let proof = base64::engine::general_purpose::STANDARD.decode(&grant.signed_message_b64)?;
+    Ok(keccak256(
+        (
+            keccak256(b"AgenticID.OperatorCheckpointAcceptance.v1"),
+            keccak256(proof),
+            keccak256(grant.signature.as_ref()),
+            grant.owner,
+            grant.version,
+        )
+            .abi_encode(),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -230,6 +250,29 @@ pub fn verify_operator_grant(
     seal_id: SealId,
     crypto: &dyn CryptoModule,
 ) -> anyhow::Result<OperatorDirective> {
+    let directive =
+        verify_operator_grant_metadata(grant, owner, chain_id, contract, seal_id, crypto)?;
+    anyhow::ensure!(
+        directive.operator.is_some(),
+        "operator authorization was revoked"
+    );
+    anyhow::ensure!(
+        directive.expires_at == 0 || directive.expires_at > chrono::Utc::now().timestamp(),
+        "operator authorization expired"
+    );
+    Ok(directive)
+}
+
+/// Transfer reconciliation also needs the checkpoint of expired/revoked
+/// grants. Validate their provenance without granting runtime permission.
+pub fn verify_operator_grant_metadata(
+    grant: &OperatorGrant,
+    owner: Address,
+    chain_id: u64,
+    contract: Address,
+    seal_id: SealId,
+    crypto: &dyn CryptoModule,
+) -> anyhow::Result<OperatorDirective> {
     anyhow::ensure!(
         grant.owner == owner,
         "operator grant belongs to a previous owner"
@@ -247,29 +290,29 @@ pub fn verify_operator_grant(
         grant.version == d.base_version + 1,
         "operator grant version no longer valid"
     );
-    anyhow::ensure!(d.operator.is_some(), "operator authorization was revoked");
-    anyhow::ensure!(
-        d.expires_at == 0 || d.expires_at > chrono::Utc::now().timestamp(),
-        "operator authorization expired"
-    );
+    if d.checkpoint.is_some() {
+        anyhow::ensure!(
+            grant.checkpoint_acceptance == Some(checkpoint_acceptance_digest(grant)?),
+            "operator checkpoint admission is missing or does not match this grant; renew the authorization"
+        );
+    }
     Ok(d)
 }
 
-/// Legacy stored grants have no anchor and retain their conservative transfer
-/// invalidation. New grants must additionally survive canonical-history checks.
+/// Accepted grants need only historical headers at runtime. The historical
+/// owner is checked once at PUT, so state pruning cannot disable a grant.
 pub async fn validate_operator_checkpoint(
     chain: &dyn ChainClient,
-    agent: crate::AgentId,
     directive: &OperatorDirective,
 ) -> Result<(), RuntimeAuthorizationError> {
     if let Some(checkpoint) = directive.checkpoint.as_ref() {
-        let owner = chain
-            .owner_at_checkpoint(agent, checkpoint)
+        let canonical = chain
+            .is_checkpoint_canonical(checkpoint)
             .await
             .map_err(RuntimeAuthorizationError::ChainUnavailable)?;
-        if owner != Some(directive.owner) {
+        if !canonical {
             return Err(RuntimeAuthorizationError::Denied(anyhow::anyhow!(
-                "operator checkpoint is not canonical or names a different owner"
+                "operator checkpoint is not canonical"
             )));
         }
     }
@@ -337,7 +380,7 @@ async fn authorize_runtime_inner(
             })?;
         let directive =
             verify_operator_grant(&grant, owner, chain_id, contract, d.seal_id, crypto)?;
-        validate_operator_checkpoint(chain, d.agent_id.unwrap(), &directive).await?;
+        validate_operator_checkpoint(chain, &directive).await?;
         anyhow::ensure!(
             directive.operator == Some(actor),
             "signer is not the authorized operator"
@@ -451,7 +494,7 @@ pub async fn revalidate_runtime_principal(
                 .ok_or_else(|| anyhow::anyhow!("runtime operator authorization is missing"))?;
             let directive =
                 verify_operator_grant(&grant, owner, chain_id, contract, d.seal_id, crypto)?;
-            validate_operator_checkpoint(chain, d.agent_id.unwrap(), &directive).await?;
+            validate_operator_checkpoint(chain, &directive).await?;
             anyhow::ensure!(
                 grant.version == version && directive.operator == Some(principal.actor),
                 "runtime operator authorization changed"
@@ -496,10 +539,11 @@ pub async fn validate_boot_operator(
                 .ok_or_else(|| anyhow::anyhow!("boot operator authorization is missing"))?;
             let directive =
                 verify_operator_grant(&grant, owner, chain_id, contract, d.seal_id, crypto)?;
-            let agent = d
-                .agent_id
-                .ok_or_else(|| anyhow::anyhow!("operator cannot authorize an unminted agent"))?;
-            validate_operator_checkpoint(chain, agent, &directive).await?;
+            anyhow::ensure!(
+                d.agent_id.is_some(),
+                "operator cannot authorize an unminted agent"
+            );
+            validate_operator_checkpoint(chain, &directive).await?;
             anyhow::ensure!(
                 directive.operator == Some(actor) && boot.operator_version == Some(grant.version),
                 "boot operator authorization changed"

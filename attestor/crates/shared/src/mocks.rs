@@ -225,6 +225,7 @@ pub struct MockChain {
     checkpoint_owner: Mutex<Option<Option<Address>>>,
     operator_checkpoint_failure: AtomicBool,
     checkpoint_owner_failure: AtomicBool,
+    checkpoint_canonical_failure: AtomicBool,
     tapp_owner: Mutex<Option<Address>>,
     tapp_owner_failure: AtomicBool,
     contract_signature_valid: AtomicBool,
@@ -279,6 +280,11 @@ impl MockChain {
     pub fn set_checkpoint_owner_failure(&self, fail: bool) {
         self.checkpoint_owner_failure.store(fail, Ordering::SeqCst);
     }
+    pub fn set_checkpoint_canonical_failure(&self, fail: bool) {
+        self.checkpoint_canonical_failure
+            .store(fail, Ordering::SeqCst);
+    }
+
     pub fn set_tapp_owner(&self, owner: Address) {
         *self.tapp_owner.lock().unwrap() = Some(owner);
     }
@@ -306,6 +312,7 @@ impl MockChain {
             checkpoint_owner: Mutex::new(None),
             operator_checkpoint_failure: AtomicBool::new(false),
             checkpoint_owner_failure: AtomicBool::new(false),
+            checkpoint_canonical_failure: AtomicBool::new(false),
             tapp_owner: Mutex::new(None),
             tapp_owner_failure: AtomicBool::new(false),
             contract_signature_valid: AtomicBool::new(false),
@@ -464,6 +471,21 @@ impl ChainClient for MockChain {
         );
         Ok(*self.operator_checkpoint.lock().unwrap())
     }
+    async fn is_checkpoint_canonical(
+        &self,
+        checkpoint: &crate::auth::operator::OperatorCheckpoint,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            !self.checkpoint_canonical_failure.load(Ordering::SeqCst),
+            "checkpoint header RPC unavailable"
+        );
+        let hashes = self.checkpoint_hashes.lock().unwrap();
+        let hash = hashes
+            .get(&checkpoint.number)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint header unavailable; node may be behind"))?;
+        Ok(*hash == checkpoint.hash)
+    }
+
     async fn owner_at_checkpoint(
         &self,
         _agent: AgentId,
@@ -473,13 +495,7 @@ impl ChainClient for MockChain {
             !self.checkpoint_owner_failure.load(Ordering::SeqCst),
             "historical ownership RPC unavailable"
         );
-        if self
-            .checkpoint_hashes
-            .lock()
-            .unwrap()
-            .get(&checkpoint.number)
-            != Some(&checkpoint.hash)
-        {
+        if !self.is_checkpoint_canonical(checkpoint).await? {
             return Ok(None);
         }
         Ok(self
@@ -729,6 +745,7 @@ impl SandboxClient for MockSandbox {
 // assert which method was hit.
 
 pub struct ConfigurableSandbox {
+    pub create_delay_ms: AtomicU64,
     /// Authenticated issuer scope is opt-in; no arbitrary-signer acceptance.
     pub authenticated_identity: Mutex<Option<crate::identity::SandboxServiceIdentity>>,
     pub identity_fails: AtomicBool,
@@ -770,6 +787,7 @@ pub struct ConfigurableSandbox {
 impl ConfigurableSandbox {
     pub fn new() -> Self {
         Self {
+            create_delay_ms: AtomicU64::new(0),
             authenticated_identity: Mutex::new(None),
             identity_fails: AtomicBool::new(false),
             attestor_tls: Mutex::new(None),
@@ -863,6 +881,10 @@ impl SandboxClient for ConfigurableSandbox {
         }
         if self.create_fails.load(Ordering::SeqCst) {
             return Err(self.fail_error());
+        }
+        let delay = self.create_delay_ms.load(Ordering::SeqCst);
+        if delay != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         }
         Ok(SandboxCreateResponse {
             id: self.create_id.lock().unwrap().clone(),
@@ -1244,6 +1266,7 @@ impl StorageClient for ConfigurableStorage {
 // stage cleared, ciphertext blanked) without touching Postgres.
 
 pub struct InMemoryDeploymentRepo {
+    operator_transfer_blocks: Mutex<HashMap<AgentId, u64>>,
     pub operator_grants: Mutex<HashMap<SealId, crate::auth::operator::OperatorGrant>>,
     pub operator_teardowns: Mutex<HashSet<(SealId, String)>>,
     operator_transfer_invalidated: Mutex<HashSet<SealId>>,
@@ -1296,6 +1319,74 @@ impl InMemoryDeploymentRepo {
         }
     }
 
+    fn transition_runtime_inner(
+        &self,
+        seal: SealId,
+        expected_sandbox: Option<&str>,
+        expected_generation: Option<i64>,
+        stage: StageStatus,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        stop_completion: bool,
+    ) -> anyhow::Result<bool> {
+        if stop_completion
+            && !matches!(
+                stage,
+                StageStatus::Stopped { .. } | StageStatus::Failed { .. }
+            )
+        {
+            return Ok(false);
+        }
+        let mut rows = self.by_seal.lock().unwrap();
+        let Some(d) = rows.get_mut(&seal) else {
+            return Ok(false);
+        };
+        if d.sandbox_id.as_deref() != expected_sandbox {
+            return Ok(false);
+        }
+        let modern = self.boot_authorizations.lock().unwrap().get(&seal).cloned();
+        let authorized = match (expected_generation, modern) {
+            (None, None) => {
+                (stop_completion || !self.operator_grants.lock().unwrap().contains_key(&seal))
+                    && !self.status_bindings.lock().unwrap().contains_key(&seal)
+            }
+            (Some(expected), Some(boot)) => {
+                boot.generation == expected && (stop_completion || boot.enabled)
+            }
+            (Some(0), None) if stop_completion => {
+                self.status_bindings.lock().unwrap().contains_key(&seal)
+            }
+            _ => false,
+        };
+        if !authorized {
+            return Ok(false);
+        }
+        let provisioned = self.status_bindings.lock().unwrap().contains_key(&seal);
+        if provisioned
+            && matches!(d.container_stage, StageStatus::Confirmed { .. })
+            && matches!(stage, StageStatus::Submitted { .. })
+        {
+            return Ok(true);
+        }
+        let stopped = matches!(
+            stage,
+            StageStatus::Stopped { .. } | StageStatus::Failed { .. }
+        );
+        if stopped {
+            self.revoke_status_boot(seal);
+        }
+        d.container_stage = stage;
+        d.phase = derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+        d.provision_deadline = if stopped || provisioned {
+            None
+        } else {
+            deadline
+        };
+        d.updated_at = chrono::Utc::now();
+        self.set_container_stage_calls
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+
     fn invalidate_transfer(
         &self,
         agent: AgentId,
@@ -1317,10 +1408,8 @@ impl InMemoryDeploymentRepo {
             if grant.version != expected_version {
                 return Ok(false);
             }
-            if let Some(checkpoint) = crate::repo::signed_operator_checkpoint(grant, seal) {
-                if canonical == Some(checkpoint) && event_block <= checkpoint.number {
-                    return Ok(true);
-                }
+            if canonical.is_some_and(|checkpoint| event_block <= checkpoint.number) {
+                return Ok(true);
             }
         }
         let mut invalidated = self.operator_transfer_invalidated.lock().unwrap();
@@ -1447,6 +1536,7 @@ impl InMemoryDeploymentRepo {
 
     pub fn new() -> Self {
         Self {
+            operator_transfer_blocks: Mutex::new(HashMap::new()),
             operator_grants: Mutex::new(HashMap::new()),
             operator_teardowns: Mutex::new(HashSet::new()),
             operator_transfer_invalidated: Mutex::new(HashSet::new()),
@@ -1511,6 +1601,19 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         Ok(self.operator_grants.lock().unwrap().get(&seal).cloned())
     }
 
+    async fn observe_operator_transfer(&self, agent: AgentId, block: u64) -> anyhow::Result<()> {
+        let Some(seal) = self.by_agent.lock().unwrap().get(&agent).copied() else {
+            return Ok(());
+        };
+        let rows = self.by_seal.lock().unwrap();
+        if rows.contains_key(&seal) {
+            let mut blocks = self.operator_transfer_blocks.lock().unwrap();
+            let floor = blocks.entry(agent).or_default();
+            *floor = (*floor).max(block);
+        }
+        Ok(())
+    }
+
     async fn invalidate_operator_for_transfer(
         &self,
         agent: AgentId,
@@ -1565,6 +1668,28 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         let d = rows
             .get_mut(&seal)
             .ok_or_else(|| anyhow::anyhow!("unknown seal"))?;
+        if let Some(agent) = d.agent_id {
+            use base64::Engine as _;
+            let checkpoint = base64::engine::general_purpose::STANDARD
+                .decode(&grant.signed_message_b64)
+                .ok()
+                .and_then(|raw| {
+                    serde_json::from_slice::<crate::auth::operator::OperatorDirective>(&raw).ok()
+                })
+                .and_then(|directive| directive.checkpoint);
+            if checkpoint.is_some_and(|checkpoint| {
+                checkpoint.number
+                    < self
+                        .operator_transfer_blocks
+                        .lock()
+                        .unwrap()
+                        .get(&agent)
+                        .copied()
+                        .unwrap_or(0)
+            }) {
+                return Ok(None);
+            }
+        }
         let mut grants = self.operator_grants.lock().unwrap();
         if grants.get(&seal).map_or(0, |g| g.version) != base_version {
             return Ok(None);
@@ -1719,61 +1844,22 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
     async fn transition_runtime(
         &self,
         seal: SealId,
-        expected_sandbox: Option<&str>,
-        expected_generation: Option<i64>,
+        sandbox: Option<&str>,
+        generation: Option<i64>,
         stage: StageStatus,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<bool> {
-        let mut rows = self.by_seal.lock().unwrap();
-        let Some(d) = rows.get_mut(&seal) else {
-            return Ok(false);
-        };
-        if d.sandbox_id.as_deref() != expected_sandbox {
-            return Ok(false);
-        }
-        let modern = self.boot_authorizations.lock().unwrap().get(&seal).cloned();
-        let authorized = match (expected_generation, modern) {
-            (None, None) => {
-                !self.operator_grants.lock().unwrap().contains_key(&seal)
-                    && !self.status_bindings.lock().unwrap().contains_key(&seal)
-            }
-            (Some(expected), Some(boot)) => {
-                boot.generation == expected
-                    && (matches!(stage, StageStatus::Stopped { .. }) || boot.enabled)
-            }
-            (Some(0), None) if matches!(stage, StageStatus::Stopped { .. }) => {
-                self.status_bindings.lock().unwrap().contains_key(&seal)
-            }
-            _ => false,
-        };
-        if !authorized {
-            return Ok(false);
-        }
-        let provisioned = self.status_bindings.lock().unwrap().contains_key(&seal);
-        if provisioned
-            && matches!(d.container_stage, StageStatus::Confirmed { .. })
-            && matches!(stage, StageStatus::Submitted { .. })
-        {
-            return Ok(true);
-        }
-        let stopped = matches!(
-            stage,
-            StageStatus::Stopped { .. } | StageStatus::Failed { .. }
-        );
-        if stopped {
-            self.revoke_status_boot(seal);
-        }
-        d.container_stage = stage;
-        d.phase = derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
-        d.provision_deadline = if stopped || provisioned {
-            None
-        } else {
-            deadline
-        };
-        d.updated_at = chrono::Utc::now();
-        self.set_container_stage_calls
-            .fetch_add(1, Ordering::SeqCst);
-        Ok(true)
+        self.transition_runtime_inner(seal, sandbox, generation, stage, deadline, false)
+    }
+
+    async fn complete_runtime_stop(
+        &self,
+        seal: SealId,
+        sandbox: Option<&str>,
+        generation: Option<i64>,
+        stage: StageStatus,
+    ) -> anyhow::Result<bool> {
+        self.transition_runtime_inner(seal, sandbox, generation, stage, None, true)
     }
 
     async fn insert(&self, d: &Deployment) -> anyhow::Result<()> {

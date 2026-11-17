@@ -21,6 +21,14 @@ pub trait ChainClient: Send + Sync {
     ) -> anyhow::Result<crate::auth::operator::OperatorCheckpoint> {
         anyhow::bail!("operator chain checkpoints are not implemented")
     }
+    /// Header-only check. An unavailable/missing header remains a dependency
+    /// error; a known canonical header with another hash returns false.
+    async fn is_checkpoint_canonical(
+        &self,
+        _checkpoint: &crate::auth::operator::OperatorCheckpoint,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("checkpoint header reads are not implemented")
+    }
     /// None means the block is absent or no longer canonical. RPC failures
     /// remain errors so callers cannot confuse unavailability with rejection.
     async fn owner_at_checkpoint(
@@ -206,7 +214,9 @@ pub trait SandboxClient: Send + Sync {
     }
     /// Full authenticated issuer scope used by workload attestations. Explicit
     /// mocks must configure it; the default never authorizes an arbitrary key.
-    async fn authenticated_service_identity(&self) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
+    async fn authenticated_service_identity(
+        &self,
+    ) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
         Ok(None)
     }
     /// Current authenticated connection metadata; mock implementations may omit it.
@@ -269,6 +279,10 @@ pub trait DeploymentRepo: Send + Sync {
         _seal_id: SealId,
     ) -> anyhow::Result<Option<crate::auth::operator::OperatorGrant>> {
         Ok(None)
+    }
+
+    async fn observe_operator_transfer(&self, _agent: AgentId, _block: u64) -> anyhow::Result<()> {
+        anyhow::bail!("operator ownership admission fencing is not implemented")
     }
 
     async fn invalidate_operator_for_transfer(
@@ -369,6 +383,18 @@ pub trait DeploymentRepo: Send + Sync {
         _pin: Option<Vec<u8>>,
     ) -> anyhow::Result<bool> {
         anyhow::bail!("runtime sandbox generation binding is not implemented")
+    }
+
+    /// Complete a provider stop without requiring the captured boot to remain
+    /// enabled. Both stopped and failed stop outcomes retain revision fencing.
+    async fn complete_runtime_stop(
+        &self,
+        _seal: SealId,
+        _sandbox: Option<&str>,
+        _generation: Option<i64>,
+        _stage: StageStatus,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("stop completion revision fencing is not implemented")
     }
 
     async fn transition_runtime(

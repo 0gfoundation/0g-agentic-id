@@ -5,8 +5,8 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use alloy::primitives::{Address, Bytes};
 use attestor_shared::auth::operator::{
-    validate_operator_checkpoint, verify_operator_directive, OperatorCheckpoint, OperatorGrant,
-    RuntimeAuthorizationError,
+    checkpoint_acceptance_digest, verify_operator_directive, verify_operator_grant,
+    OperatorCheckpoint, OperatorGrant,
 };
 use attestor_shared::{Deployment, SealId};
 use axum::extract::{Query, State};
@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize)]
 pub struct ReadParams {
     pub seal_id: SealId,
+    /// Fetch a fresh signing anchor only when preparing a grant mutation.
+    #[serde(default)]
+    pub checkpoint: bool,
 }
 
 #[derive(Deserialize)]
@@ -48,7 +51,7 @@ async fn load(state: &AppState, seal_id: SealId) -> ApiResult<(Deployment, Addre
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
     let owner = attestor_shared::auth::operator::live_owner(state.chain.as_ref(), &deployment)
         .await
-        .map_err(|e| ApiError::internal(format!("owner_of: {e}")))?;
+        .map_err(|e| ApiError::unavailable(format!("owner_of: {e}")))?;
     Ok((deployment, owner))
 }
 
@@ -57,16 +60,17 @@ pub async fn handle_get(
     Query(query): Query<ReadParams>,
 ) -> ApiResult<Json<OperatorSummary>> {
     let (deployment, owner) = load(&state, query.seal_id).await?;
-    let checkpoint =
-        if deployment.agent_id.is_some() {
-            Some(
-                state.chain.operator_checkpoint().await.map_err(|error| {
-                    ApiError::unavailable(format!("operator checkpoint: {error}"))
-                })?,
-            )
-        } else {
-            None
-        };
+    let checkpoint = if query.checkpoint && deployment.agent_id.is_some() {
+        Some(
+            state
+                .chain
+                .operator_checkpoint()
+                .await
+                .map_err(|error| checkpoint_unavailable(error))?,
+        )
+    } else {
+        None
+    };
     let grant = state.deployments.operator_grant(query.seal_id).await?;
     let mut summary = OperatorSummary {
         seal_id: query.seal_id,
@@ -87,28 +91,14 @@ pub async fn handle_get(
         if grant.owner != owner {
             return Ok(Json(summary));
         }
-        if let Ok(directive) = verify_operator_directive(
-            &grant.signed_message_b64,
-            grant.signature.as_ref(),
+        if let Ok(directive) = verify_operator_grant(
+            &grant,
             owner,
             state.cfg.chain_id,
             state.cfg.agentic_id_addr,
             query.seal_id,
             state.crypto.as_ref(),
         ) {
-            match validate_operator_checkpoint(
-                state.chain.as_ref(),
-                deployment.agent_id.unwrap(),
-                &directive,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(RuntimeAuthorizationError::Denied(_)) => return Ok(Json(summary)),
-                Err(error) => {
-                    return Err(super::lifecycle_auth::runtime_authorization_error(error))
-                }
-            }
             if directive.base_version.checked_add(1) == Some(grant.version) {
                 summary.expires_at = directive.expires_at;
                 if directive.expires_at == 0 || directive.expires_at > Utc::now().timestamp() {
@@ -120,6 +110,12 @@ pub async fn handle_get(
         }
     }
     Ok(Json(summary))
+}
+
+fn checkpoint_unavailable(error: anyhow::Error) -> ApiError {
+    let mut error = ApiError::unavailable(format!("operator checkpoint: {error}"));
+    error.code = "operator_checkpoint_unavailable";
+    error
 }
 
 pub async fn handle_set(
@@ -140,14 +136,21 @@ pub async fn handle_set(
         state.crypto.as_ref(),
     )
     .map_err(|e| ApiError::unauthorized(format!("operator authorization: {e}")))?;
-    if directive.checkpoint.is_none() {
+    let Some(checkpoint) = directive.checkpoint.as_ref() else {
         return Err(ApiError::bad_request(
             "operator directive must include a chain checkpoint",
         ));
-    }
-    validate_operator_checkpoint(state.chain.as_ref(), agent, &directive)
+    };
+    let checkpoint_owner = state
+        .chain
+        .owner_at_checkpoint(agent, checkpoint)
         .await
-        .map_err(super::lifecycle_auth::runtime_authorization_error)?;
+        .map_err(checkpoint_unavailable)?;
+    if checkpoint_owner != Some(owner) {
+        return Err(ApiError::unauthorized(
+            "operator checkpoint is not canonical or names a different owner",
+        ));
+    }
     let now = Utc::now().timestamp();
     if now.abs_diff(directive.issued_at) > 300 {
         return Err(ApiError::unauthorized(
@@ -174,12 +177,25 @@ pub async fn handle_set(
             "revocation requires allow_recreate=false and expires_at=0",
         ));
     }
-    let grant = OperatorGrant {
+    // The historical RPC can take long enough for ownership to change. This
+    // fresh read supplements the repository's indexed-transfer height fence.
+    let current_owner =
+        attestor_shared::auth::operator::live_owner(state.chain.as_ref(), &deployment)
+            .await
+            .map_err(|error| ApiError::unavailable(format!("owner_of: {error}")))?;
+    if current_owner != owner {
+        return Err(ApiError::conflict(
+            "agent owner changed during authorization; fetch a new operator checkpoint and sign again",
+        ));
+    }
+    let mut grant = OperatorGrant {
         version: directive.base_version + 1,
         owner,
         signed_message_b64: request.signed_message_b64,
         signature: request.signature,
+        checkpoint_acceptance: None,
     };
+    grant.checkpoint_acceptance = Some(checkpoint_acceptance_digest(&grant)?);
     let Some(update) = state
         .deployments
         .compare_and_swap_operator(request.seal_id, directive.base_version, grant)
@@ -219,6 +235,7 @@ mod tests {
     use super::*;
     use alloy::primitives::B256;
     use alloy::signers::{local::PrivateKeySigner, SignerSync};
+    use attestor_shared::auth::operator::RuntimeAuthorizationError;
     use attestor_shared::crypto::RealCrypto;
     use attestor_shared::mocks::{
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
@@ -245,6 +262,7 @@ mod tests {
         balance_queries: Mutex<Vec<Address>>,
         acknowledgement_queries: Mutex<Vec<Address>>,
         owner_rpc_fails: AtomicBool,
+        owner_after_checkpoint: Mutex<Option<Address>>,
     }
 
     #[async_trait::async_trait]
@@ -273,7 +291,17 @@ mod tests {
             id: AgentId,
             checkpoint: &OperatorCheckpoint,
         ) -> anyhow::Result<Option<Address>> {
-            self.inner.owner_at_checkpoint(id, checkpoint).await
+            let owner = self.inner.owner_at_checkpoint(id, checkpoint).await?;
+            if let Some(next_owner) = self.owner_after_checkpoint.lock().unwrap().take() {
+                self.inner.set_owner_of(next_owner);
+            }
+            Ok(owner)
+        }
+        async fn is_checkpoint_canonical(
+            &self,
+            checkpoint: &OperatorCheckpoint,
+        ) -> anyhow::Result<bool> {
+            self.inner.is_checkpoint_canonical(checkpoint).await
         }
         async fn is_valid_framework_hash(&self, hash: ImageHash) -> anyhow::Result<bool> {
             self.inner.is_valid_framework_hash(hash).await
@@ -346,6 +374,7 @@ mod tests {
             balance_queries: Mutex::new(Vec::new()),
             acknowledgement_queries: Mutex::new(Vec::new()),
             owner_rpc_fails: AtomicBool::new(false),
+            owner_after_checkpoint: Mutex::new(None),
         });
         s.state.cfg.tapp_registry_addr = Address::repeat_byte(1);
         s.state.cfg.app_id = Some("attestor".into());
@@ -583,7 +612,10 @@ mod tests {
         assert_eq!(summary.version, 1);
         let summary = handle_get(
             State(s.state.clone()),
-            Query(ReadParams { seal_id: s.seal_id }),
+            Query(ReadParams {
+                seal_id: s.seal_id,
+                checkpoint: false,
+            }),
         )
         .await
         .unwrap()
@@ -602,7 +634,10 @@ mod tests {
         assert_eq!(revoked.operator, None);
         let summary = handle_get(
             State(s.state.clone()),
-            Query(ReadParams { seal_id: s.seal_id }),
+            Query(ReadParams {
+                seal_id: s.seal_id,
+                checkpoint: false,
+            }),
         )
         .await
         .unwrap()
@@ -620,7 +655,10 @@ mod tests {
         s.chain.set_owner_of(Address::ZERO);
         let summary = handle_get(
             State(s.state.clone()),
-            Query(ReadParams { seal_id: s.seal_id }),
+            Query(ReadParams {
+                seal_id: s.seal_id,
+                checkpoint: false,
+            }),
         )
         .await
         .unwrap()
@@ -653,7 +691,10 @@ mod tests {
         let s = setup();
         let summary = handle_get(
             State(s.state.clone()),
-            Query(ReadParams { seal_id: s.seal_id }),
+            Query(ReadParams {
+                seal_id: s.seal_id,
+                checkpoint: true,
+            }),
         )
         .await
         .unwrap()
@@ -701,7 +742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grant_checkpoint_reorg_is_rejected_by_reads_and_runtime_authorization() {
+    async fn routing_summary_does_not_replace_runtime_canonical_validation() {
         let s = setup();
         appoint(&s, 0, false).await;
         s.chain.set_operator_checkpoint(OperatorCheckpoint {
@@ -710,12 +751,16 @@ mod tests {
         });
         let summary = handle_get(
             State(s.state.clone()),
-            Query(ReadParams { seal_id: s.seal_id }),
+            Query(ReadParams {
+                seal_id: s.seal_id,
+                checkpoint: false,
+            }),
         )
         .await
         .unwrap()
         .0;
-        assert_eq!(summary.operator, None);
+        assert_eq!(summary.operator, Some(s.operator));
+        assert_eq!(summary.checkpoint, None);
         assert_eq!(summary.version, 1);
         let error =
             super::super::start::handle(State(s.state.clone()), Json(lifecycle(&s, "create", 1)))
@@ -726,15 +771,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_rpc_failure_is_not_mistaken_for_an_invalid_grant() {
+    async fn historical_state_pruning_does_not_disable_an_accepted_grant() {
         let s = setup();
         appoint(&s, 0, false).await;
         s.chain.set_checkpoint_owner_failure(true);
-        let error =
+        s.chain.set_operator_checkpoint_failure(true);
+        let summary = handle_get(
+            State(s.state.clone()),
+            Query(ReadParams {
+                seal_id: s.seal_id,
+                checkpoint: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(summary.operator, Some(s.operator));
+        let (status, _) =
             super::super::start::handle(State(s.state.clone()), Json(lifecycle(&s, "create", 1)))
                 .await
-                .unwrap_err();
+                .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let error = handle_get(
+            State(s.state.clone()),
+            Query(ReadParams {
+                seal_id: s.seal_id,
+                checkpoint: true,
+            }),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "operator_checkpoint_unavailable");
         let error = handle_set(
             State(s.state.clone()),
             Json(request(&s, &OWNER_KEY, &directive(&s, 1, None, false))),
@@ -742,6 +810,189 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(s.jobs.submitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metadata_without_a_grant_does_not_require_checkpoint_services() {
+        let s = setup();
+        s.chain.set_operator_checkpoint_failure(true);
+        s.chain.set_checkpoint_owner_failure(true);
+        s.chain.set_checkpoint_canonical_failure(true);
+        let summary = handle_get(
+            State(s.state.clone()),
+            Query(ReadParams {
+                seal_id: s.seal_id,
+                checkpoint: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(summary.owner, s.owner);
+        assert_eq!(summary.operator, None);
+        assert_eq!(summary.checkpoint, None);
+        assert_eq!(summary.version, 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_checkpoint_headers_block_execution_but_not_routing_metadata() {
+        let s = setup();
+        appoint(&s, 0, false).await;
+        s.chain.set_checkpoint_canonical_failure(true);
+        let summary = handle_get(
+            State(s.state.clone()),
+            Query(ReadParams {
+                seal_id: s.seal_id,
+                checkpoint: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(summary.operator, Some(s.operator));
+        let error =
+            super::super::start::handle(State(s.state.clone()), Json(lifecycle(&s, "create", 1)))
+                .await
+                .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_or_mismatched_admission_cache_requires_a_fresh_owner_grant() {
+        let s = setup();
+        appoint(&s, 0, false).await;
+        let accepted = s
+            .deployments
+            .operator_grant(s.seal_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accepted.checkpoint_acceptance,
+            Some(checkpoint_acceptance_digest(&accepted).unwrap())
+        );
+        let mut changed_proof = accepted.clone();
+        let (proof, signature) =
+            signed_value(&OWNER_KEY, &directive(&s, 0, Some(s.operator), true));
+        changed_proof.signed_message_b64 = proof;
+        changed_proof.signature = signature;
+        let mut missing = accepted.clone();
+        missing.checkpoint_acceptance = None;
+        for grant in [missing, changed_proof] {
+            s.deployments
+                .operator_grants
+                .lock()
+                .unwrap()
+                .insert(s.seal_id, grant);
+            let summary = handle_get(
+                State(s.state.clone()),
+                Query(ReadParams {
+                    seal_id: s.seal_id,
+                    checkpoint: false,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(summary.operator, None);
+            assert_eq!(summary.version, 1);
+            let error = super::super::start::handle(
+                State(s.state.clone()),
+                Json(lifecycle(&s, "create", 1)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        }
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+        let renewed = appoint(&s, 1, false).await;
+        assert_eq!(renewed.operator, Some(s.operator));
+        assert_eq!(renewed.version, 2);
+    }
+
+    #[tokio::test]
+    async fn failed_historical_admission_never_creates_an_accepted_grant() {
+        let s = setup();
+        s.chain.set_checkpoint_owner_failure(true);
+        let error = handle_set(
+            State(s.state.clone()),
+            Json(request(
+                &s,
+                &OWNER_KEY,
+                &directive(&s, 0, Some(s.operator), false),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(s
+            .deployments
+            .operator_grant(s.seal_id)
+            .await
+            .unwrap()
+            .is_none());
+        s.chain.set_checkpoint_owner_failure(false);
+        s.chain
+            .set_checkpoint_owner(Some(Address::repeat_byte(0x99)));
+        let error = handle_set(
+            State(s.state.clone()),
+            Json(request(
+                &s,
+                &OWNER_KEY,
+                &directive(&s, 0, Some(s.operator), false),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(s
+            .deployments
+            .operator_grant(s.seal_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn ownership_change_during_historical_verification_prevents_grant_commit() {
+        let mut s = setup();
+        let owner = s.owner;
+        let chain = enable_payer_checks(&mut s, owner);
+        let buyer = Address::repeat_byte(0x99);
+        *chain.owner_after_checkpoint.lock().unwrap() = Some(buyer);
+        let error = handle_set(
+            State(s.state.clone()),
+            Json(request(
+                &s,
+                &OWNER_KEY,
+                &directive(&s, 0, Some(s.operator), false),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("owner changed"));
+        assert_eq!(
+            s.chain
+                .owner_of(alloy::primitives::U256::from(1))
+                .await
+                .unwrap(),
+            buyer
+        );
+        assert!(s
+            .deployments
+            .operator_grant(s.seal_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(s
+            .deployments
+            .boot_authorization(s.seal_id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(s.jobs.submitted.lock().unwrap().is_empty());
     }
 
@@ -778,6 +1029,22 @@ mod tests {
         .await
         .unwrap();
         s.chain.set_checkpoint_owner(None);
+        s.chain.set_checkpoint_owner_failure(true);
+        revalidate_runtime_principal(
+            s.chain.as_ref(),
+            s.state.crypto.as_ref(),
+            s.deployments.as_ref(),
+            s.state.cfg.chain_id,
+            s.state.cfg.agentic_id_addr,
+            &deployment,
+            &principal,
+        )
+        .await
+        .unwrap();
+        s.chain.set_operator_checkpoint(OperatorCheckpoint {
+            number: 1,
+            hash: B256::repeat_byte(2),
+        });
         let error = revalidate_runtime_principal(
             s.chain.as_ref(),
             s.state.crypto.as_ref(),
@@ -799,6 +1066,23 @@ mod tests {
         let operator = s.operator;
         let chain = enable_payer_checks(&mut s, operator);
         chain.owner_rpc_fails.store(true, Ordering::SeqCst);
+        let error = handle_get(
+            State(s.state.clone()),
+            Query(ReadParams {
+                seal_id: s.seal_id,
+                checkpoint: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        let error = handle_set(
+            State(s.state.clone()),
+            Json(request(&s, &OWNER_KEY, &directive(&s, 1, None, false))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         let error =
             super::super::start::handle(State(s.state.clone()), Json(lifecycle(&s, "create", 1)))
                 .await
@@ -920,7 +1204,10 @@ mod tests {
         s.chain.set_owner_of(buyer);
         let summary = handle_get(
             State(s.state.clone()),
-            Query(ReadParams { seal_id: s.seal_id }),
+            Query(ReadParams {
+                seal_id: s.seal_id,
+                checkpoint: false,
+            }),
         )
         .await
         .unwrap()

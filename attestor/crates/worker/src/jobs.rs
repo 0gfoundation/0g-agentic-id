@@ -668,7 +668,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     tracing::warn!(?seal_id, error = %e, "sandbox.stop failed; flipping c=Failed");
                     if !ctx
                         .deployments
-                        .transition_runtime(
+                        .complete_runtime_stop(
                             seal_id,
                             sandbox_id.as_deref(),
                             generation,
@@ -676,7 +676,6 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                                 at: now,
                                 reason: reason.clone(),
                             },
-                            None,
                         )
                         .await?
                     {
@@ -700,7 +699,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             .to_string();
             if !ctx
                 .deployments
-                .transition_runtime(
+                .complete_runtime_stop(
                     seal_id,
                     sandbox_id.as_deref(),
                     generation,
@@ -708,7 +707,6 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                         at: now,
                         reason: reason.clone(),
                     },
-                    None,
                 )
                 .await?
             {
@@ -2974,6 +2972,7 @@ mod tests {
                     owner: d.owner,
                     signed_message_b64: proof.signed_message_b64,
                     signature: proof.wallet_signature,
+                    checkpoint_acceptance: None,
                 },
             )
             .await
@@ -3093,6 +3092,44 @@ mod tests {
             .unwrap()
             .sandbox_id
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn operator_grant_expiring_during_create_retires_the_unbound_sandbox() {
+        let (t, _, operator) = operator_fixture().await;
+        let seal = dummy_seal();
+        install_operator(&t, 1, Some(operator), false, Utc::now().timestamp() + 2).await;
+        t.sandbox.create_delay_ms.store(2050, Ordering::SeqCst);
+        let error = run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: seal,
+                sandbox_envelope: operator_envelope(&t, "create", "", 2),
+            },
+        )
+        .await
+        .expect_err("the owner grant expires while create is in flight");
+        assert!(
+            error.to_string().contains("persist new sandbox ID"),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("expired"), "{error:#}");
+        assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 1);
+        let deployment = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(deployment.sandbox_id.is_none());
+        assert!(matches!(
+            deployment.container_stage,
+            StageStatus::Failed { .. }
+        ));
+        assert!(
+            !t.deployments
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
     }
 
     #[tokio::test]
@@ -6057,6 +6094,101 @@ mod tests {
             );
             assert!(t.events.events.lock().unwrap().iter().any(|event|
                 matches!(event, WsEvent::ContainerStopped { seal_id, .. } if *seal_id == seal)));
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_stop_fatal_refusal_records_failure_for_disabled_and_legacy_boots() {
+        for legacy in [false, true] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_confirmed_deployment(&t, seal, 105, "sb-old-boot").await;
+            if legacy {
+                t.deployments
+                    .boot_authorizations
+                    .lock()
+                    .unwrap()
+                    .remove(&seal);
+                t.deployments
+                    .status_bindings
+                    .lock()
+                    .unwrap()
+                    .insert(seal, [9; 32]);
+            } else {
+                t.deployments
+                    .set_container_stage(
+                        seal,
+                        StageStatus::Failed {
+                            at: Utc::now(),
+                            reason: "old boot could not provision".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            t.sandbox.stop_fails.store(true, Ordering::SeqCst);
+            *t.sandbox.fail_status.lock().unwrap() = Some(400);
+            *t.sandbox.fail_msg.lock().unwrap() = Some("permanent provider refusal".into());
+            set_provider_state(&t, Some("started"), Some("started"));
+            run_stop(&t, seal)
+                .await
+                .expect_err("fatal provider refusal remains a failed job");
+            let deployment = t.deployments.get(seal).await.unwrap().unwrap();
+            assert!(
+                matches!(deployment.container_stage,
+                StageStatus::Failed { ref reason, .. } if reason.contains("permanent provider refusal")),
+                "legacy={legacy}: {:?}",
+                deployment.container_stage
+            );
+            assert!(emitted_container_failed(&t));
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_stop_records_outcomes_without_a_boot_despite_grant_history() {
+        for fatal in [false, true] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_confirmed_deployment(&t, seal, 105, "sb-owner-legacy").await;
+            t.deployments
+                .boot_authorizations
+                .lock()
+                .unwrap()
+                .remove(&seal);
+            t.deployments.status_bindings.lock().unwrap().remove(&seal);
+            t.deployments.operator_grants.lock().unwrap().insert(
+                seal,
+                attestor_shared::auth::operator::OperatorGrant {
+                    version: 1,
+                    owner: Address::ZERO,
+                    signed_message_b64: String::new(),
+                    signature: Bytes::new(),
+                    checkpoint_acceptance: None,
+                },
+            );
+            if fatal {
+                t.sandbox.stop_fails.store(true, Ordering::SeqCst);
+                *t.sandbox.fail_status.lock().unwrap() = Some(400);
+                *t.sandbox.fail_msg.lock().unwrap() = Some("permanent provider refusal".into());
+                set_provider_state(&t, Some("started"), Some("started"));
+            }
+            let outcome = run_stop(&t, seal).await;
+            assert_eq!(outcome.is_err(), fatal);
+            let deployment = t.deployments.get(seal).await.unwrap().unwrap();
+            if fatal {
+                assert!(matches!(
+                    deployment.container_stage,
+                    StageStatus::Failed { .. }
+                ));
+                assert!(emitted_container_failed(&t));
+            } else {
+                assert!(matches!(
+                    deployment.container_stage,
+                    StageStatus::Stopped { .. }
+                ));
+                assert!(t.events.events.lock().unwrap().iter().any(|event|
+                    matches!(event, WsEvent::ContainerStopped { seal_id, .. } if *seal_id == seal)));
+            }
         }
     }
 

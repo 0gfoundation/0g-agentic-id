@@ -9,7 +9,7 @@ export interface OperatorCheckpoint {
   hash: Hash;
 }
 
-/** Public operator authorization information, resolved against live ownership. */
+/** Public operator routing metadata; the attestor authorizes runtime requests independently. */
 export interface OperatorState {
   sealId: Hash;
   owner: Address;
@@ -18,7 +18,7 @@ export interface OperatorState {
   allowRecreate: boolean;
   /** Unix seconds; 0 means until replaced or revoked. */
   expiresAt: number;
-  /** Null before mint or on an attestor that cannot anchor a new grant. */
+  /** Normally null. Grant writes separately request a fresh ownership checkpoint before signing. */
   checkpoint: OperatorCheckpoint | null;
 }
 

@@ -270,9 +270,14 @@ where
     let block = provider
         .get_block_by_number(BlockNumberOrTag::Number(checkpoint.number), false)
         .await?;
-    Ok(block.is_some_and(|block| {
-        block.header.hash == checkpoint.hash && block.header.number == checkpoint.number
-    }))
+    let block = block.ok_or_else(|| {
+        anyhow::anyhow!("operator checkpoint header unavailable; node may be behind")
+    })?;
+    anyhow::ensure!(
+        block.header.number == checkpoint.number,
+        "RPC returned a different checkpoint height"
+    );
+    Ok(block.header.hash == checkpoint.hash)
 }
 
 /// Real chain client backed by alloy. Generic over Transport and Provider.
@@ -582,6 +587,13 @@ where
             number: block.header.number,
             hash: block.header.hash,
         })
+    }
+
+    async fn is_checkpoint_canonical(
+        &self,
+        checkpoint: &OperatorCheckpoint,
+    ) -> anyhow::Result<bool> {
+        operator_checkpoint_is_canonical(&self.provider, checkpoint).await
     }
 
     async fn owner_at_checkpoint(
@@ -1144,25 +1156,32 @@ mod tests {
             number: 123,
             hash: B256::repeat_byte(0x74),
         };
-        for answer in [
-            checkpoint_block(OperatorCheckpoint {
-                number: checkpoint.number,
-                hash: B256::repeat_byte(0x75),
-            }),
-            checkpoint_block(OperatorCheckpoint {
-                number: 124,
-                hash: checkpoint.hash,
-            }),
-            serde_json::json!({"result":null}),
+        for (answer, unavailable) in [
+            (
+                checkpoint_block(OperatorCheckpoint {
+                    number: checkpoint.number,
+                    hash: B256::repeat_byte(0x75),
+                }),
+                false,
+            ),
+            (
+                checkpoint_block(OperatorCheckpoint {
+                    number: 124,
+                    hash: checkpoint.hash,
+                }),
+                true,
+            ),
+            (serde_json::json!({"result":null}), true),
         ] {
             let (url, served, requests, server) = jsonrpc_peer_with_requests(vec![answer]).await;
-            assert_eq!(
-                chain_at(url)
-                    .owner_at_checkpoint(U256::from(7), &checkpoint)
-                    .await
-                    .unwrap(),
-                None
-            );
+            let result = chain_at(url)
+                .owner_at_checkpoint(U256::from(7), &checkpoint)
+                .await;
+            if unavailable {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), None);
+            }
             server.await.unwrap();
             assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
             assert_eq!(

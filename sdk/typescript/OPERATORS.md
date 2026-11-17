@@ -59,12 +59,13 @@ model-key storage and settings-seeding behavior.
 
 ## Grant scope and updates
 
-`getOperator(sealId)` is public. It returns `owner`, effective `operator`,
-`version`, `expiresAt`, `allowRecreate` and an end-of-block `checkpoint` containing
-the block number and hash. Expired or transferred grants have `operator: null`.
-Before mint, GET returns the deployment owner with no operator and
-`checkpoint: null`; existing owner stop/reset/retry requests remain available,
-but operator grant writes require a minted agent and a checkpoint.
+`getOperator(sealId)` returns public routing metadata: `owner`, `operator`,
+`version`, `expiresAt`, `allowRecreate` and normally `checkpoint: null`. This
+ordinary read does not request a fresh block anchor or historical owner; it is
+not proof that a runtime request will be authorized. The API and worker verify
+authority independently. Before mint, it reports the deployment owner with no
+operator; existing owner stop/reset/retry requests remain available, but operator
+grant writes require a minted agent.
 
 ```ts
 const grant = await owner.agent.getOperator(sealId);
@@ -90,11 +91,25 @@ requests do not become valid again when the same wallet is reappointed.
 Authorization is checked again before execution; an operation already sent to the
 provider may still complete.
 
-The owner signs the exact checkpoint returned by GET when updating or revoking a
-grant. The SDK rejects unsafe JavaScript block numbers, malformed hashes and a
-missing checkpoint rather than inventing one. This requires an RPC that can
-return canonical block hashes and historical owners. A delayed indexer event in
-block `H` or earlier does not erase a grant anchored to the end of block `H`.
+Only set/revoke request `GET /operator?seal_id=...&checkpoint=true` for the current
+version and a fresh end-of-block checkpoint. The owner signs that exact block
+number and hash. The SDK rejects unsafe JavaScript block numbers, malformed hashes
+and missing checkpoints rather than inventing one. A successful write then
+re-reads ordinary metadata: one anchor GET, one PUT and one metadata GET, with no
+automatic retry or re-signing if the anchor is unavailable.
+
+Grant writes require an RPC able to read the anchor's historical owner before
+that state is pruned. The attestor records acceptance bound to the signed proof,
+signature and grant version. Later execution checks that acceptance, the anchor's
+canonical header, live owner and current grant; it does not repeat the historical
+owner query, so long-running grants do not require an archive RPC. This stored
+acceptance is an admission fact, not an additional cryptographic proof. An older
+anchored grant without it requires the owner to sign a new grant once; no
+acceptance is inferred from the existing signature alone.
+
+New anchors use the latest block, not a delayed confirmed block. Missing headers
+or an RPC lag return HTTP 503; a hash mismatch rejects the grant. A delayed indexer
+event in block `H` or earlier does not erase a grant anchored to the end of `H`.
 An indexed ownership transfer after `H` invalidates it. Revoking a transfer away
 and back to the same wallet depends on the indexer catching up; live owner checks
 alone cannot detect that round trip. Older stored proofs without a signed checkpoint are treated
@@ -121,6 +136,9 @@ channel.
 
 When an accepted create finishes, the worker rechecks its owner, grant and boot
 generation. Expiry of the original request envelope alone does not discard it.
+The grant's own `expiresAt` remains a permission boundary: if it expires during
+create, the result cannot be bound to the agent. The worker never extends it to
+finish an operation.
 
 This feature adds authorization, not an idle scheduler or an always-on wake
 gateway. Stop keeps its existing semantics: it does not add a final state flush

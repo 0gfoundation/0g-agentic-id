@@ -19,9 +19,10 @@ async function server(t, initial = {}) {
     owner: OWNER.address, operator: OPERATOR.address, version: 4, allow_recreate: false,
     expires_at: 0, sandbox_id: null, sandbox_controller: null, checkpoint: CHECKPOINT, ...initial,
   };
-  const puts = [], posts = [], signed = [], reads = [];
+  const puts = [], posts = [], signed = [], reads = [], operatorReads = [];
   let putStatus = 200;
   let getStatus = 200;
+  let checkpointStatus = 200;
   let lifecycleStatus = 202;
   const http = createServer((req, res) => {
     const chunks = [];
@@ -33,8 +34,13 @@ async function server(t, initial = {}) {
         res.writeHead(code, { 'content-type': 'application/json' });
         res.end(JSON.stringify(value));
       };
-      if (req.method === 'GET' && url.pathname === '/operator') return getStatus === 200
-        ? json(200, state) : json(getStatus, { error: 'operator lookup unavailable' });
+      if (req.method === 'GET' && url.pathname === '/operator') {
+        const checkpoint = url.searchParams.get('checkpoint');
+        operatorReads.push(checkpoint);
+        const status = checkpoint === 'true' ? checkpointStatus : getStatus;
+        return status === 200 ? json(200, { ...state, checkpoint: checkpoint === 'true' ? state.checkpoint : null })
+          : json(status, { code: 'operator_checkpoint_unavailable', error: 'operator lookup unavailable' });
+      }
       if (req.method === 'PUT' && url.pathname === '/operator') {
         const body = JSON.parse(Buffer.concat(chunks).toString());
         puts.push(body);
@@ -77,8 +83,9 @@ async function server(t, initial = {}) {
       throw new Error(`unexpected chain call ${functionName}`);
     } },
   });
-  return { state, puts, posts, signed, reads, base, client: (account) => new AttestorClient(ctx(account)),
+  return { state, puts, posts, signed, reads, operatorReads, base, client: (account) => new AttestorClient(ctx(account)),
     failPut: (code) => { putStatus = code; }, failGet: (code) => { getStatus = code; },
+    failCheckpoint: (code) => { checkpointStatus = code; },
     failLifecycle: (code) => { lifecycleStatus = code; } };
 }
 
@@ -112,6 +119,9 @@ test('owner appoints and revokes an operator with domain-separated CAS signature
   assert.equal(revoke.expires_at, 0);
   assert.deepEqual(revoke.checkpoint, CHECKPOINT);
   assert.equal(revoked.operator, null);
+  assert.deepEqual(f.operatorReads, ['true', null, 'true', null], 'each write has one anchor read and one metadata re-read');
+  assert.equal(updated.checkpoint, null);
+  assert.equal(revoked.checkpoint, null);
 });
 
 test('an operator cannot appoint itself; invalid grants and stale writes never silently retry', async (t) => {
@@ -154,6 +164,23 @@ test('unsafe checkpoint numbers and malformed block hashes are rejected before s
   }
   assert.equal(f.signed.length, 0);
   assert.equal(f.puts.length, 0);
+});
+
+test('checkpoint outages refuse grant writes before signing but do not block ordinary lifecycle metadata', async (t) => {
+  const f = await server(t, { sandbox_id: 'current-runtime', settings_version: 1 });
+  f.failCheckpoint(503);
+  for (const account of [OWNER, OPERATOR]) {
+    const client = f.client(account);
+    assert.equal((await client.getOperator(SEAL)).checkpoint, null);
+    await client.lifecycle('stop', { sealId: SEAL, sandboxId: 'current-runtime' });
+  }
+  assert.deepEqual(f.operatorReads, [null, null, null, null]);
+  const signatures = f.signed.length;
+  await assert.rejects(f.client(OWNER).setOperator(SEAL, OPERATOR.address), /HTTP 503.*operator_checkpoint_unavailable/);
+  await assert.rejects(f.client(OWNER).revokeOperator(SEAL), /HTTP 503.*operator_checkpoint_unavailable/);
+  assert.equal(f.signed.length, signatures);
+  assert.equal(f.puts.length, 0);
+  assert.deepEqual(f.operatorReads, [null, null, null, null, 'true', 'true'], 'no retry or metadata fallback for a failed anchor read');
 });
 
 test('operator pays under its signature while boot authority stays bound to the NFT owner', async (t) => {
@@ -238,7 +265,7 @@ test('owner pre-mint stop, reset and retry accept a non-delegated summary withou
 test('owner compatibility only tolerates an absent operator endpoint, not arbitrary lookup errors', async (t) => {
   const f = await server(t, { operator: null, settings_version: 1 });
   const c = f.client(OWNER);
-  for (const code of [400, 500]) {
+  for (const code of [400, 500, 503]) {
     f.failGet(code);
     await assert.rejects(c.lifecycle('stop', { sealId: SEAL, sandboxId: 'sandbox' }), /operator failed/);
   }
@@ -260,6 +287,7 @@ test('each lifecycle call reads authority and deployment once, without caching a
       await ag.agent[action](SEAL);
       assert.equal(f.reads.filter((p) => p === '/operator').length, 2, `${action}: re-read authority on next call`);
       assert.equal(f.reads.filter((p) => p.startsWith('/deployment/')).length, 2, `${action}: re-read deployment on next call`);
+      assert.deepEqual(f.operatorReads, [null, null], `${action}: lifecycle never requests a new ownership checkpoint`);
     }
   }
 });

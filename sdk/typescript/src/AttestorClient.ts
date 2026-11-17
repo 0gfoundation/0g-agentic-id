@@ -473,9 +473,13 @@ export class AttestorClient {
     };
   }
 
-  /** Public summary; the attestor resolves the current NFT owner live. */
+  /** Public routing metadata; runtime requests are independently authorized by the attestor. */
   async getOperator(sealId: `0x${string}`): Promise<OperatorState> {
-    const res = await fetch(`${this.baseUrl()}/operator?seal_id=${encodeURIComponent(sealId)}`, {
+    return this.fetchOperator(sealId);
+  }
+
+  private async fetchOperator(sealId: `0x${string}`, checkpoint = false): Promise<OperatorState> {
+    const res = await fetch(`${this.baseUrl()}/operator?seal_id=${encodeURIComponent(sealId)}${checkpoint ? '&checkpoint=true' : ''}`, {
       signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) {
@@ -488,20 +492,20 @@ export class AttestorClient {
       expires_at: number;
       checkpoint?: { number?: unknown; hash?: unknown } | null;
     };
-    const checkpoint = body.checkpoint;
+    const anchor = body.checkpoint;
     if (!isAddress(body.owner) || (body.operator !== null && !isAddress(body.operator)) ||
         !Number.isSafeInteger(body.version) || body.version < 0 ||
         !Number.isSafeInteger(body.expires_at) || body.expires_at < 0 ||
         typeof body.allow_recreate !== 'boolean' ||
-        (checkpoint != null && (!Number.isSafeInteger(checkpoint.number) || Number(checkpoint.number) < 0 ||
-          typeof checkpoint.hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(checkpoint.hash)))) {
+        (anchor != null && (!Number.isSafeInteger(anchor.number) || Number(anchor.number) < 0 ||
+          typeof anchor.hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(anchor.hash)))) {
       throw new Error('/operator returned an invalid authorization summary');
     }
     return {
       sealId, owner: getAddress(body.owner), operator: body.operator === null ? null : getAddress(body.operator),
       version: body.version, allowRecreate: body.allow_recreate, expiresAt: body.expires_at,
-      checkpoint: checkpoint == null ? null : {
-        number: checkpoint.number as number, hash: checkpoint.hash as `0x${string}`,
+      checkpoint: anchor == null ? null : {
+        number: anchor.number as number, hash: anchor.hash as `0x${string}`,
       },
     };
   }
@@ -519,7 +523,7 @@ export class AttestorClient {
 
   private async writeOperator(sealId: `0x${string}`, operator: Address | null, opts: OperatorOptions): Promise<OperatorState> {
     const { account, walletClient } = requireWallet(this.ctx);
-    const current = await this.getOperator(sealId);
+    const current = await this.fetchOperator(sealId, true);
     if (getAddress(account.address) !== current.owner) throw new Error('operator authorization requires the current NFT owner');
     if (!current.checkpoint) {
       throw new Error('operator authorization requires a minted agent and an ownership checkpoint from the attestor');
@@ -555,7 +559,7 @@ export class AttestorClient {
       if (res.status === 409) throw new OperatorConflictError(sealId, base, text);
       throw new Error(`/operator failed: HTTP ${res.status} ${text}`);
     }
-    // Re-read the effective grant and runtime routing after the write.
+    // Re-read public routing metadata after the write.
     return this.getOperator(sealId);
   }
 

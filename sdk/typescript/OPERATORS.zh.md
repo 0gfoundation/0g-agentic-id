@@ -56,11 +56,11 @@ owner 调用保留原有的模型密钥存储和默认 settings 初始化行为�
 
 ## 授权范围与更新
 
-`getOperator(sealId)` 是公开查询，返回 `owner`、有效 `operator`、`version`、
-`expiresAt`、`allowRecreate`，以及包含区块高度和 hash 的块末 `checkpoint`。
-授权过期或 NFT 转移后，`operator` 为 `null`。尚未 mint 时，GET 返回 deployment
-owner，operator 与 checkpoint 均为 `null`；已有 owner stop/reset/retry 流程仍然可用，
-但写入 operator 授权必须等 agent mint 完成并获得 checkpoint。
+`getOperator(sealId)` 返回公开路由信息：`owner`、`operator`、`version`、
+`expiresAt`、`allowRecreate`，以及通常为 `null` 的 `checkpoint`。普通查询不获取
+新的区块锚点或历史 owner；返回值不是运行请求能够通过授权的证明，API 和 worker
+会独立校验权限。尚未 mint 时，它返回 deployment owner，operator 为 `null`；
+已有 owner stop/reset/retry 流程仍然可用，但写入 operator 授权必须等 agent mint 完成。
 
 ```ts
 const grant = await owner.agent.getOperator(sealId);
@@ -83,9 +83,20 @@ await owner.agent.revokeOperator(sealId);
 请求不会因同一钱包被重新授权而恢复有效。执行前会再次检查授权；已经发送给
 provider 的操作仍可能完成。
 
-更新或撤销授权时，owner 的签名覆盖 GET 返回的原始 checkpoint。SDK 会拒绝不安全的
-JavaScript 区块整数、格式不正确的 hash 和缺失 checkpoint，不会自行补造。
-这需要 RPC 能提供 canonical 区块 hash 和历史 owner 查询。
+仅 set/revoke 会请求 `GET /operator?seal_id=...&checkpoint=true`，同时取得当前版本
+和新的块末 checkpoint；owner 签名覆盖该区块高度和 hash。SDK 会拒绝不安全的
+JavaScript 区块整数、格式不正确的 hash 和缺失 checkpoint，不会自行补造。写入成功后
+重新查询普通路由信息：总计一次 anchor GET、一次 PUT、一次普通 GET；锚点不可用时
+不会自动重试或重新签名。
+
+授权写入需要 RPC 仍保留锚点区块的历史 owner 状态。attestor 会记录与签名 proof、
+signature 和授权版本绑定的准入事实。后续执行校验该记录、锚点的 canonical header、
+实时 owner 和当前授权，不重复查询历史 owner，因此长期运行不需要 archive RPC。
+该记录是准入事实，不是额外的密码学证明。已有带锚点的授权若缺少该记录，
+需要 owner 重新签署一次新授权，不能只凭已有签名推定准入。
+
+新锚点取 latest 区块，不取滞后的 confirmed 区块。header 缺失或 RPC 落后返回
+HTTP 503；hash 不匹配则拒绝授权。
 锚定在区块 `H` 结束时的授权，不会被迟到的 `H` 或更早区块中的 indexer 事件删除；
 `H` 之后的所有权转移在被 indexer 索引后使它失效。转出后又转回同一钱包的撤权
 依赖 indexer 追上进度，实时 owner 检查本身无法识别这种往返。
@@ -108,6 +119,8 @@ credentials 仍通过既有 provision 通道交付。
 
 已受理的 create 完成时，worker 会重新检查 owner、授权和 boot generation；
 不会仅因原始请求 envelope 已过期就丢弃创建结果。
+授权本身的 `expiresAt` 仍是权限边界：若在 create 期间到期，结果就不能绑定给 agent；
+worker 不会为了完成操作而自动延长授权。
 
 本功能增加委托授权，不增加空闲调度或常驻唤醒网关。stop 保持现有语义，
 不增加停机前最终状态同步，也不保证没有任务正在运行。应用需要在请求停机前

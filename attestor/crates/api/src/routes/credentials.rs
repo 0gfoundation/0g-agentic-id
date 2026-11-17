@@ -969,6 +969,7 @@ mod tests {
         let signature: Vec<u8> = s.owner.sign_hash_sync(&B256::from(eip191_digest(&bytes))).unwrap().into();
         s.state.deployments.compare_and_swap_operator(s.seal_id, 0, OperatorGrant {
             version: 1, owner: s.owner.address(), signed_message_b64: b64e(&bytes), signature: signature.into(),
+            checkpoint_acceptance: None,
         }).await.unwrap().unwrap();
         let generation = s.state.deployments.prepare_operator_boot(
             s.seal_id, Some([9; 32]), s.owner.address(), operator, 1,
@@ -1009,6 +1010,7 @@ mod tests {
                 let signature: Vec<u8> = s.owner.sign_hash_sync(&B256::from(eip191_digest(&bytes))).unwrap().into();
                 s.state.deployments.compare_and_swap_operator(s.seal_id, 1, OperatorGrant {
                     version: 2, owner: s.owner.address(), signed_message_b64: b64e(&bytes), signature: signature.into(),
+                    checkpoint_acceptance: None,
                 }).await.unwrap().unwrap();
             }
             let error = handle_writeback(State(s.state.clone()), Json(writeback(&s, &s.agent_seal, &boot)))
