@@ -831,7 +831,14 @@ chat. Apply's outcomes:
 
 `status.go::severityOf` tells the owner-recoverable causes ("insufficient
 funds", a data-less revert of the seal wallet's own transaction) from the
-rest; `commitretry.go::commitFailureStatus` turns either into the warning.
+rest; `commitretry.go::commitFailureStatus` turns either into the warning. A
+failure whose error names no cause is checked against the seal wallet
+(`fundsShortfall`): when its balance is under the failed step's gas (a storage
+submit 450k, an update 350k, the largest measured on Galileo, rounded up) at
+the current gas price, it is the funds case at once, and the warning names
+the wallet and both amounts ("the agent's wallet 0x… has 0.10 OG, about
+0.90 OG is needed for its next transaction"). If the balance cannot be read,
+the count rule stands.
 
 Retries back off (`commitretry.go`): after n consecutive failures of the same
 content the next attempt waits 30 s·2^(n-1), at most 30 min; new content to

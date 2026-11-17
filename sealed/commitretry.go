@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"sort"
 	"sync"
 	"time"
+
+	"seal-verify/internal/logger"
+	"seal-verify/internal/uploader"
 )
 
 // Committing the agent's data to chain (handleDrift → upload.Apply) runs on
@@ -103,9 +108,13 @@ func driftKey(plaintexts map[string][]byte) string {
 // which blocked the owner's chat (dev, 2026-11-17). It is a "warning", which
 // keeps the agent running for the attestor and carries the reason to the
 // owner: at once for an owner-recoverable cause (the seal wallet cannot pay,
-// severityOf), after failureEscalateAt consecutive failures otherwise, so a
-// transient blip does not show.
-func commitFailureStatus(err error, consecutive int) (level, message string) {
+// severityOf, or short: the wallet holds less than the failed step needs,
+// fundsShortfall), after failureEscalateAt consecutive failures otherwise,
+// so a transient blip does not show.
+func commitFailureStatus(err error, consecutive int, short string) (level, message string) {
+	if short != "" {
+		return "warning", short
+	}
 	summary := summarizeError(err)
 	if severityOf(err) == "warning" {
 		return "warning", "agent data not committed to chain: " + summary
@@ -114,4 +123,40 @@ func commitFailureStatus(err error, consecutive int) (level, message string) {
 		return "", ""
 	}
 	return "warning", fmt.Sprintf("agent data not committed to chain (%d attempts): %s", consecutive, summary)
+}
+
+// fundsShortfall says, for a failed commit whose error does not name the
+// cause, whether the seal wallet cannot pay the step it failed at. A wallet
+// short of gas does not always fail as "insufficient funds": on Galileo at
+// 2000 gwei a storage submit's gas estimate came back as a bare
+// "execution reverted" (dev, 2026-11-17, 0.1041 OG against ~0.9 OG needed),
+// which counted as an "other" failure and showed only at the fifth, about
+// ten minutes later with the backoff. read is the uploader's FundsFor. ""
+// when the wallet holds enough, the error already says funds (severityOf), or
+// the read fails: the count rule then stands.
+func fundsShortfall(ctx context.Context, read func(context.Context, error) (uploader.WalletFunds, error), err error) string {
+	if severityOf(err) == "warning" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	f, rerr := read(ctx, err)
+	if rerr != nil {
+		logger.Logf("drift: cannot read the seal wallet's balance (%v); the failure is graded by its error", rerr)
+		return ""
+	}
+	if f.Balance == nil || f.Need == nil || f.Balance.Cmp(f.Need) >= 0 {
+		return ""
+	}
+	return fmt.Sprintf("agent data not committed to chain: the agent's wallet %s has %s OG, about %s OG is needed for its next transaction",
+		f.Address.Hex(), formatOG(f.Balance), formatOG(f.Need))
+}
+
+// formatOG writes a wei amount in OG: two decimals, four under 0.01.
+func formatOG(wei *big.Int) string {
+	og := new(big.Float).Quo(new(big.Float).SetInt(wei), big.NewFloat(1e18))
+	if og.Sign() > 0 && og.Cmp(big.NewFloat(0.01)) < 0 {
+		return og.Text('f', 4)
+	}
+	return og.Text('f', 2)
 }

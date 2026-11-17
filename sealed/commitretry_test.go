@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+
+	"seal-verify/internal/uploader"
 )
 
 func TestCommitRetryDelaysDoubleToTheCap(t *testing.T) {
@@ -76,13 +82,13 @@ func TestDriftKeyIsTheContentOfEveryRole(t *testing.T) {
 // pay, after failureEscalateAt failures otherwise.
 func TestCommitFailureIsAWarningNeverAnError(t *testing.T) {
 	funds := errors.New("uploader.Apply: upload framework: 0g-storage upload: insufficient funds for gas * price + value: have 0 want 30733644962")
-	level, msg := commitFailureStatus(funds, 1)
+	level, msg := commitFailureStatus(funds, 1, "")
 	if level != "warning" || !strings.Contains(msg, "insufficient funds") || !strings.HasPrefix(msg, "agent data not committed to chain") {
 		t.Errorf("unfunded wallet: %q %q", level, msg)
 	}
 	other := errors.New("uploader.Apply: upload APPEND_SYSTEM.md: 0g-storage upload: Failed to submit log entry: execution reverted")
 	for n := 1; n <= 40; n++ {
-		level, msg := commitFailureStatus(other, n)
+		level, msg := commitFailureStatus(other, n, "")
 		if level == "error" {
 			t.Fatalf("failure %d graded error: %q", n, msg)
 		}
@@ -91,6 +97,86 @@ func TestCommitFailureIsAWarningNeverAnError(t *testing.T) {
 		}
 		if n >= failureEscalateAt && (level != "warning" || !strings.Contains(msg, "execution reverted")) {
 			t.Errorf("failure %d: %q %q", n, level, msg)
+		}
+	}
+}
+
+// ogWei is n/1000 OG in wei.
+func ogWei(milli int64) *big.Int {
+	return new(big.Int).Mul(big.NewInt(milli), big.NewInt(1_000_000_000_000_000))
+}
+
+var (
+	sealWallet = common.HexToAddress("0x29e1Cf672CD426ee02DD83ba4498aBbA7DED2a18")
+	reverted   = errors.New("uploader.Apply: upload memory/ entry a.md: 0g-storage upload: Failed to submit log entry: execution reverted")
+	// 450k gas at Galileo's 2000 gwei.
+	submitAt2000 = new(big.Int).Mul(big.NewInt(uploader.StorageSubmitGas), big.NewInt(2000_000_000_000))
+)
+
+func readsWallet(balance *big.Int) func(context.Context, error) (uploader.WalletFunds, error) {
+	return func(context.Context, error) (uploader.WalletFunds, error) {
+		return uploader.WalletFunds{Address: sealWallet, Balance: balance, Need: submitAt2000}, nil
+	}
+}
+
+// The dev case (625, 2026-11-17): 0.1041 OG against a submit needing ~0.9 OG
+// at 2000 gwei, failing as a bare revert. It warns at the first failure and
+// says how much the wallet has and needs.
+func TestRevertedCommitWithAShortWalletWarnsAtOnce(t *testing.T) {
+	short := fundsShortfall(context.Background(), readsWallet(ogWei(104)), reverted)
+	for _, want := range []string{sealWallet.Hex(), "has 0.10 OG", "about 0.90 OG is needed"} {
+		if !strings.Contains(short, want) {
+			t.Errorf("%q lacks %q", short, want)
+		}
+	}
+	level, msg := commitFailureStatus(reverted, 1, short)
+	if level != "warning" || msg != short {
+		t.Errorf("first failure: %q %q; want the warning at once", level, msg)
+	}
+}
+
+// A wallet that holds enough leaves the failure to the count rule.
+func TestRevertedCommitWithEnoughFundsKeepsTheCountRule(t *testing.T) {
+	short := fundsShortfall(context.Background(), readsWallet(ogWei(9798)), reverted)
+	if short != "" {
+		t.Fatalf("a funded wallet reported short: %q", short)
+	}
+	if level, _ := commitFailureStatus(reverted, 1, short); level != "" {
+		t.Errorf("first failure shown: %q", level)
+	}
+	if level, msg := commitFailureStatus(reverted, failureEscalateAt, short); level != "warning" || !strings.Contains(msg, "execution reverted") {
+		t.Errorf("failure %d: %q %q", failureEscalateAt, level, msg)
+	}
+}
+
+// A balance that cannot be read changes nothing: the count rule stands. An
+// error that already says funds is not read for.
+func TestCommitFundsReadFailureFallsBack(t *testing.T) {
+	failing := func(context.Context, error) (uploader.WalletFunds, error) {
+		return uploader.WalletFunds{}, errors.New("dial tcp: connection refused")
+	}
+	if short := fundsShortfall(context.Background(), failing, reverted); short != "" {
+		t.Errorf("a failed read reported short: %q", short)
+	}
+	if level, _ := commitFailureStatus(reverted, 1, ""); level != "" {
+		t.Errorf("first failure shown after a failed read: %q", level)
+	}
+	read := false
+	spy := func(context.Context, error) (uploader.WalletFunds, error) {
+		read = true
+		return uploader.WalletFunds{}, nil
+	}
+	funds := errors.New("0g-storage upload: insufficient funds for gas * price + value")
+	if short := fundsShortfall(context.Background(), spy, funds); short != "" || read {
+		t.Errorf("an insufficient-funds error was read for: %q, read %v", short, read)
+	}
+}
+
+func TestFormatOG(t *testing.T) {
+	for wei, want := range map[string]string{"0": "0.00", "5000000000000000": "0.0050", "104100000000000000": "0.10", "900000000000000000": "0.90", "9798229938528504000": "9.80"} {
+		n, _ := new(big.Int).SetString(wei, 10)
+		if got := formatOG(n); got != want {
+			t.Errorf("formatOG(%s) = %s; want %s", wei, got, want)
 		}
 	}
 }

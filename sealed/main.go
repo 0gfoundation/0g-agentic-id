@@ -1648,7 +1648,7 @@ func handleDrift(
 	if err := upload.Apply(ctx, plaintexts); err != nil {
 		consecutiveApplyFailures++
 		next := commitRetry.Failed(time.Now(), key)
-		level, msg := commitFailureStatus(err, consecutiveApplyFailures)
+		level, msg := commitFailureStatus(err, consecutiveApplyFailures, fundsShortfall(ctx, upload.FundsFor, err))
 		logger.Logf("drift: upload.Apply: %v (failure %d; next attempt in %s unless the content changes)", err, consecutiveApplyFailures, next)
 		if level == "" {
 			return

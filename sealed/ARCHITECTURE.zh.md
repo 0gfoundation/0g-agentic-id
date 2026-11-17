@@ -722,7 +722,11 @@ sandbox 对账（见 attestor README）：sandbox 处于 started 但 `/healthz` 
 
 `status.go::severityOf` 把 owner 能处理的原因（"insufficient funds"、seal 钱包自己
 那笔交易不带数据的回滚）和其他原因分开；`commitretry.go::commitFailureStatus`
-把两者都变成 warning。
+把两者都变成 warning。错误里没说原因的失败会拿 seal 钱包核对（`fundsShortfall`）：
+余额不够失败那一步按当前 gas 价格要付的 gas（存储上传按 45 万、update 按 35 万，
+取 Galileo 上测到的最大值再往上取整），就立刻按钱不够处理，warning 里写出钱包地址和
+两个金额（"the agent's wallet 0x… has 0.10 OG, about 0.90 OG is needed for its next
+transaction"）。读不到余额时仍按次数规则。
 
 重试会退避（`commitretry.go`）：同一份内容连续失败 n 次后，下次尝试等 30 秒·2^(n-1)，
 最多 30 分钟；有新内容要提交时下一个 tick 就试，成功后重新开始。重试只上传失败的那次
