@@ -618,13 +618,18 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			get("/v1/inbox"), post("/v1/inbox/ack")),
 		route("/v1/events", "events", "Server-sent feed of turn, inbox, activity and schedule changes, resumable from a cursor: GET /v1/events?after=N.",
 			get("/v1/events")),
-		// What runs or ran. "Task" is kept for zgh-style tasks (a unit of
-		// work with its own session, state and outcome); /v1/tasks stays,
-		// as the deprecated alias of this list, until it names them.
+		// What runs or ran: turns, background commands, subagents.
 		route("/v1/activities", "activities", "Turns, background commands and subagents, with who did each: GET /v1/activities, GET /v1/activities/{id}, POST /v1/activities/{id}/cancel (id `all` cancels everything running).",
 			get("/v1/activities"), get("/v1/activities/{id}"), post("/v1/activities/{id}/cancel")),
-		route("/v1/tasks", "tasks", "Deprecated alias of /v1/activities (same answers, with Deprecation: true), until /v1/tasks names zgh-style tasks: GET /v1/tasks, GET /v1/tasks/{id}, POST /v1/tasks/{id}/cancel.",
-			get("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/cancel")),
+		// zgh-style tasks: a piece of work the owner hands the agent, with
+		// its own session, workspace, state and outcome records. The feed's
+		// own kind, task-feed, tells a client that /v1/tasks names these
+		// tasks: before them, a runtime declared kind "tasks" for the
+		// activity list's old name.
+		route("/v1/tasks", "tasks", "Owner tasks (zgh's task model): POST /v1/tasks {prompt, id?, title?, workspace?: {dir}, instructions?, outcome_tools?, metadata?} → 201 (an id taken → 409 id-taken); GET /v1/tasks?state=&metadata.K=V; GET /v1/tasks/{id} → {state: queued|working|idle|needs-input|done|failed|archived, outcome, records, runs, …}; POST /v1/tasks/{id}/input {text, mode: steer|next} → 202 {delivery}; POST /v1/tasks/{id}/cancel; POST /v1/tasks/{id}/archive; GET /v1/tasks/{id}/events (SSE). The agent records each run's outcome with raise_question, request_action or report_complete; at most four tasks run at once.",
+			get("/v1/tasks"), post("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/input"), post("/v1/tasks/{id}/cancel"), post("/v1/tasks/{id}/archive"), get("/v1/tasks/{id}/events")),
+		route("/v1/task-feed", "task-feed", "Server-sent feed of every task's changes: one `task` event per task not archived, then `ready`, then one `task` event per change.",
+			get("/v1/task-feed")),
 		route("/v1/schedules", "schedules", "Reminders the agent set for itself: GET /v1/schedules (enabled:false unless the owner's `schedule` knob is on).",
 			get("/v1/schedules"), framework.Endpoint{Method: http.MethodDelete, Path: "/v1/schedules/{id}"}),
 		// Long-term memory upkeep on the owner's request: one consolidation

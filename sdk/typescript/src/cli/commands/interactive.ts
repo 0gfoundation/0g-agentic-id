@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
-import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentActivityInfo, AgentActivityStop, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
+import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentActivityInfo, AgentActivityStop, HarnessTask, HarnessTaskRecord, HarnessTaskSummary, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
 import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
@@ -298,6 +298,83 @@ export function renderActivityTable(tasks: AgentActivityInfo[], nowMs: number): 
   ];
 }
 
+/** The /tasks list: id, state, open records, age, title. Exported for the tests. */
+export function renderTaskTable(tasks: HarnessTask[], nowMs: number): string[] {
+  const idw = Math.max(2, ...tasks.map((t) => cleanCell(t.id).length)) + 2;
+  return [
+    `  ${'ID'.padEnd(idw)}${'STATE'.padEnd(13)}${'OPEN'.padEnd(6)}${'RUNS'.padEnd(6)}${'AGE'.padEnd(6)}TITLE`,
+    ...tasks.map((t) =>
+      `  ${cleanCell(t.id).padEnd(idw)}${cellText(t.state + (t.reason ? ` (${t.reason})` : ''), 13)}` +
+      `${String(t.records?.length ?? 0).padEnd(6)}${String(t.runs?.count ?? 0).padEnd(6)}` +
+      `${span(nowMs / 1000 - t.created_at).padEnd(6)}${[...cleanCell(t.title)].slice(0, 60).join('')}`),
+  ];
+}
+
+const textArg = (v: unknown): string => (typeof v === 'string' ? v : '');
+const listArg = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+const objArg = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {});
+
+/**
+ * One outcome record as the CLI shows it: a question with its options (the
+ * recommended one starred), an action as steps, or a report. Every field is
+ * the agent's text, cleaned for the terminal. Exported for the tests.
+ */
+export function renderTaskRecord(r: HarnessTaskRecord): string[] {
+  const a = objArg(r.arguments);
+  const kind = r.tool === 'raise_question' ? 'question' : r.tool === 'request_action' ? 'action' : r.tool === 'report_complete' ? 'report' : cleanCell(r.tool);
+  const out = [`#${r.id} ${kind}${r.state === 'closed' ? ` (closed: ${cleanCell(r.closed?.how ?? '')})` : ''} · ${cleanCell(textArg(a.headline))}`];
+  const block = (label: string, v: unknown): void => {
+    const t = textArg(v).trim();
+    if (t) out.push(`  ${label}:`, ...cleanStream(t).split('\n').map((l) => `    ${l}`));
+  };
+  if (r.tool === 'raise_question') {
+    block('why', a.whyAsking);
+    block('background', a.background);
+    for (const q of listArg(a.questions).map(objArg)) {
+      out.push(`  [${cleanCell(textArg(q.key))}] ${cleanCell(textArg(q.text))}${q.multiSelect ? ' (pick any)' : ''}`);
+      for (const o of listArg(q.options).map(objArg)) {
+        out.push(`    ${o.recommended ? '★' : '-'} ${cleanCell(textArg(o.key))}: ${cleanCell(textArg(o.label))} — ${cleanCell(textArg(o.consequence))}`);
+        if (o.recommended && textArg(o.recommendationReason)) out.push(`      why: ${cleanCell(textArg(o.recommendationReason))}`);
+      }
+    }
+  } else if (r.tool === 'request_action') {
+    block('why', a.whyNeeded);
+    for (const st of listArg(a.steps).map(objArg)) out.push(`  [${cleanCell(textArg(st.key))}] ${cleanCell(textArg(st.text))}`);
+    block('the agent will check', a.verification);
+    const hint = objArg(a.credential_hint);
+    if (textArg(hint.title)) {
+      out.push(`  credential needed: ${cleanCell(textArg(hint.title))} — ${cleanCell(textArg(hint.description))} (store it with /cred)`);
+      if (textArg(hint.source)) out.push(`    the agent thinks it is at: ${cleanCell(textArg(hint.source))}`);
+    }
+  } else if (r.tool === 'report_complete') {
+    block('summary', a.summary);
+    block('how verified', a.howVerified);
+    const notDone = listArg(a.notDone).map((x) => cleanCell(textArg(x))).filter(Boolean);
+    out.push(notDone.length ? '  not done:' : '  not done: nothing', ...notDone.map((x) => `    - ${x}`));
+    const verify = listArg(a.verify).map((x) => cleanCell(textArg(x))).filter(Boolean);
+    if (verify.length) out.push('  check:', ...verify.map((x) => `    - ${x}`));
+  }
+  return out;
+}
+
+/** /tasks show: the task's state, its last run and its records. Exported for the tests. */
+export function renderTask(t: HarnessTask): string[] {
+  const last = t.runs?.last;
+  const lines = [
+    `${cleanCell(t.id)} — ${cleanCell(t.state)}${t.reason ? ` (${cleanCell(t.reason)})` : ''} · ${cleanCell(t.title)}`,
+    `  workspace ${cleanCell(t.workspace?.path ?? '')} · runs ${t.runs?.count ?? 0}${t.pending ? ` · ${t.pending} input(s) waiting` : ''}`,
+  ];
+  if (last?.error) lines.push(`  last run: ${cleanCell(last.error)}`);
+  const shown = new Set<number>();
+  for (const r of [...(t.records ?? []), ...(t.outcome ?? [])]) {
+    if (shown.has(r.id)) continue;
+    shown.add(r.id);
+    lines.push(...renderTaskRecord(r));
+  }
+  if (!shown.size) lines.push(t.state === 'working' || t.state === 'queued' ? '  (no record yet)' : '  (no record)');
+  return lines;
+}
+
 /**
  * One inbox message as the session prints it: why the agent spoke up, then
  * what it said. Exported for the tests.
@@ -323,6 +400,21 @@ export function renderSchedules(list: AgentSchedule[], nowMs: number): string[] 
     const due = r.state === 'overdue' ? 'due now' : `in ${span((Date.parse(r.scheduledAt) - nowMs) / 1000)}`;
     return `  ${cleanCell(r.id).padEnd(idw)}${how.padEnd(12)}${due.padEnd(12)}${cleanCell(r.prompt)}`;
   });
+}
+
+/**
+ * A task's run ending, as the session prints it between prompts: where the
+ * task rests and what its last record says. Only runs ending somewhere the
+ * owner acts on (a question, an action, a report, a failure) are shown.
+ * Exported for the tests.
+ */
+export function renderTaskNotice(t: HarnessTaskSummary): string | null {
+  if (!['needs-input', 'done', 'failed'].includes(t.state)) return null;
+  const last = [...(t.outcome ?? [])].pop();
+  const headline = last ? cleanCell(textArg(objArg(last.arguments).headline)) : '';
+  const what = t.state === 'needs-input' ? (last?.tool === 'request_action' ? 'needs you to act' : 'has a question')
+    : t.state === 'done' ? 'reports done' : `failed${t.reason ? ` (${cleanCell(t.reason)})` : ''}`;
+  return `◆ task ${cleanCell(t.id)} ${what}${headline ? ` · ${headline}` : ''} — /tasks show ${cleanCell(t.id)}\n`;
 }
 
 /** What stopping an activity did, in words. */
@@ -382,6 +474,11 @@ export function makeInboxFeed(show: (text: string, shown: () => void) => void): 
       for await (const e of client.events({ after: cursor, signal })) {
         // An inbox message's seq is its event's.
         if (e.type === 'inbox.message') present([{ ...(e.data as unknown as AgentInboxMessage), seq: e.seq }], false);
+        // A task's run ended where the owner acts on it.
+        else if (e.type === 'task.updated' && (e.data as { change?: string }).change === 'run-ended') {
+          const text = renderTaskNotice(e.data as unknown as HarnessTaskSummary);
+          if (text && !signal.aborted) show(`\n${text}`, () => undefined);
+        }
         // The agent could not serve our position: what we may have missed
         // is in the inbox itself.
         else if (e.type === 'reset') await readUnread(false).catch(() => undefined);
@@ -2890,7 +2987,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /sessions /activities /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /sessions /activities /tasks /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -2962,10 +3059,21 @@ const L2_HELP_FULL = `session commands
                           agent — your turns, the turns it opened itself,
                           background commands and subagents — with who did
                           each (BY) and who asked (FOR)
+  /tasks [sub …]          on 0g-harness: tasks — pieces of work the agent
+                          runs in a session and workspace of their own (at
+                          most four at once) and ends with a record: a
+                          question, an action for you, or a report. /tasks
+                          lists them (all: archived too); new <prompt>
+                          hands one over; show <id> prints its state and
+                          records; input <id> [next] <text> answers or
+                          steers it (next: its next turn); cancel <id>
+                          stops its run; archive <id> puts it away. An id
+                          can be a unique start of one
   /tasks                  elsewhere: this session's long tasks with live
                           status — on agents with the responses transport a
                           chat turn survives dropped connections and keeps
-                          running. On 0g-harness the same as /activities
+                          running. On an older 0g-harness the same as
+                          /activities
   /result [id]            re-attach to a task (default: latest): prints a
                           finished one, follows a running one live; on
                           0g-harness also a subagent's answer or a command's
@@ -3450,6 +3558,64 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           continue;
         }
         out('usage: /sessions [list | new [title] | switch <id|title> | fork [id] | default]\n');
+        continue;
+      }
+      if ((line === '/tasks' || line.startsWith('/tasks ')) && s.client?.createTask) {
+        // zgh-style tasks (0g-harness): pieces of work with their own
+        // session, workspace and outcome records.
+        const c = s.client;
+        const rest = line.slice('/tasks'.length).trim();
+        const [sub = 'list', ...words] = rest.split(/\s+/).filter(Boolean);
+        const after = (n: number): string => rest.split(/\s+/).slice(n).join(' ').trim();
+        // An id, or a unique start of one (with or without `task-`).
+        const resolve = async (arg: string | undefined): Promise<string | null> => {
+          if (!arg) { out('which task? give its id (/tasks lists them)\n'); return null; }
+          if (/^task-[a-z0-9][a-z0-9-]{0,62}$/.test(arg)) return arg;
+          const hits = (await c.listTasks!({ limit: 500 })).filter((t) => t.id.startsWith(arg) || t.id.startsWith(`task-${arg}`));
+          if (hits.length === 1) return hits[0].id;
+          out(hits.length ? `${hits.length} tasks start with ${cleanCell(arg)} — give more of the id\n` : `no task ${cleanCell(arg)}\n`);
+          return null;
+        };
+        if (sub === 'list' || sub === 'all') {
+          const list = (await c.listTasks!({ limit: 50 })).filter((t) => sub === 'all' || t.state !== 'archived');
+          if (!list.length) { out('no tasks yet — /tasks new <what to do>\n'); continue; }
+          for (const l of renderTaskTable(list, Date.now())) out(`${l}\n`);
+          out('/tasks show <id> · input <id> [next] <text> · cancel <id> · archive <id>\n');
+          continue;
+        }
+        if (sub === 'new') {
+          const prompt = after(1);
+          if (!prompt) { out('usage: /tasks new <what to do>\n'); continue; }
+          const { task } = await c.createTask!({ prompt });
+          out(`task ${cleanCell(task.id)} — ${cleanCell(task.state)}, workspace ${cleanCell(task.workspace.path)}\n`);
+          continue;
+        }
+        if (sub === 'show') {
+          const id = await resolve(words[0]);
+          if (!id) continue;
+          for (const l of renderTask(await c.getTask!(id))) out(`${l}\n`);
+          continue;
+        }
+        if (sub === 'input') {
+          const id = await resolve(words[0]);
+          if (!id) continue;
+          const next = words[1] === 'next';
+          const text = after(next ? 3 : 2);
+          if (!text) { out('usage: /tasks input <id> [next] <text>\n'); continue; }
+          const r = await c.taskInput!(id, text, next ? { mode: 'next' } : {});
+          const where = r.delivery === 'current-run' ? (r.steer ? 'read before its next model call' : 'its next turn')
+            : r.delivery === 'next-run' ? 'waits for the next run (this one has reported)' : 'queued: it starts a run';
+          out(`sent to ${cleanCell(id)} — ${where}\n`);
+          continue;
+        }
+        if (sub === 'cancel' || sub === 'archive') {
+          const id = await resolve(words[0]);
+          if (!id) continue;
+          const t = sub === 'cancel' ? await c.cancelTaskRun!(id) : await c.archiveTask!(id);
+          out(`${cleanCell(id)} — ${cleanCell(t.state)}\n`);
+          continue;
+        }
+        out('usage: /tasks [list | all | new <prompt> | show <id> | input <id> [next] <text> | cancel <id> | archive <id>]\n');
         continue;
       }
       if (line === '/activities' || line === '/tasks') {

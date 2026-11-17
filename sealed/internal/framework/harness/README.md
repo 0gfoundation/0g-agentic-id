@@ -90,12 +90,18 @@ The harness then does three things:
   inbox: for example when a background job finishes or a reminder comes due.
 
 `FrameworkRoutes()` advertises the surface on `/hello`, one kind per
-capability: `chat`, `responses`, `inbox`, `events`, `activities`, `tasks`, `schedules`, `files`, `memory`, `steer`, `sessions`. A
+capability: `chat`, `responses`, `inbox`, `events`, `activities`, `tasks`, `task-feed`, `schedules`, `files`, `memory`, `steer`, `sessions`. A
 client enables a feature only on the kinds an agent declares. The other
-frameworks declare none of the last nine, and nothing about them changes.
+frameworks declare none of the last ten, and nothing about them changes.
 `activities` is the list of what runs or ran (turns, background commands,
-subagents); `tasks` is its deprecated alias, kept until `/v1/tasks` names
-zgh-style tasks (a unit of work with its own session, state and outcome).
+subagents).
+`tasks` are zgh-style tasks: a piece of work the owner hands the agent, run
+in a session and workspace of its own (`~/tasks/<id>` by default), at most
+four at once, and ended by an outcome the agent records (`raise_question`,
+`request_action`, `report_complete`); its state is queued, working, idle,
+needs-input, done, failed or archived. `task-feed` is the feed of their
+changes; its kind also tells a client that `/v1/tasks` names these tasks
+(an earlier runtime declared kind `tasks` for the activity list's old name).
 `steer` is the owner's word for the turn already running: the harness reads it
 before that turn's next model call, and queues it as an ordinary turn when no
 owner turn is running.
