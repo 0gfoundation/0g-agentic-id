@@ -158,12 +158,18 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
 
 ### 发布通知
 
-每次发布新镜像，都在该环境的发布记录文件（`ATTESTOR_RELEASES_FILE`；`docker-compose.yml` 把 `./releases` 挂到 `/etc/attestor/releases`）里加一条。替换文件要原子地做（在同一目录写临时文件，再改名）：文件的修改时间、大小或 inode 变了，attestor 就重新读取；挂载的是目录而不是单个文件，改名后的文件才看得到。条目如下：
+每次发布新镜像，都在各环境的发布记录文件（`ATTESTOR_RELEASES_FILE`；`docker-compose.yml` 把 `./releases` 挂到 `/etc/attestor/releases`）里加一条。这个文件由脚本生成，不手写：
+
+- **改了什么、owner 要做什么**：写在 [`CHANGELOG.md`](../CHANGELOG.md) 里该版本的那一节，英文，在设定版本号的那个 PR 里写。第一行是 CLI 显示的一句话摘要。
+- **什么时候、替换哪些镜像**：各环境不同，放在该环境的参数文件 [`releases/<env>.json`](../releases)（`testnet`、`mainnet`）里：每个版本的 `published_at` 和 `migrate`。dev 的测试版本用放在 dev 部署目录里的参数文件。镜像哈希和日期都是公开信息（哈希就在信任列表上），所以和说明一样走 PR 审核。
+- `node attestor/scripts/release-entry.mjs --changelog CHANGELOG.md --params releases/mainnet.json --min-days 30 --out <机器上的目录>/releases/releases.json` 把两者合成一个文件（测试网用 `--min-days 14`；`node --test attestor/scripts/release-entry.test.mjs` 测这个脚本）。标题还带 `(unreleased)` 的版本、超过 4000 字节的说明、短于最低天数的过渡期（标了 urgent 的除外）都会被拒。带 `--out` 时先在同一目录写临时文件，再改名覆盖：文件的修改时间、大小或 inode 变了，attestor 就重新读取；挂载的是目录而不是单个文件，改名后的文件才看得到。没有 changelog 小节的测试版本，可以在参数文件里自带 `notes`。
+
+生成的文件：
 
 ```json
 {"releases": [
   {"version": "0.5.0", "published_at": "2026-11-20T00:00:00Z",
-   "notes": "What changed and what owners should do.", "notes_zh": "改了什么、owner 要做什么。",
+   "notes": "Layered runtime (…), owner credentials, …\n\n- Runtime: …",
    "migrate": [
      {"framework": "0g-harness", "image_hash": "0x…", "until": "2026-12-20T00:00:00Z"}
    ]}
@@ -176,6 +182,7 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
 - 过渡期主网至少 30 天，测试网至少 14 天，由部署方据此设定 `until`（attestor 不检查）。旧镜像不早于 `until` 下架。`urgent: true` 表示该镜像有安全问题，可能提前下架；提前下架时另发通知。同一个镜像被多个版本列出时，先看 urgent 的条目，再看最早的 `until`。
 - 解析不了或被删掉的文件会记日志，继续用上一份有效内容；要撤回全部通知，写入 `{"releases": []}`。
 - owner 在三个地方看到：CLI（每周一次，最后 7 天每天一次，列出要 reset 的 agent）、`GET /deployments` 的 owner 视图（`migrate`）、attestor 能发邮件时的邮件（发布时一封，每个过渡期最后 7 天一封）。邮件只发给 agent 链上的当前 owner；发送失败的，下一次每小时检查时重发。
+- 发布通知出现之前的旧版 CLI 看不到上面这些，只会显示升级提示（`ATTESTOR_CLI_LATEST`、`ATTESTOR_CLI_NOTES`，每天一次）。所以同一次发版要把两者都设好，`ATTESTOR_CLI_NOTES` 那一句写明过渡期的结束日期和要 reset，例如：`AgentDNA 0.5.0: run 0g-agentdna update; agents on 0.4 images keep running until 2026-12-20, reset them before then`。邮件不受 CLI 版本影响。
 - sealed 程序和官方 harness 包不用写条目：旧版本下架后，agent 会自己切到已上架的最新版本。
 - 镜像下架后，还在用它的 agent 继续运行，直到容器下次启动；那次启动的 provision 被拒，原因是 `recorded image_hash not in validFrameworkHashes: the image was retired; reset required`，owner 会看到这个失败原因。
 

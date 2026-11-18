@@ -92,6 +92,7 @@ The sandbox provider's two signed statements are likewise duplicated, across rep
 ## Conventions
 
 - **Bilingual docs**: nearly every doc has a `.zh.md` counterpart. Any doc change must be mirrored in the paired file, keeping the established terminology (identifiers/code stay English). Root `README.zh.md` links to `.zh.md` sub-docs where they exist.
+- **`CHANGELOG.md`** holds the release notes, one English section per version, written in the pull request that sets the version number; each environment's attestor release file is generated from it and that environment's dates and images in `releases/<env>.json` (`attestor/scripts/release-entry.mjs`, attestor README "Announcing a release"). Its first line per section is the CLI's one-line summary.
 - **`QUIRKS.md`** records deliberate workarounds for 0G-chain/toolchain quirks (gas-price flags, viem receipt `checkReplacement: false`, the vendored `attestor/version-meld/core2` patch, WebSocket subscription behavior). Read it before "fixing" something that looks wrong — and keep it updated when a workaround changes.
 - **Public repo, privacy check**: `.githooks/pre-commit` runs `scripts/privacy-check.mjs` on the lines each commit adds. It refuses the commit if they carry any of these:
   - private keys or seed phrases;

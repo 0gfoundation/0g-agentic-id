@@ -213,17 +213,38 @@ AgenticID 1.3 image.
 
 ### Announcing a release
 
-Every release that ships new images gets an entry in the environment's
+Every release that ships new images gets an entry in each environment's
 release file (`ATTESTOR_RELEASES_FILE`; `docker-compose.yml` mounts `./releases`
-at `/etc/attestor/releases`). Replace the file atomically (write a temporary
-file in the same directory, then rename it): the attestor reads it again when
-its modification time, size or inode changes, and a mounted directory, unlike
-a mounted single file, shows the renamed file. The entry:
+at `/etc/attestor/releases`). The file is generated, never written by hand:
+
+- **What changed and what owners should do** is the version's section of
+  [`CHANGELOG.md`](../CHANGELOG.md), in English, written in the pull request
+  that sets the version number. Its first line is the one-line summary the CLI
+  shows.
+- **When and which images** differ per environment and live in that
+  environment's parameters file, [`releases/<env>.json`](../releases)
+  (`testnet`, `mainnet`): per version, `published_at` and `migrate`. A dev
+  test release uses a parameters file kept with the dev deployment.
+  Image hashes and dates are public (the hashes are on the trust registry), so
+  they are reviewed in pull requests like the notes.
+- `node attestor/scripts/release-entry.mjs --changelog CHANGELOG.md --params
+  releases/mainnet.json --min-days 30 --out <host dir>/releases/releases.json`
+  joins the two (`--min-days 14` on testnet; `node --test
+  attestor/scripts/release-entry.test.mjs` tests the script). It refuses a version still headed
+  `(unreleased)`, notes over 4000 bytes, and a transition period shorter than
+  the minimum unless the entry is urgent. With `--out` it writes a temporary
+  file in the same directory and renames it over the target: the attestor
+  reads the file again when its modification time, size or inode changes, and
+  a mounted directory, unlike a mounted single file, shows the renamed file.
+  A test release with no changelog section may carry its own `notes` in the
+  parameters file.
+
+The generated file:
 
 ```json
 {"releases": [
   {"version": "0.5.0", "published_at": "2026-11-20T00:00:00Z",
-   "notes": "What changed and what owners should do.", "notes_zh": "改了什么、owner 要做什么。",
+   "notes": "Layered runtime (…), owner credentials, …\n\n- Runtime: …",
    "migrate": [
      {"framework": "0g-harness", "image_hash": "0x…", "until": "2026-12-20T00:00:00Z"}
    ]}
@@ -256,6 +277,12 @@ a mounted single file, shows the renamed file. The entry:
   is out and one in the last 7 days of each transition period. Emails go to
   the agent's live on-chain owner; one that fails is sent again by the next
   hourly sweep.
+- A CLI from before release notices shows none of this; it shows only the
+  update hint (`ATTESTOR_CLI_LATEST`, `ATTESTOR_CLI_NOTES`, once a day). So the
+  same release sets both, and the `ATTESTOR_CLI_NOTES` line names the end of
+  the transition period and the reset, for example: `AgentDNA 0.5.0: run
+  0g-agentdna update; agents on 0.4 images keep running until 2026-12-20,
+  reset them before then`. Email reaches owners whatever their CLI version.
 - The sealed program and the official harness package need no entry: agents
   switch to the newest listed version by themselves when the old one is
   delisted.
