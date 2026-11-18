@@ -183,6 +183,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 			be.webSearchURL = route.BaseURL() + "/v1/web/search"
 			logger.Logf("harness: web_search through %s", ws.Service)
 		} else {
+			be.webSearchOff = why
 			logger.Logf("harness: no web_search: %s", why)
 		}
 		// Further models for subagents: the main route takes those on its
@@ -295,6 +296,9 @@ type bridgeEnv struct {
 	// webSearchURL, when set, is where the harness's web_search posts: the
 	// inference route's web/search (modelroutes.go planWebSearch).
 	webSearchURL string
+	// webSearchOff is why there is no web search when Start found none
+	// (planWebSearch); the harness tells the agent.
+	webSearchOff string
 	// routesEnv carries the further subagent models (modelroutes.go routePlan.env).
 	routesEnv []string
 }
@@ -339,6 +343,18 @@ func inferenceHeaders(f inference.WireFormat, key string) map[string]string {
 		return map[string]string{"x-api-key": key}
 	}
 	return map[string]string{"Authorization": "Bearer " + key}
+}
+
+// webSearchOffMax is the most of SEAL_HARNESS_WEB_SEARCH_OFF the harness
+// reads (its docs/PROTOCOL.md).
+const webSearchOffMax = 300
+
+// clipRunes is s cut to at most n runes.
+func clipRunes(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n])
+	}
+	return s
 }
 
 // environ builds the harness process's whole environment.
@@ -393,6 +409,9 @@ func (be bridgeEnv) environ() []string {
 	env = append(env, be.routesEnv...)
 	if be.webSearchURL != "" {
 		env = append(env, "SEAL_HARNESS_WEB_SEARCH_URL="+be.webSearchURL)
+	}
+	if be.webSearchOff != "" {
+		env = append(env, "SEAL_HARNESS_WEB_SEARCH_OFF="+clipRunes(be.webSearchOff, webSearchOffMax))
 	}
 	// Public on-chain facts the agent (and seal-tools) benefit from knowing.
 	if be.rt.PublicURL != "" {
