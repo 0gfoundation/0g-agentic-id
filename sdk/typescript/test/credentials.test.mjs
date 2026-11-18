@@ -452,7 +452,7 @@ test('cli: the list says whether a connection is connected, as the running agent
     return lines.find((l) => l.startsWith('  connected')) ?? '';
   };
   assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', logged_in_at: 1793880023 }] })), /^  connected  2026-/);
-  assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', status: 'awaiting_login' }] })), /not yet — cred <agent> connect linear$/);
+  assert.match(await run(async () => ({ version: 13, entries: [{ name: 'linear', status: 'awaiting_login' }] })), /not yet — 0g-agentdna cred <agent> connect linear$/);
   assert.match(await run(async () => { throw new Error('agent down'); }), /unknown — the agent is not running/);
 });
 
