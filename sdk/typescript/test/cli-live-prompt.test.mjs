@@ -7,6 +7,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough, Writable } from 'node:stream';
 import * as readline from 'node:readline';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { LiveTurn, PlainTurn, liveKeys, splitRows, fitRow, charCols } from '../dist/cli/livePrompt.js';
 import { lineQueue, steerable, promptStatus, sessionPromptText, turnNotes } from '../dist/cli/commands/interactive.js';
 
@@ -392,6 +395,11 @@ test('the prompt says what runs and what waits', () => {
   assert.equal(sessionPromptText('625', '', false, { notices: 2, files: 1 }), 'agent 625 · 2 notices · 1 new file › ');
   assert.equal(sessionPromptText('625', ' [notes]', true, { notices: 1, files: 0 }), 'agent 625 [notes] (replying, Esc stops) · 1 notice › ');
   assert.deepEqual(turnNotes(['use v2'], [{ text: 'then this' }, { text: 'a\nb\nc' }]), ['waiting for the agent: use v2', 'next turn: then this', 'next turn: a (+2 lines)']);
+  // A dragged file by its name, not its path (attach.ts findDroppedFiles: an existing file).
+  const dir = mkdtempSync(join(tmpdir(), 'drag-'));
+  const png = join(dir, 'flag test.png');
+  writeFileSync(png, Buffer.from('89504e470d0a1a0a', 'hex'));
+  assert.deepEqual(turnNotes([], [{ text: `${png.replace(/ /g, '\\ ')} what flag?` }]), ['next turn: [image: flag test.png] what flag?']);
 });
 
 test('the prompt is retitled in place when what it counts changes', async () => {

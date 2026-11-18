@@ -1290,7 +1290,8 @@ export function lineQueue(
       }
       if (echo) echo(kind, q, buffered);
       // keep the transcript readable in pipes/logs; a long one shortened on a terminal
-      else say(`${q}${multiline() ? collapsed(buffered.text) : buffered.text}\n`);
+      // (a dragged file by its name on a terminal).
+      else say(`${q}${multiline() ? collapsed(droppedShown(buffered.text)) : buffered.text}\n`);
       return Promise.resolve(buffered);
     }
     if (stdinClosed) {
@@ -1547,7 +1548,8 @@ export function looksLikePath(word: string): boolean {
  *  into it with Enter and waiting for the agent to read it, and what waits
  *  for the next turn (Tab, or a command). Exported for the tests. */
 export function turnNotes(steered: readonly string[], queued: ReadonlyArray<{ text: string }>): string[] {
-  return [...steered.map((t) => `waiting for the agent: ${oneLine(t)}`), ...queued.map((e) => `next turn: ${oneLine(e.text)}`)];
+  // A dragged file by its name (`[image: cat.png]`), not its path.
+  return [...steered.map((t) => `waiting for the agent: ${oneLine(droppedShown(t))}`), ...queued.map((e) => `next turn: ${oneLine(droppedShown(e.text))}`)];
 }
 
 /**
@@ -5269,6 +5271,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   const busyEntries = (view: TurnView, steering: Steering | null, onTake?: () => void) => (e: Entry): boolean => {
     const t = e.text.trim();
     if (!t) return true; // an empty Enter during a turn: nothing to send or queue
+    // A file dragged in goes with the message, which is not inserted into
+    // the turn: it waits for the next one (its path is no command either).
+    if (findDroppedFiles(t).some((p) => typeof p !== 'string')) return false;
     if (!e.multi && !e.pasted && t.startsWith('/')) {
       if (readOnlyCommand(t)) { runNow(t, view); return true; }
       view.note(`(${t.split(/\s+/)[0]} runs when this turn ends)`);
