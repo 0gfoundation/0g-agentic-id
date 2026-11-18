@@ -385,3 +385,15 @@ CREATE TABLE IF NOT EXISTS indexer_deadletters (
 -- Monotonic indexed ownership watermark fences grant admission against an
 -- outgoing Transfer observed while the API was still verifying its proof.
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS operator_transfer_block BIGINT NOT NULL DEFAULT 0;
+
+-- Accepted provider responses awaiting authority/binding recovery. No secrets.
+CREATE TABLE IF NOT EXISTS runtime_create_results (
+    seal_id BYTEA NOT NULL REFERENCES deployments(seal_id) ON DELETE CASCADE,
+    generation BIGINT NOT NULL CHECK (generation > 0),
+    sandbox_id TEXT NOT NULL CHECK (sandbox_id <> ''),
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (seal_id,generation,sandbox_id)
+);
+
+ALTER TABLE runtime_create_results ADD COLUMN IF NOT EXISTS last_attempt TIMESTAMPTZ;

@@ -18,7 +18,7 @@ export interface OperatorState {
   allowRecreate: boolean;
   /** Unix seconds; 0 means until replaced or revoked. */
   expiresAt: number;
-  /** Normally null. Grant writes separately request a fresh ownership checkpoint before signing. */
+  /** Normally null. Appointing an operator separately requests a fresh checkpoint; revocation signs null. */
   checkpoint: OperatorCheckpoint | null;
 }
 
@@ -56,5 +56,16 @@ export class OperatorConflictError extends Error {
   constructor(readonly sealId: Hash, readonly baseVersion: number, detail: string) {
     super(`operator authorization changed for ${sealId}; re-read getOperator() before retrying (base version ${baseVersion}). ${detail}`);
     this.name = 'OperatorConflictError';
+  }
+}
+
+/** The ownership checkpoint must be refreshed and explicitly signed again; never automatically retried. */
+export class OperatorCheckpointSupersededError extends Error {
+  readonly code = 'operator_checkpoint_superseded';
+  readonly status = 409;
+
+  constructor(readonly sealId: Hash, readonly baseVersion: number, detail: string, readonly minimumBlock?: number) {
+    super(`operator checkpoint for ${sealId} is no longer usable; explicitly refresh the checkpoint and sign a new setOperator() request${minimumBlock === undefined ? '' : ` at or after block ${minimumBlock}`}. ${detail}`);
+    this.name = 'OperatorCheckpointSupersededError';
   }
 }

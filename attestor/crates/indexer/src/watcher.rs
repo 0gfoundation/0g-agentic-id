@@ -19,8 +19,8 @@ use attestor_shared::{
     chain::AgenticID,
     repo::{load_checkpoint, save_checkpoint},
     types::{
-        derive_phase, AgentId, Deployment, DeploymentPhase, IDataArtifact, SealId, StageStatus,
-        StorageRoot,
+        derive_phase, AgentId, ChainIDataArtifact, Deployment, DeploymentPhase, IDataArtifact,
+        SealId, StageStatus, StorageRoot,
     },
     Config, CryptoModule, DeploymentRepo, EventBus, JobPayload, JobQueue, WsEvent,
 };
@@ -649,32 +649,23 @@ impl Watcher {
             .call()
             .await?
             ._0;
-        let artifacts: Vec<IDataArtifact> = datas
+        let artifacts: Vec<ChainIDataArtifact> = datas
             .into_iter()
             .enumerate()
             .map(|(index, data)| {
                 let (role, storage_root) = parse_description(&data.dataDescription);
-                let ciphertext = deployment
-                    .i_data
-                    .get(index)
-                    .filter(|old| {
-                        old.data_hash == data.dataHash && old.description == data.dataDescription
-                    })
-                    .map(|old| old.ciphertext.clone())
-                    .unwrap_or_default();
-                IDataArtifact {
+                ChainIDataArtifact {
                     role,
                     description: data.dataDescription,
                     storage_root,
                     sealed_key: keys.get(index).cloned().unwrap_or_default(),
                     data_hash: data.dataHash,
-                    ciphertext,
                 }
             })
             .collect();
         let count = artifacts.len();
         self.deployments
-            .update_i_data_artifacts(deployment.seal_id, artifacts)
+            .sync_chain_i_data(deployment.seal_id, artifacts)
             .await?;
         Ok(Some(count))
     }
@@ -1399,6 +1390,66 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_metadata_deadletter_retries_keep_one_cursor_and_original_log() {
+        let url = std::env::var("AGENTDNA_TEST_DATABASE_URL").expect("isolated DB URL");
+        let pool = attestor_shared::repo::connect(&url).await.unwrap();
+        let chain_id = 16602u64;
+        let hash = alloy::primitives::keccak256(attestor_shared::JobId::new_v4().as_bytes());
+        let contract = Address::from_slice(&hash.as_slice()[..20]);
+        let mut log = malformed_metadata();
+        log.inner.address = contract;
+        log.block_hash = Some(hash);
+        log.log_index = Some(7);
+        let original = serde_json::to_value(&log).unwrap();
+        let sink = PostgresMetadataDeadletters {
+            pool: pool.clone(),
+            chain_id,
+        };
+        sink.record(&log, "malformed_entry_updated").await.unwrap();
+        let mut replay = log.clone();
+        replay.inner.data = alloy::primitives::LogData::new_unchecked(
+            vec![AgenticID::Updated::SIGNATURE_HASH],
+            Bytes::from_static(b"reprocessed input"),
+        );
+        sink.record(&replay, "entry_index_not_in_current_data")
+            .await
+            .unwrap();
+
+        let rows: Vec<(i64, serde_json::Value, i64, Vec<u8>, Vec<u8>, i64, String)> =
+            sqlx::query_as(
+                "SELECT attempts,raw_log,chain_id,contract,block_hash,log_index,reason
+                 FROM indexer_deadletters WHERE block_hash=$1",
+            )
+            .bind(hash.as_slice())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "replaying the same event cursor is an upsert");
+        let (attempts, raw_log, stored_chain, stored_contract, stored_hash, index, reason) =
+            &rows[0];
+        assert_eq!(*attempts, 2);
+        assert_eq!(raw_log, &original, "retain the first event's provenance");
+        assert_eq!(*stored_chain, chain_id as i64);
+        assert_eq!(stored_contract.as_slice(), contract.as_slice());
+        assert_eq!(stored_hash.as_slice(), hash.as_slice());
+        assert_eq!(*index, 7);
+        assert_eq!(reason, "entry_index_not_in_current_data");
+        let deleted = sqlx::query(
+            "DELETE FROM indexer_deadletters
+             WHERE chain_id=$1 AND contract=$2 AND block_hash=$3 AND log_index=$4",
+        )
+        .bind(chain_id as i64)
+        .bind(contract.as_slice())
+        .bind(hash.as_slice())
+        .bind(7i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+    }
+
     fn entry_log(agent: AgentId, index: u64) -> alloy::rpc::types::Log {
         use alloy::sol_types::SolValue;
         let data = (
@@ -1639,6 +1690,26 @@ mod tests {
         let seal = B256::repeat_byte(0xb5);
         let agent = U256::from(85);
         seed_bound(&deployments, seal, agent, Address::repeat_byte(0x11));
+        // This is a retained, nonempty scratch snapshot. Completed deploys
+        // whose scratch was already cleared intentionally stay empty.
+        deployments
+            .by_seal
+            .lock()
+            .unwrap()
+            .get_mut(&seal)
+            .unwrap()
+            .i_data = vec![IDataArtifact {
+            role: "framework".into(),
+            description: serde_json::json!({"role":"framework"}).to_string(),
+            storage_root: StorageRoot {
+                root_hash: B256::repeat_byte(1),
+                indexer: "http://indexer.local".into(),
+                size: 5,
+            },
+            sealed_key: Bytes::new(),
+            data_hash: B256::repeat_byte(1),
+            ciphertext: Bytes::from_static(b"retry"),
+        }];
         let mut watcher = test_watcher(
             deployments.clone(),
             Arc::new(InMemoryEventBus::new()),
@@ -1668,6 +1739,7 @@ mod tests {
         assert_eq!(d.i_data.len(), 2);
         assert_eq!(d.i_data[1].role, "new_role");
         assert_eq!(d.i_data[1].sealed_key, Bytes::from_static(b"key-2"));
+        assert_eq!(d.i_data[0].ciphertext, Bytes::from_static(b"retry"));
         let (provider, rpc) = serve_idata_snapshot(
             vec![(
                 serde_json::json!({"role":"replacement"}).to_string(),
@@ -1695,6 +1767,70 @@ mod tests {
         assert_eq!(d.i_data.len(), 1);
         assert_eq!(d.i_data[0].role, "replacement");
         assert_eq!(d.i_data[0].sealed_key, Bytes::from_static(b"key-3"));
+        assert!(d.i_data[0].ciphertext.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mint_and_entry_updates_do_not_refill_completed_deploy_scratch() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let seal = B256::repeat_byte(0xb6);
+        let agent = U256::from(86);
+        seed_bound(&deployments, seal, agent, Address::repeat_byte(0x11));
+        let mut watcher = test_watcher(
+            deployments.clone(),
+            Arc::new(InMemoryEventBus::new()),
+            Arc::new(InMemoryJobQueue::new()),
+        );
+        watcher.canonical_addr = Address::repeat_byte(0x99);
+        let sink = Arc::new(MemoryMetadataDeadletters::default());
+        watcher.metadata_deadletters = sink.clone();
+        let roles = vec![
+            (
+                serde_json::json!({"role":"framework"}).to_string(),
+                B256::repeat_byte(1),
+            ),
+            (
+                serde_json::json!({"role":"new_role"}).to_string(),
+                B256::repeat_byte(2),
+            ),
+        ];
+        let (provider, rpc) = serve_idata_snapshot(roles.clone(), vec![Bytes::new(); 2], 100).await;
+        watcher.provider = provider;
+        watcher
+            .on_updated(
+                AgenticID::Updated {
+                    tokenId: agent,
+                    oldDatas: vec![],
+                    newDatas: vec![],
+                    sealedKeys: vec![],
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        rpc.await.unwrap();
+        assert!(deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .i_data
+            .is_empty());
+        let (provider, rpc) = serve_idata_snapshot(roles, vec![Bytes::new(); 2], 100).await;
+        watcher.provider = provider;
+        watcher.process_logs(&[entry_log(agent, 1)]).await.unwrap();
+        rpc.await.unwrap();
+        assert!(deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .i_data
+            .is_empty());
+        assert!(
+            sink.rows.lock().unwrap().is_empty(),
+            "chain length validates the new role even when scratch stays empty"
+        );
     }
 
     #[tokio::test]

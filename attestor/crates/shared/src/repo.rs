@@ -312,7 +312,10 @@ fn grant_checkpoint_number(grant: &crate::auth::operator::OperatorGrant) -> Opti
         .ok()?;
     let directive: crate::auth::operator::OperatorDirective =
         serde_json::from_slice(&bytes).ok()?;
-    directive.checkpoint.map(|checkpoint| checkpoint.number)
+    directive
+        .operator
+        .and(directive.checkpoint)
+        .map(|checkpoint| checkpoint.number)
 }
 
 /// Commit the exact cleanup target and all runtime retirement state together.
@@ -538,12 +541,6 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .bind(seal.as_slice())
         .fetch_one(&mut *tx)
         .await?;
-        if grant_checkpoint_number(&grant).is_some_and(|checkpoint| {
-            checkpoint
-                < u64::try_from(row.get::<i64, _>("operator_transfer_block")).unwrap_or(u64::MAX)
-        }) {
-            return Ok(None);
-        }
         let current: Option<i64> =
             sqlx::query_scalar("SELECT version FROM operator_grants WHERE seal_id=$1")
                 .bind(seal.as_slice())
@@ -551,6 +548,10 @@ impl DeploymentRepo for PostgresDeploymentRepo {
                 .await?;
         if current.unwrap_or(0) != base_version {
             return Ok(None);
+        }
+        let minimum_block = u64::try_from(row.try_get::<i64, _>("operator_transfer_block")?)?;
+        if grant_checkpoint_number(&grant).is_some_and(|checkpoint| checkpoint < minimum_block) {
+            return Err(crate::traits::OperatorCheckpointSuperseded { minimum_block }.into());
         }
         let retired_sandbox_id = row
             .try_get::<Option<String>, _>("sandbox_id")?
@@ -1062,6 +1063,31 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .bind(seal_id.as_slice())
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn sync_chain_i_data(
+        &self,
+        seal_id: SealId,
+        artifacts: Vec<ChainIDataArtifact>,
+    ) -> anyhow::Result<()> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        let row =
+            sqlx::query("SELECT storage_stage,i_data FROM deployments WHERE seal_id=$1 FOR UPDATE")
+                .bind(seal_id.as_slice())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(row) = row else { return Ok(()) };
+        let storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
+        let current: Vec<IDataArtifact> = serde_json::from_value(row.try_get("i_data")?)?;
+        if let Some(merged) = crate::types::merge_chain_i_data(&storage, &current, artifacts) {
+            sqlx::query("UPDATE deployments SET i_data=$2,updated_at=now() WHERE seal_id=$1")
+                .bind(seal_id.as_slice())
+                .bind(serde_json::to_value(merged)?)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3915,11 +3941,17 @@ mod operator_storage_tests {
         // The outgoing event can arrive while the initial API request is in
         // its historical RPC and before any grant row exists.
         repo.observe_operator_transfer(agent, 101).await.unwrap();
-        assert!(repo
+        let superseded = repo
             .compare_and_swap_operator(seal, 0, checkpoint_grant(seal, 1, Some(old)))
             .await
-            .unwrap()
-            .is_none());
+            .expect_err("an indexed transfer must distinguish a stale checkpoint");
+        assert_eq!(
+            superseded
+                .downcast_ref::<crate::traits::OperatorCheckpointSuperseded>()
+                .unwrap()
+                .minimum_block,
+            101
+        );
         assert!(repo.operator_grant(seal).await.unwrap().is_none());
         // A new block-end consent at the watermark is allowed, including
         // an ownership round trip wholly contained in this same block.
@@ -3949,11 +3981,17 @@ mod operator_storage_tests {
             .contains(&(seal, "floor-current".into())));
         // Replaying an older event never lowers the admission watermark.
         repo.observe_operator_transfer(agent, 100).await.unwrap();
-        assert!(repo
+        let superseded = repo
             .compare_and_swap_operator(seal, 2, checkpoint_grant(seal, 3, Some(current)))
             .await
-            .unwrap()
-            .is_none());
+            .expect_err("replayed events cannot lower the checkpoint floor");
+        assert_eq!(
+            superseded
+                .downcast_ref::<crate::traits::OperatorCheckpointSuperseded>()
+                .unwrap()
+                .minimum_block,
+            102
+        );
         let latest = OperatorCheckpoint {
             number: 102,
             hash: B256::repeat_byte(0x92),
@@ -3973,6 +4011,38 @@ mod operator_storage_tests {
             repo.boot_authorization(seal).await.unwrap().unwrap(),
             replacement
         );
+        // Version races are still the existing None outcome, even when the
+        // stale write also carries an old checkpoint.
+        assert!(repo
+            .compare_and_swap_operator(seal, 0, checkpoint_grant(seal, 1, Some(old)))
+            .await
+            .unwrap()
+            .is_none());
+        // Removing authority never requires a newer checkpoint. The caller's
+        // live owner signature/version still controls the revocation.
+        repo.observe_operator_transfer(agent, 103).await.unwrap();
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+        use base64::Engine as _;
+        let mut revoke = checkpoint_grant(seal, 4, Some(old));
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&revoke.signed_message_b64)
+            .unwrap();
+        let mut directive: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        directive["operator"] = serde_json::Value::Null;
+        let raw = serde_json::to_vec(&directive).unwrap();
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x15)).unwrap();
+        let signature: Vec<u8> = signer
+            .sign_hash_sync(&B256::from(crate::sandbox::eip191_digest(&raw)))
+            .unwrap()
+            .into();
+        revoke.signed_message_b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        revoke.signature = signature.into();
+        revoke.checkpoint_acceptance = None;
+        assert!(repo
+            .compare_and_swap_operator(seal, 3, revoke)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

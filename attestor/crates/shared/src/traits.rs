@@ -6,6 +6,33 @@ use crate::types::*;
 use alloy::primitives::{Address, Bytes, TxHash, B256};
 use async_trait::async_trait;
 
+pub const MAX_OPERATOR_CHECKPOINT_SPAN: u64 = 10_000;
+pub const OPERATOR_TRANSFER_LOG_CHUNK: u64 = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorContinuityRejection {
+    NonCanonical,
+    OwnerChanged,
+    TransferObserved,
+    CheckpointTooOld { maximum_span: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorContinuity {
+    Continuous {
+        snapshot: crate::auth::operator::OperatorCheckpoint,
+    },
+    RefreshRequired {
+        reason: OperatorContinuityRejection,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("operator checkpoint predates indexed ownership block {minimum_block}; fetch a new checkpoint and sign again")]
+pub struct OperatorCheckpointSuperseded {
+    pub minimum_block: u64,
+}
+
 // ── Chain ───────────────────────────────────────────────────────────────
 #[async_trait]
 pub trait ChainClient: Send + Sync {
@@ -29,8 +56,18 @@ pub trait ChainClient: Send + Sync {
     ) -> anyhow::Result<bool> {
         anyhow::bail!("checkpoint header reads are not implemented")
     }
-    /// None means the block is absent or no longer canonical. RPC failures
-    /// remain errors so callers cannot confuse unavailability with rejection.
+    /// Prove H's ownership from current state and the intervening Transfer
+    /// history. No state read at H is required on pruning RPC nodes.
+    async fn verify_operator_continuity(
+        &self,
+        _agent: AgentId,
+        _checkpoint: &crate::auth::operator::OperatorCheckpoint,
+        _owner: Address,
+    ) -> anyhow::Result<OperatorContinuity> {
+        anyhow::bail!("operator ownership continuity is not implemented")
+    }
+    /// Optional historical-state reader. None means a known hash mismatch or
+    /// no owner at H; missing headers/state and RPC failures remain errors.
     async fn owner_at_checkpoint(
         &self,
         _agent: AgentId,
@@ -496,6 +533,17 @@ pub trait DeploymentRepo: Send + Sync {
         seal_id: SealId,
         artifacts: Vec<IDataArtifact>,
     ) -> anyhow::Result<()>;
+
+    /// Reconcile chain metadata under the same row lock as scratch cleanup.
+    /// A confirmed, empty snapshot stays empty; retry ciphertext comes only
+    /// from the latest locked row, never from a caller's earlier read.
+    async fn sync_chain_i_data(
+        &self,
+        _seal_id: SealId,
+        _artifacts: Vec<ChainIDataArtifact>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("chain iData reconciliation is not implemented")
+    }
 
     /// Set `agent_uri` and `agent_card` together — used by (a) the worker
     /// after building+uploading the AgentCard JSON and calling setAgentURI,

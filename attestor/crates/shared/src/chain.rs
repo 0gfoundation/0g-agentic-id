@@ -15,7 +15,10 @@
 //! estimated explicitly before each tx.
 
 use crate::auth::operator::OperatorCheckpoint;
-use crate::traits::ChainClient;
+use crate::traits::{
+    ChainClient, OperatorContinuity, OperatorContinuityRejection, MAX_OPERATOR_CHECKPOINT_SPAN,
+    OPERATOR_TRANSFER_LOG_CHUNK,
+};
 use crate::types::*;
 use alloy::eips::{BlockId, BlockNumberOrTag, RpcBlockHash};
 use alloy::network::{Ethereum, EthereumWallet, Network, TransactionBuilder};
@@ -23,7 +26,7 @@ use alloy::primitives::B256;
 use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::fillers::{ChainIdFiller, NonceFiller, NonceManager};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{Filter, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolEvent};
@@ -596,6 +599,111 @@ where
         operator_checkpoint_is_canonical(&self.provider, checkpoint).await
     }
 
+    async fn verify_operator_continuity(
+        &self,
+        agent: AgentId,
+        checkpoint: &OperatorCheckpoint,
+        owner: Address,
+    ) -> anyhow::Result<OperatorContinuity> {
+        use OperatorContinuityRejection as Rejection;
+        let reject = |reason| OperatorContinuity::RefreshRequired { reason };
+        let snapshot = self.operator_checkpoint().await?;
+        anyhow::ensure!(
+            snapshot.number >= checkpoint.number,
+            "operator checkpoint is ahead of this RPC node; retry on a current node"
+        );
+        let span = snapshot.number - checkpoint.number;
+        if span > MAX_OPERATOR_CHECKPOINT_SPAN {
+            return Ok(reject(Rejection::CheckpointTooOld {
+                maximum_span: MAX_OPERATOR_CHECKPOINT_SPAN,
+            }));
+        }
+        if (snapshot.number == checkpoint.number && snapshot.hash != checkpoint.hash)
+            || (snapshot.number != checkpoint.number
+                && !self.is_checkpoint_canonical(checkpoint).await?)
+        {
+            return Ok(reject(Rejection::NonCanonical));
+        }
+
+        // Only this fresh snapshot's state is read. An old H may be past the
+        // node's historical-state retention window while its headers/logs remain.
+        let contract = AgenticID::new(self.contract_addr, self.provider.clone());
+        let observed_owner = match contract
+            .ownerOf(agent)
+            .block(BlockId::Hash(RpcBlockHash::from_hash(
+                snapshot.hash,
+                Some(true),
+            )))
+            .call()
+            .await
+        {
+            Ok(result) => Some(result._0),
+            Err(alloy::contract::Error::TransportError(error)) if is_execution_revert(&error) => {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut reason = (observed_owner != Some(owner)).then_some(Rejection::OwnerChanged);
+        if reason.is_none() && span != 0 {
+            let token_topic = B256::from(agent.to_be_bytes::<32>());
+            let mut from = checkpoint.number + 1;
+            loop {
+                let to = snapshot
+                    .number
+                    .min(from.saturating_add(OPERATOR_TRANSFER_LOG_CHUNK - 1));
+                let logs = self
+                    .provider
+                    .get_logs(
+                        &Filter::new()
+                            .address(self.contract_addr)
+                            .event_signature(AgenticID::Transfer::SIGNATURE_HASH)
+                            .topic3(token_topic)
+                            .from_block(from)
+                            .to_block(to),
+                    )
+                    .await?;
+                for log in &logs {
+                    let block = log.block_number.ok_or_else(|| {
+                        anyhow::anyhow!("Transfer history returned a log without a block number")
+                    })?;
+                    anyhow::ensure!(
+                        !log.removed
+                            && log.inner.address == self.contract_addr
+                            && block >= from
+                            && block <= to,
+                        "Transfer history returned an inconsistent log"
+                    );
+                    let transfer =
+                        AgenticID::Transfer::decode_log(&log.inner, true).map_err(|error| {
+                            anyhow::anyhow!("Transfer history returned an invalid event: {error}")
+                        })?;
+                    anyhow::ensure!(
+                        transfer.data.tokenId == agent,
+                        "Transfer history returned another token"
+                    );
+                }
+                if !logs.is_empty() {
+                    reason = Some(Rejection::TransferObserved);
+                    break;
+                }
+                if to == snapshot.number {
+                    break;
+                }
+                from = to + 1;
+            }
+        }
+        // A reorg while reading history makes this attempt unavailable rather
+        // than proving either continuity or a definitive ownership rejection.
+        anyhow::ensure!(
+            self.is_checkpoint_canonical(&snapshot).await?,
+            "operator ownership snapshot changed while checking history; retry"
+        );
+        Ok(match reason {
+            Some(reason) => reject(reason),
+            None => OperatorContinuity::Continuous { snapshot },
+        })
+    }
+
     async fn owner_at_checkpoint(
         &self,
         agent: AgentId,
@@ -1010,6 +1118,7 @@ mod tests {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = requests.clone();
         let server = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async move {
             for answer in answers {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
@@ -1046,6 +1155,7 @@ mod tests {
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
+            }).await.expect("JSON-RPC fixture exceeded its 5 second deadline");
         });
         (url, served, requests, server)
     }
@@ -1252,6 +1362,255 @@ mod tests {
         assert_eq!(chain.trust_registry().await.unwrap(), Some(registry));
         assert_eq!(served.load(SeqCst), 3, "errors are not kept; the answer is");
         server.await.unwrap();
+    }
+
+    fn continuity_answers(
+        h: OperatorCheckpoint,
+        t: OperatorCheckpoint,
+        owner: Address,
+    ) -> Vec<serde_json::Value> {
+        let mut answers = vec![checkpoint_block(t)];
+        if h.number != t.number {
+            answers.push(checkpoint_block(h));
+        }
+        answers.push(serde_json::json!({"result":format!("0x{}",hex::encode(owner.into_word()))}));
+        let span = t.number - h.number;
+        for _ in 0..span.div_ceil(OPERATOR_TRANSFER_LOG_CHUNK) {
+            answers.push(serde_json::json!({"result":[]}));
+        }
+        answers.push(checkpoint_block(t));
+        answers
+    }
+
+    #[tokio::test]
+    async fn operator_continuity_uses_current_state_and_bounded_transfer_history() {
+        let h = OperatorCheckpoint {
+            number: 10,
+            hash: B256::repeat_byte(0x81),
+        };
+        let t = OperatorCheckpoint {
+            number: 1035,
+            hash: B256::repeat_byte(0x82),
+        };
+        let owner = Address::repeat_byte(0x83);
+        let agent = U256::from(7);
+        let (url, _, requests, server) =
+            jsonrpc_peer_with_requests(continuity_answers(h, t, owner)).await;
+        assert_eq!(
+            chain_at(url)
+                .verify_operator_continuity(agent, &h, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::Continuous { snapshot: t }
+        );
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert_eq!(requests[0]["params"], serde_json::json!(["latest", false]));
+        assert_eq!(requests[1]["params"], serde_json::json!(["0xa", false]));
+        assert_eq!(requests[2]["method"], "eth_call");
+        assert_eq!(
+            requests[2]["params"][1],
+            serde_json::json!({"blockHash":t.hash,"requireCanonical":true})
+        );
+        for (position, (from, to)) in [(11, 522), (523, 1034), (1035, 1035)]
+            .into_iter()
+            .enumerate()
+        {
+            let request = &requests[position + 3];
+            assert_eq!(request["method"], "eth_getLogs");
+            let filter = &request["params"][0];
+            assert_eq!(filter["address"], serde_json::json!(AGENTIC_ID));
+            assert_eq!(filter["fromBlock"], format!("0x{from:x}"));
+            assert_eq!(filter["toBlock"], format!("0x{to:x}"));
+            assert_eq!(
+                filter["topics"],
+                serde_json::json!([
+                    AgenticID::Transfer::SIGNATURE_HASH,
+                    null,
+                    null,
+                    B256::from(agent.to_be_bytes::<32>())
+                ])
+            );
+        }
+        assert_eq!(requests[6]["method"], "eth_getBlockByNumber");
+        assert_eq!(requests[6]["params"], serde_json::json!(["0x40b", false]));
+    }
+
+    #[tokio::test]
+    async fn operator_continuity_rejects_aba_but_accepts_the_post_block_challenge() {
+        let h = OperatorCheckpoint {
+            number: 100,
+            hash: B256::repeat_byte(0x84),
+        };
+        let t = OperatorCheckpoint {
+            number: 102,
+            hash: B256::repeat_byte(0x85),
+        };
+        let owner = Address::repeat_byte(0x86);
+        let buyer = Address::repeat_byte(0x87);
+        let agent = U256::from(8);
+        let mut answers = continuity_answers(h, t, owner);
+        let log = |from, to, block| alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: AGENTIC_ID,
+                data: AgenticID::Transfer {
+                    from,
+                    to,
+                    tokenId: agent,
+                }
+                .encode_log_data(),
+            },
+            block_number: Some(block),
+            block_hash: Some(B256::repeat_byte(block as u8)),
+            ..Default::default()
+        };
+        answers[3] = serde_json::json!({"result":[log(owner,buyer,101),log(buyer,owner,102)]});
+        let (url, _, _, server) = jsonrpc_peer_with_requests(answers).await;
+        assert_eq!(
+            chain_at(url)
+                .verify_operator_continuity(agent, &h, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::RefreshRequired {
+                reason: OperatorContinuityRejection::TransferObserved
+            }
+        );
+        server.await.unwrap();
+        // T's block-end checkpoint includes both transfers, even if they were
+        // in this one block. No earlier logs are scanned for a new signature.
+        let (url, _, requests, server) =
+            jsonrpc_peer_with_requests(continuity_answers(t, t, owner)).await;
+        assert_eq!(
+            chain_at(url)
+                .verify_operator_continuity(agent, &t, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::Continuous { snapshot: t }
+        );
+        server.await.unwrap();
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request["method"] != "eth_getLogs"));
+    }
+
+    #[tokio::test]
+    async fn operator_continuity_distinguishes_refresh_inputs_from_unavailable_rpc() {
+        let h = OperatorCheckpoint {
+            number: 100,
+            hash: B256::repeat_byte(0x88),
+        };
+        let t = OperatorCheckpoint {
+            number: 102,
+            hash: B256::repeat_byte(0x89),
+        };
+        let owner = Address::repeat_byte(0x8a);
+        let agent = U256::from(9);
+        let (url, _, _, server) =
+            jsonrpc_peer_with_requests(vec![checkpoint_block(OperatorCheckpoint {
+                number: 99,
+                ..t
+            })])
+            .await;
+        assert!(chain_at(url)
+            .verify_operator_continuity(agent, &h, owner)
+            .await
+            .is_err());
+        server.await.unwrap();
+        let old = OperatorCheckpoint { number: 0, ..h };
+        let far = OperatorCheckpoint {
+            number: MAX_OPERATOR_CHECKPOINT_SPAN + 1,
+            ..t
+        };
+        let (url, _, requests, server) =
+            jsonrpc_peer_with_requests(vec![checkpoint_block(far)]).await;
+        assert_eq!(
+            chain_at(url)
+                .verify_operator_continuity(agent, &old, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::RefreshRequired {
+                reason: OperatorContinuityRejection::CheckpointTooOld {
+                    maximum_span: MAX_OPERATOR_CHECKPOINT_SPAN
+                }
+            }
+        );
+        server.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let (url, _, _, server) = jsonrpc_peer_with_requests(vec![
+            checkpoint_block(t),
+            checkpoint_block(OperatorCheckpoint {
+                hash: B256::repeat_byte(0xff),
+                ..h
+            }),
+        ])
+        .await;
+        assert_eq!(
+            chain_at(url)
+                .verify_operator_continuity(agent, &h, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::RefreshRequired {
+                reason: OperatorContinuityRejection::NonCanonical
+            }
+        );
+        server.await.unwrap();
+        for failure in [1, 2, 3, 4] {
+            let mut answers = continuity_answers(h, t, owner);
+            answers[failure] = if failure == 4 {
+                checkpoint_block(OperatorCheckpoint {
+                    hash: B256::repeat_byte(0xff),
+                    ..t
+                })
+            } else if failure == 1 {
+                serde_json::json!({"result":null})
+            } else {
+                serde_json::json!({"error":{"code":-32603,"message":"RPC unavailable"}})
+            };
+            answers.truncate(failure + 1);
+            let (url, _, _, server) = jsonrpc_peer_with_requests(answers).await;
+            assert!(
+                chain_at(url)
+                    .verify_operator_continuity(agent, &h, owner)
+                    .await
+                    .is_err(),
+                "failure at RPC {failure} must not become an invalid-checkpoint rejection"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_operator_continuity_never_needs_pruned_historical_state() {
+        let chain = crate::mocks::MockChain::new();
+        let owner = Address::repeat_byte(0x8b);
+        chain.set_owner_of(owner);
+        let h = chain.operator_checkpoint().await.unwrap();
+        let t = OperatorCheckpoint {
+            number: 1000,
+            hash: B256::repeat_byte(0x8c),
+        };
+        chain.set_operator_checkpoint(t);
+        chain.set_checkpoint_owner_failure(true);
+        assert_eq!(
+            chain
+                .verify_operator_continuity(U256::from(1), &h, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::Continuous { snapshot: t }
+        );
+        chain.set_operator_transfers(U256::from(1), vec![2, 3]);
+        assert_eq!(
+            chain
+                .verify_operator_continuity(U256::from(1), &h, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::RefreshRequired {
+                reason: OperatorContinuityRejection::TransferObserved
+            }
+        );
     }
 
     // ── check_verified_feedback_anchor ─────────────────────────────────

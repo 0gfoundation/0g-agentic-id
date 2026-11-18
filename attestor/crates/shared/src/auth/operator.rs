@@ -49,7 +49,7 @@ pub struct OperatorGrant {
     pub owner: Address,
     pub signed_message_b64: String,
     pub signature: Bytes,
-    /// Records successful historical-owner admission for this exact grant.
+    /// Records successful checkpoint-ownership admission for this exact grant.
     /// This is a server-side cache, not an attestation against a malicious DB.
     #[serde(default)]
     pub checkpoint_acceptance: Option<B256>,
@@ -290,7 +290,7 @@ pub fn verify_operator_grant_metadata(
         grant.version == d.base_version + 1,
         "operator grant version no longer valid"
     );
-    if d.checkpoint.is_some() {
+    if d.operator.is_some() && d.checkpoint.is_some() {
         anyhow::ensure!(
             grant.checkpoint_acceptance == Some(checkpoint_acceptance_digest(grant)?),
             "operator checkpoint admission is missing or does not match this grant; renew the authorization"
@@ -299,8 +299,8 @@ pub fn verify_operator_grant_metadata(
     Ok(d)
 }
 
-/// Accepted grants need only historical headers at runtime. The historical
-/// owner is checked once at PUT, so state pruning cannot disable a grant.
+/// Accepted grants need only historical headers at runtime. Checkpoint
+/// ownership is admitted once at PUT, without requiring historical state.
 pub async fn validate_operator_checkpoint(
     chain: &dyn ChainClient,
     directive: &OperatorDirective,

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { privateKeyToAccount } from 'viem/accounts';
 import { recoverMessageAddress } from 'viem';
-import { AgentDNA, AttestorClient, OPERATOR_DOMAIN, OperatorConflictError } from '../dist/index.js';
+import { AgentDNA, AttestorClient, OPERATOR_DOMAIN, OperatorConflictError, OperatorCheckpointSupersededError } from '../dist/index.js';
 
 const OWNER = privateKeyToAccount(`0x${'11'.repeat(32)}`); // fixture: privacy-check: allow
 const OPERATOR = privateKeyToAccount(`0x${'22'.repeat(32)}`); // fixture: privacy-check: allow
@@ -21,6 +21,7 @@ async function server(t, initial = {}) {
   };
   const puts = [], posts = [], signed = [], reads = [], operatorReads = [];
   let putStatus = 200;
+  let putError;
   let getStatus = 200;
   let checkpointStatus = 200;
   let lifecycleStatus = 202;
@@ -44,7 +45,7 @@ async function server(t, initial = {}) {
       if (req.method === 'PUT' && url.pathname === '/operator') {
         const body = JSON.parse(Buffer.concat(chunks).toString());
         puts.push(body);
-        if (putStatus !== 200) return json(putStatus, { error: 'operator version changed', version: state.version });
+        if (putStatus !== 200) return json(putStatus, putError ?? { error: { code: 'conflict', message: 'operator version changed' }, version: state.version });
         const document = JSON.parse(Buffer.from(body.signed_message_b64, 'base64').toString());
         Object.assign(state, {
           operator: document.operator, version: state.version + 1, expires_at: document.expires_at,
@@ -84,7 +85,7 @@ async function server(t, initial = {}) {
     } },
   });
   return { state, puts, posts, signed, reads, operatorReads, base, client: (account) => new AttestorClient(ctx(account)),
-    failPut: (code) => { putStatus = code; }, failGet: (code) => { getStatus = code; },
+    failPut: (code, body) => { putStatus = code; putError = body; }, failGet: (code) => { getStatus = code; },
     failCheckpoint: (code) => { checkpointStatus = code; },
     failLifecycle: (code) => { lifecycleStatus = code; } };
 }
@@ -117,9 +118,9 @@ test('owner appoints and revokes an operator with domain-separated CAS signature
   assert.equal(revoke.operator, null);
   assert.equal(revoke.allow_recreate, false);
   assert.equal(revoke.expires_at, 0);
-  assert.deepEqual(revoke.checkpoint, CHECKPOINT);
+  assert.equal(revoke.checkpoint, null);
   assert.equal(revoked.operator, null);
-  assert.deepEqual(f.operatorReads, ['true', null, 'true', null], 'each write has one anchor read and one metadata re-read');
+  assert.deepEqual(f.operatorReads, ['true', null, null, null], 'only appointment reads an anchor; revoke reads ordinary metadata');
   assert.equal(updated.checkpoint, null);
   assert.equal(revoked.checkpoint, null);
 });
@@ -131,9 +132,33 @@ test('an operator cannot appoint itself; invalid grants and stale writes never s
   await assert.rejects(f.client(OWNER).setOperator(SEAL, OPERATOR.address, { expiresAt: -1 }), /future Unix/);
   assert.equal(f.signed.length, 0);
   f.failPut(409);
-  await assert.rejects(f.client(OWNER).setOperator(SEAL, OPERATOR.address, { baseVersion: 1 }), OperatorConflictError);
+  await assert.rejects(f.client(OWNER).setOperator(SEAL, OPERATOR.address, { baseVersion: 1 }), (error) => {
+    assert.ok(error instanceof OperatorConflictError);
+    assert.equal(error instanceof OperatorCheckpointSupersededError, false);
+    return true;
+  });
   assert.equal(f.puts.length, 1);
   assert.equal(f.signed.length, 1);
+});
+
+test('a superseded checkpoint is distinct from a version conflict and requires explicit refresh and re-signing', async (t) => {
+  for (const minimum of [456, undefined, Number.MAX_SAFE_INTEGER + 1, -1]) {
+    const f = await server(t);
+    f.failPut(409, { error: { code: 'operator_checkpoint_superseded', message: 'fetch a new checkpoint and sign again' },
+      ...(minimum === undefined ? {} : { minimum_block: minimum }) });
+    await assert.rejects(f.client(OWNER).setOperator(SEAL, OPERATOR.address), (error) => {
+      assert.ok(error instanceof OperatorCheckpointSupersededError);
+      assert.equal(error instanceof OperatorConflictError, false);
+      assert.equal(error.code, 'operator_checkpoint_superseded');
+      assert.equal(error.status, 409);
+      assert.equal(error.minimumBlock, Number.isSafeInteger(minimum) && minimum >= 0 ? minimum : undefined);
+      assert.match(error.message, /explicitly refresh.*sign a new setOperator/);
+      return true;
+    });
+    assert.equal(f.signed.length, 1);
+    assert.equal(f.puts.length, 1);
+    assert.deepEqual(f.operatorReads, ['true'], 'the SDK neither refreshes nor re-signs automatically');
+  }
 });
 
 test('grant writes require and sign the exact checkpoint supplied by the lookup', async (t) => {
@@ -166,7 +191,7 @@ test('unsafe checkpoint numbers and malformed block hashes are rejected before s
   assert.equal(f.puts.length, 0);
 });
 
-test('checkpoint outages refuse grant writes before signing but do not block ordinary lifecycle metadata', async (t) => {
+test('checkpoint outages refuse appointment but do not block lifecycle metadata or null-checkpoint revocation', async (t) => {
   const f = await server(t, { sandbox_id: 'current-runtime', settings_version: 1 });
   f.failCheckpoint(503);
   for (const account of [OWNER, OPERATOR]) {
@@ -177,10 +202,19 @@ test('checkpoint outages refuse grant writes before signing but do not block ord
   assert.deepEqual(f.operatorReads, [null, null, null, null]);
   const signatures = f.signed.length;
   await assert.rejects(f.client(OWNER).setOperator(SEAL, OPERATOR.address), /HTTP 503.*operator_checkpoint_unavailable/);
-  await assert.rejects(f.client(OWNER).revokeOperator(SEAL), /HTTP 503.*operator_checkpoint_unavailable/);
   assert.equal(f.signed.length, signatures);
   assert.equal(f.puts.length, 0);
-  assert.deepEqual(f.operatorReads, [null, null, null, null, 'true', 'true'], 'no retry or metadata fallback for a failed anchor read');
+  assert.deepEqual(f.operatorReads, [null, null, null, null, 'true'], 'no retry or metadata fallback for a failed anchor read');
+  await assert.rejects(f.client(OPERATOR).revokeOperator(SEAL), /current NFT owner/);
+  assert.equal(f.signed.length, signatures);
+  await f.client(OWNER).revokeOperator(SEAL);
+  assert.equal(f.signed.length, signatures + 1);
+  assert.equal(f.puts.length, 1);
+  const revoked = JSON.parse(Buffer.from(f.puts[0].signed_message_b64, 'base64').toString());
+  assert.equal(revoked.checkpoint, null);
+  assert.equal(revoked.operator, null);
+  assert.equal(revoked.base_version, 4);
+  assert.deepEqual(f.operatorReads, [null, null, null, null, 'true', null, null, null]);
 });
 
 test('operator pays under its signature while boot authority stays bound to the NFT owner', async (t) => {

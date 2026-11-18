@@ -85,35 +85,45 @@ cleanup through a persisted outbox. A new operator cannot assume control of the
 previous operator's sandbox or balance. Provision again after an update.
 
 Writes compare the signed base version. A competing write raises
-`OperatorConflictError`; the SDK never silently retries. Operator lifecycle
+`OperatorConflictError`. A superseded ownership checkpoint instead raises
+`OperatorCheckpointSupersededError`, with `code: 'operator_checkpoint_superseded'`
+and an optional `minimumBlock`. Refresh the checkpoint and explicitly approve a
+new `setOperator()` signature; the SDK never automatically retries or re-signs.
+Operator lifecycle
 signatures also bind the agent, chain, contract and grant version. Old queued
 requests do not become valid again when the same wallet is reappointed.
 Authorization is checked again before execution; an operation already sent to the
 provider may still complete.
 
-Only set/revoke request `GET /operator?seal_id=...&checkpoint=true` for the current
+Only `setOperator` requests `GET /operator?seal_id=...&checkpoint=true` for the current
 version and a fresh end-of-block checkpoint. The owner signs that exact block
 number and hash. The SDK rejects unsafe JavaScript block numbers, malformed hashes
 and missing checkpoints rather than inventing one. A successful write then
 re-reads ordinary metadata: one anchor GET, one PUT and one metadata GET, with no
 automatic retry or re-signing if the anchor is unavailable.
 
-Grant writes require an RPC able to read the anchor's historical owner before
-that state is pruned. The attestor records acceptance bound to the signed proof,
-signature and grant version. Later execution checks that acceptance, the anchor's
-canonical header, live owner and current grant; it does not repeat the historical
-owner query, so long-running grants do not require an archive RPC. This stored
-acceptance is an admission fact, not an additional cryptographic proof. An older
-anchored grant without it requires the owner to sign a new grant once; no
-acceptance is inferred from the existing signature alone.
+`revokeOperator` reads ordinary metadata for the owner and base version, signs
+`checkpoint: null`, then re-reads ordinary metadata after PUT. Revocation does not
+request a new anchor or depend on Transfer-log availability; it still requires
+the current owner's fresh, scoped signature and the matching base version.
+
+For appointment, the attestor verifies the owner at a fresh snapshot `T` and that
+no Transfer occurred after the signed anchor `H` through `T`. It reads canonical
+headers and Transfer logs, not historical state at `H`, so state pruning does not
+shorten the five-minute `issued_at` signing window. Validation spans at most
+10,000 blocks; an older checkpoint or an intervening Transfer requires an
+explicit refresh and new signature. Neither grant writes nor later execution
+require an archive RPC. The attestor records acceptance bound to the signed
+proof, signature and grant version. Later execution uses that admission fact,
+one canonical-header lookup, live ownership and the current grant; acceptance is
+not an additional cryptographic proof.
 
 New anchors use the latest block, not a delayed confirmed block. Missing headers
 or an RPC lag return HTTP 503; a hash mismatch rejects the grant. A delayed indexer
 event in block `H` or earlier does not erase a grant anchored to the end of `H`.
 An indexed ownership transfer after `H` invalidates it. Revoking a transfer away
 and back to the same wallet depends on the indexer catching up; live owner checks
-alone cannot detect that round trip. Older stored proofs without a signed checkpoint are treated
-conservatively; an unsigned checkpoint is never added to an old proof.
+alone cannot detect that round trip.
 
 Each lifecycle call resolves its operator authority and deployment at most once
 and reuses that request's data for sandbox routing and owner-only model planning.
@@ -136,6 +146,9 @@ channel.
 
 When an accepted create finishes, the worker rechecks its owner, grant and boot
 generation. Expiry of the original request envelope alone does not discard it.
+If a dependency is temporarily unavailable, the worker retries within a bound
+and retains the created sandbox durably for later revalidation. Cleanup follows
+an explicit rejection of authority or boot generation, not a dependency outage.
 The grant's own `expiresAt` remains a permission boundary: if it expires during
 create, the result cannot be bound to the agent. The worker never extends it to
 finish an operation.
@@ -144,3 +157,7 @@ This feature adds authorization, not an idle scheduler or an always-on wake
 gateway. Stop keeps its existing semantics: it does not add a final state flush
 or guarantee that no task is running. An application must make those decisions
 before requesting a stop.
+
+If the database cannot save an accepted create result after bounded retries, the
+worker preserves the sandbox and reports its ID for operator intervention.
+Automatic recovery requires that persisted result.

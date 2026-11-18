@@ -13,7 +13,7 @@ import { getAddress, hexToBytes, isAddress, keccak256 } from 'viem';
 import { requireWallet, type Ctx, type AttestorPublicConfig } from './context';
 import { listInferenceProviders, ProviderRegistryClient, routeHash, registrySigningMessage, acceptedRegistryDigest, validateProvider, type InferenceProvider, type ProviderRegistrySnapshot } from './Providers';
 import { SDK_VERSION } from './constants';
-import { OPERATOR_DOMAIN, OperatorConflictError, assertOperatorComputeOptions, type OperatorOptions, type OperatorState, type RuntimeBinding } from './Operators';
+import { OPERATOR_DOMAIN, OperatorConflictError, OperatorCheckpointSupersededError, assertOperatorComputeOptions, type OperatorOptions, type OperatorState, type RuntimeBinding } from './Operators';
 import { agenticIDAbi, cloneGateAbi, tappRegistryAbi } from './abi';
 import {
   canonicalSettings, modelAdvisory, settingsAuthMessage, SettingsConflictError, sha256Hex,
@@ -523,9 +523,9 @@ export class AttestorClient {
 
   private async writeOperator(sealId: `0x${string}`, operator: Address | null, opts: OperatorOptions): Promise<OperatorState> {
     const { account, walletClient } = requireWallet(this.ctx);
-    const current = await this.fetchOperator(sealId, true);
+    const current = await this.fetchOperator(sealId, operator !== null);
     if (getAddress(account.address) !== current.owner) throw new Error('operator authorization requires the current NFT owner');
-    if (!current.checkpoint) {
+    if (operator !== null && !current.checkpoint) {
       throw new Error('operator authorization requires a minted agent and an ownership checkpoint from the attestor');
     }
     const base = opts.baseVersion ?? current.version;
@@ -547,7 +547,7 @@ export class AttestorClient {
       owner: account.address, base_version: base, operator,
       allow_recreate: operator === null ? false : opts.allowRecreate ?? false,
       expires_at: expiry, issued_at: Math.floor(Date.now() / 1000),
-      checkpoint: current.checkpoint,
+      checkpoint: operator === null ? null : current.checkpoint,
     });
     const signature = await walletClient.signMessage({ account, message: canonical });
     const res = await fetch(`${this.baseUrl()}/operator`, {
@@ -556,7 +556,16 @@ export class AttestorClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      if (res.status === 409) throw new OperatorConflictError(sealId, base, text);
+      if (res.status === 409) {
+        let body: { error?: { code?: unknown }; minimum_block?: unknown } | undefined;
+        try { body = JSON.parse(text); } catch { /* Preserve the ordinary conflict for non-JSON responses. */ }
+        if (body?.error?.code === 'operator_checkpoint_superseded') {
+          const minimum = body.minimum_block;
+          throw new OperatorCheckpointSupersededError(sealId, base, text,
+            Number.isSafeInteger(minimum) && Number(minimum) >= 0 ? minimum as number : undefined);
+        }
+        throw new OperatorConflictError(sealId, base, text);
+      }
       throw new Error(`/operator failed: HTTP ${res.status} ${text}`);
     }
     // Re-read public routing metadata after the write.

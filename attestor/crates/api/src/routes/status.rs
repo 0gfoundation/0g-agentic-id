@@ -923,6 +923,7 @@ mod tests {
             events: s.state.events.clone(),
             oss: attestor_shared::oss::OssClient::for_test(),
             credentials: s.state.credentials.clone(),
+            runtime_creates: attestor_shared::runtime_creates::in_memory(),
         };
         // The owner's stop and start name the row's sandbox.
         let canonical = json!({

@@ -8,6 +8,7 @@ use attestor_shared::auth::operator::{
     checkpoint_acceptance_digest, verify_operator_directive, verify_operator_grant,
     OperatorCheckpoint, OperatorGrant,
 };
+use attestor_shared::traits::{OperatorCheckpointSuperseded, OperatorContinuity};
 use attestor_shared::{Deployment, SealId};
 use axum::extract::{Query, State};
 use axum::Json;
@@ -118,6 +119,24 @@ fn checkpoint_unavailable(error: anyhow::Error) -> ApiError {
     error
 }
 
+fn checkpoint_superseded(minimum_block: Option<u64>) -> ApiError {
+    let mut error = ApiError::conflict(
+        "operator checkpoint no longer establishes uninterrupted ownership; fetch a new checkpoint and sign again",
+    );
+    error.code = "operator_checkpoint_superseded";
+    if let Some(minimum_block) = minimum_block {
+        error = error.with_details(serde_json::json!({"minimum_block":minimum_block}));
+    }
+    error
+}
+
+fn operator_write_error(error: anyhow::Error) -> ApiError {
+    match error.downcast::<OperatorCheckpointSuperseded>() {
+        Ok(superseded) => checkpoint_superseded(Some(superseded.minimum_block)),
+        Err(error) => error.into(),
+    }
+}
+
 pub async fn handle_set(
     State(state): State<AppState>,
     Json(request): Json<WriteRequest>,
@@ -136,21 +155,6 @@ pub async fn handle_set(
         state.crypto.as_ref(),
     )
     .map_err(|e| ApiError::unauthorized(format!("operator authorization: {e}")))?;
-    let Some(checkpoint) = directive.checkpoint.as_ref() else {
-        return Err(ApiError::bad_request(
-            "operator directive must include a chain checkpoint",
-        ));
-    };
-    let checkpoint_owner = state
-        .chain
-        .owner_at_checkpoint(agent, checkpoint)
-        .await
-        .map_err(checkpoint_unavailable)?;
-    if checkpoint_owner != Some(owner) {
-        return Err(ApiError::unauthorized(
-            "operator checkpoint is not canonical or names a different owner",
-        ));
-    }
     let now = Utc::now().timestamp();
     if now.abs_diff(directive.issued_at) > 300 {
         return Err(ApiError::unauthorized(
@@ -177,7 +181,23 @@ pub async fn handle_set(
             "revocation requires allow_recreate=false and expires_at=0",
         ));
     }
-    // The historical RPC can take long enough for ownership to change. This
+    if directive.operator.is_some() {
+        let Some(checkpoint) = directive.checkpoint.as_ref() else {
+            return Err(ApiError::bad_request(
+                "operator directive must include a chain checkpoint",
+            ));
+        };
+        match state
+            .chain
+            .verify_operator_continuity(agent, checkpoint, owner)
+            .await
+            .map_err(checkpoint_unavailable)?
+        {
+            OperatorContinuity::Continuous { .. } => {}
+            OperatorContinuity::RefreshRequired { .. } => return Err(checkpoint_superseded(None)),
+        }
+    }
+    // Continuity verification can take long enough for ownership to change. This
     // fresh read supplements the repository's indexed-transfer height fence.
     let current_owner =
         attestor_shared::auth::operator::live_owner(state.chain.as_ref(), &deployment)
@@ -195,11 +215,14 @@ pub async fn handle_set(
         signature: request.signature,
         checkpoint_acceptance: None,
     };
-    grant.checkpoint_acceptance = Some(checkpoint_acceptance_digest(&grant)?);
+    if directive.operator.is_some() {
+        grant.checkpoint_acceptance = Some(checkpoint_acceptance_digest(&grant)?);
+    }
     let Some(update) = state
         .deployments
         .compare_and_swap_operator(request.seal_id, directive.base_version, grant)
-        .await?
+        .await
+        .map_err(operator_write_error)?
     else {
         let current = state.deployments.operator_grant(request.seal_id).await?;
         return Err(
@@ -241,6 +264,7 @@ mod tests {
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
         MockChain,
     };
+    use attestor_shared::traits::OperatorContinuityRejection;
     use attestor_shared::{
         derive_phase, AgentId, ChainClient, CloneFromParams, Config, DeployRequest, DeploymentRepo,
         IDataInput, ImageHash, IntelligentData, JobPayload, LifecycleRequest, MintParams,
@@ -291,11 +315,22 @@ mod tests {
             id: AgentId,
             checkpoint: &OperatorCheckpoint,
         ) -> anyhow::Result<Option<Address>> {
-            let owner = self.inner.owner_at_checkpoint(id, checkpoint).await?;
+            self.inner.owner_at_checkpoint(id, checkpoint).await
+        }
+        async fn verify_operator_continuity(
+            &self,
+            id: AgentId,
+            checkpoint: &OperatorCheckpoint,
+            expected_owner: Address,
+        ) -> anyhow::Result<OperatorContinuity> {
+            let continuity = self
+                .inner
+                .verify_operator_continuity(id, checkpoint, expected_owner)
+                .await?;
             if let Some(next_owner) = self.owner_after_checkpoint.lock().unwrap().take() {
                 self.inner.set_owner_of(next_owner);
             }
-            Ok(owner)
+            Ok(continuity)
         }
         async fn is_checkpoint_canonical(
             &self,
@@ -687,7 +722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_operator_writes_require_a_canonical_owner_checkpoint() {
+    async fn new_operator_writes_require_uninterrupted_checkpoint_ownership() {
         let s = setup();
         let summary = handle_get(
             State(s.state.clone()),
@@ -721,7 +756,7 @@ mod tests {
                 .is_none());
         }
         s.chain
-            .set_checkpoint_owner(Some(Address::repeat_byte(0x99)));
+            .set_operator_continuity_rejection(Some(OperatorContinuityRejection::TransferObserved));
         let error = handle_set(
             State(s.state.clone()),
             Json(request(
@@ -732,7 +767,8 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "operator_checkpoint_superseded");
         assert!(s
             .deployments
             .operator_grant(s.seal_id)
@@ -803,14 +839,108 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error.code, "operator_checkpoint_unavailable");
-        let error = handle_set(
+        let revoked = handle_set(
             State(s.state.clone()),
             Json(request(&s, &OWNER_KEY, &directive(&s, 1, None, false))),
         )
         .await
-        .unwrap_err();
-        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        .unwrap()
+        .0;
+        assert_eq!(revoked.operator, None);
+        assert_eq!(revoked.version, 2);
         assert_eq!(s.jobs.submitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn new_grant_admission_does_not_require_historical_owner_state() {
+        let s = setup();
+        s.chain.set_checkpoint_owner_failure(true);
+        let summary = appoint(&s, 0, false).await;
+        assert_eq!(summary.operator, Some(s.operator));
+        let grant = s
+            .deployments
+            .operator_grant(s.seal_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            grant.checkpoint_acceptance,
+            Some(checkpoint_acceptance_digest(&grant).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_ignores_missing_or_old_checkpoints_and_checkpoint_dependencies() {
+        for include_checkpoint in [false, true] {
+            let s = setup();
+            appoint(&s, 0, false).await;
+            s.deployments
+                .observe_operator_transfer(alloy::primitives::U256::from(1), 2)
+                .await
+                .unwrap();
+            s.chain.set_operator_checkpoint_failure(true);
+            s.chain.set_checkpoint_owner_failure(true);
+            s.chain.set_checkpoint_canonical_failure(true);
+            s.chain.set_operator_continuity_failure(true);
+            let mut value = directive(&s, 1, None, false);
+            if !include_checkpoint {
+                value.as_object_mut().unwrap().remove("checkpoint");
+            }
+            let summary = handle_set(
+                State(s.state.clone()),
+                Json(request(&s, &OWNER_KEY, &value)),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(summary.operator, None);
+            assert_eq!(summary.version, 2);
+            let grant = s
+                .deployments
+                .operator_grant(s.seal_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(grant.checkpoint_acceptance, None);
+            let parsed = attestor_shared::auth::operator::verify_operator_grant_metadata(
+                &grant,
+                s.owner,
+                s.state.cfg.chain_id,
+                s.state.cfg.agentic_id_addr,
+                s.seal_id,
+                s.state.crypto.as_ref(),
+            )
+            .unwrap();
+            assert_eq!(parsed.operator, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_floor_conflict_has_a_distinct_http_error() {
+        let s = setup();
+        s.deployments
+            .observe_operator_transfer(alloy::primitives::U256::from(1), 2)
+            .await
+            .unwrap();
+        let error = handle_set(
+            State(s.state.clone()),
+            Json(request(
+                &s,
+                &OWNER_KEY,
+                &directive(&s, 0, Some(s.operator), false),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "operator_checkpoint_superseded");
+        assert_eq!(error.details.unwrap()["minimum_block"], 2);
+        assert!(s
+            .deployments
+            .operator_grant(s.seal_id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -913,9 +1043,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_historical_admission_never_creates_an_accepted_grant() {
+    async fn failed_continuity_admission_never_creates_an_accepted_grant() {
         let s = setup();
-        s.chain.set_checkpoint_owner_failure(true);
+        s.chain.set_operator_continuity_failure(true);
         let error = handle_set(
             State(s.state.clone()),
             Json(request(
@@ -933,9 +1063,9 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        s.chain.set_checkpoint_owner_failure(false);
+        s.chain.set_operator_continuity_failure(false);
         s.chain
-            .set_checkpoint_owner(Some(Address::repeat_byte(0x99)));
+            .set_operator_continuity_rejection(Some(OperatorContinuityRejection::TransferObserved));
         let error = handle_set(
             State(s.state.clone()),
             Json(request(
@@ -946,7 +1076,8 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "operator_checkpoint_superseded");
         assert!(s
             .deployments
             .operator_grant(s.seal_id)
@@ -956,7 +1087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ownership_change_during_historical_verification_prevents_grant_commit() {
+    async fn ownership_change_during_continuity_verification_prevents_grant_commit() {
         let mut s = setup();
         let owner = s.owner;
         let chain = enable_payer_checks(&mut s, owner);
@@ -1147,6 +1278,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "conflict");
         assert_eq!(error.details.unwrap()["version"], 2);
     }
 

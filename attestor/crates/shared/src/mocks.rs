@@ -220,6 +220,9 @@ impl crate::attestor_tls::StatementSource for StaticStatementSource {
 // ── ChainClient mock ─────────────────────────────────────────────────────
 
 pub struct MockChain {
+    operator_continuity_failure: AtomicBool,
+    operator_continuity_rejection: Mutex<Option<crate::traits::OperatorContinuityRejection>>,
+    operator_transfers: Mutex<HashMap<AgentId, Vec<u64>>>,
     operator_checkpoint: Mutex<crate::auth::operator::OperatorCheckpoint>,
     checkpoint_hashes: Mutex<HashMap<u64, B256>>,
     checkpoint_owner: Mutex<Option<Option<Address>>>,
@@ -262,6 +265,22 @@ pub struct MockChain {
 }
 
 impl MockChain {
+    pub fn set_operator_continuity_failure(&self, fail: bool) {
+        self.operator_continuity_failure
+            .store(fail, Ordering::SeqCst);
+    }
+    pub fn set_operator_continuity_rejection(
+        &self,
+        reason: Option<crate::traits::OperatorContinuityRejection>,
+    ) {
+        *self.operator_continuity_rejection.lock().unwrap() = reason;
+    }
+    pub fn set_operator_transfers(&self, agent: AgentId, blocks: Vec<u64>) {
+        self.operator_transfers
+            .lock()
+            .unwrap()
+            .insert(agent, blocks);
+    }
     pub fn set_operator_checkpoint(&self, checkpoint: crate::auth::operator::OperatorCheckpoint) {
         self.checkpoint_hashes
             .lock()
@@ -304,6 +323,9 @@ impl MockChain {
     }
     pub fn new() -> Self {
         Self {
+            operator_continuity_failure: AtomicBool::new(false),
+            operator_continuity_rejection: Mutex::new(None),
+            operator_transfers: Mutex::new(HashMap::new()),
             operator_checkpoint: Mutex::new(crate::auth::operator::OperatorCheckpoint {
                 number: 1,
                 hash: B256::repeat_byte(1),
@@ -484,6 +506,57 @@ impl ChainClient for MockChain {
             .get(&checkpoint.number)
             .ok_or_else(|| anyhow::anyhow!("checkpoint header unavailable; node may be behind"))?;
         Ok(*hash == checkpoint.hash)
+    }
+
+    async fn verify_operator_continuity(
+        &self,
+        agent: AgentId,
+        checkpoint: &crate::auth::operator::OperatorCheckpoint,
+        owner: Address,
+    ) -> anyhow::Result<crate::traits::OperatorContinuity> {
+        use crate::traits::{
+            OperatorContinuity, OperatorContinuityRejection as Rejection,
+            MAX_OPERATOR_CHECKPOINT_SPAN,
+        };
+        anyhow::ensure!(
+            !self.operator_continuity_failure.load(Ordering::SeqCst),
+            "ownership continuity RPC unavailable"
+        );
+        let snapshot = self.operator_checkpoint().await?;
+        anyhow::ensure!(
+            snapshot.number >= checkpoint.number,
+            "operator checkpoint is ahead of this RPC node"
+        );
+        let mut reason = *self.operator_continuity_rejection.lock().unwrap();
+        if snapshot.number - checkpoint.number > MAX_OPERATOR_CHECKPOINT_SPAN {
+            reason = Some(Rejection::CheckpointTooOld {
+                maximum_span: MAX_OPERATOR_CHECKPOINT_SPAN,
+            });
+        } else if !self.is_checkpoint_canonical(checkpoint).await? {
+            reason = Some(Rejection::NonCanonical);
+        } else if *self.owner.lock().unwrap() != owner {
+            reason = Some(Rejection::OwnerChanged);
+        } else if self
+            .operator_transfers
+            .lock()
+            .unwrap()
+            .get(&agent)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| *block > checkpoint.number && *block <= snapshot.number)
+            })
+        {
+            reason = Some(Rejection::TransferObserved);
+        }
+        anyhow::ensure!(
+            self.is_checkpoint_canonical(&snapshot).await?,
+            "operator ownership snapshot changed"
+        );
+        Ok(match reason {
+            Some(reason) => OperatorContinuity::RefreshRequired { reason },
+            None => OperatorContinuity::Continuous { snapshot },
+        })
     }
 
     async fn owner_at_checkpoint(
@@ -1668,6 +1741,10 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         let d = rows
             .get_mut(&seal)
             .ok_or_else(|| anyhow::anyhow!("unknown seal"))?;
+        let mut grants = self.operator_grants.lock().unwrap();
+        if grants.get(&seal).map_or(0, |g| g.version) != base_version {
+            return Ok(None);
+        }
         if let Some(agent) = d.agent_id {
             use base64::Engine as _;
             let checkpoint = base64::engine::general_purpose::STANDARD
@@ -1676,23 +1753,17 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 .and_then(|raw| {
                     serde_json::from_slice::<crate::auth::operator::OperatorDirective>(&raw).ok()
                 })
-                .and_then(|directive| directive.checkpoint);
-            if checkpoint.is_some_and(|checkpoint| {
-                checkpoint.number
-                    < self
-                        .operator_transfer_blocks
-                        .lock()
-                        .unwrap()
-                        .get(&agent)
-                        .copied()
-                        .unwrap_or(0)
-            }) {
-                return Ok(None);
+                .and_then(|directive| directive.operator.and(directive.checkpoint));
+            let minimum_block = self
+                .operator_transfer_blocks
+                .lock()
+                .unwrap()
+                .get(&agent)
+                .copied()
+                .unwrap_or(0);
+            if checkpoint.is_some_and(|checkpoint| checkpoint.number < minimum_block) {
+                return Err(crate::traits::OperatorCheckpointSuperseded { minimum_block }.into());
             }
-        }
-        let mut grants = self.operator_grants.lock().unwrap();
-        if grants.get(&seal).map_or(0, |g| g.version) != base_version {
-            return Ok(None);
         }
         let retired_sandbox_id = d.sandbox_id.clone().filter(|id| !id.is_empty());
         grants.insert(seal, grant);
@@ -2118,6 +2189,26 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         self.update_i_data_artifacts_calls
             .fetch_add(1, Ordering::SeqCst);
         self.mut_with(seal_id, |d| d.i_data = artifacts)
+    }
+
+    async fn sync_chain_i_data(
+        &self,
+        seal_id: SealId,
+        artifacts: Vec<ChainIDataArtifact>,
+    ) -> anyhow::Result<()> {
+        let mut rows = self.by_seal.lock().unwrap();
+        let deployment = rows
+            .get_mut(&seal_id)
+            .ok_or_else(|| anyhow::anyhow!("InMemoryDeploymentRepo: unknown seal_id"))?;
+        if let Some(merged) = crate::types::merge_chain_i_data(
+            &deployment.storage_stage,
+            &deployment.i_data,
+            artifacts,
+        ) {
+            deployment.i_data = merged;
+            deployment.updated_at = chrono::Utc::now();
+        }
+        Ok(())
     }
 
     async fn set_agent_uri_and_card(
