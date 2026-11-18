@@ -43,7 +43,9 @@ async function mockAgent(handle) {
       handle(req, res);
     });
   });
-  await new Promise((r) => srv.listen(0, r));
+  // On 127.0.0.1, the address the client is given: a port the OS hands out for
+  // all addresses can be taken on 127.0.0.1 by another test file's server.
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   return { seen, base: `http://127.0.0.1:${srv.address().port}`, stop: () => { srv.closeAllConnections?.(); srv.close(); } };
 }
 const json = (res, status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
