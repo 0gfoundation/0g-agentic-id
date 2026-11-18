@@ -267,7 +267,9 @@ test('a message the agent took as new says why, by what it said; a failed turn\'
 test('/activities ids are short, longer only where two would read the same', () => {
   assert.deepEqual(shortIds(['resp_4702745b899bd6193d8f2a66', 'bash-c917aa00c683c3c1a95c3562762519b3', '6f1c2a3b-0d4e-4f5a-9b8c-7d6e5f4a3b2c', 'x1']),
     ['resp_4702745b', 'bash-c917aa00', '6f1c2a3b-0d4e', 'x1']);
-  assert.deepEqual(shortIds(['resp_4702745b899b', 'resp_4702745b12aa']), ['resp_4702745b8', 'resp_4702745b1']);
+  assert.deepEqual(shortIds(['resp_4702745b899bd6193d8f2a66', 'resp_4702745b12aad6193d8f2a66']), ['resp_4702745b8', 'resp_4702745b1']);
+  // A readable id of 20 characters or fewer stays whole.
+  assert.deepEqual(shortIds(['task-weekly-report', 'task-fix-ci-9c1d']), ['task-weekly-report', 'task-fix-ci-9c1d']);
   const now = 2_000_000;
   const row = renderActivityTable([{ id: 'bash-c917aa00c683c3c1a95c3562762519b3', type: 'command', status: 'in_progress', actor: 'agent', trigger: 'agent', label: 'npm test -- --watch=false and more words', created_at: now - 40 }], now * 1000, 79)[1];
   assert.ok(row.length <= 79, row);
