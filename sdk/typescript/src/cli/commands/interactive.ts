@@ -193,7 +193,7 @@ export function makeBrake(
     const client = getClient();
     if (!client?.interrupt) { print('\n(this agent image has no interrupt endpoint — /reset is the only stop)\n'); return; }
     client.interrupt().then(
-      (r) => print(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + cleanCell(r.note ?? 'not supported') + ')\n'),
+      (r) => print(r.aborted ? '\n⏹ stopped the running task\n' : `\n(nothing was running${r.note && !/nothing|no task|not running/i.test(r.note) ? ` — ${cleanCell(r.note)}` : ''})\n`),
       // NOT a prompt: the loop's ask() is pending right now — a notice only.
       // The seat argument is deliberately NOT called from here.
       (e) => print(brakeInterruptLine(e)),
@@ -211,7 +211,28 @@ export function brakeInterruptLine(e: unknown): string {
     // reclaims and resends.
     return '\n⚠ this agent is now driven by another client — send a message to take the seat back\n';
   }
-  return `\n(interrupt failed: ${cleanCell(msg)})\n`;
+  return `\n(could not reach the agent to stop anything: ${cleanCell(plainError(e))})\n`;
+}
+
+/**
+ * An error in the words a person reads: viem's first line (its short
+ * message), an HTTP error's message without the request detail; no stack,
+ * no raw call arguments. Exported for the tests.
+ */
+export function plainError(e: unknown): string {
+  const err = e as { shortMessage?: string; message?: string };
+  let msg = (err?.shortMessage ?? err?.message ?? String(e)).split('\n')[0].trim();
+  // "<what>: HTTP 404: {"error":{"message":"unknown task"}}" → "unknown task (HTTP 404)"
+  const http = /^(?:[\w.]+: )?HTTP (\d{3}):?\s*(.*)$/s.exec(msg);
+  if (http) {
+    let why = http[2].trim();
+    try {
+      const j = JSON.parse(why) as { error?: { message?: string } | string; message?: string };
+      why = (typeof j.error === 'string' ? j.error : j.error?.message) ?? j.message ?? why;
+    } catch { /* not JSON: as it is */ }
+    msg = `${why || 'no reason given'} (HTTP ${http[1]})`;
+  }
+  return msg;
 }
 
 /**
@@ -287,7 +308,7 @@ const ASKED_BY: Record<string, string> = { user: 'you', job: 'job', schedule: 'r
  * reminder, the agent itself). Ids print whole: they are what /result and
  * /cancel take. Exported for the tests.
  */
-export function renderActivityTable(tasks: AgentActivityInfo[], nowMs: number): string[] {
+export function renderActivityTable(tasks: AgentActivityInfo[], nowMs: number, width = 1000): string[] {
   const idw = Math.max(2, ...tasks.map((t) => cleanCell(t.id).length)) + 2;
   const head = `  ${'ID'.padEnd(idw)}${'STATUS'.padEnd(13)}${'BY'.padEnd(10)}${'FOR'.padEnd(10)}${'AGE'.padEnd(6)}WHAT`;
   return [
@@ -295,19 +316,19 @@ export function renderActivityTable(tasks: AgentActivityInfo[], nowMs: number): 
     ...tasks.map((t) =>
       `  ${cleanCell(t.id).padEnd(idw)}${cellText(t.status, 13)}${cellText(t.actor, 10)}` +
       `${cellText(ASKED_BY[t.trigger] ?? t.trigger, 10)}${span(nowMs / 1000 - t.created_at).padEnd(6)}` +
-      `${[...cleanCell(t.label)].slice(0, 70).join('')}`),
+      `${fitRow(cleanCell(t.label), Math.max(10, Math.min(70, width - 2 - idw - 39)))}`),
   ];
 }
 
 /** The /tasks list: id, state, open records, age, title. Exported for the tests. */
-export function renderTaskTable(tasks: HarnessTask[], nowMs: number): string[] {
+export function renderTaskTable(tasks: HarnessTask[], nowMs: number, width = 1000): string[] {
   const idw = Math.max(2, ...tasks.map((t) => cleanCell(t.id).length)) + 2;
   return [
     `  ${'ID'.padEnd(idw)}${'STATE'.padEnd(13)}${'OPEN'.padEnd(6)}${'RUNS'.padEnd(6)}${'AGE'.padEnd(6)}TITLE`,
     ...tasks.map((t) =>
       `  ${cleanCell(t.id).padEnd(idw)}${cellText(t.state + (t.reason ? ` (${t.reason})` : ''), 13)}` +
       `${String(t.records?.length ?? 0).padEnd(6)}${String(t.runs?.count ?? 0).padEnd(6)}` +
-      `${span(nowMs / 1000 - t.created_at).padEnd(6)}${[...cleanCell(t.title)].slice(0, 60).join('')}`),
+      `${span(nowMs / 1000 - t.created_at).padEnd(6)}${fitRow(cleanCell(t.title), Math.max(10, Math.min(60, width - 2 - idw - 31)))}`),
   ];
 }
 
@@ -363,7 +384,7 @@ export function renderTask(t: HarnessTask): string[] {
   const last = t.runs?.last;
   const lines = [
     `${cleanCell(t.id)} — ${cleanCell(t.state)}${t.reason ? ` (${cleanCell(t.reason)})` : ''} · ${cleanCell(t.title)}`,
-    `  workspace ${cleanCell(t.workspace?.path ?? '')} · runs ${t.runs?.count ?? 0}${t.pending ? ` · ${t.pending} input(s) waiting` : ''}`,
+    `  runs ${t.runs?.count ?? 0}${t.pending ? ` · ${t.pending} input(s) waiting` : ''}`,
   ];
   if (last?.error) lines.push(`  last run: ${cleanCell(last.error)}`);
   const shown = new Set<number>();
@@ -641,10 +662,12 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/download': () => outboxNames,
   // Subcommands, and the sessions last seen (entering the session, /sessions).
   '/sessions': () => sessionCompletions(sessionsSeen),
-  '/tasks': ['list', 'all', 'new ', 'show ', 'input ', 'cancel ', 'archive '],
+  '/tasks': () => ['list', 'all', 'new ', ...['show', 'input', 'cancel', 'archive'].flatMap((w) => [`${w} `, ...tasksSeen.map((id) => `${w} ${id}`)])],
 };
 /** The sessions last listed in this agent's session, for `/sessions` completion. */
 let sessionsSeen: AgentSession[] = [];
+// The ids of the agent's tasks last listed, for Tab after /tasks show|input|cancel|archive.
+let tasksSeen: string[] = [];
 /** The outbox names last seen in this session (/files, a turn's notice), for completion. */
 let outboxNames: string[] = [];
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
@@ -772,7 +795,11 @@ export function completeLine(
   const cand = state.args[cmd];
   const list = typeof cand === 'function' ? cand() : (cand ?? []);
   const hits = list.filter((c) => c.startsWith(rest));
-  return [hits.length ? hits : list, rest];
+  // What was typed up to its last space is shared by the candidates that
+  // match: only what follows is offered (`/sessions switch ` lists the
+  // sessions, not `switch …` each).
+  const cut = hits.length ? rest.lastIndexOf(' ') + 1 : 0;
+  return cut ? [hits.map((c) => c.slice(cut)), rest.slice(cut)] : [hits.length ? hits : list, rest];
 }
 
 /** The shell's Tab completion with its current state (the level's words,
@@ -823,7 +850,7 @@ export function printAbovePrompt(
 }
 import type { CommandContext } from '../types';
 import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
-import { CONT_PROMPT, LiveTurn, PlainTurn, liveKeys, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
+import { CONT_PROMPT, LiveTurn, PlainTurn, fitRow, liveKeys, wrapWords, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
 import { INK_PROMPT, MIN_COLS, MIN_ROWS, inkLoadError, loadInk, openInkScreen, type InkScreen, type Key as InkKey } from '../inkView';
 import { OUTBOX_POLL_MS, makeOutboxSync, renderOutboxEvent, supportsHyperlinks, tildePath, type OutboxSync } from '../outboxSync';
 
@@ -921,7 +948,11 @@ type Ask = ((q: string) => Promise<string>) & {
   /** Every waiting entry back to be edited, as one message ahead of what is
    *  being edited (a turn was interrupted: nothing goes on its own); how
    *  many there were. */
-  recallAll?: () => number;
+  recallAll?: (extra?: readonly string[]) => number;
+  /** Empty the message being typed (its earlier lines too); false when there is nothing. */
+  clearBox?: () => boolean;
+  /** Backspace at the start of a message's line: it joins the line before; false when there is none. */
+  unwind?: () => boolean;
   /** The shell's prompt now says q (its status changed): redrawn in place
    *  when it is up, used from the next prompt otherwise. */
   retitle?: (q: string) => void;
@@ -960,7 +991,10 @@ const PASTE_GAP_MS = 30;
 const YES_NO_QUESTION = /\[(?:y\/n|y)\]/i;
 
 type Key = { name?: string; meta?: boolean; ctrl?: boolean; sequence?: string };
-type KeySource = { on(ev: 'keypress', f: (s: string | undefined, key: Key | undefined) => void): unknown };
+type KeySource = {
+  on(ev: 'keypress', f: (s: string | undefined, key: Key | undefined) => void): unknown;
+  prependListener?(ev: 'keypress', f: (s: string | undefined, key: Key | undefined) => void): unknown;
+};
 
 /**
  * The shell's `ask` as a QUEUE, not rl.question: lines that arrive while no
@@ -1004,7 +1038,7 @@ export function lineQueue(
   const { boxed = false, echo, say = out } = opts;
   type Kind = 'q' | 'main' | 'message';
   const pending: Entry[] = [];
-  const waiters: Array<{ res: (e: Entry) => void; rej: (e: Error) => void; kind: Kind; q: string }> = [];
+  const waiters: Array<{ res: (e: Entry) => void; rej: (e: Error) => void; kind: Kind; q: string; first: string }> = [];
   const edit = rl as { line?: unknown; cursor?: unknown; prevRows?: unknown; history?: unknown };
   // readline keeps keys typed so far as the line being edited (and would
   // show them after the next question, ready for Enter), and its offset from
@@ -1134,8 +1168,11 @@ export function lineQueue(
     chunk.open = true;
     queueMicrotask(endChunk);
   };
+  let cursorBefore = -1;
+  keys?.prependListener?.('keypress', () => { cursorBefore = typeof edit.cursor === 'number' ? edit.cursor : -1; });
   keys?.on('keypress', (s, key) => {
     if (!multiline()) return;
+    if (key?.name === 'backspace' && !key.ctrl && !key.meta && cursorBefore === 0 && !boxed && messageHere()) { ask.unwind?.(); return; }
     if (key?.name === 'paste-start') { pasting = true; pasteLines = []; return; }
     if (key?.name === 'paste-end') {
       pasting = false;
@@ -1183,6 +1220,7 @@ export function lineQueue(
     }
   });
   const wait = (q: string, kind: Kind): Promise<Entry> => {
+    const first = q;
     for (let buffered = pending.shift(); buffered !== undefined; buffered = pending.shift()) {
       const refused = accepts({ kind, q }, buffered);
       if (refused) { say(`  (an earlier entry was dropped: ${refused})\n`); continue; }
@@ -1196,7 +1234,8 @@ export function lineQueue(
         }
       }
       if (echo) echo(kind, q, buffered);
-      else say(`${q}${buffered.text}\n`); // keep the transcript readable in pipes/logs
+      // keep the transcript readable in pipes/logs; a long one shortened on a terminal
+      else say(`${q}${multiline() ? collapsed(buffered.text) : buffered.text}\n`);
       return Promise.resolve(buffered);
     }
     if (stdinClosed) {
@@ -1210,7 +1249,7 @@ export function lineQueue(
     rl.setPrompt(q);
     // A line typed during a turn is shown again with the cursor where it was.
     rl.prompt(kind === 'message' && (q === CONT || editLine() !== ''));
-    return new Promise((res, rej) => waiters.push({ res, rej, kind, q }));
+    return new Promise((res, rej) => waiters.push({ res, rej, kind, q, first }));
   };
   const ask: Ask = (q: string): Promise<string> => wait(q, 'q').then((e) => e.text);
   ask.main = (q: string): Promise<string> => wait(q, 'main').then((e) => e.text);
@@ -1245,12 +1284,19 @@ export function lineQueue(
     pending.push(e);
     return true;
   };
-  ask.recallAll = (): number => {
-    if (waiters[0] || !pending.length) return 0;
-    const back = pending.splice(0);
+  ask.recallAll = (extra: readonly string[] = []): number => {
+    if (waiters[0]) return 0;
+    // Messages come back to edit (`extra` first: sent into the turn and not
+    // read); a command that waited stays its own entry and runs at the next
+    // prompt, never merged into the text.
+    const back = pending.filter((e) => steerable(e));
+    if (!extra.length && !back.length) return 0;
+    const keep = pending.filter((e) => !steerable(e) && e.text.trim());
+    pending.splice(0, pending.length, ...keep);
     const line = editLine();
     // As typed, without the blank lines.
-    const lines = [...back.flatMap((e) => e.text.split('\n')), ...draft, ...(line ? [line] : [])].filter((l) => l.trim() !== '');
+    const lines = [...extra.flatMap((t) => t.split('\n')), ...back.flatMap((e) => e.text.split('\n')), ...draft, ...(line ? [line] : [])]
+      .filter((l) => l.trim() !== '');
     const last = lines.pop() ?? '';
     const pastedAny = back.some((e) => e.pasted) || draftPasted || touched;
     draft = lines;
@@ -1258,7 +1304,39 @@ export function lineQueue(
     touched = !lines.length && pastedAny;
     if (typeof edit.line === 'string') edit.line = last;
     if (typeof edit.cursor === 'number') edit.cursor = last.length;
-    return back.length;
+    return extra.length + back.length;
+  };
+  ask.clearBox = (): boolean => {
+    if (!draft.length && !editLine()) return false;
+    draft = [];
+    draftPasted = false;
+    touched = false;
+    clearEdit();
+    const w = waiters[0];
+    if (w && !boxed && rl.terminal !== false) {
+      // What was typed stays on the screen as it was; a fresh prompt below.
+      term('\n');
+      rl.setPrompt(w.first);
+      rl.prompt();
+    }
+    return true;
+  };
+  ask.unwind = (): boolean => {
+    if (!draft.length || (typeof edit.cursor === 'number' && edit.cursor !== 0)) return false;
+    const prev = draft.pop()!;
+    const line = editLine();
+    if (typeof edit.line === 'string') edit.line = prev + line;
+    if (typeof edit.cursor === 'number') edit.cursor = prev.length;
+    const w = waiters[0];
+    if (w && !boxed && rl.terminal !== false) {
+      // The line before is on the screen above this one: both go, and the
+      // joined line is drawn where the earlier one was.
+      term('\r\x1b[2K\x1b[1A\r\x1b[2K');
+      if (typeof edit.prevRows === 'number') edit.prevRows = 0;
+      rl.setPrompt(draft.length ? CONT : w.first);
+      rl.prompt(true);
+    }
+    return true;
   };
   ask.retitle = (q: string): void => {
     const w = waiters[0];
@@ -1369,7 +1447,7 @@ interface SessionScreen {
   turnRan: boolean;
   /** A turn was interrupted: what was queued during it comes back to be
    *  edited; what to say about it ('' when nothing was queued). */
-  interrupted?: () => string;
+  interrupted?: (extra?: readonly string[]) => string;
 }
 
 /** What the session prompt counts: notices waiting to be shown, new files. */
@@ -1393,6 +1471,19 @@ export function sessionPromptText(agentId: string, label: string, busy: boolean,
 function oneLine(text: string): string {
   const lines = text.split('\n');
   return lines.length > 1 ? `${lines[0]} (+${lines.length - 1} line${lines.length === 2 ? '' : 's'})` : lines[0];
+}
+
+/** A message of many lines as it is echoed back: its first lines and how many more. Exported for the tests. */
+export function collapsed(text: string, keep = 8): string {
+  const lines = text.split('\n');
+  if (lines.length <= keep + 2) return text;
+  return [...lines.slice(0, keep), `… (+${lines.length - keep} more lines)`].join('\n');
+}
+
+/** A word that names a path rather than a command: a second `/` in it, or a
+ *  file extension. Exported for the tests. */
+export function looksLikePath(word: string): boolean {
+  return word.indexOf('/', 1) > 0 || /\.[A-Za-z0-9]{1,5}$/.test(word);
 }
 
 /** The live prompt's lines for what the owner sent during a turn: inserted
@@ -1635,8 +1726,16 @@ async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (v
   if (busy) activeAsk?.whileBusy?.(busy(view));
   const say = sayer(view);
   let reply = '';
+  // What the agent does, on the status line (as in owner-chat).
+  const t0 = Date.now();
+  const onActivity = process.stdout.isTTY
+    ? (label: string): void => {
+        if (label.startsWith('turn/end')) { view.status(null); return; }
+        view.status(`${cleanCell(activityText(label))}… (${Math.floor((Date.now() - t0) / 1000)}s)`);
+      }
+    : undefined;
   try {
-    for await (const d of client.followTask!(r.id, { signal: ac.signal })) { reply += d; say(d); }
+    for await (const d of client.followTask!(r.id, { signal: ac.signal, ...(onActivity ? { onActivity } : {}) })) { reply += d; view.status(null); say(d); }
     view.end();
     if (reply && !reply.endsWith('\n')) out('\n');
   } catch (e) {
@@ -1826,7 +1925,7 @@ export async function pollRunning(
     ? setInterval(() => {
         if (signal?.aborted) return;
         spin = (spin + 1) % SPIN.length;
-        const line = cleanCell(`${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · esc stops waiting, not the deploy)`);
+        const line = cleanCell(`${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · Esc stops waiting, not the deploy)`);
         // Under the Ink view: its status row.
         if (activeInk) activeInk.status(line);
         else term(`\r\x1b[2K  ${line}`);
@@ -2112,6 +2211,8 @@ export async function run(ctx: CommandContext): Promise<void> {
   const onInterrupt = (): void => {
     if (cancelQuestion()) return;
     if (irq.streaming) { irq.streaming.abort(); return; } // interrupt the turn, stay in the REPL
+    // Text in the box: Ctrl-C clears it (its earlier lines too) first.
+    if ((activeAsk ?? ask).clearBox?.()) return;
     const now = Date.now();
     if (now - lastSigint < 2000) { void quitShell(0, true); return; }
     lastSigint = now;
@@ -2122,6 +2223,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   const onEscape = (): void => {
     if (cancelQuestion()) return;
     if (irq.streaming) { irq.streaming.abort(); return; }
+    if ((activeAsk ?? ask).clearBox?.()) return; // text in the box: Esc clears it
     irq.brake?.(); // idle Esc in a session: stop a background/orphaned task
   };
   rl.on('SIGINT', onInterrupt);
@@ -2523,7 +2625,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
             const { allAcked, missing } = ackRes.r;
             out(`trust root  ${allAcked ? 'acknowledged' : `missing ${missing.join(', ')} — run \`ack\``}\n`);
           } else {
-            out(`trust root  (unreadable: ${ackRes.e.message})\n`);
+            out(`trust root  (could not be read: ${cleanCell(plainError(ackRes.e))})\n`);
           }
           try {
             if (!dRes.ok) throw dRes.e;
@@ -3048,7 +3150,7 @@ async function settingsOp(
     }
     for (const l of renderSettings(current)) out(`  ${l}\n`);
     if (listed) out(`  ${renderVersionsLine(listed, current?.versions)}\n`);
-    out(`  change with: model=<id> · thinking=low|high|max · provider=<name> · others='<json>' (quote it)${listed ? ` · pin a version: ${versionsCmd}` : ''}\n`);
+    out(`  change with: model=<id> · thinking=low|high|max · provider=<name>\n               others='<json>' (quote it)${listed ? ` · pin a version: ${versionsCmd}` : ''}\n`);
     return current;
   }
   const next = applyAssignments(current, assignments);
@@ -3799,7 +3901,8 @@ const L2_HELP_FULL = `session commands
   (several lines)         a paste stays one message, sent with the next
                           Enter and never run as a command; a line ending
                           in \\ or Option/Alt+Enter goes on to a new line.
-                          Lines already entered are not edited again
+                          Backspace at a line's start joins the line before;
+                          Ctrl-C or Esc with text in the box clears it
   (while it works)        the input stays on screen (framed at the bottom,
                           a status line above it saying what the agent does
                           and Esc to stop); the reply prints above it and
@@ -3844,12 +3947,12 @@ const L2_HELP_FULL = `session commands
                           which versions run; /settings versions lists the
                           ones the trust registry has, and sealed=<hash>
                           harness=<hash> pin them
-  /cred [sub …]           this agent's credentials — same as \`cred <id>\` in the
-                          manager: bare lists, set <name> [k=v …], rm, connect,
-                          disconnect,
-                          reveal <name> on|off, pending, approve|deny [<id>],
-                          log [n], presets. The agent writes [[credential:<name>]]
-                          where a key goes; sealed fills it in on the way out.
+  /cred [sub …]           this agent's credentials — same as \`cred <id>\` in
+                          the manager: bare lists, set <name> [k=v …], rm,
+                          connect, disconnect, reveal <name> on|off, pending,
+                          approve|deny [<id>], log [n], presets. The agent
+                          writes [[credential:<name>]] where a key goes;
+                          sealed fills it in on the way out.
                           A request the agent waits on (to read a value, to get
                           a credential, to be connected) comes up here at the
                           prompt; your answer goes back to the agent
@@ -3949,13 +4052,14 @@ const L2_HELP_FULL = `session commands
                           overwrites: a taken name gets -1, -2, … Names from
                           your own files: inbox/<name>. At most 50 MiB
   /agentlog [n]           agent process log, last n lines (owner-only)
-  /signatures [n]         what the agent signed as itself and what the runtime refused, last n (owner-only; 0g-harness)
+  /signatures [n]         what the agent signed as itself and what the runtime
+                          refused, last n (owner-only; 0g-harness)
   /startuplog [n]         sealed runtime startup log, last n lines
   /back  (or /unuse)      return to the manager
   /quit                   exit`;
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
-  out(`\nagent ${s.agentId} session — ${s.phase} · ${hostOf(s.attestorUrl)} · type to chat · Tab completes /commands · /help for details\n`);
+  out(`\nagent ${s.agentId} session — ${s.phase} · ${hostOf(s.attestorUrl)}\n`);
   // Low-gas heads-up WITH the entry card. It used to run detached and could
   // land mid-turn, reading like the agent said it (feedback.md F17) — so wait
   // for it, but bounded: advisory reads must not hold the prompt hostage.
@@ -4012,7 +4116,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
     };
 
-  irq.brake = makeBrake(() => s.client, out, displacedSeat, () => seatPromptPending);
+  // At the prompt its line goes above it, and the prompt stays.
+  irq.brake = makeBrake(() => s.client, (l) => (atPrompt ? printAbovePrompt(l.replace(/^\n+/, '')) : out(l)), displacedSeat, () => seatPromptPending);
   // What the agent says on its own (notices: a background job finished, a
   // reminder came due) and the files it leaves arrive at any time. At the
   // session prompt they print above the prompt; during a command, a chat
@@ -4089,9 +4194,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   phaseTimer?.unref();
   // An interrupted turn sends nothing on its own: what was queued during it
   // comes back to be edited at the next prompt.
-  screen.interrupted = (): string => {
-    const n = (ask as Ask).recallAll?.() ?? 0;
-    return n ? `(${n === 1 ? 'the queued message is' : `${n} queued messages are`} back to edit — Enter sends)` : '';
+  screen.interrupted = (extra: readonly string[] = []): string => {
+    const n = (ask as Ask).recallAll?.(extra) ?? 0;
+    return n ? `(${n === 1 ? 'your message is' : `${n} of your messages are`} back to edit, not sent — Enter sends)` : '';
   };
   // What waited prints before the prompt comes up.
   const flushHeld = (): void => {
@@ -4417,7 +4522,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const src = sub === 'fork' ? (arg || s.sessionId || 'owner-chat') : undefined;
           const made = await s.client.createSession!({ ...(sub === 'new' && arg ? { title: arg } : {}), ...(src ? { fork: src } : {}) });
           s.sessionId = made.id; s.sessionTitle = made.title || (src ? `fork of ${src}` : '');
-          out(`→ ${made.id}${src ? ` (history of ${src})` : ''}: chat now goes to this session\n`);
+          out(`→ ${made.title ? cleanCell(made.title) : src ? `a copy of ${src === 'owner-chat' ? 'owner-chat' : 'that session'}` : 'a new session (titled by your first message)'}: chat now goes there\n`);
           continue;
         }
         if (sub === 'default') { s.sessionId = undefined; s.sessionTitle = undefined; out('→ owner-chat\n'); continue; }
@@ -4428,7 +4533,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const hit = pickSession(list, arg);
           if (!hit) { out(`no session matches ${cleanCell(arg)}\n`); continue; }
           s.sessionId = hit.id === 'owner-chat' ? undefined : hit.id; s.sessionTitle = hit.title;
-          out(`→ ${hit.id}${hit.title ? ` (${cleanCell(hit.title)})` : ''}\n`);
+          out(`→ ${hit.id === 'owner-chat' ? 'owner-chat' : hit.title ? cleanCell(hit.title) : shortSessionId(hit.id)}\n`);
           continue;
         }
         out('usage: /sessions [list | switch <#|id|title> | new [title] | fork [id] | default]\n');
@@ -4444,16 +4549,22 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // An id, or a unique start of one (with or without `task-`).
         const resolve = async (arg: string | undefined): Promise<string | null> => {
           if (!arg) { out('which task? give its id (/tasks lists them)\n'); return null; }
-          if (/^(task-[a-z0-9][a-z0-9-]{0,62}|session-[a-z0-9][a-z0-9-]{0,90})$/.test(arg)) return arg;
-          const hits = (await c.listTasks!({ limit: 500 })).filter((t) => t.id.startsWith(arg) || t.id.startsWith(`task-${arg}`));
+          if (/^session-[a-z0-9][a-z0-9-]{0,90}$/.test(arg)) return arg;
+          // The full id, or a unique start of one (`task-` may be left out).
+          const list = await c.listTasks!({ limit: 500 }).catch(() => null);
+          if (!list) return arg; // the list could not be read: the id as given
+          if (list.some((t) => t.id === arg)) return arg;
+          const hits = list.filter((t) => t.id.startsWith(arg) || t.id.startsWith(`task-${arg}`));
           if (hits.length === 1) return hits[0].id;
-          out(hits.length ? `${hits.length} tasks start with ${cleanCell(arg)} — give more of the id\n` : `no task ${cleanCell(arg)}\n`);
+          out(hits.length ? `${hits.length} tasks start with ${cleanCell(arg)} — give more of the id\n` : `no task ${cleanCell(arg)} — /tasks lists them\n`);
           return null;
         };
         if (sub === 'list' || sub === 'all') {
-          const list = (await c.listTasks!({ limit: 50 })).filter((t) => sub === 'all' || t.state !== 'archived');
+          const all = await c.listTasks!({ limit: 50 });
+          tasksSeen = all.map((t) => t.id);
+          const list = all.filter((t) => sub === 'all' || t.state !== 'archived');
           if (!list.length) { out('no tasks yet — /tasks new <what to do>\n'); continue; }
-          for (const l of renderTaskTable(list, Date.now())) out(`${l}\n`);
+          for (const l of renderTaskTable(list, Date.now(), (process.stdout.columns || 80) - 1)) out(`${l}\n`);
           out('/tasks show <id> · input <id> [next] <text> · cancel <id> · archive <id>\n');
           continue;
         }
@@ -4461,7 +4572,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const prompt = after(1);
           if (!prompt) { out('usage: /tasks new <what to do>\n'); continue; }
           const { task } = await c.createTask!({ prompt });
-          out(`task ${cleanCell(task.id)} — ${cleanCell(task.state)}, workspace ${cleanCell(task.workspace.path)}\n`);
+          out(`task ${cleanCell(task.id)} — ${cleanCell(task.state)} (/tasks show ${cleanCell(task.id)})\n`);
           continue;
         }
         if (sub === 'show') {
@@ -4499,7 +4610,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (s.client?.activities) {
           const list = await s.client.activities({ limit: 30 });
           if (!list.length) { out('nothing has run on this agent yet\n'); continue; }
-          for (const l of renderActivityTable(list, Date.now())) out(`${l}\n`);
+          for (const l of renderActivityTable(list, Date.now(), (process.stdout.columns || 80) - 1)) out(`${l}\n`);
           out('/result <id> shows one · /cancel <id> stops one · /cancel all stops everything running\n');
           continue;
         }
@@ -4633,7 +4744,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           continue;
         }
         if (!id && s.client?.task) {
-          if (!s.tasks?.length) { out('no task id given and none started from this session — /cancel <id>, or /tasks to list (after a CLI restart or /back+use, this session starts empty)\n'); continue; }
+          if (!s.tasks?.length) { out(`no task id given and none started from this session — /cancel <id>, or ${s.client.activities ? '/activities' : '/tasks'} to list (after a CLI restart or /back+use, this session starts empty)\n`); continue; }
           // Fetch live statuses; a fetch FAILURE is not "not in flight" —
           // only a 404 means the record is gone. Anything else (network
           // error, 5xx, 401, 409) means we could not CHECK, and the honest
@@ -4662,7 +4773,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // the newest would leave an older running turn alive (0g-harness and
           // prime serialize turns, so a queued one is waiting on the running one).
           const inFlight = inFlightIds(rows);
-          if (!inFlight.length) { out('nothing in flight from this session — /tasks to list; a finished task cannot be cancelled\n'); continue; }
+          if (!inFlight.length) { out(`nothing in flight from this session — ${s.client.activities ? '/activities' : '/tasks'} to list; a finished task cannot be cancelled\n`); continue; }
           if (s.client?.cancelTask) {
             let seatGone = false;
             for (const tid of inFlight) {
@@ -4718,7 +4829,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (await routeTaskFailure(out, displacedSeat, e, `(interrupt failed: ${(e as Error).message})\n`, 'retry the interrupt') !== 'raw') return null;
           return null;
         });
-        if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing to stop, or: ${cleanCell(r.note ?? 'not supported')})\n`);
+        if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing was running${r.note && !/nothing|no task|not running/i.test(r.note) ? ` — ${cleanCell(r.note)}` : ''})\n`);
         continue;
       }
       if (line === '/inbox' || line === '/inbox all' || line === '/notices' || line === '/notices all') {
@@ -4793,7 +4904,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             // Listed: not new any more (when they are not saved by themselves).
             if (!filesAuto) outbox?.listed(files);
           }
-          if (!files.length) { out(filesText(dir, true)); continue; }
+          if (!files.length) {
+            out(filesText(dir, true));
+            // Saved by themselves: they left the agent's outbox for this folder.
+            if (dir === 'outbox' && outbox && filesAuto) out(`the ones saved here are in ${tildePath(outbox.dir)}\n`);
+            continue;
+          }
           out(filesText(dir, false));
           for (const l of renderFiles(files)) out(`${cleanCell(l)}\n`);
           out(`/download ${dir === 'inbox' ? 'inbox/' : ''}<name> saves one here${dir === 'outbox' && outbox && filesAuto ? ` · new ones are saved to ${tildePath(outbox.dir)} by themselves` : ''}\n`);
@@ -4802,18 +4918,28 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const args = tokenize(line.slice('/download'.length).trim());
         if (!args.length || args.length > 2) { out('usage: /download <name> [local path]\n'); continue; }
         const { dir, name } = parseDownloadName(args[0]);
-        const bytes = await s.client.downloadFile(dir, name);
+        const bytes = await s.client.downloadFile(dir, name).catch((e: Error) => {
+          if (/HTTP 404/.test(e.message)) throw new CliError('UNKNOWN', `no file ${name} in the agent's ${dir === 'inbox' ? 'inbox' : 'outbox'} — /files${dir === 'inbox' ? ' inbox' : ''} lists them`);
+          throw e;
+        });
         const saved = saveDownload(bytes, name, args[1]);
-        out(`saved ${cleanCell(name)} (${bytes.length} bytes) → ${cleanCell(saved)}\n`);
+        out(`saved ${cleanCell(name)} (${bytes.length} bytes) → ${cleanCell(tildePath(saved))}\n`);
         continue;
       }
-      if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
+      if (line.startsWith('/')) {
+        // A path (a file dragged in that is gone, a screenshot's temporary
+        // copy): said so, not taken for a command.
+        const first = line.split(/\s+/)[0];
+        if (looksLikePath(first)) { out(`file not found: ${cleanCell(basename(first.replace(/\\(.)/g, '$1')))} — nothing sent\n`); continue; }
+        out(`unknown command ${cleanCell(first)}\n${wrapWords(L2_HELP, Math.max(40, (process.stdout.columns || 80) - 1)).join('\n')}\n`);
+        continue;
+      }
     } catch (e) {
       // Show the remedy too: an error whose whole point is "do this instead"
       // (a refused settings write, a missing wallet) is useless without it.
       const ce = e as CliError;
       if (isCancelled(e)) { out('cancelled\n'); continue; }
-      out(`error: ${ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`); continue;
+      out(`error: ${e instanceof CliError ? ce.message : cleanCell(plainError(e))}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`); continue;
     }
     } // commands
     chat = true;
@@ -4848,7 +4974,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
    */
   const busyEntries = (view: TurnView, steering: Steering | null, onTake?: () => void) => (e: Entry): boolean => {
     const t = e.text.trim();
-    if (!t) return false;
+    if (!t) return true; // an empty Enter during a turn: nothing to send or queue
     if (!e.multi && !e.pasted && t.startsWith('/')) {
       if (readOnlyCommand(t)) { runNow(t, view); return true; }
       view.note(`(${t.split(/\s+/)[0]} runs when this turn ends)`);
@@ -4924,7 +5050,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   const readNote = (view: TurnView, text: string | undefined): void => {
     // Under the Ink view the message moves from the waiting rows into the transcript.
     if (activeInk && text) { activeInk.owner(text); return; }
-    view.note(!view.live ? '  ↳ (read)\n' : text ? `↳ read by the agent: ${oneLine(text)}` : '↳ (read by the agent)');
+    if (!view.live) { view.note('  ↳ (read)\n'); return; }
+    const line = text ? `↳ read by the agent: ${oneLine(text)}` : '↳ (read by the agent)';
+    // At this point of the reply: after what it has written so far.
+    if (view.after) view.after(line);
+    else view.note(line);
   };
   /** Follow the turns that answer inserted messages; more inserted while
    *  following one join the list. */
@@ -4934,8 +5064,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       (s.tasks ??= []).push({ id: f.id, prompt: '(inserted)', at: Date.now() });
       const note = followUpNote(f, !!s.client?.followTask);
       if (note) out(`${note}\n`);
-      // Under the Ink view the messages it answers go to the transcript as the owner's.
+      // What it answers: under the Ink view the messages go to the transcript
+      // as the owner's; at readline's prompt one line each.
       if (activeInk) for (const t of f.texts) activeInk.owner(t);
+      else if (f.why === 'unread' && process.stdout.isTTY) for (const t of f.texts) out(`↳ ${oneLine(t)}\n`);
       if (!s.client?.followTask) continue;
       const fac = new AbortController();
       irq.streaming = fac;
@@ -4956,10 +5088,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       } catch (e) {
         view.end();
         stopped = fac.signal.aborted;
-        const empty = stopped ? null : await emptyTurnText(s.client, f.id, e);
-        out(stopped
-          ? `\n(stopped watching — it continues; /result ${f.id} re-attaches, /cancel ${f.id} stops it)\n`
-          : `\n${empty ?? `(${cleanCell((e as Error).message)})`}\n`);
+        if (stopped) {
+          // Esc stops this turn, and the ones after it for messages not read
+          // yet; those messages come back to edit.
+          const ok = await s.client.cancelTask?.(f.id).then((t) => t.status === 'cancelled' || t.status === 'completed', () => false);
+          out(ok ? '\n⏹ interrupted — the turn stopped\n' : `\n(stopped watching — it may still be running; /cancel ${f.id} stops it)\n`);
+          const rest = after.splice(i + 1);
+          for (const r of rest) await s.client.cancelTask?.(r.id).catch(() => undefined);
+          const back = s.screen?.interrupted?.([...(steering?.texts.splice(0) ?? []), ...rest.flatMap((r) => r.texts)]);
+          if (back) out(`${back}\n`);
+        } else {
+          const empty = await emptyTurnText(s.client, f.id, e);
+          out(`\n${empty ?? `(${cleanCell((e as Error).message)})`}\n`);
+        }
       } finally {
         view.end();
         irq.streaming = null;
@@ -4974,8 +5115,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     activeArgs = L2_ARGS;
     if (sessionSealId !== s.sealId) {
       sessionsSeen = [];
-      // Prefetch the session list for Tab; failures just leave it empty.
+      tasksSeen = [];
+      // Prefetch the session and task lists for Tab; failures just leave them empty.
       s.client?.sessions?.().then((l) => { sessionsSeen = l; }).catch(() => undefined);
+      s.client?.listTasks?.({ limit: 50 }).then((l) => { tasksSeen = l.map((t) => t.id); }).catch(() => undefined);
     }
     sessionSealId = s.sealId;
     // While not connected (deploying/stopped/offline) the phase is in flux —
@@ -5221,7 +5364,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           out(stopped?.aborted || (stopped && /disconnects/.test(stopped.note ?? ''))
             ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
             : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${cleanCell(stopped.note)}` : ''}; /cancel stops it${s.client?.cancelTask ? '' : ' (bare form — this image has no per-id cancel)'})`);
-          const back = screen.interrupted?.();
+          // Not read before Esc (the agent drops it), and the turns that would
+          // answer messages sent meanwhile: stopped, and back to edit.
+          const unread = steering?.texts.splice(0) ?? [];
+          const rest = after.splice(0);
+          for (const r of rest) await s.client.cancelTask?.(r.id).catch(() => undefined);
+          const back = screen.interrupted?.([...unread, ...rest.flatMap((r) => r.texts)]);
           if (back) out(`\n${back}`);
         } else if (/lost the agent while following/.test((e as Error).message)) {
           // Responses transport: the SDK already auto-resumed through drops

@@ -486,12 +486,13 @@ test('Tab during a turn: a command is completed, as at the prompt; plain text wa
   await v.scr.close();
 });
 
-test('Esc puts back what was queued without blank lines', async () => {
+test('Esc puts back what was queued without blank lines; a command that waited runs next, on its own', async () => {
   const v = await view();
   for (const text of ['我是谁你知道么', '', '/tasks', '  ']) v.ask.later({ text, multi: false, pasted: false });
-  assert.equal(v.ask.recallAll(), 4);
+  assert.equal(v.ask.recallAll(), 1);
+  assert.deepEqual(await v.ask.message(INK_PROMPT), { text: '/tasks', multi: false, pasted: false });
   v.ask.message(INK_PROMPT);
   const s = await v.read();
-  assert.deepEqual(s.shown.slice(-4), ['❯ 我是谁你知道么', '  /tasks', v.rule, 'agent 625 · Tab completes · /help']);
+  assert.deepEqual(s.shown.slice(-5), ['❯ /tasks', v.rule, '❯ 我是谁你知道么', v.rule, 'agent 625 · Tab completes · /help']);
   await v.scr.close();
 });

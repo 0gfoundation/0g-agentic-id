@@ -230,7 +230,7 @@ test('Enter on a message that wraps, and a paste: no stale row is left', async (
   await paint();
   // The paste is the message begun: its first line under the prompt (cut
   // to the row), the line after it still being edited.
-  assert.deepEqual(t.read().lines.slice(-2), ['agent 7 (replying, Esc stops) › past…', '… pasted b']);
+  assert.deepEqual(t.read().lines.slice(-2), ['agent 7 (replying, Esc stops) › paste…', '… pasted b']);
   assert.deepEqual(t.ask.drafting(), ['pasted a']);
   await t.type('\r');
   await paint();
@@ -293,7 +293,7 @@ test('a message of several lines typed during a turn shows as it grows', async (
   t.rl.close();
 });
 
-test('an interrupted turn sends nothing queued: it all comes back to edit, as one message', async () => {
+test('an interrupted turn sends nothing queued: the messages come back to edit, as one; a command runs next on its own', async () => {
   const t = shell(60);
   const v = t.turn();
   v.write('agent> working');
@@ -302,18 +302,20 @@ test('an interrupted turn sends nothing queued: it all comes back to edit, as on
   await t.type('/files\r');
   await t.type('and more');
   v.end(); // Esc
-  assert.equal(t.ask.recallAll(), 2);
-  assert.deepEqual(t.ask.queued(), []);
-  assert.deepEqual(t.ask.drafting(), ['first idea', '/files']);
+  assert.equal(t.ask.recallAll(), 1);
+  assert.deepEqual(t.ask.queued().map((e) => e.text), ['/files']);
+  assert.deepEqual(t.ask.drafting(), ['first idea']);
   assert.equal(t.rl.line, 'and more');
   t.output.write('\n');
+  // The command that waited runs first, as a command.
+  assert.deepEqual(await t.ask.message('\nagent 7 › '), { text: '/files', multi: false, pasted: false });
   const p = t.ask.message('\nagent 7 › ');
   await later(10);
   // (The earlier lines are echoed on the shell's own stdout; the line being
   // edited is under the next-line prompt.)
   assert.equal(t.read().lines.at(-1), '… and more');
   await t.type('!\r');
-  assert.deepEqual(await p, { text: 'first idea\n/files\nand more!', multi: true, pasted: false });
+  assert.deepEqual(await p, { text: 'first idea\nand more!', multi: true, pasted: false });
   assert.equal(t.ask.recallAll(), 0, 'nothing waits');
   // One queued line and nothing typed: it is the line being edited.
   const v2 = t.turn();
@@ -452,7 +454,7 @@ test('Tab on a command during a turn completes it, as at the prompt; plain text 
 test('Esc puts what was queued back to edit without blank lines, the rest as typed', async () => {
   const t = shell(60);
   for (const text of ['first', '', 'second\n\nthird', '   ']) t.ask.later({ text, multi: text.includes('\n'), pasted: false });
-  assert.equal(t.ask.recallAll(), 4);
+  assert.equal(t.ask.recallAll(), 2);
   assert.deepEqual(t.ask.drafting(), ['first', 'second']);
   assert.equal(t.rl.line, 'third');
   t.rl.close();
@@ -476,4 +478,46 @@ test('piped input still goes line by line: waiting lines are not joined', async 
   assert.equal((await ask.message('> ')).text, 'one');
   assert.equal((await ask.message('> ')).text, 'two');
   rl.close();
+});
+
+test('Esc puts back the messages not read and the ones queued, as one; a command that waited stays its own and runs next', async () => {
+  const t = shell(60);
+  t.ask.later({ text: 'a queued one', multi: false, pasted: false });
+  t.ask.later({ text: '/compact', multi: false, pasted: false });
+  assert.equal(t.ask.recallAll(['steer before esc']), 2);
+  assert.deepEqual(t.ask.drafting(), ['steer before esc']);
+  assert.equal(t.rl.line, 'a queued one');
+  assert.deepEqual(t.ask.queued().map((e) => e.text), ['/compact']);
+  // Only a command waited: nothing comes back, it stays.
+  const u = shell(60);
+  u.ask.later({ text: '/ta', multi: false, pasted: false });
+  assert.equal(u.ask.recallAll(), 0);
+  assert.deepEqual(u.ask.queued().map((e) => e.text), ['/ta']);
+  t.rl.close();
+  u.rl.close();
+});
+
+test('a message of several lines can be taken back: Backspace at a line start joins the line before; clearBox empties it all', async () => {
+  const t = shell(60);
+  const p = t.ask.message(PROMPT);
+  await t.type('first \\');
+  await t.type('\r');
+  assert.deepEqual(t.ask.drafting(), ['first ']);
+  assert.equal(t.rl.line, '');
+  await t.type('\x7f'); // Backspace at the start of the second line
+  assert.deepEqual(t.ask.drafting(), []);
+  assert.equal(t.rl.line, 'first ');
+  assert.equal(t.rl.cursor, 6);
+  assert.deepEqual(t.read().lines.at(-1), `${PROMPT}first`);
+  await t.type('then\\');
+  await t.type('\r');
+  await t.type('more');
+  assert.deepEqual(t.ask.drafting(), ['first then']);
+  assert.equal(t.ask.clearBox(), true);
+  assert.deepEqual(t.ask.drafting(), []);
+  assert.equal(t.rl.line, '');
+  assert.equal(t.ask.clearBox(), false);
+  await t.type('sent\r');
+  assert.equal((await p).text, 'sent');
+  t.rl.close();
 });
