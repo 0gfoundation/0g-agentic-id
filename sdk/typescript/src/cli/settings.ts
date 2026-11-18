@@ -21,7 +21,7 @@
  * same quotes rather than breaking the JSON on its spaces.
  */
 
-import { CliError } from './errors';
+import { CliError, agentCmd } from './errors';
 import { THINKING_LEVELS, type SettingsDoc, type ThinkingLevel, type VersionPicks } from '../Settings';
 import { MODEL_KEY_PREFIX } from '../Credentials';
 
@@ -48,9 +48,8 @@ const USAGE = '0g-agentdna settings <agent> [provider=… model=… thinking=low
 
 const isVersionKey = (key: string): key is VersionKey => (VERSION_KEYS as readonly string[]).includes(key);
 
-/** How to quote a JSON value, in either place it can be typed. */
-const FRAMEWORK_QUOTING =
-  `settings <agent> others='{"key": "value"}'   # quote it — inside the REPL too`;
+/** How to quote a JSON value, as typed where the owner is. */
+const frameworkQuoting = (): string => `${agentCmd('settings', `others='{"key": "value"}'`)}   # quote it`;
 
 /**
  * Parse `key=value` positionals. Throws `BAD_FLAG` (exit 2) on an unknown
@@ -86,7 +85,7 @@ export function parseAssignments(args: string[]): Assignment[] {
     }
     if (isVersionKey(key) && !/^0x[0-9a-fA-F]{64}$/.test(raw)) {
       throw new CliError('BAD_FLAG', `${key}= takes a version's sha256 hash, "0x" + 64 hex, got "${raw}"`, {
-        remedy: `settings <agent>   # on a 0g-harness agent, lists the versions the trust registry has; ${key}= clears the pick`,
+        remedy: `${agentCmd('settings')} on a 0g-harness agent lists the versions the trust registry has; ${key}= clears the pick`,
       });
     }
     if (key === 'others') {
@@ -95,7 +94,7 @@ export function parseAssignments(args: string[]): Assignment[] {
         parsed = JSON.parse(raw);
       } catch (e) {
         throw new CliError('BAD_FLAG', `others= must be JSON: ${(e as Error).message}`, {
-          remedy: FRAMEWORK_QUOTING,
+          remedy: frameworkQuoting(),
         });
       }
       assertHarnessKnobShapes(parsed);
@@ -338,8 +337,8 @@ export function assertModelPresent(next: SettingsDoc, hadStored: boolean): void 
     {
       remedy:
         'include the model in the same command, e.g. ' +
-        '`settings <agent> model=0gm-1.0-35b-a3b thinking=high` (the agent\'s current model is whatever its ' +
-        'image was built or last configured with — `hello <agent>` and `/agentlog` show what it is running)',
+        `\`${agentCmd('settings', 'model=0gm-1.0-35b-a3b thinking=high')}\` (the agent's current model is whatever its ` +
+        'image was built or last configured with)',
     },
   );
 }

@@ -10,7 +10,7 @@
 
 import { formatEther, parseEther } from 'viem';
 import { findViemError } from '../viemErrors';
-import { CliError, cmdStep, shellStep, shellTo, type ErrorCode } from './errors';
+import { CliError, cmdStep, lifecycleTo, shellStep, shellTo, type ErrorCode } from './errors';
 
 /** An error as the owner reads it. */
 export interface Plain {
@@ -206,11 +206,17 @@ export function explainError(e: unknown): Plain {
   if (http) return httpPlain(http.status, http.what, http.body);
   const msg = e instanceof Error ? e.message : String(e);
   if (/^fetch failed$/i.test(msg.trim())) return { message: 'a network request got no answer (fetch failed)', remedy: 'check your network, then try again' };
+  // An owner route of the agent while it is not running.
+  if (/the agent has no public URL yet/.test(msg)) {
+    return { code: 'AGENT_NOT_RUNNING', message: 'the agent is not running, and only the running agent can answer this', remedy: lifecycleTo('start', 'start it') };
+  }
   // A deploy that stopped before the mint (the SDK's waitForMint).
   const failed = /^waitForMint: seal (0x[0-9a-fA-F]{64}) failed — ([\s\S]*)$/.exec(msg);
   if (failed) {
+    // A contract call's name ("registerWithSeal reverted: …") says nothing to the owner.
+    const why = (failed[2].split('\n')[0].trim() || 'no reason given').replace(/^[a-z][A-Za-z]+ reverted:?\s*/, 'the chain refused the mint: ');
     return {
-      message: `the deploy stopped before the mint: ${failed[2].split('\n')[0].trim() || 'no reason given'}`,
+      message: `the deploy stopped before the mint: ${why}`,
       remedy: shellTo(`retry 0x${failed[1].slice(2, 12)}`, 'resume it under the same identity'),
     };
   }

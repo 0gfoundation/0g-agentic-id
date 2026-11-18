@@ -232,7 +232,7 @@ test('cli: cred <agent> lists model keys apart, with the one in use', () => {
   assert.match(text, /model\.0g-compute {2}in use/);
   assert.match(text, /model\.anthropic {3}kept, not in use/);
   assert.match(renderCredentials([], 1, undefined, { provider: '0g-compute', source: 'deploy' }).join('\n'), /the 0g-compute key given at create\/reset/);
-  assert.match(renderCredentials([], 1, undefined, { source: 'none' }).join('\n'), /add one: cred <agent> set model provider=0g-compute/);
+  assert.match(renderCredentials([], 1, undefined, { source: 'none' }).join('\n'), /add one: 0g-agentdna cred <agent> set model provider=0g-compute/);
   assert.match(renderCredentials(defs.slice(1), 1, undefined, null).join('\n'), /unknown — the agent is not running/);
   assert.match(renderCredentials(defs.slice(1), 1, undefined, 'old').join('\n'), /predates model keys/);
 });

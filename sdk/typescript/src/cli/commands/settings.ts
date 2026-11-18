@@ -21,7 +21,7 @@
 import type { Hash } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import { buildClient } from '../sdk';
-import { CliError, cmdStep, shellStep } from '../errors';
+import { CliError, cmdStep, setAgentAtHand, shellStep } from '../errors';
 import { explainError } from '../plain';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef, type AgentRef } from '../ref';
@@ -67,6 +67,7 @@ export async function resolveSealId(ag: AgenticID, ref: AgentRef, raw: string): 
 export async function run(ctx: CommandContext): Promise<void> {
   const raw = ctx.positionals[0];
   const ref = parseAgentRef(raw);
+  setAgentAtHand(raw ?? null);
   // Grammar errors are usage errors — raise them before any network work.
   // `versions` alone asks for the versions to pick from.
   const { versions: versionsView, assignments } = settingsArgs(ctx.positionals.slice(1));

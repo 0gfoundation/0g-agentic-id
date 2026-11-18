@@ -28,7 +28,7 @@ import {
   type PendingCredentialRequest,
   type TokenRequestTemplate,
 } from '../Credentials';
-import { cancelled, CliError, isCancelled } from './errors';
+import { agentCmd, cancelled, CliError, isCancelled, lifecycleTo } from './errors';
 import { pickModelKey, type KeyPrompt } from './modelkey';
 import { createInterface } from 'node:readline';
 import { emitOk } from './envelope';
@@ -519,7 +519,7 @@ export function renderCredentials(defs: CredentialDefinition[], version: number,
       lines.push(`  connected  ${
         logins === null ? 'unknown — the agent is not running'
           : st?.loggedInAt ? dateText(st.loggedInAt)
-            : `not yet — cred <agent> connect ${d.name}`
+            : `not yet — ${agentCmd('cred', `connect ${d.name}`)}`
       }`);
     }
     for (const t of d.token_request?.take ?? []) {
@@ -544,8 +544,8 @@ function renderModelKeys(keys: CredentialDefinition[], model: ModelKeyState | un
   if (model === null) lines.push('  in use: unknown — the agent is not running');
   else if (model === 'old') lines.push("  in use: unknown — the agent's image predates model keys in cred (a reset moves it to the current image)");
   // LEGACY(model-key): the key that came with the create/reset request.
-  else if (inUse?.source === 'deploy') lines.push(`  in use: the ${inUse.provider} key given at create/reset (cred <agent> set model replaces it)`);
-  else if (inUse?.source === 'none') lines.push(`  in use: none — add one: cred <agent> set model provider=${inUse.provider || '0g-compute'}`);
+  else if (inUse?.source === 'deploy') lines.push(`  in use: the ${inUse.provider} key given at create/reset (${agentCmd('cred', 'set model')} replaces it)`);
+  else if (inUse?.source === 'none') lines.push(`  in use: none — add one: ${agentCmd('cred', `set model provider=${inUse.provider || '0g-compute'}`)}`);
   if (inUse?.issue) lines.push(`  ${printable(inUse.issue)}`);
   return lines;
 }
@@ -605,8 +605,8 @@ async function modelApplied(cred: AgenticID['credentials'], sealId: Hash, provid
     const m = (await cred.loaded(sealId, at).catch(() => undefined))?.model;
     if (m?.source === 'credentials' && m.provider === provider && m.value_hash?.toLowerCase() === valueHash.toLowerCase()) return 'in use now';
     if (m?.issue) return `kept, but not in use: ${printable(m.issue)}`;
-    if (m?.provider && m.provider !== provider) return `kept — the agent's settings use ${m.provider}; this key is used once they switch (settings <agent> provider=${provider})`;
-    if (Date.now() >= until || io.signal?.aborted) return 'kept; not confirmed in use yet — cred <agent> shows which key is in use';
+    if (m?.provider && m.provider !== provider) return `kept — the agent's settings use ${m.provider}; this key is used once they switch (${agentCmd('settings', `provider=${provider}`)})`;
+    if (Date.now() >= until || io.signal?.aborted) return `kept; not confirmed in use yet — ${agentCmd('cred')} shows which key is in use`;
   }
 }
 
@@ -647,7 +647,7 @@ async function modelRmOp(ag: AgenticID, sealId: Hash, provider: string, defs: Cr
   io.out(`removed ${name}. Revoke it at the provider too: removing it here does not.`);
   if (inUse) {
     // LEGACY(model-key): "goes back to the key given at create/reset" holds only while keys come with the request.
-    io.out(`it was in use: the agent goes back to the ${provider} key given at create/reset, if it has one; without one it cannot call its model until there is a key (cred <agent> set model provider=${provider})`);
+    io.out(`it was in use: the agent goes back to the ${provider} key given at create/reset, if it has one; without one it cannot call its model until there is a key (${agentCmd('cred', `set model provider=${provider}`)})`);
   }
   if (out.pushWarning) io.out(`the running agent did not take it: ${out.pushWarning} — it keeps the key until its next boot`);
 }
@@ -733,9 +733,9 @@ function factLines(p: PendingCredentialRequest): string[] {
 }
 
 function answerHint(p: PendingCredentialRequest): string {
-  if (p.op === 'login') return `cred <agent> connect ${p.name} ${printable(p.params?.url ?? '<mcp-url>')}   (or deny)`;
-  if (p.op === 'add') return `cred <agent> set ${p.name}${p.params?.preset ? ` preset=${printable(p.params.preset)}` : ' …'}   (or deny)`;
-  return 'cred <agent> approve | deny';
+  if (p.op === 'login') return `${agentCmd('cred', `connect ${p.name} ${printable(p.params?.url ?? '<mcp-url>')}`)}   (or deny)`;
+  if (p.op === 'add') return `${agentCmd('cred', `set ${p.name}${p.params?.preset ? ` preset=${printable(p.params.preset)}` : ' …'}`)}   (or deny)`;
+  return agentCmd('cred', 'approve | deny');
 }
 
 type AuditRecord = Awaited<ReturnType<AgenticID['credentials']['audit']>>[number];
@@ -1054,7 +1054,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       io.out(`  ${printable(authorizeUrl)}`);
       io.out('');
       if (!io.wait) {
-        io.out(`When you have finished in the browser, \`cred <agent>\` lists ${name}; the agent uses [[credential:${name}]] as its bearer token for ${host}.`);
+        io.out(`When you have finished in the browser, \`${agentCmd('cred')}\` lists ${name}; the agent uses [[credential:${name}]] as its bearer token for ${host}.`);
         return;
       }
       io.out(`waiting for the connection to complete (${io.signal ? 'Ctrl-C or Esc' : 'Ctrl-C'} stops waiting, not the login)…`);
@@ -1065,7 +1065,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
           io.signal?.addEventListener('abort', () => { clearTimeout(t); r(); }, { once: true });
         });
         if (io.signal?.aborted) {
-          io.out(`stopped waiting; the login goes on in the browser, and cred <agent> shows ${name} connected once it is done`);
+          io.out(`stopped waiting; the login goes on in the browser, and ${agentCmd('cred')} shows ${name} connected once it is done`);
           return;
         }
         const now = (await cred.loaded(sealId, { agentUrl: base }).catch(() => undefined))?.entries.find((e) => e.name === name);
@@ -1083,7 +1083,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
         // An image from before the credential log has no route for it.
         if (/HTTP 404\b/.test(e instanceof Error ? e.message : String(e))) {
           throw new CliError('RUNTIME_TOO_OLD', "this agent's runtime has no credential log yet — it comes with a newer image", {
-            remedy: 'a reset moves the agent to the current image (in its session: /reset)',
+            remedy: lifecycleTo('reset', 'move it to the current image'),
           });
         }
         throw e;
@@ -1136,7 +1136,7 @@ export async function answerPending(
       for (const l of factLines(p)) io.out(l);
       const later = (): void => {
         opts.later.add(p.auth_req_id);
-        io.out(`  left for later — cred <agent> pending lists it`);
+        io.out(`  left for later — ${agentCmd('cred', 'pending')} lists it`);
       };
       const refuse = async (): Promise<void> => {
         await cred.deny(sealId, p.auth_req_id, at);
@@ -1162,7 +1162,7 @@ export async function answerPending(
         // An existing entry is the owner's to change, with `set` itself: the
         // agent's request does not move it.
         if (defs.some((d) => d.name === p.name)) {
-          io.out(`  ${p.name} is already set; to change it, run: cred <agent> set ${p.name} …`);
+          io.out(`  ${p.name} is already set; to change it, run: ${agentCmd('cred', `set ${p.name} …`)}`);
           const a = (await io.ask(`  [n] refuse  [Enter] later: `)).trim().toLowerCase();
           if (a === 'n') await refuse();
           else later();
@@ -1172,7 +1172,7 @@ export async function answerPending(
         // Checked again as the answer comes: an entry set meanwhile is not
         // the agent's request to change.
         if (a === 's' && (await cred.get(sealId)).definitions.some((d) => d.name === p.name)) {
-          io.out(`  ${p.name} was set meanwhile; to change it, run: cred <agent> set ${p.name} …`);
+          io.out(`  ${p.name} was set meanwhile; to change it, run: ${agentCmd('cred', `set ${p.name} …`)}`);
           later();
         } else if (a === 's') {
           let args = p.params?.preset ? [`preset=${p.params.preset}`] : [];
@@ -1191,7 +1191,7 @@ export async function answerPending(
         const existing = defs.find((d) => d.name === p.name)?.mcp?.url;
         if (url && existing && existing !== url) {
           io.out(`  ${p.name} is connected to ${printable(existing)}; the agent asks for ${printable(url)}.`);
-          io.out(`  To change it, run: cred <agent> connect ${p.name} <url>`);
+          io.out(`  To change it, run: ${agentCmd('cred', `connect ${p.name} <url>`)}`);
           const a = (await io.ask(`  [n] refuse  [Enter] later: `)).trim().toLowerCase();
           if (a === 'n') await refuse();
           else later();
@@ -1210,7 +1210,7 @@ export async function answerPending(
           return !!now && now !== url;
         };
         if (a === 'c' && url && (await moved())) {
-          io.out(`  ${p.name} was connected elsewhere meanwhile; to change it, run: cred <agent> connect ${p.name} <url>`);
+          io.out(`  ${p.name} was connected elsewhere meanwhile; to change it, run: ${agentCmd('cred', `connect ${p.name} <url>`)}`);
           later();
         } else if (a === 'c' && url) {
           const before = (await cred.loaded(sealId, at)).entries.find((e) => e.name === p.name)?.logged_in_at;
@@ -1235,7 +1235,7 @@ export async function answerPending(
       // after it wait; the answers already given still go to the agent.
       if (isCancelled(e)) {
         for (const q of open.slice(open.indexOf(p))) opts.later.add(q.auth_req_id);
-        io.out('  left for later — cred <agent> pending lists them');
+        io.out(`  left for later — ${agentCmd('cred', 'pending')} lists them`);
         return tell;
       }
       // One request that could not be answered does not lose the answers

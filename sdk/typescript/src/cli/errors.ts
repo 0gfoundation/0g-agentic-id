@@ -42,6 +42,8 @@ export type ErrorCode =
   /** The agent's runtime image predates what was asked; a reset moves it to
    *  the current image. */
   | 'RUNTIME_TOO_OLD'
+  /** What was asked needs the agent running; start (or reset) it. */
+  | 'AGENT_NOT_RUNNING'
   // exit 4 — timeout
   | 'TIMEOUT'
   // exit 5 — auth/ownership
@@ -82,6 +84,7 @@ const EXIT_BY_CODE: Record<ErrorCode, number> = {
   INFERENCE_PROVIDER_UNSUPPORTED: EXIT.REMEDIABLE,
   AGENT_NOT_READY: EXIT.REMEDIABLE,
   RUNTIME_TOO_OLD: EXIT.REMEDIABLE,
+  AGENT_NOT_RUNNING: EXIT.REMEDIABLE,
   TIMEOUT: EXIT.TIMEOUT,
   AUTH_REJECTED: EXIT.AUTH,
 };
@@ -156,6 +159,36 @@ export function shellTo(cmd: string, purpose: string): string {
   return surface === 'shell'
     ? `type \`${cmd}\` to ${purpose}`
     : `run \`0g-agentdna\` and type \`${cmd}\` there to ${purpose}`;
+}
+
+/**
+ * The agent a command works on, and whether it runs in that agent's session,
+ * so a message can name the next command with its id filled in. Set by the
+ * cred and settings commands (one-shot, manager, session); null otherwise.
+ */
+let agentAtHand: { ref: string; session: boolean } | null = null;
+export function setAgentAtHand(ref: string | null, session = false): void {
+  agentAtHand = ref ? { ref, session } : null;
+}
+
+/**
+ * A `cred` or `settings` command for the agent at hand, as typed where the
+ * owner is: `/cred ls` in its session, `cred 286 ls` at the manager,
+ * `0g-agentdna cred 286 ls` outside the shell (`<agent>` when no agent is
+ * at hand).
+ */
+export function agentCmd(kind: 'cred' | 'settings', rest = ''): string {
+  const tail = rest ? ` ${rest}` : '';
+  if (agentAtHand?.session) return `/${kind}${tail}`;
+  const ref = agentAtHand?.ref ?? '<agent>';
+  return surface === 'shell' ? `${kind} ${ref}${tail}` : `0g-agentdna ${kind} ${ref}${tail}`;
+}
+
+/** A shell-only lifecycle step (`start`, `reset`) for the agent at hand, as
+ *  a whole sentence: `/reset` in its session, else shellTo's form. */
+export function lifecycleTo(kind: 'start' | 'reset', purpose: string): string {
+  if (agentAtHand?.session) return `type \`/${kind}\` to ${purpose}`;
+  return shellTo(`${kind} ${agentAtHand?.ref ?? '<agent>'}`, purpose);
 }
 
 /** A command that exists both in the shell and as a one-shot command. */

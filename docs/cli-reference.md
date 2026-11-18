@@ -112,7 +112,7 @@ The owner's credentials for the agent's sealed credential proxy (`sealed/CREDENT
 | `cred <agent> reveal <name> on\|off` | let the agent read the value itself without asking each time. A login or a rotated token the entry holds is kept. Refused for a signing key, which is never revealed. Says so when the running agent did not take the change |
 | `cred <agent> pending` | requests waiting: what sealed knows apart from what the agent says |
 | `cred <agent> approve\|deny [<id>]` | decide one (an id prefix is enough; none when only one request waits); `approve` signs a one-time EIP-712 approval. A request to add a credential or log in is answered by `set` / `login` |
-| `cred <agent> log [n]` | what the agent did with its credentials: first the counted uses of the inference key sealed holds (`×count`, first … last), then the last n other records. An agent whose image has no credential log yet says so (`RUNTIME_TOO_OLD`, exit 3): a reset moves it to the current image |
+| `cred <agent> log [n]` | what the agent did with its credentials: first the counted uses of the inference key sealed holds (`×count`, first … last), then the last n other records. An agent whose image has no credential log yet says so (`RUNTIME_TOO_OLD`, exit 3): a reset moves it to the current image; a stopped agent is refused with `AGENT_NOT_RUNNING` (exit 3): `start` it first |
 | `cred pending` | pending counts on every agent you own |
 | `cred notify [<email>\|off]` | where you are emailed when an agent waits for you or a credential is about to expire |
 | `cred presets` | the presets: hosts, positions, where to create each key and how to keep it narrow (no wallet needed) |
@@ -153,7 +153,7 @@ The banner names the attestor, the wallet, whether a model key is set, and the t
 | `clone` / `transfer` / `grant` / `revoke` / `authorizer` | clone, transfer, clone-authorization management |
 | `settings <id> [k=v …]` | same semantics as the subcommand |
 | `cred <id> [sub …]`, `cred pending`, `cred notify` | same semantics as the subcommand; `login` prints the link and returns without waiting |
-| `balance` / `deposit [og]` / `withdraw [og]` | prepaid account: balance + burn rate / fund / refund withdrawal (time-locked; bare argument claims everything). An amount is a number of OG above 0, checked before any transaction (a deposit also against what the wallet holds); `withdraw <og>` that would join a pending refund asks before restarting its time lock |
+| `balance` / `deposit [og]` / `withdraw [og]` | prepaid account: balance + burn rate / fund / refund withdrawal (time-locked; bare argument claims everything). An amount is a number of OG above 0, checked before any transaction (a deposit also against what the wallet holds); bare `deposit` / `withdraw` ask for it and have no default — Enter cancels; `withdraw <og>` that would join a pending refund asks before restarting its time lock |
 | `ack` | acknowledge the TEE trust root (implicit in deploy/start/reset) |
 | `login [provider]` | guided setup: attestor URL (required; asked again while unset) → owner key (needed to manage your agents) → a model key for each provider the platform lists (optional; Enter keeps a set key or skips an unset one) → the default provider for new agents (asked when more than one has a key) → a summary of what is set. Each answer is checked before it is saved: the URL must be an attestor whose `/config` answers, the owner key 64 hex characters (the wallet address is shown); a wrong one is asked again. Ctrl-C or Esc leaves the current step unsaved; steps finished before it stay saved, and the cancellation says which. When the attestor does not answer at the model-key step, the built-in provider list is asked. Key input echoes `*`. `login <provider>` asks that provider's key only. These keys are the ones every other step offers first (see `cred <agent> set model`) |
 | `status <id>` / `doctor` / `providers` / `releases` | the one-shot commands, run at the prompt |
@@ -189,7 +189,7 @@ The framework used by `/reset` and the chat model selector is **picked by you** 
 | 0 | success | — |
 | 1 | unknown error (incl. NOT_IMPLEMENTED) | read the message |
 | 2 | usage error (incl. unknown command, bad flag, bad agent ref, agent not found) | branch on `error.code` to tell them apart |
-| 3 | **fixable precondition** (missing attestor URL, unreachable, wallet required, `SETTINGS_CONFLICT`, `CREDENTIALS_CONFLICT`, `AGENT_NOT_READY`, `RUNTIME_TOO_OLD`, …) | read `error.remedy`, fix, retry |
+| 3 | **fixable precondition** (missing attestor URL, unreachable, wallet required, `SETTINGS_CONFLICT`, `CREDENTIALS_CONFLICT`, `AGENT_NOT_READY`, `AGENT_NOT_RUNNING`, `RUNTIME_TOO_OLD`, …) | read `error.remedy`, fix, retry |
 | 4 | timeout | check again later |
 | 5 | auth | stop |
 | 130 | cancelled at a one-shot command's prompt (Ctrl-C; prints `cancelled`) | — |
