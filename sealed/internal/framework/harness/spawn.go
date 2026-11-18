@@ -637,7 +637,9 @@ func (a *Adapter) SubprocessLogPath() string { return framework.LogPath(logName)
 // docs/PROTOCOL.md in 0g-harness (protocol 1) is the contract, and each
 // route lists its endpoints from it: the proxy forwards those requests only
 // (sealed/LAYERS.md §4.3), so an endpoint the harness's code adds is not
-// reachable from outside until sealed lists it.
+// reachable from outside until sealed lists it. /hello is public, so each
+// description is one plain sentence on what the route is for; the requests
+// and their fields are PROTOCOL.md's.
 func (a *Adapter) FrameworkRoutes() []framework.Route {
 	backend := fmt.Sprintf("http://127.0.0.1:%d", bridgePort)
 	route := func(prefix, kind, description string, endpoints ...framework.Endpoint) framework.Route {
@@ -649,34 +651,34 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 		// STATEFUL, like prime: the conversation lives in the harness's DSH
 		// session and only the last user message of `messages` is read, so
 		// re-sending an edited history does not rewind it.
-		route("/v1/", "chat", "OpenAI-compatible chat/completions API (0g-harness). STATEFUL: the conversation lives in a server-side session and only the last user message is read. Owner turns run one at a time.",
+		route("/v1/", "chat", "The owner's chat with the agent, which keeps the conversation itself.",
 			get("/v1/harness"), post("/v1/chat/completions"), post("/v1/interrupt"), post("/v1/compact")),
 		// The SDK picks Responses over chat/completions when it sees this kind
 		// (the long-task surface: the turn is owned by a server-side response
 		// id, not by the HTTP connection).
-		route("/v1/responses", "responses", "OpenAI Responses API subset (0g-harness): POST /v1/responses {input, stream} → events with sequence_number; GET /{id} polls; GET /{id}?stream=true&starting_after=N resumes; POST /{id}/cancel stops the turn. Same stateful session as the chat route.",
+		route("/v1/responses", "responses", "The same chat, with replies that keep running when the connection drops.",
 			post("/v1/responses"), get("/v1/responses/{id}"), post("/v1/responses/{id}/cancel")),
-		route("/v1/inbox", "inbox", "Messages from turns the agent opened itself — a background job finishing, a reminder coming due: GET /v1/inbox?after=N, POST /v1/inbox/ack {through}.",
+		route("/v1/inbox", "inbox", "What the agent said on its own, such as when a background job finished or a reminder came due.",
 			get("/v1/inbox"), post("/v1/inbox/ack")),
-		route("/v1/events", "events", "Server-sent feed of turn, inbox, activity and schedule changes, resumable from a cursor: GET /v1/events?after=N.",
+		route("/v1/events", "events", "A live feed of changes to the agent's replies, inbox, work and reminders.",
 			get("/v1/events")),
 		// What runs or ran: turns, background commands, subagents.
-		route("/v1/activities", "activities", "Turns, background commands and subagents, with who did each: GET /v1/activities, GET /v1/activities/{id}, POST /v1/activities/{id}/cancel (id `all` cancels everything running).",
+		route("/v1/activities", "activities", "What the agent is doing and has done, and who asked for it.",
 			get("/v1/activities"), get("/v1/activities/{id}"), post("/v1/activities/{id}/cancel")),
 		// zgh-style tasks: a piece of work the owner hands the agent, with
 		// its own session, workspace, state and outcome records. The feed's
 		// own kind, task-feed, tells a client that /v1/tasks names these
 		// tasks: before them, a runtime declared kind "tasks" for the
 		// activity list's old name.
-		route("/v1/tasks", "tasks", "Owner tasks (zgh's task model): POST /v1/tasks {prompt, id?, title?, workspace?: {dir}, instructions?, outcome_tools?, metadata?} → 201 (an id taken → 409 id-taken); GET /v1/tasks?state=&metadata.K=V; GET /v1/tasks/{id} → {state: queued|working|idle|needs-input|done|failed|archived, outcome, records, runs, …}; POST /v1/tasks/{id}/input {text, mode: steer|next} → 202 {delivery}; POST /v1/tasks/{id}/cancel; POST /v1/tasks/{id}/archive; GET /v1/tasks/{id}/events (SSE). The agent records each run's outcome with raise_question, request_action or report_complete; at most four tasks run at once.",
+		route("/v1/tasks", "tasks", "The owner's long-running tasks.",
 			get("/v1/tasks"), post("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/input"), post("/v1/tasks/{id}/cancel"), post("/v1/tasks/{id}/archive"), get("/v1/tasks/{id}/events")),
-		route("/v1/task-feed", "task-feed", "Server-sent feed of every task's changes: one `task` event per task not archived, then `ready`, then one `task` event per change.",
+		route("/v1/task-feed", "task-feed", "A live feed of changes to the owner's tasks.",
 			get("/v1/task-feed")),
-		route("/v1/schedules", "schedules", "Reminders the agent set for itself: GET /v1/schedules (enabled:false unless the owner's `schedule` knob is on).",
+		route("/v1/schedules", "schedules", "Reminders the agent set for itself.",
 			get("/v1/schedules"), framework.Endpoint{Method: http.MethodDelete, Path: "/v1/schedules/{id}"}),
 		// Long-term memory upkeep on the owner's request: one consolidation
 		// pass now (the automatic one follows others.memoryTidy).
-		route("/v1/memory", "memory", "Long-term memory upkeep: POST /v1/memory/tidy runs one consolidation pass now (merge duplicates, drop stale memories), only while no turn runs.",
+		route("/v1/memory", "memory", "Tidying the agent's long-term memory on request.",
 			post("/v1/memory/tidy")),
 		// Owner files: written by the harness (the agent user) to a new name
 		// in the file inbox ~/inbox, where the agent reads them; and the way
@@ -684,16 +686,16 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 		// ~/inbox), which the owner downloads. The file inbox is not the
 		// message inbox above. Images ride the chat and Responses messages
 		// themselves.
-		route("/v1/files", "files", "Owner files: POST /v1/files {name, content_base64} → {path, bytes} lands a file in the agent's file inbox ~/inbox (not the message inbox /v1/inbox), at most 25 MiB; GET /v1/files?dir=outbox|inbox lists, GET /v1/files/{outbox|inbox}/{name} downloads (at most 50 MiB) what the agent put in ~/outbox or what the owner sent. Both directories are container-local, not tracked.",
+		route("/v1/files", "files", "Files the owner sends the agent, and files the agent leaves for the owner.",
 			post("/v1/files"), get("/v1/files"), get("/v1/files/{id}/{id}")),
 		// The owner's word for the turn already running: read before that
 		// turn's next model call (DSH next-step input); queued as an
 		// ordinary turn when no owner turn is running.
-		route("/v1/steer", "steer", "Owner text for the running turn: POST /v1/steer {text} → {merged:true, id, turn} (read before the turn's next model call) or {merged:false, queued} (no owner turn running: an ordinary turn); GET /v1/steer/{id} → {state, turn}.",
+		route("/v1/steer", "steer", "A message from the owner, added to the reply the agent is working on.",
 			post("/v1/steer"), get("/v1/steer/{id}")),
 		// The owner's other conversations (zgh-style sessions): each its own
 		// history, all sharing persona, skills, memory and credentials.
-		route("/v1/sessions", "sessions", "Owner sessions: GET /v1/sessions; POST /v1/sessions {title?, fork?, at?, resume?} → 201 {id}; GET /v1/sessions/{id}; POST /v1/sessions/{id}/prompt {text, mode: next|steer} → 202 {id: response id}; GET /v1/sessions/{id}/events?after=N (SSE); POST /v1/sessions/{id}/cancel. owner-chat is the default session behind /v1/chat/completions and /v1/responses.",
+		route("/v1/sessions", "sessions", "The owner's other conversations with the agent.",
 			get("/v1/sessions"), post("/v1/sessions"), get("/v1/sessions/{id}"), post("/v1/sessions/{id}/prompt"), get("/v1/sessions/{id}/events"), post("/v1/sessions/{id}/cancel")),
 	}
 }

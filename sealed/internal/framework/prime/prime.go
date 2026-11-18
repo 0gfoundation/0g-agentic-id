@@ -331,8 +331,10 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			// conversation here lives in a server-side SDK session and only the
 			// last user message of `messages` is read. A caller that re-sends an
 			// edited history to rewind gets no such thing, and `kind: "chat"`
-			// alone would not tell them.
-			Description: "OpenAI-compatible chat/completions API (sealed bridge). STATEFUL: the conversation lives in a server-side session and only the last user message is read, so re-sending an edited history does not rewind it. Turns are serialized.",
+			// alone would not tell them. /hello is public, so the description
+			// says it in one plain sentence; the bridge's request shapes are in
+			// bridge/bridge.mjs.
+			Description: "The owner's chat with the agent, which keeps the conversation itself.",
 		},
 		{
 			Prefix:  "/v1/responses",
@@ -347,7 +349,7 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			// response id, not by the HTTP connection, so it survives proxy
 			// request-duration caps and network drops (resume via
 			// GET /v1/responses/{id}?stream=true&starting_after=N).
-			Description: "OpenAI Responses API subset (sealed bridge): POST /v1/responses {input, stream} → events with sequence_number; GET /{id} polls; GET /{id}?stream=true&starting_after=N resumes; POST /{id}/cancel stops the turn. Same stateful session as the chat route.",
+			Description: "The same chat, with replies that keep running when the connection drops.",
 		},
 		{
 			Prefix:  "/activity",
@@ -359,8 +361,11 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			// legitimately silent for minutes. This is where the owner can see
 			// what a turn is doing — including the moments the agent rewrites its
 			// own harness, which is a meaningful event on this platform and not
-			// merely a progress bar.
-			Description: "SSE stream of turn activity: tool and bash calls, subagent updates, context compaction, retries, and harness self-modification (refine). Correlate with a chat response by its `turn` id. Owner-only, unsigned — this is observability of the steering channel, not an attributable service.",
+			// merely a progress bar. The SSE events (bridge.mjs, Activity
+			// stream): tool and bash calls, subagent updates, context
+			// compaction, retries and harness self-modification (refine), each
+			// with the `turn` id of the chat response it belongs to.
+			Description: "A live view of what the agent is doing during a reply.",
 		},
 	}
 }

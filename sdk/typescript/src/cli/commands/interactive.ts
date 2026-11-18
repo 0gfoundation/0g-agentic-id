@@ -627,6 +627,7 @@ const L1_ARGS: Record<string, string[] | (() => string[])> = {
   list: ['--mine'],
 };
 const L2_ARGS: Record<string, string[] | (() => string[])> = {
+  '/hello': ['full'],
   '/think': ['low', 'high', 'max'],
   '/reset': ['pick'],
   '/cancel': ['all'],
@@ -1750,14 +1751,17 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · hello <id> · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · cred <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
+  'commands: list · use <id> · hello <id> [full] · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · cred <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
   use <agentId|sealId>    enter YOUR agent's session — works in ANY phase
-  hello <agentId|sealId>  any agent's public /hello: identity, services,
-                          routes, serve-proof verification (with a wallet
-                          configured it also banks a rating ticket, see rate)
+  hello <agentId|sealId> [full]
+                          any agent's public /hello: identity, serve-proof
+                          verification, its services one per line and its
+                          owner routes on one line, by kind; full prints
+                          every field (with a wallet configured it also
+                          banks a rating ticket, see rate)
   call <id> [path [body]] use an agent's public service as a client; the
                           response banks a rating ticket (bare call = list
                           its services)
@@ -2350,7 +2354,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
 
       if (cmd === 'hello') {
         // Public inspection of ANY agent (yours or not) — no wallet needed.
-        if (!args[0]) { out('usage: hello <agentId|sealId>\n'); continue; }
+        if (!args[0] || args.length > 2 || (args[1] !== undefined && args[1] !== 'full')) { out('usage: hello <agentId|sealId> [full]\n'); continue; }
         const ag = await clientFor(ctx, false);
         const ref = parseAgentRef(args[0]);
         const rows = await ag.agent.listDeployments();
@@ -2362,7 +2366,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // visit banks a rating ticket (see `rate`). Still no signing involved.
         const helloKey = ctx.env.privateKey ?? loadKey() ?? undefined;
         const helloAddr = helloKey ? ((await addressOf(helloKey)) as `0x${string}`) : undefined;
-        await showHello(ag, row.url, helloAddr);
+        await showHello(ag, row.url, { full: args[1] === 'full', more: `hello ${args[0]} full` }, helloAddr);
         continue;
       }
 
@@ -2797,18 +2801,104 @@ async function servicesOf(url: string): Promise<Array<{ path: string; method: st
   }
 }
 
+/** The two capability lists of a /hello body: services (agent-registered
+ *  endpoints, entry #0 is /hello itself) and routes (framework-declared
+ *  prefixes, the owner's API). */
+export interface HelloSurface {
+  services?: { path: string; method: string; description?: string; skill?: string; transport?: string }[];
+  routes?: { prefix: string; kind?: string; auth?: string; signed: boolean; description?: string }[];
+}
+
+/** `s` cut to `width` code points, ending in … when cut. */
+function fitLine(s: string, width: number): string {
+  const cps = [...s];
+  return cps.length <= width ? s : `${cps.slice(0, Math.max(0, width - 1)).join('')}…`;
+}
+
+/** `head` and as many of `names` as fit in `width`, comma-separated, ending
+ *  in `, …` when some are left out. */
+function fitNames(head: string, names: string[], width: number): string {
+  const all = head + names.join(', ');
+  if ([...all].length <= width) return all;
+  let line = head;
+  for (const [i, name] of names.entries()) {
+    const next = line + (i ? ', ' : '') + name;
+    if ([...next].length + 3 > width) break;
+    line = next;
+  }
+  return line === head ? `${head}…` : `${line}, …`;
+}
+
+/**
+ * The services and routes of a /hello as `/hello` and `hello <id>` print
+ * them, one string per line, without the line break. Compact (the default): one line per service,
+ * cut to `width`, and the routes folded into one line per auth mode, named by
+ * their kinds, then a pointer to `more` (the full form of the command). `full`:
+ * every field of every entry, as the agent's runtime sent it. Compact cells
+ * go through cleanCell, so nothing the agent wrote can add a line.
+ */
+export function renderHelloSurface(body: HelloSurface, opts: { full: boolean; width: number; more: string }): string[] {
+  const services = Array.isArray(body.services) ? body.services : [];
+  const routes = Array.isArray(body.routes) ? body.routes : [];
+  const lines: string[] = [];
+  if (opts.full) {
+    if (services.length) {
+      lines.push('services:');
+      for (const sv of services) {
+        lines.push(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}`);
+      }
+    }
+    if (routes.length) {
+      lines.push('routes:');
+      for (const rt of routes) {
+        const tags = [rt.kind, rt.auth ? `auth=${rt.auth}` : '', rt.signed ? 'signed' : ''].filter(Boolean).join(' · ');
+        lines.push(`  ${rt.prefix.padEnd(29)} ${tags}${rt.description ? `  — ${rt.description}` : ''}`);
+      }
+    }
+    return lines;
+  }
+  const width = Math.max(40, Math.floor(opts.width) || 80);
+  let hidden = routes.length > 0;
+  if (services.length) {
+    lines.push('services:');
+    for (const sv of services) {
+      const mcp = sv?.transport === 'mcp' ? '[mcp] ' : '';
+      const line = `  ${cleanCell(sv?.method).padEnd(4)} ${cleanCell(sv?.path).padEnd(24)} ${mcp}${cleanCell(sv?.description)}`.trimEnd();
+      const shown = fitLine(line, width);
+      if (shown !== line || sv?.skill) hidden = true;
+      lines.push(shown);
+    }
+  }
+  // One line per auth mode: on every shipped framework that is one line,
+  // `owner API (bearer): chat, responses, …`.
+  const byAuth = new Map<string, string[]>();
+  for (const rt of routes) {
+    const auth = cleanCell(rt?.auth) || 'none';
+    const name = cleanCell(rt?.kind) || cleanCell(rt?.prefix);
+    const names = byAuth.get(auth) ?? [];
+    if (name && !names.includes(name)) names.push(name);
+    byAuth.set(auth, names);
+  }
+  for (const [auth, names] of byAuth) {
+    lines.push(fitNames(auth === 'none' ? 'routes (no auth): ' : `owner API (${auth}): `, names, width));
+  }
+  if (hidden) lines.push(fitLine(`(details: ${opts.more})`, width));
+  return lines;
+}
+
 /** Fetch and print an agent's signed /hello: identity, proof verification,
- *  and its two capability tables — services (agent-registered endpoints,
- *  entry #0 is /hello itself) and routes (framework-declared prefixes).
+ *  and its two capability lists (renderHelloSurface: compact unless `full`).
  *  The public way to inspect ANY agent (L1 `hello <id>` and L2 /hello).
- *  With `clientAddr`, the serve-proof is banked as a rating ticket. */
-async function showHello(ag: AgenticID, url: string, clientAddr?: `0x${string}`): Promise<void> {
+ *  `more` is the command that prints the full form. With `clientAddr`, the
+ *  serve-proof is banked as a rating ticket. */
+async function showHello(
+  ag: AgenticID,
+  url: string,
+  view: { full: boolean; more: string },
+  clientAddr?: `0x${string}`,
+): Promise<void> {
   const { proof, bodyText, banked } = await helloWithTicket(ag, url, clientAddr);
-  let body: {
-    agent?: string; owner?: string; message?: string;
-    services?: { path: string; method: string; description?: string; skill?: string }[];
-    routes?: { prefix: string; kind?: string; auth?: string; signed: boolean; description?: string }[];
-  } = {};
+  let body: { agent?: string; owner?: string; message?: string } & HelloSurface = {};
   try { body = JSON.parse(bodyText); } catch { /* body printed fields stay empty */ }
   const valid = proof ? await ag.reputation.verifyProof(proof) : null;
   const proofLine = valid
@@ -2825,19 +2915,7 @@ async function showHello(ag: AgenticID, url: string, clientAddr?: `0x${string}`)
     }
   }
   if (banked) out(`ticket  : banked (GET /hello) — spend with \`rate\` within ~60 min\n`);
-  if (body.services?.length) {
-    out('services:\n');
-    for (const sv of body.services) {
-      out(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
-    }
-  }
-  if (body.routes?.length) {
-    out('routes:\n');
-    for (const rt of body.routes) {
-      const tags = [rt.kind, rt.auth ? `auth=${rt.auth}` : '', rt.signed ? 'signed' : ''].filter(Boolean).join(' · ');
-      out(`  ${rt.prefix.padEnd(29)} ${tags}${rt.description ? `  — ${rt.description}` : ''}\n`);
-    }
-  }
+  for (const line of renderHelloSurface(body, { ...view, width: process.stdout.columns || 80 })) out(`${line}\n`);
 }
 
 /** Build a wallet-backed client, turning a missing key into a `login` nudge. */
@@ -3259,7 +3337,9 @@ const L2_HELP_FULL = `session commands
   (prompt status)         · 2 notices · 1 new file: notices waiting to print
                           and files the agent left that are not saved yet
   (bare Enter)            refresh this agent's phase/url from the attestor
-  /hello                  identity, routes/services, serve-proof verification
+  /hello [full]           identity, serve-proof verification, services one
+                          per line, owner routes on one line by kind; full
+                          prints every field of every service and route
   /balance                this agent's agentSeal gas + the account prepaid
   /topup [og]             fund this agent's agentSeal gas (default 0.1 OG)
   /start                  start (only from stopped)
@@ -3608,9 +3688,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
 
     try {
-      if (line === '/hello') {
+      if (line === '/hello' || line.startsWith('/hello ')) {
+        const view = line.slice('/hello'.length).trim();
+        if (view && view !== 'full') { out('usage: /hello [full]\n'); continue; }
         if (s.phase !== 'running' || !s.url) { out(`agent is ${s.phase} — not reachable; /start or /reset first\n`); continue; }
-        await showHello(s.ag, s.url);
+        await showHello(s.ag, s.url, { full: view === 'full', more: '/hello full' });
         continue;
       }
       if (line === '/balance') {
