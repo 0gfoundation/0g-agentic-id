@@ -131,7 +131,10 @@ await ag.agent.reset(sealId, { framework, apiKey });   // recreate an EXISTING c
 await ag.agent.retry(sealId, { apiKey });     // resume a 'failed' deploy (do NOT redeploy — that orphans the mint)
 await ag.agent.listDeployments();             // public listing; sandboxId/lastProvisionError/containerStatus null (owner+agentSeal present on minted rows)
 await ag.agent.listMyDeployments();           // owner-signed; full detail
-// row → { agentId, sealId, phase, sandboxId, url, owner, agentSeal, name, createdAt, lastProvisionError, containerStatus }
+// row → { agentId, sealId, phase, sandboxId, url, owner, agentSeal, name, createdAt, lastProvisionError, containerStatus, migrate }
+// migrate (owner listing only): { version, framework, until, urgent, state } | null — a published
+// release replaces this agent's image: reset it by `until` (state 'recommended' | 'soon' | 'overdue').
+await ag.agent.releases();                    // the attestor's release notices, newest first (GET /releases)
 // phase: 'deploying' | 'running' | 'stopped' | 'offline' | 'failed'
 // containerStatus: { level, reason, at } | null — the container's last report. phase
 // shows a 'warning' as 'running' (e.g. reason "owner settings unusable…": no model).

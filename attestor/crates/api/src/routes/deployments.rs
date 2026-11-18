@@ -25,6 +25,7 @@
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use alloy::primitives::Address;
+use attestor_shared::releases::{self, MigrationNotice};
 use attestor_shared::sandbox::eip191_digest;
 use attestor_shared::{AgentId, ContainerStatus, Deployment, DeploymentPhase, SealId, StageStatus};
 use axum::extract::{Query, State};
@@ -126,6 +127,10 @@ struct OwnerDeployment {
     /// running agent that cannot do its work shows.
     #[serde(skip_serializing_if = "Option::is_none")]
     container_status: Option<ContainerStatus>,
+    /// The release that asks this agent to move to a newer image, and by
+    /// when (`ATTESTOR_RELEASES_FILE`); absent when its image is current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migrate: Option<MigrationNotice>,
     // Deliberately no `settings`: the owner's configuration document is
     // served by `GET /settings` alone, which proves the caller is the LIVE
     // on-chain owner. This tier authenticates against the `owner` query
@@ -152,6 +157,7 @@ impl From<Deployment> for OwnerDeployment {
             provisioned_at: d.provisioned_at,
             last_provision_error: d.last_provision_error,
             container_status: d.container_status,
+            migrate: None,
         }
     }
 }
@@ -169,9 +175,20 @@ pub async fn handle(
             verify_owner_auth(&state, &headers, owner)?;
             let rows = state.deployments.list_by_owner(owner).await?;
             let slim = matches!(p.slim.as_deref(), Some("1" | "true"));
+            let releases = releases::load(&state.cfg.releases_file);
+            let now = Utc::now();
             let dtos: Vec<OwnerDeployment> = rows
                 .into_iter()
-                .map(OwnerDeployment::from)
+                .map(|d| {
+                    let migrate = d
+                        .container_record
+                        .as_ref()
+                        .and_then(|r| releases::migration_for(&releases, r.image_hash, now));
+                    OwnerDeployment {
+                        migrate,
+                        ..OwnerDeployment::from(d)
+                    }
+                })
                 .map(|mut d| { d.agent_card = slim_card(d.agent_card, slim); d })
                 .collect();
             Ok(Json(

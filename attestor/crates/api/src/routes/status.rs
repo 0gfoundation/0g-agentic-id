@@ -249,6 +249,7 @@ mod tests {
 
             cli_latest: String::new(),
             cli_notes: String::new(),
+            releases_file: String::new(),
             frameworks: vec![attestor_shared::Framework {
                 name: "openclaw".into(),
                 image: None,

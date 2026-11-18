@@ -74,7 +74,7 @@ async fn load(state: &AppState, seal_id: SealId) -> ApiResult<Deployment> {
 /// go into the set as the agent is created. That set stays good after the mint
 /// (the mint starts no new credential epoch, indexer `watcher.rs`), and sealed
 /// checks its signer against the chain again before it loads it.
-async fn live_owner(state: &AppState, d: &Deployment) -> ApiResult<Address> {
+pub(crate) async fn live_owner(state: &AppState, d: &Deployment) -> ApiResult<Address> {
     let Some(agent_id) = d.agent_id else {
         return Ok(d.owner);
     };

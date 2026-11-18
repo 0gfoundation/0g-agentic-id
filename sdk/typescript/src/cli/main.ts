@@ -25,12 +25,14 @@ import { run as list } from './commands/list';
 import { run as update } from './commands/update';
 import { run as settings } from './commands/settings';
 import { run as providers } from './commands/providers';
+import { run as releases } from './commands/releases';
+import { dueReleaseNotice } from './releaseNotice';
 import { run as cred } from './commands/cred';
 import { run as interactive } from './commands/interactive';
 
 /** Diagnostics subcommands. Anything else (bare, or a leading agent ref)
  *  routes to the default interactive shell. */
-const COMMANDS: Record<string, CommandRun> = { doctor, status, list, update, settings, cred, providers };
+const COMMANDS: Record<string, CommandRun> = { doctor, status, list, update, settings, cred, providers, releases };
 
 // Help is written for LLM consumption as much as for humans: exact syntax,
 // env contract, exit-code semantics, runnable examples — it is the ground
@@ -156,6 +158,12 @@ COMMANDS
                    AGENTIC_PRIVATE_KEY. A write is a
                    compare-and-swap like settings (CREDENTIALS_CONFLICT, exit 3).
   providers        Read the platform provider registry (--json for export).
+  releases         The attestor's release notices: what each release
+                   changed, the images it replaces and when their
+                   transition period ends; with AGENTIC_PRIVATE_KEY, which
+                   of your agents still run one (reset them before then).
+                   Other commands print a short notice when one is due:
+                   weekly, daily in the last 7 days (stderr, terminals only).
   update           Self-update: compare against the npm registry and
                    npm install -g the latest (a git-checkout/npm-link copy
                    is reported, not overwritten). --json only reports.
@@ -257,7 +265,26 @@ async function main(): Promise<number> {
     positionals: isCommand ? rest : positionals,
     flags: { mine: values.mine, phase: values.phase },
   };
-  await run(ctx);
+  // The release notice runs alongside a one-shot command and prints after it,
+  // on stderr, in a terminal only; it waits at most 1.5 s past the command.
+  const noticeAbort = new AbortController();
+  const notice = isCommand && first !== 'releases' && first !== 'update' && !ctx.json && process.stderr.isTTY
+    ? dueReleaseNotice(ctx.env, noticeAbort.signal)
+    : null;
+  try {
+    await run(ctx);
+  } catch (e) {
+    noticeAbort.abort();
+    throw e;
+  }
+  if (notice) {
+    const due = await Promise.race([notice, new Promise<null>((r) => setTimeout(() => r(null), 1500).unref())]);
+    noticeAbort.abort();
+    if (due) {
+      process.stderr.write(`\n${due.lines.map((l) => `  ${l}`).join('\n')}\n`);
+      due.shown();
+    }
+  }
   return EXIT.OK;
 }
 

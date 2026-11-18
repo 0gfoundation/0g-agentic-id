@@ -26,6 +26,7 @@ import { buildClient } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
 import { CliError, cancelled, isCancelled } from '../errors';
 import { requireAttestorUrl } from '../env';
+import { dueReleaseNotice } from '../releaseNotice';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
 import { applyAssignments, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework, isHarnessFramework, parseAssignments, renderListedVersions, renderSettings } from '../settings';
@@ -1627,10 +1628,20 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     // The hint is NOT key-gated: a pre-login user with an attestor configured
     // is exactly who may need the newer CLI.
     const hintDone = maybePrintUpdateHint(ctx.env.attestorUrl).catch(() => {});
+    // The release notice (releaseNotice.ts) shares the same 4 s window.
+    const noticeAbort = new AbortController();
+    const noticeDue = dueReleaseNotice(ctx.env, noticeAbort.signal);
     ack = await Promise.race([readAck, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
     const left = Math.max(0, 4000 - (Date.now() - started));
     await Promise.race([hintDone, new Promise<void>((r) => setTimeout(r, left).unref())]);
     updateHintWindowOpen = false; // a losing fetch that resolves later stays silent
+    const noticeLeft = Math.max(0, 4000 - (Date.now() - started));
+    const due = await Promise.race([noticeDue, new Promise<null>((r) => setTimeout(() => r(null), noticeLeft).unref())]);
+    noticeAbort.abort();
+    if (due) {
+      out(`\n${due.lines.map((l) => `  ${l}`).join('\n')}\n`);
+      due.shown();
+    }
   }
   out(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
   out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);

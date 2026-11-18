@@ -442,6 +442,7 @@ mod tests {
             secret_env_enabled: false,
             cli_latest: String::new(),
             cli_notes: String::new(),
+            releases_file: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],

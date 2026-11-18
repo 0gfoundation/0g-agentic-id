@@ -368,7 +368,7 @@ async fn provision(
         }
         if !allowed_image(state, record.image_hash).await? {
             return Err(ApiError::unauthorized(
-                "recorded image_hash not in validFrameworkHashes; reset required",
+                "recorded image_hash not in validFrameworkHashes: the image was retired; reset required",
             ));
         }
     }
@@ -649,6 +649,7 @@ pub(crate) mod tests {
 
             cli_latest: String::new(),
             cli_notes: String::new(),
+            releases_file: String::new(),
             frameworks: vec![attestor_shared::Framework {
                 name: "openclaw".into(),
                 image: None,
@@ -1223,7 +1224,7 @@ pub(crate) mod tests {
         assert_eq!(error.status, StatusCode::UNAUTHORIZED);
         assert_eq!(
             error.message,
-            "recorded image_hash not in validFrameworkHashes; reset required"
+            "recorded image_hash not in validFrameworkHashes: the image was retired; reset required"
         );
     }
 
