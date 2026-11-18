@@ -31,7 +31,7 @@ npx @0gfoundation/0g-agentdna --help
 | `--mine` | （仅 list）只列 `AGENTIC_PRIVATE_KEY` 名下的部署；需要 owner 签名，额外给出只有 owner 能看的字段（失败原因、sandboxId） |
 | `--phase <p>` | （仅 list）按 phase 过滤：`deploying` `running` `stopped` `offline` `failed` |
 | `--help` | 帮助文本 |
-| `--version` | 包版本（与 SDK 的版本相同） |
+| `--version` | 包版本（与 SDK 的版本相同）；加 `--json` 时输出信封 `{ok: true, data: {version}}` |
 
 `--json` envelope 的约定：
 
@@ -112,7 +112,7 @@ owner 给 agent 的 sealed 凭据代理用的凭据（`sealed/CREDENTIALS.zh.md`
 | `cred <agent> reveal <name> on\|off` | 让 agent 不必每次申请就能自己读取值。条目持有的登录或轮换得到的 token 保留。对签名密钥会被拒绝，签名密钥从不交出。运行中的 agent 没接收这次修改时会说明 |
 | `cred <agent> pending` | 等待中的请求：sealed 掌握的事实与 agent 的说法分开显示 |
 | `cred <agent> approve\|deny [<id>]` | 对一条请求做决定（给出 id 前缀即可；只有一条请求在等时不用给）；`approve` 签一次性的 EIP-712 批准。新增凭据或登录的请求，用 `set` / `login` 来应答 |
-| `cred <agent> log [n]` | agent 用凭据做了什么：先是 sealed 保管的推理 key 的使用计数（`×count`，首次 … 最近一次），然后是最近 n 条其他记录 |
+| `cred <agent> log [n]` | agent 用凭据做了什么：先是 sealed 保管的推理 key 的使用计数（`×count`，首次 … 最近一次），然后是最近 n 条其他记录。agent 的镜像还没有凭据日志时会说明（`RUNTIME_TOO_OLD`，退出码 3）：reset 会把它换到当前镜像 |
 | `cred pending` | 你名下每个 agent 的待处理数量 |
 | `cred notify [<email>\|off]` | agent 等你处理、或凭据快到期时，发邮件到哪里 |
 | `cred presets` | 预设：域名、位置、每个密钥去哪里创建、怎样把权限收窄（不需要钱包） |
@@ -139,7 +139,7 @@ attestor 的发布通知，最新的在前（`--json`：`{ releases, agents }`�
 
 ### manager 层（`0g-agentdna>` 提示符）
 
-banner 写明 attestor、钱包、是否设置了模型 key，以及信任根 ack（或者哪项读取失败：attestor 没应答、链上读取失败，或 4 秒内没有应答）。到期的更新提示和发布通知打印在它之后。shell 打印的所有内容都适应终端宽度。在命令提出的提问处（向导的选项、一个金额、一把 key），Tab 不提供 shell 命令，↑ 也调不出命令，回答不进入命令历史；等待期间（start、reset、deploy，或等模型 key 被接收、等登录完成），↑ 同样调不出命令，等待行显示 `Esc stops the wait, not the agent`。错误显示为 `error: …`，有修复办法时还有 `→ <remedy>`，给出在这个提示符下输入的命令；未知的词看起来像拼写错误时，给出最接近的命令。
+banner 写明 attestor、钱包、是否设置了模型 key，以及信任根 ack（或者哪项读取失败：attestor 没应答、链上读取失败，或 4 秒内没有应答）。到期的更新提示和发布通知打印在它之后。shell 的各行，以及一次性命令在终端上的输出，都在终端宽度处按词换行。在命令提出的提问处（向导的选项、一个金额、一把 key），Tab 不提供 shell 命令，↑ 也调不出命令，回答不进入命令历史；等待期间（start、reset、deploy，或等模型 key 被接收、等登录完成），↑ 同样调不出命令，等待行显示 `Esc stops the wait, not the agent`。错误显示为 `error: …`，有修复办法时还有 `→ <remedy>`，给出在这个提示符下输入的命令；未知的词看起来像拼写错误时，给出最接近的命令。
 
 | 命令 | 作用 |
 |---|---|
@@ -189,7 +189,7 @@ banner 写明 attestor、钱包、是否设置了模型 key，以及信任根 ac
 | 0 | 成功 | — |
 | 1 | 未知错误（包括 NOT_IMPLEMENTED） | 阅读错误信息 |
 | 2 | 用法错误（包括未知命令、错误的 flag、错误的 agent 引用、找不到 agent） | 按 `error.code` 区分 |
-| 3 | **可修复的前提条件**（缺少 attestor URL、无法连接、需要钱包、`SETTINGS_CONFLICT`、`CREDENTIALS_CONFLICT`、`AGENT_NOT_READY`……） | 阅读 `error.remedy`，修复后重试 |
+| 3 | **可修复的前提条件**（缺少 attestor URL、无法连接、需要钱包、`SETTINGS_CONFLICT`、`CREDENTIALS_CONFLICT`、`AGENT_NOT_READY`、`RUNTIME_TOO_OLD`……） | 阅读 `error.remedy`，修复后重试 |
 | 4 | 超时 | 稍后再查 |
 | 5 | 认证 | 停止 |
 | 130 | 在一次性命令的提问处取消（Ctrl-C；打印 `cancelled`） | — |

@@ -16,7 +16,7 @@
 import type { Address, Hash } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import { buildClient } from '../sdk';
-import { CliError, cmdStep, shellStep } from '../errors';
+import { CliError, cmdStep, shellTo } from '../errors';
 import { explainError } from '../plain';
 import { cleanCell } from './cells';
 import { emitOk, note, print } from '../envelope';
@@ -121,7 +121,7 @@ export async function run(ctx: CommandContext): Promise<void> {
           note(`could not fetch the owner-tier failure reason (${explainError(e).message})`);
         }
       } else {
-        note(`failure reason is owner-only — with your owner key (${shellStep('login')}, or AGENTIC_PRIVATE_KEY) it shows`);
+        note(`the failure reason is owner-only: ${shellTo('login', 'save your owner key')} (or set AGENTIC_PRIVATE_KEY), then look again`);
       }
     }
   }
@@ -152,21 +152,22 @@ export async function run(ctx: CommandContext): Promise<void> {
   };
   if (data.phase === 'failed') {
     // retry preserves the minted identity; a redeploy would orphan it.
-    data.hint = `recover with ${shellStep(`retry ${agentId ?? data.agentId ?? `0x${(sealId ?? '').slice(2, 12)}`}`)} (keeps the on-chain identity); do NOT redeploy`;
+    data.hint = `${shellTo(`retry ${agentId ?? data.agentId ?? `0x${(sealId ?? '').slice(2, 12)}`}`, 'recover it under the same on-chain identity')} — do not redeploy`;
   }
 
   if (ctx.json) {
     emitOk(data);
     return;
   }
+  // An 11-column label: the 66-character sealId line fits 80 columns.
   const show = (v: unknown): string => (v === null || v === undefined ? '—' : String(v));
-  print(`agentId:        ${show(data.agentId)}`);
-  print(`sealId:         ${show(data.sealId)}`);
-  print(`agentSeal:      ${show(data.agentSeal)}`);
-  print(`owner:          ${show(data.owner)}`);
-  print(`phase:          ${show(data.phase)}`);
-  print(`name:           ${show(data.name)}`);
-  print(`createdAt:      ${show(data.createdAt)}`);
-  print(`failureReason:  ${show(data.failureReason)}`);
-  if (data.hint) print(`hint:           ${data.hint}`);
+  print(`agentId:   ${show(data.agentId)}`);
+  print(`sealId:    ${show(data.sealId)}`);
+  print(`agentSeal: ${show(data.agentSeal)}`);
+  print(`owner:     ${show(data.owner)}`);
+  print(`phase:     ${show(data.phase)}`);
+  print(`name:      ${show(data.name)}`);
+  print(`createdAt: ${show(data.createdAt)}`);
+  print(`failure:   ${show(data.failureReason)}`);
+  if (data.hint) print(`hint:      ${data.hint}`);
 }

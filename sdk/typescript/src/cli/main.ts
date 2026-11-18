@@ -17,9 +17,9 @@ import { join } from 'node:path';
 import { CliError, EXIT, isCancelled } from './errors';
 import { plainCliError } from './plain';
 import { parseAgentRef } from './ref';
-import { didYouMean } from './textfit';
+import { didYouMean, fitLines, termWidth } from './textfit';
 import { cleanCell } from './commands/cells';
-import { emitError, note, print } from './envelope';
+import { emitError, emitOk, note, print } from './envelope';
 import { readEnv } from './env';
 import { moveRenamedAttestor } from './config';
 import type { CommandContext, CommandRun } from './types';
@@ -289,7 +289,8 @@ async function main(): Promise<number> {
   });
 
   if (values.version) {
-    print(packageVersion());
+    if (values.json) emitOk({ version: packageVersion() });
+    else print(packageVersion());
     return EXIT.OK;
   }
   if (values.help) {
@@ -331,7 +332,7 @@ async function main(): Promise<number> {
     const due = await Promise.race([notice, new Promise<null>((r) => setTimeout(() => r(null), 1500).unref())]);
     noticeAbort.abort();
     if (due) {
-      process.stderr.write(`\n${due.lines.map((l) => `  ${l}`).join('\n')}\n`);
+      process.stderr.write(`\n${fitLines(due.lines.map((l) => `  ${l}`).join('\n'), termWidth(process.stderr))}\n`);
       due.shown();
     }
   }

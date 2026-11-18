@@ -31,7 +31,7 @@ Prerequisite: **Node.js ≥ 22** (recommended: `nvm install 22 && nvm use 22`).
 | `--mine` | (list only) restrict to deployments owned by `AGENTIC_PRIVATE_KEY`; owner-signed, adds owner-only fields (failure reason, sandboxId) |
 | `--phase <p>` | (list only) filter by phase: `deploying` `running` `stopped` `offline` `failed` |
 | `--help` | help text |
-| `--version` | package version (identical to the SDK's) |
+| `--version` | package version (identical to the SDK's); with `--json`, the envelope `{ok: true, data: {version}}` |
 
 The `--json` envelope contract:
 
@@ -112,7 +112,7 @@ The owner's credentials for the agent's sealed credential proxy (`sealed/CREDENT
 | `cred <agent> reveal <name> on\|off` | let the agent read the value itself without asking each time. A login or a rotated token the entry holds is kept. Refused for a signing key, which is never revealed. Says so when the running agent did not take the change |
 | `cred <agent> pending` | requests waiting: what sealed knows apart from what the agent says |
 | `cred <agent> approve\|deny [<id>]` | decide one (an id prefix is enough; none when only one request waits); `approve` signs a one-time EIP-712 approval. A request to add a credential or log in is answered by `set` / `login` |
-| `cred <agent> log [n]` | what the agent did with its credentials: first the counted uses of the inference key sealed holds (`×count`, first … last), then the last n other records |
+| `cred <agent> log [n]` | what the agent did with its credentials: first the counted uses of the inference key sealed holds (`×count`, first … last), then the last n other records. An agent whose image has no credential log yet says so (`RUNTIME_TOO_OLD`, exit 3): a reset moves it to the current image |
 | `cred pending` | pending counts on every agent you own |
 | `cred notify [<email>\|off]` | where you are emailed when an agent waits for you or a credential is about to expire |
 | `cred presets` | the presets: hosts, positions, where to create each key and how to keep it narrow (no wallet needed) |
@@ -139,7 +139,7 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 
 ### Manager level (`0g-agentdna>` prompt)
 
-The banner names the attestor, the wallet, whether a model key is set, and the trust-root ack (or which read failed: the attestor did not answer, the chain read failed, or no answer within 4 s). A due update hint and release notice print after it. Everything the shell prints fits the terminal's width. At a question a command asks (a wizard's choice, an amount, a key) Tab offers no shell command and ↑ recalls none, and the answer does not join the command history; during a wait (start, reset, deploy, a model key or a login being taken) ↑ recalls none either, and the wait line says `Esc stops the wait, not the agent`. An error is `error: …` and, when there is one, `→ <remedy>` naming a command typed at this prompt; an unknown word names the nearest command when it looks like a typo.
+The banner names the attestor, the wallet, whether a model key is set, and the trust-root ack (or which read failed: the attestor did not answer, the chain read failed, or no answer within 4 s). A due update hint and release notice print after it. The shell's lines, and a one-shot command's on a terminal, wrap between words at the terminal's width. At a question a command asks (a wizard's choice, an amount, a key) Tab offers no shell command and ↑ recalls none, and the answer does not join the command history; during a wait (start, reset, deploy, a model key or a login being taken) ↑ recalls none either, and the wait line says `Esc stops the wait, not the agent`. An error is `error: …` and, when there is one, `→ <remedy>` naming a command typed at this prompt; an unknown word names the nearest command when it looks like a typo.
 
 | Command | Effect |
 |---|---|
@@ -189,7 +189,7 @@ The framework used by `/reset` and the chat model selector is **picked by you** 
 | 0 | success | — |
 | 1 | unknown error (incl. NOT_IMPLEMENTED) | read the message |
 | 2 | usage error (incl. unknown command, bad flag, bad agent ref, agent not found) | branch on `error.code` to tell them apart |
-| 3 | **fixable precondition** (missing attestor URL, unreachable, wallet required, `SETTINGS_CONFLICT`, `CREDENTIALS_CONFLICT`, `AGENT_NOT_READY`, …) | read `error.remedy`, fix, retry |
+| 3 | **fixable precondition** (missing attestor URL, unreachable, wallet required, `SETTINGS_CONFLICT`, `CREDENTIALS_CONFLICT`, `AGENT_NOT_READY`, `RUNTIME_TOO_OLD`, …) | read `error.remedy`, fix, retry |
 | 4 | timeout | check again later |
 | 5 | auth | stop |
 | 130 | cancelled at a one-shot command's prompt (Ctrl-C; prints `cancelled`) | — |

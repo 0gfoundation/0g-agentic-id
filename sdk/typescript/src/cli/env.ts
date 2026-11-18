@@ -6,7 +6,7 @@
  * CI logs), env is not.
  */
 
-import { CliError, currentSurface, shellStep } from './errors';
+import { CliError, currentSurface, shellStep, shellTo } from './errors';
 import { loadConfig, loadKey, normalizeKey } from './config';
 
 /** Resolved CLI environment. All values come from `process.env`. */
@@ -96,7 +96,7 @@ export function requirePrivateKey(env: CliEnv): `0x${string}` {
         : 'AGENTIC_PRIVATE_KEY is set but malformed (expected 64 hex chars, 0x prefix optional)',
       {
         remedy: env.privateKeySource === 'file'
-          ? `${shellStep('login')} and enter the key again`
+          ? shellTo('login', 'enter the key again')
           : 'export AGENTIC_PRIVATE_KEY=0x<64 hex chars>   # or unset it to use the login-saved key',
       },
     );

@@ -10,7 +10,7 @@
 
 import { formatEther, parseEther } from 'viem';
 import { findViemError } from '../viemErrors';
-import { CliError, shellStep, type ErrorCode } from './errors';
+import { CliError, cmdStep, shellStep, shellTo, type ErrorCode } from './errors';
 
 /** An error as the owner reads it. */
 export interface Plain {
@@ -181,7 +181,7 @@ export function explainError(e: unknown): Plain {
       return {
         code: 'PREFLIGHT_GAS',
         message: 'the wallet does not hold enough OG for this and its gas',
-        remedy: `use a smaller amount, or fund the wallet (${shellStep('whoami')} shows its address)`,
+        remedy: `use a smaller amount, or fund the wallet (${shellTo('whoami', 'see its address')})`,
       };
     }
     const net = findViemError(e, ['HttpRequestError', 'TimeoutError', 'WebSocketRequestError']) as { url?: string } | null;
@@ -201,7 +201,25 @@ export function explainError(e: unknown): Plain {
   if (http) return httpPlain(http.status, http.what, http.body);
   const msg = e instanceof Error ? e.message : String(e);
   if (/^fetch failed$/i.test(msg.trim())) return { message: 'a network request got no answer (fetch failed)', remedy: 'check your network, then try again' };
-  return { message: msg.split('\n').find((l) => l.trim())?.trim() ?? msg };
+  // A deploy that stopped before the mint (the SDK's waitForMint).
+  const failed = /^waitForMint: seal (0x[0-9a-fA-F]{64}) failed — ([\s\S]*)$/.exec(msg);
+  if (failed) {
+    return {
+      message: `the deploy stopped before the mint: ${failed[2].split('\n')[0].trim() || 'no reason given'}`,
+      remedy: shellTo(`retry 0x${failed[1].slice(2, 12)}`, 'resume it under the same identity'),
+    };
+  }
+  const late = /^waitForMint: seal (0x[0-9a-fA-F]{64}) not minted within (\d+)ms/.exec(msg);
+  if (late) {
+    return {
+      code: 'TIMEOUT',
+      message: `agent 0x${late[1].slice(2, 12)} is not minted after ${Math.round(Number(late[2]) / 1000)} s`,
+      remedy: `${cmdStep('list')} shows when it is`,
+    };
+  }
+  // The first line, without the SDK function a message starts with.
+  const first = msg.split('\n').find((l) => l.trim())?.trim() ?? msg;
+  return { message: first.replace(/^[a-z][A-Za-z]+(?:\.[a-z][A-Za-z]+)?: (?=\S)/, '') };
 }
 
 /** The full text behind a plain error, for `--json`'s `details.cause`. */

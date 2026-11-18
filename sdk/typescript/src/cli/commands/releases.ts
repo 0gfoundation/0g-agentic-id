@@ -10,7 +10,7 @@
  */
 
 import { fetchReleases } from '../../Releases';
-import { CliError, shellStep } from '../errors';
+import { CliError, shellTo } from '../errors';
 import { attestorUnreachable } from '../sdk';
 import { emitOk, print } from '../envelope';
 import { requireAttestorUrl } from '../env';
@@ -52,7 +52,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   } else if (!agents.length) {
     print('Your agents: none runs a replaced image.');
   } else {
-    print(`Your agents to move (${shellStep('reset <agent>')}; they keep running meanwhile):`);
+    print(`Your agents to move — they keep running meanwhile; ${shellTo('reset <agent>', 'move one')}:`);
     for (const a of agents) {
       print(`  ${a.agent}  ${a.migrate.framework}  by ${dateOf(a.migrate.until)}  ${STATE_TEXT[a.migrate.state] ?? a.migrate.state}${a.migrate.urgent ? ', security fix' : ''}`);
     }

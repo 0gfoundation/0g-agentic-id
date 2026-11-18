@@ -533,7 +533,7 @@ export function renderCredentials(defs: CredentialDefinition[], version: number,
 
 /** The model keys, and which one the framework uses. */
 function renderModelKeys(keys: CredentialDefinition[], model: ModelKeyState | undefined): string[] {
-  const lines = ['', "model keys  (sealed hands the key to the framework; the agent's settings choose the provider)"];
+  const lines = ['', "model keys (the agent's settings choose which one is used)"];
   const inUse = model && model !== 'old' ? model : undefined;
   const width = Math.max(0, ...keys.map((d) => d.name.length));
   for (const d of keys) {
@@ -1079,7 +1079,15 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
     }
     case 'log': {
       const n = Number(rest[0]) || 50;
-      const all = await cred.audit(sealId, at);
+      const all = await cred.audit(sealId, at).catch((e: unknown) => {
+        // An image from before the credential log has no route for it.
+        if (/HTTP 404\b/.test(e instanceof Error ? e.message : String(e))) {
+          throw new CliError('RUNTIME_TOO_OLD', "this agent's runtime has no credential log yet — it comes with a newer image", {
+            remedy: 'a reset moves the agent to the current image (in its session: /reset)',
+          });
+        }
+        throw e;
+      });
       // Counted records (sealed's own inference key) head the log; the last
       // n of the rest follow.
       const recs = [...all.filter((r) => r.count), ...all.filter((r) => !r.count).slice(-n)];

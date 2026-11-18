@@ -24,10 +24,10 @@ import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient, probeAttestor } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
-import { CliError, cancelled, cmdStep, isCancelled, setSurface, shellStep } from '../errors';
+import { CliError, cancelled, cmdStep, currentSurface, isCancelled, setSurface, shellStep, shellTo } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { ogAmount, parseOgAmount, explainError } from '../plain';
-import { fitHelp, termWidth, wrap, didYouMean } from '../textfit';
+import { fitHelp, termWidth, didYouMean } from '../textfit';
 import { run as doctorCommand } from './doctor';
 import { run as statusCommand } from './status';
 import { run as providersCommand } from './providers';
@@ -65,16 +65,16 @@ const clientInstanceId = (globalThis.crypto?.randomUUID?.() ?? `cli-${Date.now()
  *  is ALWAYS shown ("couldn't check" ≠ "nothing owed"). */
 type EffBalance = Awaited<ReturnType<AgenticID['getEffectiveBalance']>>;
 function moneyBlock(prepaidWei: bigint | null, eff: EffBalance | null, effErr: string | null): void {
-  out(`prepaid balance : ${prepaidWei == null ? '(unreadable)' : og(prepaidWei)}\n`);
+  say(`prepaid balance : ${prepaidWei == null ? '(unreadable)' : og(prepaidWei)}\n`);
   if (eff && eff.availableWei < eff.balanceWei) {
-    if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
-    if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
-    if (eff.reservedWei > 0n) out(`reserved        : ${og(eff.reservedWei)}\n`);
-    out(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
+    if (eff.outstandingDebtWei > 0n) say(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
+    if (eff.pendingSettlementWei > 0n) say(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
+    if (eff.reservedWei > 0n) say(`reserved        : ${og(eff.reservedWei)}\n`);
+    say(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
   } else if (eff) {
-    out(`AVAILABLE       : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
+    say(`AVAILABLE       : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
   } else {
-    out(`AVAILABLE       : (unknown: ${effErr ? explainError(effErr).message : 'no answer'} — the chain number above may be optimistic)\n`);
+    say(`AVAILABLE       : (unknown: ${effErr ? explainError(effErr).message : 'no answer'} — the chain number above may be optimistic)\n`);
   }
 }
 
@@ -957,7 +957,7 @@ export function printAbovePrompt(
 }
 import type { CommandContext } from '../types';
 import { cellText, cleanCell, cleanStream, listCells, listHeader, listLayout, ownerColumnWidth, sealToAgentMap, type ListLayout } from './cells';
-import { CONT_PROMPT, LiveTurn, PlainTurn, fitRow, liveKeys, wrapProse, wrapText, wrapWords, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
+import { CONT_PROMPT, LiveTurn, PlainTurn, fitRow, liveKeys, textCols, wrapProse, wrapText, wrapWords, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
 import { INK_PROMPT, MIN_COLS, MIN_ROWS, inkLoadError, loadInk, openInkScreen, type InkScreen, type Key as InkKey } from '../inkView';
 import { OUTBOX_POLL_MS, makeOutboxSync, renderOutboxEvent, supportsHyperlinks, tildePath, type OutboxSync } from '../outboxSync';
 
@@ -1542,6 +1542,8 @@ const term = (s: string): void => {
  * nothing of that may restyle, hide or rewrite what the owner reads.
  */
 const out = (s: string): void => term(termWrap(cleanStream(s)));
+/** The shell's own whole lines: `out` already wraps them between words. */
+const say = out;
 
 /** The width the shell wraps to on a terminal (its own less one); unbounded
  *  otherwise (textfit.termWidth, shared with the one-shot commands). */
@@ -2657,8 +2659,16 @@ const L1_HELP =
 
 /** A `·`-separated list wrapped to `width` between items, never inside one. */
 export function fitItems(text: string, width: number | undefined): string {
-  const nb = text.split(' · ').map((item) => item.replace(/ /g, '\u00a0')).join(' · ');
-  return wrap(nb, width, '  ').join('\n').replace(/\u00a0/g, ' ');
+  if (!width) return text;
+  // Items packed onto rows; a row after the first starts under the list.
+  const rows: string[] = [];
+  let row = '';
+  for (const item of text.split(' · ')) {
+    const next = row ? `${row} · ${item}` : item;
+    if (row && textCols(next) + 2 > width) { rows.push(`${row} ·`); row = `  ${item}`; } else row = next;
+  }
+  rows.push(row);
+  return rows.join('\n');
 }
 
 const L1_HELP_FULL = `manager commands
@@ -2770,13 +2780,13 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   if (process.stdout.isTTY && !process.env.NO_COLOR) {
     const art = pandaLines();
     const caption = ['', '', '', '   \x1b[1m0G AgentDNA\x1b[0m', '   interactive shell', '', '', ''];
-    out('\n');
+    say('\n');
     art.forEach((l, i) => term(`  ${l}${caption[i] ?? ''}\n`));
-    out('\n');
+    say('\n');
   } else {
-    out('\n╭──────────────────────────────────────╮\n');
-    out(`│${'   0G AgentDNA — interactive shell'.padEnd(38)}│\n`);
-    out('╰──────────────────────────────────────╯\n\n');
+    say('\n╭──────────────────────────────────────╮\n');
+    say(`│${'   0G AgentDNA — interactive shell'.padEnd(38)}│\n`);
+    say('╰──────────────────────────────────────╯\n\n');
   }
   // Ack read and the update hint both hit the attestor; they start before the
   // first await and share ONE wall-clock ceiling (sequential races cost 8s on
@@ -2785,11 +2795,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   // one. A hanging (vs refusing) attestor must not stall the banner.
   let ack = '';
   // The update hint and the release notice print after the banner block,
-  // not inside it; everything the banner prints fits the terminal's width.
+  // not inside it; `out` wraps what the banner prints at the terminal's width.
   const notices: string[][] = [];
-  const width = termWidth();
-  const say = (line: string): void => out(`${wrap(line, width, '             ').join('\n')}\n`);
-  say(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}`);
+  say(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
   {
     const started = Date.now();
     // Each way the read can fail says which: the attestor did not answer,
@@ -2818,13 +2826,13 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     noticeAbort.abort();
     if (due) { notices.push(due.lines); due.shown(); }
   }
-  say(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}`);
-  say(`  model key  ${modelKey}`);
-  if (ack) say(`  ack        ${ack}`);
-  out('\n');
+  say(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
+  say(`  model key  ${modelKey}\n`);
+  if (ack) say(`  ack        ${ack}\n`);
+  say('\n');
   for (const lines of notices) {
-    for (const l of lines) out(`${wrap(`  ${l}`, width, '  ').join('\n')}\n`);
-    out('\n');
+    for (const l of lines) say(`  ${l}\n`);
+    say('\n');
   }
   const hello = !ctx.env.attestorUrl || !key
     ? 'first run? type `login` — one guided setup for the attestor + keys'
@@ -2833,7 +2841,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       // configured user over an optional item (feedback.md F8).
       ? '`help` commands · `use <id>` chat · (no model key — `login` adds one when you deploy)'
       : '`help` commands · `use <id>` chat · Esc interrupts a turn';
-  out(`${wrap(`  ${hello}`, width, '  ').join('\n')}\n\n`);
+  say(`  ${hello}\n\n`);
   // Prefill the completion id cache in the background: without it, `use
   // <Tab>` is dead until the first list/balance/agent op of the session.
   // Fire-and-forget — a slow attestor costs the completions, never the prompt.
@@ -2855,7 +2863,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     const [cmd, ...args] = line ? tokenize(line) : ['whoami'];
     try {
       if (cmd === 'quit' || cmd === 'exit') return;
-      if (cmd === 'help') { out(`${managerHelp(termWidth())}\n`); continue; }
+      if (cmd === 'help') { say(`${managerHelp(termWidth())}\n`); continue; }
 
       if (cmd === 'login' || cmd === 'config') {
         // Guided setup. The attestor URL is required; the owner key is
@@ -2879,12 +2887,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
               const url = (await ask(`attestor URL (required) [${ctx.env.attestorUrl ?? 'unset'}]: `)).trim().replace(/\/+$/, '');
               if (!url) {
                 if (ctx.env.attestorUrl) break;
-                out('  every command needs the attestor URL — type it, e.g. https://agentdna.0g.ai\n');
+                say('  every command needs the attestor URL — type it, e.g. https://agentdna.0g.ai\n');
                 continue;
               }
               const problem = await probeAttestor(url);
               if (problem) {
-                out(`  ${cleanCell(url)}: ${problem} — try again${ctx.env.attestorUrl ? ' (Enter keeps the current one)' : ''}\n`);
+                say(`  ${cleanCell(url)}: ${problem} — try again${ctx.env.attestorUrl ? ' (Enter keeps the current one)' : ''}\n`);
                 continue;
               }
               saveConfig({ attestorUrl: url });
@@ -2902,14 +2910,14 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
               // every later command see a "malformed" key until restart.
               const k = normalizeKey(typed);
               if (!k) {
-                out('  not a private key (64 hex, 0x optional) — try again, or Enter to skip\n');
+                say('  not a private key (64 hex, 0x optional) — try again, or Enter to skip\n');
                 continue;
               }
               saveKey(k);
               ctx.env.privateKey = k;
               ctx.env.privateKeySource = 'file';
               saved.push('the owner key');
-              out(`  wallet ${await addressOf(k)}\n`);
+              say(`  wallet ${await addressOf(k)}\n`);
               break;
             }
           }
@@ -2920,13 +2928,13 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
               const client = await buildClient(ctx.env);
               knownProviders = await client.agent.refreshProviders();
             } catch (e) {
-              out(`  (${explainError(e).message} — the providers below are the built-in list)\n`);
+              say(`  (${explainError(e).message} — the providers below are the built-in list)\n`);
             }
           }
           if (only && !knownProviders.some((provider) => provider.id === only)) {
             throw new CliError('BAD_FLAG', `unknown inference provider: ${only}`, { remedy: `one of: ${knownProviders.map((p) => p.id).join(', ')}` });
           }
-          if (!only) out('model keys (optional: creating or resetting an agent asks for the one its provider needs)\n');
+          if (!only) say('model keys (optional: deploy and reset ask for the one they need)\n');
           for (const id of only ? [only] : knownProviders.map((provider) => provider.id)) {
             const has = !!configuredInferenceKey(id);
             const api = (await askSecret(ask, `  ${id} key [${has ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
@@ -2941,16 +2949,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           }
         } catch (e) {
           if (isCancelled(e) && saved.length) {
-            out(`cancelled — ${saved.join(', ')} ${saved.length === 1 ? 'was' : 'were'} saved before it; the rest is as it was\n`);
+            say(`cancelled — ${saved.join(', ')} ${saved.length === 1 ? 'was' : 'were'} saved before it; the rest is as it was\n`);
             continue;
           }
           throw e;
         }
-        out(`saved to ${configPaths().dir} (credentials chmod 600)\n`);
-        out(`  attestor    ${ctx.env.attestorUrl ?? '(unset)'}\n`);
-        out(`  owner key   ${ctx.env.privateKey ?? loadKey() ? 'set' : '(none — needed to manage your agents)'}\n`);
-        out(`  model keys  ${withKey.join(', ') || '(none — creating or resetting an agent asks for one)'}\n`);
-        out(`  new agents  ${preferred}\n`);
+        say(`saved to ${configPaths().dir} (credentials chmod 600)\n`);
+        say(`  attestor    ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+        say(`  owner key   ${ctx.env.privateKey ?? loadKey() ? 'set' : '(none — needed to manage your agents)'}\n`);
+        say(`  model keys  ${withKey.join(', ') || '(none — creating or resetting an agent asks for one)'}\n`);
+        say(`  new agents  ${preferred}\n`);
         // Re-seed the startup-time caches that were filled from the OLD
         // attestor or wallet: without this, Tab completion keeps offering the
         // previous environment's (or wallet's — listMyDeployments is
@@ -2983,31 +2991,31 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const runway = burnPerMin > 0n && est.prepaidBalanceWei != null ? Number(est.prepaidBalanceWei / burnPerMin) : null;
         moneyBlock(est.prepaidBalanceWei, eff, effErr);
         if (detail && detail.pendingRefund > 0n) {
-          out(`pending refund  : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
+          say(`pending refund  : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
         }
-        out(`running agents  : ${running}  (× ${og(est.costPerMinWei)}/min each)\n`);
-        out(`burn rate       : ${og(burnPerMin)}/min\n`);
-        out(`runway          : ${runway == null ? (running === 0 ? '∞ (nothing running)' : 'n/a') : `~${runway} min`}\n`);
-        out('add funds with `deposit [amount OG]` · withdraw with `withdraw [amount OG]`\n');
+        say(`running agents  : ${running}  (× ${og(est.costPerMinWei)}/min each)\n`);
+        say(`burn rate       : ${og(burnPerMin)}/min\n`);
+        say(`runway          : ${runway == null ? (running === 0 ? '∞ (nothing running)' : 'n/a') : `~${runway} min`}\n`);
+        say('add funds with `deposit [amount OG]` · withdraw with `withdraw [amount OG]`\n');
         continue;
       }
 
       if (cmd === 'deposit') {
-        if (args.length > 1) { out('usage: deposit [amount OG]\n'); continue; }
+        if (args.length > 1) { say('usage: deposit [amount OG]\n'); continue; }
         // The amount is checked before any transaction: a positive number
         // of OG, within what the wallet holds.
         if (args[0]) parseOgAmount(args[0]);
         const ag = await withWallet(ctx);
-        const amt = args[0] || (await ask('amount OG [1]: ')).trim() || '1';
-        const amountWei = parseOgAmount(amt);
+        const amountWei = args[0] ? parseOgAmount(args[0]) : await askAmount(ask, 'amount OG [1]: ', '1');
+        if (amountWei === null) continue;
         const native = await ag.nativeBalance().catch(() => null);
         if (native != null && native <= amountWei) {
-          out(`the wallet holds ${og(native)} — not enough for ${ogAmount(amountWei)} OG plus gas\n`);
+          say(`the wallet holds ${og(native)} — not enough for ${ogAmount(amountWei)} OG plus gas\n`);
           continue;
         }
         const tx = await ag.deposit({ amountWei });
         await ag.waitForTransaction(tx);
-        out(`deposited ${ogAmount(amountWei)} OG to the prepaid sandbox balance (tx ${tx})\n`);
+        say(`deposited ${ogAmount(amountWei)} OG to the prepaid sandbox balance (tx ${tx})\n`);
         continue;
       }
 
@@ -3016,7 +3024,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // time-locked pending pot; withdrawRefund claims it after the lock.
         // `withdraw <og>` starts one, bare `withdraw` claims (or reports the
         // lock) — the pending state decides which step the user is on.
-        if (args.length > 1) { out('usage: withdraw [amount OG]\n'); continue; }
+        if (args.length > 1) { say('usage: withdraw [amount OG]\n'); continue; }
         if (args[0]) parseOgAmount(args[0]);
         const ag = await withWallet(ctx);
         const d = await ag.getBalanceDetail();
@@ -3024,8 +3032,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         let pending = d.pendingRefund;
         // Status first: spendable, the pending pot (one per provider — the
         // contract holds a single pot, not a list) and its lock state.
-        out(`spendable : ${og(d.balance)}\n`);
-        out(`pending   : ${pending > 0n ? `${og(pending)} ${Date.now() >= unlockMs ? '(unlocked — claimable now)' : `(locked until ${new Date(unlockMs).toLocaleString()})`}` : '(none)'}\n`);
+        say(`spendable : ${og(d.balance)}\n`);
+        say(`pending   : ${pending > 0n ? `${og(pending)} ${Date.now() >= unlockMs ? '(unlocked — claimable now)' : `(locked until ${new Date(unlockMs).toLocaleString()})`}` : '(none)'}\n`);
         // Matured funds are offered FIRST: requestRefund re-absorbs the pot
         // and re-locks it, so requesting before claiming would freeze money
         // that was already free.
@@ -3034,7 +3042,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           if (!yn || yn === 'y' || yn === 'yes') {
             const tx = await ag.withdrawRefund();
             await ag.waitForTransaction(tx);
-            out(`withdrew ${og(pending)} to your wallet (tx ${tx})\n`);
+            say(`withdrew ${og(pending)} to your wallet (tx ${tx})\n`);
             pending = 0n;
           }
         }
@@ -3042,23 +3050,22 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // spendable balance — the contract itself only takes a new total
         // (re-absorbing the pot, restarting the lock), so we submit
         // pending + amount on the user's behalf.
-        const more = pending > 0n ? ` more (joins the pending ${og(pending)}; lock restarts)` : '';
-        const amt = args[0] || (await ask(`withdraw how much${more}? [max ${og(d.balance)}, empty to skip]: `)).trim();
-        if (!amt) continue;
-        const amountWei = parseOgAmount(amt);
-        if (amountWei > d.balance) { out(`only ${og(d.balance)} spendable — cannot withdraw ${ogAmount(amountWei)} OG\n`); continue; }
+        if (!args[0] && pending > 0n) say(`a new request joins the pending ${og(pending)} and restarts its time lock\n`);
+        const amountWei = args[0] ? parseOgAmount(args[0]) : await askAmount(ask, `withdraw how much? [max ${og(d.balance)}, Enter skips]: `);
+        if (amountWei === null) continue;
+        if (amountWei > d.balance) { say(`only ${og(d.balance)} spendable — cannot withdraw ${ogAmount(amountWei)} OG\n`); continue; }
         // The bare form's question says a request restarts the pending lock;
         // with the amount given as an argument, ask before restarting it.
         if (args[0] && pending > 0n) {
           const yn = (await ask(`${ogAmount(amountWei)} OG joins the pending ${og(pending)}; its lock restarts — proceed? [y/N]: `)).trim().toLowerCase();
-          if (yn !== 'y' && yn !== 'yes') { out('withdraw cancelled — the pending refund and its lock are unchanged\n'); continue; }
+          if (yn !== 'y' && yn !== 'yes') { say('withdraw cancelled — the pending refund and its lock are unchanged\n'); continue; }
         }
         const tx = await ag.requestRefund({ amountWei: amountWei + pending });
         await ag.waitForTransaction(tx);
         const after = await ag.getBalanceDetail();
-        if (pending > 0n) out(`pending refund: ${og(pending)} → ${og(after.pendingRefund)} (lock restarted)\n`);
-        else out(`${ogAmount(amountWei)} OG moved to pending refund (tx ${tx})\n`);
-        out(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
+        if (pending > 0n) say(`pending refund: ${og(pending)} → ${og(after.pendingRefund)} (lock restarted)\n`);
+        else say(`${ogAmount(amountWei)} OG moved to pending refund (tx ${tx})\n`);
+        say(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
         continue;
       }
 
@@ -3109,11 +3116,11 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // a redeploy) — this is the explicit re-ack.
         const ag = await withWallet(ctx);
         const { allAcked, missing } = await ag.ackStatus();
-        if (allAcked) { out('trust root already acknowledged — nothing to do\n'); continue; }
-        out(`acknowledging: ${missing.join(', ')}\n`);
+        if (allAcked) { say('trust root already acknowledged — nothing to do\n'); continue; }
+        say(`acknowledging: ${missing.join(', ')}\n`);
         const tx = await ag.ack();
-        if (tx) { out(`acknowledging the trust root (tx ${tx}, waiting…)\n`); await ag.waitForTransaction(tx); }
-        out('acknowledged\n');
+        if (tx) { say(`acknowledging the trust root (tx ${tx}, waiting…)\n`); await ag.waitForTransaction(tx); }
+        say('acknowledged\n');
         continue;
       }
 
@@ -3122,7 +3129,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // public via ownerOf); "mine" marks still come from the owner-signed
         // listing so unminted rows attribute correctly too.
         const extra = args.filter((a) => a !== '--mine' && a !== 'mine');
-        if (extra.length) { out(`usage: list [--mine] — one agent's details: status ${cleanCell(extra[0])}\n`); continue; }
+        if (extra.length) {
+          say(/^(?:\d+|0x[0-9a-fA-F]{8,64})$/.test(extra[0])
+            ? `usage: list [--mine] — one agent's details: status ${cleanCell(extra[0])}\n`
+            : 'usage: list [--mine]\n');
+          continue;
+        }
         let key = ctx.env.privateKey ?? loadKey() ?? undefined;
         let ag: AgenticID;
         try {
@@ -3131,12 +3143,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           // A malformed key must not block a PUBLIC listing — warn, go
           // walletless. Anything else (no attestor, no answer) is the error.
           if ((e as CliError).code !== 'WALLET_REQUIRED') throw e;
-          out(`warning: ${(e as CliError).message} — listing without ownership marks\n`);
+          say(`warning: ${(e as CliError).message} — listing without ownership marks\n`);
           key = undefined;
           ag = await clientFor(ctx, false);
         }
         const mineOnly = args.includes('--mine') || args.includes('mine');
-        if (mineOnly && !key) { out('list --mine needs a wallet — run `login` first\n'); continue; }
+        if (mineOnly && !key) { say('list --mine needs a wallet — run `login` first\n'); continue; }
         // The two listings are independent — fetch them in parallel. The
         // owner-signed rows carry `owner` for UNMINTED rows too (the public
         // tier shows it only once minted); keyed by sealId for the table.
@@ -3150,8 +3162,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // A failed owner listing must not read as an empty wallet (F2): with
         // --mine it aborts with the reason; without, fall back unmarked.
         if (key && !mine) {
-          if (mineOnly) { out('could not fetch your owner-signed listing — try again or check the attestor\n'); continue; }
-          out('warning: owner listing unavailable — showing unmarked rows\n');
+          if (mineOnly) { say('could not fetch your owner-signed listing — try again or check the attestor\n'); continue; }
+          say('warning: owner listing unavailable — showing unmarked rows\n');
         }
         const shown = mineOnly ? rows.filter((r) => mine?.has(r.sealId)) : rows;
         if (!shown.length) { out(mineOnly ? 'no agents owned by this wallet here\n' : 'no agents on this attestor\n'); continue; }
@@ -3166,38 +3178,38 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const layout = listLayout(termWidth(), 2, ownerColumnWidth(merged.map((m) => m.owner), sealToAgent));
         out(renderListHeader(layout));
         for (const m of merged) out(renderListRow(m.row, m.owner, m.mark, sealToAgent, layout));
-        if (mine && !mineOnly) out(`${wrap('(* = owned by your wallet · `list --mine` filters to them)', termWidth()).join('\n')}\n`);
+        if (mine && !mineOnly) say('(* = owned by your wallet · `list --mine` filters to them)\n');
         continue;
       }
 
       if (cmd === 'stop' || cmd === 'start' || cmd === 'reset') {
         // Manager-level lifecycle: act and stay at L1 (enter with `use` to chat).
-        if (!args[0]) { out(`usage: ${cmd} <agentId|sealId>\n`); continue; }
+        if (!args[0]) { say(`usage: ${cmd} <agentId|sealId>\n`); continue; }
         const ag = await withWallet(ctx);
         const attestorUrl = requireAttestorUrl(ctx.env);
         const row = await myRow(ag, args[0]);
         // Still deploying (minted or not): the deploy brings it up itself;
         // start/reset would act on a container that is not there yet.
         if (row.phase === 'deploying' && cmd !== 'stop') {
-          out(`agent ${row.agentId} is still deploying — \`list\` shows when it is up\n`);
+          say(`agent ${row.agentId} is still deploying — \`list\` shows when it is up\n`);
           continue;
         }
         // No agentId: its deploy failed before the mint — retry resumes it.
         if (!row.minted && cmd !== 'stop') {
-          out(`agent ${row.agentId} has no agentId — its deploy stopped before the mint; resume it with: retry ${row.agentId}\n`);
+          say(`agent ${row.agentId} has no agentId — its deploy stopped before the mint; resume it with: retry ${row.agentId}\n`);
           continue;
         }
         if (cmd === 'stop') {
-          if (row.phase !== 'running' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — nothing to stop\n`); continue; }
+          if (row.phase !== 'running' || !row.sandboxId) { say(`agent ${row.agentId} is ${row.phase} — nothing to stop\n`); continue; }
           await ag.agent.stop(row.sealId, row.sandboxId);
-          out(`agent ${row.agentId} stopped\n`);
+          say(`agent ${row.agentId} stopped\n`);
           continue;
         }
         if (cmd === 'start') {
-          if (row.phase === 'running') { out(`agent ${row.agentId} is already running\n`); continue; }
-          if (row.phase !== 'stopped' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
-          if (!(await ensureOwnerReady(ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
-          out(`starting agent ${row.agentId}… (Esc cancels the wait)\n`);
+          if (row.phase === 'running') { say(`agent ${row.agentId} is already running\n`); continue; }
+          if (row.phase !== 'stopped' || !row.sandboxId) { say(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
+          if (!(await ensureOwnerReady(ag, ask))) { say('start cancelled — prepaid balance too low\n'); continue; }
+          say(`starting agent ${row.agentId}… (Esc cancels the wait)\n`);
           const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
           await ag.agent.start(row.sealId, row.sandboxId);
           const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
@@ -3210,7 +3222,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         let framework: string;
         if (row.framework && !forcePick) {
           framework = row.framework;
-          out(`framework: ${framework} (recorded — \`reset ${args[0]} pick\` to change)\n`);
+          say(`framework: ${framework} (recorded — \`reset ${args[0]} pick\` to change)\n`);
         } else {
           framework = await pickFramework(attestorUrl, ask, row.framework ?? undefined);
         }
@@ -3218,11 +3230,11 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const provider = plan.provider;
         await ag.agent.assertProviderSupported(provider, { sealId: row.sealId, framework });
         const key = await resetModelKey(ag.credentials, row.sealId, provider, framework, keyPrompt(ask));
-        if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
+        if (!(await ensureOwnerReady(ag, ask))) { say('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(ag, row.sealId, plan, out);
-        out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
+        say(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
         const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
-        await ag.agent.reset(row.sealId, { provider, framework, ...key, onWarn: (w) => out(`⚠ ${w}\n`) });
+        await ag.agent.reset(row.sealId, { provider, framework, ...key, onWarn: (w) => say(`⚠ ${w}\n`) });
         const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
         if (r) {
           await ag.credentials.resyncModelKey(row.sealId, { agentUrl: r.url }).catch(() => undefined);
@@ -3237,19 +3249,19 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // setAgentURI). Never redeploy a failed row: that would orphan the
         // identity. Container work isn't retried here — once minted, use
         // `reset <id>` to bring the agent up.
-        if (!args[0]) { out('usage: retry <agentId|sealId>\n'); continue; }
+        if (!args[0]) { say('usage: retry <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
         if (!row) throw agentNotFound(args[0]);
-        if (row.phase !== 'failed') { out(`agent ${row.agentId ?? row.sealId} is ${row.phase} — retry only applies to failed rows\n`); continue; }
-        out(`retrying seal ${row.sealId} — re-running the failed stages… (Esc-proof; may take a minute)\n`);
+        if (row.phase !== 'failed') { say(`agent ${row.agentId ?? row.sealId} is ${row.phase} — retry only applies to failed rows\n`); continue; }
+        say(`retrying seal ${row.sealId} — re-running the failed stages… (Esc-proof; may take a minute)\n`);
         await ag.agent.retry(row.sealId);
         try {
           const agentId = await ag.agent.waitForMint(row.sealId);
-          out(`recovered: agent ${agentId} minted under the same seal\n`);
-          out(`it lands offline — bring it up with: reset ${agentId}\n`);
+          say(`recovered: agent ${agentId} minted under the same seal\n`);
+          say(`it lands offline — bring it up with: reset ${agentId}\n`);
         } catch (e) {
-          out(`still failing: ${(e as Error).message}\n`);
+          say(`still failing: ${(e as Error).message}\n`);
         }
         continue;
       }
@@ -3268,7 +3280,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'cred') {
         // The owner's credentials for an agent (cli/credentials.ts); every
         // subcommand is owner-signed.
-        if (!args[0]) { out('usage: cred <agentId|sealId> [ls|set|rm|connect|disconnect|reveal|pending|approve|deny|log] · cred pending · cred notify [email|off] · cred presets — `help` has the keys\n'); continue; }
+        if (!args[0]) { say('usage: cred <agentId|sealId> [ls|set|rm|connect|disconnect|reveal|pending|approve|deny|log] · cred pending · cred notify [email|off] · cred presets — `help` has the keys\n'); continue; }
         const ag = await withWallet(ctx);
         if (await credOwnerOp(ag, args, credIO(ask))) continue;
         const row = await findAgentRow(ag, args[0]);
@@ -3280,7 +3292,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'authorizer') {
         // Extra args are ambiguous (`authorizer <id> <addr> off` — set or
         // clear?) — refuse rather than silently act on a guess.
-        if (!args[0] || args.length > 2) { out('usage: authorizer <agentId|sealId> [address|off]\n'); continue; }
+        if (!args[0] || args.length > 2) { say('usage: authorizer <agentId|sealId> [address|off]\n'); continue; }
         if (!args[1]) {
           // Read-only: anyone can inspect any agent's fork policy.
           const ag = await clientFor(ctx, false);
@@ -3299,13 +3311,13 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           // publishers don't hand-copy addresses out of DEPLOYMENT.md.
           const cfg = await (await fetch(`${requireAttestorUrl(ctx.env)}/config`)).json() as { standard_clone_authorizer_addr?: string };
           if (!cfg.standard_clone_authorizer_addr) {
-            out('this attestor does not advertise a standard clone policy (standard_clone_authorizer_addr missing from /config) — pass the policy address explicitly\n');
+            say('this attestor does not advertise a standard clone policy (standard_clone_authorizer_addr missing from /config) — pass the policy address explicitly\n');
             continue;
           }
           target = cfg.standard_clone_authorizer_addr;
-          out(`standard policy: ${target}\n`);
+          say(`standard policy: ${target}\n`);
         }
-        if (target !== ZERO_ADDR && !isAddress(target)) { out(`${addressProblem(target, 'the policy')} — or \`standard\`, or \`off\`\n`); continue; }
+        if (target !== ZERO_ADDR && !isAddress(target)) { say(`${addressProblem(target, 'the policy')} — or \`standard\`, or \`off\`\n`); continue; }
         const tx = await ag.agent.setCloneAuthorizer(id, target as Address);
         await ag.agent.waitForTransaction(tx);
         out(target === ZERO_ADDR
@@ -3316,10 +3328,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
 
       if (cmd === 'grant' || cmd === 'revoke') {
         if (!args[0] || !args[1]) {
-          out(`usage: ${cmd} <agentId|sealId> <buyer>\n`);
+          say(`usage: ${cmd} <agentId|sealId> <buyer>\n`);
           continue;
         }
-        if (!isAddress(args[1])) { out(`${addressProblem(args[1], 'the buyer')}\n`); continue; }
+        if (!isAddress(args[1])) { say(`${addressProblem(args[1], 'the buyer')}\n`); continue; }
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
         const tx = cmd === 'grant'
@@ -3333,22 +3345,22 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       if (cmd === 'transfer') {
-        if (!args[0] || !args[1]) { out('usage: transfer <agentId|sealId> <to>\n'); continue; }
-        if (!isAddress(args[1])) { out(`${addressProblem(args[1], 'the new owner')}\n`); continue; }
+        if (!args[0] || !args[1]) { say('usage: transfer <agentId|sealId> <to>\n'); continue; }
+        if (!isAddress(args[1])) { say(`${addressProblem(args[1], 'the new owner')}\n`); continue; }
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
         const from = await ag.agent.ownerOf(id);
         const yn = (await ask(`transfer agent ${id} to ${args[1]} — IRREVERSIBLE. proceed? [y/N]: `)).trim().toLowerCase();
-        if (yn !== 'y' && yn !== 'yes') { out('transfer cancelled\n'); continue; }
+        if (yn !== 'y' && yn !== 'yes') { say('transfer cancelled\n'); continue; }
         const tx = await ag.agent.transferFrom(from, args[1] as Address, id);
         await ag.agent.waitForTransaction(tx);
-        out(`agent ${id} transferred to ${args[1]}\n`);
-        out('the new owner acks + resets to take over the runtime; any fork policy you set is now dormant\n');
+        say(`agent ${id} transferred to ${args[1]}\n`);
+        say('the new owner acks + resets to take over the runtime; any fork policy you set is now dormant\n');
         continue;
       }
 
       if (cmd === 'clone') {
-        if (!args[0]) { out('usage: clone <agentId|sealId> [to]\n'); continue; }
+        if (!args[0]) { say('usage: clone <agentId|sealId> [to]\n'); continue; }
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
         const key = ctx.env.privateKey ?? loadKey();
@@ -3360,17 +3372,17 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         let params: Parameters<typeof ag.agent.clone>[0];
         if (sourceOwner.toLowerCase() === me.toLowerCase()) {
           const to = args[1] ?? me;
-          if (!isAddress(to)) { out(`${addressProblem(to, 'the new owner')}\n`); continue; }
+          if (!isAddress(to)) { say(`${addressProblem(to, 'the new owner')}\n`); continue; }
           params = { sourceAgentId: id, targetOwner: to as Address };
         } else {
-          if (args[1]) { out('policy clones always mint to YOUR wallet — drop the <to> argument\n'); continue; }
+          if (args[1]) { say('policy clones always mint to YOUR wallet — drop the <to> argument\n'); continue; }
           params = { sourceAgentId: id, targetOwner: me, authorization: { authData: '0x' } };
         }
-        if (!(await ensureOwnerReady(ag, ask))) { out('clone cancelled — prepaid balance too low\n'); continue; }
-        out(`cloning agent ${id}… (TEE re-seal + on-chain mint, may take a minute)\n`);
+        if (!(await ensureOwnerReady(ag, ask))) { say('clone cancelled — prepaid balance too low\n'); continue; }
+        say(`cloning agent ${id}… (TEE re-seal + on-chain mint, may take a minute)\n`);
         const r = await ag.agent.clone(params, { wait: 'minted' });
-        out(`cloned: new agent ${r.agentId} → ${params.targetOwner}\n`);
-        out(`it lands offline — its owner brings it up with: reset ${r.agentId}\n`);
+        say(`cloned: new agent ${r.agentId} → ${params.targetOwner}\n`);
+        say(`it lands offline — its owner brings it up with: reset ${r.agentId}\n`);
         continue;
       }
 
@@ -3383,7 +3395,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         rememberAgentIds(rows);
         const row = pickRow(ref, args[0], rows);
         if (!row) throw agentNotFound(args[0]);
-        if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
+        if (row.phase !== 'running' || !row.url) { say(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
         // With a wallet configured, declare it as the proof's redeemer so this
         // visit banks a rating ticket (see `rate`). Still no signing involved.
         const helloKey = ctx.env.privateKey ?? loadKey() ?? undefined;
@@ -3396,24 +3408,24 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Use an agent's public service as a client — the experience that
         // earns the right to rate. The response banks a rating ticket bound
         // to your wallet; `call <id>` alone lists the services.
-        if (!args[0]) { out('usage: call <agentId|sealId> [</path> [json-body]]\n'); continue; }
+        if (!args[0]) { say('usage: call <agentId|sealId> [</path> [json-body]]\n'); continue; }
         const ag = await withWallet(ctx);
         const my = (await addressOf(ctx.env.privateKey!)) as `0x${string}`;
         const row = await findAgentRow(ag, args[0]);
         if (!row) throw agentNotFound(args[0]);
-        if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
+        if (row.phase !== 'running' || !row.url) { say(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
         // Service table for method resolution (no client address — this lookup
         // is not the interaction being rated, so it must not bank a ticket).
         const services = await servicesOf(row.url);
         if (!args[1]) {
-          if (!services.length) { out('this agent registers no public services (only /hello)\n'); continue; }
-          out('services:\n');
-          for (const sv of services) out(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.transport === 'mcp' ? '[mcp] ' : ''}${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
-          out(`call one with: call ${args[0]} <path> [json-body]${services.some((sv) => sv.transport === 'mcp') ? '\n[mcp] entries speak MCP (JSON-RPC over POST) — mount the path in an MCP client; a plain call posts raw JSON' : ''}\n`);
+          if (!services.length) { say('this agent registers no public services (only /hello)\n'); continue; }
+          say('services:\n');
+          for (const sv of services) say(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.transport === 'mcp' ? '[mcp] ' : ''}${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
+          say(`call one with: call ${args[0]} <path> [json-body]${services.some((sv) => sv.transport === 'mcp') ? '\n[mcp] entries speak MCP (JSON-RPC over POST) — mount the path in an MCP client; a plain call posts raw JSON' : ''}\n`);
           continue;
         }
         const path = args[1];
-        if (!path.startsWith('/')) { out('path must start with /\n'); continue; }
+        if (!path.startsWith('/')) { say('path must start with /\n'); continue; }
         // The body is free-form — take it VERBATIM from the line. Running it
         // through the shell-style splitter and re-joining the pieces eats the
         // quote characters a JSON body is made of (`{"a":1}` → `{a:1}`, POSTed
@@ -3422,19 +3434,19 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const body = splitHead(line, 3).rest || undefined;
         const registered = services.find((sv) => sv.path === path);
         const method = registered?.method ?? (body ? 'POST' : 'GET');
-        if (!registered && path !== '/hello') out(`note: ${path} is not in the agent's service table — calling anyway\n`);
+        if (!registered && path !== '/hello') say(`note: ${path} is not in the agent's service table — calling anyway\n`);
 
         const started = Date.now();
         const t = await callAgentWithTicket(ag, row.url, path, method, body, my);
-        out(`${method} ${path} → ${t.res.status} (${((Date.now() - started) / 1000).toFixed(1)}s)\n`);
+        say(`${method} ${path} → ${t.res.status} (${((Date.now() - started) / 1000).toFixed(1)}s)\n`);
         // Display only — hashing above used the full raw bytes.
         let pretty = t.bodyText;
         try { pretty = JSON.stringify(JSON.parse(t.bodyText), null, 2); } catch { /* not JSON */ }
         out(pretty.length > 4096 ? `${pretty.slice(0, 4096)}\n… (${pretty.length} chars total)\n` : `${pretty}\n`);
-        if (t.banked) out(`ticket  : banked (${method} ${path}) — spend with \`rate ${row.agentId}\` within ~60 min\n`);
+        if (t.banked) say(`ticket  : banked (${method} ${path}) — spend with \`rate ${row.agentId}\` within ~60 min\n`);
         else if (t.proof) out('ticket  : NOT banked — the signed taskHash does not match the transcript as sent from here ' +
                               '(something between here and the agent re-encoded the request URI or a body)\n');
-        else out('ticket  : NOT banked — no serve-proof on the response\n');
+        else say('ticket  : NOT banked — no serve-proof on the response\n');
         continue;
       }
 
@@ -3444,16 +3456,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // canonical 8004 feedback + the TEE verification mark — atomically
         // (EIP-7702) when the environment has a feedbackBatcher. No ticket,
         // no rating: experiencing the agent is what earns the right to rate.
-        if (!args[0]) { out('usage: rate <agentId|sealId> [score] [</endpoint>]\n'); continue; }
+        if (!args[0]) { say('usage: rate <agentId|sealId> [score] [</endpoint>]\n'); continue; }
         const ag = await withWallet(ctx);
         const my = (await addressOf(ctx.env.privateKey!)) as `0x${string}`;
         const row = await findAgentRow(ag, args[0]);
         if (!row) throw agentNotFound(args[0]);
-        if (row.agentId == null) { out(`agent ${args[0]} is not minted yet — nothing to rate\n`); continue; }
+        if (row.agentId == null) { say(`agent ${args[0]} is not minted yet — nothing to rate\n`); continue; }
         const agentId = BigInt(row.agentId);
         // The chain would reject this at the attest step (self-feedback); say it upfront.
         const agentOwner = await ag.agent.ownerOf(agentId);
-        if (agentOwner.toLowerCase() === my.toLowerCase()) { out(`agent ${row.agentId} is yours — owners cannot rate their own agent\n`); continue; }
+        if (agentOwner.toLowerCase() === my.toLowerCase()) { say(`agent ${row.agentId} is yours — owners cannot rate their own agent\n`); continue; }
 
         // `rate <id> [score] [endpoint]` — either trailing arg order works.
         let rawScore = '';
@@ -3475,18 +3487,18 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (tickets.length === 1) {
           ticket = tickets[0];
         } else {
-          out(`you hold ${tickets.length} tickets for agent ${row.agentId}:\n`);
+          say(`you hold ${tickets.length} tickets for agent ${row.agentId}:\n`);
           tickets.forEach((e, i) => {
             const at = new Date(e.capturedAt * 1000).toLocaleTimeString();
             const exp = new Date(e.deadline * 1000).toLocaleTimeString();
-            out(`  ${i + 1}. ${e.task.method.padEnd(4)} ${e.task.uri.padEnd(24)} ${at}  (expires ${exp})\n`);
+            say(`  ${i + 1}. ${e.task.method.padEnd(4)} ${e.task.uri.padEnd(24)} ${at}  (expires ${exp})\n`);
           });
           const pick = (await ask('which interaction are you rating? [1]: ')).trim() || '1';
           const n = Number(pick);
-          if (!Number.isInteger(n) || n < 1 || n > tickets.length) { out('invalid choice\n'); continue; }
+          if (!Number.isInteger(n) || n < 1 || n > tickets.length) { say('invalid choice\n'); continue; }
           ticket = tickets[n - 1];
         }
-        out(`rating the ${ticket.task.method} ${ticket.task.uri} interaction from ${new Date(ticket.capturedAt * 1000).toLocaleTimeString()}\n`);
+        say(`rating the ${ticket.task.method} ${ticket.task.uri} interaction from ${new Date(ticket.capturedAt * 1000).toLocaleTimeString()}\n`);
         const proof = toServeProof(ticket);
 
         // Free pre-check before spending gas, on the fields the registry
@@ -3497,7 +3509,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           // failure is this side's registry configuration (ticketDisposition).
           if (ticketDisposition(v) === 'burn') {
             removeProof(ticket.proof.signature);
-            out(`serve-proof failed verification (${v.reasons.join(', ')}) — ticket discarded\n`);
+            say(`serve-proof failed verification (${v.reasons.join(', ')}) — ticket discarded\n`);
           } else {
             out(`serve-proof not verifiable in this environment (${v.reasons.join(', ')}) — ticket kept\n` +
                 `  → check the attestor's verified_feedback_addr / AGENTIC_VERIFIED_FEEDBACK_ADDR\n`);
@@ -3516,15 +3528,15 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         }
 
         if (!rawScore) rawScore = (await ask('score [1-5]: ')).trim();
-        if (!/^-?\d+$/.test(rawScore)) { out('score must be an integer\n'); continue; }
-        out('submitting: canonical 8004 feedback + TEE attestation…\n');
+        if (!/^-?\d+$/.test(rawScore)) { say('score must be an integer\n'); continue; }
+        say('submitting: canonical 8004 feedback + TEE attestation…\n');
         const fb = await ag.reputation.giveFeedback({
           agentId, value: BigInt(rawScore), serveProof: proof, endpoint: ticket.endpoint, task: ticket.task,
         });
         await ag.reputation.waitForTransaction(fb.attestTx);
         removeProof(ticket.proof.signature);
         const atomic = fb.feedbackTx === fb.attestTx;
-        out(`rated agent ${row.agentId}: ${rawScore} — canonical index ${fb.feedbackIndex}, TEE-verified (endpoint ${ticket.task.uri})${atomic ? ', atomic' : ''} (tx ${fb.attestTx})\n`);
+        say(`rated agent ${row.agentId}: ${rawScore} — canonical index ${fb.feedbackIndex}, TEE-verified (endpoint ${ticket.task.uri})${atomic ? ', atomic' : ''} (tx ${fb.attestTx})\n`);
         continue;
       }
 
@@ -3542,7 +3554,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       if (cmd === 'use' || cmd === 'link') {
-        if (!args[0]) { out('usage: use <agentId|sealId>\n'); continue; }
+        if (!args[0]) { say('usage: use <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
         const s = await attach(ag, requireAttestorUrl(ctx.env), args[0], ask);
         await enterSession(s, ask, irq, ctx);
@@ -3558,16 +3570,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       const near = didYouMean(cmd, L1_WORDS.map((w) => w.trim()));
-      out(`unknown command: ${cleanCell(cmd)}${near ? ` — did you mean \`${near}\`?` : ''}\n${fitItems(L1_HELP, termWidth() ?? 80)}\n`);
+      say(`unknown command: ${cleanCell(cmd)}${near ? ` — did you mean \`${near}\`?` : ''}\n${fitItems(L1_HELP, termWidth() ?? 80)}\n`);
     } catch (e) {
       // Keep the REPL alive on operational errors: one or two plain lines
       // and the remedy, never a raw HTTP body or a viem dump (plain.ts).
       // stdin closed (Ctrl-D, the end of piped input) ends the shell.
       if ((e as { code?: string }).code === 'ERR_USE_AFTER_CLOSE') throw e;
-      if (isCancelled(e)) out('cancelled\n');
+      if (isCancelled(e)) say('cancelled\n');
       else {
         const p = explainError(e);
-        out(`error: ${p.message}${p.remedy ? `\n  → ${p.remedy}` : ''}\n`);
+        say(`error: ${p.message}${p.remedy ? `\n  → ${p.remedy}` : ''}\n`);
       }
     }
   }
@@ -3666,7 +3678,7 @@ async function settingsOp(
   let pendingReset = false;
   if (providerChanged) {
     const provider = next.provider ?? '0g-compute';
-    const keyIO = ask ? credIO(ask) : { json: false, out: (l: string) => out(`${l}\n`), secret: async () => '' };
+    const keyIO = ask ? credIO(ask) : { json: false, out: (l: string) => say(`${l}\n`), secret: async () => '' };
     if (await ensureModelKey(ag, sealId, provider, keyIO, serveBase ? { agentUrl: serveBase } : undefined) === 'unsupported') {
       requireConfiguredInferenceKey(provider);
       pendingReset = true;
@@ -3688,7 +3700,7 @@ async function settingsOp(
       chatModelIds = providerModelIds[completionProvider] ?? [];
     }
     if (pendingReset) {
-      out(`saved; provider change pending — run reset with the ${next.provider} key\n`);
+      say(`saved; provider change pending — run reset with the ${next.provider} key\n`);
       return next;
     }
     // Push to the running container so a change made mid-conversation takes
@@ -3709,20 +3721,20 @@ async function settingsOp(
         // One line (a chain read's error is many).
         const msg = explainError(e2).message;
         if (requiresProviderReset(e2)) {
-          out(`saved; provider change pending — run reset with the ${next.provider} key\n`);
+          say(`saved; provider change pending — run reset with the ${next.provider} key\n`);
           return next;
         }
         // A container that ANSWERED and refused (HTTP status) will refuse the
         // same document on the next boot too and fall back to last-known-good;
         // only an UNREACHABLE container (no HTTP status) applies it next boot.
         if (/HTTP \d/.test((e2 as Error).message)) {
-          out(`saved, but the running container REFUSED it (${msg}) — a refused document does not boot, so the agent keeps its current configuration until you store one it accepts\n`);
+          say(`saved, but the running container REFUSED it (${msg}) — a refused document does not boot, so the agent keeps its current configuration until you store one it accepts\n`);
         } else {
-          out(`saved, but the running container was unreachable (${msg}) — it applies on the next boot\n`);
+          say(`saved, but the running container was unreachable (${msg}) — it applies on the next boot\n`);
         }
       }
     } else {
-      out(`saved; the container applies it at its next boot (reset applies it now)\n`);
+      say(`saved; the container applies it at its next boot (reset applies it now)\n`);
     }
     return next;
   } catch (e) {
@@ -3730,9 +3742,9 @@ async function settingsOp(
     // Someone else edited this agent between the read and the write. Show
     // what is there now and let the owner decide — a quiet retry here would
     // be this REPL choosing to discard the other change.
-    out(`⚠ ${e.message}\n  the document now stored (version ${e.currentVersion}):\n`);
-    for (const l of renderSettings(e.current)) out(`    ${l}\n`);
-    out('  nothing was written — repeat your command to apply it on top of that\n');
+    say(`⚠ ${e.message}\n  the document now stored (version ${e.currentVersion}):\n`);
+    for (const l of renderSettings(e.current)) say(`    ${l}\n`);
+    say('  nothing was written — repeat your command to apply it on top of that\n');
     return e.current;
   }
 }
@@ -3832,8 +3844,30 @@ async function helloWithTicket(
 /** The one way the shell says an agent reference names no agent. */
 function agentNotFound(refInput: string): CliError {
   return new CliError('AGENT_NOT_FOUND', `agent ${cleanCell(refInput)} does not exist on this attestor`, {
-    remedy: `${cmdStep('list')} shows the agents here (* marks yours)`,
+    remedy: listRemedy(),
   });
+}
+
+/** Where to look up the agents: the shell's `list` marks yours with `*`;
+ *  the one-shot `list` has no marks. */
+function listRemedy(): string {
+  return currentSurface() === 'shell' ? '`list` shows the agents here (* marks yours)' : '`0g-agentdna list` shows the agents here';
+}
+
+/**
+ * Ask for an amount of OG until the answer is one (parseOgAmount says what
+ * is wrong with any other); Enter takes `dflt`, or skips (null) without one.
+ */
+async function askAmount(ask: (q: string) => Promise<string>, q: string, dflt?: string): Promise<bigint | null> {
+  for (;;) {
+    const a = (await ask(q)).trim() || dflt;
+    if (!a) return null;
+    try {
+      return parseOgAmount(a);
+    } catch (e) {
+      say(`  ${(e as Error).message}\n`);
+    }
+  }
 }
 
 /** Public-listing row for an agentId/sealId(/unique-prefix) reference, or undefined. */
@@ -3977,14 +4011,14 @@ async function showHello(
   const proofLine = valid
     ? `${JSON.stringify(valid.ok)}${valid.ok ? '' : ` (${valid.reasons.join('; ')})`}`
     : '(no proof header)';
-  out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${proofLine}\n`);
+  say(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${proofLine}\n`);
   // A v2 proof names what each layer ran (sealed/LAYERS.md §7); the header
   // is the agent's, so every field goes through cleanCell. LEGACY(v1): a
   // proof without a version names none.
   if (proof?.version !== undefined) {
-    out(`sealed  : ${cleanCell(String(proof.sealedHash ?? '?'))}\nharness : ${cleanCell(String(proof.harnessHash ?? '?'))}\n`);
+    say(`sealed  : ${cleanCell(String(proof.sealedHash ?? '?'))}\nharness : ${cleanCell(String(proof.harnessHash ?? '?'))}\n`);
     if (proof.model || proof.inferenceURL) {
-      out(`model   : ${cleanCell(proof.model || '—')}${proof.inferenceURL ? ` via ${cleanCell(proof.inferenceURL)}` : ''}\n`);
+      say(`model   : ${cleanCell(proof.model || '—')}${proof.inferenceURL ? ` via ${cleanCell(proof.inferenceURL)}` : ''}\n`);
     }
   }
   if (banked) out(`ticket  : banked (GET /hello) — spend with \`rate\` within ~60 min\n`);
@@ -3998,8 +4032,15 @@ async function withWallet(ctx: CommandContext): Promise<AgenticID> {
     if (k) ctx.env.privateKey = k;
   }
   if (!ctx.env.privateKey) {
-    throw new CliError('WALLET_REQUIRED', 'this needs your owner wallet, and none is configured', {
-      remedy: 'run `login` here (stored 0600), or set AGENTIC_PRIVATE_KEY',
+    // With no attestor either (a first run), both are missing: one login sets both.
+    const none = !ctx.env.attestorUrl;
+    const shell = currentSurface() === 'shell';
+    throw new CliError(none ? 'MISSING_ATTESTOR_URL' : 'WALLET_REQUIRED', none
+      ? 'nothing is set up yet: no attestor URL and no owner key'
+      : 'this needs your owner key, and none is set', {
+      remedy: shell
+        ? `\`login\` sets ${none ? 'both' : 'it'}`
+        : `${shellTo('login', none ? 'set both' : 'save the key')}, or export ${none ? 'AGENTIC_ATTESTOR_URL and ' : ''}AGENTIC_PRIVATE_KEY`,
     });
   }
   return clientFor(ctx, true);
@@ -4041,7 +4082,7 @@ async function credInShell(irq: Interrupt, sub: string[], run: (io: { wait?: boo
 /** How credOp talks inside the REPL: lines out, values through askSecret. */
 function credIO(ask: (q: string) => Promise<string>) {
   return {
-    json: false, out: (l: string) => out(`${l}\n`), secret: (p: string) => askSecret(ask, p),
+    json: false, out: (l: string) => say(`${l}\n`), secret: (p: string) => askSecret(ask, p),
     // The credential prompts' terminal reset: on a terminal only.
     raw: (s: string) => { if (process.stdout.isTTY) term(s); },
     keyPrompt: keyPrompt(ask),
@@ -4168,13 +4209,13 @@ export async function askChoice(
   options: ReadonlyArray<{ id: string; name?: string }>,
   defaultIndex: number,
 ): Promise<string> {
-  out(`${title}:\n`);
-  options.forEach((o, i) => out(`  ${i}. ${o.id}${o.name && o.name !== o.id ? ` (${o.name})` : ''}${i === defaultIndex ? '  (default)' : ''}\n`));
+  say(`${title}:\n`);
+  options.forEach((o, i) => say(`  ${i}. ${o.id}${o.name && o.name !== o.id ? ` (${o.name})` : ''}${i === defaultIndex ? '  (default)' : ''}\n`));
   for (;;) {
     const answer = await ask(`${question} [${defaultIndex}]: `);
     const i = choiceIndex(answer, options, defaultIndex);
     if (i !== null) return options[i].id;
-    out(`  "${cleanCell(answer.trim())}" is not in the list — type its number (0–${options.length - 1}) or its name\n`);
+    say(`  "${cleanCell(answer.trim())}" is not in the list — type its number (0–${options.length - 1}) or its name\n`);
   }
 }
 
@@ -4186,7 +4227,7 @@ async function pickInferenceProvider(ask: (q: string) => Promise<string>, prefer
 
 /** The model key prompt of the REPL (cli/modelkey.ts). */
 function keyPrompt(ask: (q: string) => Promise<string>) {
-  return replKeyPrompt(ask, (p: string) => askSecret(ask, p), (l: string) => out(`${l}\n`));
+  return replKeyPrompt(ask, (p: string) => askSecret(ask, p), (l: string) => say(`${l}\n`));
 }
 
 
@@ -4199,7 +4240,7 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
   // overlap them; the balance gate below still waits for both.
   const effPromise = ag.getEffectiveBalance().catch(() => null);
   const ackTx = await ag.ack();
-  if (ackTx) { out(`acknowledging the trust root (tx ${ackTx}, waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
+  if (ackTx) { say(`acknowledging the trust root (tx ${ackTx}, waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
   // Gate on the provider's EFFECTIVE balance (on-chain minus outstanding
   // off-chain debt) when reachable — that's what its create gate enforces;
   // the raw chain read is the fallback.
@@ -4208,9 +4249,9 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
   if (bal < parseEther('0.1')) {
     if (eff && eff.availableWei < eff.balanceWei) {
       const owed = eff.outstandingDebtWei + eff.pendingSettlementWei + eff.reservedWei;
-      out(`available balance is ${og(bal)} — on-chain ${og(eff.balanceWei)} minus ${og(owed)} owed/queued off-chain. Deposits settle those first.\n`);
+      say(`available balance is ${og(bal)} — on-chain ${og(eff.balanceWei)} minus ${og(owed)} owed/queued off-chain. Deposits settle those first.\n`);
     } else {
-      out(`prepaid sandbox balance is ${og(bal)} — deploy/run needs ≥ 0.1 OG.\n`);
+      say(`prepaid sandbox balance is ${og(bal)} — deploy/run needs ≥ 0.1 OG.\n`);
     }
     // What the wallet can actually afford: native balance minus a gas
     // reserve. A deposit's principal + fee both come out of native, so
@@ -4220,7 +4261,7 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
     const GAS_RESERVE = parseEther('0.05');
     const affordableWei = native != null && native > GAS_RESERVE ? native - GAS_RESERVE : 0n;
     if (native != null && affordableWei < shortfallWei) {
-      out(`wallet has only ${og(native)} native gas — not enough to cover a ${og(shortfallWei)} deposit plus fees. Fund the wallet, or use one with more OG.\n`);
+      say(`wallet has only ${og(native)} native gas — not enough to cover a ${og(shortfallWei)} deposit plus fees. Fund the wallet, or use one with more OG.\n`);
       return false;
     }
     // Suggest the shortfall (no arbitrary padding), capped at what's affordable.
@@ -4234,21 +4275,21 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
     let amountWei = 0n;
     for (;;) {
       const amt = (await ask(`deposit how much OG now? (e.g. ${suggest}, empty to cancel): `)).trim();
-      if (!amt) { out('cancelled — deposit later with `deposit`.\n'); return false; }
+      if (!amt) { say('cancelled — deposit later with `deposit`.\n'); return false; }
       try {
         amountWei = parseOgAmount(amt);
       } catch (e) {
-        out(`  ${(e as Error).message}\n`);
+        say(`  ${(e as Error).message}\n`);
         continue;
       }
       if (native != null && native <= amountWei) {
-        out(`  the wallet holds ${og(native)} — not enough for ${ogAmount(amountWei)} OG plus gas\n`);
+        say(`  the wallet holds ${og(native)} — not enough for ${ogAmount(amountWei)} OG plus gas\n`);
         continue;
       }
       break;
     }
     const tx = await ag.deposit({ amountWei });
-    out(`deposit ${ogAmount(amountWei)} OG (tx ${tx}, waiting…)\n`);
+    say(`deposit ${ogAmount(amountWei)} OG (tx ${tx}, waiting…)\n`);
     await ag.waitForTransaction(tx);
   }
   return true;
@@ -4262,11 +4303,11 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
     .catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
   let framework = 'openclaw';
-  out('\n');
+  say('\n');
   if (fws.length) {
     framework = await askChoice(ask, 'frameworks', 'framework', fws.map((id) => ({ id })), Math.max(0, fws.indexOf('openclaw')));
   } else {
-    out('framework: openclaw (this attestor lists no others)\n');
+    say('framework: openclaw (this attestor lists no others)\n');
   }
 
   // Only offer models the chosen framework can actually run: chatbots only
@@ -4301,15 +4342,15 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
 
   const apiKey = provision ? (await pickModelKey(provider, keyPrompt(ask), { optional: mayGoKeyless(framework, provider) })) ?? undefined : undefined;
   if (provision && !(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
-  out(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only'}…\n`);
+  say(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only'}…\n`);
   const { deployment: dep, agentId } = await deployWithInference(ag, { name, framework, provider, model, provision, apiKey });
   if (!provision) {
-    out(`minted agentId ${agentId} — offline (no container). Bring it online with: reset ${agentId}\n`);
+    say(`minted agentId ${agentId} — offline (no container). Bring it online with: reset ${agentId}\n`);
     return null;
   }
-  out(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
+  say(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
   const r = await waitRunningInterruptible(irq, attestorUrl, dep.sealId, agentId);
-  if (!r) { out(`the deploy goes on — enter it later with: use ${agentId}\n`); return null; } // Esc: only the wait ends
+  if (!r) { say(`the deploy goes on — enter it later with: use ${agentId}\n`); return null; } // Esc: only the wait ends
   if (apiKey) await ag.credentials.resyncModelKey(dep.sealId, { agentUrl: r.url }).catch(() => undefined);
   // Enter through attach so a fresh deploy gets the same entry card
   // (avatar / gas / status) as `use`; only the wizard knows the framework.
@@ -4376,7 +4417,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
     { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string; name?: string | null; framework?: string | null } | undefined;
   if (!row) {
     throw new CliError('AGENT_NOT_FOUND', `agent ${cleanCell(refInput)} does not exist on this attestor`, {
-      remedy: `${cmdStep('list')} shows the agents here (* marks yours)`,
+      remedy: listRemedy(),
     });
   }
   // A session is keyed by the agentId: an agent without one yet (still being
@@ -4387,7 +4428,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
       ? `agent ${prefix} has no agentId — its deploy stopped before the mint`
       : `agent ${prefix} has no agentId yet — it is still being minted`, {
       remedy: row.phase === 'failed'
-        ? `${shellStep(`retry ${prefix}`)} resumes it`
+        ? shellTo(`retry ${prefix}`, 'resume it')
         : `${cmdStep('list')} shows its agentId once minted; then ${cmdStep('use <agentId>')}`,
     });
   }
@@ -4426,7 +4467,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   // anyway; the attestor's auth still guards every owner action.
   if (mine === false) {
     throw new CliError('AGENT_NOT_FOUND', `agent ${agentId} is not yours`, {
-      remedy: `its public surface: ${shellStep(`hello ${agentId}`)}`,
+      remedy: shellTo(`hello ${agentId}`, 'see its public surface'),
     });
   }
   // A running agent can still report a warning, e.g. its data not reaching
@@ -4502,7 +4543,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
     .catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
   if (!fws.length) {
-    out(`framework: ${current ?? 'openclaw'} (this attestor lists no others)\n`);
+    say(`framework: ${current ?? 'openclaw'} (this attestor lists no others)\n`);
     return current ?? 'openclaw';
   }
   return askChoice(ask, 'frameworks', 'framework', fws.map((id) => ({ id })), Math.max(0, current ? fws.indexOf(current) : 0));

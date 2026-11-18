@@ -25,7 +25,9 @@ import { privateKeyToAccount } from 'viem/accounts';
 
 import { CliError, setSurface } from '../dist/cli/errors.js';
 import { parseOgAmount, explainError, plainCliError } from '../dist/cli/plain.js';
-import { wrap, fitHelp, didYouMean } from '../dist/cli/textfit.js';
+import { fitHelp, didYouMean } from '../dist/cli/textfit.js';
+import { wrapProse } from '../dist/cli/livePrompt.js';
+const wrap = (text, width, indent = '') => (width ? wrapProse(text, width) : [text]);
 import { listLayout, listHeader, listCells, ownerColumnWidth } from '../dist/cli/commands/cells.js';
 import { askChoice, choiceIndex, managerHelp, fitItems, addressProblem, renderListHeader, renderListRow } from '../dist/cli/commands/interactive.js';
 import { planReleaseNotice } from '../dist/cli/releaseNotice.js';
@@ -517,4 +519,85 @@ test('lineQueue: ↑ at a question recalls no command; the history is back at th
   input.write('\r');
   assert.equal(await next, 'deploy', 'at the prompt ↑ recalls the command again');
   rl.close();
+});
+
+// ── re-verification round ──
+
+test('fitLines: long lines break between words, under the label or the error text', async () => {
+  const { fitLines } = await import('../dist/cli/textfit.js');
+  const money = 'pending refund  : 0.200000 OG (unlocks 11/18/2026, 11:23:31 PM — claim with `withdraw`)';
+  const out = fitLines(money, 79).split('\n');
+  assert.ok(out.every((l) => cps(l) <= 79), out.join('\n'));
+  assert.match(out[1], /^ {18}\S/, 'continues under the value after the label');
+  assert.ok(out.join(' ').includes('`withdraw`'), 'no word is cut');
+  const err = fitLines('error: the attestor at http://127.0.0.1:9 did not answer (connection refused) and more words here', 50).split('\n');
+  assert.ok(err.every((l) => cps(l) <= 50));
+  assert.match(err[1], /^ {7}\S/);
+  assert.equal(fitLines('short', 79), 'short');
+  assert.equal(fitLines(money, undefined), money);
+});
+
+test('shellTo: a remedy is a whole sentence where the owner is', async () => {
+  const { shellTo } = await import('../dist/cli/errors.js');
+  setSurface('shell');
+  assert.equal(shellTo('retry 288', 'resume it'), 'type `retry 288` to resume it');
+  setSurface('oneshot');
+  assert.equal(shellTo('retry 288', 'resume it'), 'run `0g-agentdna` and type `retry 288` there to resume it');
+});
+
+test('explainError: a deploy that stopped before the mint, without SDK names, with the retry', () => {
+  const seal = `0x6224b71b9a${'0'.repeat(54)}`;
+  setSurface('shell');
+  const p = explainError(new Error(`waitForMint: seal ${seal} failed — storage upload failed: 0g storage node timeout`));
+  assert.equal(p.message, 'the deploy stopped before the mint: storage upload failed: 0g storage node timeout');
+  assert.equal(p.remedy, 'type `retry 0x6224b71b9a` to resume it under the same identity');
+  const late = explainError(new Error(`waitForMint: seal ${seal} not minted within 180000ms`));
+  assert.equal(late.code, 'TIMEOUT');
+  assert.match(late.message, /^agent 0x6224b71b9a is not minted after 180 s$/);
+  assert.equal(explainError(new Error('claimAgent: the seat is taken')).message, 'the seat is taken');
+});
+
+test('cred log on an image without the route: RUNTIME_TOO_OLD with a reset remedy', async () => {
+  const { credOp } = await import('../dist/cli/credentials.js');
+  const ag = { credentials: { audit: async () => { throw new Error('credentials.audit: HTTP 404 no route /_seal/credentials/audit'); } } };
+  await assert.rejects(credOp(ag, `0x${'1'.repeat(64)}`, ['log'], { json: false, out: () => {}, secret: async () => '' }, 'http://agent'),
+    (e) => e.code === 'RUNTIME_TOO_OLD' && e.exitCode === 3 && /no credential log yet/.test(e.message) && /reset/.test(e.remedy));
+});
+
+test('a tool-less model on openclaw reads "an openclaw agent"', async () => {
+  const caps = async () => [{ id: 'chat-only-7b', chat: true, tools: false }];
+  await assert.rejects(assertModelFitsFramework([{ key: 'model', value: 'chat-only-7b' }], { model: 'chat-only-7b' }, 'openclaw', caps), /and an openclaw agent works/);
+});
+
+test('one-shot: --version --json is an envelope; list help points at --help; nothing set up says so', async () => {
+  const v = await run(['--version', '--json']);
+  assert.equal(v.code, 0);
+  assert.match(JSON.parse(v.stdout).data.version, /^\d+\.\d+\.\d+/);
+  const l = await run(['list', 'help']);
+  assert.equal(l.code, 2);
+  assert.match(l.stderr, /list takes no argument \(got "help"\)\n {2}fix: 0g-agentdna --help/);
+  const first = await run(['286']);
+  assert.equal(first.code, 3);
+  assert.match(first.stderr, /error \(MISSING_ATTESTOR_URL\): nothing is set up yet: no attestor URL and no owner key/);
+  assert.match(first.stderr, /fix: run `0g-agentdna` and type `login` there to set both, or export AGENTIC_ATTESTOR_URL and AGENTIC_PRIVATE_KEY/);
+  assert.doesNotMatch(first.stderr, /\bhere\b/);
+});
+
+test('one-shot: an agent that does not exist points at list without the shell\'s * marks', async () => {
+  const att = await mockAttestor();
+  try {
+    const r = await run(['99999'], { AGENTIC_ATTESTOR_URL: att.url, AGENTIC_PRIVATE_KEY: KEY });
+    assert.equal(r.code, 2);
+    assert.match(r.stderr, /agent 99999 does not exist on this attestor\n {2}fix: `0g-agentdna list` shows the agents here\n/);
+  } finally { close(att.server); }
+});
+
+test('shell: a bad answer at bare deposit is asked again, as the low-balance gate does', async () => {
+  const att = await mockAttestor();
+  try {
+    const r = await run([], { AGENTIC_ATTESTOR_URL: att.url, AGENTIC_PRIVATE_KEY: KEY }, 'deposit\nabc\n0.5\nquit\n');
+    assert.match(r.stdout, /"abc" is not an amount of OG/);
+    assert.match(r.stdout, /the wallet holds 0\.000000 OG — not enough for 0\.5 OG plus gas/, 'the next answer was taken');
+    assert.equal(att.sent(), 0);
+  } finally { close(att.server); }
 });

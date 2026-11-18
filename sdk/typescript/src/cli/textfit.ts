@@ -1,49 +1,18 @@
 /**
  * @file textfit.ts
- * @description Text that fits the owner's terminal: word wrap with a hanging
- * indent, the shell's two-column help reflowed for narrow terminals, and the
- * nearest known word for a typo. Pure functions; the width comes from the
- * caller (`termWidth()` for stdout).
+ * @description Text that fits the owner's terminal: the width to use, the
+ * shell's two-column help reflowed for narrow terminals, whole lines wrapped
+ * (with livePrompt.ts's wrapProse, the CLI's one word wrap), and the nearest
+ * known word for a typo.
  */
 
-/** The terminal's width when `stream` is one; undefined when it is piped. */
+import { wrapProse, wrapText } from './livePrompt';
+
+/** The columns text may use on `stream` when it is a terminal: its width
+ *  less the last column (a character there leaves the cursor pending a wrap
+ *  some terminals then take); undefined when it is piped. */
 export function termWidth(stream: NodeJS.WriteStream = process.stdout): number | undefined {
-  return stream.isTTY && stream.columns ? stream.columns : undefined;
-}
-
-/**
- * Wrap `text` (one paragraph) at spaces so no line is wider than `width`.
- * The first line starts with `first` (default: the text's own leading
- * spaces), later lines with `indent`. A word wider than the room is split.
- * Without a width (piped output) the text comes back as one line.
- */
-export function wrap(text: string, width: number | undefined, indent = '', first?: string): string[] {
-  const len = (s: string): number => [...s].length;
-  const head = first ?? (/^\s*/.exec(text)?.[0] ?? '');
-  const body = text.trim();
-  if (!width || len(head + body) <= width) return [`${head}${body}`.replace(/\s+$/, '')];
-  const lines: string[] = [];
-  let line = head;
-  let empty = true;
-  for (let w of body.split(/ +/).filter(Boolean)) {
-    if (!empty && len(line) + 1 + len(w) > width) {
-      lines.push(line);
-      line = indent;
-      empty = true;
-    }
-    // A word wider than a whole line: cut it to the room left.
-    while (empty && len(line) + len(w) > width && width - len(line) > 0) {
-      const room = width - len(line);
-      const cps = [...w];
-      lines.push(line + cps.slice(0, room).join(''));
-      w = cps.slice(room).join('');
-      line = indent;
-    }
-    line += (empty ? '' : ' ') + w;
-    empty = false;
-  }
-  if (!empty) lines.push(line);
-  return lines;
+  return stream.isTTY && stream.columns ? Math.max(20, stream.columns - 1) : undefined;
 }
 
 /**
@@ -74,14 +43,15 @@ export function fitHelp(text: string, width: number | undefined, col = 26): stri
   const out: string[] = [];
   const twoCol = width >= 60;
   for (const e of entries) {
-    if (e.cmd === undefined) { out.push(...wrap(e.desc, width)); continue; }
+    if (e.cmd === undefined) { out.push(...wrapProse(e.desc, width)); continue; }
     if (!e.desc) { out.push(`  ${e.cmd}`); continue; }
     if (twoCol && e.cmd.length <= col - 3) {
-      out.push(...wrap(e.desc, width, pad, `  ${e.cmd.padEnd(col - 2)}`));
+      const cmd = e.cmd;
+      wrapProse(e.desc.trim(), width - col).forEach((r, i) => out.push(`${i ? pad : `  ${cmd.padEnd(col - 2)}`}${r}`));
     } else {
       out.push(`  ${e.cmd}`);
       const under = twoCol ? pad : '      ';
-      out.push(...wrap(e.desc, width, under, under));
+      wrapProse(e.desc.trim(), width - under.length).forEach((r) => out.push(`${under}${r}`));
     }
   }
   return out.join('\n');
@@ -112,4 +82,14 @@ export function didYouMean(typed: string, words: readonly string[]): string | un
   }
   // Close means at most 2 edits, and fewer than half the word's letters.
   return best !== undefined && bestD <= 2 && bestD * 2 < Math.max(t.length, best.length) ? best : undefined;
+}
+
+/**
+ * Text of whole lines fitted to `width` (undefined: as it is), between words:
+ * the shell's word wrap (livePrompt.ts wrapText — later rows under the text,
+ * a label's value or an `error:`/`fix:` text; long tokens whole; CJK between
+ * characters), for the one-shot commands' lines on a terminal.
+ */
+export function fitLines(text: string, width: number | undefined): string {
+  return width ? wrapText(text, width) : text;
 }

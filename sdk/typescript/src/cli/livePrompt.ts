@@ -221,7 +221,9 @@ const hasWide = (s: string): boolean => [...s].some((ch) => charCols(ch.codePoin
  * A line of prose in rows of at most `cols` columns, broken between words (as
  * Claude Code does), for text that stays in the scrollback: further rows start
  * under the line's text — its indent, a list item's text after `- `, `* ` or
- * `1. `, or a value after a label and two spaces (`gas      1.2 OG …`). A word
+ * `1. `, a value after a label and two spaces (`gas      1.2 OG …`, also
+ * `pending refund  : 0.2 OG …`), or the text after an `error:` / `fix:` /
+ * `usage:` / `hint:` / `→` the CLI's messages start with. A word
  * wider than a row (a URL, a path, code) is left whole on a row of its own, for
  * the terminal to fold, so it still copies whole; a run of wide characters
  * (CJK) breaks between characters. No row starts with a space it did not have.
@@ -229,7 +231,7 @@ const hasWide = (s: string): boolean => [...s].some((ch) => charCols(ch.codePoin
 export function wrapProse(line: string, cols: number): string[] {
   if (cols < 8 || textCols(line) <= cols) return [line];
   const lead = /^\s*(?:(?:[-*•]|\d{1,3}[.)])\s+)?/.exec(line)![0];
-  const label = /^\s*\S+(?: \S+){0,3}? {2,}(?=\S)/.exec(line)?.[0];
+  const label = /^\s*(?:\S+(?: \S+){0,3}? {2,}(?::\s+)?|(?:error(?: \([A-Z_]+\))?|fix|usage|hint):\s+|→\s+)(?=\S)/.exec(line)?.[0];
   let indentW = textCols(lead);
   if (label && textCols(label) > indentW && textCols(label) <= Math.min(30, cols / 2)) indentW = textCols(label);
   if (indentW > cols / 2) indentW = 0;

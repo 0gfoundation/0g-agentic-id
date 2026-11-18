@@ -8,7 +8,7 @@
  */
 
 import { AgenticID } from '../AgenticID';
-import { CliError, shellStep } from './errors';
+import { CliError, shellTo } from './errors';
 import { credentialMarksPath, loadCredentialMarks, loadSecretEnvPins, recordCredentialMark, recordSecretEnvPin } from './config';
 import { requireAttestorUrl, requirePrivateKey, type CliEnv } from './env';
 import { explainError } from './plain';
@@ -80,7 +80,7 @@ export function attestorUnreachable(env: Pick<CliEnv, 'attestorUrl' | 'attestorU
   return new CliError('ATTESTOR_UNREACHABLE', `the attestor at ${url} did not answer (${why})`, {
     remedy: env.attestorUrlSource === 'env'
       ? 'check AGENTIC_ATTESTOR_URL and your network, then try again'
-      : `check your network, then try again — ${shellStep('login')} changes the address`,
+      : `check your network and try again, or ${shellTo('login', 'change the address')}`,
     details: { cause: e instanceof Error ? e.message : String(e) },
   });
 }
@@ -96,7 +96,7 @@ export function unreachableReason(e: unknown): string {
     if (typeof x.code === 'string' && /^E[A-Z_]+$|^UND_ERR/.test(x.code)) code = x.code;
     if (x.message === 'bad port') badPort = true;
   }
-  if (badPort) return 'a port that fetch never connects to';
+  if (badPort) return 'a port web requests are not allowed to use';
   if (/Failed to parse URL|Invalid URL/i.test(msg)) return 'not a valid URL';
   if (code === 'ECONNREFUSED') return 'connection refused';
   if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'unknown host';
