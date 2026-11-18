@@ -40,6 +40,9 @@ export interface TurnView {
   /** A line after what the reply has written so far (where the view keeps
    *  the reply's unfinished line apart; else as `note`). */
   after?(text: string): void;
+  /** How many lines came between the reply's text so far (after()): the
+   *  reply's next text is marked as the agent's again. */
+  readonly breaks?: number;
   /** Something the prompt shows changed: redraw soon. */
   refresh(): void;
   /** The turn is over: the region and its prompt go, the reply's unfinished
@@ -215,20 +218,51 @@ export function textCols(s: string): number {
 
 const hasWide = (s: string): boolean => [...s].some((ch) => charCols(ch.codePointAt(0)!) === 2);
 
+/** A word cut where it may break: between wide characters (CJK), and a run
+ *  of other characters (Latin, digits, punctuation) whole. */
+function pieces(tok: string): string[] {
+  if (!hasWide(tok)) return [tok];
+  const out: string[] = [];
+  let run = '';
+  for (const ch of tok) {
+    if (charCols(ch.codePointAt(0)!) === 2) {
+      if (run) { out.push(run); run = ''; }
+      out.push(ch);
+    } else {
+      run += ch;
+    }
+  }
+  if (run) out.push(run);
+  return out;
+}
+
+/** A run wider than `room` broken after its commas (JSON, a list), when it has any. */
+function afterCommas(run: string, room: number): string[] {
+  if (textCols(run) <= room || !run.includes(',')) return [run];
+  return run.match(/[^,]*,|[^,]+$/g) ?? [run];
+}
+
 /**
  * A line of prose in rows of at most `cols` columns, broken between words (as
  * Claude Code does), for text that stays in the scrollback: further rows start
  * under the line's text — its indent, a list item's text after `- `, `* ` or
- * `1. `, or a value after a label and two spaces (`gas      1.2 OG …`). A word
- * wider than a row (a URL, a path, code) is left whole on a row of its own, for
- * the terminal to fold, so it still copies whole; a run of wide characters
- * (CJK) breaks between characters. No row starts with a space it did not have.
+ * `1. ` (also right after `agent> `), a value after a label and two spaces
+ * (`gas      1.2 OG …`), or what was typed after a prompt (`agent 625 › `).
+ * A word wider than a row (a URL, a path) is left whole on a row of its own,
+ * for the terminal to fold, so it still copies whole; one with commas (JSON)
+ * breaks after them. Wide characters (CJK) break between them, and a run of
+ * Latin letters, digits or punctuation next to them stays whole. No row starts
+ * with a space it did not have.
  */
 export function wrapProse(line: string, cols: number): string[] {
   if (cols < 8 || textCols(line) <= cols) return [line];
-  const lead = /^\s*(?:(?:[-*•]|\d{1,3}[.)])\s+)?/.exec(line)![0];
-  const label = /^\s*\S+(?: \S+){0,3}? {2,}(?=\S)/.exec(line)?.[0];
-  let indentW = textCols(lead);
+  // A speaker (`agent> `) or a prompt (`agent 625 › `) first, then the indent
+  // and a list marker.
+  const speaker = /^(?:[\w-]+> |[^›\n]{1,40}› )/.exec(line)?.[0] ?? '';
+  const marker = /^\s*(?:(?:[-*•]|\d{1,3}[.)])\s+)?/.exec(line.slice(speaker.length))![0];
+  const lead = speaker + marker;
+  let indentW = speaker.includes('›') ? textCols(lead) : textCols(marker);
+  const label = speaker ? undefined : /^\s*\S+(?: \S+){0,3}? {2,}(?=\S)/.exec(line)?.[0];
   if (label && textCols(label) > indentW && textCols(label) <= Math.min(30, cols / 2)) indentW = textCols(label);
   if (indentW > cols / 2) indentW = 0;
   const indent = ' '.repeat(indentW);
@@ -252,22 +286,29 @@ export function wrapProse(line: string, cols: number): string[] {
       row += sp + tok;
       w += textCols(sp) + ww;
       empty = false;
-    } else if (hasWide(tok)) {
-      // Wide characters: as many as fit here, the rest on the rows after.
-      if (!empty && w + textCols(sp) < cols) { row += sp; w += textCols(sp); }
-      for (const ch of tok) {
-        const c = charCols(ch.codePointAt(0)!);
-        if (w + c > cols && !empty) newRow();
-        row += ch;
-        w += c;
-        empty = false;
-      }
-    } else {
+      continue;
+    }
+    const parts = pieces(tok).flatMap((p) => afterCommas(p, cols - indentW));
+    if (parts.length === 1) {
+      // One word: on the next row; wider than a row, alone and whole.
       if (!empty) newRow();
       row += tok;
       w += ww;
       empty = false;
-      if (w > cols) newRow(); // a word wider than a row: alone, whole
+      if (w > cols) newRow();
+      continue;
+    }
+    // Breakable: as much as fits here, the rest on the rows after.
+    if (!empty) {
+      if (w + textCols(sp) + textCols(parts[0]) <= cols) { row += sp; w += textCols(sp); } else newRow();
+    }
+    for (const p of parts) {
+      const pw = textCols(p);
+      if (w + pw > cols && !empty) newRow();
+      row += p;
+      w += pw;
+      empty = false;
+      if (w > cols) newRow();
     }
   }
   if (!empty || !rows.length) rows.push(row.trimEnd());
@@ -370,10 +411,14 @@ export class LiveTurn implements TurnView {
 
   /** A line after what the reply has written so far (its unfinished line
    *  ends there): something that happened at this point of the turn. */
+  /** Lines put between the reply's text (after()). */
+  breaks = 0;
+
   after(text: string): void {
     if (this.ended) { this.output.write(cleanStream(text)); return; }
     const t = cleanStream(text).replace(/^\n+/, '').replace(/\n+$/, '');
     if (!t) return;
+    this.breaks++;
     this.committed += `${this.partial ? `${wrapText(this.partial, this.cols())}\n` : ''}${wrapText(t, this.cols())}\n`;
     this.partial = '';
     this.schedule();

@@ -338,23 +338,30 @@ export function shortIds(ids: readonly string[]): string[] {
 export function renderActivityTable(tasks: AgentActivityInfo[], nowMs: number, width = 1000): string[] {
   const ids = shortIds(tasks.map((t) => cleanCell(t.id)));
   const idw = Math.max(2, ...ids.map((id) => id.length)) + 2;
-  const head = `  ${'ID'.padEnd(idw)}${'STATUS'.padEnd(13)}${'BY'.padEnd(10)}${'FOR'.padEnd(10)}${'AGE'.padEnd(6)}WHAT`;
+  // Narrow: AGE goes first, then FOR, then BY, before WHAT is squeezed.
+  const show = { by: true, for: true, age: true };
+  const room = (): number => width - 2 - idw - 13 - (show.by ? 10 : 0) - (show.for ? 10 : 0) - (show.age ? 6 : 0);
+  for (const k of ['age', 'for', 'by'] as const) if (room() < 18) show[k] = false;
+  const whatW = Math.max(10, Math.min(70, room()));
+  const head = `  ${'ID'.padEnd(idw)}${'STATUS'.padEnd(13)}${show.by ? 'BY'.padEnd(10) : ''}${show.for ? 'FOR'.padEnd(10) : ''}${show.age ? 'AGE'.padEnd(6) : ''}WHAT`;
   return [
     head,
     ...tasks.map((t, i) =>
-      `  ${ids[i].padEnd(idw)}${cellText(t.status, 13)}${cellText(t.actor, 10)}` +
-      `${cellText(askedFor(t, tasks, nowMs / 1000), 10)}${span(nowMs / 1000 - t.created_at).padEnd(6)}` +
-      `${fitRow(cleanCell(t.label), Math.max(10, Math.min(70, width - 2 - idw - 39)))}`),
+      `  ${ids[i].padEnd(idw)}${cellText(t.status, 13)}${show.by ? cellText(t.actor, 10) : ''}` +
+      `${show.for ? cellText(askedFor(t, tasks, nowMs / 1000), 10) : ''}${show.age ? span(nowMs / 1000 - t.created_at).padEnd(6) : ''}` +
+      `${fitRow(cleanCell(activityLabel(t.label)), whatW)}`),
   ];
 }
 
 /** The /tasks list: id, state, open records, age, title. Exported for the tests. */
 export function renderTaskTable(tasks: HarnessTask[], nowMs: number, width = 1000): string[] {
-  const idw = Math.max(2, ...tasks.map((t) => cleanCell(t.id).length)) + 2;
+  // Ids as /activities shows them: short, a unique start (/tasks show takes it).
+  const ids = shortIds(tasks.map((t) => cleanCell(t.id)));
+  const idw = Math.max(2, ...ids.map((id) => id.length)) + 2;
   return [
     `  ${'ID'.padEnd(idw)}${'STATE'.padEnd(13)}${'OPEN'.padEnd(6)}${'RUNS'.padEnd(6)}${'AGE'.padEnd(6)}TITLE`,
-    ...tasks.map((t) =>
-      `  ${cleanCell(t.id).padEnd(idw)}${cellText(t.state + (t.reason ? ` (${t.reason})` : ''), 13)}` +
+    ...tasks.map((t, i) =>
+      `  ${ids[i].padEnd(idw)}${cellText(t.state + (t.reason ? ` (${t.reason})` : ''), 13)}` +
       `${String(t.records?.length ?? 0).padEnd(6)}${String(t.runs?.count ?? 0).padEnd(6)}` +
       `${span(nowMs / 1000 - t.created_at).padEnd(6)}${fitRow(cleanCell(t.title), Math.max(10, Math.min(60, width - 2 - idw - 31)))}`),
   ];
@@ -430,6 +437,12 @@ export function renderTask(t: HarnessTask): string[] {
  * what it said. Exported for the tests.
  */
 /** A notice's text in plain words: a subagent's end (its id short, for /result). */
+/** An activity's label in plain words: a subagent's wake-up turn as `subagent finished (a3d11469)`. */
+function activityLabel(label: string): string {
+  const m = /^Background subagent ([0-9a-f][0-9a-f-]{7,}) finished\b/.exec(label);
+  return m ? `subagent finished (${m[1].slice(0, 8)})` : label;
+}
+
 function plainNotice(text: string): string {
   return text.replace(/Background subagent ([0-9a-f][0-9a-f-]{7,}) finished and will do no further work unless you send it more\.?/g,
     (_m, id: string) => `a subagent finished — /result ${id.slice(0, 8)}`);
@@ -554,7 +567,8 @@ export function renderTaskNotice(t: HarnessTaskSummary): string | null {
   const headline = last ? cleanCell(textArg(objArg(last.arguments).headline)) : '';
   const what = t.state === 'needs-input' ? (last?.tool === 'request_action' ? 'needs you to act' : 'has a question')
     : t.state === 'done' ? 'reports done' : `failed${t.reason ? ` (${cleanCell(t.reason)})` : ''}`;
-  return `◆ task ${cleanCell(t.id)} ${what}${headline ? ` · ${headline}` : ''} — /tasks show ${cleanCell(t.id)}\n`;
+  const id = shortIds([cleanCell(t.id)])[0];
+  return `◆ task ${id} ${what}${headline ? ` · ${headline}` : ''} — /tasks show ${id}\n`;
 }
 
 /** What /inbox (or /notices) says when there is nothing to show; all: `/inbox all`. */
@@ -924,7 +938,7 @@ export function printAbovePrompt(
 }
 import type { CommandContext } from '../types';
 import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
-import { CONT_PROMPT, LiveTurn, PlainTurn, fitRow, liveKeys, wrapProse, wrapText, wrapWords, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
+import { CONT_PROMPT, LiveTurn, PlainTurn, fitRow, liveKeys, textCols, wrapProse, wrapText, wrapWords, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
 import { OUTBOX_POLL_MS, makeOutboxSync, renderOutboxEvent, supportsHyperlinks, tildePath, type OutboxSync } from '../outboxSync';
 
 /**
@@ -1508,6 +1522,20 @@ const term = (s: string): void => {
  */
 const out = (s: string): void => term(termWrap(cleanStream(s)));
 
+/** `/settings`' way to change them: the items after "change with:", in rows
+ *  of at most `width` columns, further rows under the first item. Exported for the tests. */
+export function changeWith(items: readonly string[], width: number): string[] {
+  const head = '  change with: ';
+  const rows: string[] = [];
+  let row = '';
+  for (const it of items) {
+    const next = row ? `${row} · ${it}` : it;
+    if (row && head.length + textCols(next) > width) { rows.push(row); row = it; } else row = next;
+  }
+  if (row) rows.push(row);
+  return rows.map((r, i) => `${i ? ' '.repeat(head.length) : head}${r}`);
+}
+
 /** The width the shell wraps to on a terminal (its own less one); unbounded otherwise. */
 function termWidth(): number {
   return process.stdout.isTTY ? Math.max(20, (process.stdout.columns || 80) - 1) : Infinity;
@@ -1859,11 +1887,23 @@ function sessionLabel(s: Session): string {
 
 /** A writer that puts `agent> ` before the turn's first text, not before
  *  it: a status line may come first, and a turn with no text shows none. */
-function sayer(view: TurnView): (text: string) => void {
+/** Exported for the tests. */
+export function sayer(view: TurnView): (text: string) => void {
   let said = false;
+  let seen = 0;
   return (text) => {
     if (!text) return;
-    if (!said) { view.write('agent> '); said = true; }
+    const b = view.breaks ?? 0;
+    // Lines came between (a message read, a command's output): what the
+    // agent writes next is marked as its own again, on a line of its own.
+    if (said && b !== seen) {
+      const t = text.replace(/^\n+/, '');
+      if (!t) return;
+      seen = b;
+      view.write(`agent> ${t}`);
+      return;
+    }
+    if (!said) { view.write('agent> '); said = true; seen = b; }
     view.write(text);
   };
 }
@@ -3250,7 +3290,8 @@ async function settingsOp(
     }
     for (const l of renderSettings(current)) out(`  ${l}\n`);
     if (listed) out(`  ${renderVersionsLine(listed, current?.versions)}\n`);
-    out(`  change with: model=<id> · thinking=low|high|max · provider=<name>\n               others='<json>' (quote it)${listed ? ` · pin a version: ${versionsCmd}` : ''}\n`);
+    const items = ['model=<id>', 'thinking=low|high|max', 'provider=<name>', "others='<json>' (quote it)", ...(listed ? [`pin a version: ${versionsCmd}`] : [])];
+    for (const l of changeWith(items, termWidth())) out(`${l}\n`);
     return current;
   }
   const next = applyAssignments(current, assignments);
@@ -4609,7 +4650,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const prompt = after(1);
           if (!prompt) { out('usage: /tasks new <what to do>\n'); continue; }
           const { task } = await c.createTask!({ prompt });
-          out(`task ${cleanCell(task.id)} — ${cleanCell(task.state)} (/tasks show ${cleanCell(task.id)})\n`);
+          const short = shortIds([cleanCell(task.id)])[0];
+          out(`task ${short} — ${cleanCell(task.state)} (/tasks show ${short})\n`);
           continue;
         }
         if (sub === 'show') {

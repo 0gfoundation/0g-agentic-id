@@ -5,7 +5,7 @@
 // completes as readline does.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { NO_ANSWER_MAX_TOKENS, PHASE_WATCH_MS, addFollowUp, askedFor, filesText, shortIds, yesNo, nextPhaseWait, phaseMovedText, emptyTurnText, failureKind, failureText, followUpNote, keptNote, readOnlyCommand, renderActivityTable, steerFollowUp, stoppedSteers, wrapCard } from '../dist/cli/commands/interactive.js';
+import { NO_ANSWER_MAX_TOKENS, PHASE_WATCH_MS, addFollowUp, askedFor, changeWith, filesText, renderTaskNotice, renderTaskTable, sayer, shortIds, yesNo, nextPhaseWait, phaseMovedText, emptyTurnText, failureKind, failureText, followUpNote, keptNote, readOnlyCommand, renderActivityTable, steerFollowUp, stoppedSteers, wrapCard } from '../dist/cli/commands/interactive.js';
 import { completeAt } from '../dist/cli/livePrompt.js';
 
 test('readOnlyCommand: the commands that only read run during a turn; the rest wait for its end', () => {
@@ -278,4 +278,56 @@ test('/files with nothing on the agent says what was saved here this session', (
   assert.equal(filesText('outbox', true, '~/agentdna/625/outbox', ['notes.md', 'report.txt']), 'nothing waiting on the agent — 2 files saved to ~/agentdna/625/outbox this session (latest: report.txt)\n');
   assert.equal(filesText('outbox', true, '~/agentdna/625/outbox', ['report.txt']), 'nothing waiting on the agent — 1 file saved to ~/agentdna/625/outbox this session (latest: report.txt)\n');
   assert.equal(filesText('outbox', true, '~/agentdna/625/outbox', []), 'nothing from the agent yet — files it makes for you are saved to ~/agentdna/625/outbox\n');
+});
+
+test('wrapProse: a Latin run next to CJK stays whole; a list item right after agent> hangs like the others; JSON breaks after commas', async () => {
+  const { wrapProse } = await import('../dist/cli/livePrompt.js');
+  const rows = wrapProse('你的项目是“proof-of-everything”，那就是2026-11-20，然后0G App和Agent DNA都在这里', 40);
+  for (const tok of ['proof-of-everything', '2026-11-20', 'Agent']) assert.ok(rows.some((r) => r.includes(tok)), `${tok} whole: ${JSON.stringify(rows)}`);
+  assert.deepEqual(wrapProse('agent> 1. First item that is quite long and goes on and on', 40), ['agent> 1. First item that is quite long', '   and goes on and on']);
+  assert.deepEqual(wrapProse('  others     {"webSearch":"0g-router","subagents":true,"model":"glm-5.3"}', 50),
+    ['  others     {"webSearch":"0g-router",', '             "subagents":true,"model":"glm-5.3"}']);
+  // What was typed after a prompt goes on under itself.
+  assert.deepEqual(wrapProse('agent 625 › /settings others=\'{"webSearch":"0g-router","subagents":true}\'', 50),
+    ['agent 625 › /settings', '            others=\'{"webSearch":"0g-router",', '            "subagents":true}\'']);
+});
+
+test('the agent\'s text after lines that came between it is marked as its own again', () => {
+  const written = [];
+  const view = { live: true, breaks: 0, write: (t) => written.push(t) };
+  const say = sayer(view);
+  say('First part.');
+  view.breaks = 1; // a read message's row, a command's output
+  say('\n\n');
+  say('\nSecond part.');
+  say(' more');
+  assert.deepEqual(written, ['agent> ', 'First part.', 'agent> Second part.', ' more']);
+});
+
+test('/activities at 60 columns drops AGE and FOR before it squeezes WHAT; a subagent\'s wake-up turn reads plainly', () => {
+  const now = 2_000_000;
+  const acts = [
+    { id: 'resp_0123456789abcdef', type: 'turn', status: 'completed', actor: 'agent', trigger: 'user', label: 'Run `sleep 8` in bash and tell me the date', created_at: now - 5 },
+    { id: 'resp_fedcba9876543210', type: 'turn', status: 'completed', actor: 'agent', trigger: 'job', label: 'Background subagent a3d11469-8e17-4c4e-9f0a-1b2c3d4e5f60 finished and will do no further work unless you send it more.', created_at: now - 9 },
+  ];
+  const rows = renderActivityTable(acts, now * 1000, 59);
+  assert.match(rows[0], /^ {2}ID\s+STATUS\s+BY\s+WHAT$/);
+  for (const r of rows) assert.ok(r.length <= 59, r);
+  assert.match(rows[1], /agent {5}Run `sleep 8` in/);
+  assert.match(rows[2], /subagent finished \(a3d11469\)$/);
+  // Wide enough: every column.
+  assert.match(renderActivityTable(acts, now * 1000, 100)[0], /BY\s+FOR\s+AGE\s+WHAT/);
+});
+
+test('/tasks and its notices show short ids; /settings says how to change them in even rows', () => {
+  const now = 2_000_000_000;
+  const t = { id: 'task-420c2d69-3fab-4c1d-9e8f-0123456789ab', object: 'task', state: 'needs-input', reason: null, title: 'Fix CI', outcome: [{ id: 1, tool: 'raise_question', arguments: { headline: 'pin or upgrade?' } }], records: [], runs: { count: 1 }, created_at: now / 1000 - 60 };
+  assert.match(renderTaskTable([t], now, 79)[1], /^ {2}task-420c2d69 {2}needs-input/);
+  assert.equal(renderTaskNotice(t), '◆ task task-420c2d69 has a question · pin or upgrade? — /tasks show task-420c2d69\n');
+  const items = ['model=<id>', 'thinking=low|high|max', 'provider=<name>', "others='<json>' (quote it)", 'pin a version: /settings versions'];
+  const rows = changeWith(items, 59);
+  for (const r of rows) assert.ok(r.length <= 59, r);
+  assert.ok(rows[0].startsWith('  change with: model=<id>'));
+  for (const r of rows.slice(1)) assert.match(r, /^ {15}\S/);
+  assert.deepEqual(changeWith(items, Infinity), [`  change with: ${items.join(' · ')}`]);
 });
