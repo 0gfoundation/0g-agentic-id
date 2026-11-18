@@ -107,8 +107,8 @@ COMMANDS
                    others (opaque JSON for that framework's own knobs —
                    quote it: others='{"a": 1}'), and on 0g-harness sealed and
                    harness (a version's sha256 from the trust registry's
-                   lists, which a bare show prints; the agent runs a pick
-                   while it stays listed). Assignments merge into the
+                   lists, which settings <agent> versions prints; the agent
+                   runs a pick while it stays listed). Assignments merge into the
                    stored document; an empty value (thinking=) clears a field.
                    The document is the owner's, so BOTH reading and writing
                    are owner-signed and need AGENTIC_PRIVATE_KEY. A write is a

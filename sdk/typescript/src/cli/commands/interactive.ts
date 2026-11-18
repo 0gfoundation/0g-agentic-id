@@ -27,9 +27,9 @@ import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ti
 import { CliError, cancelled, isCancelled } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { dueReleaseNotice } from '../releaseNotice';
-import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
+import { loadKey, saveKey, normalizeKey, saveApiKey, loadApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
-import { applyAssignments, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework, isHarnessFramework, parseAssignments, renderListedVersions, renderSettings } from '../settings';
+import { applyAssignments, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework, isHarnessFramework, renderListedVersions, renderSettings, renderVersionsLine, settingsArgs } from '../settings';
 import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOwnerOp, ensureModelKey } from '../credentials';
 import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
@@ -697,7 +697,7 @@ export function completeCred(words: string[], names: string[], providers: string
 // argument only; the rest is free-form" — right for prompts and amounts,
 // wrong for settings' k=v list, where the keys are a closed set the user
 // should never have to remember).
-const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness='];
+const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness=', 'versions'];
 const TAIL_ARGS: Record<string, string[]> = {
   'settings': SETTING_KEYS,  // L1: settings <agent> k=v k=v …
   '/settings': SETTING_KEYS, // L2: /settings k=v k=v …
@@ -811,6 +811,20 @@ import type { CommandContext } from '../types';
 import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
 import { CONT_PROMPT, LiveTurn, PlainTurn, liveKeys, type LiveState, type TurnView } from '../livePrompt';
 import { OUTBOX_POLL_MS, makeOutboxSync, renderOutboxEvent, supportsHyperlinks, tildePath, type OutboxSync } from '../outboxSync';
+
+/**
+ * whoami's providers: the ones this machine has a model key for (`login`
+ * saved them; `hasKey` reads that store, never a value), the default for new
+ * agents first — marked when it has no key — then the others in registry
+ * order. The platform's whole list is the `providers` command; an agent's own
+ * keys are `cred <agent>`. Exported for the tests.
+ */
+export function configuredProvidersText(dflt: string, ids: readonly string[], hasKey: (id: string) => boolean): string {
+  const others = ids.filter((id) => id !== dflt && hasKey(id));
+  const own = hasKey(dflt);
+  if (!own && !others.length) return 'none — run login';
+  return [`${dflt} (new agents${own ? '' : ', no key'})`, ...others].join(', ');
+}
 
 /** Column widths of the REPL listing; its header and every row share them. */
 const LIST_COLS = { id: 6, phase: 11, framework: 12, seal: 13, agentSeal: 13, owner: 24 } as const;
@@ -1818,7 +1832,10 @@ const L1_HELP_FULL = `manager commands
   settings <id> [k=v …]   show the agent's configuration document (which model
                           it thinks with, and how hard); with assignments —
                           model=… provider=… thinking=low|high|max
-                          others=<json> — merge and write it (owner-signed)
+                          others=<json> — merge and write it (owner-signed).
+                          settings <id> versions lists the versions a
+                          0g-harness agent can be pinned to (sealed=…
+                          harness=…)
   cred <id> [sub …]       the agent's credentials (API keys, tokens): bare
                           lists them (never values); set <name> [k=v …] adds
                           or changes one (preset=<name> — cred presets lists them,
@@ -1851,7 +1868,8 @@ const L1_HELP_FULL = `manager commands
                           do this implicitly; re-run after an attestor upgrade)
   login [provider]        setup: attestor URL, owner key, each provider's model key
                           (Enter keeps the current value; secrets echo *)
-  whoami                  show attestor / wallet / api-key / ack status
+  whoami                  show attestor / wallet / the providers with a model key
+                          on this machine / ack status
   help                    this text
   quit                    exit (Ctrl-C twice also works)
 At a question a command asks (a value, an amount, a confirmation), Ctrl-C or
@@ -2098,11 +2116,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`attestor    ${ctx.env.attestorUrl ?? '(unset — run `login`)'}\n`);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
         out(`wallet      ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
-        // The providers the platform offers; new agents default to the first
-        // named. Model keys are each agent's own (cred <agent>), not shown here.
+        // The providers this machine has a model key for (login saved them),
+        // the default for new agents first. Never a key's value.
         const dflt = loadConfig().inferenceProvider ?? '0g-compute';
-        const ids = knownProviders.map((p) => p.id);
-        out(`providers   ${[dflt, ...ids.filter((id) => id !== dflt)].map((id, i) => (i === 0 ? `${id} (new agents)` : id)).join(', ')}\n`);
+        out(`providers   ${configuredProvidersText(dflt, knownProviders.map((p) => p.id), (id) => !!loadApiKey(id))}\n`);
         if (key && ctx.env.attestorUrl) {
           // The three status reads are independent — fetch them in parallel
           // (they were serial: 2.9s measured; parallel is bounded by the
@@ -2273,11 +2290,11 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'settings') {
         // The document is the owner's in both directions — reading it is
         // owner-signed too — so the wallet is needed even for a bare show.
-        if (!args[0]) { out('usage: settings <agentId|sealId> [model=… thinking=low|high|max provider=… others=<json>]\n'); continue; }
+        if (!args[0]) { out('usage: settings <agentId|sealId> [model=… thinking=low|high|max provider=… others=<json> | versions]\n'); continue; }
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
-        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework, ask);
+        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework, ask, `settings ${args[0]} versions`);
         continue;
       }
 
@@ -2618,20 +2635,31 @@ let cachedClient: { key: string; ag: AgenticID } | null = null;
  * Returns the document now in force (unchanged on a bare show), so a caller
  * like /think can report the level that actually landed.
  */
-async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null, ask?: (q: string) => Promise<string>): Promise<SettingsDoc | null> {
-  const assignments = parseAssignments(args); // throws CliError on a bad key/level
+async function settingsOp(
+  ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null, ask?: (q: string) => Promise<string>,
+  versionsCmd = '/settings versions',
+): Promise<SettingsDoc | null> {
+  // `versions` alone lists the versions to pick from; anything else is
+  // assignments (throws CliError on a bad key/level).
+  const { versions: versionsView, assignments } = settingsArgs(args);
   assertOthersFitFramework(assignments, framework);
   assertVersionsFitFramework(assignments, framework);
   const { settings: current, version } = await ag.agent.getSettings(sealId);
   if (!assignments.length) {
-    for (const l of renderSettings(current)) out(`  ${l}\n`);
-    out('  change with: model=<id> · thinking=low|high|max · provider=<name> · others=\'<json>\' (quote it)\n');
-    // The versions a 0g-harness agent can be pinned to. Advisory: a chain
-    // without a trust registry, or an unreadable one, just shows nothing.
-    if (isHarnessFramework(framework)) {
-      const listed = await ag.agent.listedVersions().catch(() => null);
-      if (listed) for (const l of renderListedVersions(listed, current?.versions)) out(`  ${l}\n`);
+    // The versions a 0g-harness agent can be pinned to: which it runs on one
+    // line, all of them with `versions`. Advisory: a chain without a trust
+    // registry, or an unreadable one, just shows nothing.
+    const harness = isHarnessFramework(framework);
+    const listed = harness ? await ag.agent.listedVersions().catch(() => null) : null;
+    if (versionsView) {
+      if (!harness) out(`this agent runs ${framework ?? 'another framework'} — only a 0g-harness agent has versions to pick\n`);
+      else if (!listed) out('the trust registry could not be read — no versions to show\n');
+      else for (const l of renderListedVersions(listed, current?.versions)) out(`  ${l}\n`);
+      return current;
     }
+    for (const l of renderSettings(current)) out(`  ${l}\n`);
+    if (listed) out(`  ${renderVersionsLine(listed, current?.versions)}\n`);
+    out(`  change with: model=<id> · thinking=low|high|max · provider=<name> · others='<json>' (quote it)${listed ? ` · pin a version: ${versionsCmd}` : ''}\n`);
     return current;
   }
   const next = applyAssignments(current, assignments);
@@ -3314,9 +3342,10 @@ const L2_HELP_FULL = `session commands
                           model=… provider=… thinking=low|high|max
                           others=<json> merge into it and write it back
                           (owner-signed). Applies at the next boot — /reset
-                          applies it now. On 0g-harness, sealed=<hash>
-                          harness=<hash> pin the runtime's versions; bare
-                          /settings lists the ones the trust registry has
+                          applies it now. On 0g-harness, bare /settings says
+                          which versions run; /settings versions lists the
+                          ones the trust registry has, and sealed=<hash>
+                          harness=<hash> pin them
   /cred [sub …]           this agent's credentials — same as \`cred <id>\` in the
                           manager: bare lists, set <name> [k=v …], rm, connect,
                           disconnect,
