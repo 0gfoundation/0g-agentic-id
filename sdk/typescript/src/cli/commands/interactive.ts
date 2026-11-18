@@ -1731,7 +1731,8 @@ async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (v
   const onActivity = process.stdout.isTTY
     ? (label: string): void => {
         if (label.startsWith('turn/end')) { view.status(null); return; }
-        view.status(`${cleanCell(activityText(label))}… (${Math.floor((Date.now() - t0) / 1000)}s)`);
+        view.activity?.(label);
+        view.status(`${cleanCell(activityText(label))}… (${Math.floor((Date.now() - t0) / 1000)}s${view.stopHint ?? ''})`);
       }
     : undefined;
   try {
@@ -2192,7 +2193,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   if (rl.terminal) {
     term(PASTE_ON);
     process.on('exit', () => { process.stdout.write(PASTE_OFF); });
-    process.once('SIGTERM', () => process.exit(143));
+    process.once('SIGTERM', () => { activeInk?.closeNow(); process.exit(143); });
   }
   const irq: Interrupt = { streaming: null, brake: null };
 

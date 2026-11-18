@@ -187,7 +187,7 @@ test('a turn: the status row says what the agent does and Esc, notices sit at it
   const at = s.shown.indexOf('agent> working on it');
   assert.deepEqual(s.shown.slice(at + 1, at + 4), ['❯ also count the tests  waiting for the agent', '❯ then write the changelog  next turn', '❯ /files  next turn']);
   assert.match(s.shown[at + 4], /^. replying… \(\ds · Esc to stop\) +2 notices · 1 new file$/);
-  assert.deepEqual(s.shown.slice(at + 5), [v.rule, '❯', v.rule, 'agent 625 · Enter steers · Tab queues · ↑ edits queued · Esc stops']);
+  assert.deepEqual(s.shown.slice(at + 5), [v.rule, '❯', v.rule, 'agent 625 · Esc stops · Enter steers · Tab queues · ↑ edits queued']);
   assert.deepEqual(steered, ['also count the tests']);
   assert.deepEqual(v.ask.queued().map((e) => e.text), ['then write the changelog', '/files']);
   // The turn's own status, as interactive.ts paints it.
@@ -291,7 +291,8 @@ test('Tab completes as the shell\'s completer says, and lists the candidates und
   assert.equal(s.shown[s.shown.length - 3], '❯ /files');
   await v.type('\t');
   s = await v.read();
-  assert.deepEqual(s.shown.slice(-2), ['agent 625 · Tab completes · /help', '/files  /files auto']);
+  assert.equal(s.shown.at(-2), 'agent 625 · Tab completes · /help');
+  assert.match(s.shown.at(-1), /^\/files +\/files auto$/);
   await v.type(' ');
   s = await v.read();
   assert.deepEqual(s.shown.slice(-3), ['❯ /files', v.rule, 'agent 625 · Tab completes · /help']);
@@ -476,7 +477,7 @@ test('Tab during a turn: a command is completed, as at the prompt; plain text wa
   assert.deepEqual(v.ask.queued(), []);
   await v.type('\t');
   s = await v.read();
-  assert.equal(s.shown[s.shown.length - 1], '/tasks  /tasks show');
+  assert.match(s.shown[s.shown.length - 1], /^\/tasks +\/tasks show$/);
   await v.type('\u0015what next');
   await v.type('\t');
   s = await v.read();
@@ -495,4 +496,76 @@ test('Esc puts back what was queued without blank lines; a command that waited r
   const s = await v.read();
   assert.deepEqual(s.shown.slice(-5), ['❯ /tasks', v.rule, '❯ 我是谁你知道么', v.rule, 'agent 625 · Tab completes · /help']);
   await v.scr.close();
+});
+
+test('QA pass 1 (Ink): Backspace joins a message\'s lines; the footer comes back after a turn with no key pressed', async () => {
+  const v = await view();
+  const p = v.ask.message(INK_PROMPT);
+  await v.type('first \\');
+  await v.type('\r');
+  await v.type('\x7f');
+  let s = await v.read();
+  assert.deepEqual(v.ask.drafting(), []);
+  assert.equal(s.shown[s.shown.length - 3], '❯ first');
+  await v.type('\r');
+  await p;
+  // A turn ends; the next prompt comes up: its hints are drawn without a key.
+  const t = v.scr.turn({ steers: true });
+  t.write('agent> done\n');
+  t.end();
+  v.ask.message(INK_PROMPT);
+  s = await v.read();
+  assert.equal(s.shown.at(-1), 'agent 625 · Tab completes · /help');
+  await v.scr.close();
+});
+
+test('QA pass 1 (Ink): a reply line too tall for the room goes to the scrollback between words', async () => {
+  const v = await view({ cols: 30, rows: 12 });
+  v.scr.write(`agent> ${'the sealed runtime starts in five strict phases '.repeat(8)}`);
+  const s = await v.read();
+  const committed = s.all.slice(1, s.all.indexOf(v.rule) - 0).filter((l) => l && !l.startsWith('─'));
+  // Every row written for good ends at a word's end.
+  for (const l of committed.slice(0, -3)) assert.match(l, /(^|\s)\S+$/, l);
+  for (const l of committed) assert.doesNotMatch(l, /^\s/, `no leading space: "${l}"`);
+  await v.scr.close();
+});
+
+test('QA pass 1 (Ink): the footer, the waiting rows, Tab\'s candidates, a long paste', async () => {
+  const v = await view({ cols: 60, ownerText: (t) => t.replace(/\/\S+\/cat\.png/, '[image: cat.png]'), complete: () => [Array.from({ length: 30 }, (_, i) => `/${String.fromCharCode(97 + (i % 26))}x${i}`), '/'] });
+  v.scr.context = { agent: () => 'agent 625', counts: () => '', state: () => 'stopped — /start' };
+  v.scr.status('⠋ deploying… (3s · Esc stops waiting, not the deploy)');
+  let s = await v.read();
+  assert.equal(s.shown.at(-1), 'agent 625'); // no "stopped" while the wait says what happens
+  v.scr.status(null);
+  v.ask.later({ text: '/private/tmp/x/cat.png what is this', multi: false, pasted: true });
+  const t = v.scr.turn();
+  s = await v.read();
+  assert.ok(s.shown.some((l) => l.startsWith('❯ [image: cat.png] what is this')), s.shown.join('\n'));
+  t.end();
+  v.ask.drain();
+  const p = v.ask.message(INK_PROMPT);
+  await v.type('/');
+  await v.type('\t');
+  s = await v.read();
+  const cand = s.shown.slice(s.shown.indexOf('agent 625 · stopped — /start · Tab completes · /help') + 1);
+  assert.ok(cand.length >= 2 && cand.length <= 3, cand.join('\n'));
+  assert.match(cand.at(-1), /… \+\d+ more$/);
+  await v.type('\u0015');
+  await v.type(`\u001b[200~${Array.from({ length: 50 }, (_, i) => `row ${i}`).join('\r')}\u001b[201~`);
+  await later(60); // Enter typed after the paste, not part of it
+  await v.type('\r');
+  await p;
+  s = await v.read();
+  assert.ok(s.all.includes('  … (+42 more lines)'), s.all.slice(-14).join('\n'));
+  await v.scr.close();
+});
+
+test('QA pass 1 (Ink): closeNow takes the region off at once (SIGTERM)', async () => {
+  const v = await view();
+  v.ask.message(INK_PROMPT);
+  await v.read();
+  v.scr.write('last words');
+  v.scr.closeNow();
+  const s = vt(v.bytes(), 60, 16);
+  assert.deepEqual(s.shown, ['earlier output', 'last words']);
 });

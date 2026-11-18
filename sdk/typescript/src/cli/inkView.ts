@@ -45,6 +45,8 @@ export const INK_PROMPT = '❯ ';
 /** What a message sent during a turn waits for: the agent to read it (Enter), the next turn (Tab, or a command). */
 export const WAITING_AGENT = 'waiting for the agent';
 export const WAITING_TURN = 'next turn';
+/** The lines of a long message of the owner's that the transcript keeps. */
+const OWNER_LINES = 8;
 /** The fewest terminal rows and columns the view is drawn on (the shell's prompt serves smaller ones). */
 export const MIN_ROWS = 12;
 export const MIN_COLS = 30;
@@ -129,10 +131,12 @@ export class InkEditor extends EventEmitter {
   private search = '';
   private returnAt = 0;
 
-  setPrompt(q: string): void { this.shown = q; }
+  /** Called when the prompt changes (a question came up): the view redraws. */
+  changed: () => void = () => undefined;
+  setPrompt(q: string): void { this.shown = q; this.changed(); }
   getPrompt(): string { return this.shown; }
   /** As readline: the cursor goes to the line's start unless kept. */
-  prompt(preserveCursor?: boolean): void { if (!preserveCursor) this.cursor = 0; }
+  prompt(preserveCursor?: boolean): void { if (!preserveCursor) this.cursor = 0; this.changed(); }
 
   /** Put text at the cursor. */
   insert(s: string): void {
@@ -285,6 +289,7 @@ export class InkEditor extends EventEmitter {
 
 /** What the shell's line queue answers for the view (interactive.ts Ask). */
 export interface InkAsk {
+  unwind?(): boolean;
   queued?(): Array<{ text: string }>;
   drafting?(): string[];
   recall?(): boolean;
@@ -335,6 +340,31 @@ function width(text: string): number {
   return w;
 }
 
+/**
+ * A line in rows of at most `cols` columns, broken between words (a row ends
+ * after a space, which is not shown; mid-word only for a word longer than a
+ * row). `end`: where the next row starts in the line.
+ */
+export function wrapRows(line: string, cols: number): Array<{ text: string; end: number }> {
+  const rows: Array<{ text: string; end: number }> = [];
+  let at = 0;
+  while (at < line.length) {
+    const rest = line.slice(at);
+    const split = splitRows(rest, cols);
+    if (split.length === 1) { rows.push({ text: split[0].text, end: line.length }); break; }
+    const cut = split[0].end;
+    const sp = rest[cut] === ' ' ? cut : rest.lastIndexOf(' ', cut - 1);
+    if (sp > 0) {
+      rows.push({ text: rest.slice(0, sp).replace(/\t/g, ' ').trimEnd(), end: at + sp + 1 });
+      at += sp + 1;
+    } else {
+      rows.push({ text: split[0].text, end: at + cut });
+      at += cut;
+    }
+  }
+  return rows.length ? rows : [{ text: '', end: 0 }];
+}
+
 function oneLine(text: string): string {
   const lines = text.split('\n');
   return lines.length > 1 ? `${lines[0]} (+${lines.length - 1} line${lines.length === 2 ? '' : 's'})` : lines[0];
@@ -379,6 +409,7 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     // The writer of transcript text, from Ink's stdout context.
     this.Grab = (): null => { this.writeOut = ink.useStdout().write; return null; };
     this.ask = o.makeAsk(this.editor, (kind, q, e) => this.echo(kind, q, e.text));
+    this.editor.changed = () => this.schedule();
   }
 
   /** Draw the region for the first time. */
@@ -450,7 +481,9 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     this.breakTail();
     let shown = text;
     try { shown = this.o.ownerText?.(text) ?? text; } catch { /* as typed */ }
-    const lines = cleanStream(shown).split('\n');
+    let lines = cleanStream(shown).split('\n');
+    // A long one (a big paste): its first lines and how many more.
+    if (lines.length > OWNER_LINES + 2) lines = [...lines.slice(0, OWNER_LINES), `… (+${lines.length - OWNER_LINES} more lines)`];
     const [on, off] = this.colors ? ['\u001b[100m', '\u001b[49m'] : ['', ''];
     this.pending += `${lines.map((l, i) => `${on}${i ? '  ' : INK_PROMPT}${l} ${off}`).join('\n')}\n`;
     this.schedule();
@@ -460,7 +493,7 @@ export class InkScreen<A extends InkAsk = InkAsk> {
   dim(text: string): void {
     this.breakTail();
     const [on, off] = this.colors ? ['\u001b[2m', '\u001b[22m'] : ['', ''];
-    this.pending += `${on}${cleanCell(text)}${off}\n`;
+    this.pending += `${on}${fitRow(cleanCell(text), Math.max(20, (this.o.stdout.columns || 80) - 1))}${off}\n`;
     this.schedule();
   }
 
@@ -553,6 +586,8 @@ export class InkScreen<A extends InkAsk = InkAsk> {
       const command = e.line.trimStart().startsWith('/') && !this.ask.drafting?.().length;
       if (this.turnView && !command) this.ask.queueEdit?.();
       else this.complete();
+    } else if (key.name === 'backspace' && plain && !e.pasting && e.cursor === 0 && this.ask.unwind?.()) {
+      // The line before comes back, joined.
     } else if (key.name === 'up' && plain && !e.pasting && !this.ask.waiting?.() && e.line === ''
       && !this.ask.drafting?.().length && this.ask.queued?.().length) {
       // ↑ on an empty line while the shell is busy: the newest queued entry, back to edit.
@@ -648,9 +683,10 @@ export class InkScreen<A extends InkAsk = InkAsk> {
       ...(this.ask.queued?.() ?? []).map((q) => ({ text: q.text, how: WAITING_TURN })),
     ];
     const shownWaiting = waiting.length > 4 ? [...waiting.slice(0, 3), { text: '', how: `… and ${waiting.length - 3} more` }] : waiting;
+    const named = (t: string): string => { try { return this.o.ownerText?.(t) ?? t; } catch { return t; } };
     let waitRows = shownWaiting.map(({ text, how }) => {
       if (!text) return this.text({ dimColor: true }, `  ${how}`);
-      const main = fitRow(`${INK_PROMPT}${cleanCell(oneLine(text))} `, Math.max(8, cols - how.length - 2));
+      const main = fitRow(`${INK_PROMPT}${cleanCell(oneLine(named(text)))} `, Math.max(8, cols - how.length - 2));
       return this.text(null, this.text({ backgroundColor: 'gray' }, main), this.text({ dimColor: true }, ` ${how}`));
     });
 
@@ -673,17 +709,21 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     const lineRows = this.lineRows(draft.length ? '  ' : first, cols, Math.max(1, height - 14));
 
     const back = !w && waiting.some((x) => x.how === WAITING_TURN) ? ' · ↑ edits queued' : '';
+    // Esc first: on a narrow screen what is cut is the end.
     const hint = turn
-      ? `${turn.steers ? 'Enter steers · Tab queues' : 'Enter queues'}${back} · Esc stops`
+      ? `Esc stops · ${turn.steers ? 'Enter steers · Tab queues' : 'Enter queues'}${back}`
       : asking ? 'Esc cancels' : w ? 'Tab completes · /help' : back.slice(3);
-    const footer = [this.context.agent(), this.context.state?.() ?? '', hint].filter(Boolean).join(' · ');
+    // While a wait is on the status row (a start, a reset), it says the phase.
+    const state = this.waitStatus ? '' : this.context.state?.() ?? '';
+    const footer = [this.context.agent(), state, hint].filter(Boolean).join(' · ');
     let footerRow: El | null = footer ? this.text({ dimColor: true }, fitRow(footer, cols)) : null;
-    let compRow: El | null = this.completions ? this.text({ dimColor: true }, fitRow(this.completions.join('  '), cols)) : null;
+    let compRows: El[] = this.completions ? this.candidateRows(this.completions, cols).map((r) => this.text({ dimColor: true }, r)) : [];
     const rule = this.text({ dimColor: true }, '─'.repeat(cols));
-    const count = (): number => waitRows.length + (statusRow ? 1 : 0) + 2 + draftShown.length + lineRows.length + (footerRow ? 1 : 0) + (compRow ? 1 : 0);
+    const count = (): number => waitRows.length + (statusRow ? 1 : 0) + 2 + draftShown.length + lineRows.length + (footerRow ? 1 : 0) + compRows.length;
     // A short screen: the least needed goes first, so the region stays below the screen's height.
     const budget = height - 2;
-    if (count() > budget) compRow = null;
+    if (count() > budget) compRows = compRows.slice(0, 1);
+    if (count() > budget) compRows = [];
     if (count() > budget) waitRows = waitRows.slice(-1);
     if (count() > budget) draftShown = draftShown.length ? [`(${draft.length} earlier lines)`] : [];
     if (count() > budget) footerRow = null;
@@ -699,12 +739,13 @@ export class InkScreen<A extends InkAsk = InkAsk> {
       ...inputRows,
       rule,
       ...(footerRow ? [footerRow] : []),
-      ...(compRow ? [compRow] : []),
+      ...compRows,
     ];
 
-    // The tail in what is left of the screen; past that, its first rows go to the transcript.
+    // The tail in what is left of the screen, wrapped between words; past
+    // that, its first rows go to the transcript as they are shown.
     let commit = '';
-    let tailRows = this.tail ? splitRows(this.tail, cols) : [];
+    let tailRows = this.tail ? wrapRows(this.tail, cols) : [];
     const room = Math.max(0, height - 1 - below.length);
     if (tailRows.length > room) {
       const head = tailRows.slice(0, tailRows.length - room);
@@ -713,6 +754,20 @@ export class InkScreen<A extends InkAsk = InkAsk> {
       tailRows = tailRows.slice(head.length);
     }
     return { tree: this.tree([...tailRows.map((r) => this.text(null, r.text)), ...below]), commit };
+  }
+
+  /** Tab's candidates in columns, at most three rows (the last one says how many more). */
+  private candidateRows(list: readonly string[], cols: number): string[] {
+    const items = list.map((c) => cleanCell(c) || ' ');
+    const colW = Math.min(cols, Math.max(...items.map(width)) + 2);
+    const per = Math.max(1, Math.floor(cols / colW));
+    const rows: string[] = [];
+    for (let i = 0; i < items.length && rows.length < 3; i += per) {
+      rows.push(fitRow(items.slice(i, i + per).map((c) => c + ' '.repeat(Math.max(0, colW - width(c)))).join('').trimEnd(), cols));
+    }
+    const shown = Math.min(items.length, per * 3);
+    if (shown < items.length) rows[2] = fitRow(`${rows[2].slice(0, Math.max(0, cols - 14))}… +${items.length - shown} more`, cols);
+    return rows;
   }
 
   /** The line being edited after `prefix`, in rows, the cursor inverted; at most `max` rows, around the cursor. */
@@ -738,6 +793,25 @@ export class InkScreen<A extends InkAsk = InkAsk> {
   }
 
   // ── leaving ──
+
+  /** Take the region off the screen now, without waiting for a frame (the process is ending). */
+  closeNow(): void {
+    if (this.done || !this.inst) return;
+    this.closing = true;
+    this.hidden = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.o.stdout.off('resize', this.onResize);
+    try {
+      this.inst.clear();
+      if (this.pending || this.tail) this.o.stdout.write(this.pending + (this.tail ? `${this.tail}\n` : ''));
+      this.pending = '';
+      this.tail = '';
+      this.inst.unmount();
+    } catch { /* the process is ending */ }
+    this.inst = null;
+    this.done = true;
+  }
 
   /** Take the region off the screen and give the terminal back; what is pending is written first. */
   async close(): Promise<void> {
