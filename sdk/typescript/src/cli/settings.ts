@@ -44,7 +44,8 @@ export interface Assignment {
   value: string | ThinkingLevel | unknown | undefined;
 }
 
-const USAGE = '0g-agentdna settings <agent> [provider=… model=… thinking=low|high|max others=<json> sealed=0x… harness=0x… | versions]';
+/** The command's grammar, as typed where the owner is (`settings 286 […]` in the shell). */
+const usage = (): string => `${agentCmd('settings')} [provider=… model=… thinking=low|high|max others=<json> sealed=0x… harness=0x… | versions]`;
 
 const isVersionKey = (key: string): key is VersionKey => (VERSION_KEYS as readonly string[]).includes(key);
 
@@ -62,7 +63,7 @@ export function parseAssignments(args: string[]): Assignment[] {
   for (const arg of args) {
     const eq = arg.indexOf('=');
     if (eq < 1) {
-      throw new CliError('BAD_FLAG', `not a setting assignment: "${arg}" (expected key=value)`, { remedy: USAGE });
+      throw new CliError('BAD_FLAG', `not a setting assignment: "${arg}" (expected key=value)`, { remedy: usage() });
     }
     const key = arg.slice(0, eq);
     const raw = arg.slice(eq + 1);
@@ -71,7 +72,7 @@ export function parseAssignments(args: string[]): Assignment[] {
         'BAD_FLAG',
         `unknown setting "${key}" — the platform's named fields are ${SETTINGS_KEYS.join(', ')} ` +
           '(anything framework-specific goes inside others=<json>)',
-        { remedy: USAGE },
+        { remedy: usage() },
       );
     }
     if (raw === '') {
@@ -80,7 +81,7 @@ export function parseAssignments(args: string[]): Assignment[] {
     }
     if (key === 'thinking' && !(THINKING_LEVELS as readonly string[]).includes(raw)) {
       throw new CliError('BAD_FLAG', `thinking must be one of ${THINKING_LEVELS.join('|')}, got "${raw}"`, {
-        remedy: USAGE,
+        remedy: usage(),
       });
     }
     if (isVersionKey(key) && !/^0x[0-9a-fA-F]{64}$/.test(raw)) {
@@ -382,7 +383,7 @@ export function renderSettings(doc: SettingsDoc | null): string[] {
 export function settingsArgs(args: string[]): { versions: boolean; assignments: ReturnType<typeof parseAssignments> } {
   if (args.length === 1 && args[0] === 'versions') return { versions: true, assignments: [] };
   if (args.includes('versions')) {
-    throw new CliError('BAD_FLAG', '`versions` goes on its own: it shows the versions to pick from, and writes nothing', { remedy: USAGE });
+    throw new CliError('BAD_FLAG', '`versions` goes on its own: it shows the versions to pick from, and writes nothing', { remedy: usage() });
   }
   return { versions: false, assignments: parseAssignments(args) };
 }

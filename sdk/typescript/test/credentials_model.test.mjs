@@ -495,3 +495,27 @@ test('cli: cred set model runs its wait through io.quiet, after the key is asked
     s.server.close();
   }
 });
+
+test('cli: cred set model with the key the set already holds from this machine is unchanged, not written again', async () => {
+  const s = await stub([], (doc) => doc.defs['model.0g-compute']
+    ? { provider: '0g-compute', source: 'credentials', value_hash: hashOf(doc, 'model.0g-compute') }
+    : { provider: '0g-compute', source: 'deploy' });
+  try {
+    const a = ag(s.port);
+    const set = async (draft) => {
+      const lines = [];
+      const k = keys({ draft: { '0g-compute': draft }, interactive: true });
+      await credOp(a, SEAL_ID, ['set', 'model'], { json: false, out: (l) => lines.push(l), secret: async () => '', keyPrompt: k.keyPrompt });
+      return lines;
+    };
+    const posts = () => s.seen.filter((r) => r.method === 'POST' || r.method === 'PUT').length;
+    assert.ok((await set('sk-same')).includes('added model.0g-compute'));
+    const before = posts();
+    const again = await set('sk-same');
+    assert.deepEqual(again, ["unchanged model.0g-compute: the agent's credential set already holds this key"]);
+    assert.equal(posts(), before, 'nothing written');
+    assert.ok((await set('sk-other')).includes('changed model.0g-compute'), 'another key is written');
+  } finally {
+    s.server.close();
+  }
+});
