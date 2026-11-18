@@ -36,12 +36,15 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { cleanCell, cleanStream } from './commands/cells';
-import { charCols, fitRow, splitRows, type TurnView } from './livePrompt';
+import { charCols, completeAt, fitRow, splitRows, type TurnView } from './livePrompt';
 
 /** The fewest milliseconds between two frames (Ink throttles at 32). */
 export const FRAME_MS = 40;
 /** The prompt of the owner's message, in the box and in the transcript. */
 export const INK_PROMPT = '❯ ';
+/** What a message sent during a turn waits for: the agent to read it (Enter), the next turn (Tab, or a command). */
+export const WAITING_AGENT = 'waiting for the agent';
+export const WAITING_TURN = 'next turn';
 /** The fewest terminal rows and columns the view is drawn on (the shell's prompt serves smaller ones). */
 export const MIN_ROWS = 12;
 export const MIN_COLS = 30;
@@ -337,13 +340,6 @@ function oneLine(text: string): string {
   return lines.length > 1 ? `${lines[0]} (+${lines.length - 1} line${lines.length === 2 ? '' : 's'})` : lines[0];
 }
 
-function commonPrefix(list: readonly string[]): string {
-  if (!list.length) return '';
-  let p = list[0];
-  for (const s of list) while (!s.startsWith(p)) p = p.slice(0, -1);
-  return p;
-}
-
 /**
  * The Ink session view: the transcript's writer, the region below it, and
  * the keys. One per session; {@link close} hands the terminal back.
@@ -552,8 +548,10 @@ export class InkScreen<A extends InkAsk = InkAsk> {
       return;
     }
     if (key.name === 'tab' && !e.pasting && !key.ctrl && !key.meta) {
-      // During a turn Tab queues what is typed; otherwise it completes.
-      if (this.turnView) this.ask.queueEdit?.();
+      // During a turn Tab queues what is typed for the next turn, unless it
+      // is a command, which it completes as at the prompt.
+      const command = e.line.trimStart().startsWith('/') && !this.ask.drafting?.().length;
+      if (this.turnView && !command) this.ask.queueEdit?.();
       else this.complete();
     } else if (key.name === 'up' && plain && !e.pasting && !this.ask.waiting?.() && e.line === ''
       && !this.ask.drafting?.().length && this.ask.queued?.().length) {
@@ -571,18 +569,9 @@ export class InkScreen<A extends InkAsk = InkAsk> {
   // nothing, the candidates are listed under the box.
   private complete(): void {
     const e = this.editor;
-    let hits: string[];
-    let sub: string;
-    try {
-      [hits, sub] = this.o.complete(e.line.slice(0, e.cursor));
-    } catch {
-      return;
-    }
-    if (!hits.length) return;
-    const prefix = commonPrefix(hits.filter(Boolean));
-    if (prefix.startsWith(sub) && prefix.length > sub.length) { e.insert(prefix.slice(sub.length)); return; }
-    if (!sub.startsWith(prefix)) { e.replaceBefore(sub.length, prefix); return; }
-    if (hits.length > 1) this.completions = hits;
+    const r = completeAt(e.line, e.cursor, (before) => this.o.complete(before));
+    if (r.line !== e.line) e.replaceBefore(e.cursor, r.line.slice(0, r.cursor));
+    if (r.list) this.completions = r.list;
   }
 
   // ── frames ──
@@ -601,10 +590,15 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     this.timer = setTimeout(() => this.frame(), wait);
   }
 
-  /** Resolves once what is pending is on the screen (tests). */
-  settle(): Promise<void> {
-    if (!this.timer) return Promise.resolve();
-    return new Promise((r) => this.settled.push(r));
+  /** Resolves once nothing is due: what was pending is on the screen, no
+   *  frame waits, and a frame's time has passed (Ink's own 32 ms window), so
+   *  the screen is the last frame (tests). */
+  async settle(): Promise<void> {
+    for (let i = 0; i < 25; i++) {
+      if (this.timer) await new Promise<void>((r) => this.settled.push(r));
+      await new Promise((r) => setTimeout(r, this.frameMs));
+      if (!this.timer) return;
+    }
   }
 
   private frame(): void {
@@ -647,10 +641,11 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     const turn = this.turnView;
     const w = this.ask.waiting?.() ?? null;
 
-    // What was sent during the turn and waits: steered into it, queued after it.
+    // What was sent during the turn and waits: inserted into it (for the
+    // agent to read at its next step), or for the next turn.
     const waiting: Array<{ text: string; how: string }> = [
-      ...(turn ? turn.steered().map((text) => ({ text, how: 'steered' })) : []),
-      ...(this.ask.queued?.() ?? []).map((q) => ({ text: q.text, how: 'queued' })),
+      ...(turn ? turn.steered().map((text) => ({ text, how: WAITING_AGENT })) : []),
+      ...(this.ask.queued?.() ?? []).map((q) => ({ text: q.text, how: WAITING_TURN })),
     ];
     const shownWaiting = waiting.length > 4 ? [...waiting.slice(0, 3), { text: '', how: `… and ${waiting.length - 3} more` }] : waiting;
     let waitRows = shownWaiting.map(({ text, how }) => {
@@ -677,7 +672,7 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     let draftShown = draft.length > 4 ? [draft[0], `(${draft.length - 3} more lines)`, ...draft.slice(-2)] : draft;
     const lineRows = this.lineRows(draft.length ? '  ' : first, cols, Math.max(1, height - 14));
 
-    const back = !w && waiting.length > waiting.filter((x) => x.how === 'steered').length ? ' · ↑ edits queued' : '';
+    const back = !w && waiting.some((x) => x.how === WAITING_TURN) ? ' · ↑ edits queued' : '';
     const hint = turn
       ? `${turn.steers ? 'Enter steers · Tab queues' : 'Enter queues'}${back} · Esc stops`
       : asking ? 'Esc cancels' : w ? 'Tab completes · /help' : back.slice(3);

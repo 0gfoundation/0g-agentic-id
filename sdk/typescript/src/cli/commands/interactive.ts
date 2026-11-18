@@ -27,9 +27,9 @@ import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ti
 import { CliError, cancelled, isCancelled } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { dueReleaseNotice } from '../releaseNotice';
-import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
+import { loadKey, saveKey, normalizeKey, saveApiKey, loadApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
-import { applyAssignments, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework, isHarnessFramework, parseAssignments, renderListedVersions, renderSettings } from '../settings';
+import { applyAssignments, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework, isHarnessFramework, renderListedVersions, renderSettings, renderVersionsLine, settingsArgs } from '../settings';
 import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOwnerOp, ensureModelKey } from '../credentials';
 import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
@@ -698,7 +698,7 @@ export function completeCred(words: string[], names: string[], providers: string
 // argument only; the rest is free-form" — right for prompts and amounts,
 // wrong for settings' k=v list, where the keys are a closed set the user
 // should never have to remember).
-const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness='];
+const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness=', 'versions'];
 const TAIL_ARGS: Record<string, string[]> = {
   'settings': SETTING_KEYS,  // L1: settings <agent> k=v k=v …
   '/settings': SETTING_KEYS, // L2: /settings k=v k=v …
@@ -775,6 +775,12 @@ export function completeLine(
   return [hits.length ? hits : list, rest];
 }
 
+/** The shell's Tab completion with its current state (the level's words,
+ *  argument lists, models, providers, credential names). */
+function shellComplete(line: string): [string[], string] {
+  return completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor });
+}
+
 // The live readline interface — askSecret scrubs submitted secrets out of
 // its history (display masking alone leaves the plaintext one ↑ away).
 let activeRl: readline.Interface | null = null;
@@ -783,6 +789,9 @@ let activeAsk: Ask | null = null;
 // The Ink session view while it is up (inkView.ts): everything printed goes
 // to its transcript, and the keys to it.
 let activeInk: InkScreen<Ask> | null = null;
+// While a command that only reads runs during a turn: where its output goes
+// (gathered, then printed above the prompt as one block).
+let outRedirect: ((s: string) => void) | null = null;
 
 /**
  * Print a block above the live prompt, keeping what the user has typed. The
@@ -814,9 +823,23 @@ export function printAbovePrompt(
 }
 import type { CommandContext } from '../types';
 import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
-import { CONT_PROMPT, LiveTurn, PlainTurn, liveKeys, type LiveState, type TurnView } from '../livePrompt';
+import { CONT_PROMPT, LiveTurn, PlainTurn, liveKeys, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
 import { INK_PROMPT, MIN_COLS, MIN_ROWS, inkLoadError, loadInk, openInkScreen, type InkScreen, type Key as InkKey } from '../inkView';
 import { OUTBOX_POLL_MS, makeOutboxSync, renderOutboxEvent, supportsHyperlinks, tildePath, type OutboxSync } from '../outboxSync';
+
+/**
+ * whoami's providers: the ones this machine has a model key for (`login`
+ * saved them; `hasKey` reads that store, never a value), the default for new
+ * agents first — marked when it has no key — then the others in registry
+ * order. The platform's whole list is the `providers` command; an agent's own
+ * keys are `cred <agent>`. Exported for the tests.
+ */
+export function configuredProvidersText(dflt: string, ids: readonly string[], hasKey: (id: string) => boolean): string {
+  const others = ids.filter((id) => id !== dflt && hasKey(id));
+  const own = hasKey(dflt);
+  if (!own && !others.length) return 'none — run login';
+  return [`${dflt} (new agents${own ? '' : ', no key'})`, ...others].join(', ');
+}
 
 /** Column widths of the REPL listing; its header and every row share them. */
 const LIST_COLS = { id: 6, phase: 11, framework: 12, seal: 13, agentSeal: 13, owner: 24 } as const;
@@ -1217,7 +1240,8 @@ export function lineQueue(
     if (waiters[0] || !pending.length) return 0;
     const back = pending.splice(0);
     const line = editLine();
-    const lines = [...back.flatMap((e) => e.text.split('\n')), ...draft, ...(line ? [line] : [])];
+    // As typed, without the blank lines.
+    const lines = [...back.flatMap((e) => e.text.split('\n')), ...draft, ...(line ? [line] : [])].filter((l) => l.trim() !== '');
     const last = lines.pop() ?? '';
     const pastedAny = back.some((e) => e.pasted) || draftPasted || touched;
     draft = lines;
@@ -1271,7 +1295,9 @@ export function lineQueue(
 /** Writes to the terminal as is: only for the shell's own control sequences.
  *  Under the Ink view its text goes to the transcript (inkView.ts raw). */
 const term = (s: string): void => {
-  if (activeInk) activeInk.raw(s);
+  const to = outRedirect as ((t: string) => void) | null;
+  if (to) to(s);
+  else if (activeInk) activeInk.raw(s);
   else process.stdout.write(s);
 };
 /**
@@ -1360,10 +1386,84 @@ function oneLine(text: string): string {
   return lines.length > 1 ? `${lines[0]} (+${lines.length - 1} line${lines.length === 2 ? '' : 's'})` : lines[0];
 }
 
-/** The live prompt's lines for what the owner sent during a turn: steered
- *  into it and not read yet, queued for after it. Exported for the tests. */
+/** The live prompt's lines for what the owner sent during a turn: inserted
+ *  into it with Enter and waiting for the agent to read it, and what waits
+ *  for the next turn (Tab, or a command). Exported for the tests. */
 export function turnNotes(steered: readonly string[], queued: ReadonlyArray<{ text: string }>): string[] {
-  return [...steered.map((t) => `steered: ${oneLine(t)}`), ...queued.map((e) => `queued: ${oneLine(e.text)}`)];
+  return [...steered.map((t) => `waiting for the agent: ${oneLine(t)}`), ...queued.map((e) => `next turn: ${oneLine(e.text)}`)];
+}
+
+/**
+ * Whether a command typed while a turn runs only reads, and so runs at once
+ * (its output above the prompt) rather than when the turn ends: it neither
+ * touches the running turn nor asks anything. Exported for the tests.
+ */
+export function readOnlyCommand(line: string): boolean {
+  const [cmd, ...rest] = line.trim().split(/\s+/);
+  const arg = rest.join(' ');
+  switch (cmd) {
+    case '/help': case '/activities': case '/schedules': case '/balance': case '/think': return !arg;
+    case '/hello': return !arg || arg === 'full';
+    case '/inbox': case '/notices': return !arg || arg === 'all';
+    case '/files': return !arg || arg === 'inbox' || arg === 'outbox';
+    case '/sessions': return !arg || arg === 'list';
+    case '/tasks': return !arg || arg === 'list' || arg === 'all' || /^show \S+$/.test(arg);
+    case '/agentlog': case '/startuplog': case '/signatures': return !arg || /^\d+$/.test(arg);
+    case '/settings': return !arg || arg === 'versions';
+    default: return false;
+  }
+}
+
+/** A turn the agent runs for messages the owner inserted into another one:
+ *  ones it finished before reading (`unread`), or one it took as a new
+ *  message as nothing was running (`idle`). One turn may answer several. */
+export interface FollowUp { id: string; texts: string[]; why: 'unread' | 'idle' }
+
+/** Messages inserted into one running turn (0g-harness steering). */
+interface Steering {
+  /** Inserted and not read yet, as typed: shown until the agent reads them. */
+  texts: string[];
+  /** Insert an entry into the turn. */
+  take(e: Entry): void;
+  /** The agent read the oldest one: its text. */
+  read(): string | undefined;
+  /** The turn ended: the ones it did not read go to the follow-ups. */
+  settle(after: FollowUp[]): Promise<void>;
+}
+
+/** Add `text` to the follow-up turn `id`, or start it: several inserted
+ *  messages the agent answers in one turn are followed once. Exported for the tests. */
+export function addFollowUp(list: FollowUp[], id: string, text: string, why: FollowUp['why']): void {
+  const f = list.find((x) => x.id === id);
+  if (f) f.texts.push(text);
+  else list.push({ id, texts: [text], why });
+}
+
+/** What the shell says before it follows a follow-up turn, in the owner's
+ *  words; an id only where a command takes it. Exported for the tests. */
+export function followUpNote(f: FollowUp, canFollow: boolean): string {
+  const n = f.texts.length;
+  let note = '';
+  if (f.why === 'unread') {
+    note = n > 1
+      ? `the agent finished before reading ${n} of your messages — they go next, together`
+      : 'the agent finished before reading this — it goes next';
+  }
+  if (!canFollow) note = `${note ? `${note}; ` : ''}/result ${f.id} shows the answer`;
+  return note ? `(${note})` : '';
+}
+
+/** A turn that ended without text because the model's output budget ran out. */
+export const NO_ANSWER_MAX_TOKENS = "no answer: the model's thinking used the whole output budget — ask again or /think high";
+
+/** The line for a turn that ended with no text (`err`, when given, says
+ *  so) because it ran out of output budget: its activity record (0g-harness)
+ *  says `max-tokens`. null for anything else. Exported for the tests. */
+export async function emptyTurnText(client: AgentClient | undefined, id: string | null | undefined, err?: unknown): Promise<string | null> {
+  if (!client?.activity || !id) return null;
+  if (err !== undefined && !/without any output/.test((err as Error)?.message ?? '')) return null;
+  const t = await client.activity(id).catch(() => null);
+  return t?.detail === 'max-tokens' ? NO_ANSWER_MAX_TOKENS : null;
 }
 
 /** Whether a turn keeps the prompt on screen: on a terminal, unless
@@ -1377,8 +1477,17 @@ function livePromptOn(): boolean {
 function openTurn(s: Session, steered: () => readonly string[] = () => [], steers = false): TurnView {
   const screen = s.screen;
   if (screen) screen.turnRan = true;
+  const a = activeAsk;
+  // Tab on a command during the turn completes it (livePrompt.ts tab).
+  const input: LiveInput = {
+    drafting: () => a?.drafting?.() ?? [],
+    queued: () => a?.queued?.() ?? [],
+    recall: () => a?.recall?.() ?? false,
+    queueEdit: () => a?.queueEdit?.() ?? false,
+    complete: shellComplete,
+  };
   const view = activeInk ? activeInk.turn({ steered, steers }) : livePromptOn() && activeRl
-    ? new LiveTurn(activeRl, process.stdout, activeAsk ?? {}, (): LiveState => ({
+    ? new LiveTurn(activeRl, process.stdout, input, (): LiveState => ({
         prompt: screen?.prompt(true) ?? sessionPromptText(s.agentId, sessionLabel(s), true, { notices: 0, files: 0 }),
         notes: turnNotes(steered(), activeAsk?.queued?.() ?? []),
       }))
@@ -1480,7 +1589,7 @@ export function activitySummary(labels: readonly string[]): string {
  * staged with /attach are uploaded and named in the text; images go only to
  * owner-chat.
  */
-async function chatInSession(s: Session, line: string, irq: Interrupt): Promise<void> {
+async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (view: TurnView) => (e: Entry) => boolean): Promise<void> {
   const client = s.client!;
   let sent = line;
   if (s.attached?.length) {
@@ -1497,8 +1606,10 @@ async function chatInSession(s: Session, line: string, irq: Interrupt): Promise<
   const r = await client.promptSession!(sid, sent);
   const ac = new AbortController();
   irq.streaming = ac;
-  // What is typed meanwhile waits for the next prompt (queued).
+  // What is typed meanwhile waits for the next turn; a command that only
+  // reads runs at once (`busy`, the session's busyEntries).
   const view = openTurn(s);
+  if (busy) activeAsk?.whileBusy?.(busy(view));
   const say = sayer(view);
   let reply = '';
   try {
@@ -1513,11 +1624,13 @@ async function chatInSession(s: Session, line: string, irq: Interrupt): Promise<
       const back = s.screen?.interrupted?.();
       if (back) out(`${back}\n`);
     } else {
-      out(`\n(turn failed: ${cleanCell((e as Error).message)})\n`);
+      const empty = await emptyTurnText(client, r.id, e);
+      out(empty ? `\n${empty}\n` : `\n(turn failed: ${cleanCell((e as Error).message)})\n`);
     }
   } finally {
     view.end();
     irq.streaming = null;
+    if (busy) activeAsk?.whileBusy?.(null);
   }
 }
 
@@ -1944,9 +2057,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     // (activeCompletions); empty line + Tab lists everything.
     // While a turn runs with the prompt on screen, Tab queues what is typed
     // instead (livePrompt.ts).
-    completer: (line: string): [string[], string] =>
-      liveKeys.tab() ? [[], line]
-        : completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor }),
+    completer: (line: string): [string[], string] => (liveKeys.tab() ? [[], line] : shellComplete(line)),
   });
   const rlKeys = process.stdin.listeners('keypress').filter((f) => !keysBefore.includes(f));
   const rlResize = process.stdout.listeners('resize').filter((f) => !resizeBefore.includes(f)) as Array<() => void>;
@@ -2087,7 +2198,10 @@ const L1_HELP_FULL = `manager commands
   settings <id> [k=v …]   show the agent's configuration document (which model
                           it thinks with, and how hard); with assignments —
                           model=… provider=… thinking=low|high|max
-                          others=<json> — merge and write it (owner-signed)
+                          others=<json> — merge and write it (owner-signed).
+                          settings <id> versions lists the versions a
+                          0g-harness agent can be pinned to (sealed=…
+                          harness=…)
   cred <id> [sub …]       the agent's credentials (API keys, tokens): bare
                           lists them (never values); set <name> [k=v …] adds
                           or changes one (preset=<name> — cred presets lists them,
@@ -2120,7 +2234,8 @@ const L1_HELP_FULL = `manager commands
                           do this implicitly; re-run after an attestor upgrade)
   login [provider]        setup: attestor URL, owner key, each provider's model key
                           (Enter keeps the current value; secrets echo *)
-  whoami                  show attestor / wallet / api-key / ack status
+  whoami                  show attestor / wallet / the providers with a model key
+                          on this machine / ack status
   help                    this text
   quit                    exit (Ctrl-C twice also works)
 At a question a command asks (a value, an amount, a confirmation), Ctrl-C or
@@ -2367,11 +2482,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`attestor    ${ctx.env.attestorUrl ?? '(unset — run `login`)'}\n`);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
         out(`wallet      ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
-        // The providers the platform offers; new agents default to the first
-        // named. Model keys are each agent's own (cred <agent>), not shown here.
+        // The providers this machine has a model key for (login saved them),
+        // the default for new agents first. Never a key's value.
         const dflt = loadConfig().inferenceProvider ?? '0g-compute';
-        const ids = knownProviders.map((p) => p.id);
-        out(`providers   ${[dflt, ...ids.filter((id) => id !== dflt)].map((id, i) => (i === 0 ? `${id} (new agents)` : id)).join(', ')}\n`);
+        out(`providers   ${configuredProvidersText(dflt, knownProviders.map((p) => p.id), (id) => !!loadApiKey(id))}\n`);
         if (key && ctx.env.attestorUrl) {
           // The three status reads are independent — fetch them in parallel
           // (they were serial: 2.9s measured; parallel is bounded by the
@@ -2542,11 +2656,11 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'settings') {
         // The document is the owner's in both directions — reading it is
         // owner-signed too — so the wallet is needed even for a bare show.
-        if (!args[0]) { out('usage: settings <agentId|sealId> [model=… thinking=low|high|max provider=… others=<json>]\n'); continue; }
+        if (!args[0]) { out('usage: settings <agentId|sealId> [model=… thinking=low|high|max provider=… others=<json> | versions]\n'); continue; }
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
-        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework, ask);
+        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework, ask, `settings ${args[0]} versions`);
         continue;
       }
 
@@ -2887,20 +3001,31 @@ let cachedClient: { key: string; ag: AgenticID } | null = null;
  * Returns the document now in force (unchanged on a bare show), so a caller
  * like /think can report the level that actually landed.
  */
-async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null, ask?: (q: string) => Promise<string>): Promise<SettingsDoc | null> {
-  const assignments = parseAssignments(args); // throws CliError on a bad key/level
+async function settingsOp(
+  ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null, ask?: (q: string) => Promise<string>,
+  versionsCmd = '/settings versions',
+): Promise<SettingsDoc | null> {
+  // `versions` alone lists the versions to pick from; anything else is
+  // assignments (throws CliError on a bad key/level).
+  const { versions: versionsView, assignments } = settingsArgs(args);
   assertOthersFitFramework(assignments, framework);
   assertVersionsFitFramework(assignments, framework);
   const { settings: current, version } = await ag.agent.getSettings(sealId);
   if (!assignments.length) {
-    for (const l of renderSettings(current)) out(`  ${l}\n`);
-    out('  change with: model=<id> · thinking=low|high|max · provider=<name> · others=\'<json>\' (quote it)\n');
-    // The versions a 0g-harness agent can be pinned to. Advisory: a chain
-    // without a trust registry, or an unreadable one, just shows nothing.
-    if (isHarnessFramework(framework)) {
-      const listed = await ag.agent.listedVersions().catch(() => null);
-      if (listed) for (const l of renderListedVersions(listed, current?.versions)) out(`  ${l}\n`);
+    // The versions a 0g-harness agent can be pinned to: which it runs on one
+    // line, all of them with `versions`. Advisory: a chain without a trust
+    // registry, or an unreadable one, just shows nothing.
+    const harness = isHarnessFramework(framework);
+    const listed = harness ? await ag.agent.listedVersions().catch(() => null) : null;
+    if (versionsView) {
+      if (!harness) out(`this agent runs ${framework ?? 'another framework'} — only a 0g-harness agent has versions to pick\n`);
+      else if (!listed) out('the trust registry could not be read — no versions to show\n');
+      else for (const l of renderListedVersions(listed, current?.versions)) out(`  ${l}\n`);
+      return current;
     }
+    for (const l of renderSettings(current)) out(`  ${l}\n`);
+    if (listed) out(`  ${renderVersionsLine(listed, current?.versions)}\n`);
+    out(`  change with: model=<id> · thinking=low|high|max · provider=<name> · others='<json>' (quote it)${listed ? ` · pin a version: ${versionsCmd}` : ''}\n`);
     return current;
   }
   const next = applyAssignments(current, assignments);
@@ -3657,19 +3782,21 @@ const L2_HELP_FULL = `session commands
                           and Esc to stop); the reply prints above it and
                           what you type stays on screen. Enter on 0g-harness
                           owner-chat steers: the message goes into the turn,
-                          read before its next model call (shown waiting as
-                          steered until then); not in the middle of a long
-                          command. If the turn ends first, it runs as a turn
-                          of its own, shown here. Tab queues instead: sent
-                          as the next message when the turn ends (Esc puts
-                          it back to edit instead); ↑ on an empty prompt
-                          takes the newest queued one back to edit.
-                          A command alone on its line waits for the prompt,
-                          and so does a message in another session or on
-                          another framework. AGENTDNA_INK=off keeps the
-                          plain prompt line instead of the frame;
-                          AGENTDNA_LIVE_PROMPT=off prints turns as a plain
-                          stream
+                          read before its next model call ("waiting for the
+                          agent" until then); not in the middle of a long
+                          command. If the turn ends first, the agent answers
+                          it next, shown here. Tab queues instead ("next
+                          turn"), sent as the next message when the turn
+                          ends (Esc puts it back to edit instead); ↑ on an
+                          empty prompt takes the newest queued one back to
+                          edit. A command alone on its line never goes to
+                          the agent: one that only reads (/files, /tasks,
+                          /inbox, …) runs at once, any other when the turn
+                          ends; Tab completes it. A message in another
+                          session or on another framework waits for the next
+                          turn. AGENTDNA_INK=off keeps the plain prompt line
+                          instead of the frame; AGENTDNA_LIVE_PROMPT=off
+                          prints turns as a plain stream
   (status)                2 notices · 1 new file: notices waiting to print
                           and files the agent left that are not saved yet
                           (at the status line's right, or in the prompt)
@@ -3690,9 +3817,10 @@ const L2_HELP_FULL = `session commands
                           model=… provider=… thinking=low|high|max
                           others=<json> merge into it and write it back
                           (owner-signed). Applies at the next boot — /reset
-                          applies it now. On 0g-harness, sealed=<hash>
-                          harness=<hash> pin the runtime's versions; bare
-                          /settings lists the ones the trust registry has
+                          applies it now. On 0g-harness, bare /settings says
+                          which versions run; /settings versions lists the
+                          ones the trust registry has, and sealed=<hash>
+                          harness=<hash> pin them
   /cred [sub …]           this agent's credentials — same as \`cred <id>\` in the
                           manager: bare lists, set <name> [k=v …], rm, connect,
                           disconnect,
@@ -3976,87 +4104,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   // prompt; what the owner decided goes to the agent as the next message.
   const credLater = new Set<string>();
   const queued: string[] = [];
-  try {
-  for (;;) {
-    activeCompletions = L2_WORDS;
-    activeArgs = L2_ARGS;
-    if (sessionSealId !== s.sealId) {
-      sessionsSeen = [];
-      // Prefetch the session list for Tab; failures just leave it empty.
-      s.client?.sessions?.().then((l) => { sessionsSeen = l; }).catch(() => undefined);
-    }
-    sessionSealId = s.sealId;
-    // While not connected (deploying/stopped/offline) the phase is in flux —
-    // auto-refresh before every prompt, printing only when it moves (and
-    // connecting the moment it reaches running). Once connected, skip: no
-    // per-chat-line attestor round-trip; bare Enter stays the manual refresh.
-    if (!s.client) { try { await refreshSession(s, 'moved'); } catch { /* prompt anyway */ } }
-    inbox.follow(s.client);
-    if (screen.turnRan) {
-      screen.turnRan = false;
-      checkOutbox();
-    }
-    flushHeld();
-    if (s.client && s.url && !queued.length) {
-      const ac = new AbortController();
-      irq.streaming = ac; // Esc stops waiting for a login
-      try {
-        const ag = await withWallet(ctx);
-        const tell = await answerPending(ag, s.sealId, { ...credIO(ask), ask: (ask as Ask).fresh ?? ask }, {
-          agentUrl: await ownerRouteUrl(ag, s), later: credLater, tokenize, signal: ac.signal,
-        });
-        if (tell.length) queued.push(tell.join('\n'));
-      } catch (e) {
-        // No owner wallet here: nothing to decide. Anything else the owner
-        // must see (a decision that did not go through).
-        if (!(e instanceof CliError && e.code === 'WALLET_REQUIRED')) {
-          out(`\n(credential requests: ${cleanCell(e instanceof Error ? e.message : String(e))})\n`);
-        }
-      } finally {
-        irq.streaming = null;
-      }
-    }
-    let line: string;
-    // A message of several lines, or a pasted one, goes to the agent as it
-    // is: never a command, whatever its first line starts with.
-    let asMessage = false;
-    if (queued.length) {
-      line = queued.shift()!;
-      if (activeInk) activeInk.owner(line);
-      else out(`\nagent ${s.agentId}${sessionLabel(s)} › ${line}\n`);
-    } else {
-      // What arrived while credential requests were looked at, too.
-      flushHeld();
-      atPrompt = true;
-      try {
-        const q = activeInk ? INK_PROMPT : `\n${screen.prompt(false)}`;
-        const entry = (ask as Ask).message ? await (ask as Ask).message!(q) : { text: await ((ask as Ask).main ?? ask)(q), multi: false, pasted: false };
-        line = entry.text.trim();
-        asMessage = entry.multi || entry.pasted;
-      } finally {
-        atPrompt = false;
-      }
-    }
-    if (!line) {
-      // Bare Enter = live status refresh (phase moves on its own during
-      // deploying/provisioning; the entry card only showed the initial one).
-      try {
-        await refreshSession(s);
-      } catch {
-        s.stale = true;
-        if (activeInk) activeInk.refresh();
-        else out(`  phase   ${s.phase} (refresh failed — attestor unreachable)\n`);
-      }
-      continue;
-    }
-    // Files dragged into the terminal (or pasted paths) go with this message,
-    // with no /attach step (attach.ts findDroppedFiles). A line that starts
-    // with one is a message, not a command.
-    const dropped = s.client?.uploadFile ? findDroppedFiles(line) : [];
-    const carriesFiles = dropped.some((p) => typeof p !== 'string');
+  /**
+   * One entry as the session's command: 'next' once a command ran, 'back'
+   * for /back, 'chat' when it goes to the agent (`message`: several lines or
+   * a paste, never a command). Run from the prompt, and while a turn runs for
+   * a command that only reads (busyEntries).
+   */
+  const runCommand = async (line: string, message: boolean): Promise<'next' | 'back' | 'chat'> => {
+    let chat = false;
+    // A command ends with `continue`: this loop runs once, so that ends it.
+    do {
     commands: {
-    if (asMessage || (carriesFiles && typeof dropped[0] !== 'string')) break commands;
-    if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
+    if (message) break commands;
+    if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return 'back'; }
     if (line === '/quit' || line === '/exit') { await quitShell(0); }
     if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
 
@@ -4713,6 +4773,238 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       out(`error: ${ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`); continue;
     }
     } // commands
+    chat = true;
+    } while (false);
+    return chat ? 'chat' : 'next';
+  };
+  // ── while a turn runs ──
+  // A command that only reads runs at once, its output gathered and printed
+  // above the prompt as one block, one command at a time.
+  let readsNow: Promise<void> = Promise.resolve();
+  const runNow = (line: string, view: TurnView): void => {
+    readsNow = readsNow.then(async () => {
+      let text = '';
+      outRedirect = (t) => { text += t; };
+      try {
+        await runCommand(line, false);
+      } catch (e) {
+        text += `error: ${(e as Error).message}\n`;
+      } finally {
+        outRedirect = null;
+      }
+      const block = `${activeInk ? INK_PROMPT : ''}${line}\n${cleanStream(text)}`;
+      if (atPrompt) printAbovePrompt(block);
+      else view.note(block);
+    });
+  };
+  /**
+   * What the owner enters while a turn runs (on a terminal). A command alone
+   * on its line never goes to the agent: one that only reads runs now, any
+   * other when the turn ends, and it says so. Other text goes into the turn
+   * where the agent takes it (`steering`), else it waits for the next turn.
+   */
+  const busyEntries = (view: TurnView, steering: Steering | null, onTake?: () => void) => (e: Entry): boolean => {
+    const t = e.text.trim();
+    if (!t) return false;
+    if (!e.multi && !e.pasted && t.startsWith('/')) {
+      if (readOnlyCommand(t)) { runNow(t, view); return true; }
+      view.note(`(${t.split(/\s+/)[0]} runs when this turn ends)`);
+      return false;
+    }
+    if (!steering) return false;
+    onTake?.();
+    steering.take(e);
+    return true;
+  };
+  /** Steering into the running owner-chat turn (0g-harness, on a terminal):
+   *  an inserted message is read before the turn's next model call. */
+  const makeSteering = (view: TurnView, after: FollowUp[]): Steering | null => {
+    const steer = s.client?.steer && process.stdin.isTTY ? s.client.steer : undefined;
+    if (!steer) return null;
+    const texts: string[] = [];
+    const unread: Array<{ id: string; text: string }> = [];
+    const unshow = (text: string): void => {
+      const i = texts.indexOf(text);
+      if (i >= 0) texts.splice(i, 1);
+    };
+    const back = (e: Entry, why: string): void => {
+      view.note(`(not inserted${why ? `: ${cleanCell(why)}` : ''} — it waits for the next turn)\n`);
+      (ask as Ask).later?.(e);
+      view.refresh();
+    };
+    return {
+      texts,
+      take(e) {
+        if (view.live) {
+          texts.push(e.text);
+          view.refresh();
+        } else {
+          out('\n↳ inserted — the agent reads it at its next step\n');
+        }
+        steer(e.text).then(
+          (r) => {
+            if (r.merged && r.id) { unread.push({ id: r.id, text: e.text }); return; }
+            unshow(e.text);
+            if (r.queued) {
+              addFollowUp(after, r.queued, e.text, 'idle');
+              view.note("(the agent wasn't working on anything — sent as a new message)\n");
+              return;
+            }
+            back(e, r.reason ?? '');
+          },
+          (err: Error) => { unshow(e.text); back(e, err.message); },
+        );
+      },
+      read() {
+        unread.shift();
+        return texts.shift();
+      },
+      // Not read when the turn ended: the agent answers it in a turn after
+      // this one, which may answer several (one follow-up, followed once).
+      async settle(list) {
+        const left = unread.splice(0);
+        if (!s.client?.steerState) return;
+        for (const u of left) {
+          let st: SteerState | null = null;
+          for (let i = 0; i < 20; i++) {
+            st = await s.client.steerState(u.id).catch(() => null);
+            if (!st || st.state !== 'pending') break;
+            await new Promise((r) => setTimeout(r, 150));
+          }
+          if (st?.state === 'turn') addFollowUp(list, st.turn, u.text, 'unread');
+        }
+      },
+    };
+  };
+  /** The agent read an inserted message. */
+  const readNote = (view: TurnView, text: string | undefined): void => {
+    // Under the Ink view the message moves from the waiting rows into the transcript.
+    if (activeInk && text) { activeInk.owner(text); return; }
+    view.note(!view.live ? '  ↳ (read)\n' : text ? `↳ read by the agent: ${oneLine(text)}` : '↳ (read by the agent)');
+  };
+  /** Follow the turns that answer inserted messages; more inserted while
+   *  following one join the list. */
+  const followUps = async (after: FollowUp[]): Promise<void> => {
+    for (let i = 0; i < after.length; i++) {
+      const f = after[i];
+      (s.tasks ??= []).push({ id: f.id, prompt: '(inserted)', at: Date.now() });
+      const note = followUpNote(f, !!s.client?.followTask);
+      if (note) out(`${note}\n`);
+      // Under the Ink view the messages it answers go to the transcript as the owner's.
+      if (activeInk) for (const t of f.texts) activeInk.owner(t);
+      if (!s.client?.followTask) continue;
+      const fac = new AbortController();
+      irq.streaming = fac;
+      let steering: Steering | null = null;
+      const view = openTurn(s, () => steering?.texts ?? [], !!(s.client?.steer && process.stdin.isTTY));
+      steering = makeSteering(view, after);
+      if (process.stdin.isTTY) (ask as Ask).whileBusy?.(busyEntries(view, steering));
+      const say = sayer(view);
+      let stopped = false;
+      try {
+        const onActivity = (label: string): void => {
+          if (label === 'steer received') readNote(view, steering?.read());
+          else view.activity?.(label);
+        };
+        for await (const delta of s.client.followTask(f.id, { signal: fac.signal, onActivity })) say(delta);
+        view.end();
+        out('\n');
+      } catch (e) {
+        view.end();
+        stopped = fac.signal.aborted;
+        const empty = stopped ? null : await emptyTurnText(s.client, f.id, e);
+        out(stopped
+          ? `\n(stopped watching — it continues; /result ${f.id} re-attaches, /cancel ${f.id} stops it)\n`
+          : `\n${empty ?? `(${cleanCell((e as Error).message)})`}\n`);
+      } finally {
+        view.end();
+        irq.streaming = null;
+        (ask as Ask).whileBusy?.(null);
+      }
+      if (!stopped) await steering?.settle(after);
+    }
+  };
+  try {
+  for (;;) {
+    activeCompletions = L2_WORDS;
+    activeArgs = L2_ARGS;
+    if (sessionSealId !== s.sealId) {
+      sessionsSeen = [];
+      // Prefetch the session list for Tab; failures just leave it empty.
+      s.client?.sessions?.().then((l) => { sessionsSeen = l; }).catch(() => undefined);
+    }
+    sessionSealId = s.sealId;
+    // While not connected (deploying/stopped/offline) the phase is in flux —
+    // auto-refresh before every prompt, printing only when it moves (and
+    // connecting the moment it reaches running). Once connected, skip: no
+    // per-chat-line attestor round-trip; bare Enter stays the manual refresh.
+    if (!s.client) { try { await refreshSession(s, 'moved'); } catch { /* prompt anyway */ } }
+    inbox.follow(s.client);
+    if (screen.turnRan) {
+      screen.turnRan = false;
+      checkOutbox();
+    }
+    flushHeld();
+    if (s.client && s.url && !queued.length) {
+      const ac = new AbortController();
+      irq.streaming = ac; // Esc stops waiting for a login
+      try {
+        const ag = await withWallet(ctx);
+        const tell = await answerPending(ag, s.sealId, { ...credIO(ask), ask: (ask as Ask).fresh ?? ask }, {
+          agentUrl: await ownerRouteUrl(ag, s), later: credLater, tokenize, signal: ac.signal,
+        });
+        if (tell.length) queued.push(tell.join('\n'));
+      } catch (e) {
+        // No owner wallet here: nothing to decide. Anything else the owner
+        // must see (a decision that did not go through).
+        if (!(e instanceof CliError && e.code === 'WALLET_REQUIRED')) {
+          out(`\n(credential requests: ${cleanCell(e instanceof Error ? e.message : String(e))})\n`);
+        }
+      } finally {
+        irq.streaming = null;
+      }
+    }
+    let line: string;
+    // A message of several lines, or a pasted one, goes to the agent as it
+    // is: never a command, whatever its first line starts with.
+    let asMessage = false;
+    if (queued.length) {
+      line = queued.shift()!;
+      if (activeInk) activeInk.owner(line);
+      else out(`\nagent ${s.agentId}${sessionLabel(s)} › ${line}\n`);
+    } else {
+      // What arrived while credential requests were looked at, too.
+      flushHeld();
+      atPrompt = true;
+      try {
+        const q = activeInk ? INK_PROMPT : `\n${screen.prompt(false)}`;
+        const entry = (ask as Ask).message ? await (ask as Ask).message!(q) : { text: await ((ask as Ask).main ?? ask)(q), multi: false, pasted: false };
+        line = entry.text.trim();
+        asMessage = entry.multi || entry.pasted;
+      } finally {
+        atPrompt = false;
+      }
+    }
+    if (!line) {
+      // Bare Enter = live status refresh (phase moves on its own during
+      // deploying/provisioning; the entry card only showed the initial one).
+      try {
+        await refreshSession(s);
+      } catch {
+        s.stale = true;
+        if (activeInk) activeInk.refresh();
+        else out(`  phase   ${s.phase} (refresh failed — attestor unreachable)\n`);
+      }
+      continue;
+    }
+    // Files dragged into the terminal (or pasted paths) go with this message,
+    // with no /attach step (attach.ts findDroppedFiles). A line that starts
+    // with one is a message, not a command.
+    const dropped = s.client?.uploadFile ? findDroppedFiles(line) : [];
+    const carriesFiles = dropped.some((p) => typeof p !== 'string');
+    const done = await runCommand(line, asMessage || (carriesFiles && typeof dropped[0] !== 'string'));
+    if (done === 'back') return;
+    if (done === 'next') continue;
 
     // a chat turn (interruptible)
     if (!s.client) { out(`agent is ${s.phase} — /start or /reset before chatting\n`); continue; }
@@ -4724,7 +5016,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       line = r.text;
     }
     if (s.sessionId && s.client.promptSession && s.client.followTask) {
-      await chatInSession(s, line, irq);
+      await chatInSession(s, line, irq, process.stdin.isTTY ? (v) => busyEntries(v, null) : undefined);
       continue;
     }
     if (!s.client.chatStream) { out('(chat unavailable on this agent)\n'); continue; }
@@ -4747,18 +5039,18 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // does; 0g-harness and the prime bridge ignore it). Send it when known, omit it
     // otherwise — and only if the framework rejects that, ask once and retry.
     let retriedWithPick = false;
-    // Inserted texts this turn did not read: each runs as a turn of its own
-    // on the agent, followed here once this turn ends.
-    const afterTurn: string[] = [];
-    // Their texts, for the Ink view's transcript (the owner's `❯ text`).
-    const afterText = new Map<string, string>();
+    // The turns that answer messages inserted into this one and not read
+    // (or taken as a new message), followed here once this turn ends.
+    const after: FollowUp[] = [];
     for (;;) {
       const ac = new AbortController();
       irq.streaming = ac;
       // Inserted into this turn and not read yet (texts, as typed): shown
       // above the live prompt until the agent reads them.
-      const steeredTexts: string[] = [];
-      const view = openTurn(s, () => steeredTexts, !!(s.client.steer && process.stdin.isTTY));
+      let steering: Steering | null = null;
+      const view = openTurn(s, () => steering?.texts ?? [], !!(s.client.steer && process.stdin.isTTY));
+      // The turn's id on the responses transport (onTask).
+      let taskId: string | null = null;
       const say = sayer(view);
       let reply = '';
       let interrupted = false;
@@ -4788,51 +5080,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       };
       // Steering (0g-harness, on a terminal): a message the owner finishes
       // while the turn runs goes into it, read before its next model call. A
-      // command alone on its line, or an empty Enter, waits for the next
-      // prompt as before, and so does what Tab queues under the live prompt.
-      const steered: string[] = []; // inserted into this turn, not read yet
-      const steer = s.client.steer && process.stdin.isTTY ? s.client.steer : undefined;
-      if (steer) {
-        const unshow = (text: string): void => {
-          const i = steeredTexts.indexOf(text);
-          if (i >= 0) steeredTexts.splice(i, 1);
-        };
-        (ask as Ask).whileBusy?.((e) => {
-          if (!steerable(e)) return false;
-          clearActivity();
-          if (view.live) {
-            steeredTexts.push(e.text);
-            view.refresh();
-          } else {
-            out('\n↳ inserted — the agent reads it at its next step\n');
-          }
-          steer(e.text).then(
-            (r) => {
-              if (r.merged && r.id) { steered.push(r.id); return; }
-              unshow(e.text);
-              if (r.queued) { afterTurn.push(r.queued); afterText.set(r.queued, e.text); }
-              view.note(`(${cleanCell(r.reason ?? 'no turn of yours is running')} — it goes as a turn of its own)\n`);
-            },
-            (err: Error) => {
-              unshow(e.text);
-              view.note(`(not inserted: ${cleanCell(err.message)} — it waits for the next prompt)\n`);
-              (ask as Ask).later?.(e);
-              view.refresh();
-            },
-          );
-          return true;
-        });
-      }
+      // command alone on its line never does (busyEntries); an empty Enter
+      // and what Tab queues wait for the next turn.
+      steering = makeSteering(view, after);
+      if (process.stdin.isTTY) (ask as Ask).whileBusy?.(busyEntries(view, steering, clearActivity));
       const onActivity = process.stdout.isTTY
         ? (label: string): void => {
             if (label === 'steer received') {
               // The agent read an inserted message.
               clearActivity();
-              const text = steeredTexts.shift();
-              // Under the Ink view the message moves from the waiting rows into the transcript.
-              if (activeInk && text) activeInk.owner(text);
-              else view.note(!view.live ? '  ↳ (read)\n' : text ? `↳ read by the agent: ${oneLine(text)}` : '↳ (read by the agent)');
-              steered.shift();
+              readNote(view, steering?.read());
               return;
             }
             // A view that sums up the turn's tool calls sees every label.
@@ -4884,6 +5141,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // Esc cancels THIS task and /tasks//result can re-attach to it.
           onTask: (id: string): void => {
             s.currentTask = id;
+            taskId = id;
             (s.tasks ??= []).push({ id, prompt: line.slice(0, 60), at: Date.now() });
           },
         };
@@ -4957,21 +5215,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         s.currentTask = null;
         (ask as Ask).whileBusy?.(null);
       }
-      // Inserted but not read: the turn ended first, so the agent runs it as
-      // a turn of its own (an interrupt drops it instead).
-      if (!interrupted && s.client?.steerState) {
-        for (const [k, id] of steered.entries()) {
-          let st: SteerState | null = null;
-          for (let i = 0; i < 20; i++) {
-            st = await s.client.steerState(id).catch(() => null);
-            if (!st || st.state !== 'pending') break;
-            await new Promise((r) => setTimeout(r, 150));
-          }
-          if (st?.state === 'turn') {
-            afterTurn.push(st.turn);
-            if (steeredTexts[k] !== undefined) afterText.set(st.turn, steeredTexts[k]);
-          }
-        }
+      // Inserted but not read: the turn ended first, so the agent answers it
+      // in a turn after this one (an interrupt drops it instead).
+      if (!interrupted) await steering?.settle(after);
+      // No text because the model's output budget ran out: say so plainly.
+      if (failure && /without any output/.test(failure)) {
+        const empty = await emptyTurnText(s.client, taskId);
+        if (empty) { out(`${reply ? '\n' : ''}${empty}`); failure = null; }
       }
       if (failure && !s.framework && !retriedWithPick) {
         out(`\n(chat failed: ${cleanCell(failure)})\nthis framework may need a model selector — pick it:\n`);
@@ -5007,30 +5257,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
       break;
     }
-    for (const id of afterTurn) {
-      (s.tasks ??= []).push({ id, prompt: '(inserted)', at: Date.now() });
-      const said = afterText.get(id);
-      if (activeInk && said !== undefined) activeInk.owner(said);
-      if (!s.client?.followTask) { out(`(your inserted message runs as ${id} — /result ${id} shows it)\n`); continue; }
-      out(`(your inserted message runs as a turn of its own, ${id})\n`);
-      const fac = new AbortController();
-      irq.streaming = fac;
-      const view = openTurn(s);
-      const say = sayer(view);
-      try {
-        for await (const delta of s.client.followTask(id, { signal: fac.signal })) say(delta);
-        view.end();
-        out('\n');
-      } catch (e) {
-        view.end();
-        out(fac.signal.aborted
-          ? `\n(stopped watching — it continues; /result ${id} re-attaches, /cancel ${id} stops it)\n`
-          : `\n(${cleanCell((e as Error).message)})\n`);
-      } finally {
-        view.end();
-        irq.streaming = null;
-      }
-    }
+    await followUps(after);
   }
   } finally {
     irq.brake = null; // leaving the session: idle-Esc no longer targets this agent

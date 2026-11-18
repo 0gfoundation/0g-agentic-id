@@ -26,7 +26,7 @@ import { emitOk, note, print } from '../envelope';
 import { parseAgentRef, type AgentRef } from '../ref';
 import {
   VERSION_KEYS, applyAssignments, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework,
-  isHarnessFramework, parseAssignments, renderListedVersions, renderSettings,
+  isHarnessFramework, renderListedVersions, renderSettings, renderVersionsLine, settingsArgs,
 } from '../settings';
 import { SettingsConflictError } from '../../Settings';
 import type { CommandContext } from '../types';
@@ -67,7 +67,8 @@ export async function run(ctx: CommandContext): Promise<void> {
   const raw = ctx.positionals[0];
   const ref = parseAgentRef(raw);
   // Grammar errors are usage errors — raise them before any network work.
-  const assignments = parseAssignments(ctx.positionals.slice(1));
+  // `versions` alone asks for the versions to pick from.
+  const { versions: versionsView, assignments } = settingsArgs(ctx.positionals.slice(1));
   const writing = assignments.length > 0;
 
   // The document is owner-gated in both directions, so a show needs the key
@@ -85,17 +86,27 @@ export async function run(ctx: CommandContext): Promise<void> {
   });
 
   if (!writing) {
-    // A 0g-harness agent can be pinned to versions the trust registry lists;
-    // show them. Advisory: no registry, or an unreadable one, shows nothing.
-    const listed = isHarnessFramework(await frameworkOf(ctx.env.attestorUrl, sealId))
-      ? await ag.agent.listedVersions().catch(() => null)
-      : null;
+    // A 0g-harness agent can be pinned to versions the trust registry lists:
+    // the show says which it runs on one line, `versions` lists them all.
+    // Advisory: no registry, or an unreadable one, shows nothing.
+    const framework = await frameworkOf(ctx.env.attestorUrl, sealId);
+    const harness = isHarnessFramework(framework);
+    const listed = harness ? await ag.agent.listedVersions().catch(() => null) : null;
     if (ctx.json) {
       emitOk({ sealId, settings: current, version, ...(listed ? { listedVersions: { sealed: listed.sealed, harness: listed.harness } } : {}) });
       return;
     }
+    if (versionsView) {
+      if (!harness) print(`this agent runs ${framework ?? 'another framework'} — only a 0g-harness agent has versions to pick`);
+      else if (!listed) print('the trust registry could not be read — no versions to show');
+      else for (const line of renderListedVersions(listed, current?.versions)) print(line);
+      return;
+    }
     for (const line of renderSettings(current)) print(line);
-    if (listed) for (const line of renderListedVersions(listed, current?.versions)) print(line);
+    if (listed) {
+      print(renderVersionsLine(listed, current?.versions));
+      print(`pin a version: 0g-agentdna settings ${raw} versions`);
+    }
     return;
   }
 

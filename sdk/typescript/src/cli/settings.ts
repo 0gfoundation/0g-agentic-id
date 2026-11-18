@@ -44,7 +44,7 @@ export interface Assignment {
   value: string | ThinkingLevel | unknown | undefined;
 }
 
-const USAGE = '0g-agentdna settings <agent> [provider=… model=… thinking=low|high|max others=<json> sealed=0x… harness=0x…]';
+const USAGE = '0g-agentdna settings <agent> [provider=… model=… thinking=low|high|max others=<json> sealed=0x… harness=0x… | versions]';
 
 const isVersionKey = (key: string): key is VersionKey => (VERSION_KEYS as readonly string[]).includes(key);
 
@@ -330,6 +330,49 @@ export function renderSettings(doc: SettingsDoc | null): string[] {
   return [...SETTINGS_KEYS.filter((k) => flat[k] !== undefined), ...extra].map(
     (k) => `${`${k} `.padEnd(11)}${show(flat[k])}`,
   );
+}
+
+/**
+ * A settings command's words after the agent: `versions` alone asks for the
+ * versions the trust registry lists; anything else is assignments
+ * ({@link parseAssignments}). `versions` is never an assignment, and goes
+ * alone.
+ */
+export function settingsArgs(args: string[]): { versions: boolean; assignments: ReturnType<typeof parseAssignments> } {
+  if (args.length === 1 && args[0] === 'versions') return { versions: true, assignments: [] };
+  if (args.includes('versions')) {
+    throw new CliError('BAD_FLAG', '`versions` goes on its own: it shows the versions to pick from, and writes nothing', { remedy: USAGE });
+  }
+  return { versions: false, assignments: parseAssignments(args) };
+}
+
+/**
+ * The versions a 0g-harness agent runs, on one line of the settings view:
+ * with no pick, the trust registry's newest (what an agent with no pick
+ * moves to); with picks, the picks — one no longer listed is not run — and
+ * the newest for a layer without one. `none listed` for an empty list.
+ */
+export function renderVersionsLine(
+  listed: { sealed: readonly string[]; harness: readonly string[] },
+  picks?: VersionPicks,
+): string {
+  const short = (h: string): string => `${h.slice(0, 10)}…`;
+  const newest = (layer: VersionKey): string => {
+    const hashes = listed[layer];
+    return hashes.length ? short(hashes[hashes.length - 1]) : 'none listed';
+  };
+  const pick = (layer: VersionKey): string | undefined => {
+    const p = picks?.[layer];
+    return typeof p === 'string' && p ? p : undefined;
+  };
+  const head = `${'versions '.padEnd(11)}`;
+  if (!VERSION_KEYS.some(pick)) return `${head}newest listed (${VERSION_KEYS.map((k) => `${k} ${newest(k)}`).join(', ')})`;
+  return `${head}pinned: ${VERSION_KEYS.map((k) => {
+    const p = pick(k);
+    if (!p) return `${k} newest listed (${newest(k)})`;
+    const isListed = listed[k].some((h) => h.toLowerCase() === p.toLowerCase());
+    return `${k} ${short(p)}${isListed ? '' : ' (not listed: not run)'}`;
+  }).join(', ')}`;
 }
 
 /**

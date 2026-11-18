@@ -32,6 +32,8 @@ import {
   parseAssignments,
   renderListedVersions,
   renderSettings,
+  renderVersionsLine,
+  settingsArgs,
 } from '../dist/cli/settings.js';
 
 const ACCOUNT = privateKeyToAccount(`0x${'42'.repeat(32)}`);
@@ -137,6 +139,27 @@ test('renderListedVersions marks the newest, the pick, and a pick no longer list
     '  harness  (none listed)',
     `  harness  ${H1}  (picked, not listed: not run)`,
   ]);
+});
+
+test('renderVersionsLine: one line — the newest with no pick, the picks with them, a pick no longer listed said so', () => {
+  const listed = { sealed: [S1, S2], harness: [H1] };
+  assert.equal(renderVersionsLine(listed, undefined), 'versions   newest listed (sealed 0xa2a2a2a2…, harness 0xb1b1b1b1…)');
+  assert.equal(renderVersionsLine(listed, {}), 'versions   newest listed (sealed 0xa2a2a2a2…, harness 0xb1b1b1b1…)');
+  assert.equal(renderVersionsLine(listed, { sealed: S1, harness: H1 }), 'versions   pinned: sealed 0xa1a1a1a1…, harness 0xb1b1b1b1…');
+  // A pick the registry dropped is not run; a layer without a pick shows its newest.
+  const gone = `0x${'c3'.repeat(32)}`;
+  assert.equal(renderVersionsLine(listed, { sealed: gone }), 'versions   pinned: sealed 0xc3c3c3c3… (not listed: not run), harness newest listed (0xb1b1b1b1…)');
+  assert.equal(renderVersionsLine({ sealed: [], harness: [] }, undefined), 'versions   newest listed (sealed none listed, harness none listed)');
+});
+
+test('settingsArgs: `versions` alone is the list, never an assignment; sealed=/harness= still write', () => {
+  assert.deepEqual(settingsArgs(['versions']), { versions: true, assignments: [] });
+  assert.deepEqual(settingsArgs([]), { versions: false, assignments: [] });
+  const w = settingsArgs([`sealed=${S1}`, `harness=${H1}`]);
+  assert.equal(w.versions, false);
+  assert.deepEqual(w.assignments.map((a) => [a.key, a.value]), [['sealed', S1], ['harness', H1]]);
+  assert.throws(() => settingsArgs(['versions', 'model=x']), /`versions` goes on its own/);
+  assert.throws(() => settingsArgs(['versions=x']), /unknown setting "versions"/);
 });
 
 // ── owner restart ──

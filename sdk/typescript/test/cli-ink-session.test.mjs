@@ -185,7 +185,7 @@ test('a turn: the status row says what the agent does and Esc, notices sit at it
   await v.type('\r');
   let s = await v.read();
   const at = s.shown.indexOf('agent> working on it');
-  assert.deepEqual(s.shown.slice(at + 1, at + 4), ['❯ also count the tests  steered', '❯ then write the changelog  queued', '❯ /files  queued']);
+  assert.deepEqual(s.shown.slice(at + 1, at + 4), ['❯ also count the tests  waiting for the agent', '❯ then write the changelog  next turn', '❯ /files  next turn']);
   assert.match(s.shown[at + 4], /^. replying… \(\ds · Esc to stop\) +2 notices · 1 new file$/);
   assert.deepEqual(s.shown.slice(at + 5), [v.rule, '❯', v.rule, 'agent 625 · Enter steers · Tab queues · ↑ edits queued · Esc stops']);
   assert.deepEqual(steered, ['also count the tests']);
@@ -197,7 +197,7 @@ test('a turn: the status row says what the agent does and Esc, notices sit at it
   // ↑ on the empty line takes the newest queued entry back to edit.
   await v.type('\u001b[A');
   s = await v.read();
-  assert.deepEqual(s.shown.slice(at + 1, at + 3), ['❯ also count the tests  steered', '❯ then write the changelog  queued']);
+  assert.deepEqual(s.shown.slice(at + 1, at + 3), ['❯ also count the tests  waiting for the agent', '❯ then write the changelog  next turn']);
   assert.equal(s.shown[s.shown.length - 3], '❯ /files');
   // The agent read the steered message: it moves into the transcript as the owner's.
   steered.shift();
@@ -205,7 +205,7 @@ test('a turn: the status row says what the agent does and Esc, notices sit at it
   t.end();
   v.ask.whileBusy(null);
   s = await v.read();
-  assert.deepEqual(s.shown.slice(at, at + 3), ['agent> working on it', '❯ also count the tests', '❯ then write the changelog  queued']);
+  assert.deepEqual(s.shown.slice(at, at + 3), ['agent> working on it', '❯ also count the tests', '❯ then write the changelog  next turn']);
   // No turn: the status row holds the counts alone, at its right.
   assert.match(s.shown[at + 3], /^ {40,}2 notices · 1 new file$/);
   assert.equal(s.shown[s.shown.length - 1], 'agent 625 · ↑ edits queued');
@@ -461,5 +461,37 @@ test('a file dragged into the message shows by its name in the transcript', asyn
   assert.equal((await p).text, typed);
   const s = await v.read();
   assert.equal(s.shown[1], '❯ [image: My Cat.png] what is this?');
+  await v.scr.close();
+});
+
+test('Tab during a turn: a command is completed, as at the prompt; plain text waits for the next turn', async () => {
+  const v = await view({ cols: 80, complete: (l) => [['/tasks', '/tasks show ', '/files'].filter((c) => c.startsWith(l)), l] });
+  v.ask.whileBusy(() => false);
+  const t = v.scr.turn({ steers: true });
+  t.write('agent> working');
+  await v.type('/ta');
+  await v.type('\t');
+  let s = await v.read();
+  assert.equal(s.shown[s.shown.length - 3], '❯ /tasks');
+  assert.deepEqual(v.ask.queued(), []);
+  await v.type('\t');
+  s = await v.read();
+  assert.equal(s.shown[s.shown.length - 1], '/tasks  /tasks show');
+  await v.type('\u0015what next');
+  await v.type('\t');
+  s = await v.read();
+  assert.deepEqual(v.ask.queued().map((e) => e.text), ['what next']);
+  assert.ok(s.shown.includes('❯ what next  next turn'), s.shown.join('\n'));
+  t.end();
+  await v.scr.close();
+});
+
+test('Esc puts back what was queued without blank lines', async () => {
+  const v = await view();
+  for (const text of ['我是谁你知道么', '', '/tasks', '  ']) v.ask.later({ text, multi: false, pasted: false });
+  assert.equal(v.ask.recallAll(), 4);
+  v.ask.message(INK_PROMPT);
+  const s = await v.read();
+  assert.deepEqual(s.shown.slice(-4), ['❯ 我是谁你知道么', '  /tasks', v.rule, 'agent 625 · Tab completes · /help']);
   await v.scr.close();
 });
