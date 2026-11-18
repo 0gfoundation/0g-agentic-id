@@ -291,6 +291,7 @@ export class InkEditor extends EventEmitter {
 export interface InkAsk {
   unwind?(): boolean;
   clearBox?(): boolean;
+  held?: { count(): number } | null;
   queued?(): Array<{ text: string }>;
   drafting?(): string[];
   recall?(): boolean;
@@ -485,9 +486,21 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     this.schedule();
   }
 
+  /** Lines put between a reply's text (the owner's message read, a line
+   *  after it): its next text is marked as the agent's again. */
+  breaks = 0;
+
+  /** A whole line after the line being written, which ends there. */
+  after(text: string): void {
+    this.breakTail();
+    this.breaks++;
+    this.note(text);
+  }
+
   /** The owner's message in the transcript: `❯ text`, highlighted. */
   owner(text: string): void {
     this.breakTail();
+    this.breaks++;
     let shown = text;
     try { shown = this.o.ownerText?.(text) ?? text; } catch { /* as typed */ }
     let lines = cleanStream(shown).split('\n');
@@ -533,6 +546,7 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     this.turnView?.end();
     const t = new InkTurn(this, o.steered ?? (() => []), !!o.steers, o.next ?? (() => []));
     this.turnView = t;
+    this.completions = null;
     this.schedule();
     return t;
   }
@@ -540,6 +554,8 @@ export class InkScreen<A extends InkAsk = InkAsk> {
   /** @internal */
   endTurn(t: InkTurn): void {
     if (this.turnView === t) this.turnView = null;
+    // Tab's candidates were for what was typed during the turn.
+    this.completions = null;
     this.schedule();
   }
 
@@ -602,7 +618,7 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     } else if (key.ctrl && !key.meta && key.name === 'u' && !e.pasting && this.ask.drafting?.().length && this.ask.clearBox?.()) {
       // Ctrl-U on a message of several lines: all of it goes, not only this line.
     } else if (key.name === 'up' && plain && !e.pasting && !this.ask.waiting?.() && e.line === ''
-      && !this.ask.drafting?.().length && this.ask.queued?.().length) {
+      && !this.ask.drafting?.().length && (this.ask.queued?.().length || this.ask.held?.count())) {
       // ↑ on an empty line while the shell is busy: the newest queued entry, back to edit.
       this.ask.recall?.();
     } else {
@@ -895,6 +911,17 @@ export class InkTurn implements TurnView {
     const t = cleanStream(text).replace(/^\n+/, '').replace(/\n+$/, '');
     if (t) this.screen.note(t);
   }
+
+  /** A line after what the reply has written so far: its line ends there. */
+  after(text: string): void {
+    if (this.ended) { this.screen.write(cleanStream(text)); return; }
+    this.closeRun();
+    const t = cleanStream(text).replace(/^\n+/, '').replace(/\n+$/, '');
+    if (t) this.screen.after(t);
+  }
+
+  /** Lines that came between the reply's text (TurnView.breaks). */
+  get breaks(): number { return this.screen.breaks; }
 
   status(text: string | null): void {
     const t = text === null ? null : cleanCell(text);
