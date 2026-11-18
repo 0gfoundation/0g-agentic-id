@@ -15,9 +15,11 @@ import { createPublicClient, http, formatEther, type PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { MIN_SANDBOX_BALANCE_WEI, type AgenticID } from '../../AgenticID';
 import { RPC_URL } from '../../constants';
-import { buildClient } from '../sdk';
+import { buildClient, unreachableReason } from '../sdk';
 import { renamedAttestor } from '../config';
-import { CliError, type ErrorCode } from '../errors';
+import { attestorUrlRemedy } from '../env';
+import { CliError, currentSurface, shellStep, type ErrorCode } from '../errors';
+import { plainError } from '../plain';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
 
@@ -63,8 +65,8 @@ export async function run(ctx: CommandContext): Promise<void> {
   if (!env.attestorUrl) {
     checks.push({
       name: 'attestor', status: 'fail', code: 'MISSING_ATTESTOR_URL',
-      detail: 'AGENTIC_ATTESTOR_URL is not set',
-      remedy: 'export AGENTIC_ATTESTOR_URL=https://agentdna.0g.ai   # or your own attestor',
+      detail: 'no attestor URL is set',
+      remedy: attestorUrlRemedy(),
     });
   } else {
     try {
@@ -78,26 +80,36 @@ export async function run(ctx: CommandContext): Promise<void> {
     } catch (e) {
       checks.push({
         name: 'attestor', status: 'fail', code: 'ATTESTOR_UNREACHABLE',
-        detail: `GET ${env.attestorUrl}/config failed: ${(e as Error).message}`,
-        remedy: 'verify AGENTIC_ATTESTOR_URL and your network, then retry',
+        detail: `${env.attestorUrl} did not answer (${unreachableReason(e)})`,
+        remedy: env.attestorUrlSource === 'env'
+          ? 'check AGENTIC_ATTESTOR_URL and your network, then retry'
+          : `check your network, then retry — ${shellStep('login')} changes the address`,
       });
     }
   }
 
-  // 2 — RPC connectivity (explicit-wins: env override > attestor /config > SDK default)
-  const rpcUrl = env.rpcUrl ?? cfg?.chain_rpc ?? RPC_URL;
-  const publicClient: PublicClient = createPublicClient({ transport: http(rpcUrl) });
+  // 2 — RPC connectivity (explicit-wins: env override > attestor /config > SDK
+  // default). Without an override the chain is the attestor's: with no
+  // attestor to name it, there is no chain to probe (never a default one the
+  // owner did not pick).
+  const rpcUrl = env.rpcUrl ?? (cfg ? cfg.chain_rpc ?? RPC_URL : undefined);
+  const publicClient: PublicClient | null = rpcUrl ? createPublicClient({ transport: http(rpcUrl) }) : null;
   let rpcOk = false;
-  try {
-    const chainId = await publicClient.getChainId();
-    rpcOk = true;
-    checks.push({ name: 'rpc', status: 'pass', detail: `${rpcUrl} (chainId ${chainId})` });
-  } catch (e) {
-    checks.push({
-      name: 'rpc', status: 'fail', code: 'RPC_UNREACHABLE',
-      detail: `${rpcUrl}: ${(e as Error).message}`,
-      remedy: 'set AGENTIC_RPC_URL to a reachable 0G RPC (an attestor /config may advertise an internal-only one)',
-    });
+  if (!publicClient) {
+    skip('rpc', "needs the attestor's /config, or AGENTIC_RPC_URL");
+  } else {
+    try {
+      const chainId = await publicClient.getChainId();
+      rpcOk = true;
+      checks.push({ name: 'rpc', status: 'pass', detail: `${rpcUrl} (chainId ${chainId})` });
+    } catch (e) {
+      const p = plainError(e);
+      checks.push({
+        name: 'rpc', status: 'fail', code: 'RPC_UNREACHABLE',
+        detail: p.code === 'RPC_UNREACHABLE' ? p.message : `${rpcUrl}: ${p.message}`,
+        remedy: 'set AGENTIC_RPC_URL to a reachable 0G RPC (an attestor /config may advertise an internal-only one)',
+      });
+    }
   }
 
   // 3 — wallet configured. Absent = skip (matching gas/ack/sandboxBalance,
@@ -107,22 +119,24 @@ export async function run(ctx: CommandContext): Promise<void> {
     checks.push({
       name: 'wallet', status: 'skip', code: 'WALLET_REQUIRED',
       detail: 'no owner key configured (owner checks skipped)',
-      remedy: 'run `login`, or export AGENTIC_PRIVATE_KEY=0x…   # env only — no flag, by design',
+      remedy: currentSurface() === 'shell'
+        ? `${shellStep('login')} saves it`
+        : `${shellStep('login')}, or export AGENTIC_PRIVATE_KEY=0x…   # env only — no flag, by design`,
     });
   } else if (!/^0x[0-9a-fA-F]{64}$/.test(env.privateKey)) {
     checks.push({
       name: 'wallet', status: 'fail', code: 'WALLET_REQUIRED',
-      detail: 'the configured owner key is malformed (expected 64 hex chars, 0x prefix optional)',
-      remedy: 'export AGENTIC_PRIVATE_KEY=0x<64 hex chars>',
+      detail: `${env.privateKeySource === 'file' ? 'the owner key saved by login' : 'AGENTIC_PRIVATE_KEY'} is malformed (expected 64 hex chars, 0x prefix optional)`,
+      remedy: env.privateKeySource === 'file' ? `${shellStep('login')} and enter the key again` : 'export AGENTIC_PRIVATE_KEY=0x<64 hex chars>',
     });
   } else {
     owner = privateKeyToAccount(env.privateKey).address;
-    checks.push({ name: 'wallet', status: 'pass', detail: `${owner} (from AGENTIC_PRIVATE_KEY)` });
+    checks.push({ name: 'wallet', status: 'pass', detail: `${owner} (${env.privateKeySource === 'file' ? 'saved by login' : 'from AGENTIC_PRIVATE_KEY'})` });
   }
 
   // 4 — gas: the owner must be able to pay for ack/deposit txs at all
   if (!owner) skip('gas', 'needs wallet');
-  else if (!rpcOk) skip('gas', 'needs rpc');
+  else if (!rpcOk || !publicClient) skip('gas', 'needs rpc');
   else {
     try {
       const bal = await publicClient.getBalance({ address: owner });
@@ -138,7 +152,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     } catch (e) {
       checks.push({
         name: 'gas', status: 'fail', code: 'PREFLIGHT_GAS',
-        detail: `could not read balance: ${(e as Error).message}`,
+        detail: `could not read balance: ${plainError(e).message}`,
         remedy: 'check RPC connectivity, then retry',
       });
     }
@@ -171,15 +185,13 @@ export async function run(ctx: CommandContext): Promise<void> {
           checks.push({
             name: 'ack', status: 'fail', code: 'PREFLIGHT_ACK',
             detail: `not acknowledged: ${missing.join(', ')}`,
-            // Stage-0 exception (spec §2.2): no `ack` CLI command yet — the
-            // remedy is guidance text until stage 1 promotes it to a command.
-            remedy: 'run `ack` in the interactive shell (or SDK: await ag.ack())',
+            remedy: shellStep('ack'),
           });
         }
       } catch (e) {
         checks.push({
           name: 'ack', status: 'fail', code: 'PREFLIGHT_ACK',
-          detail: `could not read ack status: ${(e as Error).message}`,
+          detail: `could not read ack status: ${plainError(e).message}`,
           remedy: 'verify the attestor environment, then retry',
         });
       }
@@ -197,13 +209,13 @@ export async function run(ctx: CommandContext): Promise<void> {
           checks.push({
             name: 'sandboxBalance', status: 'fail', code: 'PREFLIGHT_BALANCE',
             detail: `${formatEther(bal)} OG — below the 0.1 OG deploy floor`,
-            remedy: "run `deposit` in the interactive shell (or SDK: await ag.deposit({ amountWei: parseEther('0.1') }))",
+            remedy: shellStep(`deposit ${formatEther(MIN_SANDBOX_BALANCE_WEI - bal)}`),
           });
         }
       } catch (e) {
         checks.push({
           name: 'sandboxBalance', status: 'fail', code: 'PREFLIGHT_BALANCE',
-          detail: `could not read sandbox balance: ${(e as Error).message}`,
+          detail: `could not read sandbox balance: ${plainError(e).message}`,
           remedy: 'verify the attestor environment, then retry',
         });
       }
