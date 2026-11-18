@@ -5,7 +5,7 @@
  * transaction, one-shot routing, 80-column output, agents without an
  * agentId, login that checks before it saves.
  *
- *   1. pure units: choiceIndex, parseOgAmount, plainError, wrap/fitHelp,
+ *   1. pure units: choiceIndex, parseOgAmount, explainError, wrap/fitHelp,
  *      didYouMean, the listing layout, release-notice wording, addresses
  *   2. spawned one-shot commands: routing, --help width
  *   3. the shell, piped against a mock attestor: new manager commands,
@@ -24,7 +24,7 @@ import { BaseError, HttpRequestError, InsufficientFundsError } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
 import { CliError, setSurface } from '../dist/cli/errors.js';
-import { parseOgAmount, plainError, plainCliError } from '../dist/cli/plain.js';
+import { parseOgAmount, explainError, plainCliError } from '../dist/cli/plain.js';
 import { wrap, fitHelp, didYouMean } from '../dist/cli/textfit.js';
 import { listLayout, listHeader, listCells, ownerColumnWidth } from '../dist/cli/commands/cells.js';
 import { askChoice, choiceIndex, managerHelp, fitItems, addressProblem, renderListHeader, renderListRow } from '../dist/cli/commands/interactive.js';
@@ -108,49 +108,49 @@ test('parseOgAmount: a positive decimal of OG, nothing else', () => {
   }
 });
 
-test('plainError: an attestor 402 reads as OG and a deposit, typed where the owner is', () => {
+test('explainError: an attestor 402 reads as OG and a deposit, typed where the owner is', () => {
   const body = JSON.stringify({ error: { code: 'insufficient_sandbox_balance', message: 'prepaid sandbox balance is 5000000000000000 wei, below the 0.1 OG minimum — deposit via SandboxServing (console: top-up dialog; SDK: deposit()) and retry' } });
   const e = new Error(`/start failed: HTTP 402 ${body}`);
   setSurface('shell');
-  const shell = plainError(e);
+  const shell = explainError(e);
   assert.equal(shell.message, 'the prepaid balance is 0.005 OG — an agent needs at least 0.1 OG to run');
   assert.equal(shell.remedy, '`deposit 0.1`, then try again');
   assert.equal(shell.code, 'PREFLIGHT_BALANCE');
   setSurface('oneshot');
-  assert.equal(plainError(e).remedy, 'run `0g-agentdna` and type `deposit 0.1` there, then try again');
-  for (const p of [shell, plainError(e)]) {
+  assert.equal(explainError(e).remedy, 'run `0g-agentdna` and type `deposit 0.1` there, then try again');
+  for (const p of [shell, explainError(e)]) {
     assert.doesNotMatch(`${p.message} ${p.remedy}`, /wei|SDK|console|\{|HTTP/);
   }
   // The structured fields AttestorClient attaches read the same way.
   const structured = Object.assign(new Error('x'), { httpStatus: 402, httpWhat: '/reset', httpBody: body });
-  assert.equal(plainError(structured).code, 'PREFLIGHT_BALANCE');
+  assert.equal(explainError(structured).code, 'PREFLIGHT_BALANCE');
 });
 
-test('plainError: other HTTP answers are one line with what the server said', () => {
+test('explainError: other HTTP answers are one line with what the server said', () => {
   setSurface('shell');
-  const audit = plainError(new Error('credentials.audit: HTTP 404 {"error":{"code":"not_found","message":"no such route"}}'));
+  const audit = explainError(new Error('credentials.audit: HTTP 404 {"error":{"code":"not_found","message":"no such route"}}'));
   assert.equal(audit.message, 'the credential log: no such route (HTTP 404)');
-  assert.equal(plainError(new Error('/stop failed: HTTP 404 ')).message, 'stop: not offered here (HTTP 404)');
-  const down = plainError(new Error('provider /api/balance: HTTP 503 {"error":"maintenance"}'));
+  assert.equal(explainError(new Error('/stop failed: HTTP 404 ')).message, 'stop: not offered here (HTTP 404)');
+  const down = explainError(new Error('provider /api/balance: HTTP 503 {"error":"maintenance"}'));
   assert.equal(down.message, 'the sandbox provider: the server had an error (HTTP 503): maintenance');
   assert.equal(down.remedy, 'try again in a minute');
-  assert.equal(plainError(new Error('/reset failed: HTTP 403 {"error":{"message":"not the owner"}}')).code, 'AUTH_REJECTED');
-  const acked = plainError(new Error('/deploy failed: HTTP 402 {"error":{"code":"trust_roots_not_acked","message":"…"}}'));
+  assert.equal(explainError(new Error('/reset failed: HTTP 403 {"error":{"message":"not the owner"}}')).code, 'AUTH_REJECTED');
+  const acked = explainError(new Error('/deploy failed: HTTP 402 {"error":{"code":"trust_roots_not_acked","message":"…"}}'));
   assert.equal(acked.remedy, '`ack`, then try again');
 });
 
-test('plainError: viem errors are one sentence, never the dump', () => {
+test('explainError: viem errors are one sentence, never the dump', () => {
   setSurface('shell');
   const funds = new BaseError('Execution reverted.', { cause: new InsufficientFundsError() });
   assert.match(funds.message, /Version: viem/, 'the raw text is the multi-line dump');
-  const p = plainError(funds);
+  const p = explainError(funds);
   assert.equal(p.code, 'PREFLIGHT_GAS');
   assert.equal(p.message, 'the wallet does not hold enough OG for this and its gas');
   for (const line of [p.message, p.remedy]) assert.doesNotMatch(line, /\n|Request Arguments|Docs:|Version:/);
-  const rpc = plainError(new BaseError('outer', { cause: new HttpRequestError({ url: 'http://127.0.0.1:9', details: 'fetch failed' }) }));
+  const rpc = explainError(new BaseError('outer', { cause: new HttpRequestError({ url: 'http://127.0.0.1:9', details: 'fetch failed' }) }));
   assert.equal(rpc.code, 'RPC_UNREACHABLE');
   assert.equal(rpc.message, 'the chain did not answer (http://127.0.0.1:9)');
-  const other = plainError(new BaseError('Something went wrong.', { details: 'lots\nof\nlines' }));
+  const other = explainError(new BaseError('Something went wrong.', { details: 'lots\nof\nlines' }));
   assert.equal(other.message, 'Something went wrong.');
   // A one-shot command keeps the full text for --json.
   const ce = plainCliError(funds);

@@ -169,7 +169,7 @@ function httpFields(e: unknown): { status: number; what: string; body: string } 
  * plain; a viem error becomes its one sentence; an SDK error carrying an HTTP
  * answer becomes what the server said, in one line.
  */
-export function plainError(e: unknown): Plain {
+export function explainError(e: unknown): Plain {
   if (e instanceof CliError) return { message: e.message, remedy: e.remedy, code: e.code };
   // viem's errors, found by name along the cause chain (viemErrors.ts: not by
   // instanceof — viem ships separate ESM and CommonJS builds).
@@ -222,7 +222,7 @@ export function plainCliError(e: unknown): CliError {
       remedy: 'ask the attestor operator to enable provider-bound credentials for this runtime image, then retry',
     });
   }
-  const p = plainError(e);
+  const p = explainError(e);
   const cause = causeOf(e);
   return new CliError(p.code ?? 'UNKNOWN', p.message, {
     remedy: p.remedy,

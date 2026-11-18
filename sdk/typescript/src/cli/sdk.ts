@@ -11,7 +11,7 @@ import { AgenticID } from '../AgenticID';
 import { CliError, shellStep } from './errors';
 import { credentialMarksPath, loadCredentialMarks, loadSecretEnvPins, recordCredentialMark, recordSecretEnvPin } from './config';
 import { requireAttestorUrl, requirePrivateKey, type CliEnv } from './env';
-import { plainError } from './plain';
+import { explainError } from './plain';
 
 /**
  * Build an SDK facade from the CLI environment.
@@ -100,7 +100,7 @@ export function unreachableReason(e: unknown): string {
   if (/abort|timeout|timed out/i.test(msg) || code === 'UND_ERR_CONNECT_TIMEOUT') return 'no answer in time';
   if (/^fetch failed$/i.test(msg.trim())) return 'no answer';
   if (/JSON|Unexpected token/i.test(msg)) return 'what answered is not an attestor';
-  return plainError(e).message;
+  return explainError(e).message;
 }
 
 /**

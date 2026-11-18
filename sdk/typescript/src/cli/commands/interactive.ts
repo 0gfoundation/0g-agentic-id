@@ -26,7 +26,7 @@ import { buildClient, probeAttestor } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
 import { CliError, cancelled, cmdStep, isCancelled, setSurface, shellStep } from '../errors';
 import { requireAttestorUrl } from '../env';
-import { ogAmount, parseOgAmount, plainError } from '../plain';
+import { ogAmount, parseOgAmount, explainError } from '../plain';
 import { fitHelp, termWidth, wrap, didYouMean } from '../textfit';
 import { run as doctorCommand } from './doctor';
 import { run as statusCommand } from './status';
@@ -74,7 +74,7 @@ function moneyBlock(prepaidWei: bigint | null, eff: EffBalance | null, effErr: s
   } else if (eff) {
     out(`AVAILABLE       : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
   } else {
-    out(`AVAILABLE       : (unknown: ${effErr ? plainError(effErr).message : 'no answer'} — the chain number above may be optimistic)\n`);
+    out(`AVAILABLE       : (unknown: ${effErr ? explainError(effErr).message : 'no answer'} — the chain number above may be optimistic)\n`);
   }
 }
 
@@ -1793,7 +1793,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
               const client = await buildClient(ctx.env);
               knownProviders = await client.agent.refreshProviders();
             } catch (e) {
-              out(`  (${plainError(e).message} — the providers below are the built-in list)\n`);
+              out(`  (${explainError(e).message} — the providers below are the built-in list)\n`);
             }
           }
           if (only && !knownProviders.some((provider) => provider.id === only)) {
@@ -1848,7 +1848,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           ag.agent.estimateCosts(),
           ag.agent.listMyDeployments(),
           ag.getBalanceDetail().catch(() => null),
-          ag.getEffectiveBalance().catch((e: Error) => { effErr = plainError(e).message; return null; }),
+          ag.getEffectiveBalance().catch((e: Error) => { effErr = explainError(e).message; return null; }),
         ]);
         rememberAgentIds(rows);
         const running = rows.filter((r) => r.phase === 'running').length;
@@ -1956,7 +1956,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
             const { allAcked, missing } = ackRes.r;
             out(`ack     : ${allAcked ? 'ok (trust root acknowledged)' : `missing ${missing.join(', ')} — run \`ack\``}\n`);
           } else {
-            out(`ack     : (unreadable: ${plainError(ackRes.e).message})\n`);
+            out(`ack     : (unreadable: ${explainError(ackRes.e).message})\n`);
           }
           try {
             if (!dRes.ok) throw dRes.e;
@@ -2437,7 +2437,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if ((e as { code?: string }).code === 'ERR_USE_AFTER_CLOSE') throw e;
       if (isCancelled(e)) out('cancelled\n');
       else {
-        const p = plainError(e);
+        const p = explainError(e);
         out(`error: ${p.message}${p.remedy ? `\n  → ${p.remedy}` : ''}\n`);
       }
     }
@@ -2527,7 +2527,7 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
         const r = await ag.agent.pushSettingsToContainer(serveBase, agentId, next);
         out(`saved; ${r.note ?? 'applied to the running container'}\n`);
       } catch (e2) {
-        const msg = plainError(e2).message;
+        const msg = explainError(e2).message;
         if (requiresProviderReset(e2)) {
           out(`saved; provider change pending — run reset with the ${next.provider} key\n`);
           return next;
@@ -4098,7 +4098,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // Show the remedy too: an error whose whole point is "do this instead"
       // (a refused settings write, a missing wallet) is useless without it.
       if (isCancelled(e)) { out('cancelled\n'); continue; }
-      const p = plainError(e);
+      const p = explainError(e);
       out(`error: ${p.message}${p.remedy ? `\n  → ${p.remedy}` : ''}\n`); continue;
     }
     } // commands

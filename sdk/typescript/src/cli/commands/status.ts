@@ -16,7 +16,7 @@ import type { Address, Hash } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import { buildClient } from '../sdk';
 import { CliError, cmdStep, shellStep } from '../errors';
-import { plainError } from '../plain';
+import { explainError } from '../plain';
 import { cleanCell } from './cells';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef } from '../ref';
@@ -101,7 +101,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     try {
       row = bySeal(await ag.agent.listDeployments());
     } catch (e) {
-      note(`attestor listing unavailable (${plainError(e).message}) — chain-only view`);
+      note(`attestor listing unavailable (${explainError(e).message}) — chain-only view`);
     }
 
     // Not minted AND no deployment row → the sealId leads nowhere.
@@ -117,7 +117,7 @@ export async function run(ctx: CommandContext): Promise<void> {
         try {
           row = bySeal(await ag.agent.listMyDeployments()) ?? row;
         } catch (e) {
-          note(`could not fetch the owner-tier failure reason (${plainError(e).message})`);
+          note(`could not fetch the owner-tier failure reason (${explainError(e).message})`);
         }
       } else {
         note(`failure reason is owner-only — with your owner key (${shellStep('login')}, or AGENTIC_PRIVATE_KEY) it shows`);

@@ -22,7 +22,7 @@ import type { Hash } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import { buildClient } from '../sdk';
 import { CliError, cmdStep, shellStep } from '../errors';
-import { plainError } from '../plain';
+import { explainError } from '../plain';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef, type AgentRef } from '../ref';
 import {
@@ -182,7 +182,7 @@ export async function run(ctx: CommandContext): Promise<void> {
           pendingReset = true;
           return;
         }
-        const msg = plainError(e).message;
+        const msg = explainError(e).message;
         // pushSettingsToContainer throws `… HTTP <n>: …` when the container
         // ANSWERED and refused; a bare fetch failure (no HTTP status) means
         // it was unreachable.

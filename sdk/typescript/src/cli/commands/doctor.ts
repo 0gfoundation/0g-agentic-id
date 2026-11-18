@@ -19,7 +19,7 @@ import { buildClient, unreachableReason } from '../sdk';
 import { renamedAttestor } from '../config';
 import { attestorUrlRemedy } from '../env';
 import { CliError, currentSurface, shellStep, type ErrorCode } from '../errors';
-import { plainError } from '../plain';
+import { explainError } from '../plain';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
 
@@ -103,7 +103,7 @@ export async function run(ctx: CommandContext): Promise<void> {
       rpcOk = true;
       checks.push({ name: 'rpc', status: 'pass', detail: `${rpcUrl} (chainId ${chainId})` });
     } catch (e) {
-      const p = plainError(e);
+      const p = explainError(e);
       checks.push({
         name: 'rpc', status: 'fail', code: 'RPC_UNREACHABLE',
         detail: p.code === 'RPC_UNREACHABLE' ? p.message : `${rpcUrl}: ${p.message}`,
@@ -152,7 +152,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     } catch (e) {
       checks.push({
         name: 'gas', status: 'fail', code: 'PREFLIGHT_GAS',
-        detail: `could not read balance: ${plainError(e).message}`,
+        detail: `could not read balance: ${explainError(e).message}`,
         remedy: 'check RPC connectivity, then retry',
       });
     }
@@ -191,7 +191,7 @@ export async function run(ctx: CommandContext): Promise<void> {
       } catch (e) {
         checks.push({
           name: 'ack', status: 'fail', code: 'PREFLIGHT_ACK',
-          detail: `could not read ack status: ${plainError(e).message}`,
+          detail: `could not read ack status: ${explainError(e).message}`,
           remedy: 'verify the attestor environment, then retry',
         });
       }
@@ -215,7 +215,7 @@ export async function run(ctx: CommandContext): Promise<void> {
       } catch (e) {
         checks.push({
           name: 'sandboxBalance', status: 'fail', code: 'PREFLIGHT_BALANCE',
-          detail: `could not read sandbox balance: ${plainError(e).message}`,
+          detail: `could not read sandbox balance: ${explainError(e).message}`,
           remedy: 'verify the attestor environment, then retry',
         });
       }
