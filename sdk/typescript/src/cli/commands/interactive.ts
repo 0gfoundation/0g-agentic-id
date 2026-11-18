@@ -1900,6 +1900,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const d = await ag.getBalanceDetail();
         const unlockMs = Number(d.refundUnlockAt) * 1000;
         let pending = d.pendingRefund;
+        let claimed = false;
         // Status first: spendable, the pending pot (one per provider — the
         // contract holds a single pot, not a list) and its lock state.
         say(`spendable : ${og(d.balance)}\n`);
@@ -1908,12 +1909,14 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // and re-locks it, so requesting before claiming would freeze money
         // that was already free.
         if (pending > 0n && Date.now() >= unlockMs) {
-          const yn = (await ask(`claim ${og(pending)} to your wallet now? [Y/n]: `)).trim().toLowerCase();
-          if (!yn || yn === 'y' || yn === 'yes') {
+          // A money question never acts on a bare Enter.
+          const yn = (await ask(`claim ${og(pending)} to your wallet now? [y/N]: `)).trim().toLowerCase();
+          if (yn === 'y' || yn === 'yes') {
             const tx = await ag.withdrawRefund();
             await ag.waitForTransaction(tx);
             say(`withdrew ${og(pending)} to your wallet (tx ${tx})\n`);
             pending = 0n;
+            claimed = true;
           }
         }
         // Then the request. The amount asked is the INCREMENT, drawn from the
@@ -1923,7 +1926,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (!args[0] && pending > 0n) say(`a new request joins the pending ${og(pending)} and restarts its time lock\n`);
         // The most it can be is the spendable line just above.
         const amountWei = args[0] ? parseOgAmount(args[0]) : await askAmount(ask, 'withdraw how much OG? [Enter cancels]: ');
-        if (amountWei === null) continue;
+        if (amountWei === null) { say(claimed ? 'no further withdrawal requested\n' : 'withdraw cancelled\n'); continue; }
         if (amountWei > d.balance) { say(`only ${og(d.balance)} spendable — cannot withdraw ${ogAmount(amountWei)} OG\n`); continue; }
         // The bare form's question says a request restarts the pending lock;
         // with the amount given as an argument, ask before restarting it.
@@ -3003,14 +3006,13 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
     // Suggest the shortfall (no arbitrary padding), capped at what's affordable.
     let suggestWei = shortfallWei > 0n ? shortfallWei : parseEther('0.1');
     if (affordableWei > 0n && suggestWei > affordableWei) suggestWei = affordableWei;
-    const suggest = og(suggestWei).replace(/ OG$/, '');
-    // Empty = cancel (as the prompt says). To deposit the suggested amount,
-    // the user types it — no silent default that contradicts "empty to cancel".
-    // Typing the amount IS the confirmation — the prompt already says empty
-    // cancels; a second [Y/n] was pure friction (review of the topup flows).
+    // Enter cancels (a money question has no default). To deposit the
+    // suggested amount, the user types it. Typing the amount IS the
+    // confirmation; a second [Y/n] was pure friction (review of the topup flows).
+    say(`${og(suggestWei)} more brings it to 0.1 OG\n`);
     let amountWei = 0n;
     for (;;) {
-      const amt = (await ask(`deposit how much OG now? (e.g. ${suggest}, empty to cancel): `)).trim();
+      const amt = (await ask('deposit how much OG now? [Enter cancels]: ')).trim();
       if (!amt) { say('cancelled — deposit later with `deposit`.\n'); return false; }
       try {
         amountWei = parseOgAmount(amt);

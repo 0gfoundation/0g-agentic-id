@@ -11,7 +11,7 @@
  * listings. The SDK seals it to the agent before anything leaves the machine.
  */
 
-import type { Hash } from 'viem';
+import { keccak256, toBytes, type Hash } from 'viem';
 import type { AgenticID } from '../AgenticID';
 import {
   CredentialsConflictError,
@@ -32,6 +32,7 @@ import { agentCmd, cancelled, CliError, isCancelled, lifecycleTo } from './error
 import { pickModelKey, type KeyPrompt } from './modelkey';
 import { createInterface } from 'node:readline';
 import { emitOk } from './envelope';
+import { loadModelKeyMarks, recordModelKeyMark } from './config';
 
 /** The keys `cred <agent> set <name>` takes. */
 export const CRED_KEYS = [
@@ -621,9 +622,20 @@ async function modelSetOp(ag: AgenticID, sealId: Hash, provider: string, defs: C
     });
   }
   const value = (await pickModelKey(provider, keyPromptOf(io)))!;
+  // The same key this machine stored last, still the one in the set: nothing to write.
+  const markKey = `${sealId.toLowerCase()}:${provider}`;
+  const keyMark = keccak256(toBytes(`agentdna-model-key-mark\n${sealId.toLowerCase()}\n${provider}\n${value}`));
+  const had = loadModelKeyMarks()[markKey];
+  const stored = defs.find((d) => d.name === name);
+  if (had && stored && had.keyMark === keyMark && had.valueHash.toLowerCase() === stored.value_hash.toLowerCase()) {
+    if (io.json) return emitOk({ sealId, name, provider, unchanged: true, valueHash: stored.value_hash });
+    io.out(`unchanged ${name}: the agent's credential set already holds this key`);
+    return;
+  }
   const out = await cred.setModelKey(sealId, provider, value, at).catch(conflict);
+  recordModelKeyMark(markKey, { valueHash: out.valueHash, keyMark });
   if (io.json) return emitOk({ sealId, version: out.version, name, provider, valueHash: out.valueHash, pushWarning: out.pushWarning ?? null });
-  io.out(`${defs.some((d) => d.name === name) ? 'changed' : 'added'} ${name}`);
+  io.out(`${stored ? 'changed' : 'added'} ${name}`);
   if (out.pushWarning) return io.out(`stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot`);
   // LEGACY(model-key): the parenthesis goes with the images that read only the request.
   if (state === null) return io.out('the agent is not running: it takes the key when it starts on a current image (an image from before model keys in cred skips it and keeps the key given at create/reset)');

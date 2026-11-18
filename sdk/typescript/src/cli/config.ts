@@ -101,6 +101,47 @@ export function recordSecretEnvPin(attestorUrl: string, env: NodeJS.ProcessEnv =
 
 type CredentialMark = { epoch: number; version: number; digest?: string };
 
+/**
+ * Which model key this machine last stored for an agent and provider: the
+ * stored entry's value hash and a fingerprint of the key (a hash salted with
+ * the agent and provider, never the key), so storing the same key again can
+ * be told apart and skipped. Not secret: one small file, 0600. A file that
+ * does not parse reads as empty.
+ */
+export type ModelKeyMark = { valueHash: string; keyMark: string };
+
+function modelKeyMarksPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(configPaths(env).dir, 'model-key-marks.json');
+}
+
+export function loadModelKeyMarks(env: NodeJS.ProcessEnv = process.env): Record<string, ModelKeyMark> {
+  try {
+    const all = JSON.parse(readFileSync(modelKeyMarksPath(env), 'utf8')) as unknown;
+    if (!all || typeof all !== 'object' || Array.isArray(all)) return {};
+    const out: Record<string, ModelKeyMark> = {};
+    for (const [k, m] of Object.entries(all as Record<string, ModelKeyMark>)) {
+      if (m && typeof m.valueHash === 'string' && typeof m.keyMark === 'string') out[k] = { valueHash: m.valueHash, keyMark: m.keyMark };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function recordModelKeyMark(key: string, mark: ModelKeyMark, env: NodeJS.ProcessEnv = process.env): void {
+  try {
+    const { dir } = configPaths(env);
+    mkdirSync(dir, { recursive: true });
+    const marks = { ...loadModelKeyMarks(env), [key]: mark };
+    const file = modelKeyMarksPath(env);
+    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(marks, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch {
+    /* best-effort */
+  }
+}
+
 /** Where the newest credential set seen per agent is kept. */
 export function credentialMarksPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(configPaths(env).dir, 'credential-marks.json');
