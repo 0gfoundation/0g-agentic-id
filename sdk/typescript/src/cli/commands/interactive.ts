@@ -1167,6 +1167,15 @@ export function lineQueue(
     for (let buffered = pending.shift(); buffered !== undefined; buffered = pending.shift()) {
       const refused = accepts({ kind, q }, buffered);
       if (refused) { out(`  (an earlier entry was dropped: ${refused})\n`); continue; }
+      // At the agent prompt on a terminal, the messages that waited (typed
+      // while nothing took them, or put back) go as one, blank lines between;
+      // a command among them stays its own entry.
+      if (kind === 'message' && multiline() && steerable(buffered)) {
+        while (pending.length && steerable(pending[0])) {
+          const next = pending.shift()!;
+          buffered = { text: `${buffered.text}\n\n${next.text}`, multi: true, pasted: buffered.pasted || next.pasted };
+        }
+      }
       out(`${q}${buffered.text}\n`); // keep the transcript readable in pipes/logs
       return Promise.resolve(buffered);
     }
@@ -1401,6 +1410,20 @@ interface Steering {
   read(): string | undefined;
   /** The turn ended: the ones it did not read go to the follow-ups. */
   settle(after: FollowUp[]): Promise<void>;
+}
+
+/**
+ * Which turn answers a message inserted into turn `inserted` and not read
+ * there, from its steer state: the turn it opened (`turn`), or the one it
+ * joined when the agent answers several in one follow-up (`merged` into a
+ * turn other than the one it went into). null: read where it went, dropped,
+ * or not known yet. Exported for the tests.
+ */
+export function steerFollowUp(inserted: string | undefined, st: SteerState | null): string | null {
+  if (!st) return null;
+  if (st.state === 'turn') return st.turn || null;
+  if (st.state === 'merged' && st.turn && inserted && st.turn !== inserted) return st.turn;
+  return null;
 }
 
 /** Add `text` to the follow-up turn `id`, or start it: several inserted
@@ -4138,19 +4161,38 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // (followTask starts at sequence 0), so don't pre-print the snapshot.
         // Esc here stops WATCHING only (the deliberate stop stays on the chat
         // turn's Esc / the task's cancel).
-        out(`task ${id} — ${snap.status}; following (esc stops watching, not the task; then /cancel ${id} stops it)\nagent> `);
+        out(`task ${id} — ${snap.status}; following (esc stops watching, not the task; then /cancel ${id} stops it)\n`);
         const ac = new AbortController();
         irq.streaming = ac;
+        // What the owner enters meanwhile goes into it, as into any running
+        // owner turn; what it does not read is answered after, and followed.
+        const after: FollowUp[] = [];
+        let steering: Steering | null = null;
+        const view = openTurn(s, () => steering?.texts ?? []);
+        steering = makeSteering(view, after);
+        if (process.stdin.isTTY) (ask as Ask).whileBusy?.(busyEntries(view, steering));
+        view.write('agent> ');
+        let stopped = false;
         try {
-          for await (const delta of s.client.followTask(id, { signal: ac.signal })) out(cleanStream(delta));
+          const onActivity = (label: string): void => {
+            if (label === 'steer received') readNote(view, steering?.read());
+          };
+          for await (const delta of s.client.followTask(id, { signal: ac.signal, onActivity })) view.write(delta);
+          view.end();
           out('\n');
         } catch (e) {
-          out(ac.signal.aborted
+          view.end();
+          stopped = ac.signal.aborted;
+          out(stopped
             ? `\n(stopped watching — the task continues; /result re-attaches, then /cancel ${id} stops it)\n`
             : `\n(${(e as Error).message})\n`);
         } finally {
+          view.end();
           irq.streaming = null;
+          (ask as Ask).whileBusy?.(null);
         }
+        if (!stopped) await steering?.settle(after);
+        await followUps(after);
         continue;
       }
       if (line === '/cancel' || line.startsWith('/cancel ')) {
@@ -4415,7 +4457,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     const steer = s.client?.steer && process.stdin.isTTY ? s.client.steer : undefined;
     if (!steer) return null;
     const texts: string[] = [];
-    const unread: Array<{ id: string; text: string }> = [];
+    const unread: Array<{ id: string; text: string; turn?: string }> = [];
     const unshow = (text: string): void => {
       const i = texts.indexOf(text);
       if (i >= 0) texts.splice(i, 1);
@@ -4436,7 +4478,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         }
         steer(e.text).then(
           (r) => {
-            if (r.merged && r.id) { unread.push({ id: r.id, text: e.text }); return; }
+            if (r.merged && r.id) { unread.push({ id: r.id, text: e.text, turn: r.turn }); return; }
             unshow(e.text);
             if (r.queued) {
               addFollowUp(after, r.queued, e.text, 'idle');
@@ -4464,7 +4506,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             if (!st || st.state !== 'pending') break;
             await new Promise((r) => setTimeout(r, 150));
           }
-          if (st?.state === 'turn') addFollowUp(list, st.turn, u.text, 'unread');
+          const follow = steerFollowUp(u.turn, st);
+          if (follow) addFollowUp(list, follow, u.text, 'unread');
         }
       },
     };
@@ -4788,7 +4831,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // No text because the model's output budget ran out: say so plainly.
       if (failure && /without any output/.test(failure)) {
         const empty = await emptyTurnText(s.client, taskId);
-        if (empty) { out(`\n${empty}`); failure = null; }
+        if (empty) { out(`${reply ? '\n' : ''}${empty}`); failure = null; }
       }
       if (failure && !s.framework && !retriedWithPick) {
         out(`\n(chat failed: ${cleanCell(failure)})\nthis framework may need a model selector — pick it:\n`);

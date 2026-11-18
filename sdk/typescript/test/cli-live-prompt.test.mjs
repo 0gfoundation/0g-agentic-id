@@ -457,3 +457,23 @@ test('Esc puts what was queued back to edit without blank lines, the rest as typ
   assert.equal(t.rl.line, 'third');
   t.rl.close();
 });
+
+test('messages that waited go to the agent as one, blank lines between; a command among them stays its own', async () => {
+  const t = shell(60);
+  for (const text of ['？', '我是谁你知道么', '/files', 'third']) t.ask.later({ text, multi: false, pasted: false });
+  assert.deepEqual(await t.ask.message('> '), { text: '？\n\n我是谁你知道么', multi: true, pasted: false });
+  assert.deepEqual(await t.ask.message('> '), { text: '/files', multi: false, pasted: false });
+  assert.deepEqual(await t.ask.message('> '), { text: 'third', multi: false, pasted: false });
+  t.rl.close();
+});
+
+test('piped input still goes line by line: waiting lines are not joined', async () => {
+  const input = new PassThrough();
+  const output = new Writable({ write(_c, _e, cb) { cb(); } });
+  const rl = readline.createInterface({ input, output, terminal: false });
+  const ask = lineQueue(rl, () => false);
+  for (const text of ['one', 'two']) ask.later({ text, multi: false, pasted: false });
+  assert.equal((await ask.message('> ')).text, 'one');
+  assert.equal((await ask.message('> ')).text, 'two');
+  rl.close();
+});
