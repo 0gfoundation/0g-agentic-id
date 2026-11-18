@@ -611,6 +611,17 @@ async function modelApplied(cred: AgenticID['credentials'], sealId: Hash, provid
   }
 }
 
+/**
+ * Where this machine notes the model key it stored for an agent and
+ * provider: the stored value is sealed to the agent (a fresh encryption each
+ * time), so only this note tells the same key apart. A hash salted with the
+ * agent and provider, never the key (config.ts, model-key-marks.json).
+ */
+function modelKeyMarkOf(sealId: Hash, provider: string, value: string): { markKey: string; keyMark: string } {
+  const seal = sealId.toLowerCase();
+  return { markKey: `${seal}:${provider}`, keyMark: keccak256(toBytes(`agentdna-model-key-mark\n${seal}\n${provider}\n${value}`)) };
+}
+
 /** `cred <agent> set model …`: the value is asked for, as any other. */
 async function modelSetOp(ag: AgenticID, sealId: Hash, provider: string, defs: CredentialDefinition[], io: CredIO, at?: { agentUrl: string }): Promise<void> {
   const cred = ag.credentials;
@@ -623,8 +634,7 @@ async function modelSetOp(ag: AgenticID, sealId: Hash, provider: string, defs: C
   }
   const value = (await pickModelKey(provider, keyPromptOf(io)))!;
   // The same key this machine stored last, still the one in the set: nothing to write.
-  const markKey = `${sealId.toLowerCase()}:${provider}`;
-  const keyMark = keccak256(toBytes(`agentdna-model-key-mark\n${sealId.toLowerCase()}\n${provider}\n${value}`));
+  const { markKey, keyMark } = modelKeyMarkOf(sealId, provider, value);
   const had = loadModelKeyMarks()[markKey];
   const stored = defs.find((d) => d.name === name);
   if (had && stored && had.keyMark === keyMark && had.valueHash.toLowerCase() === stored.value_hash.toLowerCase()) {
@@ -692,6 +702,8 @@ export async function ensureModelKey(ag: AgenticID, sealId: Hash, provider: stri
   io.out(`the agent has no ${provider} model key yet`);
   const value = (await pickModelKey(provider, keyPromptOf(io)))!;
   const out = await cred.setModelKey(sealId, provider, value, at).catch(conflict);
+  const { markKey, keyMark } = modelKeyMarkOf(sealId, provider, value);
+  recordModelKeyMark(markKey, { valueHash: out.valueHash, keyMark });
   io.out(`added ${name}${out.pushWarning ? `; not applied to the running agent: ${out.pushWarning}` : ''}`);
   if (state === null) io.out(`the agent is not running: on an image from before model keys in cred, the switch takes a reset with the ${provider} key`);
   return 'added';
