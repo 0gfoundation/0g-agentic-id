@@ -333,3 +333,14 @@ test('/tasks and its notices show short ids; /settings says how to change them i
   for (const r of rows.slice(1)) assert.match(r, /^ {15}\S/);
   assert.deepEqual(changeWith(items, Infinity), [`  change with: ${items.join(' · ')}`]);
 });
+
+test('wrapProse: the CLI\'s own marks hang their further rows under the text', async () => {
+  const { wrapProse } = await import('../dist/cli/livePrompt.js');
+  assert.deepEqual(wrapProse('⚠ agentSeal gas is 0.000000 OG — it cannot commit the agent\'s state; fund with /topup [og]', 79),
+    ['⚠ agentSeal gas is 0.000000 OG — it cannot commit the agent\'s state; fund with', '  /topup [og]']);
+  for (const mark of ['◆', '·', '↳', '⏹', '→']) {
+    const rows = wrapProse(`${mark} ${'word '.repeat(20).trim()}`, 40);
+    assert.ok(rows.length > 1, mark);
+    for (const r of rows.slice(1)) assert.match(r, /^ {2}\S/, `${mark}: ${JSON.stringify(rows)}`);
+  }
+});
