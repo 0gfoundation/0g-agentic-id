@@ -525,3 +525,72 @@ test('a message of several lines can be taken back: Backspace at a line start jo
   assert.equal((await p).text, 'sent');
   t.rl.close();
 });
+
+test('put back after Esc, a message never answers a question a waiting command asks; it is back after', async () => {
+  const t = shell(60);
+  // During a turn: a command that will ask, and a message queued with Tab.
+  t.ask.whileBusy(() => false);
+  await t.type('/sessions switch 2\r');
+  t.ask.later({ text: 'queued text', multi: false, pasted: false });
+  t.ask.whileBusy(null);
+  // Esc: the message comes back to edit, the command waits for the prompt.
+  assert.equal(t.ask.recallAll(), 1);
+  assert.equal(t.rl.line, 'queued text');
+  // The prompt runs the command; its question comes with an empty line.
+  assert.deepEqual(await t.ask.message('> '), { text: '/sessions switch 2', multi: false, pasted: false });
+  const answer = t.ask('switch to #2, 东京旅行计划? [Y/n] ');
+  await later(10);
+  assert.equal(t.rl.line, '', 'the put-back text is not in the question\'s line');
+  await t.type('n\r');
+  assert.equal(await answer, 'n');
+  // The next prompt has the message back, to edit.
+  const msg = t.ask.message('> ');
+  await later(10);
+  assert.equal(t.rl.line, 'queued text');
+  await t.type('\r');
+  assert.equal((await msg).text, 'queued text');
+  t.rl.close();
+});
+
+test('what was entered during a turn answers no question; what was typed ahead at the prompt does', async () => {
+  const t = shell(60);
+  t.ask.whileBusy(() => false);
+  await t.type('/quit\r');
+  t.ask.whileBusy(null);
+  const q = t.ask('switch? [Y/n] ');
+  await later(10);
+  assert.deepEqual(t.ask.queued().map((e) => e.text), ['/quit'], 'the command waits for the prompt');
+  await t.type('y\r');
+  assert.equal(await q, 'y');
+  assert.deepEqual(await t.ask.message('> '), { text: '/quit', multi: false, pasted: false });
+  // Typed ahead with nothing running: an answer, as before.
+  await t.type('0.5\r');
+  assert.equal(await t.ask('  amount OG [0.1]: '), '0.5');
+  t.rl.close();
+});
+
+test('Ctrl-U on a message of several lines clears all of it', async () => {
+  const t = shell(60);
+  const msg = t.ask.message('> ');
+  await t.type('steer\x1b\r');
+  assert.deepEqual(t.ask.drafting(), ['steer']);
+  await t.type('queue\x15');
+  assert.deepEqual(t.ask.drafting(), []);
+  assert.equal(t.rl.line, '');
+  await t.type('/quit\r');
+  assert.deepEqual(await msg, { text: '/quit', multi: false, pasted: false });
+  t.rl.close();
+});
+
+test('a finished reply line is broken between words at the terminal width; a token wider than a row stays whole', async () => {
+  const t = shell(40);
+  const v = t.turn();
+  v.write('agent> Step three: the proxy signs every response with a serve proof, so a client can check.\n');
+  v.write(`see ${'https://example.com/'.padEnd(50, 'x')} now\n`);
+  v.end();
+  const b = t.bytes();
+  // 39 columns: the terminal's 40, less one.
+  assert.match(b, /agent> Step three: the proxy signs\nevery response with a serve proof, so a\nclient can check\.\n/);
+  assert.match(b, /see\nhttps:\/\/example\.com\/x+\nnow\n/);
+  t.rl.close();
+});
