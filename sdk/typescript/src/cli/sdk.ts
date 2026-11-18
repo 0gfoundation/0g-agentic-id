@@ -91,9 +91,12 @@ export function unreachableReason(e: unknown): string {
   // The system error's code sits somewhere down the cause chain (fetch wraps
   // it; the SDK may wrap fetch).
   let code: string | undefined;
-  for (let x = e as { cause?: unknown; code?: unknown } | undefined, i = 0; x && i < 6 && !code; x = x.cause as typeof x, i++) {
+  let badPort = false;
+  for (let x = e as { cause?: unknown; code?: unknown; message?: unknown } | undefined, i = 0; x && i < 6 && !code; x = x.cause as typeof x, i++) {
     if (typeof x.code === 'string' && /^E[A-Z_]+$|^UND_ERR/.test(x.code)) code = x.code;
+    if (x.message === 'bad port') badPort = true;
   }
+  if (badPort) return 'a port that fetch never connects to';
   if (/Failed to parse URL|Invalid URL/i.test(msg)) return 'not a valid URL';
   if (code === 'ECONNREFUSED') return 'connection refused';
   if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'unknown host';
@@ -109,7 +112,7 @@ export function unreachableReason(e: unknown): string {
  * checks an address with this before saving it).
  */
 export async function probeAttestor(url: string, timeoutMs = 8000): Promise<string | null> {
-  if (!/^https?:\/\/[^\s/]+/i.test(url)) return 'not a valid URL (it starts with https:// or http://)';
+  if (!/^https?:\/\/[^\s/]+/i.test(url)) return 'not a URL (https://… or http://…)';
   try {
     const r = await fetch(`${url.replace(/\/+$/, '')}/config`, { signal: AbortSignal.timeout(timeoutMs) });
     if (!r.ok) return `its /config answered HTTP ${r.status}`;

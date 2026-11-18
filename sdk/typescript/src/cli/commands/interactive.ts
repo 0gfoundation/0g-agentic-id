@@ -1757,7 +1757,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
               }
               const problem = await probeAttestor(url);
               if (problem) {
-                out(`  ${cleanCell(url)}: ${problem} — type the attestor's address again${ctx.env.attestorUrl ? ' (Enter keeps the current one)' : ''}\n`);
+                out(`  ${cleanCell(url)}: ${problem} — try again${ctx.env.attestorUrl ? ' (Enter keeps the current one)' : ''}\n`);
                 continue;
               }
               saveConfig({ attestorUrl: url });

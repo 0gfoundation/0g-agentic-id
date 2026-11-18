@@ -439,8 +439,8 @@ test('shell: login checks the URL and the key before saving them, and asks again
     const port = await closedPort();
     const input = ['login', 'not a url', `http://127.0.0.1:${port}`, att.url, 'nothex', KEY.slice(2), '', '', '', 'quit', ''].join('\n');
     const r = await run([], {}, input);
-    assert.match(r.stdout, /not a url: not a valid URL/);
-    assert.match(r.stdout, new RegExp(`http://127\\.0\\.0\\.1:${port}: connection refused — type the attestor's address again`));
+    assert.match(r.stdout, /not a url: not a URL \(https:\/\/… or http:\/\/…\) — try again/);
+    assert.match(r.stdout, new RegExp(`http://127\\.0\\.0\\.1:${port}: connection refused — try again`));
     assert.match(r.stdout, /not a private key: it is 64 hex characters \(0x optional\) — type it again, or Enter to skip/);
     assert.match(r.stdout, new RegExp(`wallet ${ME}`));
     const cfg = JSON.parse(readFileSync(join(r.home, '.config', '0g-agentdna', 'config.json'), 'utf8'));
