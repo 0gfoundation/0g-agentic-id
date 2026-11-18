@@ -733,7 +733,9 @@ transaction"）。这既覆盖错误里没说原因的失败，也替换掉 "ins
 最多 30 分钟；有新内容要提交时下一个 tick 就试，成功后重新开始。重试只上传失败的那次
 还没传的部分（`internal/uploader/pending.go`）：后面的上传或 update 失败之前已经传上去
 的 blob 会被复用，链上还没有的角色沿用当时生成的 data key，所以每个 blob 只付一次钱。
-这些只记在本次启动的内存里。
+内容回到本次启动中较早一次提交时的样子（加了一条记忆又删掉、改动被撤回）时，提交引用
+当时上传的 blob（同一个 data key，条目换了路径也一样，`internal/uploader/uploaded.go`），
+只发 update。两者都只记在本次启动的内存里。
 
 ### `runHeartbeat` 的 5min ticker
 
