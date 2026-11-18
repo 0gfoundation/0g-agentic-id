@@ -14,7 +14,7 @@
  */
 
 import * as readline from 'node:readline';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
@@ -401,13 +401,19 @@ export function renderTask(t: HarnessTask): string[] {
  * One inbox message as the session prints it: why the agent spoke up, then
  * what it said. Exported for the tests.
  */
+/** A notice's text in plain words: a subagent's end (its id short, for /result). */
+function plainNotice(text: string): string {
+  return text.replace(/Background subagent ([0-9a-f][0-9a-f-]{7,}) finished and will do no further work unless you send it more\.?/g,
+    (_m, id: string) => `a subagent finished — /result ${id.slice(0, 8)}`);
+}
+
 export function renderInboxMessage(m: AgentInboxMessage): string {
-  const label = cleanCell(m.label);
+  const label = cleanCell(plainNotice(m.label ?? ''));
   const why = m.trigger === 'job' ? `job finished · ${label}`
     : m.trigger === 'schedule' ? `reminder · ${label}`
     : label || cleanCell(m.trigger);
   const lines = [`◆ agent · ${why}`];
-  if (m.text?.trim()) lines.push(cleanStream(m.text).replace(/\s+$/, ''));
+  if (m.text?.trim()) lines.push(cleanStream(plainNotice(m.text)).replace(/\s+$/, ''));
   if (m.status === 'failed') lines.push(`(that turn failed: ${cleanCell(m.error ?? 'no reason given')})`);
   else if (m.status === 'cancelled') lines.push('(that turn was cancelled)');
   return `${lines.join('\n')}\n`;
@@ -1415,7 +1421,7 @@ interface Session {
   /** Tasks started from THIS session on the responses transport (newest
    *  last): lets /tasks list them and /result re-attach after a drop. The
    *  agent itself keeps the authoritative ring; this is just the ids. */
-  tasks?: Array<{ id: string; prompt: string; at: number }>;
+  tasks?: Array<{ id: string; prompt: string; at: number; session?: string }>;
   /** The reasoning level /think last wrote to the settings document, mirrored
    *  here ONLY as the per-message override for frameworks whose bridge takes
    *  one (prime). The durable copy is the document; this is a session echo of
@@ -1718,6 +1724,8 @@ async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (v
   }
   const sid = s.sessionId!;
   const r = await client.promptSession!(sid, sent);
+  // Its id, for /result and /cancel in this session.
+  (s.tasks ??= []).push({ id: r.id, prompt: line.slice(0, 60), at: Date.now(), session: sid });
   const ac = new AbortController();
   irq.streaming = ac;
   // What is typed meanwhile waits for the next turn; a command that only
@@ -3943,8 +3951,9 @@ const L2_HELP_FULL = `session commands
                           this agent thinks with, and how hard. Bare shows it;
                           model=… provider=… thinking=low|high|max
                           others=<json> merge into it and write it back
-                          (owner-signed). Applies at the next boot — /reset
-                          applies it now. On 0g-harness, bare /settings says
+                          (owner-signed). A running agent takes it at once
+                          (its runtime restarts with it); a stopped one at its
+                          next start. On 0g-harness, bare /settings says
                           which versions run; /settings versions lists the
                           ones the trust registry has, and sealed=<hash>
                           harness=<hash> pin them
@@ -3959,9 +3968,9 @@ const L2_HELP_FULL = `session commands
                           prompt; your answer goes back to the agent
   /think [low|high|max]   reasoning depth for thinking models (glm etc.) —
                           shorthand for /settings thinking=…, so it is written
-                          to the owner's document (owner-signed) and applies at
-                          the agent's next boot; /reset applies it now. prime
-                          also takes it per message, from the next one on.
+                          to the owner's document (owner-signed) and a running
+                          agent takes it at once, a stopped one at its next
+                          start. prime also takes it per message.
                           No arg shows the level currently stored
   /clear                  wipe the agent's conversation and start fresh —
                           chain-tracked memory (what the agent chose to keep)
@@ -4502,9 +4511,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // override claiming a level the agent was never given.
         if (written?.thinking === arg) {
           s.thinking = arg as ThinkingLevel;
-          out(s.framework === 'prime-agent'
-            ? '  this framework also takes it per message, so your next message uses it already\n'
-            : '  /reset applies it now; otherwise it lands at the agent\'s next boot\n');
+          // Where it applies is said above (written, and pushed to a running agent).
+          if (s.framework === 'prime-agent') out('  this framework also takes it per message, so your next message uses it already\n');
         }
         continue;
       }
@@ -4642,7 +4650,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (line === '/result' || line.startsWith('/result ')) {
         // A background command or a subagent is not a turn: its record is
         // the activity list's, and it has no stream to follow.
-        const named = line.split(/\s+/)[1];
+        let named = line.split(/\s+/)[1];
+        // An id, or a unique start of one, from the agent's activity list.
+        if (named && s.client?.activity && s.client.activities) {
+          const known = await s.client.activity(named).then(() => true, () => false);
+          if (!known) {
+            const hits = (await s.client.activities({ limit: 200 }).catch(() => [])).filter((a) => a.id.startsWith(named!));
+            if (hits.length !== 1) {
+              out(hits.length ? `${hits.length} start with ${cleanCell(named)} — give more of the id\n` : `nothing with the id ${cleanCell(named)} — /activities lists them\n`);
+              continue;
+            }
+            named = hits[0].id;
+          }
+        }
         if (named && s.client?.activity) {
           const t = await s.client.activity(named).catch(() => null);
           if (t && t.type !== 'turn') {
@@ -4654,7 +4674,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           }
         }
         if (!s.client?.task || !s.client.followTask) { out('(this agent has no task surface)\n'); continue; }
-        const id = named ?? s.tasks?.[s.tasks.length - 1]?.id;
+        // Bare: the newest turn of the session chat goes to now.
+        const id = named ?? [...(s.tasks ?? [])].reverse().find((t) => t.session === s.sessionId)?.id;
         if (!id) { out('no task to show — /result <id>, or start one by chatting\n'); continue; }
         // Adopt an explicitly-named id into this session's task memory: the
         // id may come from another window, a /tasks listing before a restart,
@@ -4666,7 +4687,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const snap = await s.client.task(id).catch(async (e: Error) => {
           // DEFENSIVE: ungated GET (see /tasks) — routed in case the gate widens
           if ((await displacedSeat(e.message ?? '', `retry /result ${id}`)) !== null) return null;
-          out(`(${e.message})\n`);
+          out(`(${cleanCell(plainError(e))})\n`);
           return null;
         });
         if (!snap) continue;
@@ -4920,9 +4941,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!args.length || args.length > 2) { out('usage: /download <name> [local path]\n'); continue; }
         const { dir, name } = parseDownloadName(args[0]);
         const bytes = await s.client.downloadFile(dir, name).catch((e: Error) => {
-          if (/HTTP 404/.test(e.message)) throw new CliError('UNKNOWN', `no file ${name} in the agent's ${dir === 'inbox' ? 'inbox' : 'outbox'} — /files${dir === 'inbox' ? ' inbox' : ''} lists them`);
-          throw e;
+          if (!/HTTP 404/.test(e.message)) throw e;
+          // Saved here by itself, and gone from the agent's outbox since.
+          const local = dir === 'outbox' && outbox ? join(outbox.dir, name) : '';
+          if (local && existsSync(local)) return null;
+          throw new CliError('UNKNOWN', `no file ${name} in the agent's ${dir === 'inbox' ? 'inbox' : 'outbox'} — /files${dir === 'inbox' ? ' inbox' : ''} lists them`);
         });
+        if (!bytes) { out(`already saved to ${cleanCell(tildePath(join(outbox!.dir, name)))}\n`); continue; }
         const saved = saveDownload(bytes, name, args[1]);
         out(`saved ${cleanCell(name)} (${bytes.length} bytes) → ${cleanCell(tildePath(saved))}\n`);
         continue;
@@ -5052,7 +5077,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // Under the Ink view the message moves from the waiting rows into the transcript.
     if (activeInk && text) { activeInk.owner(text); return; }
     if (!view.live) { view.note('  ↳ (read)\n'); return; }
-    const line = text ? `↳ read by the agent: ${oneLine(text)}` : '↳ (read by the agent)';
+    // A read this CLI did not insert (one left over from an earlier turn): no line.
+    if (!text) return;
+    const line = `↳ read by the agent: ${oneLine(text)}`;
     // At this point of the reply: after what it has written so far.
     if (view.after) view.after(line);
     else view.note(line);
@@ -5314,7 +5341,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           onNotice: (n: ChatNotice): void => {
             if (n.imagesSavedAsFiles?.length) {
               clearActivity();
-              view.note(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map(cleanCell).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);
+              view.note(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map((f) => cleanCell(basename(f))).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);
             }
             if (n.outboxFiles?.length) {
               outboxNames = [...new Set([...n.outboxFiles, ...outboxNames])];

@@ -106,3 +106,15 @@ test('charCols: wide and fullwidth two columns, the ambiguous ones (—, →, �
   assert.deepEqual(wrapWords('Step one: the sealed runtime starts in five strict phases', 20), ['Step one: the sealed', 'runtime starts in', 'five strict phases']);
   assert.deepEqual(wrapWords('abcdefghijklmnopqrstuvwxyz', 10), ['abcdefghij', 'klmnopqrst', 'uvwxyz']);
 });
+
+test('live QA: a subagent\'s end reads short, its id cut to what /result takes', async () => {
+  const { renderInboxMessage } = await import('../dist/cli/commands/interactive.js');
+  const m = {
+    seq: 1, id: 'resp_x', trigger: 'job', status: 'completed', created_at: 0,
+    label: 'Background subagent 6f1c2a3b-0d4e-4f5a-9b8c-7d6e5f4a3b2c finished and will do no further work unless you send it more.',
+    text: 'Background subagent 6f1c2a3b-0d4e-4f5a-9b8c-7d6e5f4a3b2c finished and will do no further work unless you send it more.',
+  };
+  const out = renderInboxMessage(m);
+  assert.match(out, /a subagent finished — \/result 6f1c2a3b/);
+  assert.doesNotMatch(out, /no further work|7d6e5f4a3b2c/);
+});
