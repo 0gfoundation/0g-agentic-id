@@ -51,6 +51,52 @@ pub struct IDataArtifact {
     pub ciphertext: Bytes,
 }
 
+/// Public chain metadata cannot carry the deployer's persisted retry bytes.
+/// Synchronization merges those bytes only from the currently locked DB row.
+#[derive(Debug, Clone)]
+pub struct ChainIDataArtifact {
+    pub role: String,
+    pub description: String,
+    pub storage_root: StorageRoot,
+    pub sealed_key: Bytes,
+    pub data_hash: DataHash,
+}
+
+pub(crate) fn merge_chain_i_data(
+    storage_stage: &StageStatus,
+    current: &[IDataArtifact],
+    incoming: Vec<ChainIDataArtifact>,
+) -> Option<Vec<IDataArtifact>> {
+    // A confirmed empty array is the phase-2 scratch cleanup. Chain events
+    // must not refill it, including events fetched before that cleanup.
+    if matches!(storage_stage, StageStatus::Confirmed { .. }) && current.is_empty() {
+        return None;
+    }
+    Some(
+        incoming
+            .into_iter()
+            .map(|metadata| {
+                let ciphertext = current
+                    .iter()
+                    .find(|stored| {
+                        stored.data_hash == metadata.data_hash
+                            && stored.description == metadata.description
+                    })
+                    .map(|stored| stored.ciphertext.clone())
+                    .unwrap_or_default();
+                IDataArtifact {
+                    role: metadata.role,
+                    description: metadata.description,
+                    storage_root: metadata.storage_root,
+                    sealed_key: metadata.sealed_key,
+                    data_hash: metadata.data_hash,
+                    ciphertext,
+                }
+            })
+            .collect(),
+    )
+}
+
 fn bytes_is_empty(b: &Bytes) -> bool {
     b.is_empty()
 }

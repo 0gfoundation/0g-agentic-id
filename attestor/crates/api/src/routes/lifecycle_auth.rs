@@ -22,6 +22,9 @@
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use attestor_shared::auth::operator::{
+    LifecyclePermission, RuntimeAuthorizationError, RuntimePrincipal,
+};
 use attestor_shared::sandbox::verify_envelope;
 use attestor_shared::{Deployment, SandboxEnvelope};
 
@@ -56,4 +59,97 @@ pub(super) async fn authorize_lifecycle(
         ));
     }
     Ok(())
+}
+
+/// Runtime control may be delegated, whereas asset/settings mutations and
+/// deployment recovery keep their owner-only authorization above.
+pub(super) async fn authorize_runtime_lifecycle(
+    state: &AppState,
+    d: &Deployment,
+    envelope: &SandboxEnvelope,
+    permission: LifecyclePermission,
+) -> ApiResult<RuntimePrincipal> {
+    attestor_shared::auth::operator::authorize_runtime(
+        state.chain.as_ref(),
+        state.crypto.as_ref(),
+        state.deployments.as_ref(),
+        state.cfg.chain_id,
+        state.cfg.agentic_id_addr,
+        d,
+        envelope,
+        permission,
+    )
+    .await
+    .map_err(runtime_authorization_error)
+}
+
+pub(super) fn runtime_authorization_error(error: RuntimeAuthorizationError) -> ApiError {
+    match error {
+        RuntimeAuthorizationError::Denied(error) => {
+            ApiError::unauthorized(format!("runtime authorization: {error}"))
+        }
+        RuntimeAuthorizationError::ChainUnavailable(error) => {
+            ApiError::unavailable(format!("runtime owner verification unavailable: {error}"))
+        }
+        RuntimeAuthorizationError::StoreUnavailable(error) => {
+            ApiError::internal(format!("runtime authorization storage: {error}"))
+        }
+    }
+}
+
+pub(super) fn boot_authorization_error(error: RuntimeAuthorizationError) -> ApiError {
+    match error {
+        RuntimeAuthorizationError::Denied(error) => {
+            ApiError::forbidden(format!("boot authorization: {error}"))
+        }
+        error => runtime_authorization_error(error),
+    }
+}
+
+/// Delegating compute management does not let an operator change the agent's
+/// framework or select a different runtime image. The worker repeats this
+/// validation against its configuration immediately before creating compute.
+pub(super) fn validate_operator_create(
+    state: &AppState,
+    deployment: &Deployment,
+    principal: &RuntimePrincipal,
+    framework: Option<&str>,
+    payload: &serde_json::Value,
+) -> ApiResult<()> {
+    if principal.actor == principal.owner {
+        return Ok(());
+    }
+    if framework.is_some_and(|fw| deployment.framework.as_deref() != Some(fw)) {
+        return Err(ApiError::forbidden(
+            "an operator cannot change the agent's framework",
+        ));
+    }
+    attestor_shared::auth::operator::validate_operator_snapshot(
+        &state.cfg,
+        deployment.framework.as_deref(),
+        payload,
+    )
+    .map_err(|error| ApiError::forbidden(format!("operator provisioning: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn dependency_outages_are_not_reported_as_invalid_authorization() {
+        let rpc = runtime_authorization_error(RuntimeAuthorizationError::ChainUnavailable(
+            anyhow::anyhow!("RPC unavailable"),
+        ));
+        assert_eq!(rpc.status, StatusCode::SERVICE_UNAVAILABLE);
+        let storage = runtime_authorization_error(RuntimeAuthorizationError::StoreUnavailable(
+            anyhow::anyhow!("database unavailable"),
+        ));
+        assert_eq!(storage.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let denied = runtime_authorization_error(RuntimeAuthorizationError::Denied(
+            anyhow::anyhow!("operator authorization expired"),
+        ));
+        assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+    }
 }

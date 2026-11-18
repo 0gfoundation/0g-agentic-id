@@ -93,6 +93,8 @@ impl std::error::Error for SandboxError {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalSignedMessage {
     pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentic_id: Option<crate::auth::operator::RuntimeBinding>,
     pub expires_at: i64,
     pub nonce: String,
     pub payload: serde_json::Value,
@@ -525,7 +527,10 @@ fn check_envelope_provider(
 /// the container this create made.
 fn created_container_pubkey(body: &str, seal_id: SealId) -> Option<Vec<u8>> {
     let response: serde_json::Value = serde_json::from_str(body).ok()?;
-    let raw = response.get("env")?.get("SANDBOX_SEAL_ATTESTATION")?.as_str()?;
+    let raw = response
+        .get("env")?
+        .get("SANDBOX_SEAL_ATTESTATION")?
+        .as_str()?;
     let certificate: crate::image_attestation::Certificate = serde_json::from_str(raw).ok()?;
     let parsed = certificate.parse().ok()?;
     (parsed.seal_id == seal_id).then(|| parsed.pubkey.to_vec())
@@ -540,10 +545,12 @@ fn apply_boot_ticket(env: &mut serde_json::Map<String, serde_json::Value>, ticke
 
 #[async_trait]
 impl SandboxClient for HttpSandbox {
-    async fn authenticated_service_identity(&self) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
-        let discovery = self.discovery.as_ref().ok_or_else(|| anyhow::anyhow!(
-            "workload attestation requires authenticated sandbox discovery"
-        ))?;
+    async fn authenticated_service_identity(
+        &self,
+    ) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
+        let discovery = self.discovery.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("workload attestation requires authenticated sandbox discovery")
+        })?;
         Ok(Some(discovery.service_identity().await?))
     }
 
@@ -687,9 +694,9 @@ impl SandboxClient for HttpSandbox {
         let Some(signer) = &self.admin_signer else {
             tracing::warn!(
                 %sandbox_id,
-                "sandbox admin_delete: no admin signer configured, skipping cleanup"
+                "sandbox admin_delete: no admin signer configured; cleanup remains pending"
             );
-            return Ok(());
+            anyhow::bail!("sandbox admin_delete requires an admin signer; cleanup must be retried");
         };
         if sandbox_id.is_empty() {
             anyhow::bail!("sandbox admin_delete: empty sandbox_id");
@@ -707,6 +714,7 @@ impl SandboxClient for HttpSandbox {
             hex::encode(buf)
         };
         let canonical = CanonicalSignedMessage {
+            agentic_id: None,
             action: "stop".into(),
             expires_at: chrono::Utc::now().timestamp() + 240,
             nonce,
@@ -769,7 +777,7 @@ impl SandboxClient for HttpSandbox {
             }
         }
         let (status, body) = res?;
-        if !status.is_success() {
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
             return Err(SandboxError::new("admin_delete", status.as_u16(), body).into());
         }
         tracing::info!(%sandbox_id, signer = %addr_hex, "sandbox: admin force-delete ok");
@@ -796,6 +804,7 @@ impl SandboxClient for HttpSandbox {
             hex::encode(buf)
         };
         let canonical = CanonicalSignedMessage {
+            agentic_id: None,
             action: "get_sandbox".into(),
             expires_at: chrono::Utc::now().timestamp() + 240,
             nonce,
@@ -1006,8 +1015,14 @@ mod tests {
             Some(&key[..])
         );
         // Another seal's certificate, none, or a malformed one: no key.
-        assert_eq!(created_container_pubkey(&attested, SealId::repeat_byte(0xbb)), None);
-        assert_eq!(created_container_pubkey(&body(serde_json::json!({})), seal), None);
+        assert_eq!(
+            created_container_pubkey(&attested, SealId::repeat_byte(0xbb)),
+            None
+        );
+        assert_eq!(
+            created_container_pubkey(&body(serde_json::json!({})), seal),
+            None
+        );
         assert_eq!(
             created_container_pubkey(
                 &body(serde_json::json!({"SANDBOX_SEAL_ATTESTATION": "{}"})),
@@ -1235,6 +1250,7 @@ mod tests {
         );
         sandbox.http = reqwest::Client::builder().no_proxy().build().unwrap();
         let canonical = CanonicalSignedMessage {
+            agentic_id: None,
             action: "start".into(),
             expires_at: 9_999_999_999,
             nonce: "0123456789abcdef0123456789abcdef".into(),
@@ -1334,6 +1350,7 @@ mod tests {
 
     fn make_envelope(sk: &SigningKey, addr: Address) -> (SandboxEnvelope, CanonicalSignedMessage) {
         let canonical = CanonicalSignedMessage {
+            agentic_id: None,
             action: "create".to_string(),
             expires_at: 9_999_999_999,
             nonce: "0123456789abcdef0123456789abcdef".to_string(),
@@ -1623,6 +1640,7 @@ mod tests {
         let signer = AdminSigner::from_priv(priv_bytes).unwrap();
 
         let canonical = CanonicalSignedMessage {
+            agentic_id: None,
             action: "stop".into(),
             expires_at: 9_999_999_999,
             nonce: "deadbeefcafebabedeadbeefcafebabe".into(),

@@ -26,6 +26,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 pub mod clone;
 pub mod credentials;
 pub mod deploy;
+pub mod operator;
 pub mod settings;
 pub mod status;
 

@@ -1098,6 +1098,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "attestor-shared",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "hex",

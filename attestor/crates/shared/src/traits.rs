@@ -6,6 +6,33 @@ use crate::types::*;
 use alloy::primitives::{Address, Bytes, TxHash, B256};
 use async_trait::async_trait;
 
+pub const MAX_OPERATOR_CHECKPOINT_SPAN: u64 = 10_000;
+pub const OPERATOR_TRANSFER_LOG_CHUNK: u64 = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorContinuityRejection {
+    NonCanonical,
+    OwnerChanged,
+    TransferObserved,
+    CheckpointTooOld { maximum_span: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorContinuity {
+    Continuous {
+        snapshot: crate::auth::operator::OperatorCheckpoint,
+    },
+    RefreshRequired {
+        reason: OperatorContinuityRejection,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("operator checkpoint predates indexed ownership block {minimum_block}; fetch a new checkpoint and sign again")]
+pub struct OperatorCheckpointSuperseded {
+    pub minimum_block: u64,
+}
+
 // ── Chain ───────────────────────────────────────────────────────────────
 #[async_trait]
 pub trait ChainClient: Send + Sync {
@@ -16,6 +43,39 @@ pub trait ChainClient: Send + Sync {
 
     async fn get_agent_id_by_seal_id(&self, seal_id: SealId) -> anyhow::Result<Option<AgentId>>;
     async fn owner_of(&self, agent_id: AgentId) -> anyhow::Result<Address>;
+    async fn operator_checkpoint(
+        &self,
+    ) -> anyhow::Result<crate::auth::operator::OperatorCheckpoint> {
+        anyhow::bail!("operator chain checkpoints are not implemented")
+    }
+    /// Header-only check. An unavailable/missing header remains a dependency
+    /// error; a known canonical header with another hash returns false.
+    async fn is_checkpoint_canonical(
+        &self,
+        _checkpoint: &crate::auth::operator::OperatorCheckpoint,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("checkpoint header reads are not implemented")
+    }
+    /// Prove H's ownership from current state and the intervening Transfer
+    /// history. No state read at H is required on pruning RPC nodes.
+    async fn verify_operator_continuity(
+        &self,
+        _agent: AgentId,
+        _checkpoint: &crate::auth::operator::OperatorCheckpoint,
+        _owner: Address,
+    ) -> anyhow::Result<OperatorContinuity> {
+        anyhow::bail!("operator ownership continuity is not implemented")
+    }
+    /// Optional historical-state reader. None means a known hash mismatch or
+    /// no owner at H; missing headers/state and RPC failures remain errors.
+    async fn owner_at_checkpoint(
+        &self,
+        _agent: AgentId,
+        _checkpoint: &crate::auth::operator::OperatorCheckpoint,
+    ) -> anyhow::Result<Option<Address>> {
+        anyhow::bail!("historical operator ownership is not implemented")
+    }
+
     async fn is_valid_framework_hash(&self, hash: ImageHash) -> anyhow::Result<bool>;
     async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool>;
 
@@ -191,7 +251,9 @@ pub trait SandboxClient: Send + Sync {
     }
     /// Full authenticated issuer scope used by workload attestations. Explicit
     /// mocks must configure it; the default never authorizes an arbitrary key.
-    async fn authenticated_service_identity(&self) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
+    async fn authenticated_service_identity(
+        &self,
+    ) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
         Ok(None)
     }
     /// Current authenticated connection metadata; mock implementations may omit it.
@@ -248,6 +310,141 @@ pub trait SandboxClient: Send + Sync {
 // ── Deployment repository ───────────────────────────────────────────────
 #[async_trait]
 pub trait DeploymentRepo: Send + Sync {
+    // Owner-signed runtime delegation and generation-fenced compute control.
+    async fn operator_grant(
+        &self,
+        _seal_id: SealId,
+    ) -> anyhow::Result<Option<crate::auth::operator::OperatorGrant>> {
+        Ok(None)
+    }
+
+    async fn observe_operator_transfer(&self, _agent: AgentId, _block: u64) -> anyhow::Result<()> {
+        anyhow::bail!("operator ownership admission fencing is not implemented")
+    }
+
+    async fn invalidate_operator_for_transfer(
+        &self,
+        _agent_id: AgentId,
+        _previous_owner: Address,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// A canonical signed block-end checkpoint protects only the revision
+    /// inspected by the indexer. False asks it to re-read after a concurrent CAS.
+    async fn invalidate_operator_for_transfer_at(
+        &self,
+        _agent: AgentId,
+        _previous_owner: Address,
+        _event_block: u64,
+        _expected_version: i64,
+        _canonical_checkpoint: Option<crate::auth::operator::OperatorCheckpoint>,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("checkpoint-aware operator transfer invalidation is not implemented")
+    }
+
+    /// Includes disabled and legacy binding rows whose ticket is NULL.
+    async fn runtime_generation(&self, _seal: SealId) -> anyhow::Result<Option<i64>> {
+        anyhow::bail!("runtime revision reads are not implemented")
+    }
+
+    async fn compare_and_swap_operator(
+        &self,
+        _seal_id: SealId,
+        _base_version: i64,
+        _grant: crate::auth::operator::OperatorGrant,
+    ) -> anyhow::Result<Option<crate::auth::operator::OperatorUpdate>> {
+        anyhow::bail!("operator delegation storage is not implemented")
+    }
+
+    async fn pending_operator_teardowns(&self) -> anyhow::Result<Vec<(SealId, String)>> {
+        Ok(Vec::new())
+    }
+
+    async fn complete_operator_teardown(
+        &self,
+        _seal_id: SealId,
+        _sandbox_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("operator teardown storage is not implemented")
+    }
+
+    async fn enqueue_operator_teardown(
+        &self,
+        _seal_id: SealId,
+        _sandbox_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("operator teardown storage is not implemented")
+    }
+
+    async fn prepare_operator_boot(
+        &self,
+        _seal_id: SealId,
+        _ticket: Option<[u8; 32]>,
+        _owner: Address,
+        _operator: Address,
+        _operator_version: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        anyhow::bail!("operator boot authorization is not implemented")
+    }
+
+    /// Resume only the exact sandbox and boot revision inspected by the caller.
+    /// A replacement or role change must leave its complete boot state intact.
+    async fn prepare_status_resume(
+        &self,
+        _seal_id: SealId,
+        _expected_sandbox: &str,
+        _expected_generation: i64,
+        _owner: Address,
+    ) -> anyhow::Result<Option<i64>> {
+        anyhow::bail!("owner resume fencing is not implemented")
+    }
+
+    async fn prepare_operator_resume(
+        &self,
+        _seal_id: SealId,
+        _expected_sandbox: &str,
+        _expected_generation: i64,
+        _owner: Address,
+        _operator: Address,
+        _operator_version: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        anyhow::bail!("operator resume fencing is not implemented")
+    }
+
+    async fn bind_runtime_sandbox(
+        &self,
+        _seal_id: SealId,
+        _sandbox_id: String,
+        _generation: i64,
+        _pin: Option<Vec<u8>>,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("runtime sandbox generation binding is not implemented")
+    }
+
+    /// Complete a provider stop without requiring the captured boot to remain
+    /// enabled. Both stopped and failed stop outcomes retain revision fencing.
+    async fn complete_runtime_stop(
+        &self,
+        _seal: SealId,
+        _sandbox: Option<&str>,
+        _generation: Option<i64>,
+        _stage: StageStatus,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("stop completion revision fencing is not implemented")
+    }
+
+    async fn transition_runtime(
+        &self,
+        _seal_id: SealId,
+        _expected_sandbox: Option<&str>,
+        _expected_generation: Option<i64>,
+        _stage: StageStatus,
+        _deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("runtime transition generation fencing is not implemented")
+    }
+
     async fn insert(&self, deployment: &Deployment) -> anyhow::Result<()>;
     async fn get(&self, seal_id: SealId) -> anyhow::Result<Option<Deployment>>;
     async fn get_by_agent_id(&self, agent_id: AgentId) -> anyhow::Result<Option<Deployment>>;
@@ -336,6 +533,17 @@ pub trait DeploymentRepo: Send + Sync {
         seal_id: SealId,
         artifacts: Vec<IDataArtifact>,
     ) -> anyhow::Result<()>;
+
+    /// Reconcile chain metadata under the same row lock as scratch cleanup.
+    /// A confirmed, empty snapshot stays empty; retry ciphertext comes only
+    /// from the latest locked row, never from a caller's earlier read.
+    async fn sync_chain_i_data(
+        &self,
+        _seal_id: SealId,
+        _artifacts: Vec<ChainIDataArtifact>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("chain iData reconciliation is not implemented")
+    }
 
     /// Set `agent_uri` and `agent_card` together — used by (a) the worker
     /// after building+uploading the AgentCard JSON and calling setAgentURI,

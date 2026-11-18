@@ -250,13 +250,16 @@ cargo run -p attestor-indexer# 第三个终端
 | `GET /inference/providers` | 带版本的 provider 注册表；可用 `?version=N` 读取经接受凭据校验的历史版本，供 stop/start 保持旧路由；内置初始名单为版本 0 | 公开 |
 | `PUT /admin/inference/providers` | 通过 HTTP 发布完整名单，Postgres 留存历史并校验版本，无需 SSH 或重启，见 [运维流程](../sdk/typescript/PROVIDERS.zh.md) | attestor Tapp 当前 owner 签名（EOA/EIP-1271） |
 
-### 生命周期（owner-driven）
+### 生命周期
+
+NFT owner 可以指定 operator，由 operator 创建、付费并启停自己的 sandbox。设置和凭据仍由 owner 管理。参见 [运行委托 API](./OPERATORS.zh.md) 和 [SDK 使用流程](../sdk/typescript/OPERATORS.zh.md)。
 
 | 路径 | 干什么 | 鉴权 |
 |---|---|---|
 | `POST /deploy` | 用户部署 agent。sandbox envelope 的 `env` 含 `API_KEY` / `SEAL_SECRET_ENV` 以外的键时返回 `400` 并指出该键。带 `await_credentials: true`（与其余字段一起签名）时，等 agent 的凭据集存好再创建容器；没等到时，mint 完成 10 秒后创建，mint 失败则立即停止等待、不创建容器，最多等 60 秒：SDK 在部署被接受后立即把模型 key 存进凭据集，立即创建的容器会先于它启动 | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | 源 owner 为另一 owner 铸一个全新 agent，复用源的链上 iData（dataKey 重封给新 agentSeal）；落 Offline，由新 owner 自行上线 | owner EIP-191，校验签名者 == **链上实时 `ownerOf(source)`**（非自声明 owner） |
-| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。只有当前启动票据为其签发的 sandbox 才能 `start`（resume），否则返回 `409`：AgentDNA 0.4 之前创建的 sandbox（没有启动票据，或票据没有签发时间），以及 reset 的 create 失败后仍留在记录上的旧 sandbox，都无法 provision，需 reset。envelope 的 `resource_id` 不是该部署当前 sandbox 的 `start` 或 `stop` 同样返回 `409`（API 与 worker 都会检查），因此 reset 之前留存的 sandbox id 不会以该 agent 的名义被启动或停止。create envelope（reset、首次 provision 的 `start`、带 envelope 的 `retry`）的 `env` 含 `API_KEY` / `SEAL_SECRET_ENV` 以外的键时返回 `400` 并指出该键，不会排入任何任务 | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
+| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。只有当前启动票据为其签发的 sandbox 才能 `start`（resume），否则返回 `409`：AgentDNA 0.4 之前创建的 sandbox（没有启动票据，或票据没有签发时间），以及 reset 的 create 失败后仍留在记录上的旧 sandbox，都无法 provision，需 reset。envelope 的 `resource_id` 不是该部署当前 sandbox 的 `start` 或 `stop` 同样返回 `409`（API 与 worker 都会检查），因此 reset 之前留存的 sandbox id 不会以该 agent 的名义被启动或停止。create envelope（reset、首次 provision 的 `start`、带 envelope 的 `retry`）的 `env` 含 `API_KEY` / `SEAL_SECRET_ENV` 以外的键时返回 `400` 并指出该键，不会排入任何任务 | owner 或已授权 operator 的 envelope；`/retry` 仍仅限 owner。operator 重建需 `allow_recreate`；每个钱包控制自己的 sandbox |
+| `GET /operator` / `PUT /operator` | 读取公开授权摘要；owner 通过带版本的签名指定、更新或撤销 operator。每次授权更新都会撤销当前 boot，并排队清理旧 sandbox | GET 公开；PUT 校验实时 NFT owner 的 EIP-191 签名，见 [委托 API](./OPERATORS.zh.md) |
 | `GET /settings?seal_id=0x…` | owner 读自己的配置文档，连带当前 `version`（下一次写要签的 base）。文档是 owner 的，不进任何公开层——只有这一条路能读。响应还带 `confirmed_version` / `attempts` / `fallback_active`：客户端据此告诉 owner「上次推送没起来、agent 正跑着上一份文档、再推一次就是重试」| owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /settings` | owner 写 agent 的那一份配置文档。attestor 只当**不透明 blob** 存：不解析、不校验、不打日志，所以扩配置词表永远不用改 attestor。不上链——配置可随时重给，记忆不行。写是 compare-and-swap：base version 过期就 409 带 `current_version`，于是抓包重放回不去旧文档，两个客户端也不会互相无声覆盖 | owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<文档 sha256>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `GET /credentials?seal_id=0x…` | owner 读取 agent 的凭据集（定义；值只以加密给 agent 的密文出现）、写回，以及下一个凭据集要签的所有权纪元。见 `sealed/CREDENTIALS.zh.md` | owner 对 `AgenticID.Credentials.v1:0x<sealId>:<ts>:0` 的 EIP-191 签名，校验到**链上实时 owner**；mint 之前校验到部署记录里的 owner（mint 给到的地址） |
