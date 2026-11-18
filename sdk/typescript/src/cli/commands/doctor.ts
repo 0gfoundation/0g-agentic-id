@@ -19,7 +19,7 @@ import { buildClient, unreachableReason } from '../sdk';
 import { renamedAttestor } from '../config';
 import { attestorUrlRemedy } from '../env';
 import { CliError, currentSurface, shellStep, shellTo, type ErrorCode } from '../errors';
-import { explainError } from '../plain';
+import { explainError, ogShown } from '../plain';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
 
@@ -141,7 +141,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     try {
       const bal = await publicClient.getBalance({ address: owner });
       if (bal > 0n) {
-        checks.push({ name: 'gas', status: 'pass', detail: `${formatEther(bal)} OG` });
+        checks.push({ name: 'gas', status: 'pass', detail: ogShown(bal) });
       } else {
         checks.push({
           name: 'gas', status: 'fail', code: 'PREFLIGHT_GAS',
@@ -204,11 +204,11 @@ export async function run(ctx: CommandContext): Promise<void> {
       try {
         const bal = await ag.getBalance({ user: owner });
         if (bal >= MIN_SANDBOX_BALANCE_WEI) {
-          checks.push({ name: 'sandboxBalance', status: 'pass', detail: `${formatEther(bal)} OG (≥ 0.1 floor)` });
+          checks.push({ name: 'sandboxBalance', status: 'pass', detail: `${ogShown(bal)} (≥ 0.1 floor)` });
         } else {
           checks.push({
             name: 'sandboxBalance', status: 'fail', code: 'PREFLIGHT_BALANCE',
-            detail: `${formatEther(bal)} OG — below the 0.1 OG deploy floor`,
+            detail: `${ogShown(bal)} — below the 0.1 OG deploy floor`,
             remedy: shellStep(`deposit ${formatEther(MIN_SANDBOX_BALANCE_WEI - bal)}`),
           });
         }

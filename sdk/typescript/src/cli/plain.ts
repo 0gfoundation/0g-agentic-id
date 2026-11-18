@@ -27,6 +27,11 @@ export function ogAmount(wei: bigint): string {
   return formatEther(wei);
 }
 
+/** `681.357721 OG` — an OG balance to read, with six decimals (as whoami shows them). */
+export function ogShown(wei: bigint): string {
+  return `${(Number(wei) / 1e18).toFixed(6)} OG`;
+}
+
 /**
  * An amount of OG typed by the owner, in wei. Refuses anything that is not a
  * plain positive decimal (`-1`, `abc`, `0`, `1e3`, more than 18 decimals)
