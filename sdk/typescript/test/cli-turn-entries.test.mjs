@@ -314,7 +314,7 @@ test('/activities at 60 columns drops AGE and FOR before it squeezes WHAT; a sub
   assert.match(rows[0], /^ {2}ID\s+STATUS\s+BY\s+WHAT$/);
   for (const r of rows) assert.ok(r.length <= 59, r);
   assert.match(rows[1], /agent {5}Run `sleep 8` in/);
-  assert.match(rows[2], /subagent finished \(a3d11469\)$/);
+  assert.match(renderActivityTable(acts, now * 1000, 100)[2], /subagent finished \(a3d11469\)$/);
   // Wide enough: every column.
   assert.match(renderActivityTable(acts, now * 1000, 100)[0], /BY\s+FOR\s+AGE\s+WHAT/);
 });
