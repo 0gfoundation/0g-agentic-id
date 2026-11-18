@@ -1917,7 +1917,7 @@ function proxyAddrOf(attestorUrl: string): Promise<string | undefined> {
  *  phase always; the container URL as soon as a sandbox exists (the sealed
  *  runtime serves /log while still `deploying`); the chat client only when
  *  running (and dropped again when not, so a stale connection can't linger). */
-async function refreshSession(s: Session, quiet = false): Promise<void> {
+async function refreshSession(s: Session, quiet: boolean | 'silent' = false): Promise<void> {
   const before = s.phase;
   const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`)).json()) as {
     phase?: string; url?: string; sandbox_id?: string;
@@ -1938,11 +1938,27 @@ async function refreshSession(s: Session, quiet = false): Promise<void> {
     s.sandboxId = d.sandbox_id ?? s.sandboxId;
     s.client = undefined;
   }
-  if (quiet && s.phase === before) return; // background refresh: report only movement
+  if (quiet === 'silent' || (quiet && s.phase === before)) return; // background refresh: report only movement
   out(`  phase   ${s.phase}\n`);
   if (s.url) out(`  url     ${s.url}\n`);
   const reason = d.container_stage?.state === 'failed' ? d.container_stage.reason : undefined;
   if (reason) out(`  last error: ${reason}\n`);
+}
+
+/** How often an idle session re-reads the phase of an agent it believes running. */
+export const PHASE_WATCH_MS = 30_000;
+
+/** The wait before the next phase read: the base one after a read that
+ *  worked, doubling after each that failed, up to five minutes. Exported for the tests. */
+export function nextPhaseWait(prev: number, ok: boolean): number {
+  return ok ? PHASE_WATCH_MS : Math.min(Math.max(prev, PHASE_WATCH_MS) * 2, 300_000);
+}
+
+/** The line for an agent the session believed running that is not any
+ *  more, with the way back. Exported for the tests. */
+export function phaseMovedText(phase: string): string {
+  const back = phase === 'stopped' ? ' — /start' : phase === 'offline' || phase === 'failed' ? ' — /reset' : '';
+  return `  phase   ${phase}${back}\n`;
 }
 
 /** An agent's container state just before a lifecycle request was sent. */
@@ -4037,6 +4053,31 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     recount();
   };
   const inbox = makeInboxFeed((text, shown, count) => show(text, shown, { notices: count }));
+  // While the prompt is idle and the agent is believed running, its phase is
+  // re-read now and then (one attestor read), so a stop made elsewhere shows
+  // without a key press. Not during a turn or a command; slower after errors.
+  let phaseWait = PHASE_WATCH_MS;
+  let phaseWatch: NodeJS.Timeout | null = null;
+  const watchPhase = (): void => {
+    phaseWatch = setTimeout(() => {
+      void (async () => {
+        let ok = true;
+        if (atPrompt && s.client) {
+          try {
+            const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`, { signal: AbortSignal.timeout(10_000) })).json()) as { phase?: string };
+            if (d.phase && d.phase !== 'running' && atPrompt && s.client) {
+              await refreshSession(s, 'silent');
+              if (s.phase !== 'running') printAbovePrompt(phaseMovedText(s.phase));
+            }
+          } catch { ok = false; }
+        }
+        phaseWait = nextPhaseWait(phaseWait, ok);
+        if (phaseWatch) watchPhase();
+      })();
+    }, phaseWait);
+    phaseWatch.unref();
+  };
+  if (terminal) watchPhase();
   // An interrupted turn sends nothing on its own: what was queued during it
   // comes back to be edited at the next prompt.
   screen.interrupted = (extra: readonly string[] = []): string => {
@@ -5336,6 +5377,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     irq.brake = null; // leaving the session: idle-Esc no longer targets this agent
     inbox.stop();
     if (outboxTimer) clearInterval(outboxTimer);
+    if (phaseWatch) { clearTimeout(phaseWatch); phaseWatch = null; }
     s.screen = undefined;
   }
 }
