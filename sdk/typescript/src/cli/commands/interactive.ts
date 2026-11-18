@@ -15,7 +15,7 @@
 
 import * as readline from 'node:readline';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
@@ -780,6 +780,9 @@ export function completeLine(
 let activeRl: readline.Interface | null = null;
 // The shell's line queue: a turn's live prompt shows what waits in it.
 let activeAsk: Ask | null = null;
+// The Ink session view while it is up (inkView.ts): everything printed goes
+// to its transcript, and the keys to it.
+let activeInk: InkScreen<Ask> | null = null;
 
 /**
  * Print a block above the live prompt, keeping what the user has typed. The
@@ -796,6 +799,7 @@ export function printAbovePrompt(
   rl: readline.Interface | null = activeRl,
   output: NodeJS.WritableStream = process.stdout,
 ): void {
+  if (activeInk && rl === activeRl) { activeInk.print(text); return; }
   if (!rl || !rl.terminal) {
     output.write(text.startsWith('\n') ? text : `\n${text}`);
     return;
@@ -811,6 +815,7 @@ export function printAbovePrompt(
 import type { CommandContext } from '../types';
 import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
 import { CONT_PROMPT, LiveTurn, PlainTurn, liveKeys, type LiveState, type TurnView } from '../livePrompt';
+import { INK_PROMPT, MIN_COLS, MIN_ROWS, inkLoadError, loadInk, openInkScreen, type InkScreen, type Key as InkKey } from '../inkView';
 import { OUTBOX_POLL_MS, makeOutboxSync, renderOutboxEvent, supportsHyperlinks, tildePath, type OutboxSync } from '../outboxSync';
 
 /** Column widths of the REPL listing; its header and every row share them. */
@@ -897,6 +902,10 @@ type Ask = ((q: string) => Promise<string>) & {
   /** The shell's prompt now says q (its status changed): redrawn in place
    *  when it is up, used from the next prompt otherwise. */
   retitle?: (q: string) => void;
+  /** The question up, if any: its kind and its text. */
+  waiting?: () => { kind: 'q' | 'main' | 'message'; q: string } | null;
+  /** Take every entry waiting for the next prompt out of the queue. */
+  drain?: () => Entry[];
 };
 
 /** What the owner entered: its text (newlines kept), whether it spans lines,
@@ -953,6 +962,12 @@ type KeySource = { on(ev: 'keypress', f: (s: string | undefined, key: Key | unde
  * question takes one line: several pasted lines are not its answer, and a
  * paste does not answer a yes/no question. Without keys (piped input) every
  * line is one answer, as before.
+ *
+ * `boxed`: the line being edited is drawn by the Ink session view
+ * (inkView.ts), which shows the message's earlier lines itself, so nothing
+ * readline would need to show them is written; `echo` puts what a question
+ * was given into the transcript (readline leaves it on the screen as typed);
+ * `say` is where the queue's own notes go (default: the shell's output).
  */
 export function lineQueue(
   rl: {
@@ -961,7 +976,9 @@ export function lineQueue(
   },
   tty: () => boolean,
   keys?: KeySource,
+  opts: { boxed?: boolean; echo?: (kind: 'q' | 'main' | 'message', q: string, e: Entry) => void; say?: (s: string) => void } = {},
 ): Ask {
+  const { boxed = false, echo, say = out } = opts;
   type Kind = 'q' | 'main' | 'message';
   const pending: Entry[] = [];
   const waiters: Array<{ res: (e: Entry) => void; rej: (e: Error) => void; kind: Kind; q: string }> = [];
@@ -1001,12 +1018,13 @@ export function lineQueue(
     }
     const refused = accepts(w, e);
     if (refused) {
-      out(`  (${refused}: type it)\n`);
+      say(`  (${refused}: type it)\n`);
       rl.setPrompt(w.q);
       rl.prompt();
       return;
     }
     waiters.shift();
+    echo?.(w.kind, w.q, e);
     w.res(e);
   };
   // The next line of a message: under its own prompt, when a prompt is up
@@ -1049,7 +1067,7 @@ export function lineQueue(
       // One line and its newline: as if typed (a pasted key, an address).
       if (lines.length === 1 && !tail) { touched = false; deliver({ text: lines[0], multi: false, pasted: true }); return; }
       clearEdit();
-      out(`\n  (${w.kind === 'main' ? 'several pasted lines are not a command' : 'several pasted lines are an answer only at the agent prompt'}: type it)\n`);
+      say(`\n  (${w.kind === 'main' ? 'several pasted lines are not a command' : 'several pasted lines are an answer only at the agent prompt'}: type it)\n`);
       touched = false;
       rl.setPrompt(w.q);
       rl.prompt();
@@ -1057,13 +1075,13 @@ export function lineQueue(
     }
     draft.push(...lines);
     draftPasted = true;
-    if (!w) return; // during a turn: the agent prompt shows it
+    if (!w || boxed) return; // during a turn the agent prompt shows it; the Ink view shows it always
     // The pasted lines are on the screen as readline echoed them; say how it
     // is sent, then the line being edited goes on under the next-line prompt.
     if (tail) term('\r\x1b[K');
     // The last pasted line, when no newline ended it, is the line being edited.
     const n = draft.length + (tail ? 1 : 0);
-    out(`  [pasted ${n} line${n === 1 ? '' : 's'} · Enter sends]\n`);
+    say(`  [pasted ${n} line${n === 1 ? '' : 's'} · Enter sends]\n`);
     rl.setPrompt(CONT);
     if (typeof edit.cursor === 'number') edit.cursor = tail.length;
     if (typeof edit.prevRows === 'number') edit.prevRows = 0;
@@ -1113,8 +1131,8 @@ export function lineQueue(
       draftPasted ||= touched;
       touched = false;
       clearEdit();
-      if (!waiters[0]) return;
-      out('\n');
+      if (!waiters[0] || boxed) return;
+      say('\n');
       goOn();
       return;
     }
@@ -1144,16 +1162,17 @@ export function lineQueue(
   const wait = (q: string, kind: Kind): Promise<Entry> => {
     for (let buffered = pending.shift(); buffered !== undefined; buffered = pending.shift()) {
       const refused = accepts({ kind, q }, buffered);
-      if (refused) { out(`  (an earlier entry was dropped: ${refused})\n`); continue; }
-      out(`${q}${buffered.text}\n`); // keep the transcript readable in pipes/logs
+      if (refused) { say(`  (an earlier entry was dropped: ${refused})\n`); continue; }
+      if (echo) echo(kind, q, buffered);
+      else say(`${q}${buffered.text}\n`); // keep the transcript readable in pipes/logs
       return Promise.resolve(buffered);
     }
     if (stdinClosed) {
       return Promise.reject(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
     }
-    if (kind === 'message' && draft.length) {
+    if (kind === 'message' && draft.length && !boxed) {
       // A message begun during the turn: show what it holds so far.
-      out(`${q}${draft.join('\n')}\n`);
+      say(`${q}${draft.join('\n')}\n`);
       q = CONT;
     }
     rl.setPrompt(q);
@@ -1168,6 +1187,8 @@ export function lineQueue(
   ask.later = (e) => { pending.push(e); };
   ask.drafting = () => [...draft];
   ask.queued = () => [...pending];
+  ask.waiting = () => (waiters[0] ? { kind: waiters[0].kind, q: waiters[0].q } : null);
+  ask.drain = () => pending.splice(0);
   ask.recall = (): boolean => {
     if (waiters[0] || draft.length || editLine() || !pending.length) return false;
     const e = pending.pop()!;
@@ -1237,18 +1258,22 @@ export function lineQueue(
       const shown = Date.now();
       const a = await wait(q, 'q');
       if (a.pasted && a.text.trim()) {
-        out('  (a paste is not an answer to this question: type it)\n');
+        say('  (a paste is not an answer to this question: type it)\n');
         continue;
       }
       if (!a.text.trim() || Date.now() - shown >= READ_MS) return a.text;
-      out('  (that came in before the question could be read: answer again)\n');
+      say('  (that came in before the question could be read: answer again)\n');
     }
   };
   return ask;
 }
 
-/** Writes to the terminal as is: only for the shell's own control sequences. */
-const term = (s: string): void => void process.stdout.write(s);
+/** Writes to the terminal as is: only for the shell's own control sequences.
+ *  Under the Ink view its text goes to the transcript (inkView.ts raw). */
+const term = (s: string): void => {
+  if (activeInk) activeInk.raw(s);
+  else process.stdout.write(s);
+};
 /**
  * Writes text to the terminal with escape sequences, control characters
  * (newlines and tabs kept) and bidi controls removed. Everything the shell
@@ -1345,10 +1370,10 @@ function livePromptOn(): boolean {
 
 /** A turn's output: under a live prompt on a terminal, else written as it
  *  comes. `steered`: what went into this turn and was not read yet. */
-function openTurn(s: Session, steered: () => readonly string[] = () => []): TurnView {
+function openTurn(s: Session, steered: () => readonly string[] = () => [], steers = false): TurnView {
   const screen = s.screen;
   if (screen) screen.turnRan = true;
-  const view = livePromptOn() && activeRl
+  const view = activeInk ? activeInk.turn({ steered, steers }) : livePromptOn() && activeRl
     ? new LiveTurn(activeRl, process.stdout, activeAsk ?? {}, (): LiveState => ({
         prompt: screen?.prompt(true) ?? sessionPromptText(s.agentId, sessionLabel(s), true, { notices: 0, files: 0 }),
         notes: turnNotes(steered(), activeAsk?.queued?.() ?? []),
@@ -1405,6 +1430,44 @@ export function activityText(label: string): string {
   if (tool) return TOOL_TEXT[tool] ?? (/^memory|remember/i.test(tool) ? 'updating its memory' : `using ${tool}`);
   if (/subagent|rlm_child/i.test(l)) return 'asking a subagent';
   return 'working';
+}
+
+/** What {@link activityText}'s words become once done: one, and several ({n}). */
+const TOOL_DONE: Record<string, [string, string]> = {
+  'running a command': ['ran a command', 'ran {n} commands'],
+  'searching the web': ['searched the web', 'searched the web {n} times'],
+  'reading a web page': ['read a web page', 'read {n} web pages'],
+  'reading a file': ['read a file', 'read {n} files'],
+  'looking at an image': ['looked at an image', 'looked at {n} images'],
+  'writing a file': ['wrote a file', 'wrote {n} files'],
+  'editing a file': ['edited a file', 'edited {n} files'],
+  'asking a subagent': ['asked a subagent', 'asked {n} subagents'],
+  'checking subagent models': ['checked the subagent models', 'checked the subagent models {n} times'],
+  'checking a background job': ['checked a background job', 'checked background jobs {n} times'],
+  'checking background jobs': ['checked the background jobs', 'checked the background jobs {n} times'],
+  'updating its memory': ['updated its memory', 'updated its memory {n} times'],
+};
+
+/**
+ * One run of the agent's tool calls in plain words, as the Ink view's
+ * transcript shows it: "ran 3 commands, read a file". Only the calls count
+ * (a tool's result, thinking and the like do not); '' when there were none.
+ */
+export function activitySummary(labels: readonly string[]): string {
+  const n = new Map<string, number>();
+  for (const label of labels) {
+    const l = label.trim();
+    if (!/^tool\/call\s+\S/.test(l) && !/tool_execution_start\s*[—-]\s*\S/.test(l)) continue;
+    const what = activityText(l);
+    n.set(what, (n.get(what) ?? 0) + 1);
+  }
+  return [...n].map(([what, k]) => {
+    const done = TOOL_DONE[what];
+    if (done) return k === 1 ? done[0] : done[1].replace('{n}', String(k));
+    const used = /^using (.+)$/.exec(what)?.[1];
+    if (used) return k === 1 ? `used ${used}` : `used ${used} ${k} times`;
+    return k === 1 ? what : `${what} (${k} times)`;
+  }).join(', ');
 }
 
 /**
@@ -1588,12 +1651,20 @@ export async function pollRunning(
   const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
   let spin = 0;
   let spinnerShown = false;
-  const clearSpinner = (): void => { if (spinnerShown) { term('\r\x1b[2K'); spinnerShown = false; } };
+  const clearSpinner = (): void => {
+    if (!spinnerShown) return;
+    if (activeInk) activeInk.status(null);
+    else term('\r\x1b[2K');
+    spinnerShown = false;
+  };
   const ticker = process.stdout.isTTY
     ? setInterval(() => {
         if (signal?.aborted) return;
         spin = (spin + 1) % SPIN.length;
-        term(`\r\x1b[2K  ${cleanCell(`${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · esc stops waiting, not the deploy)`)}`);
+        const line = cleanCell(`${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · esc stops waiting, not the deploy)`);
+        // Under the Ink view: its status row.
+        if (activeInk) activeInk.status(line);
+        else term(`\r\x1b[2K  ${line}`);
         spinnerShown = true;
       }, 1000)
     : null;
@@ -1669,6 +1740,143 @@ async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sea
   }
 }
 
+type KeyFn = (s: string | undefined, key: InkKey | undefined) => void;
+
+/**
+ * Every keypress through one listener that calls the shell's listeners in
+ * the order they were added, or, while the Ink session view is up, only the
+ * view's (`use`): readline must not edit a line it does not show. `drop`
+ * takes listeners out for good (readline's, once it is closed).
+ */
+function routeKeys(stdin: NodeJS.ReadStream): { use(f: KeyFn | null): void; drop(fs: unknown[]): void } {
+  let shell = stdin.listeners('keypress') as KeyFn[];
+  stdin.removeAllListeners('keypress');
+  let only: KeyFn | null = null;
+  stdin.on('keypress', (s: string | undefined, key: InkKey | undefined) => {
+    if (only) { only(s, key); return; }
+    for (const f of shell) f.call(stdin, s, key);
+  });
+  return {
+    use: (f) => { only = f; },
+    drop: (fs) => { shell = shell.filter((f) => !fs.includes(f)); },
+  };
+}
+
+/** What run() sets up that the Ink session view takes over while it is up. */
+let shellIO: {
+  rl: readline.Interface;
+  ask: Ask;
+  keys: { use(f: KeyFn | null): void } | null;
+  rlResize: Array<() => void>;
+  onInterrupt(): void;
+  onEscape(): void;
+} | null = null;
+let inkNoticeShown = false;
+let inkEof = false;
+
+/** is-in-ci's rule: there Ink prints only its last frame. */
+function inCi(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CI !== '0' && env.CI !== 'false'
+    && ('CI' in env || 'CONTINUOUS_INTEGRATION' in env || Object.keys(env).some((k) => k.startsWith('CI_')));
+}
+
+/** Whether a session gets the Ink view: where a turn keeps its prompt on
+ *  screen (livePromptOn), with both ends a terminal of a usable size, unless
+ *  AGENTDNA_INK=off. */
+function inkWanted(): boolean {
+  return livePromptOn() && !!process.stdin.isTTY && !/^(0|off|false|no)$/i.test(process.env.AGENTDNA_INK ?? '') && !inCi()
+    && (process.stdout.rows ?? 0) >= MIN_ROWS && (process.stdout.columns ?? 0) >= MIN_COLS;
+}
+
+/** Put the Ink view up for a session; null when it is not wanted or cannot start (the readline prompt then). */
+async function openInk(): Promise<InkScreen<Ask> | null> {
+  const io = shellIO;
+  if (!io?.keys || activeInk || !inkWanted()) return null;
+  const lib = await loadInk();
+  const say = (why: string): null => {
+    if (!inkNoticeShown) out(`(the framed session view is not available: ${cleanCell(why)} — the plain prompt instead)\n`);
+    inkNoticeShown = true;
+    return null;
+  };
+  if (!lib) return say(inkLoadError() ?? 'Ink did not load');
+  let screen: InkScreen<Ask>;
+  try {
+    screen = openInkScreen<Ask>({
+      lib,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      makeAsk: (editor, echo) => lineQueue(editor, () => true, editor, { boxed: true, echo }),
+      complete: (line) => completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor }),
+      onInterrupt: io.onInterrupt,
+      onEscape: io.onEscape,
+      summarize: activitySummary,
+      ownerText: droppedShown,
+      colors: !process.env.NO_COLOR,
+    });
+  } catch (e) {
+    return say((e as Error).message);
+  }
+  // What was typed ahead, and the history, go along.
+  for (const e of io.ask.drain?.() ?? []) screen.ask.later?.(e);
+  const hist = (io.rl as unknown as { history?: string[] }).history;
+  if (hist) screen.editor.history = [...hist];
+  inkEof = false;
+  screen.editor.once('close', () => { inkEof = true; });
+  for (const f of io.rlResize) process.stdout.off('resize', f);
+  io.keys.use((s, key) => screen.key(s, key ?? {}));
+  activeInk = screen;
+  activeAsk = screen.ask;
+  return screen;
+}
+
+/** Take the Ink view down and give the terminal back to readline. */
+async function closeInk(screen: InkScreen<Ask>): Promise<void> {
+  if (activeInk !== screen) return;
+  await screen.close();
+  activeInk = null;
+  const io = shellIO;
+  if (!io) return;
+  activeAsk = io.ask;
+  for (const e of screen.ask.drain?.() ?? []) io.ask.later?.(e);
+  const hist = (io.rl as unknown as { history?: string[] }).history;
+  if (hist) hist.splice(0, hist.length, ...screen.editor.history);
+  for (const f of io.rlResize) process.stdout.on('resize', f);
+  io.keys?.use(null);
+  (io.rl as unknown as { prevRows?: number }).prevRows = 0;
+  // Ctrl-D at the view's empty prompt leaves the shell, as at readline's.
+  if (inkEof) io.rl.close();
+}
+
+/** The owner's message as the Ink view's transcript shows it: a file dragged
+ *  in (attach.ts findDroppedFiles) by its name, `[image: cat.png]`, not its path. */
+export function droppedShown(text: string): string {
+  const parts = findDroppedFiles(text);
+  if (!parts.some((p) => typeof p !== 'string')) return text;
+  return parts.map((p) => {
+    if (typeof p === 'string') return p;
+    const name = basename(p.path);
+    return /\.(png|jpe?g|gif|webp)$/i.test(name) ? `[image: ${name}]` : `[file: ${name}]`;
+  }).join('');
+}
+
+/** Leave the shell: the Ink view first, so the terminal is left clean. */
+async function quitShell(code: number, closeRl = false): Promise<never> {
+  if (activeInk) await closeInk(activeInk);
+  if (closeRl) shellIO?.rl.close();
+  process.exit(code);
+}
+
+/** A session, under the Ink view when it can be up (inkView.ts), else at readline's prompt. */
+async function enterSession(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
+  const ink = await openInk();
+  if (!ink) return sessionRepl(s, ask, irq, ctx);
+  try {
+    await sessionRepl(s, ink.ask, irq, ctx);
+  } finally {
+    await closeInk(ink);
+  }
+}
+
 /** Shared interrupt state: set while an L2 turn streams; Esc/Ctrl-C abort it.
  *  `brake` is the server-side stop for the CURRENT session's agent — wired
  *  while inside an L2 session so Esc at an idle prompt can still stop a task
@@ -1685,6 +1893,10 @@ export async function run(ctx: CommandContext): Promise<void> {
     });
   }
 
+  // readline's own key and resize handlers, told apart from the shell's:
+  // the Ink session view sets them aside while it is up.
+  const keysBefore = process.stdin.listeners('keypress');
+  const resizeBefore = process.stdout.listeners('resize');
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -1704,6 +1916,8 @@ export async function run(ctx: CommandContext): Promise<void> {
       liveKeys.tab() ? [[], line]
         : completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor }),
   });
+  const rlKeys = process.stdin.listeners('keypress').filter((f) => !keysBefore.includes(f));
+  const rlResize = process.stdout.listeners('resize').filter((f) => !resizeBefore.includes(f)) as Array<() => void>;
   activeRl = rl;
   const ask = lineQueue(rl, () => !!process.stdin.isTTY, process.stdin);
   activeAsk = ask;
@@ -1712,34 +1926,53 @@ export async function run(ctx: CommandContext): Promise<void> {
   // crash (the exit event), SIGTERM — so the owner's shell is not left in it.
   if (rl.terminal) {
     term(PASTE_ON);
-    process.on('exit', () => term(PASTE_OFF));
+    process.on('exit', () => { process.stdout.write(PASTE_OFF); });
     process.once('SIGTERM', () => process.exit(143));
   }
   const irq: Interrupt = { streaming: null, brake: null };
 
+  // A question (not the shell's prompt) is waiting: cancel it, and the
+  // command that asked. Under the Ink view it stays in the transcript as asked.
+  const cancelQuestion = (): boolean => {
+    const a = activeAsk ?? ask;
+    const w = a.waiting?.();
+    const typed = activeInk?.editor.line ?? '';
+    if (!a.cancel?.()) return false;
+    if (activeInk) activeInk.cancelled(w?.q ?? '', typed);
+    else out('\n');
+    return true;
+  };
   let lastSigint = 0;
-  rl.on('SIGINT', () => {
-    // A question (not the shell's prompt) is waiting: cancel it, and the
-    // command that asked.
-    if (ask.cancel?.()) { out('\n'); return; }
+  const onInterrupt = (): void => {
+    if (cancelQuestion()) return;
     if (irq.streaming) { irq.streaming.abort(); return; } // interrupt the turn, stay in the REPL
     const now = Date.now();
-    if (now - lastSigint < 2000) { rl.close(); process.exit(0); }
+    if (now - lastSigint < 2000) { void quitShell(0, true); return; }
     lastSigint = now;
+    if (activeInk) { out('(press Ctrl-C again to exit)\n'); return; }
     out('\n(press Ctrl-C again to exit)\n');
     rl.prompt();
-  });
+  };
+  const onEscape = (): void => {
+    if (cancelQuestion()) return;
+    if (irq.streaming) { irq.streaming.abort(); return; }
+    irq.brake?.(); // idle Esc in a session: stop a background/orphaned task
+  };
+  rl.on('SIGINT', onInterrupt);
   readline.emitKeypressEvents(process.stdin, rl);
   // The live prompt sees each key before readline handles it and after
   // readline and the line queue have (livePrompt.ts).
   process.stdin.prependListener('keypress', (_s, key) => liveKeys.before(key));
   process.stdin.on('keypress', (_s, key) => liveKeys.after(key));
   process.stdin.on('keypress', (_s, key) => {
-    if (key?.name !== 'escape') return;
-    if (ask.cancel?.()) { out('\n'); return; }
-    if (irq.streaming) { irq.streaming.abort(); return; }
-    irq.brake?.(); // idle Esc in a session: stop a background/orphaned task
+    if (key?.name === 'escape') onEscape();
   });
+  // One route for the keys on a terminal: the listeners above in their
+  // order, or, while the Ink session view is up, the view alone.
+  const keys = rl.terminal ? routeKeys(process.stdin) : null;
+  rl.on('close', () => keys?.drop(rlKeys));
+  shellIO = { rl, ask, keys, rlResize, onInterrupt, onEscape };
+  if (keys && inkWanted()) void loadInk(); // loaded while the banner prints
 
   try {
     // Shortcut: `0g-agentdna <agent>` links straight into L2, then drops to L1.
@@ -1751,7 +1984,7 @@ export async function run(ctx: CommandContext): Promise<void> {
       const ag = await withWallet(ctx);
       try {
         const s = await attach(ag, requireAttestorUrl(ctx.env), ctx.positionals[0], ask);
-        await sessionRepl(s, ask, irq, ctx);
+        await enterSession(s, ask, irq, ctx);
       } catch (e) {
         if (!isCancelled(e)) throw e;
         out('cancelled\n');
@@ -2552,7 +2785,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (!args[0]) { out('usage: use <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
         const s = await attach(ag, requireAttestorUrl(ctx.env), args[0], ask);
-        await sessionRepl(s, ask, irq, ctx);
+        await enterSession(s, ask, irq, ctx);
         continue;
       }
 
@@ -2560,7 +2793,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         const s = await deployWizard(ag, requireAttestorUrl(ctx.env), ask, ctx, irq);
         if (!s) { out('wait cancelled — the deploy continues in the background; watch it with `list`, enter later with `use <id>`\n'); continue; }
-        await sessionRepl(s, ask, irq, ctx);
+        await enterSession(s, ask, irq, ctx);
         continue;
       }
 
@@ -3018,6 +3251,16 @@ function credIO(ask: (q: string) => Promise<string>) {
 /** Prompt for a secret with the typed characters not echoed. readline has no
  *  native masking, so suppress stdout echo for the duration of the question. */
 function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise<string> {
+  // The Ink view draws what is typed as `*`, keeps it out of the history and
+  // writes the answer to the transcript masked.
+  const ink = activeInk;
+  if (ink) {
+    return ink.secret(() => ask(prompt)).then((ans) => {
+      const hist = ink.editor.history;
+      for (let i = hist.length - 1; i >= 0; i--) if (ans && hist[i] === ans) hist.splice(i, 1);
+      return ans;
+    });
+  }
   // A terminal whose line editing the shell does not do (its output is
   // redirected) shows what is typed as it is typed.
   if (process.stdin.isTTY && activeRl?.terminal === false) {
@@ -3361,23 +3604,27 @@ const L2_HELP_FULL = `session commands
                           Enter and never run as a command; a line ending
                           in \\ or Option/Alt+Enter goes on to a new line.
                           Lines already entered are not edited again
-  (while it works)        the prompt stays, saying (replying, Esc stops);
-                          the reply prints above it and what you type stays
-                          on screen. Enter on 0g-harness owner-chat steers:
-                          the message goes into the turn, read before its
-                          next model call (shown as "steered:" until then);
-                          not in the middle of a long command. If the turn
-                          ends first, it runs as a turn of its own, shown
-                          here. Tab queues instead: "queued:", sent as the
-                          next message when the turn ends (Esc puts it back
-                          to edit instead); ↑ on an empty prompt takes the
-                          newest queued one back to edit.
+  (while it works)        the input stays on screen (framed at the bottom,
+                          a status line above it saying what the agent does
+                          and Esc to stop); the reply prints above it and
+                          what you type stays on screen. Enter on 0g-harness
+                          owner-chat steers: the message goes into the turn,
+                          read before its next model call (shown waiting as
+                          steered until then); not in the middle of a long
+                          command. If the turn ends first, it runs as a turn
+                          of its own, shown here. Tab queues instead: sent
+                          as the next message when the turn ends (Esc puts
+                          it back to edit instead); ↑ on an empty prompt
+                          takes the newest queued one back to edit.
                           A command alone on its line waits for the prompt,
                           and so does a message in another session or on
-                          another framework. AGENTDNA_LIVE_PROMPT=off prints
-                          turns as a plain stream
-  (prompt status)         · 2 notices · 1 new file: notices waiting to print
+                          another framework. AGENTDNA_INK=off keeps the
+                          plain prompt line instead of the frame;
+                          AGENTDNA_LIVE_PROMPT=off prints turns as a plain
+                          stream
+  (status)                2 notices · 1 new file: notices waiting to print
                           and files the agent left that are not saved yet
+                          (at the status line's right, or in the prompt)
   (bare Enter)            refresh this agent's phase/url from the attestor
   /hello [full]           identity, serve-proof verification, services one
                           per line, owner routes on one line by kind; full
@@ -3596,9 +3843,17 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     turnRan: false,
   };
   s.screen = screen;
+  // Under the Ink view the counts are on its status row, the agent in its footer.
+  if (activeInk) {
+    activeInk.context = {
+      agent: () => `agent ${s.agentId}${sessionLabel(s)}`,
+      counts: () => promptStatus(counts()).replace(/^ · /, ''),
+    };
+  }
   // What the prompt counts changed: the prompt on screen says so.
   const recount = (): void => {
-    if (atPrompt) (ask as Ask).retitle?.(`\n${screen.prompt(false)}`);
+    if (activeInk) activeInk.refresh();
+    else if (atPrompt) (ask as Ask).retitle?.(`\n${screen.prompt(false)}`);
     else screen.turn?.refresh();
   };
   // Above the prompt now, or held for the next one. raw: the shell's own
@@ -3699,13 +3954,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     let asMessage = false;
     if (queued.length) {
       line = queued.shift()!;
-      out(`\nagent ${s.agentId}${sessionLabel(s)} › ${line}\n`);
+      if (activeInk) activeInk.owner(line);
+      else out(`\nagent ${s.agentId}${sessionLabel(s)} › ${line}\n`);
     } else {
       // What arrived while credential requests were looked at, too.
       flushHeld();
       atPrompt = true;
       try {
-        const q = `\n${screen.prompt(false)}`;
+        const q = activeInk ? INK_PROMPT : `\n${screen.prompt(false)}`;
         const entry = (ask as Ask).message ? await (ask as Ask).message!(q) : { text: await ((ask as Ask).main ?? ask)(q), multi: false, pasted: false };
         line = entry.text.trim();
         asMessage = entry.multi || entry.pasted;
@@ -3727,7 +3983,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     commands: {
     if (asMessage || (carriesFiles && typeof dropped[0] !== 'string')) break commands;
     if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
-    if (line === '/quit' || line === '/exit') { process.exit(0); }
+    if (line === '/quit' || line === '/exit') { await quitShell(0); }
     if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
 
     try {
@@ -4420,13 +4676,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // Inserted texts this turn did not read: each runs as a turn of its own
     // on the agent, followed here once this turn ends.
     const afterTurn: string[] = [];
+    // Their texts, for the Ink view's transcript (the owner's `❯ text`).
+    const afterText = new Map<string, string>();
     for (;;) {
       const ac = new AbortController();
       irq.streaming = ac;
       // Inserted into this turn and not read yet (texts, as typed): shown
       // above the live prompt until the agent reads them.
       const steeredTexts: string[] = [];
-      const view = openTurn(s, () => steeredTexts);
+      const view = openTurn(s, () => steeredTexts, !!(s.client.steer && process.stdin.isTTY));
       const say = sayer(view);
       let reply = '';
       let interrupted = false;
@@ -4452,7 +4710,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         spin = (spin + 1) % SPIN.length;
         // Never over the agent's own partial line: break to a fresh one
         // first (the visual break marks where the status began).
-        view.status(`${SPIN[spin]} ${status}… (${secs}s${view.live ? '' : ' · esc to interrupt'})`, !!reply && !reply.endsWith('\n'));
+        view.status(`${SPIN[spin]} ${status}… (${secs}s${view.live ? (view.stopHint ?? '') : ' · esc to interrupt'})`, !!reply && !reply.endsWith('\n'));
       };
       // Steering (0g-harness, on a terminal): a message the owner finishes
       // while the turn runs goes into it, read before its next model call. A
@@ -4478,7 +4736,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             (r) => {
               if (r.merged && r.id) { steered.push(r.id); return; }
               unshow(e.text);
-              if (r.queued) afterTurn.push(r.queued);
+              if (r.queued) { afterTurn.push(r.queued); afterText.set(r.queued, e.text); }
               view.note(`(${cleanCell(r.reason ?? 'no turn of yours is running')} — it goes as a turn of its own)\n`);
             },
             (err: Error) => {
@@ -4497,10 +4755,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
               // The agent read an inserted message.
               clearActivity();
               const text = steeredTexts.shift();
-              view.note(!view.live ? '  ↳ (read)\n' : text ? `↳ read by the agent: ${oneLine(text)}` : '↳ (read by the agent)');
+              // Under the Ink view the message moves from the waiting rows into the transcript.
+              if (activeInk && text) activeInk.owner(text);
+              else view.note(!view.live ? '  ↳ (read)\n' : text ? `↳ read by the agent: ${oneLine(text)}` : '↳ (read by the agent)');
               steered.shift();
               return;
             }
+            // A view that sums up the turn's tool calls sees every label.
+            view.activity?.(label);
             // "did work this turn" detector, across bridges' label dialects:
             // 0g-harness "tool/call bash", prime "tool_execution_start — bash" /
             // "bash_command_start", hermes "tool/call web_search". Thinking
@@ -4624,14 +4886,17 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // Inserted but not read: the turn ended first, so the agent runs it as
       // a turn of its own (an interrupt drops it instead).
       if (!interrupted && s.client?.steerState) {
-        for (const id of steered) {
+        for (const [k, id] of steered.entries()) {
           let st: SteerState | null = null;
           for (let i = 0; i < 20; i++) {
             st = await s.client.steerState(id).catch(() => null);
             if (!st || st.state !== 'pending') break;
             await new Promise((r) => setTimeout(r, 150));
           }
-          if (st?.state === 'turn') afterTurn.push(st.turn);
+          if (st?.state === 'turn') {
+            afterTurn.push(st.turn);
+            if (steeredTexts[k] !== undefined) afterText.set(st.turn, steeredTexts[k]);
+          }
         }
       }
       if (failure && !s.framework && !retriedWithPick) {
@@ -4670,6 +4935,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     }
     for (const id of afterTurn) {
       (s.tasks ??= []).push({ id, prompt: '(inserted)', at: Date.now() });
+      const said = afterText.get(id);
+      if (activeInk && said !== undefined) activeInk.owner(said);
       if (!s.client?.followTask) { out(`(your inserted message runs as ${id} — /result ${id} shows it)\n`); continue; }
       out(`(your inserted message runs as a turn of its own, ${id})\n`);
       const fac = new AbortController();
