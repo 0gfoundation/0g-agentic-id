@@ -189,3 +189,51 @@ test('notices and files are named for what they are', async () => {
   assert.match(shown[0][0], /^\nnotices while you were away \(2\):\n/);
   assert.equal(shown[0][1], 2);
 });
+
+test('a saved outbox file is removed from the agent, once it matches; an older runtime keeps its files', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'outbox-remove-'));
+  const body = new TextEncoder().encode('report body');
+  const sha = createHash('sha256').update(body).digest('hex');
+  const files = [{ name: 'report.txt', bytes: body.length, mtime: '2026-11-18T10:00:00Z', sha256: sha }];
+  const removed = [];
+  const sync = makeOutboxSync({
+    agentId: '625', home,
+    list: async () => files,
+    download: async () => body,
+    auto: () => true,
+    remove: async (name) => { removed.push(name); return 'deleted'; },
+  });
+  const ev = await sync.check();
+  assert.equal(ev[0].kind, 'saved');
+  assert.deepEqual(removed, ['report.txt']);
+
+  // What came down differs from the listing (changed meanwhile): kept.
+  const home2 = mkdtempSync(join(tmpdir(), 'outbox-remove-'));
+  const kept = [];
+  await makeOutboxSync({
+    agentId: '625', home: home2,
+    list: async () => [{ ...files[0], sha256: 'f'.repeat(64) }],
+    download: async () => body,
+    auto: () => true,
+    remove: async (name) => { kept.push(name); return 'deleted'; },
+  }).check();
+  assert.deepEqual(kept, []);
+
+  // An older runtime without the delete route: tried once, then not again.
+  const home3 = mkdtempSync(join(tmpdir(), 'outbox-remove-'));
+  let tries = 0;
+  let listing = [files[0]];
+  const old = makeOutboxSync({
+    agentId: '625', home: home3,
+    list: async () => listing,
+    download: async (name) => new TextEncoder().encode(name === 'report.txt' ? 'report body' : 'second'),
+    auto: () => true,
+    remove: async () => { tries++; return 'unsupported'; },
+  });
+  await old.check();
+  const second = new TextEncoder().encode('second');
+  listing = [...listing, { name: 'b.txt', bytes: second.length, mtime: '2026-11-18T10:01:00Z', sha256: createHash('sha256').update(second).digest('hex') }];
+  await old.check();
+  assert.equal(tries, 1);
+  for (const h of [home, home2, home3]) rmSync(h, { recursive: true, force: true });
+});

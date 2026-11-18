@@ -734,6 +734,13 @@ export interface AgentClient {
   listFiles?(dir?: AgentFileDir): Promise<AgentFile[]>;
   /** One file's bytes (at most 50 MiB). See {@link AgentClient.listFiles}. */
   downloadFile?(dir: AgentFileDir, name: string): Promise<Uint8Array>;
+  /**
+   * Remove one file from the agent's outbox or file inbox (0g-harness
+   * `DELETE /v1/files/{dir}/{name}`). `deleted`: it is gone; `missing`: there
+   * was no such file; `unsupported`: this agent's runtime has no delete
+   * route (an older image).
+   */
+  deleteFile?(dir: AgentFileDir, name: string): Promise<'deleted' | 'missing' | 'unsupported'>;
 }
 
 /** Longest-prefix match over declared routes, or undefined if none match. */
@@ -1518,6 +1525,19 @@ export function makeAgentClient(params: {
       const r = await doFetch(`${filesBase}/${dir}/${encodeURIComponent(name)}`);
       if (!r.ok) throw noDownloads('downloadFile', r.status, await r.text());
       return new Uint8Array(await r.arrayBuffer());
+    };
+    client.deleteFile = async (dir, name) => {
+      if (dir !== 'outbox' && dir !== 'inbox') throw new Error('deleteFile: dir is outbox or inbox');
+      if (!name || name.includes('/') || name.includes('\\') || name.startsWith('.')) throw new Error('deleteFile: a file name is one path segment, without a leading dot');
+      const r = await doFetch(`${filesBase}/${dir}/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      if (r.ok) return 'deleted';
+      const text = await r.text();
+      // The harness answers a missing file with "no file …"; anything else
+      // that is not found (or a method the route does not take) is a runtime
+      // without the delete route.
+      if (r.status === 404 && /no file /i.test(text)) return 'missing';
+      if (r.status === 404 || r.status === 405) return 'unsupported';
+      throw new Error(`deleteFile: HTTP ${r.status}: ${plainText(text)}`);
     };
   }
 
