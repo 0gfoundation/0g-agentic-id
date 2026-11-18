@@ -915,7 +915,11 @@ type Ask = ((q: string) => Promise<string>) & {
   /** Every waiting entry back to be edited, as one message ahead of what is
    *  being edited (a turn was interrupted: nothing goes on its own); how
    *  many there were. */
-  recallAll?: () => number;
+  recallAll?: (extra?: readonly string[]) => number;
+  /** Empty the message being typed (its earlier lines too); false when there is nothing. */
+  clearBox?: () => boolean;
+  /** Backspace at the start of a message's line: it joins the line before; false when there is none. */
+  unwind?: () => boolean;
   /** The shell's prompt now says q (its status changed): redrawn in place
    *  when it is up, used from the next prompt otherwise. */
   retitle?: (q: string) => void;
@@ -950,7 +954,10 @@ const PASTE_GAP_MS = 30;
 const YES_NO_QUESTION = /\[(?:y\/n|y)\]/i;
 
 type Key = { name?: string; meta?: boolean; ctrl?: boolean; sequence?: string };
-type KeySource = { on(ev: 'keypress', f: (s: string | undefined, key: Key | undefined) => void): unknown };
+type KeySource = {
+  on(ev: 'keypress', f: (s: string | undefined, key: Key | undefined) => void): unknown;
+  prependListener?(ev: 'keypress', f: (s: string | undefined, key: Key | undefined) => void): unknown;
+};
 
 /**
  * The shell's `ask` as a QUEUE, not rl.question: lines that arrive while no
@@ -985,8 +992,10 @@ export function lineQueue(
   keys?: KeySource,
 ): Ask {
   type Kind = 'q' | 'main' | 'message';
+  // Readline draws the line being edited (not a view of its own).
+  const boxed = false;
   const pending: Entry[] = [];
-  const waiters: Array<{ res: (e: Entry) => void; rej: (e: Error) => void; kind: Kind; q: string }> = [];
+  const waiters: Array<{ res: (e: Entry) => void; rej: (e: Error) => void; kind: Kind; q: string; first: string }> = [];
   const edit = rl as { line?: unknown; cursor?: unknown; prevRows?: unknown; history?: unknown };
   // readline keeps keys typed so far as the line being edited (and would
   // show them after the next question, ready for Enter), and its offset from
@@ -1115,8 +1124,11 @@ export function lineQueue(
     chunk.open = true;
     queueMicrotask(endChunk);
   };
+  let cursorBefore = -1;
+  keys?.prependListener?.('keypress', () => { cursorBefore = typeof edit.cursor === 'number' ? edit.cursor : -1; });
   keys?.on('keypress', (s, key) => {
     if (!multiline()) return;
+    if (key?.name === 'backspace' && !key.ctrl && !key.meta && cursorBefore === 0 && !boxed && messageHere()) { ask.unwind?.(); return; }
     if (key?.name === 'paste-start') { pasting = true; pasteLines = []; return; }
     if (key?.name === 'paste-end') {
       pasting = false;
@@ -1164,6 +1176,7 @@ export function lineQueue(
     }
   });
   const wait = (q: string, kind: Kind): Promise<Entry> => {
+    const first = q;
     for (let buffered = pending.shift(); buffered !== undefined; buffered = pending.shift()) {
       const refused = accepts({ kind, q }, buffered);
       if (refused) { out(`  (an earlier entry was dropped: ${refused})\n`); continue; }
@@ -1190,7 +1203,7 @@ export function lineQueue(
     rl.setPrompt(q);
     // A line typed during a turn is shown again with the cursor where it was.
     rl.prompt(kind === 'message' && (q === CONT || editLine() !== ''));
-    return new Promise((res, rej) => waiters.push({ res, rej, kind, q }));
+    return new Promise((res, rej) => waiters.push({ res, rej, kind, q, first }));
   };
   const ask: Ask = (q: string): Promise<string> => wait(q, 'q').then((e) => e.text);
   ask.main = (q: string): Promise<string> => wait(q, 'main').then((e) => e.text);
@@ -1223,12 +1236,19 @@ export function lineQueue(
     pending.push(e);
     return true;
   };
-  ask.recallAll = (): number => {
-    if (waiters[0] || !pending.length) return 0;
-    const back = pending.splice(0);
+  ask.recallAll = (extra: readonly string[] = []): number => {
+    if (waiters[0]) return 0;
+    // Messages come back to edit (`extra` first: sent into the turn and not
+    // read); a command that waited stays its own entry and runs at the next
+    // prompt, never merged into the text.
+    const back = pending.filter((e) => steerable(e));
+    if (!extra.length && !back.length) return 0;
+    const keep = pending.filter((e) => !steerable(e) && e.text.trim());
+    pending.splice(0, pending.length, ...keep);
     const line = editLine();
     // As typed, without the blank lines.
-    const lines = [...back.flatMap((e) => e.text.split('\n')), ...draft, ...(line ? [line] : [])].filter((l) => l.trim() !== '');
+    const lines = [...extra.flatMap((t) => t.split('\n')), ...back.flatMap((e) => e.text.split('\n')), ...draft, ...(line ? [line] : [])]
+      .filter((l) => l.trim() !== '');
     const last = lines.pop() ?? '';
     const pastedAny = back.some((e) => e.pasted) || draftPasted || touched;
     draft = lines;
@@ -1236,7 +1256,39 @@ export function lineQueue(
     touched = !lines.length && pastedAny;
     if (typeof edit.line === 'string') edit.line = last;
     if (typeof edit.cursor === 'number') edit.cursor = last.length;
-    return back.length;
+    return extra.length + back.length;
+  };
+  ask.clearBox = (): boolean => {
+    if (!draft.length && !editLine()) return false;
+    draft = [];
+    draftPasted = false;
+    touched = false;
+    clearEdit();
+    const w = waiters[0];
+    if (w && !boxed && rl.terminal !== false) {
+      // What was typed stays on the screen as it was; a fresh prompt below.
+      term('\n');
+      rl.setPrompt(w.first);
+      rl.prompt();
+    }
+    return true;
+  };
+  ask.unwind = (): boolean => {
+    if (!draft.length || (typeof edit.cursor === 'number' && edit.cursor !== 0)) return false;
+    const prev = draft.pop()!;
+    const line = editLine();
+    if (typeof edit.line === 'string') edit.line = prev + line;
+    if (typeof edit.cursor === 'number') edit.cursor = prev.length;
+    const w = waiters[0];
+    if (w && !boxed && rl.terminal !== false) {
+      // The line before is on the screen above this one: both go, and the
+      // joined line is drawn where the earlier one was.
+      term('\r\x1b[2K\x1b[1A\r\x1b[2K');
+      if (typeof edit.prevRows === 'number') edit.prevRows = 0;
+      rl.setPrompt(draft.length ? CONT : w.first);
+      rl.prompt(true);
+    }
+    return true;
   };
   ask.retitle = (q: string): void => {
     const w = waiters[0];
@@ -1341,7 +1393,7 @@ interface SessionScreen {
   turnRan: boolean;
   /** A turn was interrupted: what was queued during it comes back to be
    *  edited; what to say about it ('' when nothing was queued). */
-  interrupted?: () => string;
+  interrupted?: (extra?: readonly string[]) => string;
 }
 
 /** What the session prompt counts: notices waiting to be shown, new files. */
@@ -1858,6 +1910,8 @@ export async function run(ctx: CommandContext): Promise<void> {
     // command that asked.
     if (ask.cancel?.()) { out('\n'); return; }
     if (irq.streaming) { irq.streaming.abort(); return; } // interrupt the turn, stay in the REPL
+    // Text in the box: Ctrl-C clears it (its earlier lines too) first.
+    if (ask.clearBox?.()) return;
     const now = Date.now();
     if (now - lastSigint < 2000) { rl.close(); process.exit(0); }
     lastSigint = now;
@@ -1873,6 +1927,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     if (key?.name !== 'escape') return;
     if (ask.cancel?.()) { out('\n'); return; }
     if (irq.streaming) { irq.streaming.abort(); return; }
+    if (ask.clearBox?.()) return; // text in the box: Esc clears it
     irq.brake?.(); // idle Esc in a session: stop a background/orphaned task
   });
 
@@ -3684,9 +3739,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   const inbox = makeInboxFeed((text, shown, count) => show(text, shown, { notices: count }));
   // An interrupted turn sends nothing on its own: what was queued during it
   // comes back to be edited at the next prompt.
-  screen.interrupted = (): string => {
-    const n = (ask as Ask).recallAll?.() ?? 0;
-    return n ? `(${n === 1 ? 'the queued message is' : `${n} queued messages are`} back to edit — Enter sends)` : '';
+  screen.interrupted = (extra: readonly string[] = []): string => {
+    const n = (ask as Ask).recallAll?.(extra) ?? 0;
+    return n ? `(${n === 1 ? 'your message is' : `${n} of your messages are`} back to edit, not sent — Enter sends)` : '';
   };
   // What waited prints before the prompt comes up.
   const flushHeld = (): void => {
@@ -4543,10 +4598,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       } catch (e) {
         view.end();
         stopped = fac.signal.aborted;
-        const empty = stopped ? null : await emptyTurnText(s.client, f.id, e);
-        out(stopped
-          ? `\n(stopped watching — it continues; /result ${f.id} re-attaches, /cancel ${f.id} stops it)\n`
-          : `\n${empty ?? `(${cleanCell((e as Error).message)})`}\n`);
+        if (stopped) {
+          // Esc stops this turn, and the ones after it for messages not read
+          // yet; those messages come back to edit.
+          const ok = await s.client.cancelTask?.(f.id).then((t) => t.status === 'cancelled' || t.status === 'completed', () => false);
+          out(ok ? '\n⏹ interrupted — the turn stopped\n' : `\n(stopped watching — it may still be running; /cancel ${f.id} stops it)\n`);
+          const rest = after.splice(i + 1);
+          for (const r of rest) await s.client.cancelTask?.(r.id).catch(() => undefined);
+          const back = s.screen?.interrupted?.([...(steering?.texts.splice(0) ?? []), ...rest.flatMap((r) => r.texts)]);
+          if (back) out(`${back}\n`);
+        } else {
+          const empty = await emptyTurnText(s.client, f.id, e);
+          out(`\n${empty ?? `(${cleanCell((e as Error).message)})`}\n`);
+        }
       } finally {
         view.end();
         irq.streaming = null;
@@ -4787,7 +4851,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           out(stopped?.aborted || (stopped && /disconnects/.test(stopped.note ?? ''))
             ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
             : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${cleanCell(stopped.note)}` : ''}; /cancel stops it${s.client?.cancelTask ? '' : ' (bare form — this image has no per-id cancel)'})`);
-          const back = screen.interrupted?.();
+          // Not read before Esc (the agent drops it), and the turns that would
+          // answer messages sent meanwhile: stopped, and back to edit.
+          const unread = steering?.texts.splice(0) ?? [];
+          const rest = after.splice(0);
+          for (const r of rest) await s.client.cancelTask?.(r.id).catch(() => undefined);
+          const back = screen.interrupted?.([...unread, ...rest.flatMap((r) => r.texts)]);
           if (back) out(`\n${back}`);
         } else if (/lost the agent while following/.test((e as Error).message)) {
           // Responses transport: the SDK already auto-resumed through drops
