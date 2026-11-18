@@ -2460,36 +2460,86 @@ async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sea
   }
 }
 
-type KeyFn = (s: string | undefined, key: InkKey | undefined) => void;
+type KeyFn = (s: string | undefined, key: InkKey | undefined) => void | false;
 
-let keysAside = 0;
-/**
- * Runs a wait (a start, reset, deploy, retry or cred wait) with the plain
- * prompt's keyboard set aside: readline would echo a key typed meanwhile
- * onto the wait's progress line and keep it as the start of the next
- * command, which the prompt then showed with the cursor before it. Esc and
- * Ctrl-C keep their meaning; any other key is dropped, and once the wait
- * ends one line says so. Under the Ink view the keys stay its editor's:
- * what is typed there is an editable line under the transcript. A wait
- * inside a wait sets nothing aside again. Exported for the tests.
- */
-export async function duringWait<T>(f: () => Promise<T>, io: Pick<NonNullable<typeof shellIO>, 'keys' | 'onEscape' | 'onInterrupt'> | null = shellIO): Promise<T> {
-  const keys = io?.keys;
-  if (!io || !keys || activeInk || keysAside) return f();
-  keysAside++;
-  let typed = false;
-  keys.use((s, key) => {
+/** What one stretch with the keys set aside has seen. */
+type Aside = { typed: boolean };
+let aside: Aside | null = null;
+let droppedNote = false;
+type WaitIO = Pick<NonNullable<typeof shellIO>, 'keys' | 'onEscape' | 'onInterrupt'> & { ask?: Ask };
+
+/** The keys while they are set aside: a question the command asks takes
+ *  them as usual (false: on to readline); otherwise Esc and Ctrl-C act, and
+ *  any other key is dropped. */
+function asideKeys(io: WaitIO, a: Aside): KeyFn {
+  return (s, key) => {
+    if ((activeAsk ?? io.ask)?.waiting?.()) return false;
     if (key?.name === 'escape') { io.onEscape(); return; }
     if (key?.ctrl && key.name === 'c') { io.onInterrupt(); return; }
-    if (typeof s === 'string' && /[^\x00-\x1f\x7f]/.test(s) && !key?.ctrl && !key?.meta) typed = true;
-  });
+    if (typeof s === 'string' && /[^\x00-\x1f\x7f]/.test(s) && !key?.ctrl && !key?.meta) a.typed = true;
+  };
+}
+
+/**
+ * Set the plain prompt's keyboard aside while a command runs (the shell does
+ * this for every manager command; duringWait for a wait elsewhere): readline
+ * would echo a key typed meanwhile onto the command's output (`xyzdeposited
+ * 0.1 OG`) and keep it as the start of the next command, which the prompt
+ * then showed with the cursor before it. A question the command asks takes
+ * keys as usual; Esc and Ctrl-C keep their meaning; any other key is
+ * dropped, and before the next prompt one line says so (flushDroppedNote).
+ * Under the Ink view nothing is set aside: its editor keeps what is typed as
+ * an editable line. Returns the function that gives the keys back; null when
+ * nothing was set aside (no terminal, the Ink view, already aside).
+ * Exported for the tests.
+ */
+export function keysAside(io: WaitIO | null = shellIO): (() => void) | null {
+  const keys = io?.keys;
+  if (!io || !keys || activeInk || aside) return null;
+  const a: Aside = { typed: false };
+  aside = a;
+  keys.use(asideKeys(io, a));
+  return () => {
+    if (aside === a) {
+      aside = null;
+      if (!activeInk) keys.use(null);
+    }
+    if (a.typed) droppedNote = true;
+  };
+}
+
+/** Runs `f` (a wait) with the keys set aside, as keysAside says. Exported for the tests. */
+export async function duringWait<T>(f: () => Promise<T>, io: WaitIO | null = shellIO): Promise<T> {
+  const back = keysAside(io);
   try {
     return await f();
   } finally {
-    keysAside--;
-    keys.use(null);
-    if (typed) out('(what was typed during the wait is not kept — type it again)\n');
+    back?.();
   }
+}
+
+/** Runs `f` (a session entered from a command) with the keys back; aside again after. */
+async function keysBack<T>(f: () => Promise<T>, io: WaitIO | null = shellIO): Promise<T> {
+  const a = aside;
+  if (!io?.keys || !a) return f();
+  aside = null;
+  io.keys.use(null);
+  try {
+    return await f();
+  } finally {
+    if (!activeInk && !aside) {
+      aside = a;
+      io.keys.use(asideKeys(io, a));
+    }
+  }
+}
+
+/** The note that keys typed while they were aside were dropped: once, right
+ *  before the next prompt, after what the command printed last. Exported for the tests. */
+export function flushDroppedNote(): void {
+  if (!droppedNote) return;
+  droppedNote = false;
+  out('(what was typed during the wait is not kept — type it again)\n');
 }
 
 /**
@@ -2503,7 +2553,8 @@ function routeKeys(stdin: NodeJS.ReadStream): { use(f: KeyFn | null): void; drop
   stdin.removeAllListeners('keypress');
   let only: KeyFn | null = null;
   stdin.on('keypress', (s: string | undefined, key: InkKey | undefined) => {
-    if (only) { only(s, key); return; }
+    // `false` from the one in use: the key goes on to the shell's listeners.
+    if (only && only(s, key) !== false) return;
     for (const f of shell) f.call(stdin, s, key);
   });
   return {
@@ -2722,6 +2773,9 @@ export async function run(ctx: CommandContext): Promise<void> {
     irq.brake?.(); // idle Esc in a session: stop a background/orphaned task
   };
   rl.on('SIGINT', onInterrupt);
+  // Keys dropped while a command ran are noted right before the next prompt.
+  const promptLine = rl.prompt.bind(rl);
+  rl.prompt = (preserveCursor?: boolean): void => { flushDroppedNote(); promptLine(preserveCursor); };
   readline.emitKeypressEvents(process.stdin, rl);
   // The live prompt sees each key before readline handles it and after
   // readline and the line queue have (livePrompt.ts).
@@ -2998,7 +3052,14 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       prefetchModelIds(ag); // so `model=<Tab>` has the catalog ready
     }).catch(() => { /* completions only */ });
   }
+  // While a command runs the keyboard is set aside (keysAside): a key typed
+  // during a transaction or a wait is neither echoed into the output nor
+  // kept as the start of the next command; a question the command asks
+  // takes keys as usual. Given back before each prompt.
+  let keysBackAtPrompt: (() => void) | null = null;
   for (;;) {
+    keysBackAtPrompt?.();
+    keysBackAtPrompt = null;
     activeCompletions = L1_WORDS;
     activeArgs = L1_ARGS;
     sessionSealId = null;
@@ -3009,6 +3070,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     // others='{"a": 1}'`) survives the way it does in a real shell.
     const [cmd, ...args] = line ? tokenize(line) : ['whoami'];
     setAgentAtHand(cmd === 'cred' || cmd === 'settings' ? args[0] ?? null : null);
+    if (cmd !== 'quit' && cmd !== 'exit') keysBackAtPrompt = keysAside();
     try {
       if (cmd === 'quit' || cmd === 'exit') return;
       if (cmd === 'help') { say(`${managerHelp(termWidth())}\n`); continue; }
@@ -3363,12 +3425,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           if (row.phase !== 'stopped' || !row.sandboxId) { say(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
           if (!(await ensureOwnerReady(ag, ask))) { say('start cancelled — prepaid balance too low\n'); continue; }
           say(`starting agent ${row.agentId}…\n`);
-          const sandboxId = row.sandboxId;
-          const r = await duringWait(async () => {
-            const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
-            await ag.agent.start(row.sealId, sandboxId);
-            return waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
-          });
+          const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
+          await ag.agent.start(row.sealId, row.sandboxId);
+          const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
           if (r) out(`running — enter with: use ${row.agentId}\n`);
           continue;
         }
@@ -3387,13 +3446,11 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         await ag.agent.assertProviderSupported(provider, { sealId: row.sealId, framework });
         const key = await resetModelKey(ag.credentials, row.sealId, provider, framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(ag, ask))) { say('reset cancelled — prepaid balance too low\n'); continue; }
-        const r = await duringWait(async () => {
-          await applyResetInference(ag, row.sealId, plan, out);
-          say(`resetting agent ${row.agentId} as ${framework}…\n`);
-          const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
-          await ag.agent.reset(row.sealId, { provider, framework, ...key, onWarn: (w) => say(`⚠ ${w}\n`) });
-          return waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
-        });
+        await applyResetInference(ag, row.sealId, plan, out);
+        say(`resetting agent ${row.agentId} as ${framework}…\n`);
+        const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
+        await ag.agent.reset(row.sealId, { provider, framework, ...key, onWarn: (w) => say(`⚠ ${w}\n`) });
+        const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
         if (r) {
           await ag.credentials.resyncModelKey(row.sealId, { agentUrl: r.url }).catch(() => undefined);
           out(`running — enter with: use ${row.agentId}\n`);
@@ -3414,18 +3471,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const label = row.agentId != null ? String(row.agentId) : sealPrefixOf(row.sealId);
         if (row.phase !== 'failed') { say(`agent ${label} is ${row.phase} — retry only applies to a deploy that failed\n`); continue; }
         say(`retrying agent ${label}: running its failed steps again (Esc does not stop this; it can take a minute)…\n`);
-        await duringWait(async () => {
-          await ag.agent.retry(row.sealId);
-          try {
-            const agentId = await ag.agent.waitForMint(row.sealId);
-            say(`recovered: agent ${agentId} minted under the same identity\n`);
-            say(`it lands offline — bring it up with: reset ${agentId}\n`);
-          } catch (e) {
-            const p = explainError(e);
-            say(`error: still failing — ${p.message.replace(/^the deploy stopped before the mint: /, '')}\n`);
-            say(`  → once the cause is fixed, \`retry ${label}\` again; \`status ${label}\` shows it in full\n`);
-          }
-        });
+        await ag.agent.retry(row.sealId);
+        try {
+          const agentId = await ag.agent.waitForMint(row.sealId);
+          say(`recovered: agent ${agentId} minted under the same identity\n`);
+          say(`it lands offline — bring it up with: reset ${agentId}\n`);
+        } catch (e) {
+          const p = explainError(e);
+          say(`error: still failing — ${p.message.replace(/^the deploy stopped before the mint: /, '')}\n`);
+          say(`  → once the cause is fixed, \`retry ${label}\` again; \`status ${label}\` shows it in full\n`);
+        }
         continue;
       }
 
@@ -3720,7 +3775,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (!args[0]) { say('usage: use <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
         const s = await attach(ag, requireAttestorUrl(ctx.env), args[0], ask);
-        await enterSession(s, ask, irq, ctx);
+        await keysBack(() => enterSession(s, ask, irq, ctx)); // the session's keys are its own
         continue;
       }
 
@@ -3728,7 +3783,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         const s = await deployWizard(ag, requireAttestorUrl(ctx.env), ask, ctx, irq);
         if (!s) continue; // mint only, or the wait was stopped: the wizard said which
-        await enterSession(s, ask, irq, ctx);
+        await keysBack(() => enterSession(s, ask, irq, ctx));
         continue;
       }
 
@@ -4507,17 +4562,13 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   const apiKey = provision ? (await pickModelKey(provider, keyPrompt(ask), { optional: mayGoKeyless(framework, provider) })) ?? undefined : undefined;
   if (provision && !(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
   say(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only'}…\n`);
-  // The mint and the container: a wait, nothing asked.
-  const { dep, agentId, r } = await duringWait(async () => {
-    const { deployment: dep, agentId } = await deployWithInference(ag, { name, framework, provider, model, provision, apiKey });
-    if (!provision) return { dep, agentId, r: null };
-    say(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
-    return { dep, agentId, r: await waitRunningInterruptible(irq, attestorUrl, dep.sealId, agentId) };
-  });
+  const { deployment: dep, agentId } = await deployWithInference(ag, { name, framework, provider, model, provision, apiKey });
   if (!provision) {
     say(`minted agentId ${agentId} — offline (no container). Bring it online with: reset ${agentId}\n`);
     return null;
   }
+  say(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
+  const r = await waitRunningInterruptible(irq, attestorUrl, dep.sealId, agentId);
   if (!r) { say(`the deploy goes on — enter it later with: use ${agentId}\n`); return null; } // Esc: only the wait ends
   if (apiKey) await ag.credentials.resyncModelKey(dep.sealId, { agentUrl: r.url }).catch(() => undefined);
   // Enter through attach so a fresh deploy gets the same entry card
@@ -4760,7 +4811,8 @@ export const L2_HELP_FULL = `session commands
                           per line, owner routes on one line by kind; full
                           prints every field of every service and route
   /balance                this agent's agentSeal gas + the account prepaid
-  /topup [og]             fund this agent's agentSeal gas (default 0.1 OG)
+  /topup [og]             fund this agent's agentSeal gas (bare: asks how
+                          much; Enter cancels)
   /start                  start (only from stopped)
   /stop                   stop the running container
   /reset                  recreate the container (uses the recorded framework;
@@ -5154,14 +5206,21 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             continue;
           }
         }
-        const amt = line.split(/\s+/)[1] || (await ask('  amount OG [0.1]: ')).trim() || '0.1';
-        const tx = await s.ag.agent.topUpAgentSeal(s.agentSeal, parseOgAmount(amt));
-        out(`sending ${amt} OG to agent ${s.agentId}'s gas wallet ${s.agentSeal} (tx ${tx}, waiting…)\n`);
-        // Parity with L1 `deposit`: return only once the chain agrees, so an
-        // immediate /balance shows the new number (feedback.md S2).
-        await s.ag.agent.waitForTransaction(tx);
-        const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId)).catch(() => null);
-        out(rc ? `confirmed — agentSeal gas now ${og(rc.sealGasWei)}\n` : 'confirmed\n');
+        // A money question has no default: Enter cancels it.
+        const given = line.split(/\s+/)[1];
+        const amountWei = given ? parseOgAmount(given) : await askAmount(ask, '  top up how much OG? [Enter cancels]: ');
+        if (amountWei === null) { out('top-up cancelled\n'); continue; }
+        const seal = s.agentSeal;
+        // The transaction and its receipt: a wait, keys set aside (plain prompt).
+        await duringWait(async () => {
+          const tx = await s.ag.agent.topUpAgentSeal(seal, amountWei);
+          out(`sending ${ogAmount(amountWei)} OG to agent ${s.agentId}'s gas wallet ${seal} (tx ${tx}, waiting…)\n`);
+          // Parity with L1 `deposit`: return only once the chain agrees, so an
+          // immediate /balance shows the new number (feedback.md S2).
+          await s.ag.agent.waitForTransaction(tx);
+          const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId)).catch(() => null);
+          out(rc ? `confirmed — agentSeal gas now ${og(rc.sealGasWei)}\n` : 'confirmed\n');
+        });
         continue;
       }
       if (line === '/stop') {
