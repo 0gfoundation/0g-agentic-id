@@ -34,7 +34,7 @@ import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOw
 import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
-import { completePath, describeStaged, prepareAttachments, stageFile, type Staged } from '../attach';
+import { completePath, describeStaged, findDroppedFiles, prepareAttachments, stageDropped, stageFile, type Staged } from '../attach';
 import { parseDownloadName, renderFiles, saveDownload } from '../download';
 import { pandaLines, svgPixelLines } from '../logo';
 import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
@@ -3109,6 +3109,11 @@ const L2_HELP_FULL = `session commands
                           Bare: unread messages; all: the read ones too
   /schedules              the reminders the agent set for itself
                           (0g-harness)
+  (drag a file in)         a file dragged into the terminal, or a pasted path to
+                          one, goes with the message you are typing: images in
+                          it, other files uploaded as below. Only files under
+                          your home, /Volumes and the temp folders; a path in
+                          backquotes stays text (0g-harness)
   /attach [path …|clear]  files and images for your next message (0g-harness):
                           an image goes with the message (when the model takes
                           images, as its provider's model list says — else it
@@ -3276,8 +3281,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       try { await refreshSession(s); } catch { out(`  phase   ${s.phase} (refresh failed — attestor unreachable)\n`); }
       continue;
     }
+    // Files dragged into the terminal (or pasted paths) go with this message,
+    // with no /attach step (attach.ts findDroppedFiles). A line that starts
+    // with one is a message, not a command.
+    const dropped = s.client?.uploadFile ? findDroppedFiles(line) : [];
+    const carriesFiles = dropped.some((p) => typeof p !== 'string');
     commands: {
-    if (asMessage) break commands;
+    if (asMessage || (carriesFiles && typeof dropped[0] !== 'string')) break commands;
     if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
     if (line === '/quit' || line === '/exit') { process.exit(0); }
     if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
@@ -3916,6 +3926,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
 
     // a chat turn (interruptible)
     if (!s.client) { out(`agent is ${s.phase} — /start or /reset before chatting\n`); continue; }
+    if (carriesFiles) {
+      // Each dropped file joins the staged ones (attach.ts stageDropped); one
+      // that cannot go sends nothing.
+      const r = stageDropped(dropped, (s.attached ??= []), (one) => out(`attached ${cleanCell(one.name)} (${one.image ? 'image' : 'file'})\n`));
+      if ('refused' in r) { out(`not sent: ${cleanCell(r.refused)}\n`); continue; }
+      line = r.text;
+    }
     if (s.sessionId && s.client.promptSession && s.client.followTask) {
       await chatInSession(s, line, irq);
       continue;

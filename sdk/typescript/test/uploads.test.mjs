@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { makeAgentClient, withImages } from '../dist/AgentClient.js';
-import { ATTACH_LIMITS, completePath, prepareAttachments, sniffImage, stageFile } from '../dist/cli/attach.js';
+import { ATTACH_LIMITS, completePath, dropRoots, findDroppedFiles, prepareAttachments, sniffImage, stageDropped, stageFile } from '../dist/cli/attach.js';
 import { assertOthersFitFramework, parseAssignments } from '../dist/cli/settings.js';
 
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
@@ -159,4 +159,49 @@ test('/attach: images by their bytes, limits when staged, files uploaded and nam
 test('modelImages is a 0g-harness switch', () => {
   assert.throws(() => assertOthersFitFramework(parseAssignments(['others={"modelImages":true}']), 'openclaw'), /0g-harness switch/);
   assert.doesNotThrow(() => assertOthersFitFramework(parseAssignments(['others={"modelImages":true}']), '0g-harness'));
+});
+
+test('a file dragged into the terminal is found in the message, as a drag or a paste leaves its path', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'drop-'));
+  const spaced = join(dir, 'My File (1).png');
+  const plain = join(dir, 'report.pdf');
+  writeFileSync(spaced, 'x');
+  writeFileSync(plain, 'y');
+  const roots = [dir];
+  const escaped = spaced.replace(/([ ()])/g, '\\$1');
+  // Escaped (Terminal), at the start of the line, then text.
+  assert.deepEqual(findDroppedFiles(`${escaped} what is this?`, roots), [{ path: spaced, raw: escaped }, ' what is this?']);
+  // Quoted (some terminals), in the middle; a plain path at the end.
+  assert.deepEqual(findDroppedFiles(`compare '${spaced}' and ${plain}`, roots), ['compare ', { path: spaced, raw: `'${spaced}'` }, ' and ', { path: plain, raw: plain }]);
+  // Not files to attach: missing, outside the roots, in backquotes, not a whole word.
+  for (const line of [`see ${join(dir, 'nope.png')}`, `${plain}, ok`, `read \`${plain}\` please`, `x${plain}`]) {
+    assert.ok(findDroppedFiles(line, roots).every((p) => typeof p === 'string'), line);
+  }
+  assert.ok(findDroppedFiles('/etc/hosts', dropRoots()).every((p) => typeof p === 'string'), '/etc/hosts is never a dropped file');
+  assert.deepEqual(findDroppedFiles('just text', roots), ['just text']);
+  assert.deepEqual(findDroppedFiles('', roots), []);
+});
+
+test('dropped files are staged with the message: images named in place, other files left to the upload line', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'drop-stage-'));
+  const png = join(dir, 'cat.png');
+  const pdf = join(dir, 'report.pdf');
+  writeFileSync(png, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]));
+  writeFileSync(pdf, '%PDF-1.4');
+  const staged = [];
+  const seen = [];
+  const r = stageDropped(findDroppedFiles(`what is in ${png}   and ${pdf}`, [dir]), staged, (s) => seen.push(s.name));
+  assert.deepEqual(r, { text: 'what is in [image: cat.png] and' });
+  assert.deepEqual(seen, ['cat.png', 'report.pdf']);
+  assert.deepEqual(staged.map((s) => [s.name, !!s.image]), [['cat.png', true], ['report.pdf', false]]);
+  // The upload line names the file once sent.
+  const uploaded = [];
+  const out = await prepareAttachments(staged, r.text, { uploadFile: async (name) => { uploaded.push(name); return { path: `/home/agent/inbox/${name}`, bytes: 8 }; } });
+  assert.equal(out.text, 'what is in [image: cat.png] and\n[file uploaded: /home/agent/inbox/report.pdf]');
+  assert.equal(out.images.length, 1);
+  assert.deepEqual(uploaded, ['report.pdf']);
+  // One that cannot go (already attached): nothing staged by this line stays.
+  const again = stageDropped(findDroppedFiles(`${pdf} ${png}`, [dir]), staged);
+  assert.match(again.refused, /already attached/);
+  assert.equal(staged.length, 2);
 });
