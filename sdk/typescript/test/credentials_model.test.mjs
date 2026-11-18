@@ -169,7 +169,7 @@ test('cli: cred set model takes the settings provider, offers the key on this ma
     await credOp(a, SEAL_ID, ['set', 'model'], { json: false, out: (l) => lines.push(l), secret: async () => '', keyPrompt: k.keyPrompt });
     assert.deepEqual(k.asked, [['confirm', 'use the 0g-compute key saved on this machine?']], 'only asked whether to use the draft');
     assert.ok(s.stored().document.defs['model.0g-compute'], 'stored under the settings provider');
-    assert.ok(lines.some((l) => /^added model\.0g-compute — version 4/.test(l)), lines.join('\n'));
+    assert.ok(lines.some((l) => /^added model\.0g-compute$/.test(l)), lines.join('\n'));
     assert.ok(lines.includes('in use now'), lines.join('\n'));
   } finally {
     s.server.close();

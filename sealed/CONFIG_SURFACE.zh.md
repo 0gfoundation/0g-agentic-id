@@ -266,7 +266,7 @@ SDK 抛 `SettingsConflictError`,并**刻意不重试** —— 盲目重放同一
 被签的那一份一致 —— **被签的消息才是权威**,不一致就是 400,而不是悄悄采信其中一个。
 
 这里写入的东西**下次开机**才到达 agent,不是现在。CLI 就是这么说的:
-*"written — version N. The container applies it on its next boot (reset to apply now)."*
+*"saved. The container applies it on its next boot."*
 
 ### 5.2 热路径 —— 容器
 

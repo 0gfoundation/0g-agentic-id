@@ -10,7 +10,8 @@
  */
 
 import { fetchReleases } from '../../Releases';
-import { CliError } from '../errors';
+import { CliError, shellStep } from '../errors';
+import { attestorUnreachable } from '../sdk';
 import { emitOk, print } from '../envelope';
 import { requireAttestorUrl } from '../env';
 import { dateOf, myMigrations, notesOf, zhLocale, type AffectedAgent } from '../releaseNotice';
@@ -25,7 +26,7 @@ const STATE_TEXT: Record<string, string> = {
 export async function run(ctx: CommandContext): Promise<void> {
   if (ctx.positionals.length) throw new CliError('BAD_FLAG', 'usage: releases (read-only)');
   const url = requireAttestorUrl(ctx.env);
-  const releases = await fetchReleases(url);
+  const releases = await fetchReleases(url).catch((e: unknown) => { throw attestorUnreachable(ctx.env, e); });
   let agents: AffectedAgent[] | null = null;
   const key = ctx.env.privateKey;
   if (key && /^0x[0-9a-fA-F]{64}$/.test(key)) agents = await myMigrations(url, key);
@@ -51,7 +52,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   } else if (!agents.length) {
     print('Your agents: none runs a replaced image.');
   } else {
-    print('Your agents to move (run 0g-agentdna, then `reset <agent>`; they keep running meanwhile):');
+    print(`Your agents to move (${shellStep('reset <agent>')}; they keep running meanwhile):`);
     for (const a of agents) {
       print(`  ${a.agent}  ${a.migrate.framework}  by ${dateOf(a.migrate.until)}  ${STATE_TEXT[a.migrate.state] ?? a.migrate.state}${a.migrate.urgent ? ', security fix' : ''}`);
     }

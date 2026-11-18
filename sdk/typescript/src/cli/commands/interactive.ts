@@ -17,19 +17,25 @@ import * as readline from 'node:readline';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
-import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
+import { parseEther, keccak256, isAddress, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, AgentInboxMessage, AgentSession, AgentSchedule, AgentActivityInfo, AgentActivityStop, HarnessTask, HarnessTaskRecord, HarnessTaskSummary, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
 import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
-import { buildClient } from '../sdk';
+import { buildClient, probeAttestor } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
-import { CliError, cancelled, isCancelled } from '../errors';
+import { CliError, cancelled, cmdStep, isCancelled, setSurface, shellStep } from '../errors';
 import { requireAttestorUrl } from '../env';
+import { ogAmount, parseOgAmount, explainError } from '../plain';
+import { fitHelp, termWidth, wrap, didYouMean } from '../textfit';
+import { run as doctorCommand } from './doctor';
+import { run as statusCommand } from './status';
+import { run as providersCommand } from './providers';
+import { run as releasesCommand } from './releases';
 import { dueReleaseNotice } from '../releaseNotice';
 import { loadKey, saveKey, normalizeKey, saveApiKey, loadApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
-import { applyAssignments, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework, isHarnessFramework, renderListedVersions, renderSettings, renderVersionsLine, settingsArgs } from '../settings';
+import { applyAssignments, assertModelFitsFramework, assertModelPresent, touchesModel, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework, frameworkNeedsToolModels, isHarnessFramework, renderListedVersions, renderSettings, renderVersionsLine, settingsArgs } from '../settings';
 import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOwnerOp, ensureModelKey } from '../credentials';
 import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
@@ -42,7 +48,7 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
-const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'status ', 'doctor', 'providers', 'releases', 'help', 'quit'];
 const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/sessions', '/activities', '/tasks', '/result', '/cancel', '/inbox', '/notices', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
@@ -68,50 +74,50 @@ function moneyBlock(prepaidWei: bigint | null, eff: EffBalance | null, effErr: s
   } else if (eff) {
     out(`AVAILABLE       : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
   } else {
-    out(`AVAILABLE       : (couldn't reach the provider's effective view: ${effErr ?? 'unknown'} — the chain number above may be optimistic)\n`);
+    out(`AVAILABLE       : (unknown: ${effErr ? explainError(effErr).message : 'no answer'} — the chain number above may be optimistic)\n`);
   }
 }
 
 /** Once-a-day update hint, driven by the attestor's /config (cli_latest +
  *  cli_notes — operator-set per release). Deliberately minimal: no npm, no
- *  semver lib (numeric dot-compare), silent on any failure. */
-// Deterministic latch for the update hint: Promise.race does NOT cancel the
-// loser, so a fetch resolving just past the deadline could still print into
-// the prompt. The banner closes the window; a late hint then stays silent.
-let updateHintWindowOpen = false;
-
-async function maybePrintUpdateHint(attestorUrl?: string): Promise<void> {
-  if (!attestorUrl) return;
-  updateHintWindowOpen = true;
-  {
+ *  semver lib (numeric dot-compare), silent on any failure. Returns the
+ *  lines to print and `shown()` to call once they are printed, so a hint
+ *  that comes too late for the banner is neither printed nor counted. */
+async function updateHint(attestorUrl?: string): Promise<{ lines: string[]; shown: () => void } | null> {
+  if (!attestorUrl) return null;
+  try {
+    const cfg = (await (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(4000) })).json()) as {
+      cli_latest?: string; cli_notes?: string;
+    };
+    const latest = cfg.cli_latest?.trim();
+    if (!latest) return null;
+    const mine = SDK_VERSION;
+    if (compareVersions(mine, latest) >= 0) return null;
+    // once per (day, latest)
+    const stamp = join(configPaths().dir, 'update-hint.json');
+    const today = new Date().toISOString().slice(0, 10);
     try {
-      const cfg = (await (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(4000) })).json()) as {
-        cli_latest?: string; cli_notes?: string;
-      };
-      const latest = cfg.cli_latest?.trim();
-      if (!latest) return;
-      const mine = SDK_VERSION;
-      if (compareVersions(mine, latest) >= 0) return;
-      // once per (day, latest)
-      const stamp = join(configPaths().dir, 'update-hint.json');
-      const today = new Date().toISOString().slice(0, 10);
-      try {
-        const prev = JSON.parse(readFileSync(stamp, 'utf8')) as { day?: string; latest?: string };
-        if (prev.day === today && prev.latest === latest) return;
-      } catch { /* first time */ }
-      if (!updateHintWindowOpen) return; // banner already closed — stay silent
+      const prev = JSON.parse(readFileSync(stamp, 'utf8')) as { day?: string; latest?: string };
+      if (prev.day === today && prev.latest === latest) return null;
+    } catch { /* first time */ }
+    const lines = [`update available: ${mine} → ${latest} — quit, then run: 0g-agentdna update`];
+    if (cfg.cli_notes?.trim()) lines.push(cfg.cli_notes.trim());
+    return {
+      lines,
       // Create the config dir first: a user whose attestorUrl comes from
       // AGENTIC_* env has never hit a write path, so the dir may not exist —
       // without this the stamp write ENOENTs, the once-a-day guard never
       // records, and the hint nags every start (review #170). Don't swallow
       // silently either.
-      try {
-        mkdirSync(configPaths().dir, { recursive: true });
-        writeFileSync(stamp, JSON.stringify({ day: today, latest }));
-      } catch (e) { console.error(`(update-hint stamp unwritable: ${(e as Error).message} — the hint may repeat)`); }
-      out(`\n  update available: ${mine} → ${latest}   0g-agentdna update\n`);
-      if (cfg.cli_notes?.trim()) out(`  ${cfg.cli_notes.trim()}\n`);
-    } catch { /* a down attestor never blocks or complains here */ }
+      shown: () => {
+        try {
+          mkdirSync(configPaths().dir, { recursive: true });
+          writeFileSync(stamp, JSON.stringify({ day: today, latest }));
+        } catch (e) { console.error(`(update-hint stamp unwritable: ${(e as Error).message} — the hint may repeat)`); }
+      },
+    };
+  } catch {
+    return null; // a down attestor never blocks or complains here
   }
 }
 
@@ -688,7 +694,7 @@ function prefetchModelIds(ag: AgenticID): void {
 }
 const CRED_SUBS = ['ls', 'set ', 'rm ', 'connect ', 'disconnect ', 'reveal ', 'pending', 'approve ', 'deny ', 'log', 'presets'];
 const L1_ARGS: Record<string, string[] | (() => string[])> = {
-  use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT,
+  use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT, status: AGENT,
   retry: AGENT, clone: AGENT, transfer: AGENT, call: AGENT, rate: AGENT,
   grant: AGENT, revoke: AGENT, authorizer: AGENT, settings: AGENT,
   cred: () => [...AGENT(), 'pending', 'notify ', 'presets'],
@@ -906,7 +912,7 @@ export function printAbovePrompt(
   rl.prompt(true);
 }
 import type { CommandContext } from '../types';
-import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
+import { cellText, cleanCell, cleanStream, listCells, listHeader, listLayout, ownerColumnWidth, sealToAgentMap, type ListLayout } from './cells';
 import { CONT_PROMPT, LiveTurn, PlainTurn, fitRow, liveKeys, wrapWords, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
 import { INK_PROMPT, MIN_COLS, MIN_ROWS, inkLoadError, loadInk, openInkScreen, type InkScreen, type Key as InkKey } from '../inkView';
 import { OUTBOX_POLL_MS, makeOutboxSync, renderOutboxEvent, supportsHyperlinks, tildePath, type OutboxSync } from '../outboxSync';
@@ -925,14 +931,13 @@ export function configuredProvidersText(dflt: string, ids: readonly string[], ha
   return [`${dflt} (new agents${own ? '' : ', no key'})`, ...others].join(', ');
 }
 
-/** Column widths of the REPL listing; its header and every row share them. */
-const LIST_COLS = { id: 6, phase: 11, framework: 12, seal: 13, agentSeal: 13, owner: 24 } as const;
+/** Every column, OWNER 24 wide: the REPL listing's layout when no terminal
+ *  width is given (piped output, the tests). */
+const ALL_COLUMNS = listLayout(undefined, 2, 24);
 
 /** The REPL listing's header line, aligned with {@link renderListRow}. */
-export function renderListHeader(): string {
-  const c = LIST_COLS;
-  return `  ${'ID'.padEnd(c.id)} ${'PHASE'.padEnd(c.phase)}${'FRAMEWORK'.padEnd(c.framework)}` +
-    `${'SEAL'.padEnd(c.seal)}${'AGENTSEAL'.padEnd(c.agentSeal)}${'OWNER'.padEnd(c.owner)}NAME\n`;
+export function renderListHeader(layout: ListLayout = ALL_COLUMNS): string {
+  return `  ${listHeader(layout)}\n`;
 }
 
 /**
@@ -941,10 +946,9 @@ export function renderListHeader(): string {
  * with `list`: a name cannot forge rows in this listing either, and an
  * agent-owned agent reads the same way — its OWNER is another row's
  * AGENTSEAL, annotated `⇄ #<agentId>` (`sealToAgent`, from the full listing).
- * SEAL is the sealId PREFIX (`0x` + 10 hex), the form commands accept as a
- * reference, so unminted rows stay referenceable without a 66-char column
- * blowout (F12).
- * AGENTSEAL is the agent's on-chain signing address.
+ * An unminted row shows its sealId PREFIX (`0x` + 10 hex) as its id, the form
+ * commands accept as a reference (F12). AGENTSEAL is the agent's on-chain
+ * signing address. `layout` fits the columns to the terminal (./cells).
  */
 export function renderListRow(
   r: {
@@ -954,12 +958,9 @@ export function renderListRow(
   owner: string | null | undefined,
   owned = ' ',
   sealToAgent: ReadonlyMap<string, string> = new Map(),
+  layout: ListLayout = ALL_COLUMNS,
 ): string {
-  const c = LIST_COLS;
-  const seal = `0x${r.sealId.slice(2, 12)}`;
-  return `${owned} ${String(r.agentId ?? '?').padEnd(c.id)} ${cellText(r.phase ?? '?', c.phase)}` +
-    `${cellText(r.framework, c.framework)}${cellText(seal, c.seal)}${cellText(shortAddr(r.agentSeal), c.agentSeal)}` +
-    `${trustedCell(ownerCellText(owner, sealToAgent), c.owner)}${cleanCell(r.name)}\n`;
+  return `${owned} ${listCells(r, owner, sealToAgent, layout, '')}\n`;
 }
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
@@ -2417,11 +2418,12 @@ export async function run(ctx: CommandContext): Promise<void> {
     // Text in the box: Ctrl-C clears it (its earlier lines too) first.
     if ((activeAsk ?? ask).clearBox?.()) return;
     const now = Date.now();
-    if (now - lastSigint < 2000) { void quitShell(0, true); return; }
+    if (now - lastSigint < 2000) { if (!activeInk && rl.terminal) term('\n'); void quitShell(0, true); return; }
     lastSigint = now;
     if (activeInk) { out('(press Ctrl-C again to exit)\n'); return; }
-    out('\n(press Ctrl-C again to exit)\n');
-    rl.prompt();
+    // Above the prompt: written below it, readline's redraw of a prompt that
+    // starts with a newline would erase it.
+    printAbovePrompt('(press Ctrl-C again to exit)', rl);
   };
   const onEscape = (): void => {
     if (cancelQuestion()) return;
@@ -2464,8 +2466,10 @@ export async function run(ctx: CommandContext): Promise<void> {
     await managerRepl(ctx, ask, irq);
   } catch (e) {
     // stdin EOF (piped input, Ctrl-D) closes readline while a question is
-    // pending — that's a normal way to leave, not an error.
+    // pending — that's a normal way to leave, not an error. On a terminal the
+    // owner's shell prompt starts on a line of its own.
     if ((e as { code?: string }).code !== 'ERR_USE_AFTER_CLOSE') throw e;
+    if (rl.terminal) term('\n');
   } finally {
     rl.close();
   }
@@ -2473,7 +2477,7 @@ export async function run(ctx: CommandContext): Promise<void> {
 
 /** Resolve an agent ref to this wallet's deployment row (owner listing —
  *  lifecycle verbs need sandboxId, which the public listing withholds). */
-async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; phase: string; sandboxId?: string; framework?: string | null }> {
+async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; minted: boolean; phase: string; sandboxId?: string; framework?: string | null }> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listMyDeployments();
   rememberAgentIds(rows);
@@ -2486,18 +2490,32 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
     throw new CliError(
       'AGENT_NOT_FOUND',
       exists
-        ? `agent ${refInput} is not yours`
-        : `agent ${refInput} does not exist`,
-      { remedy: exists ? 'check `whoami` — are you on the right wallet? `list` marks yours with *' : 'check `list` for the agents that exist here' },
+        ? `agent ${cleanCell(refInput)} is not yours`
+        : `agent ${cleanCell(refInput)} does not exist on this attestor`,
+      { remedy: exists ? 'check `whoami` — are you on the right wallet? `list` marks yours with *' : '`list` shows the agents here (* marks yours)' },
     );
   }
-  return { sealId: row.sealId, agentId: String(row.agentId ?? '?'), phase: row.phase ?? 'unknown', sandboxId: (row as { sandboxId?: string | null }).sandboxId ?? undefined, framework: (row as { framework?: string | null }).framework ?? null };
+  // An agent without an agentId yet is named by its sealId prefix, the
+  // handle every command accepts for it (`list` shows the same).
+  const minted = row.agentId !== undefined && row.agentId !== null;
+  return { sealId: row.sealId, agentId: minted ? String(row.agentId) : sealPrefixOf(row.sealId), minted, phase: row.phase ?? 'unknown', sandboxId: (row as { sandboxId?: string | null }).sandboxId ?? undefined, framework: (row as { framework?: string | null }).framework ?? null };
+}
+
+/** `0x` + the first 10 hex of a sealId: an unminted agent's handle. */
+function sealPrefixOf(sealId: string): string {
+  return `0x${sealId.slice(2, 12)}`;
 }
 
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · hello <id> [full] · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · cred <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
+  'commands: list · use <id> · hello <id> [full] · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · cred <id> · status <id> · balance · deposit · withdraw · ack · login · whoami · doctor · providers · releases · help · quit';
+
+/** A `·`-separated list wrapped to `width` between items, never inside one. */
+export function fitItems(text: string, width: number | undefined): string {
+  const nb = text.split(' · ').map((item) => item.replace(/ /g, '\u00a0')).join(' · ');
+  return wrap(nb, width, '  ').join('\n').replace(/\u00a0/g, ' ');
+}
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
@@ -2532,16 +2550,16 @@ const L1_HELP_FULL = `manager commands
                           harness=…)
   cred <id> [sub …]       the agent's credentials (API keys, tokens): bare
                           lists them (never values); set <name> [k=v …] adds
-                          or changes one (preset=<name> — cred presets lists them,
-                          host=, header='Name: … {v}', basic=, query=, body=,
-                          path=yes, use=sign signer=<json>, reveal=yes|no,
-                          expires=, desc=; the value
-                          is asked for, not echoed); rm <name>; connect <name>
-                          <mcp-url> (prints a link to open); disconnect <name>; reveal <name>
-                          on|off; pending; approve|deny [<id>]; log [n].
-                          cred pending: counts on all your agents; cred
-                          notify [email|off]: where you are emailed;
-                          cred presets: the presets
+                          or changes one (preset=<name> — cred presets lists
+                          them, host=, header='Name: … {v}', basic=, query=,
+                          body=, path=yes, use=sign signer=<json>,
+                          reveal=yes|no, expires=, desc=; the value is asked
+                          for, not echoed); rm <name>; connect <name>
+                          <mcp-url> (prints a link to open); disconnect
+                          <name>; reveal <name> on|off; pending;
+                          approve|deny [<id>]; log [n]. cred pending: counts
+                          on all your agents; cred notify [email|off]: where
+                          you are emailed; cred presets: the presets
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
                           Someone else's: goes through its fork policy — works
                           iff the seller granted YOUR wallet. Lands offline
@@ -2560,14 +2578,27 @@ const L1_HELP_FULL = `manager commands
                           much (more) to withdraw (time-locked)
   ack                     acknowledge the TEE trust root (deploy/start/reset
                           do this implicitly; re-run after an attestor upgrade)
-  login [provider]        setup: attestor URL, owner key, each provider's model key
-                          (Enter keeps the current value; secrets echo *)
-  whoami                  show attestor / wallet / the providers with a model key
-                          on this machine / ack status
+  status <id>             one agent's full picture: phase, agentId, sealId,
+                          agentSeal, failure reason
+  doctor                  check every deploy prerequisite, each failing one
+                          with its remedy
+  providers               the inference providers this attestor offers
+  releases                release notices: what changed, and which of your
+                          agents to reset by when
+  login [provider]        setup: attestor URL, owner key, each provider's model
+                          key (Enter keeps the current value; secrets echo *)
+  whoami                  show attestor / wallet / the providers with a model
+                          key on this machine / ack status
   help                    this text
   quit                    exit (Ctrl-C twice also works)
 At a question a command asks (a value, an amount, a confirmation), Ctrl-C or
 Esc cancels it and the command.`;
+
+/** The manager's `help`, fitted to a terminal `width` wide (textfit.ts).
+ *  Exported for the tests. */
+export function managerHelp(width?: number): string {
+  return fitHelp(L1_HELP_FULL, width);
+}
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   // The environment marker in every prompt: cross-environment mistakes (a
@@ -2576,8 +2607,18 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   // agent. Recomputed per prompt, NOT frozen once: `login` can change the
   // attestor mid-session, and a stale label then disagrees with the real
   // backend (the exact confusion this marker exists to prevent).
+  // From here on errors and notices name commands as typed at this prompt.
+  setSurface('shell');
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
-  const hasApiKey = !!configuredInferenceKey(loadConfig().inferenceProvider ?? '0g-compute');
+  // A model key from the environment that names no provider is refused when
+  // it is used; the banner only says so.
+  let modelKey = '(none)';
+  try {
+    if (configuredInferenceKey(loadConfig().inferenceProvider ?? '0g-compute')) modelKey = 'set';
+  } catch {
+    modelKey = '(AGENTDNA_API_KEY is set without AGENTDNA_API_KEY_PROVIDER)';
+  }
+  const hasApiKey = modelKey === 'set';
   const wallet = key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : null;
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
   // Pixel splash (the avatar generator's panda) when the terminal can show
@@ -2599,46 +2640,56 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   // must work for a keyless user too, where no wallet client exists to share
   // one. A hanging (vs refusing) attestor must not stall the banner.
   let ack = '';
-  out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+  // The update hint and the release notice print after the banner block,
+  // not inside it; everything the banner prints fits the terminal's width.
+  const notices: string[][] = [];
+  const width = termWidth();
+  const say = (line: string): void => out(`${wrap(line, width, '             ').join('\n')}\n`);
+  say(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}`);
   {
     const started = Date.now();
+    // Each way the read can fail says which: the attestor did not answer,
+    // the chain read failed, or no answer within the banner's 4 s.
     const readAck = key && ctx.env.attestorUrl
-      ? withWallet(ctx)
-          .then((ag) => ag.ackStatus())
-          .then(({ allAcked }) => (allAcked ? 'ok' : 'MISSING — run `ack`'))
-          .catch(() => '(unreachable)')
+      ? withWallet(ctx).then(
+          (ag) => ag.ackStatus().then(
+            ({ allAcked }) => (allAcked ? 'ok' : 'MISSING — run `ack`'),
+            () => '(could not read it from the chain)',
+          ),
+          (e: unknown) => ((e as CliError).code === 'WALLET_REQUIRED' ? '(needs a valid owner key — `login`)' : '(the attestor did not answer)'),
+        )
       : Promise.resolve('');
     // The hint is NOT key-gated: a pre-login user with an attestor configured
     // is exactly who may need the newer CLI.
-    const hintDone = maybePrintUpdateHint(ctx.env.attestorUrl).catch(() => {});
+    const hint = updateHint(ctx.env.attestorUrl).catch(() => null);
     // The release notice (releaseNotice.ts) shares the same 4 s window.
     const noticeAbort = new AbortController();
     const noticeDue = dueReleaseNotice(ctx.env, noticeAbort.signal);
-    ack = await Promise.race([readAck, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
+    ack = await Promise.race([readAck, new Promise<string>((r) => setTimeout(() => r('(no answer within 4 s)'), 4000).unref())]);
     const left = Math.max(0, 4000 - (Date.now() - started));
-    await Promise.race([hintDone, new Promise<void>((r) => setTimeout(r, left).unref())]);
-    updateHintWindowOpen = false; // a losing fetch that resolves later stays silent
+    const hinted = await Promise.race([hint, new Promise<null>((r) => setTimeout(() => r(null), left).unref())]);
+    if (hinted) { notices.push(hinted.lines); hinted.shown(); }
     const noticeLeft = Math.max(0, 4000 - (Date.now() - started));
     const due = await Promise.race([noticeDue, new Promise<null>((r) => setTimeout(() => r(null), noticeLeft).unref())]);
     noticeAbort.abort();
-    if (due) {
-      out(`\n${due.lines.map((l) => `  ${l}`).join('\n')}\n`);
-      due.shown();
-    }
+    if (due) { notices.push(due.lines); due.shown(); }
   }
-  out(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
-  out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
-  if (ack) out(`  ack        ${ack}\n`);
+  say(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}`);
+  say(`  model key  ${modelKey}`);
+  if (ack) say(`  ack        ${ack}`);
   out('\n');
-  if (!ctx.env.attestorUrl || !key) {
-    out('  first run? type `login` — one guided setup for the attestor + keys\n\n');
-  } else if (!hasApiKey) {
-    // API key is only needed for deploy/reset — don't re-onboard a
-    // configured user over an optional item (feedback.md F8).
-    out('  `help` commands · `use <id>` chat · (no inference API key — `login` adds one when you deploy)\n\n');
-  } else {
-    out('  `help` commands · `use <id>` chat · Esc interrupts a turn\n\n');
+  for (const lines of notices) {
+    for (const l of lines) out(`${wrap(`  ${l}`, width, '  ').join('\n')}\n`);
+    out('\n');
   }
+  const hello = !ctx.env.attestorUrl || !key
+    ? 'first run? type `login` — one guided setup for the attestor + keys'
+    : !hasApiKey
+      // A model key is only needed for deploy/reset — don't re-onboard a
+      // configured user over an optional item (feedback.md F8).
+      ? '`help` commands · `use <id>` chat · (no model key — `login` adds one when you deploy)'
+      : '`help` commands · `use <id>` chat · Esc interrupts a turn';
+  out(`${wrap(`  ${hello}`, width, '  ').join('\n')}\n\n`);
   // Prefill the completion id cache in the background: without it, `use
   // <Tab>` is dead until the first list/balance/agent op of the session.
   // Fire-and-forget — a slow attestor costs the completions, never the prompt.
@@ -2660,7 +2711,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     const [cmd, ...args] = line ? tokenize(line) : ['whoami'];
     try {
       if (cmd === 'quit' || cmd === 'exit') return;
-      if (cmd === 'help') { out(`${L1_HELP_FULL}\n`); continue; }
+      if (cmd === 'help') { out(`${managerHelp(termWidth())}\n`); continue; }
 
       if (cmd === 'login' || cmd === 'config') {
         // Guided setup. The attestor URL is required; the owner key is
@@ -2669,43 +2720,87 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // `cred set model` and a settings switch, cli/modelkey.ts). Enter
         // keeps a value or skips an unset one; a typed value replaces it.
         // Secrets masked. `login <provider>` asks that provider's key only.
+        // Each answer is checked before it is saved — the URL must be an
+        // attestor that answers, the key a private key — and asked again
+        // until it passes or is skipped. A step left with Ctrl-C or Esc saves
+        // nothing; the steps finished before it stay saved, and the
+        // cancellation says which.
         const only = args[0];
-        if (!only) {
-          for (;;) {
-            const url = (await ask(`attestor URL (required) [${ctx.env.attestorUrl ?? 'unset'}]: `)).trim();
-            if (url) { saveConfig({ attestorUrl: url.replace(/\/$/, '') }); ctx.env.attestorUrl = url.replace(/\/$/, ''); break; }
-            if (ctx.env.attestorUrl) break;
-            out('every command needs the attestor URL\n');
-          }
-          const hasKey = !!(ctx.env.privateKey ?? loadKey());
-          const key = (await askSecret(ask, `owner private key (needed to manage your agents) [${hasKey ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
-          if (key) {
-            // Cache what was SAVED, not what was typed — saveKey normalizes
-            // (0x prefix optional), and a raw un-prefixed value in ctx.env
-            // makes every later command see a "malformed" key until restart.
-            try { saveKey(key); ctx.env.privateKey = normalizeKey(key)!; ctx.env.privateKeySource = 'file'; }
-            catch (e) { out(`private key not saved: ${(e as Error).message}\n`); }
-          }
-        }
-
-        if (ctx.env.attestorUrl) {
-          const client = await buildClient(ctx.env);
-          knownProviders = await client.agent.refreshProviders();
-        } else { knownProviders = listInferenceProviders(); }
-        if (only && !knownProviders.some((provider) => provider.id === only)) throw new CliError('BAD_FLAG', `unknown inference provider: ${only}`);
-        if (!only) out('model keys (optional: creating or resetting an agent asks for the one its provider needs)\n');
-        for (const id of only ? [only] : knownProviders.map((provider) => provider.id)) {
-          const has = !!configuredInferenceKey(id);
-          const api = (await askSecret(ask, `  ${id} key [${has ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
-          if (api) saveApiKey(id, api);
-        }
-        const withKey = knownProviders.map((provider) => provider.id).filter((id) => configuredInferenceKey(id));
+        const saved: string[] = [];
+        let withKey: string[] = [];
         let preferred = loadConfig().inferenceProvider ?? '0g-compute';
-        if (!only) {
-          // New agents default to a provider there is a key for.
-          if (withKey.length > 1) preferred = await pickInferenceProvider(ask, withKey.includes(preferred) ? preferred : withKey[0], withKey);
-          else if (withKey.length === 1) preferred = withKey[0];
-          saveConfig({ inferenceProvider: preferred });
+        try {
+          if (!only) {
+            for (;;) {
+              const url = (await ask(`attestor URL (required) [${ctx.env.attestorUrl ?? 'unset'}]: `)).trim().replace(/\/+$/, '');
+              if (!url) {
+                if (ctx.env.attestorUrl) break;
+                out('  every command needs the attestor URL — type it, e.g. https://agentdna.0g.ai\n');
+                continue;
+              }
+              const problem = await probeAttestor(url);
+              if (problem) {
+                out(`  ${cleanCell(url)}: ${problem} — try again${ctx.env.attestorUrl ? ' (Enter keeps the current one)' : ''}\n`);
+                continue;
+              }
+              saveConfig({ attestorUrl: url });
+              ctx.env.attestorUrl = url;
+              ctx.env.attestorUrlSource = 'file';
+              saved.push('the attestor URL');
+              break;
+            }
+            const hasKey = !!(ctx.env.privateKey ?? loadKey());
+            for (;;) {
+              const typed = (await askSecret(ask, `owner private key (needed to manage your agents) [${hasKey ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
+              if (!typed) break;
+              // Cache what was SAVED, not what was typed — normalizeKey adds
+              // the optional 0x, and a raw un-prefixed value in ctx.env makes
+              // every later command see a "malformed" key until restart.
+              const k = normalizeKey(typed);
+              if (!k) {
+                out('  not a private key (64 hex, 0x optional) — try again, or Enter to skip\n');
+                continue;
+              }
+              saveKey(k);
+              ctx.env.privateKey = k;
+              ctx.env.privateKeySource = 'file';
+              saved.push('the owner key');
+              out(`  wallet ${await addressOf(k)}\n`);
+              break;
+            }
+          }
+
+          knownProviders = listInferenceProviders();
+          if (ctx.env.attestorUrl) {
+            try {
+              const client = await buildClient(ctx.env);
+              knownProviders = await client.agent.refreshProviders();
+            } catch (e) {
+              out(`  (${explainError(e).message} — the providers below are the built-in list)\n`);
+            }
+          }
+          if (only && !knownProviders.some((provider) => provider.id === only)) {
+            throw new CliError('BAD_FLAG', `unknown inference provider: ${only}`, { remedy: `one of: ${knownProviders.map((p) => p.id).join(', ')}` });
+          }
+          if (!only) out('model keys (optional: creating or resetting an agent asks for the one its provider needs)\n');
+          for (const id of only ? [only] : knownProviders.map((provider) => provider.id)) {
+            const has = !!configuredInferenceKey(id);
+            const api = (await askSecret(ask, `  ${id} key [${has ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
+            if (api) { saveApiKey(id, api); saved.push(`the ${id} key`); }
+          }
+          withKey = knownProviders.map((provider) => provider.id).filter((id) => configuredInferenceKey(id));
+          if (!only) {
+            // New agents default to a provider there is a key for.
+            if (withKey.length > 1) preferred = await pickInferenceProvider(ask, withKey.includes(preferred) ? preferred : withKey[0], withKey, 'default provider for new agents');
+            else if (withKey.length === 1) preferred = withKey[0];
+            saveConfig({ inferenceProvider: preferred });
+          }
+        } catch (e) {
+          if (isCancelled(e) && saved.length) {
+            out(`cancelled — ${saved.join(', ')} ${saved.length === 1 ? 'was' : 'were'} saved before it; the rest is as it was\n`);
+            continue;
+          }
+          throw e;
         }
         out(`saved to ${configPaths().dir} (credentials chmod 600)\n`);
         out(`  attestor    ${ctx.env.attestorUrl ?? '(unset)'}\n`);
@@ -2754,11 +2849,21 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       if (cmd === 'deposit') {
+        if (args.length > 1) { out('usage: deposit [amount OG]\n'); continue; }
+        // The amount is checked before any transaction: a positive number
+        // of OG, within what the wallet holds.
+        if (args[0]) parseOgAmount(args[0]);
         const ag = await withWallet(ctx);
         const amt = args[0] || (await ask('amount OG [1]: ')).trim() || '1';
-        const tx = await ag.deposit({ amountWei: parseEther(amt) });
+        const amountWei = parseOgAmount(amt);
+        const native = await ag.nativeBalance().catch(() => null);
+        if (native != null && native <= amountWei) {
+          out(`the wallet holds ${og(native)} — not enough for ${ogAmount(amountWei)} OG plus gas\n`);
+          continue;
+        }
+        const tx = await ag.deposit({ amountWei });
         await ag.waitForTransaction(tx);
-        out(`deposited ${amt} OG to the prepaid sandbox balance (tx ${tx})\n`);
+        out(`deposited ${ogAmount(amountWei)} OG to the prepaid sandbox balance (tx ${tx})\n`);
         continue;
       }
 
@@ -2767,6 +2872,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // time-locked pending pot; withdrawRefund claims it after the lock.
         // `withdraw <og>` starts one, bare `withdraw` claims (or reports the
         // lock) — the pending state decides which step the user is on.
+        if (args.length > 1) { out('usage: withdraw [amount OG]\n'); continue; }
+        if (args[0]) parseOgAmount(args[0]);
         const ag = await withWallet(ctx);
         const d = await ag.getBalanceDetail();
         const unlockMs = Number(d.refundUnlockAt) * 1000;
@@ -2794,13 +2901,19 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const more = pending > 0n ? ` more (joins the pending ${og(pending)}; lock restarts)` : '';
         const amt = args[0] || (await ask(`withdraw how much${more}? [max ${og(d.balance)}, empty to skip]: `)).trim();
         if (!amt) continue;
-        const amountWei = parseEther(amt);
-        if (amountWei > d.balance) { out(`only ${og(d.balance)} spendable — cannot withdraw ${amt} OG\n`); continue; }
+        const amountWei = parseOgAmount(amt);
+        if (amountWei > d.balance) { out(`only ${og(d.balance)} spendable — cannot withdraw ${ogAmount(amountWei)} OG\n`); continue; }
+        // The bare form's question says a request restarts the pending lock;
+        // with the amount given as an argument, ask before restarting it.
+        if (args[0] && pending > 0n) {
+          const yn = (await ask(`${ogAmount(amountWei)} OG joins the pending ${og(pending)}; its lock restarts — proceed? [y/N]: `)).trim().toLowerCase();
+          if (yn !== 'y' && yn !== 'yes') { out('withdraw cancelled — the pending refund and its lock are unchanged\n'); continue; }
+        }
         const tx = await ag.requestRefund({ amountWei: amountWei + pending });
         await ag.waitForTransaction(tx);
         const after = await ag.getBalanceDetail();
         if (pending > 0n) out(`pending refund: ${og(pending)} → ${og(after.pendingRefund)} (lock restarted)\n`);
-        else out(`${amt} OG moved to pending refund (tx ${tx})\n`);
+        else out(`${ogAmount(amountWei)} OG moved to pending refund (tx ${tx})\n`);
         out(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
         continue;
       }
@@ -2828,7 +2941,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
             const { allAcked, missing } = ackRes.r;
             out(`trust root  ${allAcked ? 'acknowledged' : `missing ${missing.join(', ')} — run \`ack\``}\n`);
           } else {
-            out(`trust root  (could not be read: ${cleanCell(plainError(ackRes.e))})\n`);
+            out(`trust root  (could not be read: ${cleanCell(explainError(ackRes.e).message)})\n`);
           }
           try {
             if (!dRes.ok) throw dRes.e;
@@ -2855,7 +2968,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (allAcked) { out('trust root already acknowledged — nothing to do\n'); continue; }
         out(`acknowledging: ${missing.join(', ')}\n`);
         const tx = await ag.ack();
-        if (tx) { out(`ack() → ${tx} (waiting…)\n`); await ag.waitForTransaction(tx); }
+        if (tx) { out(`acknowledging the trust root (tx ${tx}, waiting…)\n`); await ag.waitForTransaction(tx); }
         out('acknowledged\n');
         continue;
       }
@@ -2864,12 +2977,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Public listing — no wallet needed. Minted rows carry owner (chain-
         // public via ownerOf); "mine" marks still come from the owner-signed
         // listing so unminted rows attribute correctly too.
+        const extra = args.filter((a) => a !== '--mine' && a !== 'mine');
+        if (extra.length) { out(`usage: list [--mine] — one agent's details: status ${cleanCell(extra[0])}\n`); continue; }
         let key = ctx.env.privateKey ?? loadKey() ?? undefined;
         let ag: AgenticID;
         try {
           ag = key ? await withWallet(ctx) : await clientFor(ctx, false);
         } catch (e) {
-          // Malformed key must not block a PUBLIC listing — warn, go walletless.
+          // A malformed key must not block a PUBLIC listing — warn, go
+          // walletless. Anything else (no attestor, no answer) is the error.
+          if ((e as CliError).code !== 'WALLET_REQUIRED') throw e;
           out(`warning: ${(e as CliError).message} — listing without ownership marks\n`);
           key = undefined;
           ag = await clientFor(ctx, false);
@@ -2897,14 +3014,15 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // From the full public listing, as in `list`: a --mine view must not
         // strip the annotation off a child whose parent it hides.
         const sealToAgent = sealToAgentMap(rows);
-        out(renderListHeader());
-        for (const r of shown) {
+        // The owner tier carries owner and agentSeal for UNMINTED rows too.
+        const merged = shown.map((r) => {
           const own = mine?.get(r.sealId);
-          // The owner tier carries owner and agentSeal for UNMINTED rows too.
-          out(renderListRow({ ...r, agentSeal: own?.agentSeal ?? r.agentSeal }, own?.owner ?? r.owner, own ? '*' : ' ', sealToAgent));
-        }
-        if (mine && !mineOnly) out('(* = owned by your wallet · `list --mine` filters to them)\n');
-        if (shown.some((r) => r.agentId == null)) out("('?' rows have no agentId yet — reference them by sealId prefix, e.g. retry 0x" + shown.find((r) => r.agentId == null)!.sealId.slice(2, 12) + ')\n');
+          return { row: { ...r, agentSeal: own?.agentSeal ?? r.agentSeal }, owner: own?.owner ?? r.owner, mark: own ? '*' : ' ' };
+        });
+        const layout = listLayout(termWidth(), 2, ownerColumnWidth(merged.map((m) => m.owner), sealToAgent));
+        out(renderListHeader(layout));
+        for (const m of merged) out(renderListRow(m.row, m.owner, m.mark, sealToAgent, layout));
+        if (mine && !mineOnly) out(`${wrap('(* = owned by your wallet · `list --mine` filters to them)', termWidth()).join('\n')}\n`);
         continue;
       }
 
@@ -2914,6 +3032,17 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         const attestorUrl = requireAttestorUrl(ctx.env);
         const row = await myRow(ag, args[0]);
+        // Still deploying (minted or not): the deploy brings it up itself;
+        // start/reset would act on a container that is not there yet.
+        if (row.phase === 'deploying' && cmd !== 'stop') {
+          out(`agent ${row.agentId} is still deploying — \`list\` shows when it is up\n`);
+          continue;
+        }
+        // No agentId: its deploy failed before the mint — retry resumes it.
+        if (!row.minted && cmd !== 'stop') {
+          out(`agent ${row.agentId} has no agentId — its deploy stopped before the mint; resume it with: retry ${row.agentId}\n`);
+          continue;
+        }
         if (cmd === 'stop') {
           if (row.phase !== 'running' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — nothing to stop\n`); continue; }
           await ag.agent.stop(row.sealId, row.sandboxId);
@@ -2967,7 +3096,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (!args[0]) { out('usage: retry <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
-        if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
+        if (!row) throw agentNotFound(args[0]);
         if (row.phase !== 'failed') { out(`agent ${row.agentId ?? row.sealId} is ${row.phase} — retry only applies to failed rows\n`); continue; }
         out(`retrying seal ${row.sealId} — re-running the failed stages… (Esc-proof; may take a minute)\n`);
         await ag.agent.retry(row.sealId);
@@ -2987,7 +3116,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (!args[0]) { out('usage: settings <agentId|sealId> [model=… thinking=low|high|max provider=… others=<json> | versions]\n'); continue; }
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
-        if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
+        if (!row) throw agentNotFound(args[0]);
         await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework, ask, `settings ${args[0]} versions`);
         continue;
       }
@@ -2999,7 +3128,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         if (await credOwnerOp(ag, args, credIO(ask))) continue;
         const row = await findAgentRow(ag, args[0]);
-        if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
+        if (!row) throw agentNotFound(args[0]);
         await credInShell(irq, args.slice(1), (io) => credOp(ag, row.sealId, args.slice(1), { ...credIO(ask), ...io }, row.phase === 'running' && row.url ? row.url : undefined));
         continue;
       }
@@ -3032,7 +3161,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           target = cfg.standard_clone_authorizer_addr;
           out(`standard policy: ${target}\n`);
         }
-        if (target !== ZERO_ADDR && !isAddress(target)) { out('authorizer must be an address, `standard`, or `off`\n'); continue; }
+        if (target !== ZERO_ADDR && !isAddress(target)) { out(`${addressProblem(target, 'the policy')} — or \`standard\`, or \`off\`\n`); continue; }
         const tx = await ag.agent.setCloneAuthorizer(id, target as Address);
         await ag.agent.waitForTransaction(tx);
         out(target === ZERO_ADDR
@@ -3046,7 +3175,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           out(`usage: ${cmd} <agentId|sealId> <buyer>\n`);
           continue;
         }
-        if (!isAddress(args[1])) { out('buyer must be a 0x address\n'); continue; }
+        if (!isAddress(args[1])) { out(`${addressProblem(args[1], 'the buyer')}\n`); continue; }
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
         const tx = cmd === 'grant'
@@ -3061,7 +3190,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
 
       if (cmd === 'transfer') {
         if (!args[0] || !args[1]) { out('usage: transfer <agentId|sealId> <to>\n'); continue; }
-        if (!isAddress(args[1])) { out('to must be a 0x address\n'); continue; }
+        if (!isAddress(args[1])) { out(`${addressProblem(args[1], 'the new owner')}\n`); continue; }
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
         const from = await ag.agent.ownerOf(id);
@@ -3087,7 +3216,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         let params: Parameters<typeof ag.agent.clone>[0];
         if (sourceOwner.toLowerCase() === me.toLowerCase()) {
           const to = args[1] ?? me;
-          if (!isAddress(to)) { out('to must be a 0x address\n'); continue; }
+          if (!isAddress(to)) { out(`${addressProblem(to, 'the new owner')}\n`); continue; }
           params = { sourceAgentId: id, targetOwner: to as Address };
         } else {
           if (args[1]) { out('policy clones always mint to YOUR wallet — drop the <to> argument\n'); continue; }
@@ -3109,7 +3238,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const rows = await ag.agent.listDeployments();
         rememberAgentIds(rows);
         const row = pickRow(ref, args[0], rows);
-        if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
+        if (!row) throw agentNotFound(args[0]);
         if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
         // With a wallet configured, declare it as the proof's redeemer so this
         // visit banks a rating ticket (see `rate`). Still no signing involved.
@@ -3127,7 +3256,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         const my = (await addressOf(ctx.env.privateKey!)) as `0x${string}`;
         const row = await findAgentRow(ag, args[0]);
-        if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
+        if (!row) throw agentNotFound(args[0]);
         if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
         // Service table for method resolution (no client address — this lookup
         // is not the interaction being rated, so it must not bank a ticket).
@@ -3175,7 +3304,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         const my = (await addressOf(ctx.env.privateKey!)) as `0x${string}`;
         const row = await findAgentRow(ag, args[0]);
-        if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
+        if (!row) throw agentNotFound(args[0]);
         if (row.agentId == null) { out(`agent ${args[0]} is not minted yet — nothing to rate\n`); continue; }
         const agentId = BigInt(row.agentId);
         // The chain would reject this at the attest step (self-feedback); say it upfront.
@@ -3255,6 +3384,19 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
+      if (cmd === 'doctor' || cmd === 'status' || cmd === 'providers' || cmd === 'releases') {
+        // The one-shot commands, run here as from the OS shell. doctor ends
+        // with its own summary line, so its closing error is not repeated.
+        const runCommand = { doctor: doctorCommand, status: statusCommand, providers: providersCommand, releases: releasesCommand }[cmd];
+        try {
+          await runCommand({ env: ctx.env, json: false, positionals: args, flags: { mine: false } });
+        } catch (e) {
+          if (cmd === 'doctor' && e instanceof CliError && e.details) continue;
+          throw e;
+        }
+        continue;
+      }
+
       if (cmd === 'use' || cmd === 'link') {
         if (!args[0]) { out('usage: use <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
@@ -3266,47 +3408,24 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'deploy') {
         const ag = await withWallet(ctx);
         const s = await deployWizard(ag, requireAttestorUrl(ctx.env), ask, ctx, irq);
-        if (!s) { out('wait cancelled — the deploy continues in the background; watch it with `list`, enter later with `use <id>`\n'); continue; }
+        if (!s) continue; // mint only, or the wait was stopped: the wizard said which
         await enterSession(s, ask, irq, ctx);
         continue;
       }
 
-      out(`unknown command: ${cmd}\n${L1_HELP}\n`);
+      const near = didYouMean(cmd, L1_WORDS.map((w) => w.trim()));
+      out(`unknown command: ${cleanCell(cmd)}${near ? ` — did you mean \`${near}\`?` : ''}\n${fitItems(L1_HELP, termWidth() ?? 80)}\n`);
     } catch (e) {
-      // Keep the REPL alive on operational errors; show the remedy if present.
-      const ce = e as CliError;
+      // Keep the REPL alive on operational errors: one or two plain lines
+      // and the remedy, never a raw HTTP body or a viem dump (plain.ts).
+      // stdin closed (Ctrl-D, the end of piped input) ends the shell.
+      if ((e as { code?: string }).code === 'ERR_USE_AFTER_CLOSE') throw e;
       if (isCancelled(e)) out('cancelled\n');
-      else out(`error: ${friendlyChainError(e) ?? ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`);
+      else {
+        const p = explainError(e);
+        out(`error: ${p.message}${p.remedy ? `\n  → ${p.remedy}` : ''}\n`);
+      }
     }
-  }
-}
-
-/**
- * Translate the custom contract errors our commands can hit into one human
- * sentence, instead of viem's raw revert dump (signature + arg tuple + call
- * frame). Returns undefined for anything unrecognized — caller falls back to
- * the error's own message.
- */
-function friendlyChainError(e: unknown): string | undefined {
-  const revert = (e as { walk?: (fn: (x: unknown) => boolean) => unknown }).walk?.(
-    (x) => x instanceof ContractFunctionRevertedError,
-  ) as ContractFunctionRevertedError | undefined;
-  const d = revert?.data;
-  if (!d?.errorName) return undefined;
-  const a = (d.args ?? []) as readonly unknown[];
-  switch (d.errorName) {
-    case 'CloneGateNotTokenOwner':
-      return `agent ${a[1]} is not yours — its owner is ${a[2]} (you signed as ${a[0]})`;
-    case 'StdCloneAuthNotSeller':
-      return `only agent ${a[1]}'s owner (${a[2]}) can manage its fork grants — you signed as ${a[0]}`;
-    case 'CloneGateDenied':
-      return a[1] === ZERO_ADDR
-        ? `agent ${a[0]} has no fork policy configured — its owner opens sales with: authorizer ${a[0]} <policy>`
-        : `agent ${a[0]}'s fork policy (${a[1]}) declined — ask the seller to: grant ${a[0]} <your wallet>`;
-    case 'CloneGateNotTrustedAttestor':
-      return 'cloneFrom may only be submitted by a trusted attestor — use the attestor /clone flow, not a direct tx';
-    default:
-      return `${d.errorName}(${a.map(String).join(', ')})`;
   }
 }
 
@@ -3395,6 +3514,7 @@ async function settingsOp(
   // last-known-good cannot cover — refuse before signing, and say so.
   assertModelPresent(next, current !== null);
   assertSubagentDefaultOffered(next);
+  await assertModelFitsFramework(assignments, next, framework, (provider) => ag.agent.listModelCaps({ provider }));
   const providerChanged = changesProvider(current, next);
   // The agent takes the switch only with a key for the new provider in its
   // credential set; an image from before model keys in the set takes it at
@@ -3412,9 +3532,11 @@ async function settingsOp(
   // container applying it): a spinner says it is under way.
   let busy = progressLine('writing the settings');
   try {
-    const { version: written } = await ag.agent.setSettings(sealId, next, {
+    // The catalog advisory speaks when this write sets the model or the
+    // provider, not again on every later write that leaves them alone.
+    await ag.agent.setSettings(sealId, next, {
       baseVersion: version,
-      onWarn: (w) => { busy.clear(); out(`⚠ ${w}\n`); },
+      ...(touchesModel(assignments) ? { onWarn: (w: string) => { busy.clear(); out(`⚠ ${w}\n`); } } : {}),
     }).finally(() => busy.stop());
     for (const l of renderSettings(next)) out(`  ${l}\n`);
     if (providerChanged) {
@@ -3422,7 +3544,7 @@ async function settingsOp(
       chatModelIds = providerModelIds[completionProvider] ?? [];
     }
     if (pendingReset) {
-      out(`written — version ${written}; provider change pending — run reset with the ${next.provider} key\n`);
+      out(`saved; provider change pending — run reset with the ${next.provider} key\n`);
       return next;
     }
     // Push to the running container so a change made mid-conversation takes
@@ -3438,25 +3560,25 @@ async function settingsOp(
         const r = await ag.agent.getAgentIdBySealId(sealId)
           .then((agentId) => ag.agent.pushSettingsToContainer(serveBase, agentId, next))
           .finally(() => busy.stop());
-        out(`written — version ${written}; ${r.note ?? 'applied to the running container'}\n`);
+        out(`saved; ${r.note ?? 'applied to the running container'}\n`);
       } catch (e2) {
         // One line (a chain read's error is many).
-        const msg = plainError(e2);
+        const msg = explainError(e2).message;
         if (requiresProviderReset(e2)) {
-          out(`written — version ${written}; provider change pending — run reset with the ${next.provider} key\n`);
+          out(`saved; provider change pending — run reset with the ${next.provider} key\n`);
           return next;
         }
         // A container that ANSWERED and refused (HTTP status) will refuse the
         // same document on the next boot too and fall back to last-known-good;
         // only an UNREACHABLE container (no HTTP status) applies it next boot.
-        if (/HTTP \d/.test(msg)) {
-          out(`written — version ${written}; stored, but the running container REFUSED it (${msg}) — a refused document does not boot, so the agent keeps its current configuration until you store one it accepts\n`);
+        if (/HTTP \d/.test((e2 as Error).message)) {
+          out(`saved, but the running container REFUSED it (${msg}) — a refused document does not boot, so the agent keeps its current configuration until you store one it accepts\n`);
         } else {
-          out(`written — version ${written}; stored, but the running container was unreachable (${msg}) — it applies on the next boot\n`);
+          out(`saved, but the running container was unreachable (${msg}) — it applies on the next boot\n`);
         }
       }
     } else {
-      out(`written — version ${written}; the container applies it at its next boot (reset applies it now)\n`);
+      out(`saved; the container applies it at its next boot (reset applies it now)\n`);
     }
     return next;
   } catch (e) {
@@ -3561,6 +3683,13 @@ async function helloWithTicket(
   clientAddr?: `0x${string}`,
 ): Promise<{ res: Response; bodyText: string; proof: ServeProof | null; task: TaskReveal | null; banked: boolean }> {
   return callAgentWithTicket(ag, url, '/hello', 'GET', undefined, clientAddr);
+}
+
+/** The one way the shell says an agent reference names no agent. */
+function agentNotFound(refInput: string): CliError {
+  return new CliError('AGENT_NOT_FOUND', `agent ${cleanCell(refInput)} does not exist on this attestor`, {
+    remedy: `${cmdStep('list')} shows the agents here (* marks yours)`,
+  });
 }
 
 /** Public-listing row for an agentId/sealId(/unique-prefix) reference, or undefined. */
@@ -3826,7 +3955,9 @@ function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise
             if (hist[i] === ans) hist.splice(i, 1);
           }
         }
-        process.stdout.write('\n');
+        // A terminal's readline already ended the line on Enter; without one
+        // nothing did.
+        if (!activeRl?.terminal) process.stdout.write('\n');
         res(ans);
       },
       // stdin EOF mid-prompt: restore the write hook BEFORE surfacing, or
@@ -3841,11 +3972,20 @@ function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise
 
 const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
 
+/** Why `a` is not a usable address, for `what` (the buyer, the new owner…).
+ *  A 40-hex address whose mixed case does not match its checksum is a typo
+ *  the checksum caught, not a malformed value. Exported for the tests. */
+export function addressProblem(a: string, what: string): string {
+  return /^0x[0-9a-fA-F]{40}$/.test(a)
+    ? `${what} ${cleanCell(a)} fails its checksum (a mistyped character?) — check it, or type it all in lower case`
+    : `${what} must be a 0x address (0x and 40 hex digits)`;
+}
+
 /** Resolve an agent ref to its minted tokenId (works on ANY agent, not just mine). */
 async function mintedTokenId(ag: AgenticID, refInput: string): Promise<bigint> {
   const row = await findAgentRow(ag, refInput);
-  if (!row) throw new CliError('UNKNOWN', `no agent matching ${refInput} on this attestor`);
-  if (row.agentId == null) throw new CliError('UNKNOWN', `agent ${refInput} is not minted yet — nothing on-chain to act on`);
+  if (!row) throw agentNotFound(refInput);
+  if (row.agentId == null) throw new CliError('AGENT_NOT_READY', `agent ${cleanCell(refInput)} has no agentId yet — nothing on chain to act on`, { remedy: `${cmdStep('list')} shows its agentId once minted` });
   return BigInt(row.agentId);
 }
 
@@ -3856,15 +3996,46 @@ async function addressOf(key: `0x${string}`): Promise<string> {
 
 // ── deploy / attach (from the former chat command) ───────────────────────────
 
-async function pickInferenceProvider(ask: (q: string) => Promise<string>, preferred: string, among?: string[]): Promise<string> {
+/**
+ * Which listed option an answer names: Enter is the default, a number is the
+ * option shown with it, and otherwise an option's id or name (any case).
+ * null for anything else. Exported for the tests.
+ */
+export function choiceIndex(answer: string, options: ReadonlyArray<{ id: string; name?: string }>, defaultIndex: number): number | null {
+  const a = answer.trim();
+  if (!a) return defaultIndex;
+  if (/^\d+$/.test(a)) return Number(a) < options.length ? Number(a) : null;
+  const l = a.toLowerCase();
+  const hit = options.findIndex((o) => o.id.toLowerCase() === l || o.name?.toLowerCase() === l);
+  return hit >= 0 ? hit : null;
+}
+
+/**
+ * Show `options` numbered under `title` and ask for one (choiceIndex). An
+ * answer that names none of them is asked again — never replaced with the
+ * default. Returns the chosen option's id. Exported for the tests.
+ */
+export async function askChoice(
+  ask: (q: string) => Promise<string>,
+  title: string,
+  question: string,
+  options: ReadonlyArray<{ id: string; name?: string }>,
+  defaultIndex: number,
+): Promise<string> {
+  out(`${title}:\n`);
+  options.forEach((o, i) => out(`  ${i}. ${o.id}${o.name && o.name !== o.id ? ` (${o.name})` : ''}${i === defaultIndex ? '  (default)' : ''}\n`));
+  for (;;) {
+    const answer = await ask(`${question} [${defaultIndex}]: `);
+    const i = choiceIndex(answer, options, defaultIndex);
+    if (i !== null) return options[i].id;
+    out(`  "${cleanCell(answer.trim())}" is not in the list — type its number (0–${options.length - 1}) or its name\n`);
+  }
+}
+
+async function pickInferenceProvider(ask: (q: string) => Promise<string>, preferred: string, among?: string[], title = 'providers'): Promise<string> {
   const providers = among ? knownProviders.filter((provider) => among.includes(provider.id)) : knownProviders;
   const fallback = Math.max(0, providers.findIndex((provider) => provider.id === preferred));
-  out('providers:\n');
-  providers.forEach((provider, index) => out(`  ${index}. ${provider.id} (${provider.name})${index === fallback ? ' (default)' : ''}\n`));
-  const input = (await ask(`provider [${fallback}]: `)).trim();
-  const chosen = !input ? providers[fallback] : providers.find((provider) => provider.id === input) ?? providers[Number(input)];
-  if (!chosen) throw new CliError('BAD_FLAG', `unknown inference provider: ${input}`);
-  return chosen.id;
+  return askChoice(ask, title, 'provider', providers, fallback);
 }
 
 /** The model key prompt of the REPL (cli/modelkey.ts). */
@@ -3882,7 +4053,7 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
   // overlap them; the balance gate below still waits for both.
   const effPromise = ag.getEffectiveBalance().catch(() => null);
   const ackTx = await ag.ack();
-  if (ackTx) { out(`ack() → ${ackTx} (waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
+  if (ackTx) { out(`acknowledging the trust root (tx ${ackTx}, waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
   // Gate on the provider's EFFECTIVE balance (on-chain minus outstanding
   // off-chain debt) when reachable — that's what its create gate enforces;
   // the raw chain read is the fallback.
@@ -3914,23 +4085,30 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
     // the user types it — no silent default that contradicts "empty to cancel".
     // Typing the amount IS the confirmation — the prompt already says empty
     // cancels; a second [Y/n] was pure friction (review of the topup flows).
-    const amt = (await ask(`deposit how much OG now? (e.g. ${suggest}, empty to cancel): `)).trim();
-    if (!amt) { out('cancelled — deposit later with `deposit`.\n'); return false; }
-    const tx = await ag.deposit({ amountWei: parseEther(amt) });
-    out(`deposit ${amt} OG (tx ${tx}, waiting…)\n`);
+    let amountWei = 0n;
+    for (;;) {
+      const amt = (await ask(`deposit how much OG now? (e.g. ${suggest}, empty to cancel): `)).trim();
+      if (!amt) { out('cancelled — deposit later with `deposit`.\n'); return false; }
+      try {
+        amountWei = parseOgAmount(amt);
+      } catch (e) {
+        out(`  ${(e as Error).message}\n`);
+        continue;
+      }
+      if (native != null && native <= amountWei) {
+        out(`  the wallet holds ${og(native)} — not enough for ${ogAmount(amountWei)} OG plus gas\n`);
+        continue;
+      }
+      break;
+    }
+    const tx = await ag.deposit({ amountWei });
+    out(`deposit ${ogAmount(amountWei)} OG (tx ${tx}, waiting…)\n`);
     await ag.waitForTransaction(tx);
   }
   return true;
 }
 
-/**
- * Whether the deploy wizard offers `framework` only models with tool use: the
- * tool-driven frameworks, the harness under either of its names (`dsh` on a
- * network still on AgenticID 1.3, see `isHarnessFramework`).
- */
-export function frameworkNeedsToolModels(framework: string): boolean {
-  return framework === 'openclaw' || framework === 'prime-agent' || isHarnessFramework(framework);
-}
+export { frameworkNeedsToolModels } from '../settings';
 
 async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string) => Promise<string>, ctx: CommandContext, irq: Interrupt): Promise<Session | null> {
   const cfg = (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(10_000) })
@@ -3938,13 +4116,11 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
     .catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
   let framework = 'openclaw';
+  out('\n');
   if (fws.length) {
-    const di = Math.max(0, fws.indexOf('openclaw'));
-    out('\nframeworks:\n');
-    fws.forEach((n, i) => out(`  ${i}. ${n}${i === di ? '  (default)' : ''}\n`));
-    const raw = (await ask(`framework [${di}]: `)).trim();
-    const i = Number(raw);
-    framework = !raw ? fws[di] : Number.isInteger(i) && fws[i] ? fws[i] : fws.includes(raw) ? raw : fws[di];
+    framework = await askChoice(ask, 'frameworks', 'framework', fws.map((id) => ({ id })), Math.max(0, fws.indexOf('openclaw')));
+  } else {
+    out('framework: openclaw (this attestor lists no others)\n');
   }
 
   // Only offer models the chosen framework can actually run: chatbots only
@@ -3966,9 +4142,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
     if (!model) throw new CliError('BAD_FLAG', 'model is required');
   } else {
     if (!models.length) throw new CliError('UNKNOWN', `no compatible models advertised for ${framework} on ${provider}`);
-    out('\nmodels:\n');
-    models.forEach((id, index) => out(`  ${index}. ${id}\n`));
-    model = models[Number((await ask('model [0]: ')).trim()) || 0] ?? models[0];
+    model = await askChoice(ask, '\nmodels', 'model', models.map((id) => ({ id })), 0);
   }
 
   const name = (await ask(`name [chat-${framework}]: `)).trim() || `chat-${framework}`;
@@ -3981,7 +4155,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
 
   const apiKey = provision ? (await pickModelKey(provider, keyPrompt(ask), { optional: mayGoKeyless(framework, provider) })) ?? undefined : undefined;
   if (provision && !(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
-  out(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only, no container'}…\n`);
+  out(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only'}…\n`);
   const { deployment: dep, agentId } = await deployWithInference(ag, { name, framework, provider, model, provision, apiKey });
   if (!provision) {
     out(`minted agentId ${agentId} — offline (no container). Bring it online with: reset ${agentId}\n`);
@@ -3989,7 +4163,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   }
   out(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
   const r = await waitRunningInterruptible(irq, attestorUrl, dep.sealId, agentId);
-  if (!r) return null; // Esc: the attestor keeps deploying — only the wait ends
+  if (!r) { out(`the deploy goes on — enter it later with: use ${agentId}\n`); return null; } // Esc: only the wait ends
   if (apiKey) await ag.credentials.resyncModelKey(dep.sealId, { agentUrl: r.url }).catch(() => undefined);
   // Enter through attach so a fresh deploy gets the same entry card
   // (avatar / gas / status) as `use`; only the wizard knows the framework.
@@ -4040,7 +4214,11 @@ export function sessionCardFields(c: {
     fields.push('type to chat · /help for commands · Esc interrupts a turn');
   } else {
     if (c.failure) fields.push(`last error: ${c.failure}`);
-    fields.push(c.phase === 'stopped' ? '→ /start to bring it back' : '→ /reset to recreate its container');
+    fields.push(c.phase === 'stopped'
+      ? '→ /start to bring it back'
+      : c.phase === 'deploying'
+        ? '→ still deploying — a bare Enter shows its phase'
+        : '→ /reset to recreate its container');
   }
   return fields;
 }
@@ -4051,11 +4229,23 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   const row = pickRow(ref, refInput, rows as { agentId?: unknown; sealId?: string }[]) as
     { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string; name?: string | null; framework?: string | null } | undefined;
   if (!row) {
-    throw new CliError('AGENT_NOT_FOUND', `no deployment matches ${refInput} on this attestor`, {
-      remedy: 'use `list` to see the agents this wallet owns here',
+    throw new CliError('AGENT_NOT_FOUND', `agent ${cleanCell(refInput)} does not exist on this attestor`, {
+      remedy: `${cmdStep('list')} shows the agents here (* marks yours)`,
     });
   }
-  const agentId = String(row.agentId ?? '?');
+  // A session is keyed by the agentId: an agent without one yet (still being
+  // minted, or its deploy failed before the mint) is entered once it has it.
+  if (row.agentId === undefined || row.agentId === null) {
+    const prefix = sealPrefixOf(row.sealId);
+    throw new CliError('AGENT_NOT_READY', row.phase === 'failed'
+      ? `agent ${prefix} has no agentId — its deploy stopped before the mint`
+      : `agent ${prefix} has no agentId yet — it is still being minted`, {
+      remedy: row.phase === 'failed'
+        ? `${shellStep(`retry ${prefix}`)} resumes it`
+        : `${cmdStep('list')} shows its agentId once minted; then ${cmdStep('use <agentId>')}`,
+    });
+  }
+  const agentId = String(row.agentId);
 
   // `use` selects the agent in ANY phase — lifecycle stays explicit inside
   // the session (/start, /reset). Only a running agent gets a connection.
@@ -4090,7 +4280,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   // anyway; the attestor's auth still guards every owner action.
   if (mine === false) {
     throw new CliError('AGENT_NOT_FOUND', `agent ${agentId} is not yours`, {
-      remedy: `talk to its public surface with: hello ${agentId}`,
+      remedy: `its public surface: ${shellStep(`hello ${agentId}`)}`,
     });
   }
   // A running agent can still report a warning, e.g. its data not reaching
@@ -4118,6 +4308,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
     for (const f of cardRows) out(`  ${f}\n`);
   }
   out('\n');
+  setSurface('shell'); // a direct `0g-agentdna <agent>` is in the shell from here
   return s;
 }
 
@@ -4164,13 +4355,11 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
     .then((r) => r.json())
     .catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
-  if (!fws.length) return current ?? 'openclaw';
-  const di = Math.max(0, current ? fws.indexOf(current) : 0);
-  out('frameworks:\n');
-  fws.forEach((n, i) => out(`  ${i}. ${n}${i === di ? '  (default)' : ''}\n`));
-  const raw = (await ask(`framework [${di}]: `)).trim();
-  const i = Number(raw);
-  return !raw ? fws[di] : Number.isInteger(i) && fws[i] ? fws[i] : fws.includes(raw) ? raw : fws[di];
+  if (!fws.length) {
+    out(`framework: ${current ?? 'openclaw'} (this attestor lists no others)\n`);
+    return current ?? 'openclaw';
+  }
+  return askChoice(ask, 'frameworks', 'framework', fws.map((id) => ({ id })), Math.max(0, current ? fws.indexOf(current) : 0));
 }
 
 // ── L2: session REPL ─────────────────────────────────────────────────────────
@@ -4596,8 +4785,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           }
         }
         const amt = line.split(/\s+/)[1] || (await ask('  amount OG [0.1]: ')).trim() || '0.1';
-        const tx = await s.ag.agent.topUpAgentSeal(s.agentSeal, parseEther(amt));
-        out(`topUpAgentSeal(${s.agentSeal}, ${amt} OG) → ${tx} (waiting…)\n`);
+        const tx = await s.ag.agent.topUpAgentSeal(s.agentSeal, parseOgAmount(amt));
+        out(`sending ${amt} OG to agent ${s.agentId}'s gas wallet ${s.agentSeal} (tx ${tx}, waiting…)\n`);
         // Parity with L1 `deposit`: return only once the chain agrees, so an
         // immediate /balance shows the new number (feedback.md S2).
         await s.ag.agent.waitForTransaction(tx);
@@ -5277,9 +5466,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     } catch (e) {
       // Show the remedy too: an error whose whole point is "do this instead"
       // (a refused settings write, a missing wallet) is useless without it.
-      const ce = e as CliError;
       if (isCancelled(e)) { out('cancelled\n'); continue; }
-      out(`error: ${e instanceof CliError ? ce.message : cleanCell(plainError(e))}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`); continue;
+      const p = explainError(e);
+      out(`error: ${cleanCell(p.message)}${p.remedy ? `\n  → ${p.remedy}` : ''}\n`); continue;
     }
     } // commands
     chat = true;

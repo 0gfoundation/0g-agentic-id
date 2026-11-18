@@ -21,6 +21,7 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, renameSy
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { CliError } from './errors';
 
 export interface FileConfig {
   attestorUrl?: string;
@@ -313,12 +314,22 @@ export function saveApiKey(providerOrKey: string, keyOrEnv?: string | NodeJS.Pro
   saveCredentials({ inferenceKeys: { [provider]: key } }, source);
 }
 
-/** Global legacy variables only belong to compute; new overrides are bound. */
+/**
+ * A model key from the environment: `AGENTDNA_API_KEY` for the provider
+ * `AGENTDNA_API_KEY_PROVIDER` names, or the legacy compute-only
+ * `AGENTIC_API_KEY`. A generic `API_KEY` is never read — it belongs to
+ * whatever else set it, not to this CLI. A key without its provider is
+ * refused (the remedy says how to set both).
+ */
 export function inferenceKeyFromEnv(provider: string, env: NodeJS.ProcessEnv = process.env): string | null {
   const key = env.AGENTDNA_API_KEY?.trim();
   const binding = env.AGENTDNA_API_KEY_PROVIDER?.trim();
-  if (key && !binding) throw new Error('AGENTDNA_API_KEY requires AGENTDNA_API_KEY_PROVIDER');
+  if (key && !binding) {
+    throw new CliError('INFERENCE_KEY_REQUIRED', 'AGENTDNA_API_KEY is set without AGENTDNA_API_KEY_PROVIDER — the CLI cannot tell which provider the key is for', {
+      remedy: 'export AGENTDNA_API_KEY_PROVIDER=<provider> (e.g. openai) with it, or unset AGENTDNA_API_KEY',
+    });
+  }
   if (key && binding === provider) return key;
-  if (provider === '0g-compute') return env.AGENTIC_API_KEY?.trim() || env.API_KEY?.trim() || null;
+  if (provider === '0g-compute') return env.AGENTIC_API_KEY?.trim() || null;
   return null;
 }

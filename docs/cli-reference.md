@@ -1,5 +1,7 @@
 # 0g-agentdna CLI Reference
 
+[中文](cli-reference.zh.md)
+
 > Matches `@0gfoundation/0g-agentdna` ≥ 0.4.0 · the CLI ships inside the SDK package — no separate install
 > Every command, flag, and exit code below was verified against `sdk/typescript/src/cli/` source
 
@@ -14,10 +16,10 @@ One entry point, **two shapes**:
 
 | Shape | Invocation | Purpose |
 |---|---|---|
-| Interactive shell | bare `npx @0gfoundation/0g-agentdna` (optionally with an agent ref: `npx @0gfoundation/0g-agentdna 286`) | deploy, chat, rate — daily human use |
-| Script subcommands | `npx @0gfoundation/0g-agentdna <command>` | diagnostics & automation — all support `--json` |
+| Interactive shell | bare `npx @0gfoundation/0g-agentdna` opens its manager prompt (`0g-agentdna>`); with an agent ref (`npx @0gfoundation/0g-agentdna 286`, or `… use 286`) it goes straight into that agent's session | deploy, chat, rate — daily human use |
+| One-shot commands | `npx @0gfoundation/0g-agentdna <command>` | diagnostics & automation — all support `--json` |
 
-Key rule: **only `doctor` / `status` / `list` / `settings` / `cred` / `providers` / `update` are reserved subcommands.** Any other positional is treated as an agent reference (decimal = agentId, `0x…` = sealId) and routes straight into that agent's session — command names and agent refs can never collide.
+Key rule: **`doctor` / `status` / `list` / `settings` / `cred` / `providers` / `releases` / `update` are the one-shot commands.** A decimal positional is an agentId and a `0x…` one a sealId: both open that agent's session, so command names and agent refs never collide. `help` prints the help (as `--help`). A word of the shell's own (`login`, `whoami`, `deploy`, `balance`, `start`, …) is refused with exit 2 (`UNKNOWN_COMMAND`) and the remedy to run `0g-agentdna` and type it there; any other word is an unknown command (exit 2, `UNKNOWN_COMMAND`), with the nearest command named when it looks like a typo (`doctr` → `0g-agentdna doctor`).
 
 Prerequisite: **Node.js ≥ 22** (recommended: `nvm install 22 && nvm use 22`).
 
@@ -25,7 +27,7 @@ Prerequisite: **Node.js ≥ 22** (recommended: `nvm install 22 && nvm use 22`).
 
 | Option | Effect |
 |---|---|
-| `--json` | Machine output: stdout carries exactly one `{ok, data \| error}` envelope; all progress goes to stderr |
+| `--json` | Machine output: stdout carries exactly one `{ok, data \| error}` envelope; all progress goes to stderr. Without it an error is one or two plain lines on stderr (`error (<CODE>): …` and `fix: …`), naming a command the owner can run from where they are |
 | `--mine` | (list only) restrict to deployments owned by `AGENTIC_PRIVATE_KEY`; owner-signed, adds owner-only fields (failure reason, sandboxId) |
 | `--phase <p>` | (list only) filter by phase: `deploying` `running` `stopped` `offline` `failed` |
 | `--help` | help text |
@@ -33,7 +35,7 @@ Prerequisite: **Node.js ≥ 22** (recommended: `nvm install 22 && nvm use 22`).
 
 The `--json` envelope contract:
 
-- `error = {code, message, remedy?, details?}`; bigints serialize as decimal strings; absent values are `null`, never omitted
+- `error = {code, message, remedy?, details?}`; bigints serialize as decimal strings; absent values are `null`, never omitted. When the CLI words an error itself (a server's HTTP answer, a chain error), `details.cause` carries the original text
 - doctor packs its per-check results under `(data|error.details).checks`, each `status: pass|fail|skip`
 - an unknown flag throws immediately and exits 2
 
@@ -43,18 +45,18 @@ Environment variables **always override** the config files — CI and one-off ru
 
 | Variable | Required | Notes |
 |---|---|---|
-| `AGENTIC_ATTESTOR_URL` | yes (for writes) | attestor base URL — **one URL pins the whole environment** (contracts, RPC, appIds all come from its `/config`). Production `https://agentdna.0g.ai`, testnet `https://agentdna-testnet.0g.ai` |
+| `AGENTIC_ATTESTOR_URL` | yes, unless `login` saved one | attestor base URL — **one URL pins the whole environment** (contracts, RPC, appIds all come from its `/config`). Production `https://agentdna.0g.ai`, testnet `https://agentdna-testnet.0g.ai` |
 | `AGENTIC_PRIVATE_KEY` | no | owner key (`0x…` hex). **Env only — there is deliberately no `--key` flag.** Unlocks all write operations and owner-signed surfaces |
 | `AGENTIC_RPC_URL` | no | overrides the RPC the attestor advertises |
 | `AGENTDNA_API_KEY_PROVIDER` + `AGENTDNA_API_KEY` | no | set together: the inference key for deploy/reset with that provider (e.g. `openai`), overriding the one stored by `login`. A key without its provider is refused |
-| `AGENTIC_API_KEY` | no | legacy compute-only inference key (deploy/reset); other providers use their matching key stored by `login` |
+| `AGENTIC_API_KEY` | no | legacy compute-only inference key (deploy/reset); other providers use their matching key stored by `login`. No other variable — a generic `API_KEY` among them — is read as a model key |
 | `AGENTIC_VERIFIED_FEEDBACK_ADDR` | no | reputation-pair address override, for attestors whose `/config` doesn't advertise them yet |
 | `AGENTIC_FEEDBACK_BATCHER_ADDR` | no | FeedbackBatcher address override, same situation |
 | `AGENTDNA_LIVE_PROMPT` | no | `off` (or `0`, `false`, `no`): a chat turn prints as a plain stream, without the prompt on screen during it (§5, session level) |
 | `AGENTDNA_INK` | no | `off` (or `0`, `false`, `no`): the session keeps readline's prompt line instead of the framed input (§5, session level) |
 | `FORCE_HYPERLINK` | no | `1` or `0`: whether a saved file's path is a clickable `file://` link (OSC 8), whatever the terminal |
 
-Configure nothing → **read-only mode**: `list` (public tier) / `status` / `hello` work; every write is refused.
+Without an attestor URL (neither set nor saved by `login`) every command but `--help`/`--version`/`help` exits 3 (`MISSING_ATTESTOR_URL`; the remedy is `login`, or the variable). With the attestor URL and no owner key, the CLI is **read-only**: `list` (public tier), `status`, `providers`, `releases`, and in the shell `hello`, work; everything owner-signed is refused (`WALLET_REQUIRED`). `AGENTDNA_API_KEY` set without `AGENTDNA_API_KEY_PROVIDER` is refused where a model key is used (exit 3, `INFERENCE_KEY_REQUIRED`); the shell still starts and its banner says so.
 
 Persisted files under `~/.config/0g-agentdna/`:
 
@@ -70,7 +72,7 @@ Legacy config is migrated automatically from `~/.config/0g-agenticid/`; see the 
 
 ### `doctor`
 
-Checks every deploy prerequisite: attestor reachable, RPC, wallet, gas, trust-root ack, sandbox prepaid balance (≥ 0.1 OG). **Every failing item prints a one-line remedy.** All green = exit 0; otherwise exit 3, the error carrying the FIRST failing check's code. Diagnostics only — the ack/deposit remedies are transactions (they need gas) and must be executed via the deploy console or the SDK.
+Checks every deploy prerequisite: attestor reachable, RPC, wallet, gas, trust-root ack, sandbox prepaid balance (≥ 0.1 OG). **Every failing item prints a one-line remedy.** All green = exit 0; otherwise exit 3, the error carrying the FIRST failing check's code. The RPC is `AGENTIC_RPC_URL`, else the one the attestor's `/config` names; with neither, the check is skipped. The wallet line says where the key came from (`saved by login` or `from AGENTIC_PRIVATE_KEY`). Diagnostics only — the ack/deposit remedies are transactions (they need gas) you run in the shell (`ack`, `deposit <og>`).
 
 ### `status <agent>`
 
@@ -78,7 +80,7 @@ One agent's full picture: phase, the three coordinates (agentId / sealId / agent
 
 ### `list [--mine] [--phase <p>]`
 
-Deployment listing. The public tier carries sealIds and — for minted rows — the owner and agentSeal addresses (both chain-public once minted); `--mine` adds owner-only fields (`WHERE owner = $1` — agent-owned children never appear in your own `--mine`; nesting is only visible in the public listing). An empty result is `[]` with exit 0. Human mode shows AGENTID/PHASE/FRAMEWORK/AGENTSEAL/OWNER/NAME (NAME last, sanitized and truncated — owner-controlled names cannot forge rows); an unminted row renders its sealId prefix (`0x` + 10 hex, paste-back-ready) in the AGENTID cell, and the OWNER cell annotates `⇄ #<agentId>` when a row is owned by another listed agent; sealId, url and whole addresses live in `--json`.
+Deployment listing. The public tier carries sealIds and — for minted rows — the owner and agentSeal addresses (both chain-public once minted); `--mine` adds owner-only fields (`WHERE owner = $1` — agent-owned children never appear in your own `--mine`; nesting is only visible in the public listing). An empty result is `[]` with exit 0; an agent argument is refused (`BAD_FLAG`; `status <agent>` shows one agent). Human mode shows AGENTID/PHASE/FRAMEWORK/AGENTSEAL/OWNER/NAME (NAME last, sanitized and truncated — owner-controlled names cannot forge rows); an unminted row renders its sealId prefix (`0x` + 10 hex, paste-back-ready) in the AGENTID cell, and the OWNER cell annotates `⇄ #<agentId>` when a row is owned by another listed agent; sealId, url and whole addresses live in `--json`. In a terminal the table fits its width: AGENTID, PHASE and NAME always show, FRAMEWORK, OWNER and AGENTSEAL join in that order while NAME keeps at least 10 columns, and no row reaches the terminal's last column; piped, every column shows and NAME is cut at 18 characters.
 
 ### `settings <agent> [k=v …]`
 
@@ -89,7 +91,8 @@ Reads/writes the agent's configuration document (which model it thinks with, and
 - assignments **merge** into the stored document; an empty value (`thinking=`) clears a field
 - **both reading and writing are owner-signed** (the document is the owner's), i.e. both need `AGENTIC_PRIVATE_KEY`
 - a write is a **compare-and-swap** against the version just read: if another client changed the document meanwhile, it is refused (exit 3, `SETTINGS_CONFLICT`) — **never silently overwritten**
-- a merged document with no `model` is refused before signing (the one state the container hard-fails on); the model is checked against the selected provider's catalog first — an absence is a stderr warning only, never a refusal
+- a merged document with no `model` is refused before signing (the one state the container hard-fails on); a write that sets the model or the provider checks it against the selected provider's catalog first — an absence is a stderr warning only, never a refusal; a model the catalog lists without tool use is refused for an agent whose framework works through tools (openclaw, prime-agent, 0g-harness), as the deploy wizard does not offer one
+- the result says `saved`, and whether the running container applied it, refused it, or takes it at its next boot; `--json` carries the document's new `version`
 - a `provider=` switch needs a model key for the new provider in the agent's credential set: when there is none, the key is asked for as `cred <agent> set model` asks (the key on this machine offered first; `--json` takes the piped key or the one on this machine without asking) and stored first, then the document is written and pushed. For an agent whose image predates model keys in cred, the document is written and the switch waits for a reset with the new provider's key (`pendingReset`)
 
 ### `cred <agent> [sub …]` and `cred pending|notify|presets`
@@ -98,8 +101,8 @@ The owner's credentials for the agent's sealed credential proxy (`sealed/CREDENT
 
 | Subcommand | |
 |---|---|
-| `cred <agent>` / `ls` | list the stored entries (never values); for a login entry, whether the running agent has the login (`logged in <time>`, `not done yet`, or `unknown` when the agent is not running); then the model keys, marked `in use` or `kept, not in use`, and which key the running agent uses (`in use: the <provider> key given at create/reset`, `none — add one: …`, or `unknown`) |
-| `cred <agent> set <name> [k=v …]` | add or change one. The value is read from stdin when piped, else from a prompt that does not echo; never from an argument. Enter at the prompt keeps a stored value. Keys: `preset=<name>` (`cred presets`), `host=a,b`, `header='Name: … {v} …'`, `basic=<user>`, `query=<param>`, `body=<field>`, `path=yes`, `use=inject\|token_only\|sign`, `signer=<json>` (with `use=sign`: `sigv4`, `hmac`, `jwt`, `wallet`), `token=<json>` (a token request template), `writeback=yes\|no`, `reveal=yes\|no`, `expires=<YYYY-MM-DD\|unix>`, `desc=…`. `host=` replaces the hosts, any position key replaces the positions, the rest is kept. A new entry from a preset first prints where to create the key |
+| `cred <agent>` / `ls` | list the stored entries (never values; the set's version is in `--json` only); for a login entry, whether the running agent has the login (`logged in <time>`, `not done yet`, or `unknown` when the agent is not running); then the model keys, marked `in use` or `kept, not in use`, and which key the running agent uses (`in use: the <provider> key given at create/reset`, `none — add one: …`, or `unknown`) |
+| `cred <agent> set <name> [k=v …]` | add or change one. The value is read from stdin when piped, else from a prompt that does not echo; never from an argument. Enter at the prompt keeps a stored value; with no option given either, nothing is written (`<name> unchanged`). Keys: `preset=<name>` (`cred presets`), `host=a,b`, `header='Name: … {v} …'`, `basic=<user>`, `query=<param>`, `body=<field>`, `path=yes`, `use=inject\|token_only\|sign`, `signer=<json>` (with `use=sign`: `sigv4`, `hmac`, `jwt`, `wallet`), `token=<json>` (a token request template), `writeback=yes\|no`, `reveal=yes\|no`, `expires=<YYYY-MM-DD\|unix>`, `desc=…`. `host=` replaces the hosts, any position key replaces the positions, the rest is kept. A new entry from a preset first prints where to create the key |
 | `cred <agent> set <name> preset=oauth2-refresh\|oauth2-client token_url=… client_id=… api_host=… [client_secret=<entry>] [scope=…]` | a refresh token (it rotates and is written back) or a client secret that sealed trades for access tokens; the agent runs a token request on `<name>` and uses `[[credential:derived:<name>]]` as a Bearer token on `api_host`. A `scope=` you give is fixed; without one, the agent may ask for a scope |
 | `cred <agent> rm <name>` | remove one (revoke it at its provider too); says so when the running agent did not take the removal (it then applies at its next boot) |
 | `cred <agent> set model [provider=<id>]` | the agent's model key for one provider (the entry `model.<provider>`), bound to that provider's route in the registry the attestor serves. Without `provider=`: the provider of the agent's settings; with none there, the one provider holding a key, else `0g-compute`. With a key for that provider on this machine (`login`'s), the CLI first asks whether to use it; answering no asks for a new key, which then replaces the one on this machine. With none, the key typed is kept on this machine. Piped in (a script), nothing is asked: the piped key is used and kept, or else the one on this machine. The agent's settings choose which provider's key is used: the CLI waits until the running agent reports it `in use now` (0g-harness on 0g-compute without a restart, the other frameworks after one), or says it is `kept` because the settings use another provider. Refused for an agent whose image predates model keys in cred (reset it first) |
@@ -126,7 +129,7 @@ Lists providers from the attestor registry (`--json` supported): id, name, forma
 
 The attestor's release notices, newest first (`--json`: `{ releases, agents }`): each release's notes (the Chinese ones when `LANG`/`LC_ALL` starts with `zh` and the release has them), and the images it replaces with the end of their transition period. With `AGENTIC_PRIVATE_KEY`, it also lists your agents that still run a replaced image, the date to reset them by and where they stand (`please move`; `7 days or less left`; `transition period over: its next boot may be refused`); `agents` is `null` without a key. Such an agent keeps running; reset it in the shell (`reset <agent>`) before that date, after which its old image may be retired and its next boot refused.
 
-Every other command prints a short release notice after its output when one is due: on stderr, in a terminal only, never with `--json`, waiting at most 1.5 s for the attestor. The interactive shell prints it in its banner. With agents to move: once a week, and every day in the last 7 days and after them. Without (or without a key): once per release, for 30 days after it is out. When it was last shown is kept per attestor and kind (with agents / news alone) in `release-notice.json` in the config directory.
+Every other command prints a short release notice after its output when one is due: on stderr, in a terminal only, never with `--json`, waiting at most 1.5 s for the attestor. The interactive shell prints it after its banner, naming its own commands (`reset <agent>`, `releases`). When the attestor does not answer, `releases` exits 3 (`ATTESTOR_UNREACHABLE`). With agents to move: once a week, and every day in the last 7 days and after them. Without (or without a key): once per release, for 30 days after it is out. When it was last shown is kept per attestor and kind (with agents / news alone) in `release-notice.json` in the config directory.
 
 ### `update`
 
@@ -136,22 +139,25 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 
 ### Manager level (`0g-agentdna>` prompt)
 
+The banner names the attestor, the wallet, whether a model key is set, and the trust-root ack (or which read failed: the attestor did not answer, the chain read failed, or no answer within 4 s). A due update hint and release notice print after it. Everything the shell prints fits the terminal's width. An error is `error: …` and, when there is one, `→ <remedy>` naming a command typed at this prompt; an unknown word names the nearest command when it looks like a typo.
+
 | Command | Effect |
 |---|---|
-| `list` | public listing: sealId, FRAMEWORK, AGENTSEAL, OWNER (`⇄ #<agentId>` on agent-owned agents); `*` marks your wallet's agents |
-| `use <agentId\|sealId>` | enter an agent's session (any phase) |
-| `deploy` | wizard: pick framework → provider → model; async deploy |
+| `list` | the same columns as `0g-agentdna list`, fitted to the terminal (`⇄ #<agentId>` on agent-owned agents; an agent without an agentId yet shows its sealId prefix); `*` marks your wallet's agents. `list --mine`: yours only |
+| `use <agentId\|sealId>` | enter an agent's session (any phase). An agent without an agentId yet (still being minted, or its deploy stopped before the mint) is refused with exit-3 code `AGENT_NOT_READY`: `list` shows its agentId once minted, `retry <prefix>` resumes a failed one |
+| `deploy` | wizard: pick framework → provider → model, each by its listed number or its name (Enter takes the default; anything else is asked again); async deploy. A mint-only deploy ends with the agentId and `reset <id>` to bring it online |
 | `hello <id> [full]` | hit any agent's public `/hello`: identity and serve-proof check, its services one per line (description cut to the terminal width) and its owner routes on one line by kind, e.g. `owner API (bearer): chat, responses, inbox, …`; `full` prints every field of every service and route. With a wallet configured, banks a rating ticket |
 | `call <id> [path] [json-body]` | call an agent's registered public service; bare `call` lists its services; responses bank tickets |
 | `rate <id> [score] [/endpoint]` | spend a ticket to rate on-chain — **no interaction, no rating** |
-| `start` / `stop` / `reset` / `retry <id>` | container lifecycle (owner-signed; on-chain identity unchanged). `reset` of an agent with no settings document first stores the default pin `provider=0g-compute model=0gm-1.0-35b-a3b` when the model pinned at mint may be gone (a clone, or an agent that has provisioned before), after the reset's prompts; a mint-only agent that never booted keeps the model chosen at mint (the deploy wizard's mint-only path also stores that choice as the settings document). `start` and `reset` wait for their own outcome: until the attestor's worker picks the request up they show `queued`, and the agent's previous state or failure does not end the wait. Creating or resetting asks for the model key as `cred <agent> set model` does (a 0g-harness agent on 0g-compute may go without one: Enter at the prompt), stores it in the agent's credential set and, while older images are in use, sends it with the request too; when the set already holds a key for the provider, a reset asks nothing and sends the key on this machine along for older images (with none here it asks for it; Enter skips, and a key given there also replaces the one in the set) |
+| `start` / `stop` / `reset` / `retry <id>` | container lifecycle (owner-signed; on-chain identity unchanged). `start` and `reset` refuse an agent still deploying, and one without an agentId (`retry` resumes it); `reset <id> pick` asks the framework as the deploy wizard does. `reset` of an agent with no settings document first stores the default pin `provider=0g-compute model=0gm-1.0-35b-a3b` when the model pinned at mint may be gone (a clone, or an agent that has provisioned before), after the reset's prompts; a mint-only agent that never booted keeps the model chosen at mint (the deploy wizard's mint-only path also stores that choice as the settings document). `start` and `reset` wait for their own outcome: until the attestor's worker picks the request up they show `queued`, and the agent's previous state or failure does not end the wait. Creating or resetting asks for the model key as `cred <agent> set model` does (a 0g-harness agent on 0g-compute may go without one: Enter at the prompt), stores it in the agent's credential set and, while older images are in use, sends it with the request too; when the set already holds a key for the provider, a reset asks nothing and sends the key on this machine along for older images (with none here it asks for it; Enter skips, and a key given there also replaces the one in the set) |
 | `clone` / `transfer` / `grant` / `revoke` / `authorizer` | clone, transfer, clone-authorization management |
 | `settings <id> [k=v …]` | same semantics as the subcommand |
 | `cred <id> [sub …]`, `cred pending`, `cred notify` | same semantics as the subcommand; `login` prints the link and returns without waiting |
-| `balance` / `deposit [og]` / `withdraw [og]` | prepaid account: balance + burn rate / fund / refund withdrawal (time-locked; bare argument claims everything) |
+| `balance` / `deposit [og]` / `withdraw [og]` | prepaid account: balance + burn rate / fund / refund withdrawal (time-locked; bare argument claims everything). An amount is a number of OG above 0, checked before any transaction (a deposit also against what the wallet holds); `withdraw <og>` that would join a pending refund asks before restarting its time lock |
 | `ack` | acknowledge the TEE trust root (implicit in deploy/start/reset) |
-| `login [provider]` | guided setup: attestor URL (required; asked again while unset) → owner key (needed to manage your agents) → a model key for each provider the platform lists (optional; Enter keeps a set key or skips an unset one) → the default provider for new agents (asked when more than one has a key) → a summary of what is set. Key input echoes `*`. `login <provider>` asks that provider's key only. These keys are the ones every other step offers first (see `cred <agent> set model`) |
-| `whoami` / `help` / `quit` | `whoami`: the attestor, your wallet, the providers configured on this machine — the ones `login` saved a model key for, the default for new agents first (`0g-compute (new agents, no key)` when it has none; `none — run login` when there are none; a key's value is never shown) — whether the trust root is acknowledged, and the prepaid balance. The platform's whole list of providers is the `providers` command; an agent's own keys are `cred <agent>` (in a session `/cred`) |
+| `login [provider]` | guided setup: attestor URL (required; asked again while unset) → owner key (needed to manage your agents) → a model key for each provider the platform lists (optional; Enter keeps a set key or skips an unset one) → the default provider for new agents (asked when more than one has a key) → a summary of what is set. Each answer is checked before it is saved: the URL must be an attestor whose `/config` answers, the owner key 64 hex characters (the wallet address is shown); a wrong one is asked again. Ctrl-C or Esc leaves the current step unsaved; steps finished before it stay saved, and the cancellation says which. When the attestor does not answer at the model-key step, the built-in provider list is asked. Key input echoes `*`. `login <provider>` asks that provider's key only. These keys are the ones every other step offers first (see `cred <agent> set model`) |
+| `status <id>` / `doctor` / `providers` / `releases` | the one-shot commands, run at the prompt |
+| `whoami` / `help` / `quit` | `whoami`: the attestor, your wallet, the providers configured on this machine — the ones `login` saved a model key for, the default for new agents first (`0g-compute (new agents, no key)` when it has none; `none — run login` when there are none; a key's value is never shown) — whether the trust root is acknowledged, and the prepaid balance. The platform's whole list of providers is the `providers` command; an agent's own keys are `cred <agent>` (in a session `/cred`). `help` fits the terminal: below 80 columns each description wraps under its command. Ctrl-C at the prompt says to press it again to exit; Ctrl-C twice, or Ctrl-D, exits |
 
 ### Session level (`agent 286 ›` prompt)
 
@@ -183,14 +189,15 @@ The framework used by `/reset` and the chat model selector is **picked by you** 
 | 0 | success | — |
 | 1 | unknown error (incl. NOT_IMPLEMENTED) | read the message |
 | 2 | usage error (incl. unknown command, bad flag, bad agent ref, agent not found) | branch on `error.code` to tell them apart |
-| 3 | **fixable precondition** (missing attestor URL, unreachable, wallet required, `SETTINGS_CONFLICT`, `CREDENTIALS_CONFLICT`, …) | read `error.remedy`, fix, retry |
+| 3 | **fixable precondition** (missing attestor URL, unreachable, wallet required, `SETTINGS_CONFLICT`, `CREDENTIALS_CONFLICT`, `AGENT_NOT_READY`, …) | read `error.remedy`, fix, retry |
 | 4 | timeout | check again later |
 | 5 | auth | stop |
+| 130 | cancelled at a one-shot command's prompt (Ctrl-C; prints `cancelled`) | — |
 
 ## 7. Examples
 
 ```bash
-npx @0gfoundation/0g-agentdna                                    # interactive: deploy and chat
+npx @0gfoundation/0g-agentdna                                    # the shell: list, deploy, chat, …
 npx @0gfoundation/0g-agentdna 286                                # straight into agent 286's session
 npx @0gfoundation/0g-agentdna doctor                             # preflight check
 npx @0gfoundation/0g-agentdna status 33                          # one agent's full picture

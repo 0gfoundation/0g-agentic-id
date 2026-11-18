@@ -36,6 +36,9 @@ export type ErrorCode =
   | 'CREDENTIALS_CONFLICT'
   | 'INFERENCE_KEY_REQUIRED'
   | 'INFERENCE_PROVIDER_UNSUPPORTED'
+  /** The agent has no agentId yet (still being minted, or its deploy failed
+   *  before the mint): what needs one waits, or `retry` resumes it. */
+  | 'AGENT_NOT_READY'
   // exit 4 — timeout
   | 'TIMEOUT'
   // exit 5 — auth/ownership
@@ -74,6 +77,7 @@ const EXIT_BY_CODE: Record<ErrorCode, number> = {
   CREDENTIALS_CONFLICT: EXIT.REMEDIABLE,
   INFERENCE_KEY_REQUIRED: EXIT.REMEDIABLE,
   INFERENCE_PROVIDER_UNSUPPORTED: EXIT.REMEDIABLE,
+  AGENT_NOT_READY: EXIT.REMEDIABLE,
   TIMEOUT: EXIT.TIMEOUT,
   AUTH_REJECTED: EXIT.AUTH,
 };
@@ -114,6 +118,33 @@ export function toCliError(e: unknown): CliError {
     });
   }
   return new CliError('UNKNOWN', e instanceof Error ? e.message : String(e));
+}
+
+/**
+ * Where the owner reads an error: at the shell's prompt (`0g-agentdna>` or an
+ * agent's session), or back in their own shell after a one-shot command. A
+ * remedy names a command the owner can type THERE: `deposit 0.1` at the
+ * prompt, `run \`0g-agentdna\` and type \`deposit 0.1\` there` outside it.
+ * The interactive shell switches to 'shell' once it is up; errors are built
+ * where they are thrown, so the surface at that moment is the one that counts.
+ */
+export type Surface = 'shell' | 'oneshot';
+let surface: Surface = 'oneshot';
+export function setSurface(s: Surface): void {
+  surface = s;
+}
+export function currentSurface(): Surface {
+  return surface;
+}
+
+/** A command that exists only inside the shell, as a remedy. */
+export function shellStep(cmd: string): string {
+  return surface === 'shell' ? `\`${cmd}\`` : `run \`0g-agentdna\` and type \`${cmd}\` there`;
+}
+
+/** A command that exists both in the shell and as a one-shot command. */
+export function cmdStep(cmd: string): string {
+  return surface === 'shell' ? `\`${cmd}\`` : `\`0g-agentdna ${cmd}\``;
 }
 
 /** What a question the owner cancelled (Ctrl-C or Esc in the shell) rejects with. */

@@ -338,6 +338,16 @@ const SEALED_NEEDS_AGENT =
   '(and its agentSeal key) exists, so the key cannot be sealed. Deploy without `sandbox`, ' +
   'wait for the mint, then call start(sealId, { apiKey }).';
 
+/**
+ * An HTTP refusal from the attestor or the sandbox provider. The message is
+ * `<what>[ failed]: HTTP <status> <body>` as before; the answer is also kept
+ * apart (`httpStatus`, `httpWhat`, `httpBody`), so a caller that shows it to
+ * a person (the CLI) can say what the server said instead of its raw body.
+ */
+function httpRefusal(what: string, status: number, body: string, failed = true): Error & { httpStatus: number; httpWhat: string; httpBody: string } {
+  return Object.assign(new Error(`${what}${failed ? ' failed' : ''}: HTTP ${status} ${body}`), { httpStatus: status, httpWhat: what, httpBody: body });
+}
+
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -399,7 +409,7 @@ export class AttestorClient {
       },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!r.ok) throw new Error(`provider /api/balance: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw httpRefusal('provider /api/balance', r.status, await r.text().catch(() => ''), false);
     const b = (await r.json()) as { balance?: string; reserved?: string; outstanding_debt?: string; pending_settlement?: string; available?: string };
     return {
       balanceWei: BigInt(b.balance ?? '0'),
@@ -483,7 +493,7 @@ export class AttestorClient {
       signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) {
-      const error = new Error(`/operator failed: HTTP ${res.status} ${await res.text().catch(() => '')}`);
+      const error = httpRefusal('/operator', res.status, await res.text().catch(() => ''));
       Object.assign(error, { status: res.status });
       throw error;
     }
@@ -566,7 +576,7 @@ export class AttestorClient {
         }
         throw new OperatorConflictError(sealId, base, text);
       }
-      throw new Error(`/operator failed: HTTP ${res.status} ${text}`);
+      throw httpRefusal('/operator', res.status, text);
     }
     // Re-read public routing metadata after the write.
     return this.getOperator(sealId);
@@ -1270,7 +1280,7 @@ export class AttestorClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`${path} failed: HTTP ${res.status} ${text}`);
+      throw httpRefusal(path, res.status, text);
     }
   }
 
@@ -1425,7 +1435,7 @@ export class AttestorClient {
           detail: live ? undefined : `could not re-read the current document: ${text.slice(0, 200)}`,
         });
       }
-      throw new Error(`/settings failed: HTTP ${res.status} ${text}`);
+      throw httpRefusal('/settings', res.status, text);
     }
     const body = (await res.json()) as { version?: number | string };
     return { version: Number(body.version ?? 0) };
@@ -1500,7 +1510,7 @@ export class AttestorClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`/retry failed: HTTP ${res.status} ${text}`);
+      throw httpRefusal('/retry', res.status, text);
     }
   }
 
@@ -1696,7 +1706,7 @@ export class AttestorClient {
       }
       if (res.ok) return (await res.json()) as DeployCloneResponse;
       const text = await res.text().catch(() => '');
-      const err = new Error(`${path} failed: HTTP ${res.status} ${text}`);
+      const err = httpRefusal(path, res.status, text);
       if (res.status < 500) throw err; // 4xx — client/business error, retry won't help
       lastErr = err; // 5xx — server transient, retry
     }

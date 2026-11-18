@@ -496,9 +496,12 @@ export type ModelKeyState = ModelKeyInUse | null | 'old';
 export function renderCredentials(defs: CredentialDefinition[], version: number, logins?: LoginStates, model?: ModelKeyState): string[] {
   const keys = defs.filter((d) => d.inference);
   const forAgent = defs.filter((d) => !d.inference);
-  const lines = forAgent.length || keys.length ? [`version ${version}`] : [`no credentials (version ${version})`];
+  // The set's version is the compare-and-swap counter: --json carries it;
+  // the owner reads the entries.
+  void version;
+  const lines: string[] = forAgent.length || keys.length ? [] : ['no credentials'];
   for (const d of forAgent) {
-    lines.push('');
+    if (lines.length) lines.push('');
     lines.push(`${d.name}  →  [[credential:${d.name}]]${d.description ? `   ${d.description}` : ''}`);
     lines.push(`  hosts      ${d.hosts.join(', ') || '—'}`);
     lines.push(`  positions  ${d.positions.map(positionText).join(' · ') || '—'}`);
@@ -524,7 +527,7 @@ export function renderCredentials(defs: CredentialDefinition[], version: number,
       lines.push(`  gives      [[credential:${derived}]] on ${t.hosts.join(', ') || '—'} (${t.positions.map(positionText).join(' · ') || '—'})`);
     }
   }
-  if (keys.length || model !== undefined) lines.push(...renderModelKeys(keys, model));
+  if (keys.length || model !== undefined) lines.push(...renderModelKeys(keys, model).slice(lines.length ? 0 : 1));
   return lines;
 }
 
@@ -620,7 +623,7 @@ async function modelSetOp(ag: AgenticID, sealId: Hash, provider: string, defs: C
   const value = (await pickModelKey(provider, keyPromptOf(io)))!;
   const out = await cred.setModelKey(sealId, provider, value, at).catch(conflict);
   if (io.json) return emitOk({ sealId, version: out.version, name, provider, valueHash: out.valueHash, pushWarning: out.pushWarning ?? null });
-  io.out(`${defs.some((d) => d.name === name) ? 'changed' : 'added'} ${name} — version ${out.version}`);
+  io.out(`${defs.some((d) => d.name === name) ? 'changed' : 'added'} ${name}`);
   if (out.pushWarning) return io.out(`stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot`);
   // LEGACY(model-key): the parenthesis goes with the images that read only the request.
   if (state === null) return io.out('the agent is not running: it takes the key when it starts on a current image (an image from before model keys in cred skips it and keeps the key given at create/reset)');
@@ -641,7 +644,7 @@ async function modelRmOp(ag: AgenticID, sealId: Hash, provider: string, defs: Cr
   }
   const out = await cred.removeModelKey(sealId, provider, at).catch(conflict);
   if (io.json) return emitOk({ sealId, version: out.version, removed: name, pushWarning: out.pushWarning ?? null });
-  io.out(`removed ${name} — version ${out.version}. Revoke it at the provider too: removing it here does not.`);
+  io.out(`removed ${name}. Revoke it at the provider too: removing it here does not.`);
   if (inUse) {
     // LEGACY(model-key): "goes back to the key given at create/reset" holds only while keys come with the request.
     io.out(`it was in use: the agent goes back to the ${provider} key given at create/reset, if it has one; without one it cannot call its model until there is a key (cred <agent> set model provider=${provider})`);
@@ -674,7 +677,7 @@ export async function ensureModelKey(ag: AgenticID, sealId: Hash, provider: stri
   io.out(`the agent has no ${provider} model key yet`);
   const value = (await pickModelKey(provider, keyPromptOf(io)))!;
   const out = await cred.setModelKey(sealId, provider, value, at).catch(conflict);
-  io.out(`added ${name} — version ${out.version}${out.pushWarning ? `; not applied to the running agent: ${out.pushWarning}` : ''}`);
+  io.out(`added ${name}${out.pushWarning ? `; not applied to the running agent: ${out.pushWarning}` : ''}`);
   if (state === null) io.out(`the agent is not running: on an image from before model keys in cred, the switch takes a reset with the ${provider} key`);
   return 'added';
 }
@@ -827,7 +830,7 @@ function conflict(e: unknown): never {
 async function disconnectOp(cred: AgenticID['credentials'], sealId: Hash, name: string, io: CredIO, at?: { agentUrl: string }): Promise<void> {
   const out = await cred.disconnect(sealId, name, at).catch(conflict);
   if (io.json) return emitOk({ sealId, version: out.version, disconnected: name, revoked: out.revoked, changed: !!out.changed, note: out.note ?? null, pushWarning: out.pushWarning ?? null });
-  io.out(`disconnected ${name} — version ${out.version}; ${out.changed ? out.note : out.revoked ? 'its tokens are revoked at the server' : `not revoked at the server: ${out.note ?? 'unknown'}`}`);
+  io.out(`disconnected ${name}; ${out.changed ? out.note : out.revoked ? 'its tokens are revoked at the server' : `not revoked at the server: ${out.note ?? 'unknown'}`}`);
   if (out.pushWarning) {
     io.out(`the running agent did not take it: ${out.pushWarning}`);
     if (!out.forgotten) io.out(`the agent still holds the login until its next boot: revoke the app's access at the service, and restart the agent`);
@@ -921,13 +924,19 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       const typed = await io.secret(stored ? `${name} value (Enter keeps the stored one, Ctrl-C cancels): ` : `${name} value (Ctrl-C cancels): `);
       if (typed) entry.value = typed;
       else if (!stored) throw new CliError('BAD_FLAG', `${name} needs a value (pipe it in, or type it at the prompt)`, { remedy: SET_USAGE });
+      else if (rest.length === 1) {
+        // Enter kept the value and no option changed: nothing to write.
+        if (io.json) return emitOk({ sealId, version: cur.version, name, unchanged: true, pushWarning: null });
+        io.out(`${name} unchanged — it keeps its value and options`);
+        return;
+      }
       const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
       const out = await cred.put(sealId, [...others, entry], { baseVersion: cur.version, ...at }).catch(conflict);
       if (io.json) return emitOk({ sealId, version: out.version, name, pushWarning: out.pushWarning ?? null });
       const gives = (entry.tokenRequest?.take ?? []).map((t) => `[[credential:${derivedName(name, t)}]]`);
       io.out(gives.length && entry.use === 'token_only'
-        ? `${stored ? 'changed' : 'added'} ${name} — version ${out.version}; the agent asks for a token request on ${name} and then uses ${gives.join(', ')}`
-        : `${stored ? 'changed' : 'added'} ${name} — version ${out.version}; the agent writes [[credential:${name}]] where the key goes`);
+        ? `${stored ? 'changed' : 'added'} ${name}; the agent asks for a token request on ${name} and then uses ${gives.join(', ')}`
+        : `${stored ? 'changed' : 'added'} ${name}; the agent writes [[credential:${name}]] where the key goes`);
       io.out(out.pushWarning ? `stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot` : 'applied to the running agent');
       return;
     }
@@ -945,7 +954,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       if (def.mcp) return disconnectOp(cred, sealId, name, io, at);
       const out = await cred.remove(sealId, name, at).catch(conflict);
       if (io.json) return emitOk({ sealId, version: out.version, removed: name, pushWarning: out.pushWarning ?? null });
-      io.out(`removed ${name} — version ${out.version}. Revoke it at its provider too: removing it here does not.`);
+      io.out(`removed ${name}. Revoke it at its provider too: removing it here does not.`);
       if (out.pushWarning) io.out(`the running agent did not take it: ${out.pushWarning} — the agent can use ${name} until its next boot`);
       return;
     }
@@ -967,7 +976,7 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
         return conflict(e);
       });
       if (io.json) return emitOk({ sealId, version: out.version, name, allowReveal: allow, pushWarning: out.pushWarning ?? null });
-      io.out(`${name}: the agent ${allow ? 'may read the value itself' : 'must ask you to read the value'} — version ${out.version}`);
+      io.out(`${name}: the agent ${allow ? 'may read the value itself' : 'must ask you to read the value'}`);
       if (out.pushWarning) io.out(`the running agent did not take it: ${out.pushWarning} — it applies on the next boot`);
       return;
     }
@@ -1296,7 +1305,7 @@ export async function readSecret(prompt: string): Promise<string> {
     const onData = (d: Buffer) => {
       for (const ch of d.toString('utf8')) {
         if (ch === '\r' || ch === '\n') { done(); resolve(buf); return; }
-        if (ch === '\u0003' || ch === '\u0004') { done(); reject(new CliError('BAD_FLAG', 'cancelled')); return; }
+        if (ch === '\u0003' || ch === '\u0004') { done(); reject(cancelled()); return; }
         if (ch === '\u007f' || ch === '\b') {
           if (buf) { buf = [...buf].slice(0, -1).join(''); process.stderr.write('\b \b'); }
           continue;

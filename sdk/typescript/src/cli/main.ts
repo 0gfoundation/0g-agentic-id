@@ -14,7 +14,11 @@
 import { parseArgs } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { CliError, toCliError, EXIT } from './errors';
+import { CliError, EXIT, isCancelled } from './errors';
+import { plainCliError } from './plain';
+import { parseAgentRef } from './ref';
+import { didYouMean } from './textfit';
+import { cleanCell } from './commands/cells';
 import { emitError, note, print } from './envelope';
 import { readEnv } from './env';
 import { moveRenamedAttestor } from './config';
@@ -30,8 +34,8 @@ import { dueReleaseNotice } from './releaseNotice';
 import { run as cred } from './commands/cred';
 import { run as interactive } from './commands/interactive';
 
-/** Diagnostics subcommands. Anything else (bare, or a leading agent ref)
- *  routes to the default interactive shell. */
+/** One-shot commands. Bare, an agent ref or `use <agent>` opens the
+ *  interactive shell instead (see route). */
 const COMMANDS: Record<string, CommandRun> = { doctor, status, list, update, settings, cred, providers, releases };
 
 // Help is written for LLM consumption as much as for humans: exact syntax,
@@ -41,62 +45,64 @@ const HELP = `0g-agentdna — 0G AgentDNA CLI for the AgenticID protocol
 (ships with @0gfoundation/0g-agentdna; no separate install)
 
 USAGE
-  0g-agentdna [agent] [options]     interactive chat (default)
-  0g-agentdna <command> [options]   diagnostics
+  0g-agentdna [agent] [options]     the interactive shell (default)
+  0g-agentdna <command> [options]   one-shot commands (below)
 
-INTERACTIVE (default — no command)
-  0g-agentdna            Open the manager REPL. Its commands:
-                            list                 agents on this attestor (* = yours)
-                            use <agentId|seal>   enter YOUR agent's session, in
-                                                 ANY phase (lifecycle is inside)
-                            hello <agentId|seal> [full]
-                                                 any agent's public /hello
-                                                 (identity + proof, services
-                                                 one per line, owner routes
-                                                 on one line; full: every
-                                                 field; banks a rating ticket
-                                                 if a wallet is configured)
-                            call <id> [path]     use an agent's service (banks
-                                                 a rating ticket)
-                            rate <id> [score]    rate an agent on-chain, spending
-                                                 a ticket from call/hello (<1h)
-                            deploy               new-agent wizard, then chat
-                            start/stop/reset <id> lifecycle without entering
-                                                 the session (reset asks the
-                                                 framework + key)
-                            settings <id> [k=v]  show/change the agent's
-                                                 configuration document
-                            balance              prepaid balance + burn rate
-                            deposit [og]         fund the prepaid balance
-                            withdraw [og]        refund prepaid funds (time-
-                                                 locked; bare claims)
-                            ack                  acknowledge the TEE trust
-                                                 root (implicit in deploy/
-                                                 start/reset)
-                            login [provider]     guided setup: attestor URL,
-                                                 owner key, each provider's model
-                                                 key (Enter keeps current; keys echo *)
-                            whoami · help · quit
-  0g-agentdna <agent>    Shortcut: use that agent directly, then drop to
-                          the manager REPL on /back.
+INTERACTIVE SHELL (default — no command)
+  0g-agentdna            Open the shell at its manager prompt (0g-agentdna>).
+                         Its commands (\`help\` there lists them all):
+    list                 agents on this attestor (* = yours)
+    use <agentId|seal>   enter YOUR agent's session, in ANY phase
+                         (lifecycle is inside)
+    hello <agentId|seal> [full]
+                         any agent's public /hello (identity + proof,
+                         services one per line, owner routes on one line;
+                         full: every field; banks a rating ticket if a
+                         wallet is set)
+    call <id> [path]     use an agent's service (banks a rating ticket)
+    rate <id> [score]    rate an agent on-chain, spending a ticket from
+                         call/hello (<1h)
+    deploy               new-agent wizard, then chat
+    start/stop/reset <id>
+                         lifecycle without entering the session (reset
+                         asks the framework + key)
+    settings <id> [k=v]  show/change the agent's configuration document
+    balance              prepaid balance + burn rate
+    deposit [og]         fund the prepaid balance
+    withdraw [og]        refund prepaid funds (time-locked; bare claims)
+    ack                  acknowledge the TEE trust root (implicit in
+                         deploy/start/reset)
+    login [provider]     guided setup: attestor URL, owner key, each
+                         provider's model key (Enter keeps the current
+                         value; keys echo *)
+    doctor · status <id> · providers · releases
+                         as the one-shot commands below
+    whoami · help · quit
+  0g-agentdna <agent>    Shortcut (also \`0g-agentdna use <agent>\`): enter
+                         that agent's session; /back drops to the manager.
 
-                          In a session: type to talk; Esc / Ctrl-C interrupts
-                          the turn in flight (and cancels a /start or /reset
-                          wait). Slash: /hello [full] /balance /topup [og] /stop
-                          /start /reset /settings [k=v] /agentlog [n]
-                          /startuplog [n] /back (or /unuse) /quit. The framework (for /reset
-                          and the chat model selector) is picked by you, never
-                          guessed. Config persists to ~/.config/0g-agentdna
-                          (config.json + credentials at 0600); AGENTIC_* env
-                          vars always override the files.
+                         In a session: type to talk; Esc / Ctrl-C
+                         interrupts the turn in flight (and cancels a
+                         /start or /reset wait). Slash: /hello [full]
+                         /balance /topup [og] /stop /start /reset
+                         /settings [k=v] /agentlog [n] /startuplog [n]
+                         /back (or /unuse) /quit. The framework (for
+                         /reset and the chat model selector) is picked by
+                         you, never guessed.
+                         Config persists to ~/.config/0g-agentdna
+                         (config.json + credentials at 0600); AGENTIC_*
+                         env vars always override the files.
+  The shell's other words (login, deploy, balance, …) are not one-shot
+  commands: \`0g-agentdna login\` says to run \`0g-agentdna\` and type it
+  there. \`0g-agentdna help\` prints this text.
 
 COMMANDS
   doctor           Check every deploy prerequisite (attestor reachable, RPC,
                    wallet, gas, trust-root ack, sandbox balance). Each failing
                    item prints a remedy. Exit 0 all green; exit 3 otherwise,
                    carrying the FIRST failing check's code. Diagnostics only:
-                   the ack/deposit remedies are transactions (they need gas)
-                   executed via the deploy console or the SDK, not this CLI.
+                   its ack and deposit remedies are transactions you run in
+                   the shell (\`ack\`, \`deposit\`).
   status <agent>   One agent's full picture: phase, agentId/sealId/agentSeal,
                    failure reason (--json also carries the container url).
                    <agent> is a decimal agentId (33) or a 0x… sealId — the
@@ -112,8 +118,9 @@ COMMANDS
                    quote it: others='{"a": 1}'), and on 0g-harness sealed and
                    harness (a version's sha256 from the trust registry's
                    lists, which settings <agent> versions prints; the agent
-                   runs a pick while it stays listed). Assignments merge into the
-                   stored document; an empty value (thinking=) clears a field.
+                   runs a pick while it stays listed). Assignments merge into
+                   the stored document; an empty value (thinking=) clears a
+                   field.
                    The document is the owner's, so BOTH reading and writing
                    are owner-signed and need AGENTIC_PRIVATE_KEY. A write is a
                    compare-and-swap against the version just read: if another
@@ -143,13 +150,14 @@ COMMANDS
                        [scope=…]: sealed trades the value for access tokens
                      cred <agent> rm <name>             remove one
                      cred <agent> connect <name> <mcp-url>
-                                                        connect an MCP server: log
-                                                        in through the link it
-                                                        prints; sealed keeps the
-                                                        tokens and refreshes them
+                                                        connect an MCP server:
+                                                        log in through the link
+                                                        it prints; sealed keeps
+                                                        the tokens, refreshes
+                                                        them
                      cred <agent> disconnect <name>     revoke it at the server
-                                                        (when it offers that) and
-                                                        remove it
+                                                        (when it offers that)
+                                                        and remove it
                      cred <agent> reveal <name> on|off  the agent may read it
                      cred <agent> pending               requests waiting
                      cred <agent> approve|deny <id>     decide one (id prefix)
@@ -159,8 +167,8 @@ COMMANDS
                      cred presets                       presets, where to
                                                         create each key
                    Owner-signed (all but cred presets); needs
-                   AGENTIC_PRIVATE_KEY. A write is a
-                   compare-and-swap like settings (CREDENTIALS_CONFLICT, exit 3).
+                   AGENTIC_PRIVATE_KEY. A write is a compare-and-swap like
+                   settings (CREDENTIALS_CONFLICT, exit 3).
   providers        Read the platform provider registry (--json for export).
   releases         The attestor's release notices: what each release
                    changed, the images it replaces and when their
@@ -184,11 +192,12 @@ OPTIONS
   --help           Show this help.
   --version        Print the package version (identical to the SDK's).
 
-ENVIRONMENT
-  AGENTIC_ATTESTOR_URL   required. Attestor base URL — one URL selects the
-                         whole environment (contracts, RPC, appIds).
-  AGENTIC_PRIVATE_KEY    optional. Owner key (0x… hex). Env only — there is
-                         deliberately no flag for it.
+ENVIRONMENT (each overrides what \`login\` saved)
+  AGENTIC_ATTESTOR_URL   required unless saved by login. Attestor base URL —
+                         one URL selects the whole environment (contracts,
+                         RPC, appIds).
+  AGENTIC_PRIVATE_KEY    optional. Owner key (0x… hex). Env or login only —
+                         there is deliberately no flag for it.
   AGENTIC_RPC_URL        optional. Overrides the RPC the attestor advertises.
   AGENTDNA_API_KEY_PROVIDER / AGENTDNA_API_KEY
                          optional, set together. Inference key for deploy/
@@ -206,11 +215,12 @@ ENVIRONMENT
 EXIT CODES
   0 success · 1 unknown · 2 usage error (incl. unknown command/agent — branch
   on error.code to tell them apart) · 3 fixable precondition (run the error's
-  remedy, then retry) · 4 timeout (check again later) · 5 auth (stop)
+  remedy, then retry) · 4 timeout (check again later) · 5 auth (stop) ·
+  130 cancelled at a prompt (Ctrl-C)
 
 EXAMPLES
-  0g-agentdna                       # deploy a new agent and chat
-  0g-agentdna 286                   # attach to agent 286 and chat
+  0g-agentdna                       # the shell: list, deploy, chat, …
+  0g-agentdna 286                   # straight into agent 286's session
   0g-agentdna doctor
   0g-agentdna status 33
   0g-agentdna settings 286
@@ -223,6 +233,44 @@ EXAMPLES
 function packageVersion(): string {
   const raw = readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf8');
   return (JSON.parse(raw) as { version: string }).version;
+}
+
+/** The interactive shell's words that are not one-shot commands. */
+const SHELL_WORDS = [
+  'login', 'whoami', 'deploy', 'balance', 'deposit', 'withdraw', 'ack', 'hello', 'call', 'rate',
+  'start', 'stop', 'reset', 'retry', 'clone', 'transfer', 'authorizer', 'grant', 'revoke', 'quit',
+];
+
+/**
+ * Which command runs: a one-shot command by name; the interactive shell for
+ * nothing, an agent reference (an agentId is decimal and a sealId 0x…, so
+ * neither collides with a command name) or `use <agent>`. A word of the
+ * shell's is refused with where to type it; any other word is an unknown
+ * command, with the nearest known one when it looks like a typo.
+ */
+function route(positionals: string[]): { run: CommandRun; rest: string[]; command?: string } {
+  const [first, ...rest] = positionals;
+  if (!first) return { run: interactive, rest: [] };
+  if (Object.prototype.hasOwnProperty.call(COMMANDS, first)) return { run: COMMANDS[first], rest, command: first };
+  if (first === 'use') {
+    parseAgentRef(rest[0]);
+    return { run: interactive, rest };
+  }
+  if (/^(?:\d+|0x[0-9a-fA-F]*)$/.test(first)) return { run: interactive, rest: positionals };
+  const typed = cleanCell(first);
+  if (SHELL_WORDS.includes(first)) {
+    throw new CliError('UNKNOWN_COMMAND', `\`${typed}\` is a command of the interactive shell, not a one-shot one`, {
+      remedy: `run \`0g-agentdna\` and type \`${cleanCell(positionals.join(' '))}\` there`,
+    });
+  }
+  const near = didYouMean(first, ['help', ...Object.keys(COMMANDS), ...SHELL_WORDS]);
+  throw new CliError('UNKNOWN_COMMAND', `unknown command: ${typed}`, {
+    remedy: near === undefined
+      ? '0g-agentdna --help lists the commands'
+      : SHELL_WORDS.includes(near)
+        ? `did you mean \`${near}\`? It is a shell command: run \`0g-agentdna\` and type it there`
+        : `did you mean \`0g-agentdna ${near}\`?`,
+  });
 }
 
 async function main(): Promise<number> {
@@ -249,14 +297,12 @@ async function main(): Promise<number> {
     return EXIT.OK;
   }
 
-  // Claude-Code-style default: bare `0g-agentdna` (or with just an agent
-  // ref, e.g. `0g-agentdna 286`) enters the interactive chat. The
-  // diagnostics commands (doctor/status/list) are the only reserved words;
-  // an agentId is decimal and a sealId is 0x…, so neither collides with a
-  // command name — anything that isn't a known command routes to chat.
-  const [first, ...rest] = positionals;
-  const isCommand = !!first && first in COMMANDS;
-  const run = isCommand ? COMMANDS[first] : interactive;
+  if (positionals[0] === 'help') {
+    print(HELP);
+    return EXIT.OK;
+  }
+  const { run, rest, command } = route(positionals);
+  const isCommand = command !== undefined;
 
   // The public attestors were renamed: a saved earlier address moves to the
   // current one before the environment is read.
@@ -266,13 +312,13 @@ async function main(): Promise<number> {
   const ctx: CommandContext = {
     env: readEnv(),
     json: values.json,
-    positionals: isCommand ? rest : positionals,
+    positionals: rest,
     flags: { mine: values.mine, phase: values.phase },
   };
   // The release notice runs alongside a one-shot command and prints after it,
   // on stderr, in a terminal only; it waits at most 1.5 s past the command.
   const noticeAbort = new AbortController();
-  const notice = isCommand && first !== 'releases' && first !== 'update' && !ctx.json && process.stderr.isTTY
+  const notice = isCommand && command !== 'releases' && command !== 'update' && !ctx.json && process.stderr.isTTY
     ? dueReleaseNotice(ctx.env, noticeAbort.signal)
     : null;
   try {
@@ -303,6 +349,13 @@ main()
     process.exitCode = code;
   })
   .catch((e: unknown) => {
+    // Ctrl-C at a one-shot command's prompt: the owner stopped it, nothing
+    // failed. 130 is the shell's code for an interrupted command.
+    if (isCancelled(e) && !wantJson) {
+      process.stderr.write('cancelled\n');
+      process.exitCode = 130;
+      return;
+    }
     // node:util's parseArgs errors carry ERR_PARSE_ARGS_* codes — usage, exit 2.
     const nodeCode = (e as { code?: string }).code ?? '';
     // Own wording, not node:util's raw parseArgs prose (its "place it at the
@@ -316,6 +369,6 @@ main()
               : 'malformed command-line arguments',
             { remedy: '0g-agentdna --help' },
           )
-        : toCliError(e);
+        : plainCliError(e);
     process.exitCode = emitError(err, wantJson);
   });

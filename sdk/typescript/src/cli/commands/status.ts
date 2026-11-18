@@ -16,7 +16,9 @@
 import type { Address, Hash } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import { buildClient } from '../sdk';
-import { CliError } from '../errors';
+import { CliError, cmdStep, shellStep } from '../errors';
+import { explainError } from '../plain';
+import { cleanCell } from './cells';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef } from '../ref';
 import type { CommandContext } from '../types';
@@ -56,8 +58,8 @@ export async function run(ctx: CommandContext): Promise<void> {
         hits.length ? 'BAD_AGENT_REF' : 'AGENT_NOT_FOUND',
         hits.length
           ? `"${ctx.positionals[0]}" matches ${hits.length} agents — add more hex chars`
-          : `no agent matching ${ctx.positionals[0]} on this attestor`,
-        { remedy: '0g-agentdna list   # to discover existing agents' },
+          : `agent ${cleanCell(ctx.positionals[0])} does not exist on this attestor`,
+        { remedy: `${cmdStep('list')} shows the agents here` },
       );
     }
     ref = { kind: 'sealId', sealId: hits[0].sealId as Hash };
@@ -72,8 +74,8 @@ export async function run(ctx: CommandContext): Promise<void> {
     try {
       await ag.agent.ownerOf(agentId);
     } catch {
-      throw new CliError('AGENT_NOT_FOUND', `agent ${agentId} not found on chain`, {
-        remedy: '0g-agentdna list   # to discover existing agents',
+      throw new CliError('AGENT_NOT_FOUND', `agent ${agentId} does not exist on this attestor's chain`, {
+        remedy: `${cmdStep('list')} shows the agents here`,
       });
     }
     try {
@@ -100,13 +102,13 @@ export async function run(ctx: CommandContext): Promise<void> {
     try {
       row = bySeal(await ag.agent.listDeployments());
     } catch (e) {
-      note(`attestor listing unavailable (${(e as Error).message}) — chain-only view`);
+      note(`attestor listing unavailable (${explainError(e).message}) — chain-only view`);
     }
 
     // Not minted AND no deployment row → the sealId leads nowhere.
     if (!row && agentId === null) {
       throw new CliError('AGENT_NOT_FOUND', `seal ${sealId} has no deployment and no minted agent`, {
-        remedy: '0g-agentdna list   # to discover existing agents',
+        remedy: `${cmdStep('list')} shows the agents here`,
       });
     }
 
@@ -116,10 +118,10 @@ export async function run(ctx: CommandContext): Promise<void> {
         try {
           row = bySeal(await ag.agent.listMyDeployments()) ?? row;
         } catch (e) {
-          note(`could not fetch the owner-tier failure reason (${(e as Error).message})`);
+          note(`could not fetch the owner-tier failure reason (${explainError(e).message})`);
         }
       } else {
-        note('failure reason is owner-only — set AGENTIC_PRIVATE_KEY to see it');
+        note(`failure reason is owner-only — with your owner key (${shellStep('login')}, or AGENTIC_PRIVATE_KEY) it shows`);
       }
     }
   }
@@ -150,7 +152,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   };
   if (data.phase === 'failed') {
     // retry preserves the minted identity; a redeploy would orphan it.
-    data.hint = 'recover with retry (keeps the on-chain identity) — SDK: await ag.agent.retry(sealId); do NOT redeploy';
+    data.hint = `recover with ${shellStep(`retry ${agentId ?? data.agentId ?? `0x${(sealId ?? '').slice(2, 12)}`}`)} (keeps the on-chain identity); do NOT redeploy`;
   }
 
   if (ctx.json) {
