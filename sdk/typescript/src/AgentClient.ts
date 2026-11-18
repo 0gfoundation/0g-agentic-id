@@ -363,6 +363,11 @@ export interface AgentActivityInfo {
   trigger: string;
   /** A turn: the session it ran in (`owner-chat`, another of the owner's, a task's). */
   session?: string;
+  /** A command or subagent (0g-harness #12 on): the turn that started it,
+   *  who asked for that turn (`user` for an owner turn) and its session. */
+  parent_turn?: string;
+  parent_trigger?: string;
+  parent_session?: string;
   /** What the activity is: the prompt, the job notice, the reminder's text. */
   label: string;
   /** Unix seconds. */

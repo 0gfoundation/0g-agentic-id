@@ -202,6 +202,23 @@ test("/activities FOR: a command or subagent started during the owner's turn was
   assert.match(renderActivityTable(all, now * 1000)[4], /bash-1\s+completed\s+agent\s+you\s/);
 });
 
+test('/activities FOR: 0g-harness #12 names the turn that started a command or subagent, and who asked for that turn', () => {
+  const now = 2_000_000;
+  // A schedule's turn overlaps in time: the parent fields decide, not the overlap.
+  const all = [
+    { id: 'resp_s', type: 'turn', session: 'owner-chat', status: 'completed', actor: 'agent', trigger: 'schedule', label: 'stand-up', created_at: now - 600, started_at: now - 600, finished_at: now - 500 },
+    { id: 'bash-1', type: 'command', status: 'completed', actor: 'agent', trigger: 'agent', label: 'npm test', created_at: now - 550, parent_turn: 'resp_o', parent_trigger: 'user', parent_session: 'owner-chat' },
+    { id: 'sub-2', type: 'subagent', status: 'completed', actor: 'subagent', trigger: 'agent', label: 'look', created_at: now - 550, parent_turn: 'resp_s', parent_trigger: 'schedule', parent_session: 'owner-chat' },
+    { id: 'bash-3', type: 'command', status: 'completed', actor: 'agent', trigger: 'agent', label: 'x', created_at: now - 550, parent_turn: 'resp_j', parent_trigger: 'job', parent_session: 'owner-chat' },
+  ];
+  assert.equal(askedFor(all[1], all, now), 'you');
+  assert.equal(askedFor(all[2], all, now), 'agent');
+  assert.equal(askedFor(all[3], all, now), 'agent');
+  // Without the fields (an older harness): the overlap with a schedule's turn says agent.
+  const { parent_turn, parent_trigger, parent_session, ...old } = all[1];
+  assert.equal(askedFor(old, all, now), 'agent');
+});
+
 test('the entry card wraps at words; a field goes on under its value', () => {
   const fields = ['agent 625 · integ-e6ba387-key', 'phase    running', 'gas      15.836804 OG (agentSeal — fund with /topup)', 'type to chat · /help for commands · Esc interrupts a turn'];
   assert.deepEqual(wrapCard(fields, 38), [

@@ -309,12 +309,14 @@ const ASKED_BY: Record<string, string> = { user: 'you', job: 'job', schedule: 'r
  * /cancel take. Exported for the tests.
  */
 /**
- * Who asked for an activity, as /activities' FOR column says it. 0g-harness
- * gives a command or subagent `trigger: agent` and no turn it came from, so
- * one started while only the owner's turns ran (by their start and end) was
- * asked for by the owner: `you`. Exported for the tests.
+ * Who asked for an activity, as /activities' FOR column says it. A command
+ * or subagent: `you` when the turn that started it was the owner's
+ * (`parent_trigger: user`, 0g-harness #12 on), `agent` otherwise. An older
+ * harness names no parent turn; there one started while only the owner's
+ * turns ran (by their start and end) counts as the owner's. Exported for the tests.
  */
 export function askedFor(t: AgentActivityInfo, all: readonly AgentActivityInfo[], nowSec: number): string {
+  if (t.type !== 'turn' && typeof t.parent_trigger === 'string') return t.parent_trigger === 'user' ? 'you' : 'agent';
   if (t.type !== 'turn' && t.trigger === 'agent') {
     const during = all.filter((x) => x.type === 'turn' && x.started_at !== undefined && x.started_at <= t.created_at && t.created_at <= (x.finished_at ?? nowSec));
     if (during.length && during.every((x) => x.trigger === 'user')) return 'you';
