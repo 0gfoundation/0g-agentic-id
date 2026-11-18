@@ -442,7 +442,7 @@ test('shell: login checks the URL and the key before saving them, and asks again
     const port = await closedPort();
     const input = ['login', 'not a url', `http://127.0.0.1:${port}`, att.url, 'nothex', KEY.slice(2), '', '', '', 'quit', ''].join('\n');
     const r = await run([], {}, input);
-    assert.match(r.stdout, /not a url: not a URL \(https:\/\/… or http:\/\/…\) — try again/);
+    assert.match(r.stdout, /not a url: not a web address \(https:\/\/… or http:\/\/…\) — try again/);
     assert.match(r.stdout, new RegExp(`http://127\\.0\\.0\\.1:${port}: connection refused — try again`));
     assert.match(r.stdout, /not a private key \(64 hex, 0x optional\) — try again, or Enter to skip/);
     assert.match(r.stdout, new RegExp(`wallet ${ME}`));
@@ -631,7 +631,7 @@ test('one-shot: cred log of a stopped agent, RUNTIME_TOO_OLD, a garbage URL — 
       (e) => e.code === 'RUNTIME_TOO_OLD' && e.remedy === 'type `reset 286` to move it to the current image');
   } finally { setAgentAtHand(null); }
   const bad = await run(['list'], { AGENTIC_ATTESTOR_URL: 'not a url' });
-  assert.match(bad.stderr, /"not a url" is not a URL — an attestor's address is like https:\/\/agentdna\.0g\.ai\n {2}fix: set AGENTIC_ATTESTOR_URL to the attestor's address\n/);
+  assert.match(bad.stderr, /"not a url" is not a web address \(https:\/\/… or http:\/\/…\) — an attestor's is like https:\/\/agentdna\.0g\.ai\n {2}fix: set AGENTIC_ATTESTOR_URL to the attestor's address\n/);
 });
 
 test('50 columns: the balance block and long labelled lines hang under their value', async () => {
@@ -650,4 +650,30 @@ test('shell: a retry that fails again says why in plain words, with the next ste
     assert.match(r.stdout, /error: still failing — the chain refused the mint: seal already registered\n {2}→ once the cause is fixed, `retry 0x6224b71b9a` again; `status 0x6224b71b9a` shows it in full\n/);
     assert.doesNotMatch(r.stdout, /waitForMint|registerWithSeal|Esc-proof|0x6224b71b9acd/);
   } finally { close(att.server); }
+});
+
+test('an attestor address that is not http(s) is refused before any request, doctor too', async () => {
+  for (const url of ['ftp://example.invalid', 'not a url']) {
+    const l = await run(['list'], { AGENTIC_ATTESTOR_URL: url });
+    assert.equal(l.code, 3, l.stderr);
+    assert.match(l.stderr, /is not a web address \(https:\/\/… or http:\/\/…\)/);
+    const d = await run(['doctor'], { AGENTIC_ATTESTOR_URL: url });
+    assert.match(`${d.stdout}${d.stderr}`, /is not a web address/);
+    assert.doesNotMatch(`${d.stdout}${d.stderr}`, /did not answer|check your network/);
+  }
+});
+
+test('settings usage is typed where the owner is, with the agent at hand', async () => {
+  const { parseAssignments } = await import('../dist/cli/settings.js');
+  const { setAgentAtHand } = await import('../dist/cli/errors.js');
+  try {
+    setSurface('shell');
+    setAgentAtHand('286');
+    assert.throws(() => parseAssignments(['colour=red']), (e) => e.code === 'BAD_FLAG' && e.remedy.startsWith('settings 286 [provider=') && !/0g-agentdna|<agent>/.test(e.remedy));
+    setAgentAtHand('286', true);
+    assert.throws(() => parseAssignments(['colour=red']), (e) => e.remedy.startsWith('/settings [provider='));
+    setSurface('oneshot');
+    setAgentAtHand(null);
+    assert.throws(() => parseAssignments(['colour=red']), (e) => e.remedy.startsWith('0g-agentdna settings <agent> ['));
+  } finally { setAgentAtHand(null); setSurface('shell'); }
 });

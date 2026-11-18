@@ -25,6 +25,8 @@ import { explainError } from './plain';
  */
 export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = {}): Promise<AgenticID> {
   const attestorUrl = requireAttestorUrl(env);
+  // An address that is not http(s) is refused before anything is sent to it.
+  if (!isWebAddress(attestorUrl)) throw attestorUnreachable(env, new Error('Invalid URL'));
   // Wallet-requiring callers get the strict check (named error + remedy).
   // Read-only callers proceed WALLETLESS on a malformed key instead of dying —
   // public surfaces like `list`/`hello` must not be hostage to a bad env var.
@@ -77,10 +79,10 @@ export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = 
 export function attestorUnreachable(env: Pick<CliEnv, 'attestorUrl' | 'attestorUrlSource'>, e: unknown): CliError {
   const url = env.attestorUrl ?? '(unset)';
   const why = unreachableReason(e);
-  const notUrl = why === 'not a valid URL';
+  const notUrl = !isWebAddress(url) || why === 'not a valid URL';
   const fromEnv = env.attestorUrlSource === 'env';
   return new CliError('ATTESTOR_UNREACHABLE', notUrl
-    ? `"${url}" is not a URL — an attestor's address is like https://agentdna.0g.ai`
+    ? `"${url}" is not a web address (https://… or http://…) — an attestor's is like https://agentdna.0g.ai`
     : `the attestor at ${url} did not answer (${why})`, {
     remedy: notUrl
       ? (fromEnv ? 'set AGENTIC_ATTESTOR_URL to the attestor\'s address' : shellTo('login', 'set the address again'))
@@ -89,6 +91,16 @@ export function attestorUnreachable(env: Pick<CliEnv, 'attestorUrl' | 'attestorU
         : `check your network and try again, or ${shellTo('login', 'change the address')}`,
     details: { cause: e instanceof Error ? e.message : String(e) },
   });
+}
+
+/** An http(s) URL with a host: the only kind of address an attestor has. */
+export function isWebAddress(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return (u.protocol === 'https:' || u.protocol === 'http:') && !!u.hostname;
+  } catch {
+    return false;
+  }
 }
 
 /** Why a request to a URL got nowhere, in a few words. */
@@ -118,7 +130,7 @@ export function unreachableReason(e: unknown): string {
  * checks an address with this before saving it).
  */
 export async function probeAttestor(url: string, timeoutMs = 8000): Promise<string | null> {
-  if (!/^https?:\/\/[^\s/]+/i.test(url)) return 'not a URL (https://… or http://…)';
+  if (!/^https?:\/\/[^\s/]+/i.test(url) || !isWebAddress(url)) return 'not a web address (https://… or http://…)';
   try {
     const r = await fetch(`${url.replace(/\/+$/, '')}/config`, { signal: AbortSignal.timeout(timeoutMs) });
     if (!r.ok) return `its /config answered HTTP ${r.status}`;

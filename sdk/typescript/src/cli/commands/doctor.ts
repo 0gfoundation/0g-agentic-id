@@ -15,7 +15,7 @@ import { createPublicClient, http, formatEther, type PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { MIN_SANDBOX_BALANCE_WEI, type AgenticID } from '../../AgenticID';
 import { RPC_URL } from '../../constants';
-import { buildClient, unreachableReason } from '../sdk';
+import { attestorUnreachable, buildClient } from '../sdk';
 import { renamedAttestor } from '../config';
 import { attestorUrlRemedy } from '../env';
 import { CliError, currentSurface, shellStep, shellTo, type ErrorCode } from '../errors';
@@ -78,13 +78,9 @@ export async function run(ctx: CommandContext): Promise<void> {
         detail: current ? `${env.attestorUrl} (now ${current}; the earlier name still answers — update AGENTIC_ATTESTOR_URL)` : env.attestorUrl,
       });
     } catch (e) {
-      checks.push({
-        name: 'attestor', status: 'fail', code: 'ATTESTOR_UNREACHABLE',
-        detail: `${env.attestorUrl} did not answer (${unreachableReason(e)})`,
-        remedy: env.attestorUrlSource === 'env'
-          ? 'check AGENTIC_ATTESTOR_URL and your network, then retry'
-          : `check your network and retry, or ${shellTo('login', 'change the address')}`,
-      });
+      // As every other command says it: a garbage address is not "did not answer".
+      const why = attestorUnreachable(env, e);
+      checks.push({ name: 'attestor', status: 'fail', code: 'ATTESTOR_UNREACHABLE', detail: why.message, remedy: why.remedy });
     }
   }
 
