@@ -26,6 +26,8 @@ export interface FileConfig {
   attestorUrl?: string;
   rpcUrl?: string;
   inferenceProvider?: string;
+  /** `off`: new files from an agent are not saved by themselves (`/files auto off`). */
+  filesAuto?: 'off';
 }
 
 /** Resolve on-disk locations and move an existing legacy directory once.
@@ -59,6 +61,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FileConfig {
       attestorUrl: c.attestorUrl?.replace(/\/$/, ''),
       rpcUrl: c.rpcUrl,
       inferenceProvider: c.inferenceProvider,
+      filesAuto: c.filesAuto === 'off' ? 'off' : undefined,
     };
   } catch {
     return {};

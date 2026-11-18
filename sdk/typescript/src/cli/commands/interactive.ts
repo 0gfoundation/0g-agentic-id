@@ -43,7 +43,7 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/sessions', '/activities', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/sessions', '/activities', '/tasks', '/result', '/cancel', '/inbox', '/notices', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -418,6 +418,17 @@ export function renderTaskNotice(t: HarnessTaskSummary): string | null {
   return `◆ task ${cleanCell(t.id)} ${what}${headline ? ` · ${headline}` : ''} — /tasks show ${cleanCell(t.id)}\n`;
 }
 
+/** What /inbox (or /notices) says when there is nothing to show; all: `/inbox all`. */
+export function noNoticesText(all: boolean): string {
+  return all ? 'no notices from the agent yet\n' : 'no unread notices from the agent (/inbox all lists the ones you\'ve seen)\n';
+}
+
+/** /files' heading for a listing (empty: what it says instead). */
+export function filesText(dir: 'outbox' | 'inbox', empty: boolean): string {
+  if (dir === 'outbox') return empty ? 'the agent has left no files for you — ask it to put one in ~/outbox\n' : 'files the agent left for you (~/outbox):\n';
+  return empty ? 'you have sent no files (~/inbox) — /attach sends one with your next message\n' : 'files you sent (~/inbox):\n';
+}
+
 /** What stopping an activity did, in words. */
 const STOP_OUTCOME: Record<AgentActivityStop['outcome'], string> = {
   cancelled: 'stopped',
@@ -426,16 +437,17 @@ const STOP_OUTCOME: Record<AgentActivityStop['outcome'], string> = {
 };
 
 /**
- * Follows one agent's inbox for a session: first the messages that came in
- * while nobody was looking, then each new one as the agent's live feed
- * announces it. `show` prints a rendered message, now or at the next prompt,
- * and calls `shown` once it is on screen; the message is acked then, so
+ * Follows one agent's notices (its inbox) for a session: first the messages
+ * that came in while nobody was looking, then each new one as the agent's
+ * live feed announces it. `show` prints a rendered message, now or at the
+ * next prompt, and calls `shown` once it is on screen (`count`: how many
+ * notices the text holds); the message is acked then, so
  * another window does not show it again. A message is shown once per feed.
  * `follow` is called with the session's current client before every prompt
  * and restarts the feed when the client changed (/start, /reset); an agent
  * without an inbox gets no feed. Exported for the tests.
  */
-export function makeInboxFeed(show: (text: string, shown: () => void) => void): {
+export function makeInboxFeed(show: (text: string, shown: () => void, count: number) => void): {
   follow(client: AgentClient | undefined): void;
   stop(): void;
 } {
@@ -450,14 +462,14 @@ export function makeInboxFeed(show: (text: string, shown: () => void) => void): 
       if (!fresh.length || signal.aborted) return;
       for (const m of fresh) seen.add(m.seq);
       const through = Math.max(...fresh.map((m) => m.seq));
-      const text = (away ? `\nwhile you were away (${fresh.length}):\n` : '\n') + fresh.map(renderInboxMessage).join('\n');
+      const text = (away ? `\nnotices while you were away (${fresh.length}):\n` : '\n') + fresh.map(renderInboxMessage).join('\n');
       show(text, () => {
         if (through <= acked) return;
         acked = through;
         // Best-effort: a window that lost the seat cannot ack (409), and the
         // owner's next window shows the message again.
         client.ackInbox?.(through).catch(() => undefined);
-      });
+      }, fresh.length);
     };
     const readUnread = async (away: boolean): Promise<number | undefined> => {
       const page = await client.inbox!();
@@ -478,7 +490,7 @@ export function makeInboxFeed(show: (text: string, shown: () => void) => void): 
         // A task's run ended where the owner acts on it.
         else if (e.type === 'task.updated' && (e.data as { change?: string }).change === 'run-ended') {
           const text = renderTaskNotice(e.data as unknown as HarnessTaskSummary);
-          if (text && !signal.aborted) show(`\n${text}`, () => undefined);
+          if (text && !signal.aborted) show(`\n${text}`, () => undefined, 1);
         }
         // The agent could not serve our position: what we may have missed
         // is in the inbox itself.
@@ -560,10 +572,11 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/reset': ['pick'],
   '/cancel': ['all'],
   '/inbox': ['all'],
+  '/notices': ['all'],
   '/settings': ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness='],
   '/restart': ['harness', 'sealed'],
   '/cred': CRED_SUBS,
-  '/files': ['inbox'],
+  '/files': ['inbox', 'auto', 'auto on', 'auto off'],
   // What the outbox held when /files listed it or a turn reported it.
   '/download': () => outboxNames,
 };
@@ -700,6 +713,8 @@ export function completeLine(
 // The live readline interface — askSecret scrubs submitted secrets out of
 // its history (display masking alone leaves the plaintext one ↑ away).
 let activeRl: readline.Interface | null = null;
+// The shell's line queue: a turn's live prompt shows what waits in it.
+let activeAsk: Ask | null = null;
 
 /**
  * Print a block above the live prompt, keeping what the user has typed. The
@@ -730,6 +745,8 @@ export function printAbovePrompt(
 }
 import type { CommandContext } from '../types';
 import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
+import { CONT_PROMPT, LiveTurn, PlainTurn, liveKeys, type LiveState, type TurnView } from '../livePrompt';
+import { OUTBOX_POLL_MS, makeOutboxSync, renderOutboxEvent, supportsHyperlinks, tildePath, type OutboxSync } from '../outboxSync';
 
 /** Column widths of the REPL listing; its header and every row share them. */
 const LIST_COLS = { id: 6, phase: 11, framework: 12, seal: 13, agentSeal: 13, owner: 24 } as const;
@@ -797,6 +814,24 @@ type Ask = ((q: string) => Promise<string>) & {
   whileBusy?: (take: ((e: Entry) => boolean) | null) => void;
   /** Put an entry back to wait for the next prompt. */
   later?: (e: Entry) => void;
+  /** The lines of a message begun and not sent yet (during a turn). */
+  drafting?: () => string[];
+  /** Entries waiting for the next prompt, oldest first. */
+  queued?: () => Entry[];
+  /** Take the newest waiting entry back to be edited (its last line on the
+   *  line being edited, the others as the message's earlier lines); false
+   *  when none waits or something is being edited. */
+  recall?: () => boolean;
+  /** What is being edited (earlier lines and the line) waits for the next
+   *  prompt as an entry; false when there is nothing. */
+  queueEdit?: () => boolean;
+  /** Every waiting entry back to be edited, as one message ahead of what is
+   *  being edited (a turn was interrupted: nothing goes on its own); how
+   *  many there were. */
+  recallAll?: () => number;
+  /** The shell's prompt now says q (its status changed): redrawn in place
+   *  when it is up, used from the next prompt otherwise. */
+  retitle?: (q: string) => void;
 };
 
 /** What the owner entered: its text (newlines kept), whether it spans lines,
@@ -816,7 +851,7 @@ export function steerable(e: Entry): boolean {
 /** An answer to a signing question this soon after it is shown was typed before it. */
 const READ_MS = 300;
 /** The prompt of a message's next line. */
-const CONT = '… ';
+const CONT = CONT_PROMPT;
 /** The terminal's bracketed paste mode (xterm): on, off. */
 const PASTE_ON = '\x1b[?2004h';
 const PASTE_OFF = '\x1b[?2004l';
@@ -1057,7 +1092,8 @@ export function lineQueue(
       q = CONT;
     }
     rl.setPrompt(q);
-    rl.prompt(kind === 'message' && q === CONT);
+    // A line typed during a turn is shown again with the cursor where it was.
+    rl.prompt(kind === 'message' && (q === CONT || editLine() !== ''));
     return new Promise((res, rej) => waiters.push({ res, rej, kind, q }));
   };
   const ask: Ask = (q: string): Promise<string> => wait(q, 'q').then((e) => e.text);
@@ -1065,6 +1101,55 @@ export function lineQueue(
   ask.message = (q: string): Promise<Entry> => wait(q, 'message');
   ask.whileBusy = (take) => { busy = take; };
   ask.later = (e) => { pending.push(e); };
+  ask.drafting = () => [...draft];
+  ask.queued = () => [...pending];
+  ask.recall = (): boolean => {
+    if (waiters[0] || draft.length || editLine() || !pending.length) return false;
+    const e = pending.pop()!;
+    const lines = e.text.split('\n');
+    const last = lines.pop() ?? '';
+    draft = lines;
+    draftPasted = !!lines.length && e.pasted;
+    touched = !lines.length && e.pasted;
+    if (typeof edit.line === 'string') edit.line = last;
+    if (typeof edit.cursor === 'number') edit.cursor = last.length;
+    return true;
+  };
+  ask.queueEdit = (): boolean => {
+    if (waiters[0]) return false;
+    const line = editLine();
+    if (!draft.length && !line.trim()) return false;
+    const e: Entry = { text: [...draft, line].join('\n'), multi: draft.length > 0, pasted: draftPasted || touched };
+    draft = [];
+    draftPasted = false;
+    touched = false;
+    clearEdit();
+    pending.push(e);
+    return true;
+  };
+  ask.recallAll = (): number => {
+    if (waiters[0] || !pending.length) return 0;
+    const back = pending.splice(0);
+    const line = editLine();
+    const lines = [...back.flatMap((e) => e.text.split('\n')), ...draft, ...(line ? [line] : [])];
+    const last = lines.pop() ?? '';
+    const pastedAny = back.some((e) => e.pasted) || draftPasted || touched;
+    draft = lines;
+    draftPasted = !!lines.length && pastedAny;
+    touched = !lines.length && pastedAny;
+    if (typeof edit.line === 'string') edit.line = last;
+    if (typeof edit.cursor === 'number') edit.cursor = last.length;
+    return back.length;
+  };
+  ask.retitle = (q: string): void => {
+    const w = waiters[0];
+    if (!w || w.kind === 'q' || w.q === q) return;
+    const up = (rl as { getPrompt?: () => string }).getPrompt?.() === w.q;
+    w.q = q;
+    if (!up) return; // a message's next line is up: the new prompt comes with the next one
+    rl.setPrompt(q);
+    rl.prompt(true);
+  };
   ask.cancel = (): boolean => {
     const i = waiters.findIndex((w) => w.kind === 'q');
     if (i < 0) return false;
@@ -1141,6 +1226,71 @@ interface Session {
    *  default `owner-chat`. */
   sessionId?: string;
   sessionTitle?: string;
+  /** The session's prompt and the turn on screen (sessionRepl). */
+  screen?: SessionScreen;
+}
+
+/** What a session's turns need from its prompt. */
+interface SessionScreen {
+  /** The prompt's text (no leading newline); busy: a turn runs. */
+  prompt(busy: boolean): string;
+  /** The turn on screen, told when what the prompt counts changes. */
+  turn: TurnView | null;
+  /** A turn ran since the prompt was last up. */
+  turnRan: boolean;
+  /** A turn was interrupted: what was queued during it comes back to be
+   *  edited; what to say about it ('' when nothing was queued). */
+  interrupted?: () => string;
+}
+
+/** What the session prompt counts: notices waiting to be shown, new files. */
+export interface PromptCounts { notices: number; files: number }
+
+/** The prompt's status: ` · 2 notices · 1 new file`, nothing for zeros. */
+export function promptStatus(c: PromptCounts): string {
+  const parts: string[] = [];
+  if (c.notices > 0) parts.push(`${c.notices} notice${c.notices === 1 ? '' : 's'}`);
+  if (c.files > 0) parts.push(`${c.files} new file${c.files === 1 ? '' : 's'}`);
+  return parts.map((p) => ` · ${p}`).join('');
+}
+
+/** The session prompt without its leading newline, e.g.
+ *  `agent 625 (replying, Esc stops) · 1 notice › `. busy: a turn runs. */
+export function sessionPromptText(agentId: string, label: string, busy: boolean, c: PromptCounts): string {
+  return `agent ${agentId}${label}${busy ? ' (replying, Esc stops)' : ''}${promptStatus(c)} › `;
+}
+
+/** An entry in one line: its first line and how many follow. */
+function oneLine(text: string): string {
+  const lines = text.split('\n');
+  return lines.length > 1 ? `${lines[0]} (+${lines.length - 1} line${lines.length === 2 ? '' : 's'})` : lines[0];
+}
+
+/** The live prompt's lines for what the owner sent during a turn: steered
+ *  into it and not read yet, queued for after it. Exported for the tests. */
+export function turnNotes(steered: readonly string[], queued: ReadonlyArray<{ text: string }>): string[] {
+  return [...steered.map((t) => `steered: ${oneLine(t)}`), ...queued.map((e) => `queued: ${oneLine(e.text)}`)];
+}
+
+/** Whether a turn keeps the prompt on screen: on a terminal, unless
+ *  AGENTDNA_LIVE_PROMPT=off. */
+function livePromptOn(): boolean {
+  return !!activeRl?.terminal && process.env.TERM !== 'dumb' && !/^(0|off|false|no)$/i.test(process.env.AGENTDNA_LIVE_PROMPT ?? '');
+}
+
+/** A turn's output: under a live prompt on a terminal, else written as it
+ *  comes. `steered`: what went into this turn and was not read yet. */
+function openTurn(s: Session, steered: () => readonly string[] = () => []): TurnView {
+  const screen = s.screen;
+  if (screen) screen.turnRan = true;
+  const view = livePromptOn() && activeRl
+    ? new LiveTurn(activeRl, process.stdout, activeAsk ?? {}, (): LiveState => ({
+        prompt: screen?.prompt(true) ?? sessionPromptText(s.agentId, sessionLabel(s), true, { notices: 0, files: 0 }),
+        notes: turnNotes(steered(), activeAsk?.queued?.() ?? []),
+      }))
+    : new PlainTurn(term);
+  if (screen) screen.turn = view;
+  return view;
 }
 
 /** The session the prompt names, when chat goes to one other than owner-chat. */
@@ -1173,19 +1323,26 @@ async function chatInSession(s: Session, line: string, irq: Interrupt): Promise<
   const r = await client.promptSession!(sid, sent);
   const ac = new AbortController();
   irq.streaming = ac;
-  out('agent> ');
+  // What is typed meanwhile waits for the next prompt (queued).
+  const view = openTurn(s);
+  view.write('agent> ');
   let reply = '';
   try {
-    for await (const d of client.followTask!(r.id, { signal: ac.signal })) { reply += d; out(cleanStream(d)); }
+    for await (const d of client.followTask!(r.id, { signal: ac.signal })) { reply += d; view.write(d); }
+    view.end();
     if (reply && !reply.endsWith('\n')) out('\n');
   } catch (e) {
+    view.end();
     if (ac.signal.aborted) {
       await client.cancelSession!(sid).catch(() => undefined);
       out('\n⏹ interrupted — the turn stopped\n');
+      const back = s.screen?.interrupted?.();
+      if (back) out(`${back}\n`);
     } else {
       out(`\n(turn failed: ${cleanCell((e as Error).message)})\n`);
     }
   } finally {
+    view.end();
     irq.streaming = null;
   }
 }
@@ -1434,11 +1591,15 @@ export async function run(ctx: CommandContext): Promise<void> {
     // Tab completion on the command word. One readline serves both levels,
     // so the candidate set is swapped by whichever REPL loop is active
     // (activeCompletions); empty line + Tab lists everything.
+    // While a turn runs with the prompt on screen, Tab queues what is typed
+    // instead (livePrompt.ts).
     completer: (line: string): [string[], string] =>
-      completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor }),
+      liveKeys.tab() ? [[], line]
+        : completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor }),
   });
   activeRl = rl;
   const ask = lineQueue(rl, () => !!process.stdin.isTTY, process.stdin);
+  activeAsk = ask;
   // Bracketed paste: the terminal marks a paste, so its lines stay one
   // message (lineQueue). Off again on every way out — exit, Ctrl-C twice, a
   // crash (the exit event), SIGTERM — so the owner's shell is not left in it.
@@ -1462,6 +1623,10 @@ export async function run(ctx: CommandContext): Promise<void> {
     rl.prompt();
   });
   readline.emitKeypressEvents(process.stdin, rl);
+  // The live prompt sees each key before readline handles it and after
+  // readline and the line queue have (livePrompt.ts).
+  process.stdin.prependListener('keypress', (_s, key) => liveKeys.before(key));
+  process.stdin.on('keypress', (_s, key) => liveKeys.after(key));
   process.stdin.on('keypress', (_s, key) => {
     if (key?.name !== 'escape') return;
     if (ask.cancel?.()) { out('\n'); return; }
@@ -3009,12 +3174,23 @@ const L2_HELP_FULL = `session commands
                           Enter and never run as a command; a line ending
                           in \\ or Option/Alt+Enter goes on to a new line.
                           Lines already entered are not edited again
-  (typing while it works) 0g-harness: a message you finish while the agent
-                          works goes into its turn, read before its next
-                          model call ("↳ inserted", then "(read)"); not in
-                          the middle of a long command. If the turn ends
-                          first, it runs as a turn of its own, shown here.
-                          A command alone on its line waits for the prompt
+  (while it works)        the prompt stays, saying (replying, Esc stops);
+                          the reply prints above it and what you type stays
+                          on screen. Enter on 0g-harness owner-chat steers:
+                          the message goes into the turn, read before its
+                          next model call (shown as "steered:" until then);
+                          not in the middle of a long command. If the turn
+                          ends first, it runs as a turn of its own, shown
+                          here. Tab queues instead: "queued:", sent as the
+                          next message when the turn ends (Esc puts it back
+                          to edit instead); ↑ on an empty prompt takes the
+                          newest queued one back to edit.
+                          A command alone on its line waits for the prompt,
+                          and so does a message in another session or on
+                          another framework. AGENTDNA_LIVE_PROMPT=off prints
+                          turns as a plain stream
+  (prompt status)         · 2 notices · 1 new file: notices waiting to print
+                          and files the agent left that are not saved yet
   (bare Enter)            refresh this agent's phase/url from the attestor
   /hello                  identity, routes/services, serve-proof verification
   /balance                this agent's agentSeal gas + the account prepaid
@@ -3102,11 +3278,12 @@ const L2_HELP_FULL = `session commands
                           /back + use. On 0g-harness an id can be anything
                           /activities lists, and /cancel all stops everything
                           running on the agent
-  /inbox [all]            what the agent said on its own (0g-harness): a
-                          background job finished, a reminder came due. It
-                          prints above the prompt as it arrives, and what
-                          came while you were away prints when you enter.
-                          Bare: unread messages; all: the read ones too
+  /inbox [all]            notices: what the agent said on its own
+                          (0g-harness) — a background job finished, a
+                          reminder came due. A notice prints above the
+                          prompt as it arrives, and what came while you were
+                          away prints when you enter. Bare: unread ones;
+                          all: the ones you've seen too. /notices is the same
   /schedules              the reminders the agent set for itself
                           (0g-harness)
   /attach [path …|clear]  files and images for your next message (0g-harness):
@@ -3117,10 +3294,15 @@ const L2_HELP_FULL = `session commands
                           and the message names its path. Bare lists what is
                           staged. Images: 8 per message, 10 MiB each, 32 MiB
                           together; a file: 25 MiB
-  /files [inbox]          the files the agent left for you in its ~/outbox (or,
-                          with inbox, the ones you sent, in its ~/inbox — not
-                          the message /inbox) — container-local,
-                          lost on a reset (0g-harness)
+  /files [inbox]          files the agent left for you, in its ~/outbox (or,
+                          with inbox, files you sent, in its ~/inbox) —
+                          container-local, lost on a reset (0g-harness). On a
+                          terminal, new ones are saved to
+                          ~/agentdna/<agent>/outbox by themselves (checked
+                          when a turn ends and every 30 s; never over a
+                          different file; over 50 MiB: skipped and said so)
+  /files auto [on|off]    whether new files are saved by themselves (this
+                          CLI's setting, for every agent; on by default)
   /download <name> [path] save one to the current directory (or path); never
                           overwrites: a taken name gets -1, -2, … Names from
                           your own files: inbox/<name>. At most 50 MiB
@@ -3189,20 +3371,77 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     };
 
   irq.brake = makeBrake(() => s.client, out, displacedSeat, () => seatPromptPending);
-  // What the agent says on its own (a background job finished, a reminder
-  // came due) arrives at any time. At the session prompt it prints above the
-  // prompt; during a command, a chat turn or any other question it waits for
-  // the next session prompt, so it never lands inside a reply.
+  // What the agent says on its own (notices: a background job finished, a
+  // reminder came due) and the files it leaves arrive at any time. At the
+  // session prompt they print above the prompt; during a command, a chat
+  // turn or any other question they wait for the next session prompt, so
+  // they never land inside a reply, and the prompt counts them meanwhile.
   let atPrompt = false;
-  const held: Array<{ text: string; shown: () => void }> = [];
-  const inbox = makeInboxFeed((text, shown) => {
+  const held: Array<{ text: string; shown: () => void; notices: number; files: number; raw: boolean }> = [];
+  const terminal = !!activeRl?.terminal;
+  // New files from the agent are saved by themselves (on a terminal, unless
+  // /files auto off): checked when a turn ends and every 30 s.
+  let filesAuto = loadConfig().filesAuto !== 'off';
+  const outbox: OutboxSync | null = terminal && /^\d+$/.test(s.agentId)
+    ? makeOutboxSync({
+        agentId: s.agentId,
+        list: () => s.client!.listFiles!('outbox'),
+        download: (name) => s.client!.downloadFile!('outbox', name),
+        auto: () => filesAuto,
+      })
+    : null;
+  const counts = (): PromptCounts => ({
+    notices: held.reduce((n, h) => n + h.notices, 0),
+    files: held.reduce((n, h) => n + h.files, 0) + (outbox?.unseen() ?? 0),
+  });
+  const screen: SessionScreen = {
+    prompt: (busy) => sessionPromptText(s.agentId, sessionLabel(s), busy, terminal ? counts() : { notices: 0, files: 0 }),
+    turn: null,
+    turnRan: false,
+  };
+  s.screen = screen;
+  // What the prompt counts changed: the prompt on screen says so.
+  const recount = (): void => {
+    if (atPrompt) (ask as Ask).retitle?.(`\n${screen.prompt(false)}`);
+    else screen.turn?.refresh();
+  };
+  // Above the prompt now, or held for the next one. raw: the shell's own
+  // text (a link in it), its parts cleaned where it was made.
+  const show = (text: string, shown: () => void, what: { notices?: number; files?: number; raw?: boolean }): void => {
     if (atPrompt) {
       printAbovePrompt(text);
       shown();
-    } else {
-      held.push({ text, shown });
+      return;
     }
-  });
+    held.push({ text, shown, notices: what.notices ?? 0, files: what.files ?? 0, raw: !!what.raw });
+    recount();
+  };
+  const inbox = makeInboxFeed((text, shown, count) => show(text, shown, { notices: count }));
+  // An interrupted turn sends nothing on its own: what was queued during it
+  // comes back to be edited at the next prompt.
+  screen.interrupted = (): string => {
+    const n = (ask as Ask).recallAll?.() ?? 0;
+    return n ? `(${n === 1 ? 'the queued message is' : `${n} queued messages are`} back to edit — Enter sends)` : '';
+  };
+  // What waited prints before the prompt comes up.
+  const flushHeld = (): void => {
+    for (const h of held.splice(0)) {
+      if (h.raw) term(h.text);
+      else out(h.text);
+      h.shown();
+    }
+  };
+  const links = supportsHyperlinks();
+  const checkOutbox = (): void => {
+    if (!outbox || !s.client?.listFiles || !s.client.downloadFile) return;
+    outbox.check().then((events) => {
+      for (const e of events) show(renderOutboxEvent(e, links), () => undefined, { files: e.kind === 'saved' ? 1 : 0, raw: true });
+      recount();
+    }, () => undefined /* an agent without downloads, or unreachable: the next check */);
+  };
+  const outboxTimer = outbox ? setInterval(checkOutbox, OUTBOX_POLL_MS) : null;
+  outboxTimer?.unref();
+  checkOutbox();
   // A friendly message that hides WHICH failure happened costs a whole
   // debugging round trip: "no headers ever arrived" and "the stream was cut
   // mid-way" have different causes and used to print identically. Append the
@@ -3229,10 +3468,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // per-chat-line attestor round-trip; bare Enter stays the manual refresh.
     if (!s.client) { try { await refreshSession(s, true); } catch { /* prompt anyway */ } }
     inbox.follow(s.client);
-    for (const h of held.splice(0)) {
-      out(h.text);
-      h.shown();
+    if (screen.turnRan) {
+      screen.turnRan = false;
+      checkOutbox();
     }
+    flushHeld();
     if (s.client && s.url && !queued.length) {
       const ac = new AbortController();
       irq.streaming = ac; // Esc stops waiting for a login
@@ -3260,9 +3500,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       line = queued.shift()!;
       out(`\nagent ${s.agentId}${sessionLabel(s)} › ${line}\n`);
     } else {
+      // What arrived while credential requests were looked at, too.
+      flushHeld();
       atPrompt = true;
       try {
-        const q = `\nagent ${s.agentId}${sessionLabel(s)} › `;
+        const q = `\n${screen.prompt(false)}`;
         const entry = (ask as Ask).message ? await (ask as Ask).message!(q) : { text: await ((ask as Ask).main ?? ask)(q), multi: false, pasted: false };
         line = entry.text.trim();
         asMessage = entry.multi || entry.pasted;
@@ -3674,7 +3916,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (t && t.type !== 'turn') {
             out(`${cleanCell(t.id)} — ${cleanCell(t.status)} · by ${cleanCell(t.actor)} · ${cleanCell(t.label)}\n`);
             if (t.output_text) out(`${cleanStream(t.output_text)}\n`);
-            else if (t.type === 'command') out('(a command\'s output goes to the agent, which reports on it when the command finishes — /inbox)\n');
+            else if (t.type === 'command') out('(a command\'s output goes to the agent, which reports on it in a notice when the command finishes — /inbox)\n');
             if (t.error) out(`error: ${cleanCell(t.error)}\n`);
             continue;
           }
@@ -3839,12 +4081,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing to stop, or: ${cleanCell(r.note ?? 'not supported')})\n`);
         continue;
       }
-      if (line === '/inbox' || line === '/inbox all') {
+      if (line === '/inbox' || line === '/inbox all' || line === '/notices' || line === '/notices all') {
         if (!s.client) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
-        if (!s.client.inbox) { out('(no inbox on this agent: its framework does not run work in the background)\n'); continue; }
-        const all = line === '/inbox all';
+        if (!s.client.inbox) { out('(no notices on this agent: its framework does not run work in the background)\n'); continue; }
+        const all = line.endsWith(' all');
         const page = await s.client.inbox(all ? { after: 0 } : {});
-        if (!page.data.length) { out(all ? 'the inbox is empty\n' : 'no new messages — /inbox all shows the ones already read\n'); continue; }
+        if (!page.data.length) { out(noNoticesText(all)); continue; }
         out(page.data.map(renderInboxMessage).join('\n'));
         const through = Math.max(...page.data.map((m) => m.seq));
         if (through > page.read_through) await s.client.ackInbox?.(through).catch(() => undefined);
@@ -3882,18 +4124,39 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (staged.length) out('your next message carries them\n');
         continue;
       }
+      if (line === '/files auto' || line.startsWith('/files auto ')) {
+        // Whether new files from the agent are saved by themselves: this
+        // CLI's setting (config.json filesAuto), for every agent.
+        const to = line.slice('/files auto'.length).trim();
+        if (to && to !== 'on' && to !== 'off') { out('usage: /files auto [on|off]\n'); continue; }
+        if (to) {
+          filesAuto = to === 'on';
+          saveConfig({ filesAuto: filesAuto ? undefined : 'off' });
+        }
+        const where = outbox ? tildePath(outbox.dir) : `~/agentdna/${cleanCell(s.agentId)}/outbox`;
+        out(filesAuto
+          ? `new files the agent leaves for you are saved to ${where} by themselves${terminal ? '' : ' (when the session runs on a terminal)'} — /files auto off stops that\n`
+          : 'new files the agent leaves for you are not saved by themselves: the prompt counts them, /files lists them, /download saves one — /files auto on saves them again\n');
+        if (to) checkOutbox();
+        continue;
+      }
       if (line === '/files' || line.startsWith('/files ') || line === '/download' || line.startsWith('/download ')) {
         if (!s.client) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
         if (!s.client.listFiles || !s.client.downloadFile) { out('(this agent hands over no files: its framework has no files route — 0g-harness does)\n'); continue; }
         if (line === '/files' || line.startsWith('/files ')) {
           const which = line.slice('/files'.length).trim();
-          if (which && which !== 'inbox' && which !== 'outbox') { out('usage: /files [inbox]\n'); continue; }
+          if (which && which !== 'inbox' && which !== 'outbox') { out('usage: /files [inbox|auto [on|off]]\n'); continue; }
           const dir = which === 'inbox' ? 'inbox' : 'outbox';
           const files = await s.client.listFiles(dir);
-          if (dir === 'outbox') outboxNames = files.map((f) => f.name);
-          if (!files.length) { out(dir === 'outbox' ? 'the outbox is empty — ask the agent to put a file in ~/outbox for you\n' : 'the file inbox is empty\n'); continue; }
+          if (dir === 'outbox') {
+            outboxNames = files.map((f) => f.name);
+            // Listed: not new any more (when they are not saved by themselves).
+            if (!filesAuto) outbox?.listed(files);
+          }
+          if (!files.length) { out(filesText(dir, true)); continue; }
+          out(filesText(dir, false));
           for (const l of renderFiles(files)) out(`${cleanCell(l)}\n`);
-          out(`/download ${dir === 'inbox' ? 'inbox/' : ''}<name> saves one here\n`);
+          out(`/download ${dir === 'inbox' ? 'inbox/' : ''}<name> saves one here${dir === 'outbox' && outbox && filesAuto ? ` · new ones are saved to ${tildePath(outbox.dir)} by themselves` : ''}\n`);
           continue;
         }
         const args = tokenize(line.slice('/download'.length).trim());
@@ -3946,7 +4209,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     for (;;) {
       const ac = new AbortController();
       irq.streaming = ac;
-      out('agent> ');
+      // Inserted into this turn and not read yet (texts, as typed): shown
+      // above the live prompt until the agent reads them.
+      const steeredTexts: string[] = [];
+      const view = openTurn(s, () => steeredTexts);
+      view.write('agent> ');
       let reply = '';
       let interrupted = false;
       let failure: string | null = null;
@@ -3957,46 +4224,54 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // "thinking" as the default guess), elapsed seconds, and the way out.
       //     ⠹ tool/call bash… (14s · esc to interrupt)
       // Repainted once a second; any real output erases it. TTY only —
-      // pipes get the clean payload.
+      // pipes get the clean payload. Under the live prompt it is a row above
+      // the prompt, which itself says Esc stops.
       const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
       const turnT0 = Date.now();
       let spin = 0;
       let status = 'thinking';
-      let statusShown = false;
       let sawToolActivity = false;
-      const clearActivity = (): void => {
-        if (statusShown) { term('\r\x1b[2K'); statusShown = false; }
-      };
+      const clearActivity = (): void => view.status(null);
       const paintStatus = (): void => {
         if (!process.stdout.isTTY || ac.signal.aborted) return;
-        // Never overwrite the agent's own partial line — break to a fresh
-        // one first (the visual break marks where the status began).
-        if (!statusShown && reply && !reply.endsWith('\n')) out('\n');
         const secs = Math.floor((Date.now() - turnT0) / 1000);
         spin = (spin + 1) % SPIN.length;
-        term(`\r\x1b[2K  ${cleanCell(`${SPIN[spin]} ${status}… (${secs}s · esc to interrupt)`)}`);
-        statusShown = true;
+        // Never over the agent's own partial line: break to a fresh one
+        // first (the visual break marks where the status began).
+        view.status(`${SPIN[spin]} ${status}… (${secs}s${view.live ? '' : ' · esc to interrupt'})`, !!reply && !reply.endsWith('\n'));
       };
       // Steering (0g-harness, on a terminal): a message the owner finishes
       // while the turn runs goes into it, read before its next model call. A
       // command alone on its line, or an empty Enter, waits for the next
-      // prompt as before.
+      // prompt as before, and so does what Tab queues under the live prompt.
       const steered: string[] = []; // inserted into this turn, not read yet
       const steer = s.client.steer && process.stdin.isTTY ? s.client.steer : undefined;
       if (steer) {
+        const unshow = (text: string): void => {
+          const i = steeredTexts.indexOf(text);
+          if (i >= 0) steeredTexts.splice(i, 1);
+        };
         (ask as Ask).whileBusy?.((e) => {
           if (!steerable(e)) return false;
           clearActivity();
-          out('\n↳ inserted — the agent reads it at its next step\n');
+          if (view.live) {
+            steeredTexts.push(e.text);
+            view.refresh();
+          } else {
+            out('\n↳ inserted — the agent reads it at its next step\n');
+          }
           steer(e.text).then(
             (r) => {
               if (r.merged && r.id) { steered.push(r.id); return; }
+              unshow(e.text);
               if (r.queued) afterTurn.push(r.queued);
-              out(`(${cleanCell(r.reason ?? 'no turn of yours is running')} — it goes as a turn of its own)\n`);
+              view.note(`(${cleanCell(r.reason ?? 'no turn of yours is running')} — it goes as a turn of its own)\n`);
             },
             (err: Error) => {
-              out(`(not inserted: ${cleanCell(err.message)} — it waits for the next prompt)\n`);
+              unshow(e.text);
+              view.note(`(not inserted: ${cleanCell(err.message)} — it waits for the next prompt)\n`);
               (ask as Ask).later?.(e);
+              view.refresh();
             },
           );
           return true;
@@ -4007,7 +4282,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             if (label === 'steer received') {
               // The agent read an inserted message.
               clearActivity();
-              out('  ↳ (read)\n');
+              const text = steeredTexts.shift();
+              view.note(!view.live ? '  ↳ (read)\n' : text ? `↳ read by the agent: ${oneLine(text)}` : '↳ (read by the agent)');
               steered.shift();
               return;
             }
@@ -4043,12 +4319,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           onNotice: (n: ChatNotice): void => {
             if (n.imagesSavedAsFiles?.length) {
               clearActivity();
-              out(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map(cleanCell).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);
+              view.note(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map(cleanCell).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);
             }
             if (n.outboxFiles?.length) {
-              clearActivity();
               outboxNames = [...new Set([...n.outboxFiles, ...outboxNames])];
-              out(`\n(the agent left ${n.outboxFiles.length === 1 ? 'a file' : 'files'} for you: ${n.outboxFiles.map(cleanCell).join(', ')} — /download <name> saves ${n.outboxFiles.length === 1 ? 'it' : 'one'} here)\n`);
+              // Saved by themselves when the turn ends (checkOutbox), and said so then.
+              if (!(outbox && filesAuto)) {
+                clearActivity();
+                view.note(`\n(the agent left ${n.outboxFiles.length === 1 ? 'a file' : 'files'} for you: ${n.outboxFiles.map(cleanCell).join(', ')} — /download <name> saves ${n.outboxFiles.length === 1 ? 'it' : 'one'} here)\n`);
+              }
             }
           },
           // Responses transport only: remember the server-side task id, so
@@ -4060,13 +4339,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         };
         for await (const delta of s.client.chatStream(messages, opts)) {
           clearActivity();
-          out(cleanStream(delta)); reply += delta;
+          view.write(delta); reply += delta;
           lastOutputAt = Date.now();
           status = 'writing';
         }
         clearActivity();
       } catch (e) {
         clearActivity();
+        // What follows prints below the turn: the live prompt goes first.
+        view.end();
         if ((e as Error).name === 'AbortError' || ac.signal.aborted) {
           interrupted = true;
           // Esc means "stop the TASK", not "stop watching": tearing down the
@@ -4088,6 +4369,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           out(stopped?.aborted || (stopped && /disconnects/.test(stopped.note ?? ''))
             ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
             : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${cleanCell(stopped.note)}` : ''}; /cancel stops it${s.client?.cancelTask ? '' : ' (bare form — this image has no per-id cancel)'})`);
+          const back = screen.interrupted?.();
+          if (back) out(`\n${back}`);
         } else if (/lost the agent while following/.test((e as Error).message)) {
           // Responses transport: the SDK already auto-resumed through drops
           // and only gives up after repeated reconnect failures — the agent
@@ -4119,6 +4402,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       } finally {
         if (ticker) clearInterval(ticker);
         clearActivity();
+        view.end();
         irq.streaming = null;
         s.currentTask = null;
         (ask as Ask).whileBusy?.(null);
@@ -4173,17 +4457,22 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     for (const id of afterTurn) {
       (s.tasks ??= []).push({ id, prompt: '(inserted)', at: Date.now() });
       if (!s.client?.followTask) { out(`(your inserted message runs as ${id} — /result ${id} shows it)\n`); continue; }
-      out(`(your inserted message runs as a turn of its own, ${id})\nagent> `);
+      out(`(your inserted message runs as a turn of its own, ${id})\n`);
       const fac = new AbortController();
       irq.streaming = fac;
+      const view = openTurn(s);
+      view.write('agent> ');
       try {
-        for await (const delta of s.client.followTask(id, { signal: fac.signal })) out(cleanStream(delta));
+        for await (const delta of s.client.followTask(id, { signal: fac.signal })) view.write(delta);
+        view.end();
         out('\n');
       } catch (e) {
+        view.end();
         out(fac.signal.aborted
           ? `\n(stopped watching — it continues; /result ${id} re-attaches, /cancel ${id} stops it)\n`
           : `\n(${cleanCell((e as Error).message)})\n`);
       } finally {
+        view.end();
         irq.streaming = null;
       }
     }
@@ -4191,5 +4480,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   } finally {
     irq.brake = null; // leaving the session: idle-Esc no longer targets this agent
     inbox.stop();
+    if (outboxTimer) clearInterval(outboxTimer);
+    s.screen = undefined;
   }
 }
