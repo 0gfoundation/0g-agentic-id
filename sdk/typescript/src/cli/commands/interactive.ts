@@ -733,6 +733,8 @@ const L2_ARGS: Record<string, string[] | ((rest: string) => string[])> = {
   },
   '/tasks': () => ['list', 'all', 'new ', ...['show', 'input', 'cancel', 'archive'].flatMap((w) => [`${w} `, ...tasksSeen.map((id) => `${w} ${id}`)])],
 };
+/** Each agent's session history (↑), kept apart from the manager's. */
+const sessionHistories = new Map<string, string[]>();
 /** The sessions last listed in this agent's session, for `/sessions` completion. */
 let sessionsSeen: AgentSession[] = [];
 /** The `/sessions` list last shown in this agent's session, in its order:
@@ -832,7 +834,7 @@ export function completeLine(
   if (sp === -1) {
     const hits = state.completions.filter((c) => c.startsWith(line));
     // One command fits: it is completed with a space after it, as a shell does.
-    if (hits.length === 1 && line) return [[`${hits[0]} `], line];
+    if (hits.length === 1 && line) return [[hits[0].endsWith(' ') ? hits[0] : `${hits[0]} `], line];
     return [hits.length ? hits : state.completions, line];
   }
   const cmd = line.slice(0, sp);
@@ -1005,6 +1007,13 @@ type Ask = ((q: string) => Promise<string>) & {
   whileBusy?: (take: ((e: Entry) => boolean) | null) => void;
   /** Put an entry back to wait for the next prompt. */
   later?: (e: Entry) => void;
+  /** Entries already handed to the agent (taken as new messages, queued on
+   *  its side): ↑ takes the newest back only by cancelling the agent's copy
+   *  first. Set while a turn runs. */
+  held?: { count(): number; takeBack(): boolean } | null;
+  /** A message taken back from the agent, into the empty box (or, when
+   *  something is being edited, to wait for the next prompt). */
+  putBack?: (text: string) => void;
   /** The lines of a message begun and not sent yet (during a turn). */
   drafting?: () => string[];
   /** Entries waiting for the next prompt, oldest first. */
@@ -1019,7 +1028,7 @@ type Ask = ((q: string) => Promise<string>) & {
   /** Every waiting entry back to be edited, as one message ahead of what is
    *  being edited (a turn was interrupted: nothing goes on its own); how
    *  many there were. */
-  recallAll?: (extra?: readonly string[]) => number;
+  recallAll?: (extra?: readonly string[], form?: (text: string) => string) => number;
   /** Empty the message being typed (its earlier lines too); false when there is nothing. */
   clearBox?: () => boolean;
   /** Backspace at the start of a message's line: it joins the line before; false when there is none. */
@@ -1353,7 +1362,10 @@ export function lineQueue(
   ask.drafting = () => [...draft];
   ask.queued = () => [...pending];
   ask.recall = (): boolean => {
-    if (waiters[0] || draft.length || editLine() || !pending.length) return false;
+    if (waiters[0] || draft.length || editLine()) return false;
+    // Nothing waits here: the newest one with the agent, if any (taken back
+    // by cancelling its copy there; never copied).
+    if (!pending.length) return ask.held?.takeBack() ?? false;
     const e = pending.pop()!;
     const lines = e.text.split('\n');
     const last = lines.pop() ?? '';
@@ -1363,6 +1375,15 @@ export function lineQueue(
     if (typeof edit.line === 'string') edit.line = last;
     if (typeof edit.cursor === 'number') edit.cursor = last.length;
     return true;
+  };
+  ask.putBack = (text: string): void => {
+    if (waiters[0]?.kind === 'q' || draft.length || editLine()) { pending.push({ text, multi: text.includes('\n'), pasted: false, during: true }); return; }
+    const lines = text.split('\n');
+    const last = lines.pop() ?? '';
+    draft = lines;
+    if (typeof edit.line === 'string') edit.line = last;
+    if (typeof edit.cursor === 'number') edit.cursor = last.length;
+    if (waiters[0] && !boxed && rl.terminal !== false) rl.prompt(true);
   };
   ask.queueEdit = (): boolean => {
     if (waiters[0]) return false;
@@ -1376,7 +1397,8 @@ export function lineQueue(
     pending.push({ ...e, during: true });
     return true;
   };
-  ask.recallAll = (extra: readonly string[] = []): number => {
+  // `form`: how a message comes back into the box (a dragged file by its name, say).
+  ask.recallAll = (extra: readonly string[] = [], form: (text: string) => string = (t) => t): number => {
     if (waiters[0]) return 0;
     // Messages come back to edit (`extra` first: sent into the turn and not
     // read); a command that waited stays its own entry and runs at the next
@@ -1387,7 +1409,7 @@ export function lineQueue(
     pending.splice(0, pending.length, ...keep);
     const line = editLine();
     // As typed, without the blank lines.
-    const lines = [...extra.flatMap((t) => t.split('\n')), ...back.flatMap((e) => e.text.split('\n')), ...draft, ...(line ? [line] : [])]
+    const lines = [...extra.flatMap((t) => form(t).split('\n')), ...back.flatMap((e) => form(e.text).split('\n')), ...draft, ...(line ? [line] : [])]
       .filter((l) => l.trim() !== '');
     const last = lines.pop() ?? '';
     const pastedAny = back.some((e) => e.pasted) || draftPasted || touched;
@@ -1637,6 +1659,8 @@ interface Steering {
   settle(after: FollowUp[], failed?: boolean): Promise<void>;
   /** Taken as a new message (no owner turn to go into): waits for its turn. */
   next: string[];
+  /** ↑ on these: the newest back to the box, by cancelling the agent's copy. */
+  held: { count(): number; takeBack(): boolean };
   /** The turn was cancelled (Esc): what became of the ones not read
    *  ({@link stoppedSteers}); turns they opened go to `after`. */
   stop(after: FollowUp[]): Promise<StoppedSteers>;
@@ -1811,6 +1835,7 @@ function openTurn(s: Session, steered: () => readonly string[] = () => [], next:
     drafting: () => a?.drafting?.() ?? [],
     queued: () => a?.queued?.() ?? [],
     recall: () => a?.recall?.() ?? false,
+    held: () => a?.held?.count() ?? 0,
     queueEdit: () => a?.queueEdit?.() ?? false,
     complete: shellComplete,
   };
@@ -4713,7 +4738,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         let steering: Steering | null = null;
         const view = openTurn(s, () => steering?.texts ?? [], () => steering?.next ?? []);
         steering = makeSteering(view, after);
-        if (process.stdin.isTTY) (ask as Ask).whileBusy?.(busyEntries(view, steering));
+        if (process.stdin.isTTY) { (ask as Ask).whileBusy?.(busyEntries(view, steering)); (ask as Ask).held = steering?.held ?? null; }
         view.write('agent> ');
         let stopped = false;
         try {
@@ -4732,7 +4757,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         } finally {
           view.end();
           irq.streaming = null;
-          (ask as Ask).whileBusy?.(null);
+          (ask as Ask).whileBusy?.(null); (ask as Ask).held = null;
         }
         if (!stopped) await steering?.settle(after);
         await followUps(after);
@@ -4997,6 +5022,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
       const block = `${line}\n${cleanStream(text)}`;
       if (atPrompt) printAbovePrompt(block);
+      // Below what the reply has written so far: its line ends there.
+      else if (view.after) view.after(block);
       else view.note(block);
     });
   };
@@ -5040,9 +5067,34 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       (ask as Ask).later?.(e);
       view.refresh();
     };
+    // ↑: the newest one taken as a new message comes back only if the agent's
+    // copy (its queued response) can be cancelled; it is never copied.
+    const held = {
+      count: (): number => next.length,
+      takeBack: (): boolean => {
+        const text = next[next.length - 1];
+        if (text === undefined) return false;
+        const f = after.find((x) => x.why === 'idle' && x.texts.includes(text));
+        const c = s.client;
+        const already = (): void => view.note("(that one is already with the agent — it runs next; Esc stops it)");
+        if (!f || !c?.cancelTask) { already(); return true; }
+        void (async () => {
+          const t = c.task ? await c.task(f.id).catch(() => null) : null;
+          const ok = (!c.task || t?.status === 'queued') && await c.cancelTask!(f.id).then((r) => r.status === 'cancelled', () => false);
+          if (!ok || !next.includes(text)) { already(); return; }
+          next.splice(next.lastIndexOf(text), 1);
+          f.texts.splice(f.texts.indexOf(text), 1);
+          if (!f.texts.length) after.splice(after.indexOf(f), 1);
+          (ask as Ask).putBack?.(text);
+          view.refresh();
+        })();
+        return true;
+      },
+    };
     return {
       texts,
       next,
+      held,
       take(e) {
         if (view.live) {
           texts.push(e.text);
@@ -5139,7 +5191,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       let steering: Steering | null = null;
       const view = openTurn(s, () => steering?.texts ?? [], () => steering?.next ?? []);
       steering = makeSteering(view, after);
-      if (process.stdin.isTTY) (ask as Ask).whileBusy?.(busyEntries(view, steering));
+      if (process.stdin.isTTY) { (ask as Ask).whileBusy?.(busyEntries(view, steering)); (ask as Ask).held = steering?.held ?? null; }
       const say = sayer(view);
       let stopped = false;
       let followFailed = false;
@@ -5174,11 +5226,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       } finally {
         view.end();
         irq.streaming = null;
-        (ask as Ask).whileBusy?.(null);
+        (ask as Ask).whileBusy?.(null); (ask as Ask).held = null;
       }
       if (!stopped) await steering?.settle(after, followFailed);
     }
   };
+  // The session's lines have a history of their own (per agent): ↑ at the
+  // manager never brings back a session's /back or messages, nor the other way.
+  const rlHistory = (activeRl as unknown as { history?: string[] } | null)?.history;
+  const managerHistory = rlHistory ? [...rlHistory] : null;
+  if (rlHistory) rlHistory.splice(0, rlHistory.length, ...(sessionHistories.get(s.agentId) ?? []));
   try {
   for (;;) {
     activeCompletions = L2_WORDS;
@@ -5322,7 +5379,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // command alone on its line never does (busyEntries); an empty Enter
       // and what Tab queues wait for the next turn.
       steering = makeSteering(view, after);
-      if (process.stdin.isTTY) (ask as Ask).whileBusy?.(busyEntries(view, steering, clearActivity));
+      if (process.stdin.isTTY) { (ask as Ask).whileBusy?.(busyEntries(view, steering, clearActivity)); (ask as Ask).held = steering?.held ?? null; }
       const onActivity = process.stdout.isTTY
         ? (label: string): void => {
             if (label === 'steer received') {
@@ -5458,7 +5515,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         view.end();
         irq.streaming = null;
         s.currentTask = null;
-        (ask as Ask).whileBusy?.(null);
+        (ask as Ask).whileBusy?.(null); (ask as Ask).held = null;
       }
       // Inserted but not read: the turn ended first, so the agent answers it
       // in a turn after this one (an interrupt drops it instead).
@@ -5510,6 +5567,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   }
   } finally {
     irq.brake = null; // leaving the session: idle-Esc no longer targets this agent
+    if (rlHistory && managerHistory) {
+      sessionHistories.set(s.agentId, [...rlHistory]);
+      rlHistory.splice(0, rlHistory.length, ...managerHistory);
+    }
     inbox.stop();
     if (outboxTimer) clearInterval(outboxTimer);
     if (phaseWatch) { clearTimeout(phaseWatch); phaseWatch = null; }

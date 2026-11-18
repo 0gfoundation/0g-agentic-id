@@ -55,6 +55,8 @@ export interface LiveInput {
   queued?(): Array<{ text: string }>;
   /** Put the newest waiting entry back to be edited; false when there is none. */
   recall?(): boolean;
+  /** How many entries wait with the agent (↑ takes the newest back by cancelling it there). */
+  held?(): number;
   /** Queue what is being edited for the next prompt; false when nothing is. */
   queueEdit?(): boolean;
   /** The shell's Tab completion of the text before the cursor (completeLine). */
@@ -403,7 +405,7 @@ export class LiveTurn implements TurnView {
     // ↑ on an empty prompt takes back the newest queued entry, instead of
     // readline's history (emptied for this one key).
     if (key.name === 'up' && !key.ctrl && !key.meta && !key.shift && this.rl.line === ''
-      && !this.input.drafting?.().length && this.input.queued?.().length && Array.isArray(this.rl.history)) {
+      && !this.input.drafting?.().length && (this.input.queued?.().length || this.input.held?.()) && Array.isArray(this.rl.history)) {
       this.stash = this.rl.history;
       this.rl.history = [];
     }

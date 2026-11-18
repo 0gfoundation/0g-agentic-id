@@ -594,3 +594,27 @@ test('a finished reply line is broken between words at the terminal width; a tok
   assert.match(b, /see\nhttps:\/\/example\.com\/x+\nnow\n/);
   t.rl.close();
 });
+
+test('↑ with nothing waiting here takes back the newest entry the agent holds, only through its take-back; never a copy', async () => {
+  const t = shell(60);
+  let asked = 0;
+  t.ask.held = { count: () => 1, takeBack: () => { asked++; setTimeout(() => t.ask.putBack('QUEUEME original'), 5); return true; } };
+  assert.equal(t.ask.recall(), true);
+  assert.equal(asked, 1);
+  await later(20);
+  assert.equal(t.rl.line, 'QUEUEME original');
+  // With text in the box it waits for the next prompt instead of joining it.
+  t.ask.putBack('second');
+  assert.deepEqual(t.ask.queued().map((e) => e.text), ['second']);
+  t.ask.held = null;
+  t.rl.close();
+});
+
+test('Esc puts a message back in the form it is given (a dragged file by its name)', async () => {
+  const t = shell(60);
+  t.ask.later({ text: 'look at /tmp/x/cat.png', multi: false, pasted: false });
+  assert.equal(t.ask.recallAll(['and /tmp/x/cat.png'], (text) => text.replace('/tmp/x/cat.png', '[image: cat.png]')), 2);
+  assert.deepEqual(t.ask.drafting(), ['and [image: cat.png]']);
+  assert.equal(t.rl.line, 'look at [image: cat.png]');
+  t.rl.close();
+});
