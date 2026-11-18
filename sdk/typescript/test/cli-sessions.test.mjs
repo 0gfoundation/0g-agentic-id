@@ -47,7 +47,9 @@ test('Tab after /sessions offers the subcommands and the sessions to switch to',
   assert.ok(offered.includes('switch nightly report'));
   const state = { completions: ['/sessions'], args: { '/sessions': () => offered }, models: [] };
   assert.deepEqual(completeLine('/sessions sw', state)[0].slice(0, 2), ['switch sess-bbbbbbbb', 'switch nightly report']);
-  assert.deepEqual(completeLine('/sessions switch sess-5', state), [['switch sess-5d25f787'], 'switch sess-5']);
+  // After `switch `, only the session part is offered and replaced.
+  assert.deepEqual(completeLine('/sessions switch sess-5', state), [['sess-5d25f787'], 'sess-5']);
+  assert.ok(completeLine('/sessions switch ', state)[0].includes('nightly report'));
   assert.deepEqual(completeLine('/sessions d', state), [['default'], 'd']);
   // Before any list: the subcommands and a bare `switch `.
   assert.ok(sessionCompletions([]).includes('switch '));

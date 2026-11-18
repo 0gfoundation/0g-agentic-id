@@ -230,7 +230,7 @@ test('Enter on a message that wraps, and a paste: no stale row is left', async (
   await paint();
   // The paste is the message begun: its first line under the prompt (cut
   // to the row), the line after it still being edited.
-  assert.deepEqual(t.read().lines.slice(-2), ['agent 7 (replying, Esc stops) › past…', '… pasted b']);
+  assert.deepEqual(t.read().lines.slice(-2), ['agent 7 (replying, Esc stops) › paste…', '… pasted b']);
   assert.deepEqual(t.ask.drafting(), ['pasted a']);
   await t.type('\r');
   await paint();

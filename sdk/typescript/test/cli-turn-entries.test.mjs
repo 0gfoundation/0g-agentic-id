@@ -77,3 +77,32 @@ test('completeAt: Tab as readline does it — the shared start filled in, the ca
   const args = (l) => (l.startsWith('/sessions switch ') ? [['2', '3'].map((n) => `${n}`).filter((n) => n.startsWith(l.slice(17))), l.slice(17)] : [[], l]);
   assert.deepEqual(completeAt('/sessions switch ', 17, args), { line: '/sessions switch ', cursor: 17, list: ['2', '3'] });
 });
+
+test('QA pass 1: plain errors, a path is not a command, long echoes short, tables in the width', async () => {
+  const { plainError, looksLikePath, collapsed, renderActivityTable, renderTaskTable } = await import('../dist/cli/commands/interactive.js');
+  assert.equal(plainError(new Error('getTask: HTTP 404: {"error":{"message":"unknown task"}}')), 'unknown task (HTTP 404)');
+  assert.equal(plainError(new Error('interrupt: HTTP 502: sandbox unavailable')), 'sandbox unavailable (HTTP 502)');
+  assert.equal(plainError(Object.assign(new Error('Execution reverted for an unknown reason.\n\nRaw Call Arguments:\n  to: 0x0'), { shortMessage: 'Execution reverted for an unknown reason.' })), 'Execution reverted for an unknown reason.');
+  assert.equal(looksLikePath('/private/tmp/x/missing.png'), true);
+  assert.equal(looksLikePath('/Volumes/USB/shot'), true);
+  assert.equal(looksLikePath('/files'), false);
+  assert.equal(looksLikePath('/tasks'), false);
+  const long = Array.from({ length: 200 }, (_, i) => `line ${i}`).join('\n');
+  assert.equal(collapsed(long).split('\n').length, 9);
+  assert.match(collapsed(long), /… \(\+192 more lines\)$/);
+  assert.equal(collapsed('a\nb'), 'a\nb');
+  const now = Date.now();
+  const acts = renderActivityTable([{ id: 'resp_1', type: 'turn', status: 'completed', actor: 'agent', trigger: 'user', label: 'x'.repeat(200), created_at: now / 1000 - 5 }], now, 79);
+  for (const l of acts) assert.ok([...l].length <= 79, `${[...l].length}: ${l}`);
+  const tasks = renderTaskTable([{ id: 'task-abc', state: 'running', title: 'y'.repeat(200), created_at: now / 1000 - 5, records: [], runs: { count: 1 } }], now, 79);
+  for (const l of tasks) assert.ok([...l].length <= 79, `${[...l].length}: ${l}`);
+});
+
+test('charCols: wide and fullwidth two columns, the ambiguous ones (—, →, ─, ❯) one', async () => {
+  const { charCols, wrapWords } = await import('../dist/cli/livePrompt.js');
+  for (const ch of ['—', '→', '─', '❯', '›', '·', 'é', 'a']) assert.equal(charCols(ch.codePointAt(0)), 1, ch);
+  for (const ch of ['中', '한', 'あ', '😀', '🚀', '（']) assert.equal(charCols(ch.codePointAt(0)), 2, ch);
+  // Scrollback text breaks between words, mid-word only for a word longer than a row.
+  assert.deepEqual(wrapWords('Step one: the sealed runtime starts in five strict phases', 20), ['Step one: the sealed', 'runtime starts in', 'five strict phases']);
+  assert.deepEqual(wrapWords('abcdefghijklmnopqrstuvwxyz', 10), ['abcdefghij', 'klmnopqrst', 'uvwxyz']);
+});

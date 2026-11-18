@@ -37,6 +37,9 @@ export interface TurnView {
   /** The status line (null hides it). `breakLine`: the reply's last line is
    *  unfinished (only a turn without a live prompt needs it). */
   status(text: string | null, breakLine?: boolean): void;
+  /** A line after what the reply has written so far (where the view keeps
+   *  the reply's unfinished line apart; else as `note`). */
+  after?(text: string): void;
   /** Something the prompt shows changed: redraw soon. */
   refresh(): void;
   /** The turn is over: the region and its prompt go, the reply's unfinished
@@ -109,18 +112,44 @@ type Key = { name?: string; meta?: boolean; ctrl?: boolean; shift?: boolean };
 type LiveRl = readline.Interface & { prevRows?: number; history?: string[] };
 
 /**
- * Columns a code point takes, erring wide: 0 for controls and combining or
- * zero-width marks, 1 below U+1100, 2 from there on except the Latin and
- * Greek extensions and Braille. A row measured too wide only comes out
- * shorter; one measured too narrow would wrap and leave a stale row behind.
+ * The code points Unicode's East Asian Width calls Wide or Fullwidth (15.1):
+ * two columns in a terminal. Everything else, the Ambiguous ones among them
+ * (`—`, `→`, `─`, `❯`), is one, as terminals outside CJK locales draw them.
+ */
+const WIDE: ReadonlyArray<readonly [number, number]> = [
+  [0x1100, 0x115f], [0x231a, 0x231b], [0x2329, 0x232a], [0x23e9, 0x23ec], [0x23f0, 0x23f0], [0x23f3, 0x23f3],
+  [0x25fd, 0x25fe], [0x2614, 0x2615], [0x2648, 0x2653], [0x267f, 0x267f], [0x2693, 0x2693], [0x26a1, 0x26a1],
+  [0x26aa, 0x26ab], [0x26bd, 0x26be], [0x26c4, 0x26c5], [0x26ce, 0x26ce], [0x26d4, 0x26d4], [0x26ea, 0x26ea],
+  [0x26f2, 0x26f3], [0x26f5, 0x26f5], [0x26fa, 0x26fa], [0x26fd, 0x26fd], [0x2705, 0x2705], [0x270a, 0x270b],
+  [0x2728, 0x2728], [0x274c, 0x274c], [0x274e, 0x274e], [0x2753, 0x2755], [0x2757, 0x2757], [0x2795, 0x2797],
+  [0x27b0, 0x27b0], [0x27bf, 0x27bf], [0x2b1b, 0x2b1c], [0x2b50, 0x2b50], [0x2b55, 0x2b55], [0x2e80, 0x303e],
+  [0x3041, 0x33ff], [0x3400, 0x4dbf], [0x4e00, 0x9fff], [0xa000, 0xa4cf], [0xa960, 0xa97f], [0xac00, 0xd7a3],
+  [0xf900, 0xfaff], [0xfe10, 0xfe19], [0xfe30, 0xfe6f], [0xff00, 0xff60], [0xffe0, 0xffe6], [0x16fe0, 0x16fe4],
+  [0x17000, 0x18cff], [0x1b000, 0x1b2ff], [0x1f004, 0x1f004], [0x1f0cf, 0x1f0cf], [0x1f18e, 0x1f18e], [0x1f191, 0x1f19a],
+  [0x1f200, 0x1f202], [0x1f210, 0x1f23b], [0x1f240, 0x1f248], [0x1f250, 0x1f251], [0x1f260, 0x1f265], [0x1f300, 0x1f320],
+  [0x1f32d, 0x1f335], [0x1f337, 0x1f37c], [0x1f37e, 0x1f393], [0x1f3a0, 0x1f3ca], [0x1f3cf, 0x1f3d3], [0x1f3e0, 0x1f3f0],
+  [0x1f3f4, 0x1f3f4], [0x1f3f8, 0x1f43e], [0x1f440, 0x1f440], [0x1f442, 0x1f4fc], [0x1f4ff, 0x1f53d], [0x1f54b, 0x1f54e],
+  [0x1f550, 0x1f567], [0x1f57a, 0x1f57a], [0x1f595, 0x1f596], [0x1f5a4, 0x1f5a4], [0x1f5fb, 0x1f64f], [0x1f680, 0x1f6c5],
+  [0x1f6cc, 0x1f6cc], [0x1f6d0, 0x1f6d2], [0x1f6d5, 0x1f6d7], [0x1f6dc, 0x1f6df], [0x1f6eb, 0x1f6ec], [0x1f6f4, 0x1f6fc],
+  [0x1f7e0, 0x1f7eb], [0x1f7f0, 0x1f7f0], [0x1f90c, 0x1f93a], [0x1f93c, 0x1f945], [0x1f947, 0x1f9ff], [0x1fa70, 0x1faff],
+  [0x20000, 0x2fffd], [0x30000, 0x3fffd],
+];
+
+/**
+ * Columns a code point takes in a terminal: 0 for controls and combining or
+ * zero-width marks, 2 for East Asian Wide and Fullwidth ones ({@link WIDE}),
+ * 1 for everything else.
  */
 export function charCols(cp: number): number {
   if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
   if ((cp >= 0x300 && cp <= 0x36f) || (cp >= 0x200b && cp <= 0x200f) || cp === 0x2060 || (cp >= 0x20d0 && cp <= 0x20ff)
     || (cp >= 0xfe00 && cp <= 0xfe0f) || (cp >= 0xfe20 && cp <= 0xfe2f) || (cp >= 0xe0100 && cp <= 0xe01ef)) return 0;
   if (cp < 0x1100) return 1;
-  if ((cp >= 0x1e00 && cp <= 0x1fff) || (cp >= 0x2800 && cp <= 0x28ff)) return 1;
-  return 2;
+  for (const [a, b] of WIDE) {
+    if (cp < a) return 1;
+    if (cp <= b) return 2;
+  }
+  return 1;
 }
 
 /** One screen row of a line: its text (tabs as spaces) and where it ends in the line. */
@@ -147,6 +176,32 @@ export function splitRows(line: string, cols: number): Row[] {
   }
   rows.push({ text, end: i });
   return rows;
+}
+
+/**
+ * A line cut into rows of at most `cols` columns at word boundaries: a row
+ * ends after a space where one is (the space is not shown), mid-word only for
+ * a word longer than a row. For text that stays in the scrollback: copied,
+ * it breaks between words.
+ */
+export function wrapWords(line: string, cols: number): string[] {
+  const out: string[] = [];
+  let rest = line;
+  while (rest) {
+    const rows = splitRows(rest, cols);
+    if (rows.length === 1) { out.push(rows[0].text.trimEnd()); break; }
+    const cut = rows[0].end;
+    // The last space in the first row, or right after it.
+    const sp = rest[cut] === ' ' ? cut : rest.lastIndexOf(' ', cut - 1);
+    if (sp > 0) {
+      out.push(rest.slice(0, sp).replace(/\t/g, ' ').trimEnd());
+      rest = rest.slice(sp + 1);
+    } else {
+      out.push(rows[0].text);
+      rest = rest.slice(cut);
+    }
+  }
+  return out.length ? out : [''];
 }
 
 /** A line in one row of at most `cols` columns, cut with an ellipsis. */
@@ -229,6 +284,17 @@ export class LiveTurn implements TurnView {
     const t = text === null ? null : cleanCell(text);
     if (t === this.statusText) return;
     this.statusText = t;
+    this.schedule();
+  }
+
+  /** A line after what the reply has written so far (its unfinished line
+   *  ends there): something that happened at this point of the turn. */
+  after(text: string): void {
+    if (this.ended) { this.output.write(cleanStream(text)); return; }
+    const t = cleanStream(text).replace(/^\n+/, '').replace(/\n+$/, '');
+    if (!t) return;
+    this.committed += `${this.partial}${this.partial ? '\n' : ''}${t}\n`;
+    this.partial = '';
     this.schedule();
   }
 
@@ -356,10 +422,17 @@ export class LiveTurn implements TurnView {
     let partial = this.partial ? splitRows(this.partial, cols) : [];
     const most = Math.max(1, Math.min(12, (this.output.rows || 24) - 4 - below.length));
     if (partial.length > most) {
-      const head = partial.slice(0, partial.length - most);
-      text += head.map((r) => `${r.text}\n`).join('');
-      this.partial = this.partial.slice(head[head.length - 1].end);
-      partial = partial.slice(head.length);
+      // Written for good, broken between words: whole rows go until what is
+      // left fits.
+      while (splitRows(this.partial, cols).length > most) {
+        const rows = splitRows(this.partial, cols);
+        const cut = rows[0].end;
+        const sp = this.partial[cut] === ' ' ? cut : this.partial.lastIndexOf(' ', cut - 1);
+        const at = sp > 0 ? sp : cut;
+        text += `${this.partial.slice(0, at).replace(/\t/g, ' ').trimEnd()}\n`;
+        this.partial = this.partial.slice(sp > 0 ? sp + 1 : cut);
+      }
+      partial = splitRows(this.partial, cols);
     }
     const rows = [...partial.map((r) => r.text), ...below];
     for (const r of rows) text += `${r}\n`;
