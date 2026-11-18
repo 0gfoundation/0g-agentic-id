@@ -119,7 +119,7 @@ export function didYouMean(typed: string, words: readonly string[]): string | un
 /**
  * Text of whole lines fitted to `width` (undefined: as it is): a line wider
  * than the terminal is wrapped between words, its later lines indented under
- * where its text starts — after a label column (`prepaid balance : `,
+ * where its text starts — after a label column (`prepaid balance   : `,
  * `sealId:    `, `✓ attestor        `), after `error: ` / `fix: ` / `→ `, or
  * at the line's own indent. The one word-wrap every shell and one-shot
  * message goes through.

@@ -339,6 +339,7 @@ test('doctor: no attestor → no RPC probed; a login key is named as login\'s', 
 
 const MINTED_SEAL = `0x${'42'.repeat(32)}`;
 const UNMINTED_SEAL = `0x0025786d4d${'ab'.repeat(27)}`;
+const FAILED_SEAL = `0x6224b71b9a${'cd'.repeat(27)}`;
 
 /** An attestor + JSON-RPC double: one minted running agent (42) and one
  *  being minted. Counts transactions sent, so a refused amount provably
@@ -348,6 +349,7 @@ function mockAttestor(opts = {}) {
   const rows = [
     { seal_id: MINTED_SEAL, agent_id: '0x2a', phase: 'running', framework: '0g-harness', owner: ME, agent_card: { name: 'echo' }, created_at: '2026-11-01T00:00:00Z' },
     { seal_id: UNMINTED_SEAL, phase: 'deploying', framework: 'openclaw', agent_card: { name: 'minting' }, created_at: '2026-11-18T00:00:00Z' },
+    ...(opts.failed ? [{ seal_id: FAILED_SEAL, phase: 'failed', framework: '0g-harness', owner: ME, agent_card: { name: 'stuck' }, created_at: '2026-11-18T00:00:00Z', mint_stage: { status: 'failed', reason: 'registerWithSeal reverted: seal already registered' } }] : []),
   ];
   const server = createServer((req, res) => {
     const chunks = [];
@@ -358,6 +360,7 @@ function mockAttestor(opts = {}) {
       if (url.pathname === '/config') return json({ chain_id: 31337, chain_rpc: `http://127.0.0.1:${server.address().port}/rpc`, frameworks: [{ name: 'openclaw' }, { name: '0g-harness' }] });
       if (url.pathname === '/deployments') return json(opts.ownerFails && url.searchParams.get('owner') ? [] : rows);
       if (url.pathname.startsWith('/deployment/')) return json(rows.find((r) => url.pathname.endsWith(r.seal_id)) ?? {}, 200);
+      if (url.pathname === '/retry' && req.method === 'POST') return json({ ok: true });
       if (url.pathname === '/rpc') {
         const body = JSON.parse(Buffer.concat(chunks).toString());
         const one = (r) => {
@@ -557,4 +560,94 @@ test('doctor shows OG balances with six decimals, as whoami does', async () => {
   assert.equal(ogShown(681357720926745194035n), '681.357721 OG');
   assert.equal(ogShown(75540000000001018400n), '75.540000 OG');
   assert.equal(ogShown(0n), '0.000000 OG');
+});
+
+test('shell: a bare deposit has no default — Enter cancels and sends nothing', async () => {
+  const att = await mockAttestor();
+  try {
+    const r = await run([], { AGENTIC_ATTESTOR_URL: att.url, AGENTIC_PRIVATE_KEY: KEY }, 'deposit\n\nquit\n');
+    assert.match(r.stdout, /deposit how much OG\? \[Enter cancels\]: /);
+    assert.match(r.stdout, /deposit cancelled\n/);
+    assert.doesNotMatch(r.stdout, /not enough for|\[1\]/, 'no amount was taken');
+    assert.equal(att.sent(), 0);
+  } finally { close(att.server); }
+});
+
+test('the agent at hand fills the cred/settings commands a message names, as typed there', async () => {
+  const { agentCmd, lifecycleTo, setAgentAtHand } = await import('../dist/cli/errors.js');
+  try {
+    setSurface('shell');
+    setAgentAtHand('287');
+    assert.equal(agentCmd('cred', 'set model'), 'cred 287 set model');
+    assert.equal(agentCmd('settings', 'provider=x'), 'settings 287 provider=x');
+    assert.equal(lifecycleTo('reset', 'move it'), 'type `reset 287` to move it');
+    setSurface('oneshot');
+    assert.equal(agentCmd('cred'), '0g-agentdna cred 287');
+    assert.equal(lifecycleTo('start', 'start it'), 'run `0g-agentdna` and type `start 287` there to start it');
+    setAgentAtHand('287', true);
+    assert.equal(agentCmd('cred', 'pending'), '/cred pending');
+    assert.equal(lifecycleTo('reset', 'move it'), 'type `/reset` to move it');
+    setAgentAtHand(null);
+    setSurface('shell');
+    assert.equal(agentCmd('cred'), 'cred <agent>', 'no agent at hand keeps the placeholder');
+  } finally { setAgentAtHand(null); }
+});
+
+test('explainError: an owner route of a stopped agent is AGENT_NOT_RUNNING with a start remedy', async () => {
+  const { setAgentAtHand } = await import('../dist/cli/errors.js');
+  try {
+    setSurface('shell');
+    setAgentAtHand('287');
+    const p = explainError(new Error('credentials: the agent has no public URL yet (not running?)'));
+    assert.equal(p.code, 'AGENT_NOT_RUNNING');
+    assert.equal(p.message, 'the agent is not running, and only the running agent can answer this');
+    assert.equal(p.remedy, 'type `start 287` to start it');
+    const c = plainCliError(new Error('credentials: the agent has no public URL yet (not running?)'));
+    assert.equal(c.exitCode, 3);
+  } finally { setAgentAtHand(null); }
+});
+
+test('explainError: a refused mint names no contract function', () => {
+  setSurface('shell');
+  const p = explainError(new Error(`waitForMint: seal 0x${'ab'.repeat(32)} failed — registerWithSeal reverted: seal already registered`));
+  assert.equal(p.message, 'the deploy stopped before the mint: the chain refused the mint: seal already registered');
+  assert.doesNotMatch(`${p.message} ${p.remedy}`, /waitForMint|registerWithSeal|0x(?:ab){20}/);
+});
+
+test('one-shot: cred log of a stopped agent, RUNTIME_TOO_OLD, a garbage URL — plain, with the agent named', async () => {
+  const att = await mockAttestor();
+  try {
+    const r = await run(['cred', '0x4242424242', 'log'], { AGENTIC_ATTESTOR_URL: att.url, AGENTIC_PRIVATE_KEY: KEY });
+    assert.equal(r.code, 3, r.stderr);
+    assert.match(r.stderr, /error \(AGENT_NOT_RUNNING\): the agent is not running, and only the running agent can answer this\n {2}fix: run `0g-agentdna` and type `start 0x4242424242` there to start it/);
+  } finally { close(att.server); }
+  const { credOp } = await import('../dist/cli/credentials.js');
+  const { setAgentAtHand } = await import('../dist/cli/errors.js');
+  try {
+    setSurface('shell');
+    setAgentAtHand('286');
+    const ag = { credentials: { audit: async () => { throw new Error('credentials.audit: HTTP 404 no route'); } } };
+    await assert.rejects(credOp(ag, `0x${'1'.repeat(64)}`, ['log'], { json: false, out: () => {}, secret: async () => '' }, 'http://agent'),
+      (e) => e.code === 'RUNTIME_TOO_OLD' && e.remedy === 'type `reset 286` to move it to the current image');
+  } finally { setAgentAtHand(null); }
+  const bad = await run(['list'], { AGENTIC_ATTESTOR_URL: 'not a url' });
+  assert.match(bad.stderr, /"not a url" is not a URL — an attestor's address is like https:\/\/agentdna\.0g\.ai/);
+});
+
+test('50 columns: the balance block and long labelled lines hang under their value', async () => {
+  const { fitLines } = await import('../dist/cli/textfit.js');
+  const lines = fitLines('outstanding debt  : 1.950000 OG  (parked; settles from deposits first)', 50).split('\n');
+  assert.ok(lines.length > 1);
+  for (const l of lines) assert.ok(cps(l) <= 50, l);
+  for (const l of lines.slice(1)) assert.match(l, /^ {20}\S/, l);
+});
+
+test('shell: a retry that fails again says why in plain words, with the next step', async () => {
+  const att = await mockAttestor({ failed: true });
+  try {
+    const r = await run([], { AGENTIC_ATTESTOR_URL: att.url, AGENTIC_PRIVATE_KEY: KEY }, 'retry 0x6224b71b9a\nquit\n');
+    assert.match(r.stdout, /retrying agent 0x6224b71b9a: running its failed steps again \(Esc does not stop this; it can take a minute\)…\n/, r.stdout);
+    assert.match(r.stdout, /still failing: the chain refused the mint: seal already registered\n {2}→ once the cause is fixed, `retry 0x6224b71b9a` again; `status 0x6224b71b9a` shows it in full\n/);
+    assert.doesNotMatch(r.stdout, /waitForMint|registerWithSeal|Esc-proof|0x6224b71b9acd/);
+  } finally { close(att.server); }
 });

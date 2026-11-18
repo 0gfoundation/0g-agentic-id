@@ -109,7 +109,7 @@ owner 给 agent 的 sealed 凭据代理用的凭据（`sealed/CREDENTIALS.zh.md`
 | `cred <agent> reveal <name> on\|off` | 让 agent 不必每次申请就能自己读取值。条目持有的登录或轮换得到的 token 保留。对签名密钥会被拒绝，签名密钥从不交出。运行中的 agent 没接收这次修改时会说明 |
 | `cred <agent> pending` | 等待中的请求：sealed 掌握的事实与 agent 的说法分开显示 |
 | `cred <agent> approve\|deny [<id>]` | 对一条请求做决定（给出 id 前缀即可；只有一条请求在等时不用给）；`approve` 签一次性的 EIP-712 批准。新增凭据或登录的请求，用 `set` / `login` 来应答 |
-| `cred <agent> log [n]` | agent 用凭据做了什么：先是 sealed 保管的推理 key 的使用计数（`×count`，首次 … 最近一次），然后是最近 n 条其他记录。agent 的镜像还没有凭据日志时会说明（`RUNTIME_TOO_OLD`，退出码 3）：reset 会把它换到当前镜像 |
+| `cred <agent> log [n]` | agent 用凭据做了什么：先是 sealed 保管的推理 key 的使用计数（`×count`，首次 … 最近一次），然后是最近 n 条其他记录。agent 的镜像还没有凭据日志时会说明（`RUNTIME_TOO_OLD`，退出码 3）：reset 会把它换到当前镜像；已停止的 agent 被拒绝（`AGENT_NOT_RUNNING`，退出码 3）：先 `start` 它 |
 | `cred pending` | 你名下每个 agent 的待处理数量 |
 | `cred notify [<email>\|off]` | agent 等你处理、或凭据快到期时，发邮件到哪里 |
 | `cred presets` | 预设：域名、位置、每个密钥去哪里创建、怎样把权限收窄（不需要钱包） |
@@ -150,7 +150,7 @@ banner 写明 attestor、钱包、是否设置了模型 key，以及信任根 ac
 | `clone` / `transfer` / `grant` / `revoke` / `authorizer` | 克隆、转让、克隆授权管理 |
 | `settings <id> [k=v …]` | 与同名子命令语义相同 |
 | `cred <id> [sub …]`、`cred pending`、`cred notify` | 与同名子命令语义相同；`login` 打印链接后直接返回，不等待 |
-| `balance` / `deposit [og]` / `withdraw [og]` | 预付费账户：余额 + 消耗速率 / 充值 / 退款提取（有时间锁；不带参数时领取全部）。金额是大于 0 的 OG 数，在发起任何交易之前检查（充值还会对照钱包持有的金额）；`withdraw <og>` 会并入一笔待处理的退款时，先询问，再重启它的时间锁 |
+| `balance` / `deposit [og]` / `withdraw [og]` | 预付费账户：余额 + 消耗速率 / 充值 / 退款提取（有时间锁；不带参数时领取全部）。金额是大于 0 的 OG 数，在发起任何交易之前检查（充值还会对照钱包持有的金额）；不带参数的 `deposit` / `withdraw` 会询问金额，没有默认值——回车即取消；`withdraw <og>` 会并入一笔待处理的退款时，先询问，再重启它的时间锁 |
 | `ack` | 确认 TEE 信任根（deploy/start/reset 时隐式完成） |
 | `login [provider]` | 引导式设置：attestor URL（必填；没设置就一直再问）→ owner 私钥（管理你的 agent 需要它）→ 平台列出的每个 provider 的模型 key（可选；Enter 保留已设的 key，或跳过未设的）→ 新 agent 的默认 provider（多于一个 provider 有 key 时才问）→ 已设置内容的汇总。每个回答保存前都会检查：URL 必须是 `/config` 有应答的 attestor，owner 私钥必须是 64 个十六进制字符（会显示钱包地址）；不对就再问。Ctrl-C 或 Esc 不保存当前这一步；之前完成的步骤保持已保存，取消时会说明是哪些。在模型 key 这一步 attestor 不应答时，按内置的 provider 列表询问。输入 key 时回显 `*`。`login <provider>` 只问这个 provider 的 key。其他各步首先提供的就是这些 key（见 `cred <agent> set model`） |
 | `status <id>` / `doctor` / `providers` / `releases` | 即一次性命令，在提示符下运行 |
@@ -184,7 +184,7 @@ banner 写明 attestor、钱包、是否设置了模型 key，以及信任根 ac
 | 0 | 成功 | — |
 | 1 | 未知错误（包括 NOT_IMPLEMENTED） | 阅读错误信息 |
 | 2 | 用法错误（包括未知命令、错误的 flag、错误的 agent 引用、找不到 agent） | 按 `error.code` 区分 |
-| 3 | **可修复的前提条件**（缺少 attestor URL、无法连接、需要钱包、`SETTINGS_CONFLICT`、`CREDENTIALS_CONFLICT`、`AGENT_NOT_READY`、`RUNTIME_TOO_OLD`……） | 阅读 `error.remedy`，修复后重试 |
+| 3 | **可修复的前提条件**（缺少 attestor URL、无法连接、需要钱包、`SETTINGS_CONFLICT`、`CREDENTIALS_CONFLICT`、`AGENT_NOT_READY`、`AGENT_NOT_RUNNING`、`RUNTIME_TOO_OLD`……） | 阅读 `error.remedy`，修复后重试 |
 | 4 | 超时 | 稍后再查 |
 | 5 | 认证 | 停止 |
 | 130 | 在一次性命令的提问处取消（Ctrl-C；打印 `cancelled`） | — |

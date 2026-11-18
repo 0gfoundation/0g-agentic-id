@@ -24,7 +24,7 @@ import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient, probeAttestor } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
-import { CliError, cancelled, cmdStep, currentSurface, isCancelled, setSurface, shellStep, shellTo } from '../errors';
+import { CliError, cancelled, cmdStep, currentSurface, isCancelled, setAgentAtHand, setSurface, shellStep, shellTo } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { ogAmount, parseOgAmount, explainError } from '../plain';
 import { fitHelp, fitLines, termWidth, wrap, didYouMean } from '../textfit';
@@ -65,16 +65,16 @@ const clientInstanceId = (globalThis.crypto?.randomUUID?.() ?? `cli-${Date.now()
  *  is ALWAYS shown ("couldn't check" ≠ "nothing owed"). */
 type EffBalance = Awaited<ReturnType<AgenticID['getEffectiveBalance']>>;
 function moneyBlock(prepaidWei: bigint | null, eff: EffBalance | null, effErr: string | null): void {
-  say(`prepaid balance : ${prepaidWei == null ? '(unreadable)' : og(prepaidWei)}\n`);
+  say(`prepaid balance   : ${prepaidWei == null ? '(unreadable)' : og(prepaidWei)}\n`);
   if (eff && eff.availableWei < eff.balanceWei) {
-    if (eff.outstandingDebtWei > 0n) say(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
-    if (eff.pendingSettlementWei > 0n) say(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
-    if (eff.reservedWei > 0n) say(`reserved        : ${og(eff.reservedWei)}\n`);
-    say(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
+    if (eff.outstandingDebtWei > 0n) say(`outstanding debt  : ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
+    if (eff.pendingSettlementWei > 0n) say(`pending settles   : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
+    if (eff.reservedWei > 0n) say(`reserved          : ${og(eff.reservedWei)}\n`);
+    say(`AVAILABLE         : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
   } else if (eff) {
-    say(`AVAILABLE       : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
+    say(`AVAILABLE         : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
   } else {
-    say(`AVAILABLE       : (unknown: ${effErr ? explainError(effErr).message : 'no answer'} — the chain number above may be optimistic)\n`);
+    say(`AVAILABLE         : (unknown: ${effErr ? explainError(effErr).message : 'no answer'} — the chain number above may be optimistic)\n`);
   }
 }
 
@@ -1593,7 +1593,8 @@ const L1_HELP_FULL = `manager commands
                           policy only; a switch — revoke closes it again)
   revoke <id> <buyer>     seller: close the door for <buyer>
   balance                 prepaid sandbox balance, burn rate, runway
-  deposit [og]            fund the prepaid balance (default 1 OG)
+  deposit [og]            fund the prepaid balance (bare: asks how much;
+                          Enter cancels)
   withdraw [og]           get prepaid funds back: shows balance + pending,
                           offers to claim matured refunds, then asks how
                           much (more) to withdraw (time-locked)
@@ -1728,6 +1729,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     // Quote-aware, so a value with a space in it (`settings 286
     // others='{"a": 1}'`) survives the way it does in a real shell.
     const [cmd, ...args] = line ? tokenize(line) : ['whoami'];
+    setAgentAtHand(cmd === 'cred' || cmd === 'settings' ? args[0] ?? null : null);
     try {
       if (cmd === 'quit' || cmd === 'exit') return;
       if (cmd === 'help') { say(`${managerHelp(termWidth())}\n`); continue; }
@@ -1858,11 +1860,11 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const runway = burnPerMin > 0n && est.prepaidBalanceWei != null ? Number(est.prepaidBalanceWei / burnPerMin) : null;
         moneyBlock(est.prepaidBalanceWei, eff, effErr);
         if (detail && detail.pendingRefund > 0n) {
-          say(`pending refund  : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
+          say(`pending refund    : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
         }
-        say(`running agents  : ${running}  (× ${og(est.costPerMinWei)}/min each)\n`);
-        say(`burn rate       : ${og(burnPerMin)}/min\n`);
-        say(`runway          : ${runway == null ? (running === 0 ? '∞ (nothing running)' : 'n/a') : `~${runway} min`}\n`);
+        say(`running agents    : ${running}  (× ${og(est.costPerMinWei)}/min each)\n`);
+        say(`burn rate         : ${og(burnPerMin)}/min\n`);
+        say(`runway            : ${runway == null ? (running === 0 ? '∞ (nothing running)' : 'n/a') : `~${runway} min`}\n`);
         say('add funds with `deposit [amount OG]` · withdraw with `withdraw [amount OG]`\n');
         continue;
       }
@@ -1873,8 +1875,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // of OG, within what the wallet holds.
         if (args[0]) parseOgAmount(args[0]);
         const ag = await withWallet(ctx);
-        const amountWei = args[0] ? parseOgAmount(args[0]) : await askAmount(ask, 'amount OG [1]: ', '1');
-        if (amountWei === null) continue;
+        // A money question has no default: Enter cancels it.
+        const amountWei = args[0] ? parseOgAmount(args[0]) : await askAmount(ask, 'deposit how much OG? [Enter cancels]: ');
+        if (amountWei === null) { say('deposit cancelled\n'); continue; }
         const native = await ag.nativeBalance().catch(() => null);
         if (native != null && native <= amountWei) {
           say(`the wallet holds ${og(native)} — not enough for ${ogAmount(amountWei)} OG plus gas\n`);
@@ -1918,7 +1921,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // (re-absorbing the pot, restarting the lock), so we submit
         // pending + amount on the user's behalf.
         if (!args[0] && pending > 0n) say(`a new request joins the pending ${og(pending)} and restarts its time lock\n`);
-        const amountWei = args[0] ? parseOgAmount(args[0]) : await askAmount(ask, `withdraw how much? [max ${og(d.balance)}, Enter skips]: `);
+        const amountWei = args[0] ? parseOgAmount(args[0]) : await askAmount(ask, `withdraw how much? [max ${og(d.balance)}, Enter cancels]: `);
         if (amountWei === null) continue;
         if (amountWei > d.balance) { say(`only ${og(d.balance)} spendable — cannot withdraw ${ogAmount(amountWei)} OG\n`); continue; }
         // The bare form's question says a request restarts the pending lock;
@@ -2118,15 +2121,18 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
         if (!row) throw agentNotFound(args[0]);
-        if (row.phase !== 'failed') { say(`agent ${row.agentId ?? row.sealId} is ${row.phase} — retry only applies to failed rows\n`); continue; }
-        say(`retrying seal ${row.sealId} — re-running the failed stages… (Esc-proof; may take a minute)\n`);
+        const label = row.agentId != null ? String(row.agentId) : sealPrefixOf(row.sealId);
+        if (row.phase !== 'failed') { say(`agent ${label} is ${row.phase} — retry only applies to a deploy that failed\n`); continue; }
+        say(`retrying agent ${label}: running its failed steps again (Esc does not stop this; it can take a minute)…\n`);
         await ag.agent.retry(row.sealId);
         try {
           const agentId = await ag.agent.waitForMint(row.sealId);
-          say(`recovered: agent ${agentId} minted under the same seal\n`);
+          say(`recovered: agent ${agentId} minted under the same identity\n`);
           say(`it lands offline — bring it up with: reset ${agentId}\n`);
         } catch (e) {
-          say(`still failing: ${(e as Error).message}\n`);
+          const p = explainError(e);
+          say(`still failing: ${p.message.replace(/^the deploy stopped before the mint: /, '')}\n`);
+          say(`  → once the cause is fixed, \`retry ${label}\` again; \`status ${label}\` shows it in full\n`);
         }
         continue;
       }
@@ -2670,11 +2676,12 @@ function listRemedy(): string {
 
 /**
  * Ask for an amount of OG until the answer is one (parseOgAmount says what
- * is wrong with any other); Enter takes `dflt`, or skips (null) without one.
+ * is wrong with any other); Enter cancels (null) — a money question has no
+ * default.
  */
-async function askAmount(ask: (q: string) => Promise<string>, q: string, dflt?: string): Promise<bigint | null> {
+async function askAmount(ask: (q: string) => Promise<string>, q: string): Promise<bigint | null> {
   for (;;) {
-    const a = (await ask(q)).trim() || dflt;
+    const a = (await ask(q)).trim();
     if (!a) return null;
     try {
       return parseOgAmount(a);
@@ -3355,6 +3362,7 @@ const L2_HELP_FULL = `session commands
   /quit                   exit`;
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
+  setAgentAtHand(s.agentId, true); // cred/settings messages name /cred, /settings
   out(`\nagent ${s.agentId} session — ${s.phase} · ${hostOf(s.attestorUrl)} · type to chat · Tab completes /commands · /help for details\n`);
   // Low-gas heads-up WITH the entry card. It used to run detached and could
   // land mid-turn, reading like the agent said it (feedback.md F17) — so wait
