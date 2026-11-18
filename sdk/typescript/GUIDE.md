@@ -970,7 +970,11 @@ sees them is what the provider's model list says (the 0G router's
 `architecture.input_modalities`: glm-5.3 takes text only, glm-5.3-flash images
 too); the owner's `others.modelImages` overrides it. A model that cannot view
 images gets each one saved as a file in the agent's file inbox `~/inbox` instead; the
-`onNotice` callback receives `{ imagesSavedAsFiles: [paths] }`. Any other file
+`onNotice` callback receives `{ imagesSavedAsFiles: [paths] }`. An image may
+carry its file name (`{ mediaType, data, name: 'flag test.png' }`): the SDK
+sends it as the part's `filename` when the agent's `GET /v1/harness` lists
+`features.image_names` (asked once per client), so the saved file keeps that
+name instead of `image-<ms>-<n>.png`; elsewhere the name is left out. Any other file
 goes through `uploadFile(name, bytes)` (present when `/hello` declares kind
 `files`; at most 25 MiB): it lands in `~/inbox` under a new name, never over
 an existing file, and returns `{ path, bytes }` — name the path in your

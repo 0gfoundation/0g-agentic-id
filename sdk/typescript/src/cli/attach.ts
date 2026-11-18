@@ -107,7 +107,7 @@ export async function prepareAttachments(
   for (const s of staged) {
     const data = readFileSync(s.path);
     if (s.image) {
-      images.push({ mediaType: s.image, data: data.toString('base64') });
+      images.push({ mediaType: s.image, data: data.toString('base64'), name: s.name });
       continue;
     }
     if (!client.uploadFile) throw new Error('this agent takes no files: its framework has no upload route');

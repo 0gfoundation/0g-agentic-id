@@ -148,6 +148,11 @@ export interface ChatMessage {
 export interface ChatImage {
   mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
   data: string;
+  /** Its file name on the owner's side (`flag test.png`). Sent as the part's
+   *  `filename` only to an agent that says it reads one (0g-harness
+   *  `GET /v1/harness` → `features.image_names`): a model that cannot view
+   *  images gets the file under this name in `~/inbox`. */
+  name?: string;
 }
 
 /**
@@ -865,14 +870,16 @@ const imageUrl = (im: ChatImage): string => `data:${im.mediaType};base64,${im.da
  * shape: chat/completions `image_url` parts, or Responses `input_text` /
  * `input_image` parts. No images: the messages as they are.
  */
-export function withImages(messages: ChatMessage[], images: ChatImage[] | undefined, shape: 'chat' | 'responses'): unknown[] {
+export function withImages(messages: ChatMessage[], images: ChatImage[] | undefined, shape: 'chat' | 'responses', names = false): unknown[] {
   if (!images?.length) return messages;
   let i = messages.length - 1;
   while (i >= 0 && messages[i].role !== 'user') i--;
   const text = i >= 0 ? messages[i].content : '';
+  // `filename` only where the agent reads it (`names`): another runtime may refuse a field it does not know.
+  const named = (im: ChatImage): { filename?: string } => (names && im.name ? { filename: im.name } : {});
   const content = shape === 'chat'
-    ? [{ type: 'text', text }, ...images.map((im) => ({ type: 'image_url', image_url: { url: imageUrl(im) } }))]
-    : [{ type: 'input_text', text }, ...images.map((im) => ({ type: 'input_image', image_url: imageUrl(im) }))];
+    ? [{ type: 'text', text }, ...images.map((im) => ({ type: 'image_url', image_url: { url: imageUrl(im) }, ...named(im) }))]
+    : [{ type: 'input_text', text }, ...images.map((im) => ({ type: 'input_image', image_url: imageUrl(im), ...named(im) }))];
   const out: unknown[] = messages.slice();
   if (i >= 0) out[i] = { role: 'user', content };
   else out.push({ role: 'user', content });
@@ -1029,10 +1036,31 @@ export function makeAgentClient(params: {
   // deploy. There's no framework-agnostic default (/hello doesn't declare it),
   // so omit the field when the caller doesn't set one rather than sending a
   // bogus value the framework rejects.
-  const chatBody = (messages: ChatMessage[], opts?: { model?: string; images?: ChatImage[] }) => {
-    const sent = withImages(messages, opts?.images, 'chat');
+  const chatBody = async (messages: ChatMessage[], opts?: { model?: string; images?: ChatImage[] }) => {
+    const sent = withImages(messages, opts?.images, 'chat', await imageNames(opts?.images));
     return JSON.stringify(opts?.model ? { model: opts.model, messages: sent, stream: true } : { messages: sent, stream: true });
   };
+
+  // What the agent's runtime says it reads (0g-harness `GET /v1/harness`,
+  // `features`), asked once; null where there is no such route.
+  let featuresAsked: Promise<Record<string, unknown> | null> | null = null;
+  const harnessFeatures = (): Promise<Record<string, unknown> | null> => {
+    const r = routes.find((x) => x.kind === 'chat') ?? routes.find((x) => x.kind === 'responses');
+    if (!r || !canAuth) return Promise.resolve(null);
+    const path = r.kind === 'chat' ? `${r.prefix.replace(/\/?$/, '/')}harness` : r.prefix.replace(/responses\/?$/, 'harness');
+    featuresAsked ??= doFetch(path, { signal: AbortSignal.timeout(5000) })
+      .then(async (res) => {
+        if (res.status === 404) return null; // not a harness: it never will be
+        if (!res.ok) throw new Error(`harness: HTTP ${res.status}`);
+        const f = ((await res.json()) as { features?: unknown }).features;
+        return f && typeof f === 'object' ? f as Record<string, unknown> : null;
+      })
+      .catch(() => { featuresAsked = null; return null; }); // asked again next time
+    return featuresAsked;
+  };
+  /** Whether image parts carry their file name: only where the agent says it reads it. */
+  const imageNames = async (images?: ChatImage[]): Promise<boolean> =>
+    !!images?.some((im) => im.name) && (await harnessFeatures())?.image_names === true;
 
   const chat = routes.find((r) => r.kind === 'chat');
   if (chat && canAuth) {
@@ -1066,7 +1094,7 @@ export function makeAgentClient(params: {
       const r = await doFetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: chatBody(messages, opts),
+        body: await chatBody(messages, opts),
         signal: opts?.signal,
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
@@ -1084,7 +1112,7 @@ export function makeAgentClient(params: {
       const r = await doFetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: chatBody(messages, opts),
+        body: await chatBody(messages, opts),
         signal: opts?.signal,
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
@@ -1381,7 +1409,7 @@ export function makeAgentClient(params: {
       // returns the id in milliseconds, so every long-lived byte after that
       // travels on a GET we can always resume by id. One extra round trip
       // buys the guarantee that a task is never lost to a dropped connection.
-      const payload: Record<string, unknown> = { input: withImages(messages, opts?.images, 'responses') };
+      const payload: Record<string, unknown> = { input: withImages(messages, opts?.images, 'responses', await imageNames(opts?.images)) };
       if (opts?.model) payload.model = opts.model;
       if (opts?.thinking) payload.reasoning = { effort: opts.thinking };
       const r = await doFetch(rPrefix, {
