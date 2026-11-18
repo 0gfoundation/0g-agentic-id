@@ -21,11 +21,12 @@
 import type { Hash } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import { buildClient } from '../sdk';
-import { CliError } from '../errors';
+import { CliError, cmdStep, shellStep } from '../errors';
+import { plainError } from '../plain';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef, type AgentRef } from '../ref';
 import {
-  VERSION_KEYS, applyAssignments, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework,
+  VERSION_KEYS, applyAssignments, assertModelFitsFramework, touchesModel, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework,
   isHarnessFramework, parseAssignments, renderListedVersions, renderSettings,
 } from '../settings';
 import { SettingsConflictError } from '../../Settings';
@@ -48,8 +49,8 @@ export async function resolveSealId(ag: AgenticID, ref: AgentRef, raw: string): 
         hits.length ? 'BAD_AGENT_REF' : 'AGENT_NOT_FOUND',
         hits.length
           ? `"${raw}" matches ${hits.length} agents — add more hex chars`
-          : `no agent matching ${raw} on this attestor`,
-        { remedy: '0g-agentdna list   # to discover existing agents' },
+          : `agent ${raw} does not exist on this attestor`,
+        { remedy: `${cmdStep('list')} shows the agents here` },
       );
     }
     return hits[0].sealId;
@@ -57,7 +58,7 @@ export async function resolveSealId(ag: AgenticID, ref: AgentRef, raw: string): 
   const seal = await ag.agent.getSealId(ref.agentId).catch(() => ZERO_HASH);
   if (seal === ZERO_HASH) {
     throw new CliError('AGENT_NOT_FOUND', `agent ${ref.agentId} has no sealId on chain`, {
-      remedy: '0g-agentdna list   # to discover existing agents',
+      remedy: `${cmdStep('list')} shows the agents here`,
     });
   }
   return seal;
@@ -78,7 +79,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     // No row for this seal — a wrong attestor or a wrong id, not an internal fault.
     if (/HTTP 404/.test(e.message)) {
       throw new CliError('AGENT_NOT_FOUND', `no deployment for seal ${sealId} on this attestor`, {
-        remedy: '0g-agentdna list   # to discover existing agents',
+        remedy: `${cmdStep('list')} shows the agents here`,
       });
     }
     throw e;
@@ -112,9 +113,11 @@ export async function run(ctx: CommandContext): Promise<void> {
   }
   const next = applyAssignments(current, assignments);
   // Before anything is signed: a document with no model is the one state the
-  // container cannot boot from and last-known-good cannot cover.
+  // container cannot boot from and last-known-good cannot cover; a model
+  // that cannot call tools fails every turn of a tool-driven framework.
   assertModelPresent(next, current !== null);
   assertSubagentDefaultOffered(next);
+  await assertModelFitsFramework(assignments, next, await frameworkOf(ctx.env.attestorUrl, sealId), (provider) => ag.agent.listModelCaps({ provider }));
   const base = await runningServeBase(ctx.env.attestorUrl, sealId);
   // The agent takes a provider switch only with a key for the new provider
   // in its credential set: asked for (Enter takes the key login saved) and
@@ -134,10 +137,14 @@ export async function run(ctx: CommandContext): Promise<void> {
   const written = await ag.agent
     .setSettings(sealId, next, {
       baseVersion: version,
-      onWarn: (w) => {
-        warnings.push(w);
-        note(`warning: ${w}`);
-      },
+      // Only a write that sets the model or the provider: the advisory is
+      // about that choice, not repeated on every later write.
+      ...(touchesModel(assignments) ? {
+        onWarn: (w: string) => {
+          warnings.push(w);
+          note(`warning: ${w}`);
+        },
+      } : {}),
     })
     .catch((e: unknown) => {
       // Someone else wrote this document since the read a moment ago. Report
@@ -175,11 +182,11 @@ export async function run(ctx: CommandContext): Promise<void> {
           pendingReset = true;
           return;
         }
-        const msg = e instanceof Error ? e.message : String(e);
+        const msg = plainError(e).message;
         // pushSettingsToContainer throws `… HTTP <n>: …` when the container
         // ANSWERED and refused; a bare fetch failure (no HTTP status) means
         // it was unreachable.
-        rejected = /HTTP \d/.test(msg);
+        rejected = /HTTP \d/.test(e instanceof Error ? e.message : String(e));
         const w = rejected
           ? `stored, but the running container REFUSED it: ${msg} — a refused document does not boot, so the agent keeps its current configuration until you store one it accepts (e.g. an openai-format model for hermes)`
           : `stored, but the running container was unreachable: ${msg} — it applies on the next boot`;
@@ -195,12 +202,12 @@ export async function run(ctx: CommandContext): Promise<void> {
   for (const line of renderSettings(next)) print(line);
   note(
     pendingReset
-      ? `written — version ${written.version}; provider change pending — run reset ${raw} with the ${next.provider} key`
+      ? `saved; provider change pending — reset agent ${raw} with the ${next.provider} key (${shellStep(`reset ${raw}`)})`
       : applied
-      ? `written — version ${written.version}; ${applied}`
+      ? `saved; ${applied}`
       : rejected
-        ? `written — version ${written.version}, but the running container refused it (see the warning above); it will not boot as-is.`
-        : `written — version ${written.version}. The container applies it on its next boot.`,
+        ? 'saved, but the running container refused it (see the warning above); it will not boot as-is.'
+        : 'saved. The container applies it on its next boot.',
   );
 }
 

@@ -208,6 +208,47 @@ export function isHarnessFramework(framework: string | null | undefined): boolea
 }
 
 /**
+ * Whether `framework` works through tool calls, so its model must be able to
+ * call tools: the tool-driven frameworks, the harness under either of its
+ * names (`dsh` on a network still on AgenticID 1.3, see `isHarnessFramework`).
+ * The deploy wizard offers such a framework only models with tool use.
+ */
+export function frameworkNeedsToolModels(framework: string): boolean {
+  return framework === 'openclaw' || framework === 'prime-agent' || isHarnessFramework(framework);
+}
+
+/** Whether these assignments set the model or the provider. */
+export function touchesModel(assignments: Assignment[]): boolean {
+  return assignments.some((a) => a.key === 'model' || a.key === 'provider');
+}
+
+/**
+ * Refuse, before signing, a model change to one its provider's catalog lists
+ * without tool use on an agent whose framework works through tools: it would
+ * fail every turn there (the deploy wizard does not offer such a model
+ * either). Only a write that sets the model or the provider is checked; a
+ * model the catalog does not list, an unreadable catalog or an unknown
+ * framework passes — the catalog advisory speaks to the first.
+ */
+export async function assertModelFitsFramework(
+  assignments: Assignment[],
+  next: SettingsDoc,
+  framework: string | null | undefined,
+  caps: (provider: string) => Promise<Array<{ id: string; chat: boolean; tools: boolean }>>,
+): Promise<void> {
+  const model = next.model?.trim();
+  if (!model || !framework || !frameworkNeedsToolModels(framework)) return;
+  if (!touchesModel(assignments)) return;
+  const listed = await caps(next.provider ?? '0g-compute').catch(() => null);
+  const entry = listed?.find((m) => m.id.toLowerCase() === model.toLowerCase());
+  if (!listed || !entry || entry.tools) return;
+  const able = listed.filter((m) => m.chat && m.tools).map((m) => m.id);
+  throw new CliError('BAD_FLAG', `${model} cannot call tools, and a ${framework} agent works through tool calls — it would fail every turn`, {
+    remedy: able.length ? `pick a model that can: ${able.slice(0, 4).join(', ')}` : 'pick a model that can call tools',
+  });
+}
+
+/**
  * Refuse 0g-harness switches in `others=` for an agent known to run another
  * framework, before anything is signed. There `others` is that framework's
  * own configuration, so the switch does nothing, and openclaw goes further:
