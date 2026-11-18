@@ -28,7 +28,7 @@
  */
 
 import { buildClient } from '../sdk';
-import { listCells, listHeader, listLayout, ownerColumnWidth, sealToAgentMap } from './cells';
+import { cleanCell, listCells, listHeader, listLayout, ownerColumnWidth, sealToAgentMap } from './cells';
 import { termWidth } from '../textfit';
 import { CliError } from '../errors';
 import { emitOk, print } from '../envelope';
@@ -41,8 +41,11 @@ export async function run(ctx: CommandContext): Promise<void> {
   // Validate --phase BEFORE any network work: a typo'd phase must be a loud
   // exit-2, not a plausible-looking empty success (agent-walkthrough finding).
   if (ctx.positionals.length) {
-    throw new CliError('BAD_FLAG', `list takes no agent (got "${ctx.positionals[0]}")`, {
-      remedy: `0g-agentdna status ${ctx.positionals[0]}   # one agent's full picture`,
+    // An agent ref there wants that agent's picture; anything else, the help.
+    const word = cleanCell(ctx.positionals[0]);
+    const isRef = /^(?:\d+|0x[0-9a-fA-F]{8,64})$/.test(ctx.positionals[0]);
+    throw new CliError('BAD_FLAG', `list takes no argument (got "${word}")`, {
+      remedy: isRef ? `0g-agentdna status ${word}   # one agent's full picture` : '0g-agentdna --help',
     });
   }
   if (ctx.flags.phase && !PHASES.includes(ctx.flags.phase)) {

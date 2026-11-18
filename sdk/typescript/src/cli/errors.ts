@@ -39,6 +39,9 @@ export type ErrorCode =
   /** The agent has no agentId yet (still being minted, or its deploy failed
    *  before the mint): what needs one waits, or `retry` resumes it. */
   | 'AGENT_NOT_READY'
+  /** The agent's runtime image predates what was asked; a reset moves it to
+   *  the current image. */
+  | 'RUNTIME_TOO_OLD'
   // exit 4 — timeout
   | 'TIMEOUT'
   // exit 5 — auth/ownership
@@ -78,6 +81,7 @@ const EXIT_BY_CODE: Record<ErrorCode, number> = {
   INFERENCE_KEY_REQUIRED: EXIT.REMEDIABLE,
   INFERENCE_PROVIDER_UNSUPPORTED: EXIT.REMEDIABLE,
   AGENT_NOT_READY: EXIT.REMEDIABLE,
+  RUNTIME_TOO_OLD: EXIT.REMEDIABLE,
   TIMEOUT: EXIT.TIMEOUT,
   AUTH_REJECTED: EXIT.AUTH,
 };
@@ -140,6 +144,18 @@ export function currentSurface(): Surface {
 /** A command that exists only inside the shell, as a remedy. */
 export function shellStep(cmd: string): string {
   return surface === 'shell' ? `\`${cmd}\`` : `run \`0g-agentdna\` and type \`${cmd}\` there`;
+}
+
+/**
+ * A shell command and what it is for, as a whole sentence for where the
+ * owner is: at the prompt "type `retry 288` to resume it"; outside it "run
+ * `0g-agentdna` and type `retry 288` there to resume it". `purpose` is a
+ * verb phrase.
+ */
+export function shellTo(cmd: string, purpose: string): string {
+  return surface === 'shell'
+    ? `type \`${cmd}\` to ${purpose}`
+    : `run \`0g-agentdna\` and type \`${cmd}\` there to ${purpose}`;
 }
 
 /** A command that exists both in the shell and as a one-shot command. */

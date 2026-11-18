@@ -243,7 +243,8 @@ export async function assertModelFitsFramework(
   const entry = listed?.find((m) => m.id.toLowerCase() === model.toLowerCase());
   if (!listed || !entry || entry.tools) return;
   const able = listed.filter((m) => m.chat && m.tools).map((m) => m.id);
-  throw new CliError('BAD_FLAG', `${model} cannot call tools, and a ${framework} agent works through tool calls — it would fail every turn`, {
+  const an = /^[aeiou]/i.test(framework) ? 'an' : 'a';
+  throw new CliError('BAD_FLAG', `${model} cannot call tools, and ${an} ${framework} agent works through tool calls — it would fail every turn`, {
     remedy: able.length ? `pick a model that can: ${able.slice(0, 4).join(', ')}` : 'pick a model that can call tools',
   });
 }
@@ -383,7 +384,7 @@ export function renderListedVersions(
   listed: { sealed: readonly string[]; harness: readonly string[] },
   picks?: VersionPicks,
 ): string[] {
-  const lines = ['versions the trust registry lists (oldest first; pick with sealed=<hash> harness=<hash>):'];
+  const lines = ['listed versions, oldest first (pick with sealed=<hash> harness=<hash>):'];
   for (const layer of VERSION_KEYS) {
     const hashes = listed[layer];
     const pick = picks?.[layer]?.toLowerCase();

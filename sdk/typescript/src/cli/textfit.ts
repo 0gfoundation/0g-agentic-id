@@ -6,9 +6,11 @@
  * caller (`termWidth()` for stdout).
  */
 
-/** The terminal's width when `stream` is one; undefined when it is piped. */
+/** The columns text may use on `stream` when it is a terminal: its width
+ *  less the last column (a character there leaves the cursor pending a wrap
+ *  some terminals then take); undefined when it is piped. */
 export function termWidth(stream: NodeJS.WriteStream = process.stdout): number | undefined {
-  return stream.isTTY && stream.columns ? stream.columns : undefined;
+  return stream.isTTY && stream.columns ? Math.max(20, stream.columns - 1) : undefined;
 }
 
 /**
@@ -112,4 +114,25 @@ export function didYouMean(typed: string, words: readonly string[]): string | un
   }
   // Close means at most 2 edits, and fewer than half the word's letters.
   return best !== undefined && bestD <= 2 && bestD * 2 < Math.max(t.length, best.length) ? best : undefined;
+}
+
+/**
+ * Text of whole lines fitted to `width` (undefined: as it is): a line wider
+ * than the terminal is wrapped between words, its later lines indented under
+ * where its text starts — after a label column (`prepaid balance : `,
+ * `sealId:    `, `✓ attestor        `), after `error: ` / `fix: ` / `→ `, or
+ * at the line's own indent. The one word-wrap every shell and one-shot
+ * message goes through.
+ */
+export function fitLines(text: string, width: number | undefined): string {
+  if (!width) return text;
+  const cols = (s: string): number => [...s].length;
+  return text.split('\n').map((line) => {
+    if (cols(line) <= width) return line;
+    const lead = /^\s*/.exec(line)?.[0] ?? '';
+    const label = /^(\s*(?:error(?: \([A-Z_]+\))?: |fix: |→ |⚠ |[✓✗⊘] \S+\s+|\S[^:]{0,24}?(?: {2,}(?::\s+)?|: +)))\S/.exec(line);
+    let head = label ? label[1] : lead;
+    if (cols(head) > width / 2) head = lead;
+    return wrap(line.slice(head.length), width, ' '.repeat(cols(head)), head).join('\n');
+  }).join('\n');
 }

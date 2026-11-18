@@ -18,7 +18,7 @@ import { RPC_URL } from '../../constants';
 import { buildClient, unreachableReason } from '../sdk';
 import { renamedAttestor } from '../config';
 import { attestorUrlRemedy } from '../env';
-import { CliError, currentSurface, shellStep, type ErrorCode } from '../errors';
+import { CliError, currentSurface, shellStep, shellTo, type ErrorCode } from '../errors';
 import { explainError } from '../plain';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
@@ -83,7 +83,7 @@ export async function run(ctx: CommandContext): Promise<void> {
         detail: `${env.attestorUrl} did not answer (${unreachableReason(e)})`,
         remedy: env.attestorUrlSource === 'env'
           ? 'check AGENTIC_ATTESTOR_URL and your network, then retry'
-          : `check your network, then retry — ${shellStep('login')} changes the address`,
+          : `check your network and retry, or ${shellTo('login', 'change the address')}`,
       });
     }
   }
@@ -127,7 +127,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     checks.push({
       name: 'wallet', status: 'fail', code: 'WALLET_REQUIRED',
       detail: `${env.privateKeySource === 'file' ? 'the owner key saved by login' : 'AGENTIC_PRIVATE_KEY'} is malformed (expected 64 hex chars, 0x prefix optional)`,
-      remedy: env.privateKeySource === 'file' ? `${shellStep('login')} and enter the key again` : 'export AGENTIC_PRIVATE_KEY=0x<64 hex chars>',
+      remedy: env.privateKeySource === 'file' ? shellTo('login', 'enter the key again') : 'export AGENTIC_PRIVATE_KEY=0x<64 hex chars>',
     });
   } else {
     owner = privateKeyToAccount(env.privateKey).address;
