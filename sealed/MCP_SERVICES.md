@@ -142,8 +142,9 @@ default 256 MiB, 64–4096) and the blocks allocated below its private `$HOME`,
 the same 2 s tick, while the filesystem holding the task directories has less
 than 1 GiB or 65536 inodes free, sealed stops every service process and refuses
 new ones; that also reclaims space no walk sees, such as files deleted while
-still open. These are watched, not kernel limits: a burst between two reads can
-pass them. Memory no process has resident (a memfd written but not mapped, pipe
+still open. From the same line the owner's status shows a disk warning
+([ARCHITECTURE.md](ARCHITECTURE.md) §9, The sandbox disk). These are watched,
+not kernel limits: a burst between two reads can pass them. Memory no process has resident (a memfd written but not mapped, pipe
 buffers) is bounded only by the sandbox's memory limit. Under memory pressure
 the kernel's OOM killer takes service processes first (`oom_score_adj` 1000),
 and Landlock keeps them from lowering it. Cleanup becomes the identity and signals every process of it (a

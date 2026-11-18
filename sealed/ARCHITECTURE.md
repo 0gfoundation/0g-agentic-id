@@ -857,6 +857,29 @@ After Phase 4, `main.go` starts a goroutine that calls
 failures only log and don't affect the process; the attestor's 15-min
 threshold is the backstop.
 
+### The sandbox disk
+
+sealed, the agent and the programs it hosts share one sandbox disk, with no
+quota inside it. `diskwatch.go` reads the free space of the filesystem that
+holds the agent's home (`privsep.AgentHome()`) once before the boot's first
+report and every minute after. Below servicehost's reserve, 1 GiB
+(`DiskReserveBytes`) or, where the filesystem counts them, 65536 inodes
+(`DiskReserveInodes`), the status is a `warning`: "sandbox disk nearly full:
+412 MiB free; ask the agent to delete files it no longer needs, or reset it"
+("room for N more files" when inodes run out). The line is servicehost's
+because below it sealed stops every hosted service process and refuses new
+ones ([MCP_SERVICES.md](MCP_SERVICES.md)), so the owner hears about the disk
+when the agent starts losing what it runs. The warning clears once free space
+is back 512 MiB (and 32768 inodes) above the line, so files written and
+deleted around it do not raise and clear it every minute. Rising and clearing
+are reported at once; the free figure in between reaches the attestor with
+the heartbeat. Like the settings warning it shows while nothing else is
+wrong, after that warning, and an unreadable filesystem leaves it as it was.
+The owner reads it where every warning shows: the deployment row's
+`container_status` ([attestor README](../attestor/README.md)) and the
+`warning` line of the CLI's session card
+([docs/cli-reference.md](../docs/cli-reference.md)).
+
 ### Where serve-proof's `data_hash` comes from
 
 The serve-proof envelope's `data_hashes` is a **flat list of the `data_hash`

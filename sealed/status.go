@@ -49,7 +49,10 @@ type runtimeStatus struct {
 	// settingsIssue is why the settings this boot runs on give the agent
 	// no usable model (e.g. a clone whose new owner has not written any).
 	// It shows like pinned, after it, until a settings push applies.
-	settingsIssue     string
+	settingsIssue string
+	// diskIssue is why the sandbox disk is nearly full (diskwatch.go). It
+	// shows like settingsIssue, after it, until the disk has room again.
+	diskIssue         string
 	supervisorFailure string
 	// modelKeyIssue is why the framework is stopped: the model key the
 	// settings choose cannot be used (modelkey.go). Cleared once a key
@@ -80,6 +83,9 @@ func (s *runtimeStatus) effective() (string, string) {
 	}
 	if s.level == "running" && s.settingsIssue != "" {
 		return "warning", s.settingsIssue
+	}
+	if s.level == "running" && s.diskIssue != "" {
+		return "warning", s.diskIssue
 	}
 	return s.level, s.message
 }
@@ -167,6 +173,14 @@ func (s *runtimeStatus) SettingsIssue(message string) string {
 	prev, _ := s.effective()
 	s.settingsIssue = message
 	return prev
+}
+
+// DiskIssue sets (or, with "", clears) the disk warning described on
+// runtimeStatus.
+func (s *runtimeStatus) DiskIssue(message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.diskIssue = message
 }
 
 // severityOf tells an owner-recoverable commit failure ("warning":
