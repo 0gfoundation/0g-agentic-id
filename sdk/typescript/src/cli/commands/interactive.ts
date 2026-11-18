@@ -1376,7 +1376,7 @@ async function chatInSession(s: Session, line: string, irq: Interrupt): Promise<
   if (s.attached?.length) {
     if (s.attached.some((a) => !!a.image)) { out('images go with owner-chat messages only — /sessions default, or /attach clear\n'); return; }
     try {
-      ({ text: sent } = await prepareAttachments(s.attached, line, client, (a, path) => out(`uploaded ${cleanCell(a.name)} → ${cleanCell(path)}\n`)));
+      ({ text: sent } = await prepareAttachments(s.attached, line, client, (a) => out(`uploaded ${cleanCell(a.name)}\n`)));
     } catch (e) {
       out(`not sent: ${cleanCell((e as Error).message)} — the attachments stay staged (/attach lists them)\n`);
       return;
@@ -4263,7 +4263,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     let images: ChatImage[] = [];
     if (s.attached?.length) {
       try {
-        ({ text: sent, images } = await prepareAttachments(s.attached, line, s.client, (a, path) => out(`uploaded ${cleanCell(a.name)} → ${cleanCell(path)}\n`)));
+        ({ text: sent, images } = await prepareAttachments(s.attached, line, s.client, (a) => out(`uploaded ${cleanCell(a.name)}\n`)));
       } catch (e) {
         out(`not sent: ${cleanCell((e as Error).message)} — the attachments stay staged (/attach lists them)\n`);
         continue;
