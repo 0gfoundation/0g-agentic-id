@@ -2,7 +2,8 @@
  * @file status.ts
  * @description `0g-agentdna status <agent>` — one agent's full picture
  * (spec v0.03 §3.2): all three coordinates (agentId / sealId / agentSeal),
- * phase, url, and the FOLDED failure reason. `<agent>` is a decimal agentId
+ * phase, and the FOLDED failure reason (`--json` also carries the container
+ * url, which the human output leaves out). `<agent>` is a decimal agentId
  * or a 0x… sealId; the command resolves the other coordinates from chain +
  * the attestor listing.
  *
@@ -162,7 +163,6 @@ export async function run(ctx: CommandContext): Promise<void> {
   print(`agentSeal:      ${show(data.agentSeal)}`);
   print(`owner:          ${show(data.owner)}`);
   print(`phase:          ${show(data.phase)}`);
-  print(`url:            ${show(data.url)}`);
   print(`name:           ${show(data.name)}`);
   print(`createdAt:      ${show(data.createdAt)}`);
   print(`failureReason:  ${show(data.failureReason)}`);

@@ -1318,6 +1318,10 @@ interface Session {
   sessionTitle?: string;
   /** The session's prompt and the turn on screen (sessionRepl). */
   screen?: SessionScreen;
+  /** Why the container failed, when its last stage did (refreshSession). */
+  failure?: string;
+  /** The last refresh could not reach the attestor. */
+  stale?: boolean;
 }
 
 /** What a session's turns need from its prompt. */
@@ -1556,11 +1560,36 @@ function proxyAddrOf(attestorUrl: string): Promise<string | undefined> {
   return p;
 }
 
-/** Re-read the deployment row and resync the session, printing the result:
- *  phase always; the container URL as soon as a sandbox exists (the sealed
- *  runtime serves /log while still `deploying`); the chat client only when
- *  running (and dropped again when not, so a stale connection can't linger). */
-async function refreshSession(s: Session, quiet = false): Promise<void> {
+/** The agent's phase on one line, with why the container failed when it did. */
+export function phaseLine(phase: string, failure?: string): string {
+  return `  phase   ${phase}${failure ? ` — last error: ${failure}` : ''}\n`;
+}
+
+/** What the Ink view's footer says about an agent that is not running, with
+ *  the way out ('' while it runs). */
+export function phaseNote(phase: string, failure?: string): string {
+  if (phase === 'running') return '';
+  if (phase === 'stopped') return 'stopped — /start';
+  if (phase === 'offline') return 'offline — /reset';
+  if (phase === 'failed') return `failed — /reset${failure ? ` · ${failure}` : ''}`;
+  if (phase === 'deploying') return 'deploying…';
+  return phase;
+}
+
+/**
+ * Re-read the deployment row and resync the session: the phase; the
+ * container URL as soon as a sandbox exists (the sealed runtime serves /log
+ * while still `deploying`), kept for the session's own requests and never
+ * printed; the chat client only when running (and dropped again when not,
+ * so a stale connection can't linger). What it says: the phase on one line,
+ * every time (`always`) or when it moved (`moved`); under the Ink view
+ * (`view`) nothing, as its footer shows the phase. Exported for the tests.
+ */
+export async function refreshSession(
+  s: Session,
+  say: 'always' | 'moved' | 'never' = 'always',
+  view: { refresh(): void } | null = activeInk,
+): Promise<void> {
   const before = s.phase;
   const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`)).json()) as {
     phase?: string; url?: string; sandbox_id?: string;
@@ -1581,11 +1610,11 @@ async function refreshSession(s: Session, quiet = false): Promise<void> {
     s.sandboxId = d.sandbox_id ?? s.sandboxId;
     s.client = undefined;
   }
-  if (quiet && s.phase === before) return; // background refresh: report only movement
-  out(`  phase   ${s.phase}\n`);
-  if (s.url) out(`  url     ${s.url}\n`);
-  const reason = d.container_stage?.state === 'failed' ? d.container_stage.reason : undefined;
-  if (reason) out(`  last error: ${reason}\n`);
+  s.failure = d.container_stage?.state === 'failed' ? d.container_stage.reason ?? undefined : undefined;
+  s.stale = false;
+  if (view) { view.refresh(); return; }
+  if (say === 'never' || (say === 'moved' && s.phase === before)) return; // background refresh: report only movement
+  out(phaseLine(s.phase, s.failure));
 }
 
 /** An agent's container state just before a lifecycle request was sent. */
@@ -1846,6 +1875,9 @@ async function closeInk(screen: InkScreen<Ask>): Promise<void> {
   // Ctrl-D at the view's empty prompt leaves the shell, as at readline's.
   if (inkEof) io.rl.close();
 }
+
+/** How often the Ink view re-reads the phase of an agent that is not running. */
+const PHASE_POLL_MS = 10_000;
 
 /** The owner's message as the Ink view's transcript shows it: a file dragged
  *  in (attach.ts findDroppedFiles) by its name, `[image: cat.png]`, not its path. */
@@ -2454,7 +2486,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
           await ag.agent.start(row.sealId, row.sandboxId);
           const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
-          if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
+          if (r) out(`running — enter with: use ${row.agentId}\n`);
           continue;
         }
         // reset — the row remembers its framework; ask only when unknown
@@ -2479,7 +2511,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
         if (r) {
           await ag.credentials.resyncModelKey(row.sealId, { agentUrl: r.url }).catch(() => undefined);
-          out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
+          out(`running — enter with: use ${row.agentId}\n`);
         }
         continue;
       }
@@ -3482,6 +3514,32 @@ export function warningOf(status: { level: string; reason: string | null } | nul
   return line.length > 200 ? `${line.slice(0, 199)}…` : line;
 }
 
+/**
+ * The entry card's lines (beside the avatar): who the agent is, its phase,
+ * sealId, gas, a warning, and how to go on. No container URL: that is the
+ * session's own address for the agent, not one the owner uses. Exported for
+ * the tests.
+ */
+export function sessionCardFields(c: {
+  agentId: string; name?: string | null; phase: string; sealId: string; gasWei: bigint | null;
+  warning: string | null; connected: boolean; failure?: string;
+}): string[] {
+  const fields = [
+    `agent ${c.agentId}${c.name ? ` · ${c.name}` : ''}`,
+    `phase    ${c.phase}`,
+    `sealId   ${c.sealId.slice(0, 10)}…${c.sealId.slice(-6)}`,
+  ];
+  if (c.gasWei != null) fields.push(`gas      ${og(c.gasWei)} (agentSeal — fund with /topup)`);
+  if (c.warning) fields.push(`warning  ${c.warning}`);
+  if (c.connected) {
+    fields.push('type to chat · /help for commands · Esc interrupts a turn');
+  } else {
+    if (c.failure) fields.push(`last error: ${c.failure}`);
+    fields.push(c.phase === 'stopped' ? '→ /start to bring it back' : '→ /reset to recreate its container');
+  }
+  return fields;
+}
+
 async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask: (q: string) => Promise<string>): Promise<Session> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listDeployments();
@@ -3530,24 +3588,14 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
       remedy: `talk to its public surface with: hello ${agentId}`,
     });
   }
-  const fields: string[] = [];
-  fields.push(`agent ${agentId}${row.name ? ` · ${row.name}` : ''}`);
-  fields.push(`phase    ${s.phase}`);
-  if (s.url) fields.push(`url      ${s.url}`);
-  fields.push(`sealId   ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}`);
-  if (gasWei != null) fields.push(`gas      ${og(gasWei)} (agentSeal — fund with /topup)`);
   // A running agent can still report a warning, e.g. its data not reaching
   // chain because the agentSeal wallet cannot pay: say so where the owner
   // looks first.
   const warning = mine ? warningOf(mine.containerStatus) : null;
-  if (warning) fields.push(`warning  ${warning}`);
-  if (s.phase === 'running' && s.url) {
-    fields.push('type to chat · /help for commands · Esc interrupts a turn');
-  } else {
-    const reason = await failureReasonOf(attestorUrl, row.sealId);
-    if (reason) fields.push(`last error: ${reason}`);
-    fields.push(s.phase === 'stopped' ? '→ /start to bring it back' : '→ /reset to recreate its container');
-  }
+  const connected = s.phase === 'running' && !!s.url;
+  const failure = connected ? undefined : await failureReasonOf(attestorUrl, row.sealId);
+  if (failure) s.failure = failure;
+  const fields = sessionCardFields({ agentId, name: row.name, phase: s.phase, sealId: row.sealId, gasWei, warning, connected, failure });
   out('\n');
   if (art) {
     for (let i = 0; i < Math.max(art.length, fields.length); i++) {
@@ -3625,7 +3673,8 @@ const L2_HELP_FULL = `session commands
   (status)                2 notices · 1 new file: notices waiting to print
                           and files the agent left that are not saved yet
                           (at the status line's right, or in the prompt)
-  (bare Enter)            refresh this agent's phase/url from the attestor
+  (bare Enter)            refresh this agent's phase from the attestor (in
+                          the framed view its footer shows it)
   /hello [full]           identity, serve-proof verification, services one
                           per line, owner routes on one line by kind; full
                           prints every field of every service and route
@@ -3844,10 +3893,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   };
   s.screen = screen;
   // Under the Ink view the counts are on its status row, the agent in its footer.
+  // Its footer also says when the agent is not running, and the way out.
   if (activeInk) {
     activeInk.context = {
       agent: () => `agent ${s.agentId}${sessionLabel(s)}`,
       counts: () => promptStatus(counts()).replace(/^ · /, ''),
+      state: () => {
+        const note = phaseNote(s.phase, s.failure);
+        return s.stale ? `${note ? `${note} · ` : ''}attestor unreachable` : note;
+      },
     };
   }
   // What the prompt counts changed: the prompt on screen says so.
@@ -3868,6 +3922,20 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     recount();
   };
   const inbox = makeInboxFeed((text, shown, count) => show(text, shown, { notices: count }));
+  // Under the Ink view the footer follows the phase while the agent is not
+  // running: re-read quietly while the prompt is up (connecting once it runs).
+  let phaseBusy = false;
+  const phaseTimer = activeInk
+    ? setInterval(() => {
+        if (!atPrompt || s.client || phaseBusy) return;
+        phaseBusy = true;
+        refreshSession(s, 'never').then(
+          () => inbox.follow(s.client),
+          () => { s.stale = true; activeInk?.refresh(); },
+        ).finally(() => { phaseBusy = false; });
+      }, PHASE_POLL_MS)
+    : null;
+  phaseTimer?.unref();
   // An interrupted turn sends nothing on its own: what was queued during it
   // comes back to be edited at the next prompt.
   screen.interrupted = (): string => {
@@ -3922,7 +3990,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // auto-refresh before every prompt, printing only when it moves (and
     // connecting the moment it reaches running). Once connected, skip: no
     // per-chat-line attestor round-trip; bare Enter stays the manual refresh.
-    if (!s.client) { try { await refreshSession(s, true); } catch { /* prompt anyway */ } }
+    if (!s.client) { try { await refreshSession(s, 'moved'); } catch { /* prompt anyway */ } }
     inbox.follow(s.client);
     if (screen.turnRan) {
       screen.turnRan = false;
@@ -3972,7 +4040,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (!line) {
       // Bare Enter = live status refresh (phase moves on its own during
       // deploying/provisioning; the entry card only showed the initial one).
-      try { await refreshSession(s); } catch { out(`  phase   ${s.phase} (refresh failed — attestor unreachable)\n`); }
+      try {
+        await refreshSession(s);
+      } catch {
+        s.stale = true;
+        if (activeInk) activeInk.refresh();
+        else out(`  phase   ${s.phase} (refresh failed — attestor unreachable)\n`);
+      }
       continue;
     }
     // Files dragged into the terminal (or pasted paths) go with this message,
@@ -4062,7 +4136,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
         if (!r) continue;
         await connectSession(s, r.url);
-        out(`running at ${s.url}\n`); continue;
+        out('running — type to chat\n'); continue;
       }
       if (line === '/reset' || line === '/reset pick') {
         // Known framework (the attestor row remembers it, or this session
@@ -4087,7 +4161,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!r) continue;
         await s.ag.credentials.resyncModelKey(s.sealId, { agentUrl: r.url }).catch(() => undefined);
         await connectSession(s, r.url);
-        messages.length = 0; out(`back up at ${s.url}\n`); continue;
+        messages.length = 0; out('back up — type to chat\n'); continue;
       }
       if (line === '/clear') {
         // Wipe the agent's persisted conversation (server-side) and this
@@ -4962,6 +5036,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     irq.brake = null; // leaving the session: idle-Esc no longer targets this agent
     inbox.stop();
     if (outboxTimer) clearInterval(outboxTimer);
+    if (phaseTimer) clearInterval(phaseTimer);
     s.screen = undefined;
   }
 }

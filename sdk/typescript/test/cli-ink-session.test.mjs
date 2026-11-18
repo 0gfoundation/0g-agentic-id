@@ -138,6 +138,11 @@ test('the box: a rule above and below the ❯ line, the footer under it; a sent 
   assert.deepEqual(await p, { text: 'hello there', multi: false, pasted: false });
   // No question is up any more: the footer names the agent only.
   assert.deepEqual((await v.read()).shown, ['earlier output', '❯ hello there', v.rule, '❯', v.rule, 'agent 625']);
+  // A bare Enter (the session's refresh) leaves nothing in the transcript.
+  const bare = v.ask.message(INK_PROMPT);
+  await v.type('\r');
+  assert.equal((await bare).text, '');
+  assert.deepEqual((await v.read()).shown, ['earlier output', '❯ hello there', v.rule, '❯', v.rule, 'agent 625']);
   await v.scr.close();
 });
 

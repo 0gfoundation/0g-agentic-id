@@ -98,8 +98,9 @@ COMMANDS
                    the ack/deposit remedies are transactions (they need gas)
                    executed via the deploy console or the SDK, not this CLI.
   status <agent>   One agent's full picture: phase, agentId/sealId/agentSeal,
-                   url, failure reason. <agent> is a decimal agentId (33) or a
-                   0x… sealId — the CLI converts between them for you.
+                   failure reason (--json also carries the container url).
+                   <agent> is a decimal agentId (33) or a 0x… sealId — the
+                   CLI converts between them for you.
   list             List deployments. --mine (owner-signed, needs
                    AGENTIC_PRIVATE_KEY) adds owner-only fields such as the
                    failure reason and sandboxId.

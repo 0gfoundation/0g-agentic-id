@@ -319,6 +319,8 @@ export interface InkContext {
   agent(): string;
   /** e.g. `2 notices · 1 new file`, '' for none. */
   counts(): string;
+  /** The agent when it is not running, with the way out (`stopped — /start`); '' while it runs. */
+  state?(): string;
 }
 
 const CSI = /\u001b\[[0-?]*[ -/]*[@-~]|\u009b[0-?]*[ -/]*[@-~]/g;
@@ -524,8 +526,9 @@ export class InkScreen<A extends InkAsk = InkAsk> {
   refresh(): void { this.schedule(); }
 
   private echo(kind: string, q: string, text: string): void {
-    if (kind === 'message') this.owner(text);
-    else this.questionLine(q, this.masked ? '*'.repeat([...text].length) : text);
+    // A bare Enter at the message prompt (a refresh) leaves no line behind.
+    if (kind === 'message') { if (text.trim()) this.owner(text); return; }
+    this.questionLine(q, this.masked ? '*'.repeat([...text].length) : text);
   }
 
   private questionLine(q: string, text: string): void {
@@ -678,7 +681,7 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     const hint = turn
       ? `${turn.steers ? 'Enter steers · Tab queues' : 'Enter queues'}${back} · Esc stops`
       : asking ? 'Esc cancels' : w ? 'Tab completes · /help' : back.slice(3);
-    const footer = [this.context.agent(), hint].filter(Boolean).join(' · ');
+    const footer = [this.context.agent(), this.context.state?.() ?? '', hint].filter(Boolean).join(' · ');
     let footerRow: El | null = footer ? this.text({ dimColor: true }, fitRow(footer, cols)) : null;
     let compRow: El | null = this.completions ? this.text({ dimColor: true }, fitRow(this.completions.join('  '), cols)) : null;
     const rule = this.text({ dimColor: true }, '─'.repeat(cols));
