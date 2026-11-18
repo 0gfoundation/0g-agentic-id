@@ -2078,7 +2078,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           if (row.phase === 'running') { say(`agent ${row.agentId} is already running\n`); continue; }
           if (row.phase !== 'stopped' || !row.sandboxId) { say(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
           if (!(await ensureOwnerReady(ag, ask))) { say('start cancelled — prepaid balance too low\n'); continue; }
-          say(`starting agent ${row.agentId}… (Esc cancels the wait)\n`);
+          say(`starting agent ${row.agentId}…\n`);
           const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
           await ag.agent.start(row.sealId, row.sandboxId);
           const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
@@ -2101,7 +2101,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const key = await resetModelKey(ag.credentials, row.sealId, provider, framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(ag, ask))) { say('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(ag, row.sealId, plan, out);
-        say(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
+        say(`resetting agent ${row.agentId} as ${framework}…\n`);
         const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
         await ag.agent.reset(row.sealId, { provider, framework, ...key, onWarn: (w) => say(`⚠ ${w}\n`) });
         const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
@@ -3583,7 +3583,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (s.phase === 'running') { out('already running\n'); continue; }
         if (s.phase !== 'stopped' || !s.sandboxId) { out(`agent is ${s.phase} — a plain start cannot revive it; use /reset\n`); continue; }
         if (!(await ensureOwnerReady(s.ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
-        out('starting… (Esc cancels the wait)\n');
+        out('starting…\n');
         const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
         await s.ag.agent.start(s.sealId, s.sandboxId);
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
@@ -3607,7 +3607,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const key = await resetModelKey(s.ag.credentials, s.sealId, provider, s.framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(s.ag, s.sealId, plan, out);
-        out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
+        out(`resetting as ${s.framework}…\n`);
         const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
         await s.ag.agent.reset(s.sealId, { provider, framework: s.framework, ...key, onWarn: (w) => out(`⚠ ${w}\n`) });
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
