@@ -848,7 +848,11 @@ commit is tried on the next tick, and a success starts over. A retry uploads
 only what the failed attempt did not (`internal/uploader/pending.go`): the
 blobs an attempt uploaded before a later upload or the update failed are
 reused, with the data key minted for a role not yet on chain, so each blob
-is paid for once. This is kept in memory for the boot.
+is paid for once. Content that comes back to what an earlier commit of the
+boot held (a memory added and removed again, a change undone) is committed by
+reference to the blobs uploaded then, under the same data key, whatever path
+an entry is at (`internal/uploader/uploaded.go`): only the update is sent.
+Both are kept in memory for the boot.
 
 ### `runHeartbeat`'s 5-min ticker
 
