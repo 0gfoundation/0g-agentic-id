@@ -2,7 +2,7 @@
 // a title or "(untitled)"; switch by number, id, id prefix or title words.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { agoText, pickSession, renderSessionList, shortSessionId } from '../dist/cli/commands/interactive.js';
+import { agoText, completeLine, pickSession, renderSessionList, sessionCompletions, shortSessionId } from '../dist/cli/commands/interactive.js';
 
 const NOW = 1_800_000_000_000;
 const list = [
@@ -37,4 +37,18 @@ test('switch by number, id, id prefix or title words', () => {
   assert.equal(pickSession(list, 'NIGHTLY').id, 'sess-bbbbbbbb-0000-0000-0000-000000000000');
   assert.equal(pickSession(list, '9'), undefined);
   assert.equal(pickSession(list, 'nothing like it'), undefined);
+});
+
+test('Tab after /sessions offers the subcommands and the sessions to switch to', () => {
+  const offered = sessionCompletions(list);
+  assert.deepEqual(offered.slice(0, 4), ['list', 'new ', 'fork ', 'default']);
+  assert.ok(offered.includes('switch sess-5d25f787'));
+  assert.ok(offered.includes('switch owner-chat'));
+  assert.ok(offered.includes('switch nightly report'));
+  const state = { completions: ['/sessions'], args: { '/sessions': () => offered }, models: [] };
+  assert.deepEqual(completeLine('/sessions sw', state)[0].slice(0, 2), ['switch sess-bbbbbbbb', 'switch nightly report']);
+  assert.deepEqual(completeLine('/sessions switch sess-5', state), [['switch sess-5d25f787'], 'switch sess-5']);
+  assert.deepEqual(completeLine('/sessions d', state), [['default'], 'd']);
+  // Before any list: the subcommands and a bare `switch `.
+  assert.ok(sessionCompletions([]).includes('switch '));
 });

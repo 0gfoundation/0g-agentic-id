@@ -403,6 +403,22 @@ export function agoText(atMs: number, nowMs: number): string {
   return `${Math.floor(s / 86_400)} d ago`;
 }
 
+/**
+ * What Tab offers after `/sessions`: its subcommands, and `switch <short id>`
+ * and `switch <title>` for each session in `list` (as {@link orderSessions}
+ * orders them).
+ */
+export function sessionCompletions(list: readonly AgentSession[]): string[] {
+  const out = ['list', 'new ', 'fork ', 'default'];
+  for (const x of orderSessions(list)) {
+    out.push(`switch ${shortSessionId(x.id)}`);
+    const title = x.title?.trim();
+    if (title && !/\s{2,}|[\u0000-\u001f]/.test(title)) out.push(`switch ${title}`);
+  }
+  if (!list.length) out.push('switch ');
+  return [...new Set(out)];
+}
+
 /** Sessions as `/sessions` numbers them: the most recently active first. */
 export function orderSessions(list: readonly AgentSession[]): AgentSession[] {
   return [...list].sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0));
@@ -622,7 +638,12 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/files': ['inbox', 'auto', 'auto on', 'auto off'],
   // What the outbox held when /files listed it or a turn reported it.
   '/download': () => outboxNames,
+  // Subcommands, and the sessions last seen (entering the session, /sessions).
+  '/sessions': () => sessionCompletions(sessionsSeen),
+  '/tasks': ['list', 'all', 'new ', 'show ', 'input ', 'cancel ', 'archive '],
 };
+/** The sessions last listed in this agent's session, for `/sessions` completion. */
+let sessionsSeen: AgentSession[] = [];
 /** The outbox names last seen in this session (/files, a turn's notice), for completion. */
 let outboxNames: string[] = [];
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
@@ -3508,6 +3529,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   for (;;) {
     activeCompletions = L2_WORDS;
     activeArgs = L2_ARGS;
+    if (sessionSealId !== s.sealId) {
+      sessionsSeen = [];
+      // Prefetch the session list for Tab; failures just leave it empty.
+      s.client?.sessions?.().then((l) => { sessionsSeen = l; }).catch(() => undefined);
+    }
     sessionSealId = s.sealId;
     // While not connected (deploying/stopped/offline) the phase is in flux —
     // auto-refresh before every prompt, printing only when it moves (and
@@ -3834,6 +3860,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const arg = rest.join(' ').trim();
         if (!sub || sub === 'list') {
           const list = await s.client.sessions();
+          sessionsSeen = list;
           for (const l of renderSessionList(list, s.sessionId ?? 'owner-chat', Date.now())) out(`${l}\n`);
           out('/sessions switch <#|id|title> · new [title] · fork [id] · default\n');
           continue;
@@ -3849,6 +3876,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (sub === 'switch') {
           if (!arg) { out('usage: /sessions switch <#|id|title>\n'); continue; }
           const list = await s.client.sessions();
+          sessionsSeen = list;
           const hit = pickSession(list, arg);
           if (!hit) { out(`no session matches ${cleanCell(arg)}\n`); continue; }
           s.sessionId = hit.id === 'owner-chat' ? undefined : hit.id; s.sessionTitle = hit.title;
