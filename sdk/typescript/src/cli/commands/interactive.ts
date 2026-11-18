@@ -360,12 +360,17 @@ export function renderTaskTable(tasks: HarnessTask[], nowMs: number, width = 100
   // Ids as /activities shows them: short, a unique start (/tasks show takes it).
   const ids = shortIds(tasks.map((t) => cleanCell(t.id)));
   const idw = Math.max(2, ...ids.map((id) => id.length)) + 2;
+  // Narrow: AGE goes first, then RUNS, then OPEN, before TITLE is squeezed.
+  const show = { open: true, runs: true, age: true };
+  const room = (): number => width - 2 - idw - 13 - (show.open ? 6 : 0) - (show.runs ? 6 : 0) - (show.age ? 6 : 0);
+  for (const k of ['age', 'runs', 'open'] as const) if (room() < 18) show[k] = false;
+  const titleW = Math.max(10, Math.min(60, room()));
   return [
-    `  ${'ID'.padEnd(idw)}${'STATE'.padEnd(13)}${'OPEN'.padEnd(6)}${'RUNS'.padEnd(6)}${'AGE'.padEnd(6)}TITLE`,
+    `  ${'ID'.padEnd(idw)}${'STATE'.padEnd(13)}${show.open ? 'OPEN'.padEnd(6) : ''}${show.runs ? 'RUNS'.padEnd(6) : ''}${show.age ? 'AGE'.padEnd(6) : ''}TITLE`,
     ...tasks.map((t, i) =>
       `  ${ids[i].padEnd(idw)}${cellText(t.state + (t.reason ? ` (${t.reason})` : ''), 13)}` +
-      `${String(t.records?.length ?? 0).padEnd(6)}${String(t.runs?.count ?? 0).padEnd(6)}` +
-      `${span(nowMs / 1000 - t.created_at).padEnd(6)}${fitRow(cleanCell(t.title), Math.max(10, Math.min(60, width - 2 - idw - 31)))}`),
+      `${show.open ? String(t.records?.length ?? 0).padEnd(6) : ''}${show.runs ? String(t.runs?.count ?? 0).padEnd(6) : ''}` +
+      `${show.age ? span(nowMs / 1000 - t.created_at).padEnd(6) : ''}${fitRow(cleanCell(t.title), titleW)}`),
   ];
 }
 
@@ -1547,6 +1552,40 @@ const term = (s: string): void => {
  * nothing of that may restyle, hide or rewrite what the owner reads.
  */
 const out = (s: string): void => term(termWrap(cleanStream(s)));
+
+/**
+ * A help text written for 80 columns (`  /cmd …` with its description from
+ * column 26, further lines of it indented to there) in rows of at most
+ * `width` columns: each description joined back into one and wrapped once,
+ * its further rows under the description column; at a width too narrow for
+ * that, the description goes under the command. Other lines as they are.
+ * Exported for the tests.
+ */
+export function helpRows(text: string, width: number): string[] {
+  if (!Number.isFinite(width)) return text.split('\n');
+  const COL = 26;
+  const entries: Array<{ head: string; desc: string } | string> = [];
+  for (const l of text.split('\n')) {
+    const last = entries[entries.length - 1];
+    if (/^ {26}\S/.test(l) && last && typeof last !== 'string') { last.desc += ` ${l.trim()}`; continue; }
+    if (/^ {2}\S/.test(l) && l.length > COL && / $/.test(l.slice(0, COL)) && /^\S/.test(l.slice(COL))) {
+      entries.push({ head: l.slice(0, COL), desc: l.slice(COL).trim() });
+      continue;
+    }
+    entries.push(l);
+  }
+  const rows: string[] = [];
+  for (const e of entries) {
+    if (typeof e === 'string') { rows.push(...wrapProse(e, width)); continue; }
+    if (width - COL >= 24) {
+      wrapProse(e.desc, width - COL).forEach((r, i) => rows.push(`${i ? ' '.repeat(COL) : e.head}${r}`));
+    } else {
+      rows.push(e.head.trimEnd());
+      for (const r of wrapProse(e.desc, width - 4)) rows.push(`    ${r}`);
+    }
+  }
+  return rows;
+}
 
 /** `/settings`' way to change them: the items after "change with:", in rows
  *  of at most `width` columns, further rows under the first item. Exported for the tests. */
@@ -3107,7 +3146,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           if (row.phase === 'running') { out(`agent ${row.agentId} is already running\n`); continue; }
           if (row.phase !== 'stopped' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
           if (!(await ensureOwnerReady(ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
-          out(`starting agent ${row.agentId}… (Esc cancels the wait)\n`);
+          out(`starting agent ${row.agentId}…\n`);
           const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
           await ag.agent.start(row.sealId, row.sandboxId);
           const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
@@ -3130,7 +3169,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const key = await resetModelKey(ag.credentials, row.sealId, provider, framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(ag, row.sealId, plan, out);
-        out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
+        out(`resetting agent ${row.agentId} as ${framework}…\n`);
         const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
         await ag.agent.reset(row.sealId, { provider, framework, ...key, onWarn: (w) => out(`⚠ ${w}\n`) });
         const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
@@ -4362,7 +4401,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 const L2_HELP =
   'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /sessions /activities /tasks /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
-const L2_HELP_FULL = `session commands
+export const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
                           turn in flight (the runtime cancels server-side);
                           at a question a command asks, they cancel it
@@ -4755,7 +4794,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (message) break commands;
     if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return 'back'; }
     if (line === '/quit' || line === '/exit') { await quitShell(0); }
-    if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
+    if (line === '/help') { for (const l of helpRows(L2_HELP_FULL, termWidth())) out(`${l}\n`); continue; }
 
     try {
       if (line === '/hello' || line.startsWith('/hello ')) {
@@ -4827,7 +4866,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (s.phase === 'running') { out('already running\n'); continue; }
         if (s.phase !== 'stopped' || !s.sandboxId) { out(`agent is ${s.phase} — a plain start cannot revive it; use /reset\n`); continue; }
         if (!(await ensureOwnerReady(s.ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
-        out('starting… (Esc cancels the wait)\n');
+        out('starting…\n');
         const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
         await s.ag.agent.start(s.sealId, s.sandboxId);
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
@@ -4851,7 +4890,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const key = await resetModelKey(s.ag.credentials, s.sealId, provider, s.framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(s.ag, s.sealId, plan, out);
-        out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
+        out(`resetting as ${s.framework}…\n`);
         const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
         await s.ag.agent.reset(s.sealId, { provider, framework: s.framework, ...key, onWarn: (w) => out(`⚠ ${w}\n`) });
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
@@ -5180,7 +5219,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (named && s.client?.activity) {
           const t = await s.client.activity(named).catch(() => null);
           if (t && t.type !== 'turn') {
-            out(`${cleanCell(t.id)} — ${cleanCell(t.status)} · by ${cleanCell(t.actor)} · ${cleanCell(t.label)}\n`);
+            out(`${shortIds([cleanCell(t.id)])[0]} — ${cleanCell(t.status)} · by ${cleanCell(t.actor)} · ${cleanCell(t.label)}\n`);
             if (t.output_text) out(`${cleanStream(t.output_text)}\n`);
             else if (t.type === 'command') out('(a command\'s output goes to the agent, which reports on it in a notice when the command finishes — /inbox)\n');
             if (t.error) out(`error: ${cleanCell(t.error)}\n`);
@@ -5206,7 +5245,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         });
         if (!snap) continue;
         if (snap.status === 'completed' || snap.status === 'cancelled' || snap.status === 'failed') {
-          out(`task ${id} — ${snap.status}\n`);
+          out(`task ${shortIds([cleanCell(id)])[0]} — ${cleanCell(snap.status)}\n`);
           if (snap.output_text) out(`${cleanStream(snap.output_text)}\n`);
           if (snap.error) out(`error: ${cleanCell(snap.error.message)}\n`);
           continue;
@@ -5215,7 +5254,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // (followTask starts at sequence 0), so don't pre-print the snapshot.
         // Esc here stops WATCHING only (the deliberate stop stays on the chat
         // turn's Esc / the task's cancel).
-        out(`task ${id} — ${snap.status}; following (esc stops watching, not the task; then /cancel ${id} stops it)\n`);
+        const shortId = shortIds([cleanCell(id)])[0];
+        out(`task ${shortId} — ${cleanCell(snap.status)}; following (Esc stops watching, not the task; then /cancel ${shortId} stops it)\n`);
         const ac = new AbortController();
         irq.streaming = ac;
         // What the owner enters meanwhile goes into it, as into any running
@@ -5239,7 +5279,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           view.end();
           stopped = ac.signal.aborted;
           out(stopped
-            ? `\n(stopped watching — the task continues; /result re-attaches, then /cancel ${id} stops it)\n`
+            ? `\n(stopped watching — the task continues; /result re-attaches, then /cancel ${shortIds([cleanCell(id)])[0]} stops it)\n`
             : `\n(${(e as Error).message})\n`);
         } finally {
           view.end();
