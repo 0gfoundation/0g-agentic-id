@@ -677,3 +677,30 @@ test('settings usage is typed where the owner is, with the agent at hand', async
     assert.throws(() => parseAssignments(['colour=red']), (e) => e.remedy.startsWith('0g-agentdna settings <agent> ['));
   } finally { setAgentAtHand(null); setSurface('shell'); }
 });
+
+test('cred connect on an image without the login route: RUNTIME_TOO_OLD, the new entry taken out again', async () => {
+  const { credOp } = await import('../dist/cli/credentials.js');
+  const { setAgentAtHand } = await import('../dist/cli/errors.js');
+  const calls = [];
+  const ag = {
+    credentials: {
+      get: async () => ({ version: 1, definitions: [] }),
+      agentUrl: async () => 'http://agent',
+      put: async (_s, defs) => { calls.push(['put', defs.map((d) => d.name)]); return { version: 2 }; },
+      remove: async (_s, name) => { calls.push(['remove', name]); return { version: 3 }; },
+      loaded: async () => ({ entries: [] }),
+      connect: async () => { throw new Error('credentials.connect: HTTP 404 no route /_seal/credentials/login'); },
+    },
+  };
+  try {
+    setSurface('shell');
+    setAgentAtHand('286');
+    await assert.rejects(
+      credOp(ag, `0x${'1'.repeat(64)}`, ['connect', 'linear', 'https://mcp.linear.app/mcp'], { json: false, out: () => {}, secret: async () => '' }, 'http://agent'),
+      (e) => e.code === 'RUNTIME_TOO_OLD' && e.exitCode === 3
+        && /cannot connect a login yet — it comes with a newer image \(linear was not kept\)/.test(e.message)
+        && e.remedy === 'type `reset 286` to move it to the current image, then connect again',
+    );
+    assert.deepEqual(calls, [['put', ['linear']], ['remove', 'linear']]);
+  } finally { setAgentAtHand(null); }
+});

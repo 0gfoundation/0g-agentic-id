@@ -1071,7 +1071,25 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
         }
       }
       const before = (await cred.loaded(sealId, { agentUrl: base }).catch(() => undefined))?.entries.find((e) => e.name === name);
-      const { authorizeUrl } = await cred.connect(sealId, name, { agentUrl: base });
+      const { authorizeUrl } = await cred.connect(sealId, name, { agentUrl: base }).catch(async (e: unknown) => {
+        // An image from before connections has no login route: not a
+        // half-made connection left behind — one defined just now is taken
+        // out again.
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!(/HTTP 404\b/.test(msg) && /no route/i.test(msg))) throw e;
+        let left = '';
+        if (!same && !stored) {
+          left = await cred.remove(sealId, name, { agentUrl: base }).then(
+            () => ` (${name} was not kept)`,
+            () => ` (${name} stays defined, not connected: \`${agentCmd('cred', `rm ${name}`)}\` removes it)`,
+          );
+        } else if (!same) {
+          left = ` (${name} keeps the definition just stored; it connects with the same command after the reset)`;
+        }
+        throw new CliError('RUNTIME_TOO_OLD', `this agent's runtime cannot connect a login yet — it comes with a newer image${left}`, {
+          remedy: lifecycleTo('reset', 'move it to the current image, then connect again'),
+        });
+      });
       if (io.json) return emitOk({ sealId, name, authorizeUrl });
       io.out(`Open this link and log in to connect ${host} to the agent (valid 10 minutes):`);
       io.out('');

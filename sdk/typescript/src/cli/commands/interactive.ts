@@ -2225,7 +2225,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
         const from = await ag.agent.ownerOf(id);
-        const yn = (await ask(`transfer agent ${id} to ${args[1]} — IRREVERSIBLE. proceed? [y/N]: `)).trim().toLowerCase();
+        // The address on its own line: with it, the question is wider than 80 columns.
+        say(`transfer agent ${id} to\n  ${args[1]}\n`);
+        const yn = (await ask('IRREVERSIBLE — proceed? [y/N]: ')).trim().toLowerCase();
         if (yn !== 'y' && yn !== 'yes') { say('transfer cancelled\n'); continue; }
         const tx = await ag.agent.transferFrom(from, args[1] as Address, id);
         await ag.agent.waitForTransaction(tx);
