@@ -415,7 +415,11 @@ test('activity labels read as plain words, never the frameworks\' event names', 
   assert.equal(activityText('bash_command_start'), 'running a command');
   assert.equal(activityText('tool/call memory_write'), 'updating its memory');
   assert.equal(activityText('tool/call some_new_tool'), 'using some_new_tool');
-  assert.equal(activityText('tool/result'), 'working');
+  // A tool returned: the model reads its result next.
+  assert.equal(activityText('tool/result'), 'thinking');
+  assert.equal(activityText('tool/result bash'), 'thinking');
+  assert.equal(activityText('tool_execution_end — read'), 'thinking');
+  assert.equal(activityText('compacting'), 'working');
   assert.equal(activityText('rlm_child spawned'), 'asking a subagent');
   assert.equal(activityText(''), 'thinking');
 });

@@ -361,6 +361,8 @@ export interface AgentActivityInfo {
   /** Who asked. A turn: `user` | `job` | `schedule` | `plugin`. A command or
    *  a subagent: `agent` (the main agent started it). */
   trigger: string;
+  /** A turn: the session it ran in (`owner-chat`, another of the owner's, a task's). */
+  session?: string;
   /** What the activity is: the prompt, the job notice, the reminder's text. */
   label: string;
   /** Unix seconds. */
