@@ -139,7 +139,7 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 
 ### Manager level (`0g-agentdna>` prompt)
 
-The banner names the attestor, the wallet, whether a model key is set, and the trust-root ack (or which read failed: the attestor did not answer, the chain read failed, or no answer within 4 s). A due update hint and release notice print after it. Everything the shell prints fits the terminal's width. An error is `error: …` and, when there is one, `→ <remedy>` naming a command typed at this prompt; an unknown word names the nearest command when it looks like a typo.
+The banner names the attestor, the wallet, whether a model key is set, and the trust-root ack (or which read failed: the attestor did not answer, the chain read failed, or no answer within 4 s). A due update hint and release notice print after it. Everything the shell prints fits the terminal's width. At a question a command asks (a wizard's choice, an amount, a key) Tab offers no shell command and ↑ recalls none, and the answer does not join the command history; during a wait (start, reset, deploy, a model key or a login being taken) ↑ recalls none either, and the wait line says `Esc stops the wait, not the agent`. An error is `error: …` and, when there is one, `→ <remedy>` naming a command typed at this prompt; an unknown word names the nearest command when it looks like a typo.
 
 | Command | Effect |
 |---|---|
