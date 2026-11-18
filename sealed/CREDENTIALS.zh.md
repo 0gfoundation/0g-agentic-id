@@ -198,7 +198,7 @@ agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` /
 
 `/provision` 在每次启动时交给容器 `{document, owner_epoch}` 及其写回，用 ECIES 加密给容器。状态上报（`StatusReport.v3`）带待办数量；数量上升时，attestor 给 owner 的地址发邮件（每个 agent 在 `ATTESTOR_NOTIFY_COOLDOWN_SECONDS` 内最多一封），只写明是哪个 agent、有几条，不包含 agent 写的内容。每小时检查一次，在条目 `expires_at` 前一周提醒 owner。
 
-SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-agentdna cred`（`docs/cli-reference.md`）。
+SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-agentdna cred`（`docs/cli-reference.zh.md`）。
 
 ## 范围之外
 
