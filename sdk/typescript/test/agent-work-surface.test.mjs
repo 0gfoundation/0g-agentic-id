@@ -533,9 +533,10 @@ test('a notice prints above the prompt and keeps what is typed', () => {
     assert.deepEqual(s.lines, [
       'earlier output',
       '',
-      // Broken between words at the terminal's width, less one.
+      // Broken between words at the terminal's width, less one, the further
+      // row under the text after ◆.
       '◆ agent · job finished · bash job9',
-      '[status: completed, exit code: 0]',
+      '  [status: completed, exit code: 0]',
       'report 9',
       '',
       ...promptRows,
