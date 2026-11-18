@@ -5,7 +5,7 @@
 // completes as readline does.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { NO_ANSWER_MAX_TOKENS, addFollowUp, emptyTurnText, followUpNote, readOnlyCommand } from '../dist/cli/commands/interactive.js';
+import { NO_ANSWER_MAX_TOKENS, addFollowUp, emptyTurnText, followUpNote, readOnlyCommand, steerFollowUp } from '../dist/cli/commands/interactive.js';
 import { completeAt } from '../dist/cli/livePrompt.js';
 
 test('readOnlyCommand: the commands that only read run during a turn; the rest wait for its end', () => {
@@ -34,6 +34,24 @@ test('follow-ups: messages the agent answers in one turn are followed once; the 
   // Not followable here: the id is what /result takes.
   assert.equal(followUpNote(after[1], false), '(/result resp_b shows the answer)');
   for (const f of after) assert.doesNotMatch(followUpNote(f, true), /resp_/);
+});
+
+test('steerFollowUp: the turn that answers an unread message — the one it opened, or the one it joined', () => {
+  // One follow-up for several (0g-harness#12): the first opens it, the rest join it.
+  assert.equal(steerFollowUp('resp_main', { id: 'm-1', state: 'turn', turn: 'resp_f' }), 'resp_f');
+  assert.equal(steerFollowUp('resp_main', { id: 'm-2', state: 'merged', turn: 'resp_f' }), 'resp_f');
+  // Read in the turn it went into, dropped, still pending, or unknown: none.
+  assert.equal(steerFollowUp('resp_main', { id: 'm-3', state: 'merged', turn: 'resp_main' }), null);
+  assert.equal(steerFollowUp('resp_main', { id: 'm-4', state: 'dropped', turn: '' }), null);
+  assert.equal(steerFollowUp('resp_main', { id: 'm-5', state: 'pending', turn: 'resp_main' }), null);
+  assert.equal(steerFollowUp('resp_main', null), null);
+  assert.equal(steerFollowUp(undefined, { id: 'm-6', state: 'merged', turn: 'resp_x' }), null);
+  // The follow-up list keeps one entry for all of them.
+  const after = [];
+  for (const [i, st] of [{ state: 'turn' }, { state: 'merged' }, { state: 'merged' }].entries()) {
+    addFollowUp(after, steerFollowUp('resp_main', { id: `m-${i}`, turn: 'resp_f', ...st }), `line ${i}`, 'unread');
+  }
+  assert.deepEqual(after, [{ id: 'resp_f', texts: ['line 0', 'line 1', 'line 2'], why: 'unread' }]);
 });
 
 test('a turn with no text because the output budget ran out says so; another empty turn does not', async () => {
