@@ -1509,6 +1509,55 @@ interface Steering {
   read(): string | undefined;
   /** The turn ended: the ones it did not read go to the follow-ups. */
   settle(after: FollowUp[]): Promise<void>;
+  /** The turn was cancelled (Esc): what became of the ones not read
+   *  ({@link stoppedSteers}); turns they opened go to `after`. */
+  stop(after: FollowUp[]): Promise<StoppedSteers>;
+}
+
+/** The inserted messages not read when Esc cancelled their turn, by what
+ *  the agent says became of each. */
+export interface StoppedSteers {
+  /** Dropped with the turn: back to the box. */
+  back: string[];
+  /** Read after all, before the stop. */
+  read: string[];
+  /** Still held by the agent (an older 0g-harness keeps them pending and
+   *  gives them to its next turn), or not known: not put back, so they are
+   *  not sent twice. */
+  kept: string[];
+  /** Answered in a turn of their own, which the stop cancels too: back to
+   *  the box with that turn's other texts. */
+  turns: Array<{ turn: string; text: string }>;
+}
+
+/** Sort the inserted messages not read at a cancel by their steer states,
+ *  read after the cancel (`null`: not known). A dropped one comes back as the
+ *  agent sends it back (`text`, 0g-harness #12 on), else as it was typed.
+ *  Exported for the tests. */
+export function stoppedSteers(left: ReadonlyArray<{ text: string; turn?: string }>, states: ReadonlyArray<SteerState | null>): StoppedSteers {
+  const r: StoppedSteers = { back: [], read: [], kept: [], turns: [] };
+  left.forEach((u, i) => {
+    const st = states[i] ?? null;
+    if (st?.state === 'dropped') {
+      const own = typeof st.text === 'string' ? st.text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '') : '';
+      r.back.push(own.trim() ? own : u.text);
+      return;
+    }
+    const turn = steerFollowUp(u.turn, st);
+    if (turn) r.turns.push({ turn, text: u.text });
+    else if (st?.state === 'merged') r.read.push(u.text);
+    else r.kept.push(u.text);
+  });
+  return r;
+}
+
+/** The line for inserted messages the agent may still read (an older
+ *  0g-harness keeps them for its next turn): not put back. Exported for the tests. */
+export function keptNote(kept: readonly string[]): string {
+  if (!kept.length) return '';
+  const n = kept.length;
+  const head = `(not put back — the agent may still read ${n === 1 ? 'this' : `these ${n}`} in its next turn)`;
+  return [head, ...kept.map((t) => `↳ ${oneLine(t)}`)].join('\n');
 }
 
 /**
@@ -4611,6 +4660,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (!steer) return null;
     const texts: string[] = [];
     const unread: Array<{ id: string; text: string; turn?: string }> = [];
+    const inflight = new Set<Promise<void>>();
     const unshow = (text: string): void => {
       const i = texts.indexOf(text);
       if (i >= 0) texts.splice(i, 1);
@@ -4629,7 +4679,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         } else {
           out('\n↳ inserted — the agent reads it at its next step\n');
         }
-        steer(e.text).then(
+        const sent = steer(e.text).then(
           (r) => {
             if (r.merged && r.id) { unread.push({ id: r.id, text: e.text, turn: r.turn }); return; }
             unshow(e.text);
@@ -4642,6 +4692,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           },
           (err: Error) => { unshow(e.text); back(e, err.message); },
         );
+        inflight.add(sent);
+        void sent.finally(() => inflight.delete(sent));
       },
       read() {
         unread.shift();
@@ -4662,6 +4714,28 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const follow = steerFollowUp(u.turn, st);
           if (follow) addFollowUp(list, follow, u.text, 'unread');
         }
+      },
+      // Esc cancelled the turn: ask the agent what became of each one not
+      // read. 0g-harness drops them with the cancel (#12 on) and says so; an
+      // older one leaves them pending and gives them to its next turn, so
+      // those are not put back.
+      async stop(list) {
+        if (inflight.size) await Promise.race([Promise.allSettled([...inflight]), new Promise((r) => setTimeout(r, 3000))]);
+        texts.splice(0);
+        const left = unread.splice(0);
+        const stateOf = async (id: string): Promise<SteerState | null> => {
+          if (!s.client?.steerState) return null;
+          let st: SteerState | null = null;
+          for (let i = 0; i < 5; i++) {
+            st = await s.client.steerState(id).catch(() => null);
+            if (!st || st.state !== 'pending') break;
+            await new Promise((r) => setTimeout(r, 150));
+          }
+          return st;
+        };
+        const r = stoppedSteers(left, await Promise.all(left.map((u) => stateOf(u.id))));
+        for (const t of r.turns) addFollowUp(list, t.turn, t.text, 'unread');
+        return r;
       },
     };
   };
@@ -4709,10 +4783,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // yet; those messages come back to edit.
           const ok = await s.client.cancelTask?.(f.id).then((t) => t.status === 'cancelled' || t.status === 'completed', () => false);
           out(ok ? '\n⏹ interrupted — the turn stopped\n' : `\n(stopped watching — it may still be running; /cancel ${f.id} stops it)\n`);
-          const rest = after.splice(i + 1);
+          const left = await steering?.stop(after);
+          const rest = after.splice(i + 1).filter((r) => r.id !== f.id);
           for (const r of rest) await s.client.cancelTask?.(r.id).catch(() => undefined);
-          const back = s.screen?.interrupted?.([...(steering?.texts.splice(0) ?? []), ...rest.flatMap((r) => r.texts)]);
+          for (const t of left?.read ?? []) out(`↳ read by the agent: ${oneLine(t)}\n`);
+          const back = s.screen?.interrupted?.([...(left?.back ?? []), ...rest.flatMap((r) => r.texts)]);
           if (back) out(`${back}\n`);
+          const kept = keptNote(left?.kept ?? []);
+          if (kept) out(`${kept}\n`);
         } else {
           const empty = await emptyTurnText(s.client, f.id, e);
           out(`\n${empty ?? `(${cleanCell((e as Error).message)})`}\n`);
@@ -4961,11 +5039,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${cleanCell(stopped.note)}` : ''}; /cancel stops it${s.client?.cancelTask ? '' : ' (bare form — this image has no per-id cancel)'})`);
           // Not read before Esc (the agent drops it), and the turns that would
           // answer messages sent meanwhile: stopped, and back to edit.
-          const unread = steering?.texts.splice(0) ?? [];
+          const left = await steering?.stop(after);
           const rest = after.splice(0);
           for (const r of rest) await s.client.cancelTask?.(r.id).catch(() => undefined);
-          const back = screen.interrupted?.([...unread, ...rest.flatMap((r) => r.texts)]);
+          for (const t of left?.read ?? []) out(`\n↳ read by the agent: ${oneLine(t)}`);
+          const back = screen.interrupted?.([...(left?.back ?? []), ...rest.flatMap((r) => r.texts)]);
           if (back) out(`\n${back}`);
+          const kept = keptNote(left?.kept ?? []);
+          if (kept) out(`\n${kept}`);
         } else if (/lost the agent while following/.test((e as Error).message)) {
           // Responses transport: the SDK already auto-resumed through drops
           // and only gives up after repeated reconnect failures — the agent

@@ -308,9 +308,13 @@ export interface SteerState {
   id: string;
   /** pending: not read yet. merged: read in `turn`. turn: the turn it was
    *  meant for ended first, so it opened `turn`, an owner turn of its own.
-   *  dropped: an interrupt came first. */
+   *  dropped: an interrupt, or a cancel of its turn, came first (a cancel
+   *  drops them from 0g-harness #12 on; an older one leaves them pending and
+   *  gives them to the next turn). */
   state: 'pending' | 'merged' | 'turn' | 'dropped';
   turn: string;
+  /** The text as sent (0g-harness #12 on). */
+  text?: string;
 }
 
 /**
