@@ -161,7 +161,7 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
 每次发布新镜像，都在各环境的发布记录文件（`ATTESTOR_RELEASES_FILE`；`docker-compose.yml` 把 `./releases` 挂到 `/etc/attestor/releases`）里加一条。这个文件由脚本生成，不手写：
 
 - **改了什么、owner 要做什么**：写在 [`CHANGELOG.md`](../CHANGELOG.md) 里该版本的那一节，英文，在设定版本号的那个 PR 里写。第一行是 CLI 显示的一句话摘要。
-- **什么时候、替换哪些镜像**：各环境不同，放在该环境的参数文件 [`releases/<env>.json`](../releases)（`dev`、`testnet`、`mainnet`）里：每个版本的 `published_at` 和 `migrate`。镜像哈希和日期都是公开信息（哈希就在信任列表上），所以和说明一样走 PR 审核。
+- **什么时候、替换哪些镜像**：各环境不同，放在该环境的参数文件 [`releases/<env>.json`](../releases)（`testnet`、`mainnet`）里：每个版本的 `published_at` 和 `migrate`。dev 的测试版本用放在 dev 部署目录里的参数文件。镜像哈希和日期都是公开信息（哈希就在信任列表上），所以和说明一样走 PR 审核。
 - `node attestor/scripts/release-entry.mjs --changelog CHANGELOG.md --params releases/mainnet.json --min-days 30 --out <机器上的目录>/releases/releases.json` 把两者合成一个文件（测试网用 `--min-days 14`；`node --test attestor/scripts/release-entry.test.mjs` 测这个脚本）。标题还带 `(unreleased)` 的版本、超过 4000 字节的说明、短于最低天数的过渡期（标了 urgent 的除外）都会被拒。带 `--out` 时先在同一目录写临时文件，再改名覆盖：文件的修改时间、大小或 inode 变了，attestor 就重新读取；挂载的是目录而不是单个文件，改名后的文件才看得到。没有 changelog 小节的测试版本，可以在参数文件里自带 `notes`。
 
 生成的文件：

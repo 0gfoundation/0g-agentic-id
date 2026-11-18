@@ -223,7 +223,8 @@ at `/etc/attestor/releases`). The file is generated, never written by hand:
   shows.
 - **When and which images** differ per environment and live in that
   environment's parameters file, [`releases/<env>.json`](../releases)
-  (`dev`, `testnet`, `mainnet`): per version, `published_at` and `migrate`.
+  (`testnet`, `mainnet`): per version, `published_at` and `migrate`. A dev
+  test release uses a parameters file kept with the dev deployment.
   Image hashes and dates are public (the hashes are on the trust registry), so
   they are reviewed in pull requests like the notes.
 - `node attestor/scripts/release-entry.mjs --changelog CHANGELOG.md --params
