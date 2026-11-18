@@ -621,14 +621,17 @@ async function modelSetOp(ag: AgenticID, sealId: Hash, provider: string, defs: C
     });
   }
   const value = (await pickModelKey(provider, keyPromptOf(io)))!;
-  const out = await cred.setModelKey(sealId, provider, value, at).catch(conflict);
-  if (io.json) return emitOk({ sealId, version: out.version, name, provider, valueHash: out.valueHash, pushWarning: out.pushWarning ?? null });
-  io.out(`${defs.some((d) => d.name === name) ? 'changed' : 'added'} ${name}`);
-  if (out.pushWarning) return io.out(`stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot`);
-  // LEGACY(model-key): the parenthesis goes with the images that read only the request.
-  if (state === null) return io.out('the agent is not running: it takes the key when it starts on a current image (an image from before model keys in cred skips it and keeps the key given at create/reset)');
-  io.out(`waiting for the running agent to take it (up to ${MODEL_WAIT_MS / 60_000} minutes)…`);
-  io.out(await modelApplied(cred, sealId, provider, out.valueHash, io, at));
+  // From here on nothing is asked: the set, then the wait for the agent.
+  return quietOf(io)(async () => {
+    const out = await cred.setModelKey(sealId, provider, value, at).catch(conflict);
+    if (io.json) return emitOk({ sealId, version: out.version, name, provider, valueHash: out.valueHash, pushWarning: out.pushWarning ?? null });
+    io.out(`${defs.some((d) => d.name === name) ? 'changed' : 'added'} ${name}`);
+    if (out.pushWarning) return io.out(`stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot`);
+    // LEGACY(model-key): the parenthesis goes with the images that read only the request.
+    if (state === null) return io.out('the agent is not running: it takes the key when it starts on a current image (an image from before model keys in cred skips it and keeps the key given at create/reset)');
+    io.out(`waiting for the running agent to take it (up to ${MODEL_WAIT_MS / 60_000} minutes)…`);
+    io.out(await modelApplied(cred, sealId, provider, out.valueHash, io, at));
+  });
 }
 
 /** `cred <agent> rm model …`. */
@@ -776,7 +779,12 @@ export interface CredIO {
   raw?(s: string): void;
   /** How a model key is asked for (cli/modelkey.ts); by default, as a script is: nothing asked. */
   keyPrompt?: KeyPrompt;
+  /** Runs a stretch that asks nothing, a wait (the shell sets its keyboard aside meanwhile). */
+  quiet?<T>(f: () => Promise<T>): Promise<T>;
 }
+
+/** io.quiet, or the stretch as it is. */
+const quietOf = (io: CredIO) => io.quiet ?? (<T>(f: () => Promise<T>): Promise<T> => f());
 
 /** The model key prompt of an operation: its own, or a script's. */
 function keyPromptOf(io: Pick<CredIO, 'json' | 'out' | 'secret' | 'keyPrompt'>): KeyPrompt {
@@ -1058,24 +1066,25 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
         return;
       }
       io.out(`waiting for the connection to complete (${io.signal ? 'Ctrl-C or Esc' : 'Ctrl-C'} stops waiting, not the login)…`);
-      for (const deadline = Date.now() + 10 * 60_000; Date.now() < deadline; ) {
-        await new Promise<void>((r) => {
-          if (io.signal?.aborted) return r();
-          const t = setTimeout(r, 3000);
-          io.signal?.addEventListener('abort', () => { clearTimeout(t); r(); }, { once: true });
-        });
-        if (io.signal?.aborted) {
-          io.out(`stopped waiting; the login goes on in the browser, and ${agentCmd('cred')} shows ${name} connected once it is done`);
-          return;
+      return quietOf(io)(async () => {
+        for (const deadline = Date.now() + 10 * 60_000; Date.now() < deadline; ) {
+          await new Promise<void>((r) => {
+            if (io.signal?.aborted) return r();
+            const t = setTimeout(r, 3000);
+            io.signal?.addEventListener('abort', () => { clearTimeout(t); r(); }, { once: true });
+          });
+          if (io.signal?.aborted) {
+            io.out(`stopped waiting; the login goes on in the browser, and ${agentCmd('cred')} shows ${name} connected once it is done`);
+            return;
+          }
+          const now = (await cred.loaded(sealId, { agentUrl: base }).catch(() => undefined))?.entries.find((e) => e.name === name);
+          if (now?.logged_in_at && now.logged_in_at !== before?.logged_in_at) {
+            io.out(`connected: the agent uses [[credential:${name}]] as its bearer token for ${host}`);
+            return;
+          }
         }
-        const now = (await cred.loaded(sealId, { agentUrl: base }).catch(() => undefined))?.entries.find((e) => e.name === name);
-        if (now?.logged_in_at && now.logged_in_at !== before?.logged_in_at) {
-          io.out(`connected: the agent uses [[credential:${name}]] as its bearer token for ${host}`);
-          return;
-        }
-      }
-      io.out(`not completed within 10 minutes; start again with the same command`);
-      return;
+        io.out(`not completed within 10 minutes; start again with the same command`);
+      });
     }
     case 'log': {
       const n = Number(rest[0]) || 50;

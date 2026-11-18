@@ -475,3 +475,23 @@ test('sdk: with an attestor that seals no request keys, the sealed model key has
   const refused = integrator(async () => { throw new SecretEnvRefusedError('provider_binding_unsupported', 'no route'); });
   await assert.rejects(refused.server.sealModelKey(SEAL_ID, { owner: owner.address, apiKey: 'sk-1' }), /no route/);
 });
+
+test('cli: cred set model runs its wait through io.quiet, after the key is asked', async () => {
+  const s = await stub([], (doc) => doc.defs['model.0g-compute']
+    ? { provider: '0g-compute', source: 'credentials', value_hash: hashOf(doc, 'model.0g-compute') }
+    : { provider: '0g-compute', source: 'deploy' });
+  try {
+    const order = [];
+    const k = keys({ draft: { '0g-compute': 'sk-saved' }, interactive: true });
+    const confirm = k.keyPrompt.confirm;
+    k.keyPrompt.confirm = async (q, d) => { order.push('asked'); return confirm(q, d); };
+    let inside = false;
+    const quiet = async (f) => { order.push('quiet'); inside = true; try { return await f(); } finally { inside = false; } };
+    const lines = [];
+    await credOp(ag(s.port), SEAL_ID, ['set', 'model'], { json: false, out: (l) => lines.push([l, inside]), secret: async () => '', keyPrompt: k.keyPrompt, quiet });
+    assert.deepEqual(order, ['asked', 'quiet'], 'the question first, then the quiet stretch');
+    assert.deepEqual(lines.find(([l]) => l === 'in use now'), ['in use now', true], 'the wait ran inside it');
+  } finally {
+    s.server.close();
+  }
+});
