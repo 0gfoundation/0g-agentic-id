@@ -396,7 +396,7 @@ test('shell: amounts are checked before any transaction', async () => {
     assert.match(r.stdout, /error: the amount must be above 0 OG/);
     assert.match(r.stdout, /error: "abc" is not an amount of OG/);
     assert.match(r.stdout, /error: "-5" is not an amount of OG/);
-    assert.match(r.stdout, /the wallet holds 0\.000000 OG — not enough to deposit 5 OG and pay its gas/);
+    assert.match(r.stdout, /the wallet holds 0\.000000 OG — not enough for 5 OG plus gas/);
     assert.doesNotMatch(r.stdout, /Request Arguments|viem@|Docs: https/);
   } finally { close(att.server); }
 });

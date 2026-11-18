@@ -1875,7 +1875,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const amountWei = parseOgAmount(amt);
         const native = await ag.nativeBalance().catch(() => null);
         if (native != null && native <= amountWei) {
-          out(`the wallet holds ${og(native)} — not enough to deposit ${ogAmount(amountWei)} OG and pay its gas\n`);
+          out(`the wallet holds ${og(native)} — not enough for ${ogAmount(amountWei)} OG plus gas\n`);
           continue;
         }
         const tx = await ag.deposit({ amountWei });
@@ -2976,7 +2976,7 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
         continue;
       }
       if (native != null && native <= amountWei) {
-        out(`  the wallet holds ${og(native)} — not enough to deposit ${ogAmount(amountWei)} OG and pay its gas\n`);
+        out(`  the wallet holds ${og(native)} — not enough for ${ogAmount(amountWei)} OG plus gas\n`);
         continue;
       }
       break;
