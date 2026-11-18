@@ -938,6 +938,13 @@ await agent.stopAllActivities!();         // everything running
 await agent.schedules!();              // { enabled, data }: the reminders the agent set for itself
 ```
 
+A 0g-harness owner's `others` section also picks the agent's web search service
+(`webSearch`: the 0G router by default, or OpenAI or Anthropic) and the further
+models its subagents may run on (`subagentModels`, `subagentDefault`); each is
+paid with the model key or a named owner credential, never a key the agent
+holds. sealed's harness adapter README lists the fields; the CLI checks their
+shape before signing.
+
 A 0g-harness agent also takes **images and files** from its owner. Images ride
 a message: `chat` / `chatStream` take `images: [{ mediaType, data }]` (PNG, JPEG,
 WebP or GIF, base64; at most 8 per message, 10 MiB each, 32 MiB together),

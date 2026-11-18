@@ -2029,3 +2029,16 @@ func TestPlainValueIsItsOwnJSONForm(t *testing.T) {
 		}
 	}
 }
+
+// ExplicitURL addresses an https base URL through the explicit form.
+func TestExplicitURL(t *testing.T) {
+	got, err := ExplicitURL("http://127.0.0.1:9/tok/", "https://api.openai.com/v1/")
+	if err != nil || got != "http://127.0.0.1:9/tok/https/api.openai.com/v1" {
+		t.Fatalf("%q %v", got, err)
+	}
+	for _, bad := range []string{"http://api.openai.com", "https://user:p@api.openai.com", "https://api.openai.com/?x=1", "not a url"} { // privacy-check: allow (URL userinfo fixture)
+		if _, err := ExplicitURL("http://127.0.0.1:9/tok", bad); err == nil {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+}

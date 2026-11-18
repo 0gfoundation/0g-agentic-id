@@ -106,9 +106,12 @@ managed provider 转发到 `Resolved.Endpoint`；`openai` 和 `anthropic` 转发
 回环地址；代理给每个请求写上 owner 的模型、在 system prompt 末尾附上 agent doc，并设置
 密钥（`harness/spawn.go` `modelEndpoint`）。它只转发模型调用，按代理基地址下的精确路径：
 POST `chat/completions`、`messages`、`responses`，GET `models`，前面带不带 `/v1` 都行
-（`inferproxy.endpoint`）。模型走 0G router（`0g-compute`）且 owner 的 `webTools` 开关打开时，
-还转发 POST `web/search`（harness 的 `web_search`）：只收 `{"query"}` 请求体，重新组装后设置
-密钥，不写模型名，也不附 agent doc（`inferproxy` `webSearch`）；其他 provider 上这条路径返回 404。
+（`inferproxy.endpoint`）。owner 的 `webTools` 开关打开、且 `others.webSearch` 选的搜索服务能付费时，
+还提供 POST `web/search`（harness 的 `web_search`）：只收 `{"query"}` 请求体，不附 agent doc，发给
+0G router 的搜索，或作为一次带该 provider 网页搜索工具的 OpenAI / Anthropic 模型调用，并按 router 的
+结果格式回答（`inferproxy` `websearch.go`）；否则这条路径返回 404。`others.subagentModels` 提供的
+其他模型是同一个代理上的路由：和主模型同 endpoint、同密钥的，由主路由多接一个模型；其余的各是
+`/p/<id>` 下的一条命名路由，有自己的上游、密钥和模型（`harness/modelroutes.go`）。
 只有 sealed 不知道 endpoint 的 provider 仍由 harness 自己拨。
 其他三个框架的 native provider 仍用框架自带接线。
 

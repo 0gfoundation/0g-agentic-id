@@ -101,6 +101,9 @@ type Endpoint struct {
 	// for this wire format (ANTHROPIC_API_KEY / OPENAI_API_KEY). The 0g
 	// key itself is format-agnostic; only the variable name differs.
 	EnvKey string
+	// WebSearch is the web search service this endpoint's key pays for
+	// (SearchServices), "" for none (Provider.WebSearch).
+	WebSearch string
 }
 
 // Route is a resolved routing decision for one model on 0g-compute: both

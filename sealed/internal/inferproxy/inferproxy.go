@@ -17,11 +17,19 @@
 // or without a leading /v1 (an OpenAI-wire client's base URL ends in /v1, an
 // Anthropic-wire one's does not). Responses stream back as they arrive.
 //
-// One more call passes where the route has one (Route.WebSearch, set only
-// for the 0G router): POST web/search, the router's web search. Its body is
-// rebuilt as {"query"} alone, with no model and no platform text, and goes
-// to the search URL with the route's credential headers, the same way and
-// through the same credential proxy as a model call.
+// One more call passes where the main route has one (Route.WebSearch):
+// POST web/search, the owner's web search service. Its body is checked as
+// {"query"} alone and goes, with no platform text, to the service the
+// owner's settings pick (websearch.go): the 0G router's search as it is, or
+// an OpenAI or Anthropic model call with that provider's web search tool,
+// whose answer and sources come back in the router's {"results"} shape.
+//
+// Besides the main route at the root, the proxy serves named routes under
+// /p/<id> (SetRoutes): the further models the owner offers subagents, each
+// route with its own upstream, credential headers and model set. A request
+// on a route may name any model in that route's set; the main route sends
+// any other name as its pinned Model, as it always has, and a named route
+// refuses it.
 package inferproxy
 
 import (
@@ -34,6 +42,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -51,21 +61,40 @@ type Route struct {
 	// Headers are set on every request sent upstream; the framework's own
 	// values of these headers are dropped.
 	Headers map[string]string
-	// Model is the model name every request names.
+	// Model is the model a request on this route is sent with unless it
+	// names one of Models.
 	Model string
+	// Models are the further models a request on this route may name; such
+	// a request goes as it is. Any other name: the main route sends Model,
+	// a named route refuses the request.
+	Models []string
 	// System is appended to every model request's system prompt.
 	System string
-	// WebSearch, when set, lets web/search through to the provider's web
-	// search (the 0G router's /v1/web/search). nil: web/search is refused.
+	// WebSearch, when set on the main route, lets web/search through to the
+	// owner's search service (websearch.go). nil: web/search is refused.
 	WebSearch *WebSearch
 }
 
-// WebSearch is where a web search goes and the headers it carries (the
-// route's credential, as a bearer token).
-type WebSearch struct {
-	URL     string
-	Headers map[string]string
+// pick is the model a request naming requested is sent with, or ok=false
+// when a named route refuses it.
+func (r *Route) pick(requested string, named bool) (model string, ok bool) {
+	if requested == r.Model {
+		return r.Model, true
+	}
+	for _, m := range r.Models {
+		if requested == m {
+			return m, true
+		}
+	}
+	if named {
+		return "", false
+	}
+	return r.Model, true
 }
+
+// RouteID is the grammar of a named route's id: a provider id, optionally
+// with "+<credential>" and "@<format>".
+var RouteID = regexp.MustCompile(`^[a-z0-9][a-z0-9._+@-]{0,127}$`)
 
 // maxSearchBody bounds a web search request; maxSearchQuery bounds its query.
 const (
@@ -80,8 +109,12 @@ type Server struct {
 	base   string
 	client *http.Client
 
-	mu    sync.RWMutex
-	route *Route
+	mu     sync.RWMutex
+	route  *Route
+	routes map[string]*Route // named, under /p/<id>
+	// used records each further model a route has forwarded a request for,
+	// so the log names it once (noteModel).
+	used map[string]bool
 }
 
 // Start listens on a loopback port and serves the proxy.
@@ -110,17 +143,59 @@ func Start() (*Server, error) {
 // per-process path token.
 func (s *Server) BaseURL() string { return s.base }
 
-// SetRoute sets where requests go from now on.
-func (s *Server) SetRoute(r Route) {
+// SetRoute sets where requests go from now on: the main route alone, with
+// no named routes.
+func (s *Server) SetRoute(r Route) { _ = s.SetRoutes(r, nil) }
+
+// SetRoutes sets the main route and the named ones (id → route, each id
+// matching RouteID) from now on. A bad id sets nothing.
+func (s *Server) SetRoutes(main Route, named map[string]Route) error {
+	routes := make(map[string]*Route, len(named))
+	for id, r := range named {
+		if !RouteID.MatchString(id) {
+			return fmt.Errorf("inferproxy: route id %q", id)
+		}
+		r := r
+		r.WebSearch = nil // web/search rides the main route only
+		routes[id] = &r
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.route = &r
+	s.route = &main
+	s.routes = routes
+	s.used = map[string]bool{}
+	return nil
 }
+
+// noteModel logs, once per route setting, the first request a route
+// forwards for a model other than the main route's own: the owner's evidence
+// that a subagent's model reached its route.
+func (s *Server) noteModel(route, model string) {
+	key := route + "\x00" + model
+	s.mu.Lock()
+	first := s.used != nil && !s.used[key]
+	if first {
+		s.used[key] = true
+	}
+	s.mu.Unlock()
+	if first {
+		logger.Logf("inference route %s: first request for model %s", route, model)
+	}
+}
+
+// NamedBaseURL is the base URL of named route id.
+func (s *Server) NamedBaseURL(id string) string { return s.base + "/p/" + url.PathEscape(id) }
 
 func (s *Server) current() *Route {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.route
+}
+
+func (s *Server) named(id string) *Route {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.routes[id]
 }
 
 // endpoints are the model calls the proxy forwards: method and exact path
@@ -157,12 +232,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no inference route set", http.StatusServiceUnavailable)
 		return
 	}
+	named, routeName := false, "main"
+	if after, ok := strings.CutPrefix(rest, "/p/"); ok {
+		seg, tail, _ := strings.Cut(after, "/")
+		id, err := url.PathUnescape(seg)
+		if route = s.named(id); err != nil || route == nil {
+			http.Error(w, "no such model route", http.StatusNotFound)
+			return
+		}
+		named, routeName, rest = true, id, "/"+tail
+	}
 	kind := endpoint(r.Method, rest)
 	if kind == "" {
 		http.Error(w, "only model calls pass the inference route", http.StatusNotFound)
 		return
 	}
 	if kind == "websearch" {
+		if named {
+			http.Error(w, "web search is not available on this inference route", http.StatusNotFound)
+			return
+		}
 		s.webSearch(w, r, route)
 		return
 	}
@@ -179,7 +268,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 			return
 		}
-		out, err := Rewrite(kind, raw, route.Model, route.System)
+		model, ok := route.pick(requestModel(raw), named)
+		if !ok {
+			http.Error(w, fmt.Sprintf("model %q is not offered on this route", requestModel(raw)), http.StatusBadRequest)
+			return
+		}
+		if named || model != route.Model {
+			s.noteModel(routeName, model)
+		}
+		out, err := Rewrite(kind, raw, model, route.System)
 		if err != nil {
 			http.Error(w, "rewrite request: "+err.Error(), http.StatusBadRequest)
 			return
@@ -215,65 +312,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return // the framework went away
 		}
 		http.Error(w, "inference route: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	for k, vs := range resp.Header {
-		if hopHeader(k) || strings.EqualFold(k, "Content-Length") {
-			continue
-		}
-		w.Header()[k] = vs
-	}
-	w.WriteHeader(resp.StatusCode)
-	flushCopy(w, resp.Body)
-}
-
-// webSearch forwards one web search: the query alone, to the route's search
-// URL with its headers; the framework's own headers stay behind except
-// Accept and User-Agent.
-func (s *Server) webSearch(w http.ResponseWriter, r *http.Request, route *Route) {
-	if route.WebSearch == nil || route.WebSearch.URL == "" {
-		http.Error(w, "web search is not available on this inference route", http.StatusNotFound)
-		return
-	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, maxSearchBody+1))
-	if err != nil {
-		http.Error(w, "read request: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if len(raw) > maxSearchBody {
-		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	var req struct {
-		Query *string `json:"query"`
-	}
-	if err := json.Unmarshal(raw, &req); err != nil || req.Query == nil || strings.TrimSpace(*req.Query) == "" || len([]rune(*req.Query)) > maxSearchQuery {
-		http.Error(w, fmt.Sprintf(`a web search is {"query": "<1..%d characters>"}`, maxSearchQuery), http.StatusBadRequest)
-		return
-	}
-	body := mustJSON(map[string]string{"query": *req.Query})
-	up, err := http.NewRequestWithContext(r.Context(), http.MethodPost, route.WebSearch.URL, bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, "build request: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	up.ContentLength = int64(len(body))
-	up.Header.Set("Content-Type", "application/json")
-	for _, k := range []string{"Accept", "User-Agent"} {
-		if v := r.Header.Get(k); v != "" {
-			up.Header.Set(k, v)
-		}
-	}
-	for k, v := range route.WebSearch.Headers {
-		up.Header.Set(k, v)
-	}
-	resp, err := s.client.Do(up)
-	if err != nil {
-		if r.Context().Err() != nil {
-			return
-		}
-		http.Error(w, "web search: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -369,6 +407,15 @@ func Rewrite(kind string, body []byte, model, system string) ([]byte, error) {
 		}
 	}
 	return json.Marshal(req)
+}
+
+// requestModel is the model a request body names, "" for none.
+func requestModel(body []byte) string {
+	var req struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &req)
+	return req.Model
 }
 
 func mustJSON(v any) json.RawMessage {

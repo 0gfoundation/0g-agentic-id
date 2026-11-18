@@ -25,7 +25,7 @@ import { CliError } from '../errors';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef, type AgentRef } from '../ref';
 import {
-  VERSION_KEYS, applyAssignments, assertModelPresent, assertOthersFitFramework, assertVersionsFitFramework,
+  VERSION_KEYS, applyAssignments, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework,
   isHarnessFramework, parseAssignments, renderListedVersions, renderSettings,
 } from '../settings';
 import { SettingsConflictError } from '../../Settings';
@@ -114,6 +114,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   // Before anything is signed: a document with no model is the one state the
   // container cannot boot from and last-known-good cannot cover.
   assertModelPresent(next, current !== null);
+  assertSubagentDefaultOffered(next);
   const base = await runningServeBase(ctx.env.attestorUrl, sealId);
   // The agent takes a provider switch only with a key for the new provider
   // in its credential set: asked for (Enter takes the key login saved) and

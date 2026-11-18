@@ -28,6 +28,54 @@ type Provider struct {
 	ModelCatalog  string                `json:"modelCatalog,omitempty"`
 	Models        []zgCatalogEntry      `json:"models,omitempty"`
 	Compatibility map[string]any        `json:"compatibility,omitempty"`
+	// WebSearch names the web search service this provider's key pays for
+	// (one of SearchServices); "" for none. Not routing: it is outside the
+	// route hash, and it only decides whether the model key can serve the
+	// owner's chosen search service (internal/inferproxy adapts each).
+	WebSearch string `json:"webSearch,omitempty"`
+}
+
+// The web search services sealed's inference route can call. Each answers
+// the harness in the 0G router's shape (internal/inferproxy).
+const (
+	SearchZGRouter  = "0g-router" // the 0G router's /v1/web/search: a result list
+	SearchOpenAI    = "openai"    // OpenAI Responses with the web_search tool: an answer and its sources
+	SearchAnthropic = "anthropic" // Anthropic Messages with the web_search server tool: an answer and its sources
+)
+
+// SearchServices lists the services in the order docs and the CLI show them.
+var SearchServices = []string{SearchZGRouter, SearchOpenAI, SearchAnthropic}
+
+// KnownSearchService reports whether s names one of SearchServices.
+func KnownSearchService(s string) bool {
+	for _, k := range SearchServices {
+		if s == k {
+			return true
+		}
+	}
+	return false
+}
+
+// SearchBaseURL is the official base URL of a search service, for a search
+// paid with an owner credential rather than the model key: the 0G router's
+// OpenAI-wire endpoint from the built-in registry, or a native provider's.
+func SearchBaseURL(service string) string {
+	switch service {
+	case SearchZGRouter:
+		return ZGOpenAIBaseURL
+	case SearchOpenAI, SearchAnthropic:
+		return nativeEndpoints[service].BaseURL
+	}
+	return ""
+}
+
+// webSearchOf is the search service p's key pays for. A 0g-compute entry
+// from a registry published before the field existed keeps the router's.
+func webSearchOf(p Provider) string {
+	if p.WebSearch == "" && p.ID == ZGComputeProvider {
+		return SearchZGRouter
+	}
+	return p.WebSearch
 }
 
 type Registry struct {
@@ -80,6 +128,9 @@ func NewRegistry(definitions []byte) (*Registry, error) {
 		}
 		if !p.Native && !containsFormat(p.Formats, p.DefaultFormat) {
 			return nil, fmt.Errorf("provider registry: %q has no valid default format", p.ID)
+		}
+		if p.WebSearch != "" && !KnownSearchService(p.WebSearch) {
+			return nil, fmt.Errorf("provider registry: %q names an unknown web search service %q", p.ID, p.WebSearch)
 		}
 		if p.ModelCatalog != "" && !trustedHTTPS(p.ModelCatalog) {
 			return nil, fmt.Errorf("provider registry: %q requires an HTTPS catalog", p.ID)
@@ -154,7 +205,7 @@ func (r *Registry) Resolve(ctx context.Context, provider, model string) (ModelFa
 	if format == WireAnthropic {
 		envKey = "ANTHROPIC_API_KEY"
 	}
-	return facts, &Endpoint{ProviderID: provider, Format: format, BaseURL: base, EnvKey: envKey, Compatibility: cloneCompatibility(p.Compatibility)}, nil
+	return facts, &Endpoint{ProviderID: provider, Format: format, BaseURL: base, EnvKey: envKey, Compatibility: cloneCompatibility(p.Compatibility), WebSearch: webSearchOf(p)}, nil
 }
 
 func (r *Registry) catalogEntry(ctx context.Context, p Provider, model string) (zgCatalogEntry, bool) {
@@ -217,8 +268,8 @@ func EndpointCompatibility(ep *Endpoint, provider string) map[string]any {
 // to that provider's own host and nowhere else, and the route hash the key
 // is bound to stays what it was.
 var nativeEndpoints = map[string]Endpoint{
-	"openai":    {ProviderID: "openai", Format: WireOpenAI, BaseURL: "https://api.openai.com/v1", EnvKey: "OPENAI_API_KEY"},
-	"anthropic": {ProviderID: "anthropic", Format: WireAnthropic, BaseURL: "https://api.anthropic.com", EnvKey: "ANTHROPIC_API_KEY"},
+	"openai":    {ProviderID: "openai", Format: WireOpenAI, BaseURL: "https://api.openai.com/v1", EnvKey: "OPENAI_API_KEY", WebSearch: SearchOpenAI},
+	"anthropic": {ProviderID: "anthropic", Format: WireAnthropic, BaseURL: "https://api.anthropic.com", EnvKey: "ANTHROPIC_API_KEY", WebSearch: SearchAnthropic},
 }
 
 // NativeEndpoint is the official endpoint of native provider id.

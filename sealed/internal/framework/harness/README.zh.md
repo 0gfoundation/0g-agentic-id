@@ -29,7 +29,9 @@
 
 `spawn.go` 以 agent 用户身份运行 `node /opt/0g-harness/<sha256>/bin/0g-harness.mjs`(没有包的镜像上是 `node /usr/local/lib/node_modules/@0gfoundation/0g-harness/bin/0g-harness.mjs`),监听本机回环端口 8794,环境变量由 `environ()` 生成。这些环境变量的约定写在 harness 的 `docs/PROTOCOL.md` 里。其中 `SEAL_OWNER` 是启动时从链上读到的 owner(小写),harness 拿它核对每条记忆的 `trusted_by`。
 
-- 只要 sealed 知道 provider 的 endpoint,harness 就通过 sealed 的推理代理(`internal/inferproxy`,一个回环地址)调用模型:注册表里的 managed provider,以及 `openai` 和 `anthropic`(sealed 固定的官方 endpoint)。代理写上 owner 的模型,在 system prompt 末尾附上 agent doc,并设置密钥;harness 手里只有占位符(`../../CONFIG_SURFACE.zh.md` §3、§7)。模型走 0G router(`0g-compute`)且 `webTools` 打开时，代理还为 `web_search` 转发 `POST /v1/web/search`：只收 `{"query"}` 请求体，重新组装后设置密钥，不写模型名，也不附 agent doc(`inferproxy` `webSearch`)；harness 从 `SEAL_HARNESS_WEB_SEARCH_URL` 拿到这个地址。
+- 只要 sealed 知道 provider 的 endpoint,harness 就通过 sealed 的推理代理(`internal/inferproxy`,一个回环地址)调用模型:注册表里的 managed provider,以及 `openai` 和 `anthropic`(sealed 固定的官方 endpoint)。代理写上 owner 的模型,在 system prompt 末尾附上 agent doc,并设置密钥;harness 手里只有占位符(`../../CONFIG_SURFACE.zh.md` §3、§7)。`webTools` 打开、且 owner 选的搜索服务能付费时，代理还为 `web_search` 提供 `POST /v1/web/search`：只收 `{"query"}` 请求体，发给该服务，不附 agent doc(`inferproxy` `websearch.go`)，并按 0G router 的结果格式回答；harness 从 `SEAL_HARNESS_WEB_SEARCH_URL` 拿到这个地址。
+- owner 给子 agent 提供的其他模型(`subagentModels`)是同一个代理上的路由(`modelroutes.go`)：和主模型同 endpoint、同密钥的模型，由主路由多接一个模型；其余的各是 `/p/<id>` 下的一条命名路由，有自己的上游、密钥和模型。每条路由固定自己的模型并附上 agent doc；命名路由拒绝其他模型名。harness 从 `SEAL_HARNESS_MODEL_ROUTES` 拿到它们(不含密钥)。每条路由第一次为某个其他模型转发请求时，日志记一行 `inference route <id>: first request for model <model>`(主路由的 id 记为 `main`)。
+- 搜索服务和每个其他模型怎么付费，按同一条规则：和主模型同 provider、没指定凭据时用模型 key；指定了 owner 的凭据时，经凭证代理带上它的占位符，代理只在 owner 允许的 host 和位置上代填；都不满足就不提供，日志里写明原因。模型 key 条目（`model.<provider>`）不能被指定：它没有占位符，指定它的搜索或模型不提供。指定的凭据在请求发出时才检查：owner 没有这个凭据时凭证代理拒绝，`web_search` 返回拒绝的代码和原因，0G router 也一样。
 - harness 在 `/v1/*` 上检查它自己的 token(`SEAL_BRIDGE_TOKEN`)。owner 从 `/_seal/auth` 拿到的是另一个 token,sealed 的 proxy 在请求进来时把它换成 harness 的,所以 harness 运行的任何东西都看不到 owner 的 token。
 
 harness 做三件事:
@@ -86,7 +88,10 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | `memoryExtractMinMessages` | `6` | 某一轮没存记忆时，自上次提取以来 owner 和 agent 的新消息至少要有多少条，才读一遍找记忆（1 到 1000）。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT_MIN_MESSAGES`。 |
 | `memoryRecall` | `true` | 超过 `memoryInlineBytes` 后，每条 owner 消息之前，harness 调用一次模型挑出最多 5 条有用的记忆，把正文放在消息前面（0g-harness `src/memory-recall.mjs`）；设为 `false` 关闭。渲染为 `SEAL_HARNESS_MEMORY_RECALL`。 |
 | `memoryTidy` | `true` | agent 空闲时，harness 不定期为每个记忆角色调用一次模型，整理这个角色里当前 owner 可信的记忆：合并重复的，删掉过时或被推翻的，从不在两个角色之间移动（0g-harness `src/memory-tidy.mjs`；距上次整理 24 小时且记忆有变化时到期，某个索引接近上限时提前）；设为 `false` 关闭自动整理，`POST /v1/memory/tidy` 仍可按需整理一次。渲染为 `SEAL_HARNESS_MEMORY_TIDY`。 |
-| `webTools` | `true` | 打开 `web_fetch` 工具（把一个公网 http(s) 页面读成文本；私网和回环地址拒绝，DNS 解析之后也查；经凭证代理出站）；模型走 0G router（`0g-compute`）时还打开 `web_search`（经推理代理调 router 的 `/v1/web/search`，按次计费，记在 owner 的 0G Compute key 上）（0g-harness `src/web.mjs`）；设为 `false` 两个都关。渲染为 `SEAL_HARNESS_WEB`。 |
+| `webTools` | `true` | 打开 `web_fetch` 工具（把一个公网 http(s) 页面读成文本；私网和回环地址拒绝，DNS 解析之后也查；经凭证代理出站）和 `web_search`（走 `webSearch` 选的服务）（0g-harness `src/web.mjs`）；设为 `false` 两个都关。渲染为 `SEAL_HARNESS_WEB`。 |
+| `webSearch` | `{"service":"0g-router"}` | `{"service", "credential"?, "model"?}`。`service`：`0g-router`（router 的结果列表）、`openai`（一次带 `web_search` 工具的 Responses 调用）或 `anthropic`（一次带 `web_search_20250305` 服务端工具的 Messages 调用），后两者先返回模型写的回答，再返回它引用的来源；`off` 去掉 `web_search`。模型的 provider 就是该服务、且没指定 `credential` 时用模型 key 付费，否则用指定的 owner 凭据，该凭据必须允许该服务的 host 和 key 所在的请求头。`model` 是执行 `openai`/`anthropic` 搜索的模型；默认：主模型在该 provider 上时用主模型。provider 注册表的 `webSearch` 字段写明每个 provider 的 key 能付哪个服务（`0g-agentdna providers`）。 |
+| `subagentModels` | 无 | 子 agent 可以指定的其他模型，最多 8 个 `{"provider", "model", "credential"?}`，付费规则同 `webSearch`；主模型始终可用。需要打开 `subagents`。格式不对时整个列表作废。 |
+| `subagentDefault` | 主模型 | `{"provider", "model"}`：调用没指定模型时子 agent 用它；必须是主模型或 `subagentModels` 中的一个，否则忽略。 |
 | `memoryInlineBytes` | `8192` | 两个记忆角色的正文合计不超过这个字节数时，每条记忆整条放进系统提示，不做回忆；超过时放索引并回忆（256 到 65536）。渲染为 `SEAL_HARNESS_MEMORY_INLINE_BYTES`。 |
 
 这里填错,不会让 agent 起不来。`RenderSettings` 每次 spawn 前都会运行,要是在这里报错,agent 就开不了机,而不是"这次推送被拒"。所以解析不了或超出范围的值,一律退回出厂默认值,在日志里说明,其他开关照常生效(`settings.go`)。

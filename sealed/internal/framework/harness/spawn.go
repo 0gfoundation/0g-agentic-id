@@ -173,14 +173,26 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 			upstream = ep.BaseURL
 		}
 		r := inferproxy.Route{Upstream: upstream, Headers: inferenceHeaders(ep.Format, apiKey), Model: model, System: doc}
-		// The 0G router also serves a web search under the same key: the
-		// route lets web/search through to it, and the harness's web_search
-		// posts there (src/web.mjs). Other providers have none.
-		if provider == inference.ZGComputeProvider && rendered.knobs.WebTools {
-			r.WebSearch = &inferproxy.WebSearch{URL: inferproxy.WebSearchURL(upstream), Headers: map[string]string{"Authorization": "Bearer " + apiKey}}
+		// What the owner's web search and further subagent models can be
+		// paid with, one rule for both (modelroutes.go).
+		keys := keySource{mainProvider: provider, key: apiKey, held: modelBaseURL != "", proxy: rt.CredProxy, mainHost: hostOf(ep.BaseURL)}
+		// web/search on the main route goes to the owner's search service;
+		// the harness's web_search posts there (src/web.mjs).
+		if ws, why := planWebSearch(rendered.knobs, keys, ep, upstream, model); ws != nil {
+			r.WebSearch = ws
 			be.webSearchURL = route.BaseURL() + "/v1/web/search"
+			logger.Logf("harness: web_search through %s", ws.Service)
+		} else {
+			logger.Logf("harness: no web_search: %s", why)
 		}
-		route.SetRoute(r)
+		// Further models for subagents: the main route takes those on its
+		// own endpoint and key, named routes the rest.
+		plan := planRoutes(ctx, rendered.knobs, keys, rendered.resolved, ep, doc, route.BaseURL(), route.NamedBaseURL)
+		r.Models = plan.mainModels
+		if err := route.SetRoutes(r, plan.named); err != nil {
+			return framework.StartResult{}, fmt.Errorf("harness.Start: inference routes: %w", err)
+		}
+		be.routesEnv = plan.env()
 		be.docRouted = true
 		be.apiKey, be.modelBaseURL, be.modelAPI = routedKeyPlaceholder, route.BaseURL(), wireAPI(ep.Format)
 		inferURL = ep.BaseURL
@@ -281,8 +293,10 @@ type bridgeEnv struct {
 	// protocol of the endpoint the inference route forwards to.
 	modelAPI string
 	// webSearchURL, when set, is where the harness's web_search posts: the
-	// inference route's web/search (0G router only).
+	// inference route's web/search (modelroutes.go planWebSearch).
 	webSearchURL string
+	// routesEnv carries the further subagent models (modelroutes.go routePlan.env).
+	routesEnv []string
 }
 
 // modelEndpoint is the endpoint sealed's inference route forwards the
@@ -376,6 +390,7 @@ func (be bridgeEnv) environ() []string {
 		// layer), so the key never touches a credentials file.
 		env = append(env, "SEAL_MODEL_API_KEY="+be.apiKey)
 	}
+	env = append(env, be.routesEnv...)
 	if be.webSearchURL != "" {
 		env = append(env, "SEAL_HARNESS_WEB_SEARCH_URL="+be.webSearchURL)
 	}
