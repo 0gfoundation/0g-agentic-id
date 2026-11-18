@@ -5,10 +5,10 @@
  *
  * The attestor serves the deployer's release file on `GET /releases`
  * (public) and, on the owner tier of `GET /deployments`, a `migrate` entry on
- * each agent whose image a published release replaces. Until `until` the
- * agent keeps running; after it the old image may be retired, and the agent
- * then stops until it is reset. `urgent` marks an image that may be retired
- * sooner (a security fix).
+ * each agent whose image a published release replaces. Until `until` the old
+ * image stays allowed; after it the image may be retired, and an agent still
+ * on it is then refused at its container's next boot until it is reset.
+ * `urgent` marks an image that may be retired sooner (a security fix).
  */
 
 export type MigrationState = 'recommended' | 'soon' | 'overdue';

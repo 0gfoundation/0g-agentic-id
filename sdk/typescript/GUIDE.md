@@ -741,8 +741,9 @@ When a release replaces an image, your agents on the old one keep running
 through a transition period, and the owner listing marks them: `migrate` is
 `{ version, framework, until, urgent, state }` (`state`: `recommended`, `soon`
 in the last 7 days, `overdue` after `until`). Reset such an agent before
-`until`: after it the old image may be retired, and the agent then stops until
-it is reset. `urgent` means the image may be retired sooner (a security fix).
+`until`: after it the old image may be retired, and the agent's next boot is
+then refused until it is reset. `urgent` means the image may be retired sooner
+(a security fix).
 `ag.agent.releases()` reads the attestor's release notices (`GET /releases`):
 each release's `notes` (and `notesZh`) and the images it replaces.
 

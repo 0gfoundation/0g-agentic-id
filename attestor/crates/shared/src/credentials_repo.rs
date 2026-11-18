@@ -85,14 +85,22 @@ pub trait CredentialRepo: Send + Sync {
         version: i64,
         expires_at: i64,
     ) -> anyhow::Result<bool>;
-    /// Claim the release email of `kind` (`published` or `reminder`) for
-    /// one owner and release: true the first time, false after.
+    /// Claim the release email of `kind` (`published`, or
+    /// `reminder:<until>`) for one owner and release: true the first time,
+    /// false after.
     async fn claim_release_notice(
         &self,
         owner: Address,
         version: &str,
         kind: &str,
     ) -> anyhow::Result<bool>;
+    /// Give a claim back after its email could not be sent.
+    async fn unclaim_release_notice(
+        &self,
+        owner: Address,
+        version: &str,
+        kind: &str,
+    ) -> anyhow::Result<()>;
     /// Drop the set (with its writebacks), its pending count and the
     /// reminders sent for it: the agent changed hands.
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()>;
@@ -357,6 +365,21 @@ impl CredentialRepo for PostgresCredentialRepo {
         Ok(n.rows_affected() == 1)
     }
 
+    async fn unclaim_release_notice(
+        &self,
+        owner: Address,
+        version: &str,
+        kind: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM release_notices WHERE owner = $1 AND version = $2 AND kind = $3")
+            .bind(owner.as_slice())
+            .bind(version)
+            .bind(kind)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM credential_sets WHERE seal_id = $1")
             .bind(seal_id.as_slice())
@@ -615,6 +638,20 @@ impl CredentialRepo for InMemoryCredentialRepo {
         )))
     }
 
+    async fn unclaim_release_notice(
+        &self,
+        owner: Address,
+        version: &str,
+        kind: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.lock().unwrap().release_notices.remove(&(
+            owner,
+            version.to_string(),
+            kind.to_string(),
+        ));
+        Ok(())
+    }
+
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()> {
         let mut s = self.inner.lock().unwrap();
         s.sets.remove(&seal_id);
@@ -851,6 +888,32 @@ mod tests {
             .unwrap());
         assert!(!repo
             .claim_reminder(seal, "rt", 2, 1_900_000_000)
+            .await
+            .unwrap());
+
+        // Release emails: one claim per owner, version and kind; a failed
+        // send gives it back.
+        assert!(repo
+            .claim_release_notice(owner, "0.5.0", "published")
+            .await
+            .unwrap());
+        assert!(!repo
+            .claim_release_notice(owner, "0.5.0", "published")
+            .await
+            .unwrap());
+        assert!(repo
+            .claim_release_notice(owner, "0.5.0", "reminder:1900000000")
+            .await
+            .unwrap());
+        repo.unclaim_release_notice(owner, "0.5.0", "published")
+            .await
+            .unwrap();
+        assert!(repo
+            .claim_release_notice(owner, "0.5.0", "published")
+            .await
+            .unwrap());
+        assert!(!repo
+            .claim_release_notice(owner, "0.5.0", "reminder:1900000000")
             .await
             .unwrap());
 

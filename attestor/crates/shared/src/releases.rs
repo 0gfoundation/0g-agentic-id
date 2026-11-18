@@ -9,9 +9,11 @@
 //! gets no key until it is reset. `urgent` marks an image that may be delisted
 //! before `until` (a security fix).
 //!
-//! The file is read again when it changes on disk, so a new entry needs no
-//! restart. A file that does not parse is logged and the last good content is
-//! kept.
+//! The file is read again when it changes on disk (its modification time,
+//! size or inode), so a new entry needs no restart; mount its directory, not
+//! the file, and replace the file atomically (write a temporary file, then
+//! rename it), so the container sees each edit whole. A file that does not
+//! parse, or is gone, is logged and the last good content is kept.
 
 use alloy::primitives::B256;
 use chrono::{DateTime, Duration, Utc};
@@ -73,8 +75,12 @@ pub fn parse(json: &str) -> anyhow::Result<Vec<Release>> {
     let mut versions = std::collections::HashSet::new();
     for r in &releases {
         anyhow::ensure!(
-            !r.version.trim().is_empty() && r.version.len() <= MAX_VERSION,
-            "release version must be 1-{MAX_VERSION} characters"
+            !r.version.is_empty()
+                && r.version.len() <= MAX_VERSION
+                && r.version
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b)),
+            "release version must be 1-{MAX_VERSION} of A-Z a-z 0-9 . _ + -"
         );
         anyhow::ensure!(
             versions.insert(r.version.clone()),
@@ -155,20 +161,26 @@ pub fn state_at(until: DateTime<Utc>, now: DateTime<Utc>) -> MigrationState {
     }
 }
 
-/// The notice for an agent running `image_hash`: from the published releases
-/// that list it, the earliest `until` (urgent if any is). None when no
-/// published release replaces the image.
+/// The notice for an agent running `image_hash`, from the published releases
+/// that list it: an urgent entry first, then the earliest `until`. The
+/// version, date and urgency all come from that one entry, so an email names
+/// the release whose notes explain them. None when no published release
+/// replaces the image.
 pub fn migration_for(
     releases: &[Release],
     image_hash: B256,
     now: DateTime<Utc>,
 ) -> Option<MigrationNotice> {
     let mut best: Option<(&Release, &Migration)> = None;
-    let mut urgent = false;
     for r in releases.iter().filter(|r| r.published_at <= now) {
         for m in r.migrate.iter().filter(|m| m.image_hash == image_hash) {
-            urgent |= m.urgent;
-            if best.is_none_or(|(_, b)| m.until < b.until) {
+            let better = match best {
+                None => true,
+                Some((_, b)) => {
+                    (m.urgent, std::cmp::Reverse(m.until)) > (b.urgent, std::cmp::Reverse(b.until))
+                }
+            };
+            if better {
                 best = Some((r, m));
             }
         }
@@ -177,12 +189,25 @@ pub fn migration_for(
         version: r.version.clone(),
         framework: m.framework.clone(),
         until: m.until,
-        urgent,
+        urgent: m.urgent,
         state: state_at(m.until, now),
     })
 }
 
-type Cached = (Option<SystemTime>, Arc<Vec<Release>>);
+/// What identifies one version of the file on disk: modification time, size
+/// and (on Unix) inode, so an atomic replace or a write that finishes within
+/// the same timestamp tick is still seen.
+type Stamp = Option<(SystemTime, u64, u64)>;
+type Cached = (Stamp, Arc<Vec<Release>>);
+
+fn stamp_of(path: &std::path::Path) -> Stamp {
+    let m = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&m);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some((m.modified().ok()?, m.len(), ino))
+}
 
 fn cache() -> &'static Mutex<HashMap<PathBuf, Cached>> {
     static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, Cached>>> = std::sync::OnceLock::new();
@@ -190,17 +215,17 @@ fn cache() -> &'static Mutex<HashMap<PathBuf, Cached>> {
 }
 
 /// The releases in the file at `path`, newest first; empty for an empty
-/// path. Read again when the file's modification time changes. A missing or
+/// path. Read again when the file changes on disk ([`Stamp`]). A missing or
 /// malformed file is logged (once per change) and the last good content kept.
 pub fn load(path: &str) -> Arc<Vec<Release>> {
     if path.trim().is_empty() {
         return Arc::new(Vec::new());
     }
     let path = PathBuf::from(path);
-    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let stamp = stamp_of(&path);
     let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
     if let Some((seen, releases)) = cache.get(&path) {
-        if *seen == mtime {
+        if *seen == stamp {
             return releases.clone();
         }
     }
@@ -218,7 +243,12 @@ pub fn load(path: &str) -> Arc<Vec<Release>> {
             last_good
         }
     };
-    cache.insert(path, (mtime, fresh.clone()));
+    // Read the stamp again: a write that was still going on when the stamp
+    // above was taken is then read on the next call.
+    cache.insert(
+        path.clone(),
+        (stamp.filter(|s| Some(*s) == stamp_of(&path)), fresh.clone()),
+    );
     fresh
 }
 
@@ -279,8 +309,8 @@ pub fn owner_email(
         "\nThey keep running until then. To move one, reset it (its persona, skills, settings and \
          memory stay; the conversation starts fresh): run 0g-agentdna, then at its prompt\n\n  \
          reset <agent>\n\n\
-         After that date the previous version may be retired, and an agent still on it stops \
-         until it is reset.\n",
+         After that date the previous version may be retired: an agent still on it keeps running \
+         until its container next boots, and that boot is then refused until the agent is reset.\n",
     );
     if urgent {
         text.push_str(
@@ -344,6 +374,8 @@ mod tests {
                 r#"{{"version":"1","published_at":"2026-11-20T00:00:00Z","notes":"x","migrate":[{{"framework":"f","image_hash":"{H1}","until":"2026-12-19T00:00:00Z"}},{{"framework":"f","image_hash":"{H1}","until":"2026-12-19T00:00:00Z"}}]}}"#
             )),
             one(r#"{"version":"1","published_at":"2026-11-20T00:00:00Z","notes":"x","typo":true}"#),
+            one(r#"{"version":"0.5.0 ","published_at":"2026-11-20T00:00:00Z","notes":"x"}"#),
+            one(r#"{"version":"0.5/0","published_at":"2026-11-20T00:00:00Z","notes":"x"}"#),
             format!(
                 r#"{{"releases":[{{"version":"1","published_at":"2026-11-20T00:00:00Z","notes":"x"}},{{"version":"1","published_at":"2026-11-21T00:00:00Z","notes":"y"}}]}}"#
             ),
@@ -387,6 +419,20 @@ mod tests {
         // Before any release is published, or for an image no release names: nothing.
         assert!(migration_for(&r, h1, t("2026-11-19T00:00:00Z")).is_none());
         assert!(migration_for(&r, B256::repeat_byte(9), t("2026-12-05T00:00:00Z")).is_none());
+        // An urgent entry wins over an earlier ordinary one, and the version,
+        // date and urgency all come from it.
+        let both = parse(&format!(
+            r#"{{"releases":[
+              {{"version":"a","published_at":"2026-11-20T00:00:00Z","notes":"x","migrate":[{{"framework":"f","image_hash":"{H1}","until":"2026-12-01T00:00:00Z"}}]}},
+              {{"version":"b","published_at":"2026-11-21T00:00:00Z","notes":"y","migrate":[{{"framework":"f","image_hash":"{H1}","until":"2026-12-09T00:00:00Z","urgent":true}}]}}
+            ]}}"#
+        ))
+        .unwrap();
+        let n = migration_for(&both, h1, t("2026-11-22T00:00:00Z")).unwrap();
+        assert_eq!(
+            (n.version.as_str(), n.until, n.urgent),
+            ("b", t("2026-12-09T00:00:00Z"), true)
+        );
     }
 
     #[test]
@@ -424,6 +470,47 @@ mod tests {
             .set_modified(later)
             .unwrap();
         assert_eq!(load(p).len(), 2);
+        // A broken read cached under one modification time does not hide the
+        // finished write in the same tick (the size differs).
+        let tick = SystemTime::now() + std::time::Duration::from_secs(7);
+        std::fs::write(&path, "{ half").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(tick)
+            .unwrap();
+        assert_eq!(load(p).len(), 2);
+        std::fs::write(
+            &path,
+            r#"{"releases":[{"version":"8","published_at":"2026-11-20T00:00:00Z","notes":"x"}]}"#,
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(tick)
+            .unwrap();
+        assert_eq!(load(p)[0].version, "8");
+        // An atomic replace (a new inode) is picked up too.
+        let tmp = dir.join("releases.json.tmp");
+        std::fs::write(
+            &tmp,
+            r#"{"releases":[{"version":"7","published_at":"2026-11-20T00:00:00Z","notes":"x"}]}"#,
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_modified(tick)
+            .unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        assert_eq!(load(p)[0].version, "7");
+        // A deleted file keeps the last good content.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(load(p)[0].version, "7");
         // A good edit is picked up.
         std::fs::write(
             &path,

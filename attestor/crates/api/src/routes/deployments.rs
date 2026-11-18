@@ -184,7 +184,10 @@ pub async fn handle(
                         .container_record
                         .as_ref()
                         .and_then(|r| releases::migration_for(&releases, r.image_hash, now));
-                    OwnerDeployment { migrate, ..OwnerDeployment::from(d) }
+                    OwnerDeployment {
+                        migrate,
+                        ..OwnerDeployment::from(d)
+                    }
                 })
                 .map(|mut d| { d.agent_card = slim_card(d.agent_card, slim); d })
                 .collect();

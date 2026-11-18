@@ -360,7 +360,7 @@ CREATE TABLE IF NOT EXISTS credential_reminders (
     PRIMARY KEY (seal_id, name, version, expires_at)
 );
 -- Release emails sent (releases.rs): one per owner, release and kind
--- (`published`, `reminder`).
+-- (`published`, `reminder:<until>`).
 CREATE TABLE IF NOT EXISTS release_notices (
     owner   BYTEA NOT NULL,
     version TEXT  NOT NULL,

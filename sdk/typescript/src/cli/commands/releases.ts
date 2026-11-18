@@ -19,7 +19,7 @@ import type { CommandContext } from '../types';
 const STATE_TEXT: Record<string, string> = {
   recommended: 'please move',
   soon: '7 days or less left',
-  overdue: 'transition period over: may stop any time',
+  overdue: 'transition period over: its next boot may be refused',
 };
 
 export async function run(ctx: CommandContext): Promise<void> {
@@ -51,7 +51,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   } else if (!agents.length) {
     print('Your agents: none runs a replaced image.');
   } else {
-    print('Your agents to move (run 0g-agentdna, then `reset <agent>`; they keep running until then):');
+    print('Your agents to move (run 0g-agentdna, then `reset <agent>`; they keep running meanwhile):');
     for (const a of agents) {
       print(`  ${a.agent}  ${a.migrate.framework}  by ${dateOf(a.migrate.until)}  ${STATE_TEXT[a.migrate.state] ?? a.migrate.state}${a.migrate.urgent ? ', security fix' : ''}`);
     }

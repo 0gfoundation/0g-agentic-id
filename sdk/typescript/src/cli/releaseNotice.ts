@@ -7,7 +7,7 @@
  * How often: with agents to move, once a week, and every day in the last 7
  * days of their transition period and after it; with none (or no wallet to
  * ask with), once per release, for 30 days after it is published. Remembered
- * per attestor in `release-notice.json` in the config directory. Silent on
+ * per attestor and kind in `release-notice.json` in the config directory. Silent on
  * any failure: a release notice never blocks or fails a command.
  */
 
@@ -90,7 +90,7 @@ export function planReleaseNotice(p: {
     const lines = [
       release ? `AgentDNA ${version} is out: ${firstLine(notesOf(release, p.zh))}` : `AgentDNA ${version} is out.`,
       worst === 'overdue'
-        ? `Agent(s) ${names(p.agents)} still run the previous version, whose transition period ended ${until}: it may be retired any time, and they then stop until reset.`
+        ? `Agent(s) ${names(p.agents)} still run the previous version, whose transition period ended ${until}: it may be retired any time, and their next boot is then refused until they are reset.`
         : `Agent(s) ${names(p.agents)} still run the previous version. They keep running; please reset them onto the new one by ${until} (${left} day${left === 1 ? '' : 's'} left).`,
       'To reset one: run 0g-agentdna, then `reset <agent>` (persona, skills, settings and memory stay).',
     ];
@@ -126,7 +126,12 @@ export async function myMigrations(attestorUrl: string, privateKey: `0x${string}
   for (const r of Array.isArray(rows) ? rows : []) {
     const migrate = agentMigrationOf(r.migrate);
     if (!migrate) continue;
-    const agent = r.agent_id != null ? String(r.agent_id) : String(r.seal_id ?? '').slice(0, 12);
+    // The owner tier sends agent_id as a U256 hex string ("0x210"); the
+    // shell's `reset` takes the decimal agentId.
+    let agent = String(r.seal_id ?? '').slice(0, 12);
+    if (r.agent_id != null) {
+      try { agent = BigInt(r.agent_id as string).toString(); } catch { agent = String(r.agent_id); }
+    }
     out.push({ agent, migrate });
   }
   return out;
@@ -136,21 +141,28 @@ function stampFile(): string {
   return join(configPaths().dir, 'release-notice.json');
 }
 
-function readStamp(attestorUrl: string): NoticeStamp | null {
+/** Stamps are kept per attestor and per kind of notice (`agents`: with the
+ *  owner's agents to move; `news`: the release alone), so running with and
+ *  without a key does not reset each other's cadence. */
+function stampKey(attestorUrl: string, kind: 'agents' | 'news'): string {
+  return `${attestorUrl}|${kind}`;
+}
+
+function readStamp(key: string): NoticeStamp | null {
   try {
     const all = JSON.parse(readFileSync(stampFile(), 'utf8')) as Record<string, NoticeStamp>;
-    const s = all[attestorUrl];
+    const s = all[key];
     return s && typeof s.key === 'string' && typeof s.at === 'string' ? s : null;
   } catch {
     return null;
   }
 }
 
-function writeStamp(attestorUrl: string, stamp: NoticeStamp): void {
+function writeStamp(key: string, stamp: NoticeStamp): void {
   try {
     let all: Record<string, NoticeStamp> = {};
     try { all = JSON.parse(readFileSync(stampFile(), 'utf8')) as Record<string, NoticeStamp>; } catch { /* first time */ }
-    all[attestorUrl] = stamp;
+    all[key] = stamp;
     mkdirSync(configPaths().dir, { recursive: true });
     writeFileSync(stampFile(), JSON.stringify(all));
   } catch { /* an unwritable stamp only means the notice may repeat */ }
@@ -171,9 +183,10 @@ export async function dueReleaseNotice(env: CliEnv, signal?: AbortSignal): Promi
     if (env.privateKey && /^0x[0-9a-fA-F]{64}$/.test(env.privateKey)) {
       try { agents = await myMigrations(url, env.privateKey, signal); } catch { /* releases alone */ }
     }
-    const plan = planReleaseNotice({ releases, agents, now: new Date(), stamp: readStamp(url), zh: zhLocale() });
+    const key = stampKey(url, agents.length ? 'agents' : 'news');
+    const plan = planReleaseNotice({ releases, agents, now: new Date(), stamp: readStamp(key), zh: zhLocale() });
     if (!plan) return null;
-    return { lines: plan.lines, shown: () => writeStamp(url, plan.stamp) };
+    return { lines: plan.lines, shown: () => writeStamp(key, plan.stamp) };
   } catch {
     return null;
   }

@@ -67,7 +67,7 @@ test('the notice: weekly while there is time, daily in the last week and after, 
   // After the period, and an urgent release.
   const over = planReleaseNotice({ releases, agents: [agent('528', 'overdue', '2026-12-20T00:00:00Z', true)], now: new Date('2026-12-21T00:00:00Z'), stamp: soon.stamp, zh: true });
   assert.equal(over.lines[0], 'AgentDNA 0.5.0 is out: 分层运行。');
-  assert.match(over.lines[1], /transition period ended 2026-12-20: it may be retired any time/);
+  assert.match(over.lines[1], /transition period ended 2026-12-20: it may be retired any time, and their next boot is then refused/);
   assert.ok(over.lines.some((l) => /security issue/.test(l)));
   // No agents to move: the news once, for 30 days.
   const info = planReleaseNotice({ releases, agents: [], now, stamp: null, zh: false });
@@ -94,8 +94,8 @@ async function attestor({ releases = 'ok' } = {}) {
       if (!message?.startsWith(`0GDeployments:${OWNER}:`) || signer !== OWNER) return res.writeHead(401).end();
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify([
-        { agent_id: '528', seal_id: `0x${'aa'.repeat(32)}`, migrate: { version: '0.5.0', framework: 'openclaw', until: new Date(Date.now() + 30 * DAY).toISOString(), urgent: false, state: 'recommended' } },
-        { agent_id: '617', seal_id: `0x${'bb'.repeat(32)}` },
+        { agent_id: '0x210', seal_id: `0x${'aa'.repeat(32)}`, migrate: { version: '0.5.0', framework: 'openclaw', until: new Date(Date.now() + 30 * DAY).toISOString(), urgent: false, state: 'recommended' } },
+        { agent_id: '0x269', seal_id: `0x${'bb'.repeat(32)}` },
         { agent_id: null, seal_id: `0x${'cc'.repeat(32)}`, migrate: { version: '0.5.0', framework: 'hermes', until: new Date(Date.now() + 30 * DAY).toISOString(), urgent: false, state: 'recommended' } },
       ]));
     }
@@ -132,6 +132,10 @@ test('the due notice is remembered per attestor once shown', async () => {
     // Without a wallet: the news alone, its own stamp.
     const news = await dueReleaseNotice({ attestorUrl: a.url });
     assert.deepEqual(news.lines, ['AgentDNA 0.5.0 is out: Layered runtime.', 'Details: 0g-agentdna releases']);
+    // With the key again: the agents notice keeps its own stamp (not due).
+    assert.equal(await dueReleaseNotice({ attestorUrl: a.url, privateKey: KEY }), null);
+    news.shown();
+    assert.equal(await dueReleaseNotice({ attestorUrl: a.url }), null);
     // An unreachable attestor: nothing, no error.
     assert.equal(await dueReleaseNotice({ attestorUrl: 'http://127.0.0.1:1' }), null);
   } finally {

@@ -214,8 +214,11 @@ AgenticID 1.3 image.
 ### Announcing a release
 
 Every release that ships new images gets an entry in the environment's
-release file (`ATTESTOR_RELEASES_FILE`), written before the new images become
-the default:
+release file (`ATTESTOR_RELEASES_FILE`; `docker-compose.yml` mounts `./releases`
+at `/etc/attestor/releases`). Replace the file atomically (write a temporary
+file in the same directory, then rename it): the attestor reads it again when
+its modification time, size or inode changes, and a mounted directory, unlike
+a mounted single file, shows the renamed file. The entry:
 
 ```json
 {"releases": [
@@ -231,20 +234,33 @@ the default:
   `until`, the end of each one's transition period. Agents on an old image keep
   running until then; owners are told to reset them onto the new image (their
   persona, skills, settings and memory stay; the conversation starts fresh).
-- The transition period is at least 30 days on mainnet and 14 on testnet.
-  The old image is delisted no earlier than `until`. `urgent: true` marks an
-  image with a security problem, which may be delisted earlier; send a
-  separate notice when that happens.
-- An entry with a future `published_at` stays hidden until then.
+- `published_at` is at or after the moment the new images become the default
+  (`ATTESTOR_FRAMEWORKS` / `ATTESTOR_SANDBOX_SNAPSHOT`, read at the attestor's
+  start): an owner who resets on the notice must land on the new image. An
+  entry with a future `published_at` stays hidden until then, so the entry can
+  be written ahead.
+- `version` is 1-64 of `A-Z a-z 0-9 . _ + -`, and a published one is never
+  renamed: emails are sent once per owner, version and kind, so a renamed
+  version is emailed again.
+- The transition period is at least 30 days on mainnet and 14 on testnet; the
+  deployer sets `until` accordingly (the attestor does not check it). The old
+  image is delisted no earlier than `until`. `urgent: true` marks an image with
+  a security problem, which may be delisted earlier; send a separate notice
+  when that happens. For an image listed by several releases, an urgent entry
+  counts first, then the earliest `until`.
+- A file that does not parse, or is removed, is logged and its last good
+  content is kept; to withdraw every notice, write `{"releases": []}`.
 - Owners hear about it in three places: the CLI (once a week, every day in the
   last 7 days, with the agents to reset), the owner tier of `GET /deployments`
   (`migrate`), and, where the attestor sends email, an email when the release
-  is out and one in the last 7 days.
+  is out and one in the last 7 days of each transition period. Emails go to
+  the agent's live on-chain owner; one that fails is sent again by the next
+  hourly sweep.
 - The sealed program and the official harness package need no entry: agents
   switch to the newest listed version by themselves when the old one is
   delisted.
-- After the image is delisted, an agent still on it is refused at its next
-  provision with `recorded image_hash not in validFrameworkHashes: the image
+- After the image is delisted, an agent still on it keeps running until its
+  container next boots; that boot's provision is refused with `recorded image_hash not in validFrameworkHashes: the image
   was retired; reset required`, which the owner sees as its failure reason.
 
 ## Workspace
@@ -347,7 +363,7 @@ The NFT owner can appoint an operator to create, fund, start and stop its own sa
 |---|---|---|
 | `GET /provision?seal_id=…` | Returns `{"generation", "certificate_required", "layered"}`: the enabled boot generation (never its ticket), whether no container key is recorded yet so the next boot must send its certificate, and whether this attestor runs the layered flow (`sealed/LAYERS.md` §10) — true once the chain has a trust registry (AgenticID's `trustRegistry()` is not zero). It is false only when AgenticID refuses that call, as one before 1.4.0 does (a revert: JSON-RPC code 3 or "execution reverted"); any other failed read, an error the node answers included, is a 503. The answer is kept for 60 s. `403 no authorized boot; reset required` without an enabled authorization | public metadata |
 | `GET /attestor-tls?provider=0x…` | Relays, byte-identical, the latest statement in which the sandbox provider signs this attestor's TLS SPKI pins (EIP-712 `AttestorTLS`, fetched from the discovered provider's `/api/attestor-tls`). Before serving, the attestor checks the provider signature, the lease (at most 300 s) and that its own TLS key is pinned; it refreshes 60 s before expiry, serves a statement until 15 s before it expires (sealed needs more than 5 s left), and consults sandbox discovery only for that refresh, so a discovery renewal or outage does not hold or fail a request the cache can answer. Each new statement is logged; the api fetches one at startup and logs the result. Unknown provider → 404; no valid statement → 503 with `Retry-After: 5`. Always `Cache-Control: no-store`. sealed pins every later attestor connection to these pins | public |
-| `POST /provision` | Container receives ECIES-encrypted `agentSeal_priv`, owner settings, the owner's credential set (`encrypted_credentials`: `{document, owner_epoch}` with its writebacks, only for the current ownership) and an opaque per-boot status token (`encrypted_status_binding`, plaintext `{"token":"<64 hex>"}`; only its SHA-256 is stored, beside the settings version and digest actually served). **First boot** sends its v3 certificate (`certificate`: the `SANDBOX_SEAL_ATTESTATION` object, EIP-712 `ImageAttestation` signed by the provider key). The attestor requires the discovered provider instance as signer and scope, an issue time from 300 s before the boot ticket up to now + 300 s, an image in `validFrameworkHashes`, and the key the provider reported for the sandbox this attestor created under the current ticket (`401 certificate is not for the sandbox this attestor created; reset required`), then records container key, image and provider instance. **Later boots** send no certificate: the recorded key must sign the boot claim, the recorded provider instance must still be the discovered one (`403 provider instance no longer trusted; reset required`) and the recorded image still allowed (`401 recorded image_hash not in validFrameworkHashes; reset required`). No record and no certificate → `409 certificate_required`; a certificate for another key → `403 container key differs from record; reset required`. Every request carries the owner-authorized ticket, generation and a container-key boot claim with a strictly newer `boot_started_at`; 409 until create bookkeeping is persisted. Rejected requests never delete containers; a 401/403 for the authorized boot is logged (`provision rejected`), recorded as `last_provision_error` and takes the container stage to `failed` at once (published as `container_failed`), while that generation is current; the next accepted boot or a new container's ticket clears it. Repeated unconfirmed boots fall back to last-known-good (a retry by the same boot is the same attempt). **Layered flow**: a container whose loader started sealed adds `sealed_hash` (`0x` + 64 hex) and signs it into its claim (`ProvisionBoot.v2:…:<sealed hash>`); the trust registry's sealed list must hold it. One it does not hold is a `403` that is noted as `last_provision_error` but does not take the agent offline: sealed moves to the newest listed version and claims again under the same generation. `sealed_hash` on a chain without a trust registry is a `400`. A claim without one (`ProvisionBoot.v1`) is an image without the loader and is served as before (`crates/shared/src/legacy.rs`) | provider-signed certificate (first boot) or recorded container key + owner-authorized ticket, generation and container-key boot claim |
+| `POST /provision` | Container receives ECIES-encrypted `agentSeal_priv`, owner settings, the owner's credential set (`encrypted_credentials`: `{document, owner_epoch}` with its writebacks, only for the current ownership) and an opaque per-boot status token (`encrypted_status_binding`, plaintext `{"token":"<64 hex>"}`; only its SHA-256 is stored, beside the settings version and digest actually served). **First boot** sends its v3 certificate (`certificate`: the `SANDBOX_SEAL_ATTESTATION` object, EIP-712 `ImageAttestation` signed by the provider key). The attestor requires the discovered provider instance as signer and scope, an issue time from 300 s before the boot ticket up to now + 300 s, an image in `validFrameworkHashes`, and the key the provider reported for the sandbox this attestor created under the current ticket (`401 certificate is not for the sandbox this attestor created; reset required`), then records container key, image and provider instance. **Later boots** send no certificate: the recorded key must sign the boot claim, the recorded provider instance must still be the discovered one (`403 provider instance no longer trusted; reset required`) and the recorded image still allowed (`401 recorded image_hash not in validFrameworkHashes: the image was retired; reset required`). No record and no certificate → `409 certificate_required`; a certificate for another key → `403 container key differs from record; reset required`. Every request carries the owner-authorized ticket, generation and a container-key boot claim with a strictly newer `boot_started_at`; 409 until create bookkeeping is persisted. Rejected requests never delete containers; a 401/403 for the authorized boot is logged (`provision rejected`), recorded as `last_provision_error` and takes the container stage to `failed` at once (published as `container_failed`), while that generation is current; the next accepted boot or a new container's ticket clears it. Repeated unconfirmed boots fall back to last-known-good (a retry by the same boot is the same attempt). **Layered flow**: a container whose loader started sealed adds `sealed_hash` (`0x` + 64 hex) and signs it into its claim (`ProvisionBoot.v2:…:<sealed hash>`); the trust registry's sealed list must hold it. One it does not hold is a `403` that is noted as `last_provision_error` but does not take the agent offline: sealed moves to the newest listed version and claims again under the same generation. `sealed_hash` on a chain without a trust registry is a `400`. A claim without one (`ProvisionBoot.v1`) is an image without the loader and is served as before (`crates/shared/src/legacy.rs`) | provider-signed certificate (first boot) or recorded container key + owner-authorized ticket, generation and container-key boot claim |
 | `POST /status` | sealed heartbeat/status (`StatusReport.v2` canonical; `StatusReport.v3` appends the count of credential requests waiting for the owner, stored per seal: a rise emails the owner when notifications are configured). Signature covers the status token hash and applied settings digest; one transaction checks the token is the current boot's and updates stage, liveness and exact-version confirmation. Only a `running` / `warning` report whose applied digest equals the digest that boot was served promotes settings. Stale instances are ignored; errors leave settings unchanged. The report's level and reason (`error_detail`) are kept on the row as `container_status` | agentSeal raw-keccak signature + current status token |
 | `POST /credentials/writeback` | Container stores a value it obtained (a rotated refresh token, an MCP login), sealed to its agentSeal key, for the next boot. Accepted only from the current boot, for an entry in the set with `writeback: true` | agentSeal raw-keccak signature over `CredentialWriteback.v2:0x<sealId>:<name>:<binding>:<boot_id>:<keccak256 of the ciphertext>`, `binding` being `value:0x<64 hex>` or `mcp:0x<64 hex>` (`sealed/CREDENTIALS.md`) |
 | `POST /settings/seed` | Container hands back a configuration document recovered from a pre-settings chain role, so it survives a recreate. Seed only, and single-use: it lands only while `settings_version = 0`, and is ignored outright when no sandbox is on record (ghost container — every container this agent ever had holds the agentSeal key) | agentSeal signature over `SettingsSeed:0x<sealId>:<sha256>` |
@@ -447,7 +463,7 @@ Attestor and configured sealed images are released together. `/config.inference_
 
 | env | Meaning |
 |---|---|
-| `ATTESTOR_NOTIFY_RESEND_API_KEY` / `ATTESTOR_NOTIFY_FROM` | Email through Resend's HTTP API. Both set: an owner who registered an address (`POST /credentials/notify`) is emailed when an agent's count of credential requests rises, a week before a credential's `expires_at`, and about agents a release asks to move: once when the release is out and once in the last 7 days of its transition period (hourly sweep). The message names the agent and the count, never what the agent wrote. Either blank: no email |
+| `ATTESTOR_NOTIFY_RESEND_API_KEY` / `ATTESTOR_NOTIFY_FROM` | Email through Resend's HTTP API. Both set: an owner who registered an address (`POST /credentials/notify`) is emailed when an agent's count of credential requests rises, a week before a credential's `expires_at`, and about agents a release asks to move: once when the release is out and once in the last 7 days of each transition period (hourly sweep). A credential email names the agent and the count, never what the agent wrote. Either blank: no email |
 | `ATTESTOR_NOTIFY_COOLDOWN_SECONDS` | Minimum seconds between two messages about the same agent. Default 600 |
 
 ### Releases

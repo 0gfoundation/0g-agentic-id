@@ -158,7 +158,7 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
 
 ### 发布通知
 
-每次发布新镜像，都在该环境的发布记录文件（`ATTESTOR_RELEASES_FILE`）里加一条，在新镜像成为默认之前写好：
+每次发布新镜像，都在该环境的发布记录文件（`ATTESTOR_RELEASES_FILE`；`docker-compose.yml` 把 `./releases` 挂到 `/etc/attestor/releases`）里加一条。替换文件要原子地做（在同一目录写临时文件，再改名）：文件的修改时间、大小或 inode 变了，attestor 就重新读取；挂载的是目录而不是单个文件，改名后的文件才看得到。条目如下：
 
 ```json
 {"releases": [
@@ -171,11 +171,13 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
 ```
 
 - `migrate` 列出这个版本替换掉的镜像（每个框架一条），以及每个镜像过渡期的结束时间 `until`。在那之前，旧镜像上的 agent 照常运行；owner 会被提醒把它们 reset 到新镜像（人格、技能、设置和记忆保留，对话重新开始）。
-- 过渡期主网至少 30 天，测试网至少 14 天。旧镜像不早于 `until` 下架。`urgent: true` 表示该镜像有安全问题，可能提前下架；提前下架时另发通知。
-- `published_at` 在未来的条目，到时间才会公开。
-- owner 在三个地方看到：CLI（每周一次，最后 7 天每天一次，列出要 reset 的 agent）、`GET /deployments` 的 owner 视图（`migrate`）、attestor 能发邮件时的邮件（发布时一封，最后 7 天一封）。
+- `published_at` 不早于新镜像成为默认的时刻（`ATTESTOR_FRAMEWORKS` / `ATTESTOR_SANDBOX_SNAPSHOT`，attestor 启动时读取）：owner 看到通知去 reset，必须落到新镜像上。`published_at` 在未来的条目到时间才公开，所以可以提前写好。
+- `version` 由 1-64 个 `A-Z a-z 0-9 . _ + -` 组成，已发布的版本不能改名：邮件按 owner、版本和类型各发一次，改名会重发。
+- 过渡期主网至少 30 天，测试网至少 14 天，由部署方据此设定 `until`（attestor 不检查）。旧镜像不早于 `until` 下架。`urgent: true` 表示该镜像有安全问题，可能提前下架；提前下架时另发通知。同一个镜像被多个版本列出时，先看 urgent 的条目，再看最早的 `until`。
+- 解析不了或被删掉的文件会记日志，继续用上一份有效内容；要撤回全部通知，写入 `{"releases": []}`。
+- owner 在三个地方看到：CLI（每周一次，最后 7 天每天一次，列出要 reset 的 agent）、`GET /deployments` 的 owner 视图（`migrate`）、attestor 能发邮件时的邮件（发布时一封，每个过渡期最后 7 天一封）。邮件只发给 agent 链上的当前 owner；发送失败的，下一次每小时检查时重发。
 - sealed 程序和官方 harness 包不用写条目：旧版本下架后，agent 会自己切到已上架的最新版本。
-- 镜像下架后，还在用它的 agent 在下次 provision 时被拒，原因是 `recorded image_hash not in validFrameworkHashes: the image was retired; reset required`，owner 会看到这个失败原因。
+- 镜像下架后，还在用它的 agent 继续运行，直到容器下次启动；那次启动的 provision 被拒，原因是 `recorded image_hash not in validFrameworkHashes: the image was retired; reset required`，owner 会看到这个失败原因。
 
 ## Workspace
 
@@ -274,7 +276,7 @@ NFT owner 可以指定 operator，由 operator 创建、付费并启停自己的
 |---|---|---|
 | `GET /provision?seal_id=…` | 返回 `{"generation", "certificate_required", "layered"}`：已启用的启动代次（不返回票据），当前是否尚未记录容器公钥、下一次启动必须携带证书，以及本 attestor 是否运行分层流程（`sealed/LAYERS.zh.md` 第 10 节）——链上有信任注册表（AgenticID 的 `trustRegistry()` 不为零）时为 true。只有 AgenticID 拒绝该调用时为 false，1.4.0 之前的 AgenticID 就是这样（revert：JSON-RPC 错误码 3 或 "execution reverted"）；其他读取失败，包括节点返回的其他错误，一律返回 503。结果缓存 60 秒。没有已启用的授权时返回 `403 no authorized boot; reset required` | 公开元数据 |
 | `GET /attestor-tls?provider=0x…` | 原样（逐字节）转发 sandbox provider 对本 attestor TLS SPKI pin 的最新签名声明（EIP-712 `AttestorTLS`，取自已发现 provider 的 `/api/attestor-tls`）。转发前检查 provider 签名、租期（最长 300 秒）以及本 attestor 自己的 TLS 公钥在 pin 中；到期前 60 秒刷新，声明到期前 15 秒停止下发（sealed 要求剩余超过 5 秒），且只在刷新时询问 sandbox discovery，因此 discovery 续期或不可用不会阻塞或拒绝缓存能回答的请求。未知 provider → 404；没有有效声明 → 503 并带 `Retry-After: 5`。始终 `Cache-Control: no-store`。每份新声明都会打日志；api 启动时取一次并记录结果。sealed 之后对 attestor 的所有连接都钉在这些 pin 上 | 公开 |
-| `POST /provision` | 容器领取 ECIES 加密的 `agentSeal_priv`、owner 配置文档、owner 的凭据集（`encrypted_credentials`：`{document, owner_epoch}` 及其写回，只发给当前所有权），以及不透明的单次启动状态令牌（`encrypted_status_binding`，明文 `{"token":"<64 hex>"}`；只存其 SHA-256，旁边记录实际下发的配置版本和摘要）。**首次启动**携带 v3 证书（`certificate`：`SANDBOX_SEAL_ATTESTATION` 对象，provider 密钥签的 EIP-712 `ImageAttestation`）。attestor 要求签名者与 scope 是已发现的 provider 实例，签发时间在启动票据之前 300 秒到当前时间 + 300 秒之间，镜像在 `validFrameworkHashes` 中，且公钥是 provider 为本 attestor 在当前票据下创建的 sandbox 所报告的公钥（`401 certificate is not for the sandbox this attestor created; reset required`），然后记录容器公钥、镜像和 provider 实例。**之后的启动**不带证书：由已记录的公钥签 boot claim，已记录的 provider 实例必须仍是当前发现的实例（否则 `403 provider instance no longer trusted; reset required`），已记录镜像仍须在白名单中（否则 `401 recorded image_hash not in validFrameworkHashes; reset required`）。没有记录也没有证书 → `409 certificate_required`；证书对应另一把公钥 → `403 container key differs from record; reset required`。每个请求都带 owner 授权的票据、启动代次和容器公钥签名的 boot claim，`boot_started_at` 必须严格递增；create 尚未落库时返回 409。拒绝的请求不删除容器；对已授权启动的 401/403 会打日志（`provision rejected`），在该代次仍有效时记为 `last_provision_error`，并立即把容器 stage 置为 `failed`（发布 `container_failed`）；下一次被接受的启动或新容器的票据会清除它。未确认配置多次启动后回退至 last-known-good（同一次启动的重试算同一次尝试）。**分层流程**：由加载器启动 sealed 的容器加上 `sealed_hash`（`0x` + 64 位十六进制），并把它签进 boot claim（`ProvisionBoot.v2:…:<sealed hash>`）；信任注册表的 sealed 名单必须包含它。不在名单上返回 `403`，记为 `last_provision_error`，但不让 agent 下线：sealed 切到最新的已列出版本，在同一代次下重新申领。链上没有信任注册表时带 `sealed_hash` 返回 `400`。不带它的 claim（`ProvisionBoot.v1`）来自没有加载器的镜像，按原流程处理（`crates/shared/src/legacy.rs`）| provider 签名的证书（首次启动）或已记录的容器公钥 + owner 授权的票据、启动代次和容器公钥签名的 boot claim |
+| `POST /provision` | 容器领取 ECIES 加密的 `agentSeal_priv`、owner 配置文档、owner 的凭据集（`encrypted_credentials`：`{document, owner_epoch}` 及其写回，只发给当前所有权），以及不透明的单次启动状态令牌（`encrypted_status_binding`，明文 `{"token":"<64 hex>"}`；只存其 SHA-256，旁边记录实际下发的配置版本和摘要）。**首次启动**携带 v3 证书（`certificate`：`SANDBOX_SEAL_ATTESTATION` 对象，provider 密钥签的 EIP-712 `ImageAttestation`）。attestor 要求签名者与 scope 是已发现的 provider 实例，签发时间在启动票据之前 300 秒到当前时间 + 300 秒之间，镜像在 `validFrameworkHashes` 中，且公钥是 provider 为本 attestor 在当前票据下创建的 sandbox 所报告的公钥（`401 certificate is not for the sandbox this attestor created; reset required`），然后记录容器公钥、镜像和 provider 实例。**之后的启动**不带证书：由已记录的公钥签 boot claim，已记录的 provider 实例必须仍是当前发现的实例（否则 `403 provider instance no longer trusted; reset required`），已记录镜像仍须在白名单中（否则 `401 recorded image_hash not in validFrameworkHashes: the image was retired; reset required`）。没有记录也没有证书 → `409 certificate_required`；证书对应另一把公钥 → `403 container key differs from record; reset required`。每个请求都带 owner 授权的票据、启动代次和容器公钥签名的 boot claim，`boot_started_at` 必须严格递增；create 尚未落库时返回 409。拒绝的请求不删除容器；对已授权启动的 401/403 会打日志（`provision rejected`），在该代次仍有效时记为 `last_provision_error`，并立即把容器 stage 置为 `failed`（发布 `container_failed`）；下一次被接受的启动或新容器的票据会清除它。未确认配置多次启动后回退至 last-known-good（同一次启动的重试算同一次尝试）。**分层流程**：由加载器启动 sealed 的容器加上 `sealed_hash`（`0x` + 64 位十六进制），并把它签进 boot claim（`ProvisionBoot.v2:…:<sealed hash>`）；信任注册表的 sealed 名单必须包含它。不在名单上返回 `403`，记为 `last_provision_error`，但不让 agent 下线：sealed 切到最新的已列出版本，在同一代次下重新申领。链上没有信任注册表时带 `sealed_hash` 返回 `400`。不带它的 claim（`ProvisionBoot.v1`）来自没有加载器的镜像，按原流程处理（`crates/shared/src/legacy.rs`）| provider 签名的证书（首次启动）或已记录的容器公钥 + owner 授权的票据、启动代次和容器公钥签名的 boot claim |
 | `POST /status` | sealed 心跳与状态（`StatusReport.v2` canonical；`StatusReport.v3` 末尾追加等待 owner 处理的凭据待办数量，按 seal 记录：配置了通知时，数量上升会给 owner 发邮件）。签名覆盖状态令牌哈希和实际使用的配置摘要；在一个事务里检查令牌属于当前启动，再更新状态、心跳与精确版本确认。只有实际使用的配置摘要等于该次启动下发摘要的 `running` / `warning` 上报才能提升配置；旧容器上报被忽略，`error` 不改配置。上报的级别和原因（`error_detail`）作为 `container_status` 记在该行 | agentSeal 原始 keccak 签名 + 当前状态令牌 |
 | `POST /credentials/writeback` | 容器把自己获得的值（轮换得到的 refresh token、MCP 登录结果）加密给自己的 agentSeal 后存下，供下次启动使用。只接受当前启动的容器、凭据集中带 `writeback: true` 的条目 | agentSeal 对 `CredentialWriteback.v2:0x<sealId>:<name>:<binding>:<boot_id>:<密文 keccak256>` 的原始 keccak 签名，`binding` 为 `value:0x<64 位 hex>` 或 `mcp:0x<64 位 hex>`（见 `sealed/CREDENTIALS.zh.md`） |
 | `POST /settings/seed` | 容器把从旧 config role 里捞回来的配置文档交还 attestor，保证重建容器后不丢。仅播种且一次性：只在 `settings_version = 0` 时落库；行上没有 sandbox 记录时直接忽略（幽灵容器——这个 agent 历史上每个容器都握着 agentSeal 私钥）| agentSeal 对 `SettingsSeed:0x<sealId>:<sha256>` 的签名 |
