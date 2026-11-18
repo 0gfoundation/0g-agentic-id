@@ -54,6 +54,45 @@ export interface LiveInput {
   recall?(): boolean;
   /** Queue what is being edited for the next prompt; false when nothing is. */
   queueEdit?(): boolean;
+  /** The shell's Tab completion of the text before the cursor (completeLine). */
+  complete?(before: string): [string[], string];
+}
+
+function commonPrefix(list: readonly string[]): string {
+  if (!list.length) return '';
+  let p = list[0];
+  for (const s of list) while (!s.startsWith(p)) p = p.slice(0, -1);
+  return p;
+}
+
+/**
+ * Tab on `line` with the cursor at `cursor`, as readline does it: what the
+ * candidates share is filled in; when that adds nothing and there are
+ * several, `list` has them to show. Exported for the tests.
+ */
+export function completeAt(
+  line: string,
+  cursor: number,
+  complete: (before: string) => [string[], string],
+): { line: string; cursor: number; list: string[] | null } {
+  let hits: string[];
+  let sub: string;
+  try {
+    [hits, sub] = complete(line.slice(0, cursor));
+  } catch {
+    return { line, cursor, list: null };
+  }
+  if (!hits.length) return { line, cursor, list: null };
+  const prefix = commonPrefix(hits.filter(Boolean));
+  if (prefix.startsWith(sub) && prefix.length > sub.length) {
+    const add = prefix.slice(sub.length);
+    return { line: line.slice(0, cursor) + add + line.slice(cursor), cursor: cursor + add.length, list: null };
+  }
+  if (!sub.startsWith(prefix)) {
+    const at = cursor - sub.length;
+    return { line: line.slice(0, at) + prefix + line.slice(cursor), cursor: at + prefix.length, list: null };
+  }
+  return { line, cursor, list: hits.length > 1 ? hits : null };
 }
 
 /** What the live prompt shows besides the reply, read at every redraw. */
@@ -254,6 +293,17 @@ export class LiveTurn implements TurnView {
   tab(): boolean {
     if (this.ended || this.closed) return false;
     const cursor = this.snap?.cursor ?? this.cursorRows();
+    // A command is completed, as when no turn runs (several candidates show
+    // above the prompt); other text is queued for the next turn.
+    const edit = this.rl as unknown as { line: string; cursor: number };
+    if (edit.line.trimStart().startsWith('/') && !this.input.drafting?.().length && this.input.complete) {
+      const r = completeAt(edit.line, edit.cursor, this.input.complete);
+      edit.line = r.line;
+      edit.cursor = r.cursor;
+      if (r.list) this.committed += `${r.list.join('  ')}\n`;
+      this.paint(this.rows + cursor);
+      return true;
+    }
     if (this.input.queueEdit?.()) this.paint(this.rows + cursor);
     return true;
   }

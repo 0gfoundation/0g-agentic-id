@@ -201,7 +201,7 @@ test('Enter steers: shown as steered until read, the prompt is empty again', asy
   await t.type('stop after step two\r');
   await paint();
   assert.deepEqual(taken, ['stop after step two']);
-  assert.deepEqual(t.read().lines, ['earlier output', 'agent> working', '  steered: stop after step two', P]);
+  assert.deepEqual(t.read().lines, ['earlier output', 'agent> working', '  waiting for the agent: stop after step two', P]);
   assert.equal(t.rl.line, '');
   // The agent read it: the note goes, a line says so above the reply's line.
   t.steered.shift();
@@ -252,14 +252,14 @@ test('Tab queues what is typed; a lone command waits too; ↑ takes the newest b
   await t.type('/files\r'); // a command alone: waits for the prompt
   await paint();
   assert.deepEqual(t.ask.queued().map((e) => e.text), ['and then write the tests', '/files']);
-  assert.deepEqual(t.read().lines, ['earlier output', 'agent> working', '  queued: and then write the tests', '  queued: /files', P]);
+  assert.deepEqual(t.read().lines, ['earlier output', 'agent> working', '  next turn: and then write the tests', '  next turn: /files', P]);
   assert.equal(t.rl.line, '');
   // ↑ on the empty prompt: the newest queued entry comes back to be edited.
   await t.type('\x1b[A');
   await paint();
   assert.equal(t.rl.line, '/files');
   assert.deepEqual(t.ask.queued().map((e) => e.text), ['and then write the tests']);
-  assert.deepEqual(t.read().lines.slice(-2), ['  queued: and then write the tests', `${PROMPT}/files`]);
+  assert.deepEqual(t.read().lines.slice(-2), ['  next turn: and then write the tests', `${PROMPT}/files`]);
   // ↑ on a prompt with something typed is readline's history, as always.
   await t.type('\x7f\x7f\x7f\x7f\x7f\x7f'); // erase it
   await t.type('\x1b[A');
@@ -283,7 +283,7 @@ test('a message of several lines typed during a turn shows as it grows', async (
   await t.type('\t'); // queued, both lines
   await paint();
   assert.deepEqual(t.ask.queued().map((e) => [e.text, e.multi]), [['first line\nsecond', true]]);
-  assert.deepEqual(t.read().lines.slice(-2), ['  queued: first line (+1 line)', P]);
+  assert.deepEqual(t.read().lines.slice(-2), ['  next turn: first line (+1 line)', P]);
   // ↑ brings both back: the first as the message's earlier line.
   await t.type('\x1b[A');
   await paint();
@@ -389,7 +389,7 @@ test('the prompt says what runs and what waits', () => {
   assert.equal(sessionPromptText('625', '', false, { notices: 0, files: 0 }), 'agent 625 › ');
   assert.equal(sessionPromptText('625', '', false, { notices: 2, files: 1 }), 'agent 625 · 2 notices · 1 new file › ');
   assert.equal(sessionPromptText('625', ' [notes]', true, { notices: 1, files: 0 }), 'agent 625 [notes] (replying, Esc stops) · 1 notice › ');
-  assert.deepEqual(turnNotes(['use v2'], [{ text: 'then this' }, { text: 'a\nb\nc' }]), ['steered: use v2', 'queued: then this', 'queued: a (+2 lines)']);
+  assert.deepEqual(turnNotes(['use v2'], [{ text: 'then this' }, { text: 'a\nb\nc' }]), ['waiting for the agent: use v2', 'next turn: then this', 'next turn: a (+2 lines)']);
 });
 
 test('the prompt is retitled in place when what it counts changes', async () => {
@@ -416,4 +416,44 @@ test('activity labels read as plain words, never the frameworks\' event names', 
   assert.equal(activityText('tool/result'), 'working');
   assert.equal(activityText('rlm_child spawned'), 'asking a subagent');
   assert.equal(activityText(''), 'thinking');
+});
+
+test('Tab on a command during a turn completes it, as at the prompt; plain text is queued', async () => {
+  const t = shell(60);
+  const words = ['/tasks', '/tasks show ', '/files'];
+  const complete = (l) => [words.filter((w) => w.startsWith(l)), l];
+  const input = {
+    drafting: () => t.ask.drafting(), queued: () => t.ask.queued(), recall: () => t.ask.recall(), queueEdit: () => t.ask.queueEdit(), complete,
+  };
+  const v = new LiveTurn(t.rl, t.output, input, () => ({ prompt: PROMPT, notes: turnNotes([], t.ask.queued()) }), 0);
+  v.write('agent> working');
+  await paint();
+  await t.type('/ta');
+  await t.type('\t');
+  await paint();
+  assert.equal(t.rl.line, '/tasks');
+  assert.deepEqual(t.ask.queued(), []);
+  assert.equal(t.read().lines.at(-1), `${PROMPT}/tasks`);
+  // Nothing more to fill in: the candidates show above, the line stays.
+  await t.type('\t');
+  await paint();
+  assert.ok(t.read().lines.includes('/tasks  /tasks show'), t.read().lines.join('\n'));
+  assert.equal(t.rl.line, '/tasks');
+  // Plain text: queued for the next turn.
+  await t.type('\u0015hello there');
+  await t.type('\t');
+  await paint();
+  assert.deepEqual(t.ask.queued().map((e) => e.text), ['hello there']);
+  assert.equal(t.read().lines.at(-2), '  next turn: hello there');
+  v.end();
+  t.rl.close();
+});
+
+test('Esc puts what was queued back to edit without blank lines, the rest as typed', async () => {
+  const t = shell(60);
+  for (const text of ['first', '', 'second\n\nthird', '   ']) t.ask.later({ text, multi: text.includes('\n'), pasted: false });
+  assert.equal(t.ask.recallAll(), 4);
+  assert.deepEqual(t.ask.drafting(), ['first', 'second']);
+  assert.equal(t.rl.line, 'third');
+  t.rl.close();
 });
