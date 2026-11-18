@@ -23,6 +23,7 @@
 
 import { CliError } from './errors';
 import { THINKING_LEVELS, type SettingsDoc, type ThinkingLevel, type VersionPicks } from '../Settings';
+import { MODEL_KEY_PREFIX } from '../Credentials';
 
 /** The layered runtime's version picks, spelled as their own keys and
  *  written into the document's `versions` (0g-harness only). */
@@ -125,6 +126,16 @@ function knobError(message: string): CliError {
   });
 }
 
+/**
+ * A model key entry (`model.<provider>`) pays only the agent's own model:
+ * the credential proxy has no placeholder for it, so sealed refuses it here.
+ */
+function assertNotModelKey(credential: unknown, field: string): void {
+  if (typeof credential === 'string' && credential.startsWith(MODEL_KEY_PREFIX)) {
+    throw knobError(`${field} "${credential}" is a model key, which pays only the agent's own model: leave "credential" out to use the model key, or store the key as an owner credential (cred <agent> set <name> preset=<provider>) and name that`);
+  }
+}
+
 function onlyKeys(v: unknown, keys: string[]): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).every((k) => keys.includes(k));
 }
@@ -143,6 +154,7 @@ export function assertHarnessKnobShapes(others: unknown): void {
       throw knobError(`webSearch must be {"service": ${WEB_SEARCH_SERVICES.join('|')}, "credential"?, "model"?}`);
     }
     if (ws.credential !== undefined && (typeof ws.credential !== 'string' || !CREDENTIAL_NAME.test(ws.credential))) throw knobError('webSearch.credential must name a credential');
+    assertNotModelKey(ws.credential, 'webSearch.credential');
     if (ws.model !== undefined && (typeof ws.model !== 'string' || !MODEL_ID.test(ws.model))) throw knobError('webSearch.model must be a model id');
     if (ws.model !== undefined && ws.service !== 'openai' && ws.service !== 'anthropic') throw knobError('webSearch.model applies only to the openai and anthropic services');
   }
@@ -156,6 +168,7 @@ export function assertHarnessKnobShapes(others: unknown): void {
           (m.credential !== undefined && (typeof m.credential !== 'string' || !CREDENTIAL_NAME.test(m.credential)))) {
         throw knobError('each subagentModels entry is {"provider", "model", "credential"?}');
       }
+      assertNotModelKey(m.credential, 'subagentModels credential');
       const key = `${m.provider}\0${m.model}\0${m.credential ?? ''}`;
       if (seen.has(key)) throw knobError(`subagentModels repeats ${m.provider}/${m.model}`);
       seen.add(key);

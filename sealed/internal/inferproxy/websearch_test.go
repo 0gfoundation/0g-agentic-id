@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"seal-verify/internal/credproxy"
 )
 
 // upstreamRecorder serves canned answers and records the last request.
@@ -272,5 +274,35 @@ func TestUpstreamMessageCredentialRefusal(t *testing.T) {
 	}
 	if got := upstreamMessage([]byte(`not json`), ""); got != "no error message" {
 		t.Fatalf("no message: got %q", got)
+	}
+}
+
+// A router search the credential proxy refuses says so, as the model-run
+// searches do; the router's own answers, errors included, pass as they are.
+func TestRouterSearchCredentialRefusal(t *testing.T) {
+	refuse := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if refuse {
+			w.Header().Set(credproxy.ErrorHeader, "unknown_entry")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"code":"unknown_entry","message":"no credential named \"router-key\""}`)
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"slow down"}}`)
+	}))
+	t.Cleanup(srv.Close)
+	s := startProxy(t)
+	s.SetRoute(Route{Upstream: srv.URL, Model: "m", WebSearch: &WebSearch{Service: ServiceZGRouter, URL: srv.URL + "/v1/web/search"}})
+	code, m := postJSON(t, s.BaseURL()+"/v1/web/search", `{"query":"q"}`)
+	msg, _ := m["error"].(map[string]any)["message"].(string)
+	if code != http.StatusForbidden || msg != `0g-router web search: the credential proxy refused it (unknown_entry): no credential named "router-key"` {
+		t.Fatalf("refused: status %d message %q", code, msg)
+	}
+	refuse = false
+	code, m = postJSON(t, s.BaseURL()+"/v1/web/search", `{"query":"q"}`)
+	if msg, _ := m["error"].(map[string]any)["message"].(string); code != http.StatusTooManyRequests || msg != "slow down" {
+		t.Fatalf("router error: status %d %v", code, m)
 	}
 }

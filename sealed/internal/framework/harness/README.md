@@ -98,9 +98,11 @@ Nothing outside that allowlist is settable by anyone. Measured code decides:
   named owner credential goes through the credential proxy as its
   placeholder, which the proxy fills only on the hosts and in the positions
   the owner allowed; otherwise the search or model is not offered, and the
-  log says why. A named credential is checked when a request runs: the
-  credential proxy refuses one the owner does not hold, and `web_search`
-  reports that refusal's code and message.
+  log says why. A model key entry (`model.<provider>`) cannot be named: it
+  has no placeholder, so the search or model naming it is not offered. A
+  named credential is checked when a request runs: the credential proxy
+  refuses one the owner does not hold, and `web_search` reports that
+  refusal's code and message, for the 0G router too.
 - The harness checks its own token on `/v1/*` (`SEAL_BRIDGE_TOKEN`). The
   owner gets a different one from `/_seal/auth`, and sealed's proxy swaps it
   for the harness's on the way in, so nothing the harness runs sees the

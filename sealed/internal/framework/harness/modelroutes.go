@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 
+	"seal-verify/internal/credentials"
 	"seal-verify/internal/credproxy"
 	"seal-verify/internal/inference"
 	"seal-verify/internal/inferproxy"
@@ -55,6 +56,10 @@ func hostOf(base string) string {
 // value its credential header carries; why is set when it cannot be paid.
 func (k keySource) reach(provider, credential, base string) (upstream, value, why string) {
 	switch {
+	case strings.HasPrefix(credential, credentials.ModelKeyPrefix):
+		// A model key entry has no placeholder (credentials.InferenceSpec):
+		// the proxy would refuse every request naming it.
+		return "", "", fmt.Sprintf("%s is a model key, which pays only the agent's own model; leave \"credential\" out to use the model key of %s, or name an owner credential", credential, k.mainProvider)
 	case credential != "":
 		if k.proxy == "" {
 			return "", "", "the credential proxy is off, so no owner credential can be used"

@@ -25,6 +25,7 @@ test('webSearch: a known service, an optional credential name, a model only for 
     { webSearch: { service: 'openai', credential: 'Not A Name' } },
     { webSearch: { service: '0g-router', model: 'x' } },
     { webSearch: { service: 'openai', apiKey: 'sk-x' } },
+    { webSearch: { service: '0g-router', credential: 'model.0g-compute' } },
   ]) assert.throws(() => others(bad), (e) => e.code === 'BAD_FLAG', JSON.stringify(bad));
 });
 
@@ -37,6 +38,7 @@ test('subagentModels: at most 8 distinct {provider, model, credential?}; subagen
     { subagentModels: [{ provider: 'Open AI', model: 'm' }] },
     { subagentModels: [{ provider: 'openai', model: 'm' }, { provider: 'openai', model: 'm' }] },
     { subagentModels: [{ provider: 'openai', model: 'm', key: 'sk-x' }] },
+    { subagentModels: [{ provider: 'openai', model: 'm', credential: 'model.openai' }] },
     { subagentDefault: { provider: 'openai' } },
   ]) assert.throws(() => others(bad), (e) => e.code === 'BAD_FLAG', JSON.stringify(bad));
   assert.doesNotThrow(() => assertHarnessKnobShapes(null));

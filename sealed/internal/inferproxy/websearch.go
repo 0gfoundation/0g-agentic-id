@@ -149,6 +149,13 @@ func (s *Server) routerSearch(w http.ResponseWriter, r *http.Request, ws *WebSea
 		return
 	}
 	defer resp.Body.Close()
+	if code := resp.Header.Get(credproxy.ErrorHeader); code != "" {
+		// Refused by the credential proxy, not by the router: say so as the
+		// model-run searches do.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		searchError(w, resp.StatusCode, ws.Service+" web search: "+upstreamMessage(body, code))
+		return
+	}
 	for k, vs := range resp.Header {
 		if hopHeader(k) || strings.EqualFold(k, "Content-Length") {
 			continue

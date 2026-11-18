@@ -127,6 +127,10 @@ func TestPlanWebSearch(t *testing.T) {
 	if ws != nil {
 		t.Fatalf("a credential with the proxy off: %+v", ws)
 	}
+	// A model key entry has no placeholder: naming one is refused, with the way out.
+	if ws, why := planWebSearch(knobs(t, `{"webSearch":{"service":"0g-router","credential":"model.0g-compute"}}`), held, routerEp, routerBase, "glm-5.3"); ws != nil || !strings.Contains(why, "is a model key") || !strings.Contains(why, `leave "credential" out`) {
+		t.Fatalf("model key named: %+v %q", ws, why)
+	}
 	unheld.proxy = "http://127.0.0.1:9/tok"
 	ws, _ = planWebSearch(knobs(t, `{"webSearch":{"service":"0g-router","credential":"router-key"}}`), unheld, openaiEp, "https://api.openai.com/v1", "gpt-main")
 	if ws == nil || ws.URL != "http://127.0.0.1:9/tok/https/router-api.0g.ai/v1/web/search" || ws.Headers["Authorization"] != "Bearer [[credential:router-key]]" {
@@ -166,7 +170,8 @@ func TestPlanRoutes(t *testing.T) {
 		{"provider":"openai","model":"gpt-x"},
 		{"provider":"openai","model":"gpt-x","credential":"my-openai"},
 		{"provider":"openai","model":"gpt-y","credential":"my-openai"},
-		{"provider":"mystery","model":"m","credential":"c"}],
+		{"provider":"mystery","model":"m","credential":"c"},
+		{"provider":"0g-compute","model":"deepseek-v3","credential":"model.0g-compute"}],
 		"subagentDefault":{"provider":"openai","model":"gpt-y"}}`)
 	plan := planRoutes(context.Background(), k, keys, main, routerOpenAI, "DOC", "http://127.0.0.1:7/r", named)
 
@@ -185,8 +190,12 @@ func TestPlanRoutes(t *testing.T) {
 		r.Model != "gpt-x" || len(r.Models) != 1 || r.Models[0] != "gpt-y" {
 		t.Fatalf("openai credential route %+v (%v)", r, ok)
 	}
-	// Another provider with no credential, or one sealed knows no endpoint
-	// of: not offered. The main model is always there and not repeated.
+	// Another provider with no credential, one sealed knows no endpoint of,
+	// or a model key named as a credential: not offered. The main model is
+	// always there and not repeated.
+	if _, ok := plan.named["0g-compute+model.0g-compute"]; ok {
+		t.Fatal("a route on a model key entry was offered")
+	}
 	if len(plan.named) != 2 || len(plan.offered) != 4 {
 		t.Fatalf("named %v offered %+v", plan.named, plan.offered)
 	}
