@@ -2131,7 +2131,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           say(`it lands offline — bring it up with: reset ${agentId}\n`);
         } catch (e) {
           const p = explainError(e);
-          say(`still failing: ${p.message.replace(/^the deploy stopped before the mint: /, '')}\n`);
+          say(`error: still failing — ${p.message.replace(/^the deploy stopped before the mint: /, '')}\n`);
           say(`  → once the cause is fixed, \`retry ${label}\` again; \`status ${label}\` shows it in full\n`);
         }
         continue;

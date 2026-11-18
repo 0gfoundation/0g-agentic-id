@@ -647,7 +647,7 @@ test('shell: a retry that fails again says why in plain words, with the next ste
   try {
     const r = await run([], { AGENTIC_ATTESTOR_URL: att.url, AGENTIC_PRIVATE_KEY: KEY }, 'retry 0x6224b71b9a\nquit\n');
     assert.match(r.stdout, /retrying agent 0x6224b71b9a: running its failed steps again \(Esc does not stop this; it can take a minute\)…\n/, r.stdout);
-    assert.match(r.stdout, /still failing: the chain refused the mint: seal already registered\n {2}→ once the cause is fixed, `retry 0x6224b71b9a` again; `status 0x6224b71b9a` shows it in full\n/);
+    assert.match(r.stdout, /error: still failing — the chain refused the mint: seal already registered\n {2}→ once the cause is fixed, `retry 0x6224b71b9a` again; `status 0x6224b71b9a` shows it in full\n/);
     assert.doesNotMatch(r.stdout, /waitForMint|registerWithSeal|Esc-proof|0x6224b71b9acd/);
   } finally { close(att.server); }
 });
