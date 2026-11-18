@@ -357,7 +357,7 @@ test('cli: set merges onto the stored set and takes the value from the prompt', 
   assert.deepEqual(put.entries.map((e) => [e.name, e.value]), [['openai', undefined], ['github', 'tok']]);
   assert.match(prompts[0], /^github value \(Ctrl-C cancels\): $/);
   assert.match(lines[0], /^create it at https:\/\/github\.com\//);
-  assert.match(lines[1], /^added github — version 5/);
+  assert.match(lines[1], /^added github; the agent writes/);
 });
 
 test('cli: set on a stored name keeps its value when the prompt is left empty', async () => {
@@ -546,7 +546,7 @@ test('cli: disconnect revokes at the server and removes; rm of a connection does
   const lines = [];
   const io = { json: false, out: (l) => lines.push(l), secret: async () => '' };
   await credOp(ag, SEAL_ID, ['disconnect', 'linear'], io);
-  assert.match(lines.at(-1), /^disconnected linear — version 4; its tokens are revoked at the server$/);
+  assert.match(lines.at(-1), /^disconnected linear; its tokens are revoked at the server$/);
   await credOp(ag, SEAL_ID, ['rm', 'linear'], io);
   await credOp(ag, SEAL_ID, ['rm', 'github'], io);
   assert.deepEqual(calls, [['disconnect', 'linear'], ['disconnect', 'linear'], ['remove', 'github']]);
