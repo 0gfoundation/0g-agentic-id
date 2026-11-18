@@ -80,4 +80,8 @@ test('Tab after /sessions offers the subcommands; after `switch `, only the sess
   assert.deepEqual(completeLine('/sessions switch ', state), [['1 [task] nightly report', '2 ?', '3 owner chat', '4 (untitled)'], '']);
   assert.deepEqual(completeLine('/sessions switch 3', state), [['3 owner chat'], '3']);
   assert.deepEqual(completeLine('/sessions d', state), [['default'], 'd']);
+  // A word that already ends with a space gets no second one (the manager's `use `).
+  const l1 = { completions: ['use ', 'whoami', 'withdraw'], args: {}, models: [] };
+  assert.deepEqual(completeLine('us', l1), [['use '], 'us']);
+  assert.deepEqual(completeLine('who', l1), [['whoami '], 'who']);
 });

@@ -11,7 +11,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InkEditor, INK_PROMPT, inkLoadError, loadInk, openInkScreen } from '../dist/cli/inkView.js';
-import { activitySummary, droppedShown, lineQueue, steerable } from '../dist/cli/commands/interactive.js';
+import { activitySummary, droppedShown, lineQueue, sayer, steerable } from '../dist/cli/commands/interactive.js';
 
 // Ink draws only its last frame where it thinks it runs in CI (is-in-ci).
 for (const k of Object.keys(process.env)) if (k === 'CI' || k === 'CONTINUOUS_INTEGRATION' || k.startsWith('CI_')) delete process.env[k];
@@ -601,4 +601,35 @@ test('QA re-verify: a waiting message that starts with a dragged file is a messa
   assert.equal(steerable({ text: `${png} look`, multi: false, pasted: false }), true);
   assert.equal(steerable({ text: '/files', multi: false, pasted: false }), false);
   assert.equal(steerable({ text: '/nowhere/missing.png look', multi: false, pasted: false }), false);
+});
+
+test('integ QA (Ink): a line after the reply ends its line first; the agent\'s next text is marked again; Tab\'s list goes when the turn ends', async () => {
+  const v = await view({ cols: 60, rows: 16, complete: () => [['1 owner chat', '2 第二个'], ''] });
+  const t = v.scr.turn({ steers: true });
+  const say = sayer(t);
+  say('First part of the answer');
+  t.after('/files\nfiles the agent left for you (~/outbox):');
+  say('\n\nSecond part.\n');
+  await v.type('/sessions switch \t');
+  let s = await v.read();
+  assert.ok(s.all.some((l) => l.includes('2 第二个')), 'the candidates show');
+  t.end();
+  s = await v.read();
+  const text = s.all.join('\n');
+  assert.match(text, /agent> First part of the answer\n\/files\nfiles the agent left for you \(~\/outbox\):\nagent> Second part\./);
+  assert.ok(!s.shown.some((l) => l.includes('2 第二个')), 'the candidates are gone with the turn');
+  await v.scr.close();
+});
+
+test('integ QA (Ink): ↑ with nothing queued here asks the queue to take back what the agent holds', async () => {
+  const v = await view();
+  let asked = 0;
+  v.ask.held = { count: () => 1, takeBack: () => { asked++; return true; } };
+  // During a turn (no prompt up), nothing queued here.
+  const t = v.scr.turn({ steers: true });
+  await v.type('\x1b[A');
+  assert.equal(asked, 1);
+  t.end();
+  v.ask.held = null;
+  await v.scr.close();
 });
