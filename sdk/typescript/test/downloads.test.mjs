@@ -129,3 +129,23 @@ test('/download: never overwrites; inbox/ names the owner\'s own files; a local 
   const lines = renderFiles([{ name: 'report.pdf', bytes: 2048, mtime: '2026-11-17T06:00:00.123Z' }]);
   assert.match(lines[0], /report\.pdf\s+2\.0 KiB\s+2026-11-17 06:00:00Z/);
 });
+
+test('deleteFile: deleted, missing, or a runtime without the route', async () => {
+  const agent = await mockAgent((req, res) => {
+    if (req.method !== 'DELETE') return json(res, 405, { error: { message: 'method not allowed' } });
+    if (req.url === '/v1/files/outbox/report.pdf') { res.writeHead(204); return res.end(); }
+    if (req.url === '/v1/files/outbox/gone.pdf') return json(res, 404, { error: { message: 'no file gone.pdf in outbox' } });
+    if (req.url === '/v1/files/inbox/old.txt') return json(res, 404, { error: { message: 'no route' } });
+    return json(res, 500, { error: { message: 'boom' } });
+  });
+  try {
+    const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS, token: 't' });
+    assert.equal(await c.deleteFile('outbox', 'report.pdf'), 'deleted');
+    assert.equal(await c.deleteFile('outbox', 'gone.pdf'), 'missing');
+    assert.equal(await c.deleteFile('inbox', 'old.txt'), 'unsupported');
+    await assert.rejects(c.deleteFile('outbox', 'x.txt'), /HTTP 500/);
+    await assert.rejects(c.deleteFile('outbox', '../x'), /one path segment/);
+  } finally {
+    agent.stop();
+  }
+});

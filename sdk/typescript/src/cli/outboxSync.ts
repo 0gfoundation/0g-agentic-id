@@ -6,6 +6,12 @@
  * "-1", "-2", … before its extension (saveDownload). Files over the download
  * limit are skipped and reported once.
  *
+ * Once a file is saved and its size (and hash, when the listing has one)
+ * match the outbox's, it is removed from the outbox (`remove`): the owner
+ * has it, and the agent's disk does not keep a copy. A runtime without the
+ * delete route keeps its files; deleting is then not tried again this
+ * session.
+ *
  * Which versions of which files were saved is kept next to that folder
  * (`outbox-saved.json`: name → size, time, hash, local path), so a check
  * downloads only what changed. Without it (lost, unreadable) a check downloads
@@ -61,6 +67,8 @@ export function makeOutboxSync(o: {
   download(name: string): Promise<Uint8Array>;
   /** Whether new files are saved (else only counted). */
   auto(): boolean;
+  /** Remove a saved file from the outbox; see {@link AgentClient.deleteFile}. */
+  remove?(name: string): Promise<'deleted' | 'missing' | 'unsupported'>;
 }): OutboxSync {
   const base = agentFilesDir(o.agentId, o.home);
   const dir = join(base, 'outbox');
@@ -71,6 +79,7 @@ export function makeOutboxSync(o: {
   const shown = new Set<string>();
   let unseen: AgentFile[] = [];
   let running: Promise<OutboxEvent[]> | null = null;
+  let canRemove = !!o.remove;
 
   const version = (f: AgentFile): string => `${f.name}\u0000${f.bytes}\u0000${f.mtime}`;
   const isNew = (f: AgentFile): boolean => {
@@ -101,6 +110,13 @@ export function makeOutboxSync(o: {
         index[f.name] = { bytes: f.bytes, mtime: f.mtime, sha256: f.sha256 ?? sha256, path };
         writeIndex(indexFile, index);
         if (!have) events.push({ kind: 'saved', name: f.name, bytes: bytes.length, path });
+        // The owner has it: take it off the agent's disk, unless what came
+        // down is not what the listing described (it changed meanwhile).
+        if (canRemove && bytes.length === f.bytes && (!f.sha256 || f.sha256 === sha256)) {
+          try {
+            if ((await o.remove!(f.name)) === 'unsupported') canRemove = false;
+          } catch { /* kept in the outbox; its age clears it later */ }
+        }
       } catch (e) {
         reported.add(version(f));
         events.push({ kind: 'failed', name: f.name, bytes: f.bytes, error: (e as Error).message });

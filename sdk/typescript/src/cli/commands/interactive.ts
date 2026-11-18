@@ -3583,6 +3583,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         list: () => s.client!.listFiles!('outbox'),
         download: (name) => s.client!.downloadFile!('outbox', name),
         auto: () => filesAuto,
+        ...(s.client?.deleteFile ? { remove: (name: string) => s.client!.deleteFile!('outbox', name) } : {}),
       })
     : null;
   const counts = (): PromptCounts => ({
