@@ -2458,7 +2458,7 @@ async function closeInk(screen: InkScreen<Ask>): Promise<void> {
   io.keys?.use(null);
   (io.rl as unknown as { prevRows?: number }).prevRows = 0;
   // Ctrl-D at the view's empty prompt leaves the shell, as at readline's.
-  if (inkEof) io.rl.close();
+  if (inkEof) { endedInInk = true; io.rl.close(); }
 }
 
 /** How often the Ink view re-reads the phase of an agent that is not running. */
@@ -2493,6 +2493,9 @@ async function enterSession(s: Session, ask: (q: string) => Promise<string>, irq
     await closeInk(ink);
   }
 }
+
+/** The shell ended from the Ink view (its last frame ends the line). */
+let endedInInk = false;
 
 /** Shared interrupt state: set while an L2 turn streams; Esc/Ctrl-C abort it.
  *  `brake` is the server-side stop for the CURRENT session's agent — wired
@@ -2615,7 +2618,9 @@ export async function run(ctx: CommandContext): Promise<void> {
     // pending — that's a normal way to leave, not an error. On a terminal the
     // owner's shell prompt starts on a line of its own.
     if ((e as { code?: string }).code !== 'ERR_USE_AFTER_CLOSE') throw e;
-    if (rl.terminal) term('\n');
+    // At readline's prompt the cursor sits after it: the owner's shell
+    // prompt starts on a line of its own.
+    if (rl.terminal && !endedInInk) term('\n');
   } finally {
     rl.close();
   }
