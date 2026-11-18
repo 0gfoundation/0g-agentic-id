@@ -3161,7 +3161,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // (re-absorbing the pot, restarting the lock), so we submit
         // pending + amount on the user's behalf.
         if (!args[0] && pending > 0n) say(`a new request joins the pending ${og(pending)} and restarts its time lock\n`);
-        const amountWei = args[0] ? parseOgAmount(args[0]) : await askAmount(ask, `withdraw how much? [max ${og(d.balance)}, Enter cancels]: `);
+        // The most it can be is the spendable line just above.
+        const amountWei = args[0] ? parseOgAmount(args[0]) : await askAmount(ask, 'withdraw how much OG? [Enter cancels]: ');
         if (amountWei === null) continue;
         if (amountWei > d.balance) { say(`only ${og(d.balance)} spendable — cannot withdraw ${ogAmount(amountWei)} OG\n`); continue; }
         // The bare form's question says a request restarts the pending lock;
@@ -3379,7 +3380,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
             say(`it lands offline — bring it up with: reset ${agentId}\n`);
           } catch (e) {
             const p = explainError(e);
-            say(`still failing: ${p.message.replace(/^the deploy stopped before the mint: /, '')}\n`);
+            say(`error: still failing — ${p.message.replace(/^the deploy stopped before the mint: /, '')}\n`);
             say(`  → once the cause is fixed, \`retry ${label}\` again; \`status ${label}\` shows it in full\n`);
           }
         });
