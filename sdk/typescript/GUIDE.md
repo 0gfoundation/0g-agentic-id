@@ -778,9 +778,12 @@ const [latest] = await ag.agent.releases();   // newest first
   - `routes` — the framework's declared prefixes:
     `{ prefix, kind?, auth?, signed, description? }`, e.g. a `kind:"chat"` API
     at `/v1/` (auth `bearer`). `auth` tells you how to present the owner token;
-    `signed` says whether responses on that route carry an `X-Agent-Proof`.
-    Shipped frameworks are chat-only; a framework could declare a UI route,
-    but none currently do.
+    `signed` says whether responses on that route carry an `X-Agent-Proof`;
+    `description` is one plain sentence on what the route is for. Every
+    shipped framework declares a `chat` route, and `/hello` lists a
+    `responses` route next to it (the runtime serves one where the framework
+    does not); prime adds `activity`, 0g-harness `tasks`, `inbox`, `files`
+    and more. A framework could declare a UI route, but none currently do.
 
 - **`ag.agent.client(agentId)`** — one handle (`AgentClient`) for every caller.
   Whether it can do owner ops is inherited from `ag`, exactly like `ag`'s

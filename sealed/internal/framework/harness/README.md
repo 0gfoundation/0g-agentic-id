@@ -139,7 +139,9 @@ and credentials are shared); `owner-chat` is the default one behind `chat`
 and `responses` (CONVERSATION.md invariant 2).
 Each route lists its exact endpoints, those of the harness's protocol v1
 (`routes_test.go`), and sealed's proxy forwards nothing else: an unlisted
-path gets 404, an unlisted method 405.
+path gets 404, an unlisted method 405. `/hello` is public, so each route's
+description is one plain sentence on what the route is for; the requests and
+their fields are in the harness's `docs/PROTOCOL.md`.
 
 The harness can ask sealed to restart it (`POST /harness/restart` on the sign
 socket): sealed stops the process and starts it again from the package it is

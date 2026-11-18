@@ -321,10 +321,10 @@ func (s *Server) frameworkRoutesForHello() []report.Route {
 			Kind:   "responses",
 			Auth:   "bearer",
 			Signed: false,
-			Description: "OpenAI Responses API subset (synthesized by the sealed proxy in front of the framework's chat API): " +
-				"POST /v1/responses {input, stream} → events with sequence_number; GET /{id} polls; " +
-				"GET /{id}?stream=true&starting_after=N resumes; POST /{id}/cancel stops the turn. " +
-				"The turn survives client disconnects; same stateful session as the chat route.",
+			// The same sentence as the native ones (prime, 0g-harness): /hello
+			// is public and says what the route is for; how it works is
+			// responses.go and ARCHITECTURE.md's route table.
+			Description: "The same chat, with replies that keep running when the connection drops.",
 		})
 	}
 	return out
