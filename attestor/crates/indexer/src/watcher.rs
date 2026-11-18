@@ -247,8 +247,11 @@ impl Watcher {
             let Some(grant) = self.deployments.operator_grant(deployment.seal_id).await? else {
                 return Ok(());
             };
-            // Verify the stored owner proof and its admission cache exactly
-            // once. The repository only CASes this already checked revision.
+            // Only an admitted appointment at/after this outgoing transfer
+            // can exempt the grant. Revocations have no checkpoint authority,
+            // including legacy records accepted with an unchecked checkpoint.
+            // Do not let that untrusted value trigger an RPC or block indexing.
+            // The repository only CASes this already checked revision.
             let checkpoint = attestor_shared::auth::operator::verify_operator_grant_metadata(
                 &grant,
                 grant.owner,
@@ -258,7 +261,8 @@ impl Watcher {
                 self.crypto.as_ref(),
             )
             .ok()
-            .and_then(|directive| directive.checkpoint);
+            .and_then(|directive| directive.operator.and(directive.checkpoint))
+            .filter(|checkpoint| grant.owner == previous_owner && event_block <= checkpoint.number);
             let canonical = if let Some(checkpoint) = checkpoint {
                 if attestor_shared::chain::operator_checkpoint_is_canonical(
                     &self.provider,
@@ -1426,7 +1430,11 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1, "replaying the same event cursor is an upsert");
+        assert_eq!(
+            rows.len(),
+            1,
+            "replaying the same event cursor is an upsert"
+        );
         let (attempts, raw_log, stored_chain, stored_contract, stored_hash, index, reason) =
             &rows[0];
         assert_eq!(*attempts, 2);
@@ -1886,6 +1894,225 @@ mod tests {
                 .is_empty());
             assert!(jobs.submitted.lock().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_revocation_checkpoint_cannot_block_later_transfers() {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+        use attestor_shared::auth::operator::{OperatorCheckpoint, OperatorGrant};
+        use base64::Engine as _;
+
+        // Reproduce records the previous API accepted. Neither an ordinary
+        // anchor nor a made-up future height gives a revocation authority to
+        // spare a grant or make the indexer query that header.
+        for number in [102, 1u64 << 62] {
+            let (mut watcher, deployments, jobs, owner, seal, agent, _) =
+                checkpoint_runtime().await;
+            watcher.canonical_addr = Address::repeat_byte(0x99);
+            let owner_key = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x16)).unwrap();
+            let proof = serde_json::to_vec(&serde_json::json!({
+                "domain":"AgenticID.Operator.v1","chain_id":16602,"contract":Address::ZERO,
+                "seal_id":seal,"owner":owner,"base_version":1,"operator":null,
+                "allow_recreate":false,"expires_at":0,"issued_at":Utc::now().timestamp(),
+                "checkpoint":OperatorCheckpoint {number,hash:B256::repeat_byte(0xee)},
+            }))
+            .unwrap();
+            let signature: Vec<u8> = owner_key
+                .sign_hash_sync(&B256::from(attestor_shared::sandbox::eip191_digest(&proof)))
+                .unwrap()
+                .into();
+            let grant = OperatorGrant {
+                version: 2,
+                owner,
+                signed_message_b64: base64::engine::general_purpose::STANDARD.encode(proof),
+                signature: signature.into(),
+                checkpoint_acceptance: None,
+            };
+            assert!(
+                attestor_shared::auth::operator::verify_operator_grant_metadata(
+                    &grant,
+                    owner,
+                    watcher.chain_id,
+                    watcher.contract_addr,
+                    seal,
+                    watcher.crypto.as_ref(),
+                )
+                .is_ok()
+            );
+            deployments
+                .compare_and_swap_operator(seal, 1, grant)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let next_seal = B256::repeat_byte(0xa7);
+            let next_agent = U256::from(17);
+            let buyer = Address::repeat_byte(0x28);
+            seed_bound(&deployments, next_seal, next_agent, owner);
+            let logs: Vec<_> = [agent, next_agent]
+                .into_iter()
+                .map(|token_id| alloy::rpc::types::Log {
+                    inner: alloy::primitives::Log {
+                        address: watcher.contract_addr,
+                        data: AgenticID::Transfer {
+                            from: owner,
+                            to: buyer,
+                            tokenId: token_id,
+                        }
+                        .encode_log_data(),
+                    },
+                    block_number: Some(101),
+                    ..Default::default()
+                })
+                .collect();
+            for _ in 0..3 {
+                // Only live ownerOf is served: a header request would fail.
+                let (provider, rpc) = serve_owner(buyer).await;
+                watcher.provider = provider;
+                tokio::time::timeout(Duration::from_secs(5), watcher.process_logs(&logs))
+                    .await
+                    .expect("revocation must not stall the range")
+                    .unwrap();
+                rpc.await.unwrap();
+            }
+            for id in [seal, next_seal] {
+                let after = deployments.get(id).await.unwrap().unwrap();
+                assert_eq!(after.owner, buyer);
+                assert!(after.container_record.is_none());
+                assert_eq!(watcher.credentials.epoch(id).await.unwrap(), 101);
+            }
+            assert!(deployments
+                .get(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .sandbox_id
+                .is_none());
+            assert_eq!(
+                deployments
+                    .operator_grant(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version,
+                3,
+                "the revoked record is invalidated once, even across replays"
+            );
+            assert!(
+                !deployments
+                    .boot_authorization(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .enabled
+            );
+            assert!(jobs.submitted.lock().unwrap().iter().any(|job| matches!(
+                job,
+                JobPayload::SandboxTeardown { seal_id, expected_sandbox_id }
+                    if *seal_id == next_seal && expected_sandbox_id.as_deref() == Some("sb-1")
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn unadmitted_appointment_checkpoint_cannot_block_transfer() {
+        let (mut watcher, deployments, _, owner, seal, agent, _) = checkpoint_runtime().await;
+        deployments
+            .operator_grants
+            .lock()
+            .unwrap()
+            .get_mut(&seal)
+            .unwrap()
+            .checkpoint_acceptance = None;
+        let (provider, rpc) = serve_owner(owner).await;
+        watcher.provider = provider;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            watcher.on_transfer(
+                AgenticID::Transfer {
+                    from: owner,
+                    to: Address::repeat_byte(0xb1),
+                    tokenId: agent,
+                },
+                101,
+            ),
+        )
+        .await
+        .expect("a grant without admission cannot require a header check")
+        .unwrap();
+        rpc.await.unwrap();
+        assert_eq!(
+            deployments
+                .operator_grant(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            2
+        );
+        assert!(
+            !deployments
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        assert!(deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .sandbox_id
+            .is_none());
+        assert!(deployments
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "new-after-aba".into())));
+    }
+
+    #[tokio::test]
+    async fn transfer_after_appointment_checkpoint_needs_no_header_read() {
+        let (mut watcher, deployments, _, owner, seal, agent, _) = checkpoint_runtime().await;
+        let (provider, rpc) = serve_owner(owner).await;
+        watcher.provider = provider;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            watcher.on_transfer(
+                AgenticID::Transfer {
+                    from: owner,
+                    to: Address::repeat_byte(0xb1),
+                    tokenId: agent,
+                },
+                103,
+            ),
+        )
+        .await
+        .expect("a checkpoint before the transfer cannot exempt the grant")
+        .unwrap();
+        rpc.await.unwrap();
+        assert_eq!(
+            deployments
+                .operator_grant(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            2
+        );
+        assert!(deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .sandbox_id
+            .is_none());
+        assert!(deployments
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "new-after-aba".into())));
     }
 
     #[tokio::test]

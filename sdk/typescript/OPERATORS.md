@@ -106,6 +106,7 @@ automatic retry or re-signing if the anchor is unavailable.
 `checkpoint: null`, then re-reads ordinary metadata after PUT. Revocation does not
 request a new anchor or depend on Transfer-log availability; it still requires
 the current owner's fresh, scoped signature and the matching base version.
+A hand-written revocation with a non-null checkpoint is rejected with HTTP 400.
 
 For appointment, the attestor verifies the owner at a fresh snapshot `T` and that
 no Transfer occurred after the signed anchor `H` through `T`. It reads canonical
@@ -159,5 +160,5 @@ or guarantee that no task is running. An application must make those decisions
 before requesting a stop.
 
 If the database cannot save an accepted create result after bounded retries, the
-worker preserves the sandbox and reports its ID for operator intervention.
+worker preserves the sandbox and reports its ID for attestor admin intervention.
 Automatic recovery requires that persisted result.

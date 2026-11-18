@@ -38,7 +38,8 @@ attestor 检查其 canonical hash、新快照 `T` 的 owner，以及该 NFT 在 
 没有 Transfer，校验跨度最多为 10,000 个区块。它不查询 `H` 的历史状态，
 所以状态剪枝不会缩短签名窗口，也不需要 archive RPC。
 
-撤销读取普通路由信息并签署 `checkpoint: null`。它跳过新锚点和 Transfer 日志校验，
+撤销读取普通路由信息并签署 `checkpoint: null`；非空 checkpoint 返回 HTTP 400。
+它跳过新锚点和 Transfer 日志校验，
 仍保留 scope、当前 owner、签名新鲜度及基础版本检查。普通版本冲突返回 HTTP 409；
 锚点被取代也返回 409，但带有 `error.code: 'operator_checkpoint_superseded'`
 和可选的 `minimum_block`，需要刷新后明确重新签名，不能自动重试或重新签署。
@@ -84,4 +85,4 @@ A → B → A 往返后的撤权依赖 indexer 追上进度，实时 owner 检�
 也不改变现有停止与状态持久化语义。
 
 如果数据库在有限次重试后仍无法保存已受理的创建结果，worker 会保留沙盒并报告其 ID，
-要求 operator 介入。自动恢复需要该创建结果已持久保存。
+要求 attestor 管理员介入。自动恢复需要该创建结果已持久保存。

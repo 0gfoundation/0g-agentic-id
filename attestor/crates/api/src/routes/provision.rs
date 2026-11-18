@@ -914,6 +914,11 @@ pub(crate) mod tests {
         base_version: i64,
     ) {
         use base64::Engine;
+        let checkpoint = if operator.is_some() {
+            Some(state.chain.operator_checkpoint().await.unwrap())
+        } else {
+            None
+        };
         let canonical = serde_json::json!({
             "domain": "AgenticID.Operator.v1",
             "chain_id": state.cfg.chain_id,
@@ -925,7 +930,7 @@ pub(crate) mod tests {
             "allow_recreate": false,
             "expires_at": 0,
             "issued_at": Utc::now().timestamp(),
-            "checkpoint": state.chain.operator_checkpoint().await.unwrap(),
+            "checkpoint": checkpoint,
         });
         let bytes = serde_json::to_vec(&canonical).unwrap();
         let signature = owner
@@ -962,17 +967,34 @@ pub(crate) mod tests {
         repo.seed(d);
         write_runtime_operator(&state, seal, &owner, Some(operator), 0).await;
         let generation = repo
-            .prepare_operator_boot(seal, Some(binding_hash(&ticket())), owner.address(), operator, 1)
+            .prepare_operator_boot(
+                seal,
+                Some(binding_hash(&ticket())),
+                owner.address(),
+                operator,
+                1,
+            )
             .await
             .unwrap()
             .unwrap();
         assert!(repo
-            .bind_runtime_sandbox(seal, "operator-runtime".into(), generation, Some(pubkey(CONTAINER_PRIV)))
+            .bind_runtime_sandbox(
+                seal,
+                "operator-runtime".into(),
+                generation,
+                Some(pubkey(CONTAINER_PRIV))
+            )
             .await
             .unwrap());
-        repo.set_container_stage(seal, StageStatus::Submitted { tx_hash: None, at: Utc::now() })
-            .await
-            .unwrap();
+        repo.set_container_stage(
+            seal,
+            StageStatus::Submitted {
+                tx_hash: None,
+                at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
         (state, repo, seal, owner, operator)
     }
 
@@ -988,7 +1010,13 @@ pub(crate) mod tests {
             decrypt(&state, &response.encrypted_agent_seal_priv, CONTAINER_PRIV),
             state.crypto.derive_agent_seal(seal).await.unwrap().priv_key,
         );
-        assert!(repo.get(seal).await.unwrap().unwrap().container_record.is_some());
+        assert!(repo
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .container_record
+            .is_some());
     }
 
     #[tokio::test]
@@ -1013,20 +1041,44 @@ pub(crate) mod tests {
         call(&state, first(&repo, seal).await).await.unwrap();
         let old_request = later(&repo, seal).await;
         write_runtime_operator(&state, seal, &owner, None, 1).await;
-        assert_eq!(call(&state, old_request).await.unwrap_err().status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            call(&state, old_request).await.unwrap_err().status,
+            StatusCode::FORBIDDEN
+        );
         assert!(repo.get(seal).await.unwrap().unwrap().sandbox_id.is_none());
-        assert!(!repo.boot_authorization(seal).await.unwrap().unwrap().enabled);
+        assert!(
+            !repo
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
     }
 
     #[tokio::test]
     async fn operator_ticket_cannot_provision_a_different_v3_certified_container() {
         let (state, repo, seal, _, _) = operator_setup().await;
         let other_private = [0x59; 32]; // privacy-check: allow
-        let other = request(&repo, seal, other_private, Some(certificate(seal, other_private))).await;
+        let other = request(
+            &repo,
+            seal,
+            other_private,
+            Some(certificate(seal, other_private)),
+        )
+        .await;
         let error = call(&state, other).await.unwrap_err();
         assert_eq!(error.status, StatusCode::UNAUTHORIZED);
-        assert!(error.message.contains("not for the sandbox this attestor created"));
-        assert!(repo.get(seal).await.unwrap().unwrap().container_record.is_none());
+        assert!(error
+            .message
+            .contains("not for the sandbox this attestor created"));
+        assert!(repo
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .container_record
+            .is_none());
     }
 
     #[tokio::test]

@@ -43,7 +43,8 @@ NFT's Transfer events in `(H, T]`, with a maximum span of 10,000 blocks. It does
 not query historical state at `H`; state pruning does not shorten the signing
 window, and no archive RPC is needed.
 
-Revocation uses the ordinary metadata GET and signs `checkpoint: null`. It skips
+Revocation uses the ordinary metadata GET and signs `checkpoint: null`; a non-null
+checkpoint is rejected with HTTP 400. It skips
 the new-anchor and Transfer-log checks while retaining scope, current-owner,
 freshness and base-version validation. An ordinary version conflict is HTTP 409.
 A superseded checkpoint also returns 409, with
@@ -88,7 +89,7 @@ rejection sends that result to cleanup.
 The grant's own expiry still prevents binding a create that finishes after it;
 the worker does not extend the owner's authorization to finish the operation.
 If the database cannot save the accepted result after those retries, the worker
-keeps the sandbox and reports its ID for operator intervention; automatic
+keeps the sandbox and reports its ID for attestor admin intervention; automatic
 recovery requires the persisted result.
 
 Live owner checks reject another owner's grant immediately. The signed checkpoint
@@ -105,5 +106,5 @@ writeback, may finish. This feature adds neither idle scheduling nor wake-on-cal
 routing, and retains the existing stop/state-persistence semantics.
 
 If the database cannot save an accepted create result after bounded retries, the
-worker preserves the sandbox and reports its ID for operator intervention.
+worker preserves the sandbox and reports its ID for attestor admin intervention.
 Automatic recovery requires that persisted result.

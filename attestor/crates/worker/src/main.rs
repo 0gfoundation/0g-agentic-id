@@ -181,7 +181,9 @@ async fn main() -> anyhow::Result<()> {
         events,
         oss,
         credentials: attestor_shared::credentials_repo::PostgresCredentialRepo::new(pool.clone()),
-        runtime_creates: attestor_shared::runtime_creates::PostgresRuntimeCreateRepo::new(pool.clone()),
+        runtime_creates: attestor_shared::runtime_creates::PostgresRuntimeCreateRepo::new(
+            pool.clone(),
+        ),
     };
 
     // background sweep task — four responsibilities, same 60s tick:
@@ -220,10 +222,19 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
 
-                match tokio::time::timeout(Duration::from_secs(10), jobs::recover_created_runtimes(&reaper_ctx)).await {
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    jobs::recover_created_runtimes(&reaper_ctx),
+                )
+                .await
+                {
                     Ok(Ok(_)) => {}
-                    Ok(Err(e)) => tracing::warn!(error = %e, "accepted create recovery sweep failed"),
-                    Err(_) => tracing::warn!("accepted create recovery sweep deferred remaining records"),
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "accepted create recovery sweep failed")
+                    }
+                    Err(_) => {
+                        tracing::warn!("accepted create recovery sweep deferred remaining records")
+                    }
                 }
                 if let Err(e) = jobs::reap_operator_teardowns(&reaper_ctx).await {
                     tracing::warn!(error = %e, "operator sandbox cleanup sweep failed");

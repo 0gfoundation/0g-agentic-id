@@ -263,8 +263,9 @@ pub fn verify_operator_grant(
     Ok(directive)
 }
 
-/// Transfer reconciliation also needs the checkpoint of expired/revoked
-/// grants. Validate their provenance without granting runtime permission.
+/// Transfer reconciliation also needs the checkpoint of expired appointments.
+/// Validate provenance without granting runtime permission; a revocation's
+/// checkpoint, including in a legacy proof, must never exempt a transfer.
 pub fn verify_operator_grant_metadata(
     grant: &OperatorGrant,
     owner: Address,

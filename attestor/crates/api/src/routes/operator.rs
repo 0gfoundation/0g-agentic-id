@@ -181,6 +181,9 @@ pub async fn handle_set(
             "revocation requires allow_recreate=false and expires_at=0",
         ));
     }
+    if directive.operator.is_none() && directive.checkpoint.is_some() {
+        return Err(ApiError::bad_request("revocation requires checkpoint=null"));
+    }
     if directive.operator.is_some() {
         let Some(checkpoint) = directive.checkpoint.as_ref() else {
             return Err(ApiError::bad_request(
@@ -583,7 +586,7 @@ mod tests {
             "allow_recreate": recreate,
             "expires_at": 0,
             "issued_at": Utc::now().timestamp(),
-            "checkpoint": {"number":1,"hash":B256::repeat_byte(1)},
+            "checkpoint": operator.map(|_| OperatorCheckpoint {number:1,hash:B256::repeat_byte(1)}),
         })
     }
 
@@ -870,7 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revocation_ignores_missing_or_old_checkpoints_and_checkpoint_dependencies() {
+    async fn revocation_accepts_null_or_missing_checkpoint_without_checkpoint_dependencies() {
         for include_checkpoint in [false, true] {
             let s = setup();
             appoint(&s, 0, false).await;
@@ -895,6 +898,7 @@ mod tests {
             .0;
             assert_eq!(summary.operator, None);
             assert_eq!(summary.version, 2);
+            assert_eq!(summary.checkpoint, None);
             let grant = s
                 .deployments
                 .operator_grant(s.seal_id)
@@ -912,6 +916,101 @@ mod tests {
             )
             .unwrap();
             assert_eq!(parsed.operator, None);
+            assert_eq!(parsed.checkpoint, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_rejects_non_null_checkpoint_without_changing_grant_or_boot() {
+        for base_version in [0, 1] {
+            let s = setup();
+            let generation = if base_version == 0 {
+                s.deployments
+                    .prepare_status_boot(s.seal_id, Some([9; 32]), s.owner)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            } else {
+                appoint(&s, 0, false).await;
+                s.deployments
+                    .prepare_operator_boot(s.seal_id, Some([9; 32]), s.owner, s.operator, 1)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
+            assert!(s
+                .deployments
+                .bind_runtime_sandbox(
+                    s.seal_id,
+                    "sb-existing".into(),
+                    generation,
+                    Some(vec![2; 33]),
+                )
+                .await
+                .unwrap());
+            let accepted =
+                serde_json::to_value(s.deployments.operator_grant(s.seal_id).await.unwrap())
+                    .unwrap();
+            let boot = s.deployments.boot_authorization(s.seal_id).await.unwrap();
+            for number in [1, 1u64 << 62] {
+                let mut value = directive(&s, base_version, None, false);
+                value["checkpoint"] = json!({"number":number,"hash":B256::repeat_byte(1)});
+                let error = handle_set(
+                    State(s.state.clone()),
+                    Json(request(&s, &OWNER_KEY, &value)),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.status, StatusCode::BAD_REQUEST);
+                assert!(error.message.contains("checkpoint=null"));
+                assert_eq!(
+                    serde_json::to_value(s.deployments.operator_grant(s.seal_id).await.unwrap())
+                        .unwrap(),
+                    accepted
+                );
+                assert_eq!(
+                    s.deployments.boot_authorization(s.seal_id).await.unwrap(),
+                    boot
+                );
+                assert_eq!(
+                    s.deployments
+                        .get(s.seal_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .sandbox_id
+                        .as_deref(),
+                    Some("sb-existing")
+                );
+            }
+            let mut value = directive(&s, base_version, None, false);
+            value["checkpoint"] = Value::Null;
+            let summary = handle_set(
+                State(s.state.clone()),
+                Json(request(&s, &OWNER_KEY, &value)),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(summary.version, base_version + 1);
+            assert_eq!(summary.operator, None);
+            assert_eq!(summary.checkpoint, None);
+            assert!(
+                !s.deployments
+                    .boot_authorization(s.seal_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .enabled
+            );
+            assert!(s
+                .deployments
+                .get(s.seal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .sandbox_id
+                .is_none());
         }
     }
 

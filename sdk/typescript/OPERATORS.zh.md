@@ -95,6 +95,7 @@ JavaScript 区块整数、格式不正确的 hash 和缺失 checkpoint，不会�
 `revokeOperator` 只查询普通路由信息以取得 owner 和基础版本，签署 `checkpoint: null`，
 PUT 后再次读取普通路由信息。撤销不获取新锚点，也不依赖 Transfer 日志可用；
 它仍要求当前 owner 的新鲜、限定范围签名，并匹配基础版本。
+手工构造的撤销请求如果包含非空 checkpoint，会返回 HTTP 400。
 
 指定 operator 时，attestor 检查新快照 `T` 的 owner，以及签名锚点 `H` 之后到 `T`
 之间没有发生 Transfer。它读取 canonical header 和 Transfer 日志，不查询 `H` 的
@@ -137,4 +138,4 @@ worker 不会为了完成操作而自动延长授权。
 自行作出这些判断。
 
 如果数据库在有限次重试后仍无法保存已受理的创建结果，worker 会保留沙盒并报告其 ID，
-要求 operator 介入。自动恢复需要该创建结果已持久保存。
+要求 attestor 管理员介入。自动恢复需要该创建结果已持久保存。
