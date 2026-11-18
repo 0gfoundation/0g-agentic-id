@@ -2518,10 +2518,19 @@ export async function duringWait<T>(f: () => Promise<T>, io: WaitIO | null = she
   }
 }
 
-/** Runs `f` (a session entered from a command) with the keys back; aside again after. */
+/** The note for keys dropped so far, now (before a session's entry card:
+ *  the session's view has no readline prompt to note them at). */
+function noteDroppedKeys(): void {
+  if (aside?.typed) { aside.typed = false; droppedNote = true; }
+  flushDroppedNote();
+}
+
+/** Runs `f` (a session entered from a command) with the keys back; aside
+ *  again after. Keys dropped before it are noted first. */
 async function keysBack<T>(f: () => Promise<T>, io: WaitIO | null = shellIO): Promise<T> {
   const a = aside;
   if (!io?.keys || !a) return f();
+  noteDroppedKeys();
   aside = null;
   io.keys.use(null);
   try {
@@ -4571,6 +4580,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   const r = await waitRunningInterruptible(irq, attestorUrl, dep.sealId, agentId);
   if (!r) { say(`the deploy goes on — enter it later with: use ${agentId}\n`); return null; } // Esc: only the wait ends
   if (apiKey) await ag.credentials.resyncModelKey(dep.sealId, { agentUrl: r.url }).catch(() => undefined);
+  noteDroppedKeys(); // above the entry card, not inside it
   // Enter through attach so a fresh deploy gets the same entry card
   // (avatar / gas / status) as `use`; only the wizard knows the framework.
   const s = await attach(ag, attestorUrl, agentId, ask);
