@@ -125,3 +125,17 @@ test('under the Ink view a bare Enter prints nothing; the footer says the phase 
     a.close();
   }
 });
+
+test('the card\'s warning says when it was reported, and what the wallet holds now when it holds more', () => {
+  const now = Date.parse('2026-11-18T12:00:00Z');
+  const f = sessionCardFields({
+    agentId: '625', sealId: SEAL, phase: 'running', connected: true, gasWei: 30_530_000_000_000_000_000n,
+    warning: 'agent data not committed to chain: seal wallet has 0.53 OG, the next step needs about 0.9 OG',
+    warningAt: '2026-11-18T10:58:00Z', now,
+  });
+  const w = f.find((l) => l.startsWith('warning'));
+  assert.match(w, /\(reported 1 h ago\)/);
+  assert.match(w, /it holds 30\.530000 OG now; this clears at its next commit/);
+  const g = sessionCardFields({ agentId: '625', sealId: SEAL, phase: 'running', connected: true, gasWei: 10n ** 17n, warning: 'seal wallet has 0.53 OG', warningAt: '2026-11-18T11:59:30Z', now });
+  assert.equal(g.find((l) => l.startsWith('warning')), 'warning  seal wallet has 0.53 OG (reported just now)');
+});

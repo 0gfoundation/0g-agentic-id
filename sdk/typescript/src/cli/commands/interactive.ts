@@ -3782,6 +3782,8 @@ export function warningOf(status: { level: string; reason: string | null } | nul
 export function sessionCardFields(c: {
   agentId: string; name?: string | null; phase: string; sealId: string; gasWei: bigint | null;
   warning: string | null; connected: boolean; failure?: string;
+  /** When the container reported the warning (ISO time); `now` for the tests. */
+  warningAt?: string; now?: number;
 }): string[] {
   const fields = [
     `agent ${c.agentId}${c.name ? ` · ${c.name}` : ''}`,
@@ -3789,7 +3791,17 @@ export function sessionCardFields(c: {
     `sealId   ${c.sealId.slice(0, 10)}…${c.sealId.slice(-6)}`,
   ];
   if (c.gasWei != null) fields.push(`gas      ${og(c.gasWei)} (agentSeal — fund with /topup)`);
-  if (c.warning) fields.push(`warning  ${c.warning}`);
+  if (c.warning) {
+    // The container's last report, which can be older than the gas above:
+    // when it was made, and, for a wallet that held too little, what it
+    // holds now (the warning clears at the agent's next commit).
+    const at = Date.parse(c.warningAt ?? '');
+    const age = Number.isFinite(at) ? ` (reported ${agoText(at, c.now ?? Date.now())})` : '';
+    const had = /(\d+(?:\.\d+)?) OG/.exec(c.warning)?.[1];
+    const topped = had && c.gasWei != null && Number(c.gasWei) / 1e18 > Number(had) + 1e-9
+      ? ` — it holds ${og(c.gasWei)} now; this clears at its next commit` : '';
+    fields.push(`warning  ${c.warning}${age}${topped}`);
+  }
   if (c.connected) {
     fields.push('type to chat · /help for commands · Esc interrupts a turn');
   } else {
@@ -3854,7 +3866,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   const connected = s.phase === 'running' && !!s.url;
   const failure = connected ? undefined : await failureReasonOf(attestorUrl, row.sealId);
   if (failure) s.failure = failure;
-  const fields = sessionCardFields({ agentId, name: row.name, phase: s.phase, sealId: row.sealId, gasWei, warning, connected, failure });
+  const fields = sessionCardFields({ agentId, name: row.name, phase: s.phase, sealId: row.sealId, gasWei, warning, connected, failure, warningAt: mine ? mine.containerStatus?.at : undefined });
   out('\n');
   if (art) {
     for (let i = 0; i < Math.max(art.length, fields.length); i++) {
