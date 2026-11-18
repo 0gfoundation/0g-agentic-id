@@ -13,14 +13,14 @@ import assert from 'node:assert/strict';
 import { duringWait, keysAside, flushDroppedNote } from '../dist/cli/commands/interactive.js';
 
 /** A key router double: records what takes the keys, and presses them. */
-function router(asking = () => null) {
+function router(asking = () => null, waitUnderWay = () => true) {
   let only = null;
-  const calls = { escape: 0, interrupt: 0 };
+  const calls = { escape: 0, cancel: 0 };
   return {
     keys: { use: (f) => { only = f; } },
     ask: { waiting: asking },
     onEscape: () => { calls.escape++; },
-    onInterrupt: () => { calls.interrupt++; },
+    cancelWait: () => { if (!waitUnderWay()) return false; calls.cancel++; return true; },
     /** What the handler did with the key: false = passed on to readline. */
     press: (s, key) => (only ? only(s, key) : 'readline'),
     taken: () => only !== null,
@@ -36,7 +36,7 @@ async function captured(f) {
   try { return { value: await f(), text }; } finally { process.stdout.write = orig; }
 }
 
-test('a wait takes the keys: typed text is dropped and noted before the next prompt; Esc and Ctrl-C still act', async () => {
+test('a wait takes the keys: typed text is dropped and noted before the next prompt; Esc and Ctrl-C stop the wait', async () => {
   const io = router();
   const { value, text } = await captured(() => duringWait(async () => {
     assert.ok(io.taken(), 'the keys are the wait\'s while it runs');
@@ -48,7 +48,7 @@ test('a wait takes the keys: typed text is dropped and noted before the next pro
   }, io));
   assert.equal(value, 7);
   assert.equal(io.taken(), false, 'given back to the prompt');
-  assert.deepEqual(io.calls, { escape: 1, interrupt: 1 });
+  assert.deepEqual(io.calls, { escape: 1, cancel: 1 });
   assert.equal(text, '', 'nothing printed under the command\'s own last line');
   const note = await captured(async () => { flushDroppedNote(); flushDroppedNote(); });
   assert.equal(note.text, '(what was typed during the wait is not kept — type it again)\n', 'once, at the prompt');
@@ -93,6 +93,16 @@ test('keys set aside once: a wait inside a command sets nothing again; a failing
 });
 
 test('without a key router (piped input) nothing is set aside', async () => {
-  assert.equal(keysAside({ keys: null, onEscape() {}, onInterrupt() {} }), null);
-  assert.equal(await duringWait(async () => 'ran', { keys: null, onEscape() {}, onInterrupt() {} }), 'ran');
+  assert.equal(keysAside({ keys: null, onEscape() {}, cancelWait: () => false }), null);
+  assert.equal(await duringWait(async () => 'ran', { keys: null, onEscape() {}, cancelWait: () => false }), 'ran');
+});
+
+test('Ctrl-C while a transaction or a write is in flight: one line says it cannot stop now; nothing exits', async () => {
+  const io = router(() => null, () => false);
+  const { text } = await captured(() => duringWait(async () => {
+    io.press('\x03', { name: 'c', ctrl: true, sequence: '\x03' });
+    io.press('\x03', { name: 'c', ctrl: true, sequence: '\x03' });
+  }, io));
+  assert.equal(io.calls.cancel, 0);
+  assert.equal(text.replace(/\r\x1b\[2K/g, ''), "(still working — this can't be stopped now)\n", 'once, however often it is pressed');
 });

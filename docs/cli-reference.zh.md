@@ -139,7 +139,7 @@ attestor 的发布通知，最新的在前（`--json`：`{ releases, agents }`�
 
 ### manager 层（`0g-agentdna>` 提示符）
 
-banner 写明 attestor、钱包、是否设置了模型 key，以及信任根 ack（或者哪项读取失败：attestor 没应答、链上读取失败，或 4 秒内没有应答）。到期的更新提示和发布通知打印在它之后。shell 的各行，以及一次性命令在终端上的输出，都在终端宽度处按词换行。在命令提出的提问处（向导的选项、一个金额、一把 key），Tab 不提供 shell 命令，↑ 也调不出命令，回答不进入命令历史；命令运行期间（一笔交易，start、reset、deploy、retry，或等模型 key 被接收、等登录完成），除 Esc 和 Ctrl-C 外的按键都不起作用，命令提出的提问除外：输入的内容不显示，也不留给下一条命令，下一个提示符之前有一行说明（`(what was typed during the wait is not kept — type it again)`）；等待行显示 `Esc stops the wait, not the agent`。会话里使用 readline 提示符时，`/start`、`/reset` 和 `/topup` 期间同样如此；在带边框的会话视图（见下文）里，这期间输入的内容留在输入框中，可以继续编辑或发送。错误显示为 `error: …`，有修复办法时还有 `→ <remedy>`，给出在这个提示符下输入的命令；未知的词看起来像拼写错误时，给出最接近的命令。
+banner 写明 attestor、钱包、是否设置了模型 key，以及信任根 ack（或者哪项读取失败：attestor 没应答、链上读取失败，或 4 秒内没有应答）。到期的更新提示和发布通知打印在它之后。shell 的各行，以及一次性命令在终端上的输出，都在终端宽度处按词换行。在命令提出的提问处（向导的选项、一个金额、一把 key），Tab 不提供 shell 命令，↑ 也调不出命令，回答不进入命令历史；命令运行期间（一笔交易，start、reset、deploy、retry，或等模型 key 被接收、等登录完成），除 Esc 和 Ctrl-C 外的按键都不起作用，命令提出的提问除外：输入的内容不显示，也不留给下一条命令，下一个提示符之前有一行说明（`(what was typed during the wait is not kept — type it again)`）；等待行显示 `Esc stops the wait, not the agent`，Ctrl-C 也能停止等待。正在进行的交易或写入无法停止：这时 Ctrl-C 只说明一次（`(still working — this can't be stopped now)`），并且不计入退出——退出要在提示符处按两次 Ctrl-C。会话里使用 readline 提示符时，`/start`、`/reset` 和 `/topup` 期间同样如此；在带边框的会话视图（见下文）里，这期间输入的内容留在输入框中，可以继续编辑或发送。错误显示为 `error: …`，有修复办法时还有 `→ <remedy>`，给出在这个提示符下输入的命令；未知的词看起来像拼写错误时，给出最接近的命令。
 
 | 命令 | 作用 |
 |---|---|

@@ -2463,19 +2463,30 @@ async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sea
 type KeyFn = (s: string | undefined, key: InkKey | undefined) => void | false;
 
 /** What one stretch with the keys set aside has seen. */
-type Aside = { typed: boolean };
+type Aside = { typed: boolean; busyNoted?: boolean };
 let aside: Aside | null = null;
 let droppedNote = false;
-type WaitIO = Pick<NonNullable<typeof shellIO>, 'keys' | 'onEscape' | 'onInterrupt'> & { ask?: Ask };
+type WaitIO = Pick<NonNullable<typeof shellIO>, 'keys' | 'onEscape' | 'cancelWait'> & { ask?: Ask };
 
 /** The keys while they are set aside: a question the command asks takes
  *  them as usual (false: on to readline); otherwise Esc and Ctrl-C act, and
- *  any other key is dropped. */
+ *  any other key is dropped. Ctrl-C stops a wait, as Esc does; anything else
+ *  in flight (a transaction, a write) cannot be stopped now, and one line
+ *  says so. It never counts toward the double Ctrl-C that exits: that is the
+ *  idle prompt's. */
 function asideKeys(io: WaitIO, a: Aside): KeyFn {
   return (s, key) => {
     if ((activeAsk ?? io.ask)?.waiting?.()) return false;
     if (key?.name === 'escape') { io.onEscape(); return; }
-    if (key?.ctrl && key.name === 'c') { io.onInterrupt(); return; }
+    if (key?.ctrl && key.name === 'c') {
+      if (io.cancelWait()) return;
+      if (!a.busyNoted) {
+        a.busyNoted = true;
+        term('\r\x1b[2K'); // over a progress line, if one is showing; it draws again below
+        out("(still working — this can't be stopped now)\n");
+      }
+      return;
+    }
     if (typeof s === 'string' && /[^\x00-\x1f\x7f]/.test(s) && !key?.ctrl && !key?.meta) a.typed = true;
   };
 }
@@ -2486,7 +2497,7 @@ function asideKeys(io: WaitIO, a: Aside): KeyFn {
  * would echo a key typed meanwhile onto the command's output (`xyzdeposited
  * 0.1 OG`) and keep it as the start of the next command, which the prompt
  * then showed with the cursor before it. A question the command asks takes
- * keys as usual; Esc and Ctrl-C keep their meaning; any other key is
+ * keys as usual; Esc and Ctrl-C stop a wait (asideKeys); any other key is
  * dropped, and before the next prompt one line says so (flushDroppedNote).
  * Under the Ink view nothing is set aside: its editor keeps what is typed as
  * an editable line. Returns the function that gives the keys back; null when
@@ -2580,6 +2591,8 @@ let shellIO: {
   rlResize: Array<() => void>;
   onInterrupt(): void;
   onEscape(): void;
+  /** Stop the wait under way (a cancellable one); false when there is none. */
+  cancelWait(): boolean;
 } | null = null;
 let inkNoticeShown = false;
 let inkEof = false;
@@ -2797,7 +2810,12 @@ export async function run(ctx: CommandContext): Promise<void> {
   // order, or, while the Ink session view is up, the view alone.
   const keys = rl.terminal ? routeKeys(process.stdin) : null;
   rl.on('close', () => keys?.drop(rlKeys));
-  shellIO = { rl, ask, keys, rlResize, onInterrupt, onEscape };
+  const cancelWait = (): boolean => {
+    if (!irq.streaming) return false;
+    irq.streaming.abort();
+    return true;
+  };
+  shellIO = { rl, ask, keys, rlResize, onInterrupt, onEscape, cancelWait };
   if (keys && inkWanted()) void loadInk(); // loaded while the banner prints
 
   try {
