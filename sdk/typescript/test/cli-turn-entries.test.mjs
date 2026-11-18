@@ -5,7 +5,7 @@
 // completes as readline does.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { NO_ANSWER_MAX_TOKENS, addFollowUp, emptyTurnText, followUpNote, readOnlyCommand, steerFollowUp } from '../dist/cli/commands/interactive.js';
+import { NO_ANSWER_MAX_TOKENS, addFollowUp, emptyTurnText, followUpNote, keptNote, readOnlyCommand, steerFollowUp, stoppedSteers } from '../dist/cli/commands/interactive.js';
 import { completeAt } from '../dist/cli/livePrompt.js';
 
 test('readOnlyCommand: the commands that only read run during a turn; the rest wait for its end', () => {
@@ -52,6 +52,39 @@ test('steerFollowUp: the turn that answers an unread message — the one it open
     addFollowUp(after, steerFollowUp('resp_main', { id: `m-${i}`, turn: 'resp_f', ...st }), `line ${i}`, 'unread');
   }
   assert.deepEqual(after, [{ id: 'resp_f', texts: ['line 0', 'line 1', 'line 2'], why: 'unread' }]);
+});
+
+test('stoppedSteers: after Esc, each unread inserted message by what the agent says became of it', () => {
+  const left = [
+    { text: 'dropped, sent back', turn: 'resp_main' },
+    { text: 'dropped, older reply', turn: 'resp_main' },
+    { text: 'read after all', turn: 'resp_main' },
+    { text: 'still pending', turn: 'resp_main' },
+    { text: 'not known', turn: 'resp_main' },
+    { text: 'opened a turn', turn: 'resp_main' },
+    { text: 'joined that turn', turn: 'resp_main' },
+  ];
+  const r = stoppedSteers(left, [
+    // 0g-harness #12: a cancel drops them, and the state carries the text.
+    { id: 'm-1', state: 'dropped', turn: 'resp_main', text: 'dropped, sent back\x1b[2J' },
+    // Dropped by an interrupt on an older one: no text, the typed copy comes back.
+    { id: 'm-2', state: 'dropped', turn: 'resp_main' },
+    { id: 'm-3', state: 'merged', turn: 'resp_main' },
+    // An older one leaves them pending and gives them to its next turn: kept.
+    { id: 'm-4', state: 'pending', turn: 'resp_main' },
+    null,
+    { id: 'm-6', state: 'turn', turn: 'resp_f' },
+    { id: 'm-7', state: 'merged', turn: 'resp_f' },
+  ]);
+  assert.deepEqual(r, {
+    back: ['dropped, sent back[2J', 'dropped, older reply'],
+    read: ['read after all'],
+    kept: ['still pending', 'not known'],
+    turns: [{ turn: 'resp_f', text: 'opened a turn' }, { turn: 'resp_f', text: 'joined that turn' }],
+  });
+  assert.equal(keptNote([]), '');
+  assert.equal(keptNote(['still pending']), '(not put back — the agent may still read this in its next turn)\n↳ still pending');
+  assert.equal(keptNote(['a', 'b\nc']), '(not put back — the agent may still read these 2 in its next turn)\n↳ a\n↳ b (+1 line)');
 });
 
 test('a turn with no text because the output budget ran out says so; another empty turn does not', async () => {
