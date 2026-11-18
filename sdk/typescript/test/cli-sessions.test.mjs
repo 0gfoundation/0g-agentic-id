@@ -27,6 +27,10 @@ test('the listing numbers sessions newest first, with short ids and titles', () 
   assert.match(lines[3], /^ {5}3 {2}owner-chat {5}idle {5}10 min ago {3}owner chat$/);
   assert.match(lines[4], /^ {5}4 {2}sess-aaaaaaaa {2}stored {3}2 d ago {6}\(untitled\)$/);
   assert.equal(shortSessionId('owner-chat'), 'owner-chat');
+  // At the terminal's width, a long title goes on under the TITLE column.
+  const long = [{ id: 'sess-research-7f3a', kind: 'session', title: 'Research on TEE attestation formats', state: 'stored', created_at: 1, updated_at: (NOW - 3_600_000) / 1000 }];
+  const narrow = renderSessionList(long, 'owner-chat', NOW, 70);
+  assert.deepEqual(narrow.slice(1), ['     1  sess-research  stored   1 h ago      Research on TEE', `${' '.repeat(45)}attestation formats`]);
 });
 
 test('switch by number in the list last shown, id, id prefix or title words', () => {
