@@ -2037,6 +2037,22 @@ export async function refreshSession(
   out(phaseLine(s.phase, s.failure));
 }
 
+/** How often an idle session re-reads the phase of an agent it believes running. */
+export const PHASE_WATCH_MS = 30_000;
+
+/** The wait before the next phase read: the base one after a read that
+ *  worked, doubling after each that failed, up to five minutes. Exported for the tests. */
+export function nextPhaseWait(prev: number, ok: boolean): number {
+  return ok ? PHASE_WATCH_MS : Math.min(Math.max(prev, PHASE_WATCH_MS) * 2, 300_000);
+}
+
+/** The line for an agent the session believed running that is not any
+ *  more, with the way back. Exported for the tests. */
+export function phaseMovedText(phase: string): string {
+  const back = phase === 'stopped' ? ' — /start' : phase === 'offline' || phase === 'failed' ? ' — /reset' : '';
+  return `  phase   ${phase}${back}\n`;
+}
+
 /** An agent's container state just before a lifecycle request was sent. */
 export interface LifecycleBaseline {
   /** The container stage's `at`, in ms (server clock); undefined when it has none. */
@@ -4459,6 +4475,32 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }, PHASE_POLL_MS)
     : null;
   phaseTimer?.unref();
+  // While the prompt is idle and the agent is believed running, its phase is
+  // re-read now and then (one attestor read), so a stop made elsewhere shows
+  // without a key press. Not during a turn or a command; slower after errors.
+  let phaseWait = PHASE_WATCH_MS;
+  let phaseWatch: NodeJS.Timeout | null = null;
+  const watchPhase = (): void => {
+    phaseWatch = setTimeout(() => {
+      void (async () => {
+        let ok = true;
+        if (atPrompt && s.client) {
+          try {
+            const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`, { signal: AbortSignal.timeout(10_000) })).json()) as { phase?: string };
+            if (d.phase && d.phase !== 'running' && atPrompt && s.client) {
+              // Under the Ink view its footer says so (refreshSession redraws it).
+              await refreshSession(s, 'never');
+              if (s.phase !== 'running' && !activeInk) printAbovePrompt(phaseMovedText(s.phase));
+            }
+          } catch { ok = false; }
+        }
+        phaseWait = nextPhaseWait(phaseWait, ok);
+        if (phaseWatch) watchPhase();
+      })();
+    }, phaseWait);
+    phaseWatch.unref();
+  };
+  if (terminal || activeInk) watchPhase();
   // An interrupted turn sends nothing on its own: what was queued during it
   // comes back to be edited at the next prompt.
   screen.interrupted = (extra: readonly string[] = []): string => {
@@ -5792,6 +5834,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     inbox.stop();
     if (outboxTimer) clearInterval(outboxTimer);
     if (phaseTimer) clearInterval(phaseTimer);
+    if (phaseWatch) { clearTimeout(phaseWatch); phaseWatch = null; }
     s.screen = undefined;
   }
 }

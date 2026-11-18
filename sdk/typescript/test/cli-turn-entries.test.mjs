@@ -5,7 +5,7 @@
 // completes as readline does.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { NO_ANSWER_MAX_TOKENS, addFollowUp, askedFor, emptyTurnText, failureKind, failureText, followUpNote, keptNote, readOnlyCommand, renderActivityTable, steerFollowUp, stoppedSteers, wrapCard } from '../dist/cli/commands/interactive.js';
+import { NO_ANSWER_MAX_TOKENS, PHASE_WATCH_MS, addFollowUp, askedFor, nextPhaseWait, phaseMovedText, emptyTurnText, failureKind, failureText, followUpNote, keptNote, readOnlyCommand, renderActivityTable, steerFollowUp, stoppedSteers, wrapCard } from '../dist/cli/commands/interactive.js';
 import { completeAt } from '../dist/cli/livePrompt.js';
 
 test('readOnlyCommand: the commands that only read run during a turn; the rest wait for its end', () => {
@@ -214,4 +214,19 @@ test('the entry card wraps at words; a field goes on under its value', () => {
   ]);
   // Piped (no width): as they are.
   assert.deepEqual(wrapCard(fields, Infinity), fields);
+});
+
+test('an idle session re-reads a running agent\'s phase every 30 s, slower after errors, and says when it stopped', () => {
+  assert.equal(PHASE_WATCH_MS, 30_000);
+  assert.equal(nextPhaseWait(PHASE_WATCH_MS, true), 30_000);
+  assert.equal(nextPhaseWait(30_000, false), 60_000);
+  assert.equal(nextPhaseWait(60_000, false), 120_000);
+  assert.equal(nextPhaseWait(240_000, false), 300_000);
+  assert.equal(nextPhaseWait(300_000, false), 300_000);
+  // Back to the base once a read works again.
+  assert.equal(nextPhaseWait(300_000, true), 30_000);
+  assert.equal(phaseMovedText('stopped'), '  phase   stopped — /start\n');
+  assert.equal(phaseMovedText('offline'), '  phase   offline — /reset\n');
+  assert.equal(phaseMovedText('failed'), '  phase   failed — /reset\n');
+  assert.equal(phaseMovedText('deploying'), '  phase   deploying\n');
 });
