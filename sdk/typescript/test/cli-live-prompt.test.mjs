@@ -403,3 +403,17 @@ test('the prompt is retitled in place when what it counts changes', async () => 
   assert.equal((await p).text, 'half typed done');
   t.rl.close();
 });
+
+test('activity labels read as plain words, never the frameworks\' event names', async () => {
+  const { activityText } = await import('../dist/cli/commands/interactive.js');
+  assert.equal(activityText('thinking'), 'thinking');
+  assert.equal(activityText('tool/call bash'), 'running a command');
+  assert.equal(activityText('tool/call web_search'), 'searching the web');
+  assert.equal(activityText('tool_execution_start — read'), 'reading a file');
+  assert.equal(activityText('bash_command_start'), 'running a command');
+  assert.equal(activityText('tool/call memory_write'), 'updating its memory');
+  assert.equal(activityText('tool/call some_new_tool'), 'using some_new_tool');
+  assert.equal(activityText('tool/result'), 'working');
+  assert.equal(activityText('rlm_child spawned'), 'asking a subagent');
+  assert.equal(activityText(''), 'thinking');
+});

@@ -1365,6 +1365,48 @@ function sessionLabel(s: Session): string {
   return ` [${t}]`;
 }
 
+/** A writer that puts `agent> ` before the turn's first text, not before
+ *  it: a status line may come first, and a turn with no text shows none. */
+function sayer(view: TurnView): (text: string) => void {
+  let said = false;
+  return (text) => {
+    if (!text) return;
+    if (!said) { view.write('agent> '); said = true; }
+    view.write(text);
+  };
+}
+
+const TOOL_TEXT: Record<string, string> = {
+  bash: 'running a command',
+  bash_persistent: 'running a command',
+  pwsh: 'running a command',
+  terminal: 'running a command',
+  web_search: 'searching the web',
+  web_fetch: 'reading a web page',
+  read: 'reading a file',
+  read_image: 'looking at an image',
+  write: 'writing a file',
+  edit: 'editing a file',
+  subagent: 'asking a subagent',
+  list_subagent_models: 'checking subagent models',
+  job_output: 'checking a background job',
+  job_list: 'checking background jobs',
+};
+
+/** What the agent is doing, in plain words, from an activity label as the
+ *  frameworks report it ("tool/call bash", "tool_execution_start — bash",
+ *  "tool/result", "thinking"). */
+export function activityText(label: string): string {
+  const l = label.trim();
+  if (!l || /^thinking/i.test(l)) return 'thinking';
+  const tool = /^tool\/call\s+(\S+)/.exec(l)?.[1]
+    ?? /tool_execution_start\s*[—-]\s*(\S+)/.exec(l)?.[1]
+    ?? (/^bash_command_start/.test(l) ? 'bash' : undefined);
+  if (tool) return TOOL_TEXT[tool] ?? (/^memory|remember/i.test(tool) ? 'updating its memory' : `using ${tool}`);
+  if (/subagent|rlm_child/i.test(l)) return 'asking a subagent';
+  return 'working';
+}
+
 /**
  * One chat turn in a non-default owner session (0g-harness `/sessions`): the
  * message is the session's next turn, followed live; Esc stops it. Files
@@ -1390,10 +1432,10 @@ async function chatInSession(s: Session, line: string, irq: Interrupt): Promise<
   irq.streaming = ac;
   // What is typed meanwhile waits for the next prompt (queued).
   const view = openTurn(s);
-  view.write('agent> ');
+  const say = sayer(view);
   let reply = '';
   try {
-    for await (const d of client.followTask!(r.id, { signal: ac.signal })) { reply += d; view.write(d); }
+    for await (const d of client.followTask!(r.id, { signal: ac.signal })) { reply += d; say(d); }
     view.end();
     if (reply && !reply.endsWith('\n')) out('\n');
   } catch (e) {
@@ -4384,7 +4426,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // above the live prompt until the agent reads them.
       const steeredTexts: string[] = [];
       const view = openTurn(s, () => steeredTexts);
-      view.write('agent> ');
+      const say = sayer(view);
       let reply = '';
       let interrupted = false;
       let failure: string | null = null;
@@ -4393,7 +4435,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // model thinking, tools running. One transient line keeps the wait
       // legible: a spinner, what it's doing (last activity label, or
       // "thinking" as the default guess), elapsed seconds, and the way out.
-      //     ⠹ tool/call bash… (14s · esc to interrupt)
+      //     ⠹ running a command… (14s · esc to interrupt)
       // Repainted once a second; any real output erases it. TTY only —
       // pipes get the clean payload. Under the live prompt it is a row above
       // the prompt, which itself says Esc stops.
@@ -4465,7 +4507,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             // a failure worth reporting.
             if (/tool|bash|subagent|rlm_child/i.test(label) && label !== 'thinking') sawToolActivity = true;
             if (label.startsWith('turn/end')) { clearActivity(); return; }
-            status = cleanCell(label);
+            status = cleanCell(activityText(label));
             paintStatus();
           }
         : undefined;
@@ -4510,7 +4552,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         };
         for await (const delta of s.client.chatStream(messages, opts)) {
           clearActivity();
-          view.write(delta); reply += delta;
+          say(delta); reply += delta;
           lastOutputAt = Date.now();
           status = 'writing';
         }
@@ -4632,9 +4674,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       const fac = new AbortController();
       irq.streaming = fac;
       const view = openTurn(s);
-      view.write('agent> ');
+      const say = sayer(view);
       try {
-        for await (const delta of s.client.followTask(id, { signal: fac.signal })) view.write(delta);
+        for await (const delta of s.client.followTask(id, { signal: fac.signal })) say(delta);
         view.end();
         out('\n');
       } catch (e) {
