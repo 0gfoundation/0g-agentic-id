@@ -5114,7 +5114,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (message) break commands;
     if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return 'back'; }
     if (line === '/quit' || line === '/exit') { await quitShell(0); }
-    if (line === '/help') { for (const l of helpRows(L2_HELP_FULL, termWidth())) out(`${l}\n`); continue; }
+    if (line === '/help') { for (const l of helpRows(L2_HELP_FULL, wrapWidth())) out(`${l}\n`); continue; }
 
     try {
       if (line === '/hello' || line.startsWith('/hello ')) {
