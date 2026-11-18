@@ -28,6 +28,8 @@ if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
 // ── Facade + namespaces ──
 export { AgenticID as AgentDNA, AgenticID, AgentApi, AdminApi, ReputationApi } from './AgenticID';
 export type { ContainerStatus, DeployAccepted, WaitLevel, ModelKeyLifecycleOpts } from './AgenticID';
+export { fetchReleases, releaseNoticeOf, agentMigrationOf } from './Releases';
+export type { ReleaseNotice, ReleaseMigration, AgentMigration, MigrationState } from './Releases';
 export { makeAgentClient } from './AgentClient';
 export type {
   AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask,

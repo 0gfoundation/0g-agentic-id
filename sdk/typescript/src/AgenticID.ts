@@ -38,6 +38,7 @@ import { sha256Hex, type SettingsDoc } from './Settings';
 import { SecretEnvRefusedError, type SecretEnvMode } from './secretEnv';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader, type TaskExchange } from './ServeSession';
 import { listedHashes, trustRegistryOf } from './TrustRegistry';
+import { agentMigrationOf, fetchReleases, type AgentMigration, type ReleaseNotice } from './Releases';
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
 import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
 import type {
@@ -1089,11 +1090,23 @@ export class AgentApi {
     agentSeal: Address | null;
     createdAt: string | null; lastProvisionError: string | null;
     containerStatus: ContainerStatus | null;
+    migrate: AgentMigration | null;
   }>> {
     // slim=1 drops the embedded avatar data-URIs (~95% of the payload); servers
     // predating the param ignore it.
     const rows = (await (await fetch(`${this.attestorBase()}/deployments?slim=1`)).json()) as Array<Record<string, unknown>>;
     return rows.map((r) => this.normalizeDeploymentRow(r));
+  }
+
+  /**
+   * The attestor's published release notices, newest first: what each
+   * release changed, and the images it replaces with the end of their
+   * transition period. Which of your agents run one of those images is on
+   * {@link AgentApi.listMyDeployments} (`migrate`). Empty from an attestor
+   * without release notices.
+   */
+  async releases(): Promise<ReleaseNotice[]> {
+    return fetchReleases(this.attestorBase());
   }
 
   /**
@@ -1131,6 +1144,7 @@ export class AgentApi {
     agentSeal: Address | null;
     createdAt: string | null; lastProvisionError: string | null;
     containerStatus: ContainerStatus | null;
+    migrate: AgentMigration | null;
   } {
     const card = (r.agent_card as Record<string, unknown>) ?? {};
     // The card's url points at the /hello card endpoint; the base (origin)
@@ -1174,6 +1188,9 @@ export class AgentApi {
       createdAt: (r.created_at as string) ?? null,
       lastProvisionError: failureReason,
       containerStatus: containerStatusOf(r.container_status),
+      // Owner tier only: the release that asks this agent to move to a
+      // newer image, and by when (GET /releases has the notes).
+      migrate: agentMigrationOf(r.migrate),
       // No `settings`: the owner's configuration document is owner-gated on
       // READ as well as write and is served only by {@link getSettings}. No
       // listing tier carries it, so advertising it here would have meant a

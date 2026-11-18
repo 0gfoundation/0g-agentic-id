@@ -330,6 +330,15 @@ CREATE TABLE IF NOT EXISTS credential_reminders (
     sent_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (seal_id, name, version, expires_at)
 );
+-- Release emails sent (releases.rs): one per owner, release and kind
+-- (`published`, `reminder`).
+CREATE TABLE IF NOT EXISTS release_notices (
+    owner   BYTEA NOT NULL,
+    version TEXT  NOT NULL,
+    kind    TEXT  NOT NULL,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner, version, kind)
+);
 -- Where an owner wants to be told about pending requests (owner-signed).
 CREATE TABLE IF NOT EXISTS credential_notify (
     owner      BYTEA PRIMARY KEY,

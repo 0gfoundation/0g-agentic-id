@@ -22,6 +22,7 @@ pub mod nonce_submit;
 pub mod notify;
 pub mod oss;
 pub mod provider_registry;
+pub mod releases;
 pub mod pinned_tls;
 pub mod repo;
 pub mod retry;

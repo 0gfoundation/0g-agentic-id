@@ -119,6 +119,12 @@ Writes are a compare-and-swap like `settings` (exit 3, `CREDENTIALS_CONFLICT`). 
 
 Lists providers from the attestor registry (`--json` supported): id, name, formats, and the web search service each provider's key pays for (`webSearch`; without the field, the one sealed uses: the router's for `0g-compute`, its own for native `openai` and `anthropic`; `-` for none). A 0g-harness agent's `others.webSearch` picks the service. `--json` prints the registry as published. Registry publication is an operations API / SDK admin action, authorized by the attestor Tapp owner; it is not a CLI command.
 
+### `releases`
+
+The attestor's release notices, newest first (`--json`: `{ releases, agents }`): each release's notes (the Chinese ones when `LANG`/`LC_ALL` starts with `zh` and the release has them), and the images it replaces with the end of their transition period. With `AGENTIC_PRIVATE_KEY`, it also lists your agents that still run a replaced image, the date to reset them by and where they stand (`please move`; `7 days or less left`; `transition period over: may stop any time`); `agents` is `null` without a key. Such an agent keeps running until it is reset (in the shell: `reset <agent>`) or its old image is retired after that date.
+
+Every other command prints a short release notice after its output when one is due: on stderr, in a terminal only, never with `--json`, waiting at most 1.5 s for the attestor. The interactive shell prints it in its banner. With agents to move: once a week, and every day in the last 7 days and after them. Without (or without a key): once per release, for 30 days after it is out. When it was last shown is kept per attestor in `release-notice.json` in the config directory.
+
 ### `update`
 
 Self-update: compares against the npm registry and `npm install -g`s the latest (a git-checkout / npm-link install is reported, not overwritten). `--json` only reports.

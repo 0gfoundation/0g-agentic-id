@@ -85,6 +85,14 @@ pub trait CredentialRepo: Send + Sync {
         version: i64,
         expires_at: i64,
     ) -> anyhow::Result<bool>;
+    /// Claim the release email of `kind` (`published` or `reminder`) for
+    /// one owner and release: true the first time, false after.
+    async fn claim_release_notice(
+        &self,
+        owner: Address,
+        version: &str,
+        kind: &str,
+    ) -> anyhow::Result<bool>;
     /// Drop the set (with its writebacks), its pending count and the
     /// reminders sent for it: the agent changed hands.
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()>;
@@ -327,6 +335,24 @@ impl CredentialRepo for PostgresCredentialRepo {
         Ok(n.rows_affected() == 1)
     }
 
+    async fn claim_release_notice(
+        &self,
+        owner: Address,
+        version: &str,
+        kind: &str,
+    ) -> anyhow::Result<bool> {
+        let n = sqlx::query(
+            "INSERT INTO release_notices (owner, version, kind) VALUES ($1, $2, $3)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(owner.as_slice())
+        .bind(version)
+        .bind(kind)
+        .execute(&self.pool)
+        .await?;
+        Ok(n.rows_affected() == 1)
+    }
+
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM credential_sets WHERE seal_id = $1")
             .bind(seal_id.as_slice())
@@ -387,6 +413,7 @@ pub struct InMemoryCredentialRepo {
 struct InMemoryState {
     sets: HashMap<SealId, StoredCredentials>,
     reminders: std::collections::HashSet<(SealId, String, i64, i64)>,
+    release_notices: std::collections::HashSet<(Address, String, String)>,
     pending: HashMap<SealId, PendingState>,
     notify: HashMap<Address, String>,
     epochs: HashMap<SealId, i64>,
@@ -537,6 +564,19 @@ impl CredentialRepo for InMemoryCredentialRepo {
             name.to_string(),
             version,
             expires_at,
+        )))
+    }
+
+    async fn claim_release_notice(
+        &self,
+        owner: Address,
+        version: &str,
+        kind: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self.inner.lock().unwrap().release_notices.insert((
+            owner,
+            version.to_string(),
+            kind.to_string(),
         )))
     }
 

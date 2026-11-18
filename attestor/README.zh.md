@@ -156,6 +156,27 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
 `0g-harness`；它也无法验证 0.4 创建的容器的 v3 证书，也解码不了 0.4 的 job。某一步检查失败时，按该步的处理方法向前修复，不要重新
 部署 AgenticID 1.3 镜像。
 
+### 发布通知
+
+每次发布新镜像，都在该环境的发布记录文件（`ATTESTOR_RELEASES_FILE`）里加一条，在新镜像成为默认之前写好：
+
+```json
+{"releases": [
+  {"version": "0.5.0", "published_at": "2026-11-20T00:00:00Z",
+   "notes": "What changed and what owners should do.", "notes_zh": "改了什么、owner 要做什么。",
+   "migrate": [
+     {"framework": "0g-harness", "image_hash": "0x…", "until": "2026-12-20T00:00:00Z"}
+   ]}
+]}
+```
+
+- `migrate` 列出这个版本替换掉的镜像（每个框架一条），以及每个镜像过渡期的结束时间 `until`。在那之前，旧镜像上的 agent 照常运行；owner 会被提醒把它们 reset 到新镜像（人格、技能、设置和记忆保留，对话重新开始）。
+- 过渡期主网至少 30 天，测试网至少 14 天。旧镜像不早于 `until` 下架。`urgent: true` 表示该镜像有安全问题，可能提前下架；提前下架时另发通知。
+- `published_at` 在未来的条目，到时间才会公开。
+- owner 在三个地方看到：CLI（每周一次，最后 7 天每天一次，列出要 reset 的 agent）、`GET /deployments` 的 owner 视图（`migrate`）、attestor 能发邮件时的邮件（发布时一封，最后 7 天一封）。
+- sealed 程序和官方 harness 包不用写条目：旧版本下架后，agent 会自己切到已上架的最新版本。
+- 镜像下架后，还在用它的 agent 在下次 provision 时被拒，原因是 `recorded image_hash not in validFrameworkHashes: the image was retired; reset required`，owner 会看到这个失败原因。
+
 ## Workspace
 
 ```
@@ -225,6 +246,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|---|
 | `GET /health` | 进程级 liveness probe | — |
 | `GET /config` | 链 RPC / 合约地址 / appId / snapshot 等前端要的公开配置 | — |
+| `GET /releases` | 已发布的发布通知，最新的在前：`version`、`published_at`、`notes`（及 `notes_zh`），以及 `migrate`，即每个版本替换掉的镜像和它们过渡期的结束时间（`until`、`urgent`）。见[发布通知](#发布通知) | — |
 | `GET /inference/providers` | 带版本的 provider 注册表；可用 `?version=N` 读取经接受凭据校验的历史版本，供 stop/start 保持旧路由；内置初始名单为版本 0 | 公开 |
 | `PUT /admin/inference/providers` | 通过 HTTP 发布完整名单，Postgres 留存历史并校验版本，无需 SSH 或重启，见 [运维流程](../sdk/typescript/PROVIDERS.zh.md) | attestor Tapp 当前 owner 签名（EOA/EIP-1271） |
 
@@ -258,7 +280,7 @@ cargo run -p attestor-indexer# 第三个终端
 
 | 路径 | 干什么 |
 |---|---|
-| `GET /deployments` | 列出当前 deployment。带 `?owner=` 和 owner 签名时，自己的行还带各 stage、`sandbox_id`、`last_provision_error` 和 `container_status` |
+| `GET /deployments` | 列出当前 deployment。带 `?owner=` 和 owner 签名时，自己的行还带各 stage、`sandbox_id`、`last_provision_error`、`container_status`；已发布的版本替换了该 agent 的镜像时，还带 `migrate`（`version`、`framework`、`until`、`urgent`、`state`：`recommended`，7 天内为 `soon`，过期为 `overdue`） |
 | `GET /deployment/:seal_id` | 单条 deployment 详情（无需认证；不返回 settings 文档、容器记录、iData 重试材料）。`container_status`（`{level, reason, at}`）是当前容器最近一次 `/status` 上报：`phase` 把 `warning` 显示为 `running`，所以 agent 在运行却无法应答（例如配置里没有模型）时要看这里。新的启动被授权或被接受时清空，该次启动上报之前不出现 |
 | `GET /agent-seal-pubkey?seal_id=` | agent 的 agentSeal 公钥。SDK（以及本 console 的 Restore/Reset）用它加密推理 key（`SEAL_SECRET_ENV`），owner 钱包签名弹窗里不再出现明文 key（issue #166）。只回答已知 seal_id；按 seal 缓存，并限制同时进行的 KMS 派生数量 |
 | `GET /ws/subscribe` | WebSocket 事件流（indexer / worker 通过 EventBus 推 ） |
@@ -344,8 +366,14 @@ attestor 与已配置 sealed 镜像统一发布。`/config.inference_capabilitie
 
 | env | 含义 |
 |---|---|
-| `ATTESTOR_NOTIFY_RESEND_API_KEY` / `ATTESTOR_NOTIFY_FROM` | 通过 Resend 的 HTTP API 发邮件。两者都设置时：登记了地址（`POST /credentials/notify`）的 owner，在 agent 的凭据待办数量上升时、以及凭据 `expires_at` 前一周（每小时检查）收到邮件。邮件只写明是哪个 agent、有几条，不包含 agent 写的内容。任一为空则不发邮件 |
+| `ATTESTOR_NOTIFY_RESEND_API_KEY` / `ATTESTOR_NOTIFY_FROM` | 通过 Resend 的 HTTP API 发邮件。两者都设置时：登记了地址（`POST /credentials/notify`）的 owner，在 agent 的凭据待办数量上升时、凭据 `expires_at` 前一周，以及有版本要求其 agent 迁移时（版本发布时一封，过渡期最后 7 天一封）收到邮件（每小时检查）。凭据邮件只写明是哪个 agent、有几条，不包含 agent 写的内容。任一为空则不发邮件 |
 | `ATTESTOR_NOTIFY_COOLDOWN_SECONDS` | 同一个 agent 两封邮件之间的最短间隔（秒）。默认 600 |
+
+### 版本发布
+
+| env | 含义 |
+|---|---|
+| `ATTESTOR_RELEASES_FILE` | 发布记录文件的路径（见[发布通知](#发布通知)）。文件变了会重新读取；解析不了时记日志，继续用上一份有效内容。为空：没有发布记录 |
 
 ### Agent runtime URL 拼装
 

@@ -137,7 +137,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if state.notify.is_some() {
-        // Hourly: remind owners of credentials that expire within a week.
+        // Hourly: remind owners of credentials that expire within a week, and
+        // email them about agents a release asks to move (releases.rs).
         let st = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -145,6 +146,9 @@ async fn main() -> anyhow::Result<()> {
                 tick.tick().await;
                 if let Err(e) = routes::credentials::remind_expiring(&st).await {
                     tracing::warn!(error = %e, "credential expiry sweep failed");
+                }
+                if let Err(e) = routes::releases::remind_releases(&st).await {
+                    tracing::warn!(error = %e, "release email sweep failed");
                 }
             }
         });

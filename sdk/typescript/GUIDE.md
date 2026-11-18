@@ -736,6 +736,21 @@ const agentUrl = me?.url;               // null until the container is provision
 if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 ```
 
+When a release replaces an image, your agents on the old one keep running
+through a transition period, and the owner listing marks them: `migrate` is
+`{ version, framework, until, urgent, state }` (`state`: `recommended`, `soon`
+in the last 7 days, `overdue` after `until`). Reset such an agent before
+`until`: after it the old image may be retired, and the agent then stops until
+it is reset. `urgent` means the image may be retired sooner (a security fix).
+`ag.agent.releases()` reads the attestor's release notices (`GET /releases`):
+each release's `notes` (and `notesZh`) and the images it replaces.
+
+```ts
+const toMove = (await ag.agent.listMyDeployments()).filter((d) => d.migrate);
+for (const d of toMove) console.log(d.agentId, d.migrate!.until, d.migrate!.state);
+const [latest] = await ag.agent.releases();   // newest first
+```
+
 - **`GET {agentUrl}/hello`** — public identity card: who I am, my owner, and
   the surface I expose. Buffered responses carry a signed `X-Agent-Proof`
   (a framework route's SSE stream doesn't — a signature needs a complete

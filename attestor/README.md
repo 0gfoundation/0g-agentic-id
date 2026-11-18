@@ -211,6 +211,42 @@ to `0g-harness`; it also cannot verify the v3 certificates of the containers
 check fails, fix forward with that step's remedy rather than redeploying the
 AgenticID 1.3 image.
 
+### Announcing a release
+
+Every release that ships new images gets an entry in the environment's
+release file (`ATTESTOR_RELEASES_FILE`), written before the new images become
+the default:
+
+```json
+{"releases": [
+  {"version": "0.5.0", "published_at": "2026-11-20T00:00:00Z",
+   "notes": "What changed and what owners should do.", "notes_zh": "改了什么、owner 要做什么。",
+   "migrate": [
+     {"framework": "0g-harness", "image_hash": "0x…", "until": "2026-12-20T00:00:00Z"}
+   ]}
+]}
+```
+
+- `migrate` lists the images the release replaces, one per framework, and
+  `until`, the end of each one's transition period. Agents on an old image keep
+  running until then; owners are told to reset them onto the new image (their
+  persona, skills, settings and memory stay; the conversation starts fresh).
+- The transition period is at least 30 days on mainnet and 14 on testnet.
+  The old image is delisted no earlier than `until`. `urgent: true` marks an
+  image with a security problem, which may be delisted earlier; send a
+  separate notice when that happens.
+- An entry with a future `published_at` stays hidden until then.
+- Owners hear about it in three places: the CLI (once a week, every day in the
+  last 7 days, with the agents to reset), the owner tier of `GET /deployments`
+  (`migrate`), and, where the attestor sends email, an email when the release
+  is out and one in the last 7 days.
+- The sealed program and the official harness package need no entry: agents
+  switch to the newest listed version by themselves when the old one is
+  delisted.
+- After the image is delisted, an agent still on it is refused at its next
+  provision with `recorded image_hash not in validFrameworkHashes: the image
+  was retired; reset required`, which the owner sees as its failure reason.
+
 ## Workspace
 
 ```
@@ -283,6 +319,7 @@ stay up.
 |---|---|---|
 | `GET /health` | Process-level liveness probe | — |
 | `GET /config` | Public config the frontend needs (chain RPC, contract addresses, appId, snapshot, etc.) | — |
+| `GET /releases` | The published release notices, newest first: `version`, `published_at`, `notes` (and `notes_zh`), and `migrate`, the images each release replaces with the end of their transition period (`until`, `urgent`). See [Announcing a release](#announcing-a-release) | — |
 | `GET /inference/providers` | Versioned provider registry; `?version=N` reads verified accepted history for stop/start route continuity. Built-in seed is version 0 | public |
 | `PUT /admin/inference/providers` | Publish the full registry through HTTP; Postgres history + compare-and-swap, no SSH/restart. See [operator workflow](../sdk/typescript/PROVIDERS.md) | current attestor Tapp owner signature (EOA/EIP-1271) |
 
@@ -316,7 +353,7 @@ stay up.
 
 | Path | Purpose |
 |---|---|
-| `GET /deployments` | List current deployments. With `?owner=` and the owner's signature, your own rows also carry the stages, `sandbox_id`, `last_provision_error` and `container_status` |
+| `GET /deployments` | List current deployments. With `?owner=` and the owner's signature, your own rows also carry the stages, `sandbox_id`, `last_provision_error`, `container_status`, and `migrate` when a published release replaces the agent's image (`version`, `framework`, `until`, `urgent`, `state`: `recommended`, `soon` within 7 days, `overdue`) |
 | `GET /deployment/:seal_id` | Single deployment detail (unauthenticated; never carries the settings document, the container record, or iData retry material). `container_status` (`{level, reason, at}`) is the current container's last `/status` report: `phase` shows a `warning` as `running`, so this is where a running agent that cannot answer (for example, its settings give it no model) shows. It is cleared when a new boot is authorized or accepted, and absent until that boot reports |
 | `GET /agent-seal-pubkey?seal_id=` | The agent's agentSeal public key. The SDK (and this console's Restore/Reset) seal the inference key to it (`SEAL_SECRET_ENV`) so the owner's wallet prompt never shows the key (issue #166). Known seal_ids only; cached per seal, with a small bound on concurrent KMS derivations |
 | `GET /ws/subscribe` | WebSocket event stream (indexer and worker push through the EventBus) |
@@ -407,8 +444,14 @@ Attestor and configured sealed images are released together. `/config.inference_
 
 | env | Meaning |
 |---|---|
-| `ATTESTOR_NOTIFY_RESEND_API_KEY` / `ATTESTOR_NOTIFY_FROM` | Email through Resend's HTTP API. Both set: an owner who registered an address (`POST /credentials/notify`) is emailed when an agent's count of credential requests rises, and a week before a credential's `expires_at` (hourly sweep). The message names the agent and the count, never what the agent wrote. Either blank: no email |
+| `ATTESTOR_NOTIFY_RESEND_API_KEY` / `ATTESTOR_NOTIFY_FROM` | Email through Resend's HTTP API. Both set: an owner who registered an address (`POST /credentials/notify`) is emailed when an agent's count of credential requests rises, a week before a credential's `expires_at`, and about agents a release asks to move: once when the release is out and once in the last 7 days of its transition period (hourly sweep). The message names the agent and the count, never what the agent wrote. Either blank: no email |
 | `ATTESTOR_NOTIFY_COOLDOWN_SECONDS` | Minimum seconds between two messages about the same agent. Default 600 |
+
+### Releases
+
+| env | Meaning |
+|---|---|
+| `ATTESTOR_RELEASES_FILE` | Path of the release file ([Announcing a release](#announcing-a-release)). Read again when it changes; a file that does not parse is logged and its last good content kept. Blank: no releases |
 
 ### Agent runtime URL composition
 
