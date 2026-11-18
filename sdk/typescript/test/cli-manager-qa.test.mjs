@@ -601,3 +601,10 @@ test('shell: a bad answer at bare deposit is asked again, as the low-balance gat
     assert.equal(att.sent(), 0);
   } finally { close(att.server); }
 });
+
+test('doctor shows OG balances with six decimals, as whoami does', async () => {
+  const { ogShown } = await import('../dist/cli/plain.js');
+  assert.equal(ogShown(681357720926745194035n), '681.357721 OG');
+  assert.equal(ogShown(75540000000001018400n), '75.540000 OG');
+  assert.equal(ogShown(0n), '0.000000 OG');
+});
