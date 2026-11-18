@@ -49,10 +49,13 @@ INTERACTIVE (default — no command)
                             list                 agents on this attestor (* = yours)
                             use <agentId|seal>   enter YOUR agent's session, in
                                                  ANY phase (lifecycle is inside)
-                            hello <agentId|seal> any agent's public /hello
-                                                 (identity + services + proof;
-                                                 banks a rating ticket if a
-                                                 wallet is configured)
+                            hello <agentId|seal> [full]
+                                                 any agent's public /hello
+                                                 (identity + proof, services
+                                                 one per line, owner routes
+                                                 on one line; full: every
+                                                 field; banks a rating ticket
+                                                 if a wallet is configured)
                             call <id> [path]     use an agent's service (banks
                                                  a rating ticket)
                             rate <id> [score]    rate an agent on-chain, spending
@@ -79,7 +82,7 @@ INTERACTIVE (default — no command)
 
                           In a session: type to talk; Esc / Ctrl-C interrupts
                           the turn in flight (and cancels a /start or /reset
-                          wait). Slash: /hello /balance /topup [og] /stop
+                          wait). Slash: /hello [full] /balance /topup [og] /stop
                           /start /reset /settings [k=v] /agentlog [n]
                           /startuplog [n] /back (or /unuse) /quit. The framework (for /reset
                           and the chat model selector) is picked by you, never
