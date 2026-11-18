@@ -3,6 +3,7 @@ package harness
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"seal-verify/internal/inference"
 	"seal-verify/internal/settings"
@@ -129,5 +130,51 @@ func TestBridgeEnvWebSearch(t *testing.T) {
 	}
 	if got := has(bridgeEnv{token: "tok", webSearchURL: "http://127.0.0.1:1/t/v1/web/search"}.environ()); got != "http://127.0.0.1:1/t/v1/web/search" {
 		t.Fatalf("search URL %q", got)
+	}
+}
+
+// When Start finds no web search the harness is told why
+// (SEAL_HARNESS_WEB_SEARCH_OFF), so the agent can tell its owner: each
+// reason planWebSearch gives reaches it as it is, cut to 300 characters, and
+// nothing is sent when there is a search.
+func TestBridgeEnvWebSearchOff(t *testing.T) {
+	off := func(env []string) (string, bool) {
+		for _, kv := range env {
+			if v, ok := strings.CutPrefix(kv, "SEAL_HARNESS_WEB_SEARCH_OFF="); ok {
+				return v, true
+			}
+		}
+		return "", false
+	}
+	routerEp := &inference.Endpoint{ProviderID: inference.ZGComputeProvider, Format: inference.WireOpenAI, BaseURL: "https://router-api.0g.ai/v1", WebSearch: inference.SearchZGRouter}
+	held := keySource{mainProvider: inference.ZGComputeProvider, key: "[[credential:sealed:inference]]", held: true, proxy: "http://127.0.0.1:9/tok", mainHost: "router-api.0g.ai"}
+	noProxy := keySource{mainProvider: "openai", key: "sk-raw"}
+	routerBase := "http://127.0.0.1:9/tok/https/router-api.0g.ai/v1"
+	for _, c := range []struct {
+		others string
+		keys   keySource
+		want   string
+	}{
+		{`{"webTools":false}`, held, "the webTools setting is off"},
+		{`{"webSearch":{"service":"off"}}`, held, "your owner turned it off (settings: webSearch.service = off)"},
+		{`{"webSearch":{"service":"openai"}}`, held, "the openai search needs the model on openai or a credential (webSearch.credential)"},
+		{`{"webSearch":{"service":"anthropic","credential":"my-claude"}}`, held, "the anthropic search needs a model (webSearch.model)"},
+		{`{"webSearch":{"service":"0g-router","credential":"router-key"}}`, noProxy, "the credential proxy is off, so no owner credential can be used"},
+		{`{"webSearch":{"service":"0g-router","credential":"model.0g-compute"}}`, held, `model.0g-compute is a model key, which pays only the agent's own model; leave "credential" out to use the model key of 0g-compute, or name an owner credential`},
+	} {
+		ws, why := planWebSearch(knobs(t, c.others), c.keys, routerEp, routerBase, "glm-5.3")
+		if ws != nil || why != c.want {
+			t.Errorf("%s: %+v %q, want the reason %q", c.others, ws, why, c.want)
+			continue
+		}
+		if got, ok := off(bridgeEnv{token: "tok", webSearchOff: why}.environ()); !ok || got != c.want {
+			t.Errorf("%s: SEAL_HARNESS_WEB_SEARCH_OFF = %q (set %v), want %q", c.others, got, ok, c.want)
+		}
+	}
+	if got, _ := off(bridgeEnv{token: "tok", webSearchOff: strings.Repeat("é", 400)}.environ()); utf8.RuneCountInString(got) != webSearchOffMax || !utf8.ValidString(got) {
+		t.Errorf("a long reason reaches the harness as %d characters", utf8.RuneCountInString(got))
+	}
+	if got, ok := off(bridgeEnv{token: "tok", webSearchURL: "http://127.0.0.1:1/t/v1/web/search"}.environ()); ok {
+		t.Errorf("a search is set, yet SEAL_HARNESS_WEB_SEARCH_OFF = %q", got)
 	}
 }
