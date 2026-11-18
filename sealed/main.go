@@ -1535,6 +1535,12 @@ func startAgent(
 		onBeat = lr.recheck
 	}
 	go runHeartbeat(watchCtx, cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, cfg.StatusBinding, onBeat)
+	// The sandbox disk: a warning while the filesystem holding the agent's
+	// home is nearly full (diskwatch.go). The first check runs here, so the
+	// boot's first report already carries it.
+	disk := newDiskWatch(privsep.AgentHome(), reportStatus)
+	disk.check()
+	go disk.run(watchCtx)
 
 	return nil
 }
