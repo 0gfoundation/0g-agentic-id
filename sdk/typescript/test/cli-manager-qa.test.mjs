@@ -631,7 +631,7 @@ test('one-shot: cred log of a stopped agent, RUNTIME_TOO_OLD, a garbage URL — 
       (e) => e.code === 'RUNTIME_TOO_OLD' && e.remedy === 'type `reset 286` to move it to the current image');
   } finally { setAgentAtHand(null); }
   const bad = await run(['list'], { AGENTIC_ATTESTOR_URL: 'not a url' });
-  assert.match(bad.stderr, /"not a url" is not a URL — an attestor's address is like https:\/\/agentdna\.0g\.ai/);
+  assert.match(bad.stderr, /"not a url" is not a URL — an attestor's address is like https:\/\/agentdna\.0g\.ai\n {2}fix: set AGENTIC_ATTESTOR_URL to the attestor's address\n/);
 });
 
 test('50 columns: the balance block and long labelled lines hang under their value', async () => {

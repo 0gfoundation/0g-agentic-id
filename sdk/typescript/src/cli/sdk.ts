@@ -77,12 +77,16 @@ export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = 
 export function attestorUnreachable(env: Pick<CliEnv, 'attestorUrl' | 'attestorUrlSource'>, e: unknown): CliError {
   const url = env.attestorUrl ?? '(unset)';
   const why = unreachableReason(e);
-  return new CliError('ATTESTOR_UNREACHABLE', why === 'not a valid URL'
+  const notUrl = why === 'not a valid URL';
+  const fromEnv = env.attestorUrlSource === 'env';
+  return new CliError('ATTESTOR_UNREACHABLE', notUrl
     ? `"${url}" is not a URL — an attestor's address is like https://agentdna.0g.ai`
     : `the attestor at ${url} did not answer (${why})`, {
-    remedy: env.attestorUrlSource === 'env'
-      ? 'check AGENTIC_ATTESTOR_URL and your network, then try again'
-      : `check your network and try again, or ${shellTo('login', 'change the address')}`,
+    remedy: notUrl
+      ? (fromEnv ? 'set AGENTIC_ATTESTOR_URL to the attestor\'s address' : shellTo('login', 'set the address again'))
+      : fromEnv
+        ? 'check AGENTIC_ATTESTOR_URL and your network, then try again'
+        : `check your network and try again, or ${shellTo('login', 'change the address')}`,
     details: { cause: e instanceof Error ? e.message : String(e) },
   });
 }
