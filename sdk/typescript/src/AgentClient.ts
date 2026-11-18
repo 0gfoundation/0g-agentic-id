@@ -342,8 +342,8 @@ export interface ChatCompletion {
  */
 export interface AgentActivityInfo {
   /** A turn: `resp_…` (the id {@link AgentClient.task} and
-   *  {@link AgentClient.followTask} take). A command: `bash-N`. A subagent:
-   *  `subagent-N`. */
+   *  {@link AgentClient.followTask} take). A command: `bash-<hex>`. A
+   *  subagent: its session id (a UUID). */
   id: string;
   type: 'turn' | 'command' | 'subagent';
   status: AgentTask['status'];
