@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
-import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentActivityInfo, AgentActivityStop, HarnessTask, HarnessTaskRecord, HarnessTaskSummary, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
+import type { AgentClient, AgentInboxMessage, AgentSession, AgentSchedule, AgentActivityInfo, AgentActivityStop, HarnessTask, HarnessTaskRecord, HarnessTaskSummary, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
 import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
@@ -394,6 +394,49 @@ export function renderInboxMessage(m: AgentInboxMessage): string {
 
 /** The /schedules lines: id, how often, when next, the reminder's text.
  *  Exported for the tests. */
+/** "just now", "5 min ago", "3 h ago", "2 d ago": how long since `atMs`. */
+export function agoText(atMs: number, nowMs: number): string {
+  const s = Math.max(0, Math.round((nowMs - atMs) / 1000));
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86_400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86_400)} d ago`;
+}
+
+/** Sessions as `/sessions` numbers them: the most recently active first. */
+export function orderSessions(list: readonly AgentSession[]): AgentSession[] {
+  return [...list].sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0));
+}
+
+/** A session's id as the list shows it: owner-chat whole, others their first 13 characters (`sess-5d25f787`). */
+export function shortSessionId(id: string): string {
+  return id === 'owner-chat' ? id : id.slice(0, 13);
+}
+
+/**
+ * The `/sessions` listing: a number to switch by, the short id, its state,
+ * when it was last active, and its title (the harness names a session after
+ * its first message), `*` on the one chat goes to.
+ */
+export function renderSessionList(list: readonly AgentSession[], current: string, nowMs: number): string[] {
+  const rows = orderSessions(list);
+  const lines = [`    #  ${'SESSION'.padEnd(15)}${'STATE'.padEnd(9)}${'ACTIVE'.padEnd(13)}TITLE`];
+  rows.forEach((x, i) => {
+    // updated_at is in seconds on the wire; accept milliseconds too.
+    const at = x.updated_at > 1e12 ? x.updated_at : x.updated_at * 1000;
+    const title = x.title?.trim() ? cleanCell(x.title) : x.kind === 'owner' ? 'owner chat' : '(untitled)';
+    lines.push(`  ${x.id === current ? '*' : ' '} ${String(i + 1).padStart(2)}  ${cleanCell(shortSessionId(x.id)).padEnd(15)}${cleanCell(x.state).padEnd(9)}${(x.updated_at ? agoText(at, nowMs) : '-').padEnd(13)}${x.kind === 'task' ? `[task] ${title}` : title}`);
+  });
+  return lines;
+}
+
+/** The session `/sessions switch <arg>` means: its number in the listing, its id or id prefix, else a title containing it. */
+export function pickSession(list: readonly AgentSession[], arg: string): AgentSession | undefined {
+  const rows = orderSessions(list);
+  if (/^\d+$/.test(arg)) return rows[Number(arg) - 1];
+  return rows.find((x) => x.id === arg) ?? rows.find((x) => x.id.startsWith(arg)) ?? rows.find((x) => (x.title || '').toLowerCase().includes(arg.toLowerCase()));
+}
+
 export function renderSchedules(list: AgentSchedule[], nowMs: number): string[] {
   const idw = Math.max(2, ...list.map((r) => cleanCell(r.id).length)) + 2;
   return list.map((r) => {
@@ -1993,7 +2036,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
         out(`wallet  : ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
         out(`provider: ${loadConfig().inferenceProvider ?? '0g-compute'} (default for deploy/login)\n`);
-        for (const provider of knownProviders) out(`key ${provider.id}: ${configuredInferenceKey(provider.id) ? 'set' : '(not registered)'}\n`);
+        // Model keys saved on THIS machine (login), offered at deploy and
+        // reset. A running agent uses the key in its own credential set.
+        for (const provider of knownProviders) out(`key ${provider.id}: ${configuredInferenceKey(provider.id) ? 'saved on this machine' : 'none saved on this machine'}\n`);
+        out('  (an agent uses the model key in its own credential set: cred <agent>)\n');
         if (key && ctx.env.attestorUrl) {
           // The three status reads are independent — fetch them in parallel
           // (they were serial: 2.9s measured; parallel is bounded by the
@@ -3238,7 +3284,8 @@ const L2_HELP_FULL = `session commands
                           start); either picks up version changes. 0g-harness
   /sessions               on 0g-harness: your sessions (* = the one chat goes
                           to). /sessions new [title] opens one and switches to
-                          it; /sessions switch <id|title> switches; /sessions
+                          it; /sessions switch <#|id|title> switches (# from
+                          the list, newest first); /sessions
                           fork [id] copies a session's history into a new one;
                           /sessions default goes back to owner-chat. Every
                           session shares the agent's memory, skills and
@@ -3787,11 +3834,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const arg = rest.join(' ').trim();
         if (!sub || sub === 'list') {
           const list = await s.client.sessions();
-          const cur = s.sessionId ?? 'owner-chat';
-          for (const x of list) {
-            out(`${x.id === cur ? '*' : ' '} ${x.id.padEnd(42)} ${x.state.padEnd(8)} ${cleanCell(x.title || (x.kind === 'owner' ? 'owner chat' : ''))}\n`);
-          }
-          out('/sessions new [title] · switch <id|title> · fork [id] · default\n');
+          for (const l of renderSessionList(list, s.sessionId ?? 'owner-chat', Date.now())) out(`${l}\n`);
+          out('/sessions switch <#|id|title> · new [title] · fork [id] · default\n');
           continue;
         }
         if (sub === 'new' || sub === 'fork') {
@@ -3803,15 +3847,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         }
         if (sub === 'default') { s.sessionId = undefined; s.sessionTitle = undefined; out('→ owner-chat\n'); continue; }
         if (sub === 'switch') {
-          if (!arg) { out('usage: /sessions switch <id|title>\n'); continue; }
+          if (!arg) { out('usage: /sessions switch <#|id|title>\n'); continue; }
           const list = await s.client.sessions();
-          const hit = list.find((x) => x.id === arg) ?? list.filter((x) => x.id.startsWith(arg) || x.title.toLowerCase().includes(arg.toLowerCase()))[0];
+          const hit = pickSession(list, arg);
           if (!hit) { out(`no session matches ${cleanCell(arg)}\n`); continue; }
           s.sessionId = hit.id === 'owner-chat' ? undefined : hit.id; s.sessionTitle = hit.title;
           out(`→ ${hit.id}${hit.title ? ` (${cleanCell(hit.title)})` : ''}\n`);
           continue;
         }
-        out('usage: /sessions [list | new [title] | switch <id|title> | fork [id] | default]\n');
+        out('usage: /sessions [list | switch <#|id|title> | new [title] | fork [id] | default]\n');
         continue;
       }
       if ((line === '/tasks' || line.startsWith('/tasks ')) && s.client?.createTask) {

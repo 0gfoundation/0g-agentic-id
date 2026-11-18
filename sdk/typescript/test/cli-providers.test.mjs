@@ -158,5 +158,5 @@ test('login registers a provider key without exposing it or replacing the comput
   assert.equal(loadApiKey('0g-compute',env),'sk-old-compute');
   assert.ok(!result.stdout.includes('sk-private-openai') && !result.stderr.includes('sk-private-openai'));
   assert.ok(!result.stdout.includes(KEY) && !result.stderr.includes(KEY));
-  assert.match(result.stdout,/key openai: set/);
+  assert.match(result.stdout,/key openai: saved on this machine/);
 });
