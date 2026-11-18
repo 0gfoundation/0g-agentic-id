@@ -324,13 +324,25 @@ export function askedFor(t: AgentActivityInfo, all: readonly AgentActivityInfo[]
   return ASKED_BY[t.trigger] ?? t.trigger;
 }
 
+/** Ids as a list shows them: their first 13 characters (`resp_4702745b`,
+ *  `bash-c917aa00`), longer where two would read the same. /result and
+ *  /cancel take a unique start of an id. Exported for the tests. */
+export function shortIds(ids: readonly string[]): string[] {
+  return ids.map((id) => {
+    let n = Math.min(13, id.length);
+    while (n < id.length && ids.some((o) => o !== id && o.startsWith(id.slice(0, n)))) n++;
+    return id.slice(0, n);
+  });
+}
+
 export function renderActivityTable(tasks: AgentActivityInfo[], nowMs: number, width = 1000): string[] {
-  const idw = Math.max(2, ...tasks.map((t) => cleanCell(t.id).length)) + 2;
+  const ids = shortIds(tasks.map((t) => cleanCell(t.id)));
+  const idw = Math.max(2, ...ids.map((id) => id.length)) + 2;
   const head = `  ${'ID'.padEnd(idw)}${'STATUS'.padEnd(13)}${'BY'.padEnd(10)}${'FOR'.padEnd(10)}${'AGE'.padEnd(6)}WHAT`;
   return [
     head,
-    ...tasks.map((t) =>
-      `  ${cleanCell(t.id).padEnd(idw)}${cellText(t.status, 13)}${cellText(t.actor, 10)}` +
+    ...tasks.map((t, i) =>
+      `  ${ids[i].padEnd(idw)}${cellText(t.status, 13)}${cellText(t.actor, 10)}` +
       `${cellText(askedFor(t, tasks, nowMs / 1000), 10)}${span(nowMs / 1000 - t.created_at).padEnd(6)}` +
       `${fitRow(cleanCell(t.label), Math.max(10, Math.min(70, width - 2 - idw - 39)))}`),
   ];
@@ -548,9 +560,12 @@ export function noNoticesText(all: boolean): string {
 }
 
 /** /files' heading for a listing (empty: what it says instead). */
-export function filesText(dir: 'outbox' | 'inbox', empty: boolean, savedTo?: string): string {
+export function filesText(dir: 'outbox' | 'inbox', empty: boolean, savedTo?: string, saved: readonly string[] = []): string {
   if (dir === 'outbox') {
     if (!empty) return 'files the agent left for you (~/outbox):\n';
+    if (savedTo && saved.length) {
+      return `nothing waiting on the agent — ${saved.length === 1 ? '1 file' : `${saved.length} files`} saved to ${savedTo} this session (latest: ${saved[saved.length - 1]})\n`;
+    }
     return savedTo ? `nothing from the agent yet — files it makes for you are saved to ${savedTo}\n` : 'nothing from the agent yet — /download <name> saves one it leaves for you\n';
   }
   return empty ? 'you have sent no files (~/inbox) — /attach sends one with your next message\n' : 'files you sent (~/inbox):\n';
@@ -901,13 +916,15 @@ export function printAbovePrompt(
   readline.moveCursor(output, 0, -rows);
   readline.cursorTo(output, 0);
   readline.clearScreenDown(output);
-  output.write(text.endsWith('\n') ? text : `${text}\n`);
+  // Broken between words, unless it carries the shell's own sequences (a link).
+  const shown = /\x1b/.test(text) ? text : wrapText(text, Math.max(20, ((output as { columns?: number }).columns || 80) - 1));
+  output.write(shown.endsWith('\n') ? shown : `${shown}\n`);
   output.write('\n'.repeat(rows));
   rl.prompt(true);
 }
 import type { CommandContext } from '../types';
 import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
-import { CONT_PROMPT, LiveTurn, PlainTurn, fitRow, liveKeys, wrapWords, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
+import { CONT_PROMPT, LiveTurn, PlainTurn, fitRow, liveKeys, wrapText, wrapWords, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
 import { INK_PROMPT, MIN_COLS, MIN_ROWS, inkLoadError, loadInk, openInkScreen, type InkScreen, type Key as InkKey } from '../inkView';
 import { OUTBOX_POLL_MS, makeOutboxSync, renderOutboxEvent, supportsHyperlinks, tildePath, type OutboxSync } from '../outboxSync';
 
@@ -1022,7 +1039,12 @@ type Ask = ((q: string) => Promise<string>) & {
 /** What the owner entered: its text (newlines kept), whether it spans lines,
  *  and whether any of it was pasted. An agent message that spans lines or was
  *  pasted is never a command. */
-export type Entry = { text: string; multi: boolean; pasted: boolean };
+export type Entry = {
+  text: string; multi: boolean; pasted: boolean;
+  /** Entered while a turn ran (queued, put back, or a command that waits for
+   *  its end): never the answer to a question asked after it. */
+  during?: boolean;
+};
 
 /** Whether an entry finished during a turn goes into that turn (steer): any
  *  message, but not an empty line or a command typed alone on its line —
@@ -1030,7 +1052,8 @@ export type Entry = { text: string; multi: boolean; pasted: boolean };
 export function steerable(e: Entry): boolean {
   const t = e.text.trim();
   if (!t) return false;
-  return e.multi || e.pasted || !t.startsWith('/');
+  // A dragged file's path first is a message, not a command.
+  return e.multi || e.pasted || !t.startsWith('/') || findDroppedFiles(t).some((p) => typeof p !== 'string');
 }
 
 /** An answer to a signing question this soon after it is shown was typed before it. */
@@ -1127,7 +1150,7 @@ export function lineQueue(
     const w = waiters[0];
     if (!w) {
       if (busy && busy(e)) return;
-      pending.push(e);
+      pending.push(busy ? { ...e, during: true } : e);
       return;
     }
     const refused = accepts(w, e);
@@ -1230,6 +1253,9 @@ export function lineQueue(
   keys?.on('keypress', (s, key) => {
     if (!multiline()) return;
     if (key?.name === 'backspace' && !key.ctrl && !key.meta && cursorBefore === 0 && !boxed && messageHere()) { ask.unwind?.(); return; }
+    // Ctrl-U on a message of several lines clears all of it, not only the
+    // line the cursor is on (its earlier lines would go with the next one).
+    if (key?.name === 'u' && key.ctrl && !key.meta && draft.length && !boxed && messageHere()) { ask.clearBox?.(); return; }
     if (key?.name === 'paste-start') { pasting = true; pasteLines = []; return; }
     if (key?.name === 'paste-end') {
       pasting = false;
@@ -1276,9 +1302,35 @@ export function lineQueue(
       w.rej(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
     }
   });
+  // A message being written when a question comes (put back after Esc,
+  // say): out of the box while the question is asked, back at the next prompt.
+  let stashed: { draft: string[]; line: string; pasted: boolean; touched: boolean } | null = null;
   const wait = (q: string, kind: Kind): Promise<Entry> => {
     const first = q;
-    for (let buffered = pending.shift(); buffered !== undefined; buffered = pending.shift()) {
+    if (kind === 'q' && multiline()) {
+      if (draft.length || editLine()) {
+        stashed = { draft, line: editLine(), pasted: draftPasted, touched };
+        draft = [];
+        draftPasted = false;
+        touched = false;
+        clearEdit();
+      }
+    } else if (stashed && !draft.length && !editLine()) {
+      ({ draft } = stashed);
+      draftPasted = stashed.pasted;
+      touched = stashed.touched;
+      if (typeof edit.line === 'string') edit.line = stashed.line;
+      if (typeof edit.cursor === 'number') edit.cursor = stashed.line.length;
+      stashed = null;
+    }
+    // What was entered during a turn answers no question asked after it (on
+    // a terminal): it waits for the prompt. What was typed ahead otherwise does.
+    const next = (): Entry | undefined => {
+      if (kind !== 'q' || !multiline()) return pending.shift();
+      const at = pending.findIndex((e) => !e.during);
+      return at < 0 ? undefined : pending.splice(at, 1)[0];
+    };
+    for (let buffered = next(); buffered !== undefined; buffered = next()) {
       const refused = accepts({ kind, q }, buffered);
       if (refused) { say(`  (an earlier entry was dropped: ${refused})\n`); continue; }
       // At the agent prompt on a terminal, the messages that waited (typed
@@ -1294,7 +1346,8 @@ export function lineQueue(
       // keep the transcript readable in pipes/logs; a long one shortened on a terminal
       // (a dragged file by its name on a terminal).
       else say(`${q}${multiline() ? collapsed(droppedShown(buffered.text)) : buffered.text}\n`);
-      return Promise.resolve(buffered);
+      const { during: _during, ...entry } = buffered;
+      return Promise.resolve(entry);
     }
     if (stdinClosed) {
       return Promise.reject(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
@@ -1313,7 +1366,7 @@ export function lineQueue(
   ask.main = (q: string): Promise<string> => wait(q, 'main').then((e) => e.text);
   ask.message = (q: string): Promise<Entry> => wait(q, 'message');
   ask.whileBusy = (take) => { busy = take; };
-  ask.later = (e) => { pending.push(e); };
+  ask.later = (e) => { pending.push({ ...e, during: true }); };
   ask.drafting = () => [...draft];
   ask.queued = () => [...pending];
   ask.waiting = () => (waiters[0] ? { kind: waiters[0].kind, q: waiters[0].q } : null);
@@ -1339,7 +1392,7 @@ export function lineQueue(
     draftPasted = false;
     touched = false;
     clearEdit();
-    pending.push(e);
+    pending.push({ ...e, during: true });
     return true;
   };
   ask.recallAll = (extra: readonly string[] = []): number => {
@@ -1452,7 +1505,14 @@ const term = (s: string): void => {
  * (term): much of what it prints comes from the agent or its server, and
  * nothing of that may restyle, hide or rewrite what the owner reads.
  */
-const out = (s: string): void => term(cleanStream(s));
+const out = (s: string): void => term(termWrap(cleanStream(s)));
+
+/** On a terminal, text broken between words at its width (wrapProse); as it
+ *  is when the output is piped or captured. */
+function termWrap(s: string): string {
+  if (!process.stdout.isTTY || outRedirect) return s;
+  return wrapText(s, Math.max(20, (process.stdout.columns || 80) - 1));
+}
 
 interface Session {
   /** What the last failed turn's error pointed at (null after a turn that did not fail). */
@@ -1578,7 +1638,13 @@ export function readOnlyCommand(line: string): boolean {
 /** A turn the agent runs for messages the owner inserted into another one:
  *  ones it finished before reading (`unread`), or one it took as a new
  *  message as nothing was running (`idle`). One turn may answer several. */
-export interface FollowUp { id: string; texts: string[]; why: 'unread' | 'idle' }
+export interface FollowUp {
+  id: string; texts: string[]; why: 'unread' | 'idle';
+  /** idle: why the agent took it as a new message (its steer reason). */
+  reason?: string;
+  /** unread: the turn it went into failed before the agent read it. */
+  failed?: boolean;
+}
 
 /** Messages inserted into one running turn (0g-harness steering). */
 interface Steering {
@@ -1589,7 +1655,9 @@ interface Steering {
   /** The agent read the oldest one: its text. */
   read(): string | undefined;
   /** The turn ended: the ones it did not read go to the follow-ups. */
-  settle(after: FollowUp[]): Promise<void>;
+  settle(after: FollowUp[], failed?: boolean): Promise<void>;
+  /** Taken as a new message (no owner turn to go into): waits for its turn. */
+  next: string[];
   /** The turn was cancelled (Esc): what became of the ones not read
    *  ({@link stoppedSteers}); turns they opened go to `after`. */
   stop(after: FollowUp[]): Promise<StoppedSteers>;
@@ -1657,10 +1725,10 @@ export function steerFollowUp(inserted: string | undefined, st: SteerState | nul
 
 /** Add `text` to the follow-up turn `id`, or start it: several inserted
  *  messages the agent answers in one turn are followed once. Exported for the tests. */
-export function addFollowUp(list: FollowUp[], id: string, text: string, why: FollowUp['why']): void {
+export function addFollowUp(list: FollowUp[], id: string, text: string, why: FollowUp['why'], more: { reason?: string; failed?: boolean } = {}): void {
   const f = list.find((x) => x.id === id);
   if (f) f.texts.push(text);
-  else list.push({ id, texts: [text], why });
+  else list.push({ id, texts: [text], why, ...(more.reason ? { reason: more.reason } : {}), ...(more.failed ? { failed: true } : {}) });
 }
 
 /** What the shell says before it follows a follow-up turn, in the owner's
@@ -1669,11 +1737,14 @@ export function followUpNote(f: FollowUp, canFollow: boolean): string {
   const n = f.texts.length;
   let note = '';
   if (f.why === 'unread') {
-    note = n > 1
-      ? `the agent finished before reading ${n} of your messages — they go next, together`
-      : 'the agent finished before reading this — it goes next';
-  } else {
+    const what = f.failed ? 'the turn failed before the agent read' : 'the agent finished before reading';
+    note = n > 1 ? `${what} ${n} of your messages — they go next, together` : `${what} this — it goes next`;
+  } else if (/agent'?s own/i.test(f.reason ?? '')) {
+    note = 'the agent was busy with its own work — this goes next';
+  } else if (/no turn/i.test(f.reason ?? '')) {
     note = "the agent wasn't working on anything — sent as a new message";
+  } else {
+    note = 'sent as a new message';
   }
   if (!canFollow) note = `${note ? `${note}; ` : ''}/result ${f.id} shows the answer`;
   return note ? `(${note})` : '';
@@ -1752,7 +1823,7 @@ function livePromptOn(): boolean {
 
 /** A turn's output: under a live prompt on a terminal, else written as it
  *  comes. `steered`: what went into this turn and was not read yet. */
-function openTurn(s: Session, steered: () => readonly string[] = () => [], steers = false): TurnView {
+function openTurn(s: Session, steered: () => readonly string[] = () => [], steers = false, next: () => readonly string[] = () => []): TurnView {
   const screen = s.screen;
   if (screen) screen.turnRan = true;
   const a = activeAsk;
@@ -1764,10 +1835,10 @@ function openTurn(s: Session, steered: () => readonly string[] = () => [], steer
     queueEdit: () => a?.queueEdit?.() ?? false,
     complete: shellComplete,
   };
-  const view = activeInk ? activeInk.turn({ steered, steers }) : livePromptOn() && activeRl
+  const view = activeInk ? activeInk.turn({ steered, steers, next }) : livePromptOn() && activeRl
     ? new LiveTurn(activeRl, process.stdout, input, (): LiveState => ({
         prompt: screen?.prompt(true) ?? sessionPromptText(s.agentId, sessionLabel(s), true, { notices: 0, files: 0 }),
-        notes: turnNotes(steered(), activeAsk?.queued?.() ?? []),
+        notes: turnNotes(steered(), [...(activeAsk?.queued?.() ?? []), ...next().map((text) => ({ text }))]),
       }))
     : new PlainTurn(term);
   if (screen) screen.turn = view;
@@ -1777,7 +1848,8 @@ function openTurn(s: Session, steered: () => readonly string[] = () => [], steer
 /** The session the prompt names, when chat goes to one other than owner-chat. */
 function sessionLabel(s: Session): string {
   if (!s.sessionId) return '';
-  const t = s.sessionTitle ? cleanCell(s.sessionTitle).slice(0, 24) : s.sessionId.slice(0, 13);
+  const title = s.sessionTitle ? cleanCell(s.sessionTitle) : '';
+  const t = title ? (title.length > 24 ? `${title.slice(0, 23)}…` : title) : s.sessionId.slice(0, 13);
   return ` [${t}]`;
 }
 
@@ -1912,17 +1984,28 @@ async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (v
   if (busy) activeAsk?.whileBusy?.(busy(view));
   const say = sayer(view);
   let reply = '';
-  // What the agent does, on the status line (as in owner-chat).
+  // What the agent does, on the status line (as in owner-chat): a spinner,
+  // its last activity, the seconds since the message went.
   const t0 = Date.now();
+  const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+  let spin = 0;
+  let doing: string | null = 'replying';
+  const paint = (): void => {
+    if (!doing) return;
+    spin = (spin + 1) % SPIN.length;
+    view.status(`${SPIN[spin]} ${doing}… (${Math.floor((Date.now() - t0) / 1000)}s${view.stopHint ?? (view.live ? '' : ' · esc to interrupt')})`);
+  };
+  const ticker = process.stdout.isTTY ? setInterval(paint, 1000) : null;
   const onActivity = process.stdout.isTTY
     ? (label: string): void => {
-        if (label.startsWith('turn/end')) { view.status(null); return; }
+        if (label.startsWith('turn/end')) { doing = null; view.status(null); return; }
         view.activity?.(label);
-        view.status(`${cleanCell(activityText(label))}… (${Math.floor((Date.now() - t0) / 1000)}s${view.stopHint ?? ''})`);
+        doing = cleanCell(activityText(label));
+        paint();
       }
     : undefined;
   try {
-    for await (const d of client.followTask!(r.id, { signal: ac.signal, ...(onActivity ? { onActivity } : {}) })) { reply += d; view.status(null); say(d); }
+    for await (const d of client.followTask!(r.id, { signal: ac.signal, ...(onActivity ? { onActivity } : {}) })) { reply += d; doing = null; view.status(null); say(d); }
     view.end();
     if (reply && !reply.endsWith('\n')) out('\n');
   } catch (e) {
@@ -1937,6 +2020,7 @@ async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (v
       out(empty ? `\n${empty}\n` : `\n${await turnFailureText(s, (e as Error).message)}\n`);
     }
   } finally {
+    if (ticker) clearInterval(ticker);
     view.end();
     irq.streaming = null;
     if (busy) activeAsk?.whileBusy?.(null);
@@ -2041,6 +2125,25 @@ export async function refreshSession(
 
 /** How often an idle session re-reads the phase of an agent it believes running. */
 export const PHASE_WATCH_MS = 30_000;
+
+/** What an answer to a yes/no question says: y/yes, n/no, Enter (the
+ *  default); null for anything else (asked again). Exported for the tests. */
+export function yesNo(answer: string, dflt: boolean): boolean | null {
+  const a = answer.trim().toLowerCase();
+  if (!a) return dflt;
+  if (a === 'y' || a === 'yes') return true;
+  if (a === 'n' || a === 'no') return false;
+  return null;
+}
+
+/** A yes/no question asked until it is answered y, yes, n, no or Enter. */
+async function askYesNo(ask: (q: string) => Promise<string>, q: string, dflt: boolean): Promise<boolean> {
+  for (;;) {
+    const r = yesNo(await ask(q), dflt);
+    if (r !== null) return r;
+    out('  (y or n)\n');
+  }
+}
 
 /** The wait before the next phase read: the base one after a read that
  *  worked, doubling after each that failed, up to five minutes. Exported for the tests. */
@@ -4518,9 +4621,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     }
   };
   const links = supportsHyperlinks();
+  // The files saved by themselves in this session, for /files.
+  const savedHere: string[] = [];
   const checkOutbox = (): void => {
     if (!outbox || !s.client?.listFiles || !s.client.downloadFile) return;
     outbox.check().then((events) => {
+      for (const e of events) if (e.kind === 'saved') savedHere.push(cleanCell(e.name));
       for (const e of events) show(renderOutboxEvent(e, links), () => undefined, { files: e.kind === 'saved' ? 1 : 0, raw: true });
       recount();
     }, () => undefined /* an agent without downloads, or unreachable: the next check */);
@@ -4717,7 +4823,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           else if (status === 409) out(`compact refused: ${msg.replace(/^compactConversation: HTTP 409: /, '').trim()}\n`);
           else if (failed) out(`${failed[1].trim()}\n`);
           else if (unanswered) out(`no answer yet (${status ? `HTTP ${status} from a gateway on the way` : cause}); the agent may still be compacting — /startuplog shows the outcome (a "compact:" line). Wait for it before sending /compact again.\n`);
-          else out(`compact failed: ${msg}${cause ? ` (${cause})` : ''}\n`);
+          else out(`compact failed: ${plainError(new Error(msg))}${cause ? ` (${cause})` : ''}\n`);
         }
         continue;
       }
@@ -4851,7 +4957,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             for (const l of renderSessionList(list, s.sessionId ?? 'owner-chat', Date.now())) out(`${l}\n`);
             const row = sessionsShown[picked.number - 1];
             if (!row) { out(`there is no #${picked.number} — /sessions switch <#> with a number above\n`); continue; }
-            const yes = !(await ask(`switch to #${picked.number}, ${row.title}? [Y/n] `)).trim().toLowerCase().startsWith('n');
+            const yes = await askYesNo(ask, `switch to #${picked.number}, ${row.title}? [Y/n] `, true);
             if (!yes) continue;
             hit = list.find((x) => x.id === row.id);
           }
@@ -4935,7 +5041,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const list = await s.client.activities({ limit: 30 });
           if (!list.length) { out('nothing has run on this agent yet\n'); continue; }
           for (const l of renderActivityTable(list, Date.now(), (process.stdout.columns || 80) - 1)) out(`${l}\n`);
-          out('/result <id> shows one · /cancel <id> stops one · /cancel all stops everything running\n');
+          out('/result <id> shows one · /cancel <id> stops one (an id as listed) · /cancel all stops everything running\n');
           continue;
         }
         if (line === '/activities') { out('(this agent has no activity list — /tasks shows this session\'s long tasks)\n'); continue; }
@@ -5023,7 +5129,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // owner turn; what it does not read is answered after, and followed.
         const after: FollowUp[] = [];
         let steering: Steering | null = null;
-        const view = openTurn(s, () => steering?.texts ?? [], !!(s.client.steer && process.stdin.isTTY));
+        const view = openTurn(s, () => steering?.texts ?? [], !!(s.client.steer && process.stdin.isTTY), () => steering?.next ?? []);
         steering = makeSteering(view, after);
         if (process.stdin.isTTY) (ask as Ask).whileBusy?.(busyEntries(view, steering));
         view.write('agent> ');
@@ -5064,6 +5170,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (id && s.client.stopActivity && s.client.stopAllActivities) {
           for (;;) {
             try {
+              // An id as /activities lists it: a unique start of one.
+              if (id !== 'all' && s.client.activities) {
+                const list = await s.client.activities({ limit: 200 }).catch(() => null);
+                const hits = list?.filter((a) => a.id.startsWith(id!)) ?? [];
+                if (list && !list.some((a) => a.id === id) && hits.length === 1) id = hits[0].id;
+                else if (list && hits.length > 1 && !list.some((a) => a.id === id)) { out(`${hits.length} activities start with ${cleanCell(id)} — give more of the id\n`); break; }
+              }
               const stopped = id === 'all' ? await s.client.stopAllActivities() : [await s.client.stopActivity(id)];
               if (!stopped.length) out('nothing running\n');
               for (const x of stopped) out(`⏹ ${cleanCell(x.id)} — ${STOP_OUTCOME[x.outcome] ?? x.outcome}\n`);
@@ -5243,7 +5356,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           }
           if (!files.length) {
             // Saved by themselves: they leave the agent's outbox for this folder.
-            out(filesText(dir, true, dir === 'outbox' && outbox && filesAuto ? cleanCell(tildePath(outbox.dir)) : undefined));
+            out(filesText(dir, true, dir === 'outbox' && outbox && filesAuto ? cleanCell(tildePath(outbox.dir)) : undefined, savedHere));
             continue;
           }
           out(filesText(dir, false));
@@ -5320,6 +5433,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (findDroppedFiles(t).some((p) => typeof p !== 'string')) return false;
     if (!e.multi && !e.pasted && t.startsWith('/')) {
       if (readOnlyCommand(t)) { runNow(t, view); return true; }
+      // A switch by number with no list shown yet: the list now, so the
+      // number counts in it when the switch runs (no question then).
+      if (/^\/sessions\s+switch\s+\d+\b/.test(t) && !sessionsShown && s.client?.sessions) runNow('/sessions', view);
       view.note(`(${t.split(/\s+/)[0]} runs when this turn ends)`);
       return false;
     }
@@ -5334,6 +5450,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     const steer = s.client?.steer && process.stdin.isTTY ? s.client.steer : undefined;
     if (!steer) return null;
     const texts: string[] = [];
+    const next: string[] = [];
     const unread: Array<{ id: string; text: string; turn?: string }> = [];
     const inflight = new Set<Promise<void>>();
     const unshow = (text: string): void => {
@@ -5347,6 +5464,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     };
     return {
       texts,
+      next,
       take(e) {
         if (view.live) {
           texts.push(e.text);
@@ -5358,8 +5476,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           (r) => {
             if (r.merged && r.id) { unread.push({ id: r.id, text: e.text, turn: r.turn }); return; }
             unshow(e.text);
-            // Said after the message, when its turn is followed (followUpNote).
-            if (r.queued) { addFollowUp(after, r.queued, e.text, 'idle'); return; }
+            // Shown as waiting for its turn; what the agent said comes after
+            // the message, when its turn is followed (followUpNote).
+            if (r.queued) {
+              next.push(e.text);
+              view.refresh();
+              addFollowUp(after, r.queued, e.text, 'idle', { reason: r.reason });
+              return;
+            }
             back(e, r.reason ?? '');
           },
           (err: Error) => { unshow(e.text); back(e, err.message); },
@@ -5373,7 +5497,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       },
       // Not read when the turn ended: the agent answers it in a turn after
       // this one, which may answer several (one follow-up, followed once).
-      async settle(list) {
+      async settle(list, failed) {
         const left = unread.splice(0);
         if (!s.client?.steerState) return;
         for (const u of left) {
@@ -5384,7 +5508,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             await new Promise((r) => setTimeout(r, 150));
           }
           const follow = steerFollowUp(u.turn, st);
-          if (follow) addFollowUp(list, follow, u.text, 'unread');
+          if (follow) addFollowUp(list, follow, u.text, 'unread', { failed });
         }
       },
       // Esc cancelled the turn: ask the agent what became of each one not
@@ -5440,11 +5564,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       const fac = new AbortController();
       irq.streaming = fac;
       let steering: Steering | null = null;
-      const view = openTurn(s, () => steering?.texts ?? [], !!(s.client?.steer && process.stdin.isTTY));
+      const view = openTurn(s, () => steering?.texts ?? [], !!(s.client?.steer && process.stdin.isTTY), () => steering?.next ?? []);
       steering = makeSteering(view, after);
       if (process.stdin.isTTY) (ask as Ask).whileBusy?.(busyEntries(view, steering));
       const say = sayer(view);
       let stopped = false;
+      let followFailed = false;
       try {
         const onActivity = (label: string): void => {
           if (label === 'steer received') readNote(view, steering?.read());
@@ -5456,6 +5581,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       } catch (e) {
         view.end();
         stopped = fac.signal.aborted;
+        followFailed = !stopped;
         if (stopped) {
           // Esc stops this turn, and the ones after it for messages not read
           // yet; those messages come back to edit.
@@ -5478,7 +5604,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         irq.streaming = null;
         (ask as Ask).whileBusy?.(null);
       }
-      if (!stopped) await steering?.settle(after);
+      if (!stopped) await steering?.settle(after, followFailed);
     }
   };
   try {
@@ -5608,7 +5734,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // Inserted into this turn and not read yet (texts, as typed): shown
       // above the live prompt until the agent reads them.
       let steering: Steering | null = null;
-      const view = openTurn(s, () => steering?.texts ?? [], !!(s.client.steer && process.stdin.isTTY));
+      const view = openTurn(s, () => steering?.texts ?? [], !!(s.client.steer && process.stdin.isTTY), () => steering?.next ?? []);
       // The turn's id on the responses transport (onTask).
       let taskId: string | null = null;
       const say = sayer(view);
@@ -5785,7 +5911,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
       // Inserted but not read: the turn ended first, so the agent answers it
       // in a turn after this one (an interrupt drops it instead).
-      if (!interrupted) await steering?.settle(after);
+      if (!interrupted) await steering?.settle(after, !!failure);
       // No text because the model's output budget ran out: say so plainly.
       if (failure && /without any output/.test(failure)) {
         const empty = await emptyTurnText(s.client, taskId);

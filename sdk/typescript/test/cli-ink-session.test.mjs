@@ -569,3 +569,36 @@ test('QA pass 1 (Ink): closeNow takes the region off at once (SIGTERM)', async (
   const s = vt(v.bytes(), 60, 16);
   assert.deepEqual(s.shown, ['earlier output', 'last words']);
 });
+
+test('QA re-verify (Ink): a whole line written at once breaks between words; a long token stays whole', async () => {
+  const v = await view({ cols: 60, rows: 16 });
+  v.scr.write('agent> Step one: the sealed runtime starts in five strict phases — attest, provision, chain bootstrap, framework restore and status report — and each must finish before the next one begins.\n');
+  v.scr.write(`see https://example.com/${'x'.repeat(70)} done\n`);
+  const s = await v.read();
+  const text = s.all.join('\n');
+  assert.match(text, /agent> Step one: the sealed runtime starts in five strict\nphases — attest, provision, chain bootstrap, framework\n/);
+  assert.match(v.bytes(), /see\nhttps:\/\/example\.com\/x{70}\ndone\n/, 'the URL is written whole, for the terminal to fold');
+  await v.scr.close();
+});
+
+test('QA re-verify (Ink): Ctrl-U on a message of several lines clears all of it', async () => {
+  const v = await view();
+  const p = v.ask.message(INK_PROMPT);
+  await v.type('steer\x1b\r');
+  assert.deepEqual(v.ask.drafting(), ['steer']);
+  await v.type('queue');
+  await v.type('\x15');
+  assert.deepEqual(v.ask.drafting(), []);
+  await v.type('/quit\r');
+  assert.deepEqual(await p, { text: '/quit', multi: false, pasted: false });
+  await v.scr.close();
+});
+
+test('QA re-verify: a waiting message that starts with a dragged file is a message, so Esc puts it back', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'drag-'));
+  const png = join(dir, 'cat.png');
+  writeFileSync(png, Buffer.from('89504e470d0a1a0a', 'hex'));
+  assert.equal(steerable({ text: `${png} look`, multi: false, pasted: false }), true);
+  assert.equal(steerable({ text: '/files', multi: false, pasted: false }), false);
+  assert.equal(steerable({ text: '/nowhere/missing.png look', multi: false, pasted: false }), false);
+});

@@ -208,6 +208,79 @@ export function wrapWords(line: string, cols: number): string[] {
   return out.length ? out : [''];
 }
 
+/** A string's width on a terminal, in columns (tabs to the next stop of 8). */
+export function textCols(s: string): number {
+  let w = 0;
+  for (const ch of s) w += ch === '\t' ? 8 - (w % 8) : charCols(ch.codePointAt(0)!);
+  return w;
+}
+
+const hasWide = (s: string): boolean => [...s].some((ch) => charCols(ch.codePointAt(0)!) === 2);
+
+/**
+ * A line of prose in rows of at most `cols` columns, broken between words (as
+ * Claude Code does), for text that stays in the scrollback: further rows start
+ * under the line's text — its indent, a list item's text after `- `, `* ` or
+ * `1. `, or a value after a label and two spaces (`gas      1.2 OG …`). A word
+ * wider than a row (a URL, a path, code) is left whole on a row of its own, for
+ * the terminal to fold, so it still copies whole; a run of wide characters
+ * (CJK) breaks between characters. No row starts with a space it did not have.
+ */
+export function wrapProse(line: string, cols: number): string[] {
+  if (cols < 8 || textCols(line) <= cols) return [line];
+  const lead = /^\s*(?:(?:[-*•]|\d{1,3}[.)])\s+)?/.exec(line)![0];
+  const label = /^\s*\S+(?: \S+){0,3}? {2,}(?=\S)/.exec(line)?.[0];
+  let indentW = textCols(lead);
+  if (label && textCols(label) > indentW && textCols(label) <= Math.min(30, cols / 2)) indentW = textCols(label);
+  if (indentW > cols / 2) indentW = 0;
+  const indent = ' '.repeat(indentW);
+  const rows: string[] = [];
+  let row = lead;
+  let w = textCols(lead);
+  let empty = true; // no word on this row yet
+  const newRow = (): void => {
+    rows.push(row.trimEnd());
+    row = indent;
+    w = indentW;
+    empty = true;
+  };
+  let space = '';
+  for (const tok of line.slice(lead.length).match(/\s+|\S+/g) ?? []) {
+    if (/^\s/.test(tok)) { space = tok; continue; }
+    const sp = empty ? '' : space;
+    space = '';
+    const ww = textCols(tok);
+    if (w + textCols(sp) + ww <= cols) {
+      row += sp + tok;
+      w += textCols(sp) + ww;
+      empty = false;
+    } else if (hasWide(tok)) {
+      // Wide characters: as many as fit here, the rest on the rows after.
+      if (!empty && w + textCols(sp) < cols) { row += sp; w += textCols(sp); }
+      for (const ch of tok) {
+        const c = charCols(ch.codePointAt(0)!);
+        if (w + c > cols && !empty) newRow();
+        row += ch;
+        w += c;
+        empty = false;
+      }
+    } else {
+      if (!empty) newRow();
+      row += tok;
+      w += ww;
+      empty = false;
+      if (w > cols) newRow(); // a word wider than a row: alone, whole
+    }
+  }
+  if (!empty || !rows.length) rows.push(row.trimEnd());
+  return rows;
+}
+
+/** Text of several lines, each wrapped by {@link wrapProse}. */
+export function wrapText(text: string, cols: number): string {
+  return text.split('\n').map((l) => wrapProse(l, cols).join('\n')).join('\n');
+}
+
 /** A line in one row of at most `cols` columns, cut with an ellipsis. */
 export function fitRow(line: string, cols: number): string {
   const rows = splitRows(line, cols);
@@ -269,10 +342,16 @@ export class LiveTurn implements TurnView {
     if (nl < 0) {
       this.partial = all;
     } else {
-      this.committed += all.slice(0, nl + 1);
+      // Finished lines stay in the scrollback: broken between words.
+      this.committed += wrapText(all.slice(0, nl + 1), this.cols());
       this.partial = all.slice(nl + 1);
     }
     this.schedule();
+  }
+
+  /** The width text is wrapped to: the terminal's, less one. */
+  private cols(): number {
+    return Math.max(20, (this.output.columns || 80) - 1);
   }
 
   note(text: string): void {
@@ -280,7 +359,7 @@ export class LiveTurn implements TurnView {
     if (this.ended) { this.output.write(cleanStream(text)); return; }
     const t = cleanStream(text).replace(/^\n+/, '').replace(/\n+$/, '');
     if (!t) return;
-    this.committed += `${t}\n`;
+    this.committed += `${wrapText(t, this.cols())}\n`;
     this.schedule();
   }
 
@@ -297,7 +376,7 @@ export class LiveTurn implements TurnView {
     if (this.ended) { this.output.write(cleanStream(text)); return; }
     const t = cleanStream(text).replace(/^\n+/, '').replace(/\n+$/, '');
     if (!t) return;
-    this.committed += `${this.partial}${this.partial ? '\n' : ''}${t}\n`;
+    this.committed += `${this.partial ? `${wrapText(this.partial, this.cols())}\n` : ''}${wrapText(t, this.cols())}\n`;
     this.partial = '';
     this.schedule();
   }
@@ -311,7 +390,7 @@ export class LiveTurn implements TurnView {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     const up = this.rows + this.cursorRows();
-    this.output.write(`${up > 0 ? `\x1b[${up}A` : ''}\r\x1b[J${this.committed}${this.partial}`);
+    this.output.write(`${up > 0 ? `\x1b[${up}A` : ''}\r\x1b[J${this.committed}${wrapText(this.partial, this.cols())}`);
     this.committed = '';
     this.ended = true;
     if (current === this) current = null;
@@ -354,8 +433,9 @@ export class LiveTurn implements TurnView {
       return;
     }
     // Option+Enter, the end of a paste: the line queue took what was typed
-    // into the draft and cleared the line; the screen still shows it.
-    if ((key.meta && (key.name === 'return' || key.name === 'enter')) || key.name === 'paste-end') {
+    // into the draft and cleared the line; the screen still shows it. Ctrl-U
+    // may have cleared the draft's earlier lines.
+    if ((key.meta && (key.name === 'return' || key.name === 'enter')) || key.name === 'paste-end' || (key.ctrl && key.name === 'u')) {
       this.paint(this.rows + snap.cursor);
     }
   }
