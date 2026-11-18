@@ -256,6 +256,12 @@ a mounted single file, shows the renamed file. The entry:
   is out and one in the last 7 days of each transition period. Emails go to
   the agent's live on-chain owner; one that fails is sent again by the next
   hourly sweep.
+- A CLI from before release notices shows none of this; it shows only the
+  update hint (`ATTESTOR_CLI_LATEST`, `ATTESTOR_CLI_NOTES`, once a day). So the
+  same release sets both, and the `ATTESTOR_CLI_NOTES` line names the end of
+  the transition period and the reset, for example: `AgentDNA 0.5.0: run
+  0g-agentdna update; agents on 0.4 images keep running until 2026-12-20,
+  reset them before then`. Email reaches owners whatever their CLI version.
 - The sealed program and the official harness package need no entry: agents
   switch to the newest listed version by themselves when the old one is
   delisted.

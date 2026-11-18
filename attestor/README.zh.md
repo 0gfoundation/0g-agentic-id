@@ -176,6 +176,7 @@ dev 上通过发布测试计划的那几个：记下它们的 digest，并且只
 - 过渡期主网至少 30 天，测试网至少 14 天，由部署方据此设定 `until`（attestor 不检查）。旧镜像不早于 `until` 下架。`urgent: true` 表示该镜像有安全问题，可能提前下架；提前下架时另发通知。同一个镜像被多个版本列出时，先看 urgent 的条目，再看最早的 `until`。
 - 解析不了或被删掉的文件会记日志，继续用上一份有效内容；要撤回全部通知，写入 `{"releases": []}`。
 - owner 在三个地方看到：CLI（每周一次，最后 7 天每天一次，列出要 reset 的 agent）、`GET /deployments` 的 owner 视图（`migrate`）、attestor 能发邮件时的邮件（发布时一封，每个过渡期最后 7 天一封）。邮件只发给 agent 链上的当前 owner；发送失败的，下一次每小时检查时重发。
+- 发布通知出现之前的旧版 CLI 看不到上面这些，只会显示升级提示（`ATTESTOR_CLI_LATEST`、`ATTESTOR_CLI_NOTES`，每天一次）。所以同一次发版要把两者都设好，`ATTESTOR_CLI_NOTES` 那一句写明过渡期的结束日期和要 reset，例如：`AgentDNA 0.5.0: run 0g-agentdna update; agents on 0.4 images keep running until 2026-12-20, reset them before then`。邮件不受 CLI 版本影响。
 - sealed 程序和官方 harness 包不用写条目：旧版本下架后，agent 会自己切到已上架的最新版本。
 - 镜像下架后，还在用它的 agent 继续运行，直到容器下次启动；那次启动的 provision 被拒，原因是 `recorded image_hash not in validFrameworkHashes: the image was retired; reset required`，owner 会看到这个失败原因。
 
