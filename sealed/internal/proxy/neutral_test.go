@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"seal-verify/internal/framework"
+	"seal-verify/internal/framework/harness"
 )
 
 // bearerAdapter keeps the framework's token in sealed: the owner holds
@@ -71,6 +72,51 @@ func TestHandleProxy_ListedEndpointsAndOwnerToken(t *testing.T) {
 	}
 	if rec := do(http.MethodOptions, "/v1/chat/completions", ""); rec.Code != http.StatusOK {
 		t.Errorf("a preflight on a listed path: %d, want it forwarded", rec.Code)
+	}
+}
+
+// The 0g-harness routes as the adapter declares them: the owner's DELETE of
+// a file in the agent's outbox or inbox reaches the harness, with the
+// harness's token; a method or a path the files route does not list stops at
+// the proxy.
+func TestHandleProxy_HarnessFileDelete(t *testing.T) {
+	backend := echoAuthBackend(t)
+	s, _ := armedProxy(t, backend.URL, "")
+	s.fwRoutes = nil
+	for _, rt := range harness.New().FrameworkRoutes() {
+		rt.Backend = backend.URL
+		s.fwRoutes = append(s.fwRoutes, rt)
+	}
+	s.adapter = bearerAdapter{}
+
+	do := func(method, path, auth string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		rec := httptest.NewRecorder()
+		s.handleProxy(rec, req)
+		return rec
+	}
+
+	for _, path := range []string{"/v1/files/outbox/report.pdf", "/v1/files/inbox/notes.txt"} {
+		if rec := do(http.MethodDelete, path, "Bearer owner"); rec.Code != http.StatusOK || rec.Body.String() != "DELETE "+path+" Bearer framework" {
+			t.Errorf("owner's DELETE %s: %d %q, want it forwarded", path, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := do(http.MethodDelete, "/v1/files/outbox/report.pdf", ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("DELETE without the owner's token: %d, want 401", rec.Code)
+	}
+	for _, method := range []string{http.MethodPatch, http.MethodPut} {
+		if rec := do(method, "/v1/files/outbox/report.pdf", "Bearer owner"); rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s on a file: %d, want 405", method, rec.Code)
+		}
+	}
+	if rec := do(http.MethodDelete, "/v1/files", "Bearer owner"); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("DELETE on the listing: %d, want 405", rec.Code)
+	}
+	if rec := do(http.MethodDelete, "/v1/files/outbox/a/b", "Bearer owner"); rec.Code != http.StatusNotFound {
+		t.Errorf("DELETE below a file: %d, want 404", rec.Code)
 	}
 }
 
