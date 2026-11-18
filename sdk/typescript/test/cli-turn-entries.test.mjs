@@ -5,7 +5,7 @@
 // completes as readline does.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { NO_ANSWER_MAX_TOKENS, addFollowUp, emptyTurnText, followUpNote, keptNote, readOnlyCommand, steerFollowUp, stoppedSteers } from '../dist/cli/commands/interactive.js';
+import { NO_ANSWER_MAX_TOKENS, addFollowUp, askedFor, emptyTurnText, failureKind, failureText, followUpNote, keptNote, readOnlyCommand, renderActivityTable, steerFollowUp, stoppedSteers, wrapCard } from '../dist/cli/commands/interactive.js';
 import { completeAt } from '../dist/cli/livePrompt.js';
 
 test('readOnlyCommand: the commands that only read run during a turn; the rest wait for its end', () => {
@@ -29,10 +29,10 @@ test('follow-ups: messages the agent answers in one turn are followed once; the 
   assert.deepEqual(after, [{ id: 'resp_a', texts: ['first', 'second'], why: 'unread' }, { id: 'resp_b', texts: ['later'], why: 'idle' }]);
   assert.equal(followUpNote(after[0], true), '(the agent finished before reading 2 of your messages — they go next, together)');
   assert.equal(followUpNote({ id: 'resp_c', texts: ['x'], why: 'unread' }, true), '(the agent finished before reading this — it goes next)');
-  // Taken as a new message: said when it was sent, nothing more here.
-  assert.equal(followUpNote(after[1], true), '');
+  // Taken as a new message: said after the message's line, when its turn is followed.
+  assert.equal(followUpNote(after[1], true), "(the agent wasn't working on anything — sent as a new message)");
   // Not followable here: the id is what /result takes.
-  assert.equal(followUpNote(after[1], false), '(/result resp_b shows the answer)');
+  assert.equal(followUpNote(after[1], false), "(the agent wasn't working on anything — sent as a new message; /result resp_b shows the answer)");
   for (const f of after) assert.doesNotMatch(followUpNote(f, true), /resp_/);
 });
 
@@ -85,6 +85,36 @@ test('stoppedSteers: after Esc, each unread inserted message by what the agent s
   assert.equal(keptNote([]), '');
   assert.equal(keptNote(['still pending']), '(not put back — the agent may still read this in its next turn)\n↳ still pending');
   assert.equal(keptNote(['a', 'b\nc']), '(not put back — the agent may still read these 2 in its next turn)\n↳ a\n↳ b (+1 line)');
+});
+
+test('a failed turn says in one plain line what failed: the model service, an overloaded model, or the settings', () => {
+  // The model service: 5xx or the provider's own error.
+  const e502 = 'chat: 502 {"error":{"message":"upstream provider error","type":"provider_error","code":"provider_error"}}';
+  assert.equal(failureKind(e502), 'service');
+  assert.equal(failureText(e502, { model: 'glm-5.3', provider: '0g-compute' }), 'the model service failed (glm-5.3 via 0g-compute) — try again in a moment');
+  assert.equal(failureText(e502), 'the model service failed — try again in a moment');
+  assert.equal(failureKind('LLM request failed: HTTP 503: service unavailable'), 'service');
+  assert.equal(failureKind('chat: provider_error: the upstream model call failed'), 'service');
+  // Overloaded: 429, or said so.
+  const e429 = 'chat: 429 {"error":{"message":"model is overloaded, try later","code":"model_overloaded"}}';
+  assert.equal(failureKind(e429), 'overloaded');
+  assert.equal(failureText(e429), 'the model is overloaded — try again shortly');
+  assert.equal(failureKind('chat: rate limit exceeded'), 'overloaded');
+  // Settings: unknown model, a key, a bad request — the error's words, no JSON;
+  // what usually causes it only when it comes again.
+  const e400 = 'chat: LLM request failed: upstream 400 (max_tokens 65536 > 32768)';
+  assert.equal(failureKind(e400), 'config');
+  assert.equal(failureText(e400), "(chat failed: LLM request failed: upstream 400 (max_tokens 65536 > 32768)) — /agentlog has the agent's full error");
+  assert.match(failureText(e400, { repeated: true }), /failing again the same way usually means the model or settings just set — \/settings shows them$/);
+  const e404 = 'chat: 404 {"error":{"message":"unknown model glm-9"}}';
+  assert.equal(failureKind(e404), 'config');
+  assert.equal(failureText(e404), "(chat failed: 404 unknown model glm-9) — /agentlog has the agent's full error");
+  assert.equal(failureKind('chat: 401 invalid api key'), 'config');
+  // None of these: as it is, with no guess at its cause.
+  assert.equal(failureKind('chat: the agent process exited'), 'other');
+  assert.equal(failureText('chat: the agent process exited', { repeated: true }), "(chat failed: the agent process exited) — /agentlog has the agent's full error");
+  // A number that is not a status does not make it one.
+  assert.equal(failureKind('chat: tool output over 500 lines was cut'), 'other');
 });
 
 test('a turn with no text because the output budget ran out says so; another empty turn does not', async () => {
@@ -150,4 +180,38 @@ test('live QA: a subagent\'s end reads short, its id cut to what /result takes',
   const out = renderInboxMessage(m);
   assert.match(out, /a subagent finished — \/result 6f1c2a3b/);
   assert.doesNotMatch(out, /no further work|7d6e5f4a3b2c/);
+});
+
+test("/activities FOR: a command or subagent started during the owner's turn was asked for by the owner", () => {
+  const now = 2_000_000;
+  const all = [
+    { id: 'resp_o', type: 'turn', session: 'owner-chat', status: 'completed', actor: 'agent', trigger: 'user', label: 'run the tests', created_at: now - 600, started_at: now - 600, finished_at: now - 500 },
+    { id: 'resp_s', type: 'turn', session: 'owner-chat', status: 'completed', actor: 'agent', trigger: 'schedule', label: 'stand-up', created_at: now - 300, started_at: now - 300, finished_at: now - 200 },
+    { id: 'resp_r', type: 'turn', session: 'owner-chat', status: 'in_progress', actor: 'agent', trigger: 'user', label: 'go on', created_at: now - 50, started_at: now - 50 },
+    // 0g-harness: commands and subagents say trigger "agent", and no turn.
+    { id: 'bash-1', type: 'command', status: 'completed', actor: 'agent', trigger: 'agent', label: 'npm test', created_at: now - 550 },
+    { id: 'bash-2', type: 'command', status: 'completed', actor: 'agent', trigger: 'agent', label: 'check mail', created_at: now - 250 },
+    { id: 'sub-3', type: 'subagent', status: 'in_progress', actor: 'subagent', trigger: 'agent', label: 'look it up', created_at: now - 10 },
+    { id: 'bash-4', type: 'command', status: 'completed', actor: 'agent', trigger: 'agent', label: 'between turns', created_at: now - 400 },
+  ];
+  const by = Object.fromEntries(all.map((t) => [t.id, askedFor(t, all, now)]));
+  assert.deepEqual(by, { resp_o: 'you', resp_s: 'reminder', resp_r: 'you', 'bash-1': 'you', 'bash-2': 'agent', 'sub-3': 'you', 'bash-4': 'agent' });
+  // Two turns at once, one not the owner's: not known, so the agent's.
+  const both = [...all, { id: 'resp_t', type: 'turn', session: 'task-x', status: 'completed', actor: 'agent', trigger: 'job', label: 'x', created_at: now - 560, started_at: now - 560, finished_at: now - 540 }];
+  assert.equal(askedFor(all[3], both, now), 'agent');
+  assert.match(renderActivityTable(all, now * 1000)[4], /bash-1\s+completed\s+agent\s+you\s/);
+});
+
+test('the entry card wraps at words; a field goes on under its value', () => {
+  const fields = ['agent 625 · integ-e6ba387-key', 'phase    running', 'gas      15.836804 OG (agentSeal — fund with /topup)', 'type to chat · /help for commands · Esc interrupts a turn'];
+  assert.deepEqual(wrapCard(fields, 38), [
+    'agent 625 · integ-e6ba387-key',
+    'phase    running',
+    'gas      15.836804 OG (agentSeal —',
+    '         fund with /topup)',
+    'type to chat · /help for commands ·',
+    'Esc interrupts a turn',
+  ]);
+  // Piped (no width): as they are.
+  assert.deepEqual(wrapCard(fields, Infinity), fields);
 });

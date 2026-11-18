@@ -176,7 +176,9 @@ test('notices and files are named for what they are', async () => {
   assert.equal(noNoticesText(true), 'no notices from the agent yet\n');
   assert.equal(filesText('outbox', false), 'files the agent left for you (~/outbox):\n');
   assert.equal(filesText('inbox', false), 'files you sent (~/inbox):\n');
-  assert.match(filesText('outbox', true), /^the agent has left no files for you/);
+  // Empty: no path in the agent's home, but where its files land here.
+  assert.equal(filesText('outbox', true, '~/agentdna/625/outbox'), 'nothing from the agent yet — files it makes for you are saved to ~/agentdna/625/outbox\n');
+  assert.equal(filesText('outbox', true), 'nothing from the agent yet — /download <name> saves one it leaves for you\n');
   assert.match(filesText('inbox', true), /^you have sent no files/);
   // What came while you were away is called notices, and counted.
   const shown = [];

@@ -149,11 +149,58 @@ test('/attach: images by their bytes, limits when staged, files uploaded and nam
   const sent = await prepareAttachments(staged, 'please read', client);
   assert.deepEqual(uploads, [['report.pdf', '%PDF-1.4 tiny']]);
   assert.equal(sent.text, 'please read\n[file uploaded: /home/agent/inbox/report.pdf]');
-  assert.deepEqual(sent.images, [{ mediaType: 'image/png', data: PNG.toString('base64') }]);
+  assert.deepEqual(sent.images, [{ mediaType: 'image/png', data: PNG.toString('base64'), name: 'shot.dat' }]);
   await assert.rejects(prepareAttachments(staged, 'x', {}), /takes no files/);
 
   assert.deepEqual(completePath(join(dir, 're')), [join(dir, 'report.pdf')]);
   assert.deepEqual(completePath(join(dir, 'su')), [join(dir, 'sub') + '/']);
+});
+
+test('an image\'s file name goes as `filename` only where the agent says it reads it (features.image_names)', async () => {
+  const named = { ...IMAGE, name: 'flag test.png' };
+  const msgs = [{ role: 'user', content: 'what flag?' }];
+  // The shape: on the part, both transports; never without `names`, never without a name.
+  assert.deepEqual(withImages(msgs, [named], 'chat', true)[0].content[1], { type: 'image_url', image_url: { url: `data:image/png;base64,${IMAGE.data}` }, filename: 'flag test.png' });
+  assert.deepEqual(withImages(msgs, [named], 'responses', true)[0].content[1], { type: 'input_image', image_url: `data:image/png;base64,${IMAGE.data}`, filename: 'flag test.png' });
+  assert.equal(withImages(msgs, [named], 'chat')[0].content[1].filename, undefined);
+  assert.equal(withImages(msgs, [IMAGE], 'responses', true)[0].content[1].filename, undefined);
+
+  // Over the wire, by what GET /v1/harness says.
+  for (const [transport, routes] of [['responses', HARNESS], ['chat', CHAT_ONLY]]) {
+    for (const features of [{ images: false, image_names: true }, { images: false }, null]) {
+      const agent = await mockAgent((req, res) => {
+        const path = req.url.split('?')[0];
+        if (path === '/v1/harness') return features ? json(res, 200, { name: '0g-harness', features }) : json(res, 404, { error: 'not found' });
+        if (req.method === 'POST' && path === '/v1/responses') return json(res, 200, { id: 'resp_01', object: 'response', status: 'queued', output_text: '' });
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        if (path === '/v1/chat/completions') return res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n\ndata: [DONE]\n\n`);
+        res.end(`id: 1\nevent: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', sequence_number: 1, response: { id: 'resp_01', status: 'completed', output_text: 'ok' } })}\n\n`);
+      });
+      try {
+        const c = makeAgentClient({ base: agent.base, services: [], routes, token: 't' });
+        for (let i = 0; i < 2; i++) for await (const _ of c.chatStream(msgs, { images: [named] })) { /* drain */ }
+        const sent = agent.seen.filter((r) => r.method === 'POST').map((r) => (transport === 'responses' ? r.body.input : r.body.messages)[0].content[1]);
+        assert.equal(sent.length, 2);
+        for (const part of sent) assert.equal(part.filename, features?.image_names ? 'flag test.png' : undefined, `${transport} ${JSON.stringify(features)}`);
+        // Asked once, not per message.
+        assert.equal(agent.seen.filter((r) => r.url === '/v1/harness').length, 1, `${transport} ${JSON.stringify(features)}`);
+      } finally {
+        agent.stop();
+      }
+    }
+  }
+  // An image without a name never asks.
+  const agent = await mockAgent((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n\ndata: [DONE]\n\n`);
+  });
+  try {
+    const c = makeAgentClient({ base: agent.base, services: [], routes: CHAT_ONLY, token: 't' });
+    for await (const _ of c.chatStream(msgs, { images: [IMAGE] })) { /* drain */ }
+    assert.deepEqual(agent.seen.map((r) => r.url), ['/v1/chat/completions']);
+  } finally {
+    agent.stop();
+  }
 });
 
 test('modelImages is a 0g-harness switch', () => {

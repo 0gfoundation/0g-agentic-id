@@ -308,6 +308,20 @@ const ASKED_BY: Record<string, string> = { user: 'you', job: 'job', schedule: 'r
  * reminder, the agent itself). Ids print whole: they are what /result and
  * /cancel take. Exported for the tests.
  */
+/**
+ * Who asked for an activity, as /activities' FOR column says it. 0g-harness
+ * gives a command or subagent `trigger: agent` and no turn it came from, so
+ * one started while only the owner's turns ran (by their start and end) was
+ * asked for by the owner: `you`. Exported for the tests.
+ */
+export function askedFor(t: AgentActivityInfo, all: readonly AgentActivityInfo[], nowSec: number): string {
+  if (t.type !== 'turn' && t.trigger === 'agent') {
+    const during = all.filter((x) => x.type === 'turn' && x.started_at !== undefined && x.started_at <= t.created_at && t.created_at <= (x.finished_at ?? nowSec));
+    if (during.length && during.every((x) => x.trigger === 'user')) return 'you';
+  }
+  return ASKED_BY[t.trigger] ?? t.trigger;
+}
+
 export function renderActivityTable(tasks: AgentActivityInfo[], nowMs: number, width = 1000): string[] {
   const idw = Math.max(2, ...tasks.map((t) => cleanCell(t.id).length)) + 2;
   const head = `  ${'ID'.padEnd(idw)}${'STATUS'.padEnd(13)}${'BY'.padEnd(10)}${'FOR'.padEnd(10)}${'AGE'.padEnd(6)}WHAT`;
@@ -315,7 +329,7 @@ export function renderActivityTable(tasks: AgentActivityInfo[], nowMs: number, w
     head,
     ...tasks.map((t) =>
       `  ${cleanCell(t.id).padEnd(idw)}${cellText(t.status, 13)}${cellText(t.actor, 10)}` +
-      `${cellText(ASKED_BY[t.trigger] ?? t.trigger, 10)}${span(nowMs / 1000 - t.created_at).padEnd(6)}` +
+      `${cellText(askedFor(t, tasks, nowMs / 1000), 10)}${span(nowMs / 1000 - t.created_at).padEnd(6)}` +
       `${fitRow(cleanCell(t.label), Math.max(10, Math.min(70, width - 2 - idw - 39)))}`),
   ];
 }
@@ -435,15 +449,24 @@ export function agoText(atMs: number, nowMs: number): string {
  * and `switch <title>` for each session in `list` (as {@link orderSessions}
  * orders them).
  */
-export function sessionCompletions(list: readonly AgentSession[]): string[] {
-  const out = ['list', 'new ', 'fork ', 'default'];
-  for (const x of orderSessions(list)) {
-    out.push(`switch ${shortSessionId(x.id)}`);
-    const title = x.title?.trim();
-    if (title && !/\s{2,}|[\u0000-\u001f]/.test(title)) out.push(`switch ${title}`);
-  }
-  if (!list.length) out.push('switch ');
-  return [...new Set(out)];
+export function sessionCompletions(list: readonly AgentSession[], rest = '', shown?: readonly ShownSession[] | null): string[] {
+  if (!rest.startsWith('switch ')) return ['list', 'new ', 'fork ', 'default', 'switch '];
+  // After `switch `: the sessions, numbered as the list the owner last saw.
+  return (shown ?? shownSessions(list)).map((x, i) => `switch ${i + 1} ${x.title}`);
+}
+
+/** One row of a `/sessions` listing as shown: its id, and its title as the list prints it. */
+export interface ShownSession { id: string; title: string }
+
+/** A session's title as the list prints it, on one line. */
+function sessionTitle(x: AgentSession): string {
+  const title = x.title?.trim() ? cleanCell(x.title).replace(/\s+/g, ' ') : x.kind === 'owner' ? 'owner chat' : '(untitled)';
+  return x.kind === 'task' ? `[task] ${title}` : title;
+}
+
+/** The listing's rows in the order `/sessions` numbers them. */
+export function shownSessions(list: readonly AgentSession[]): ShownSession[] {
+  return orderSessions(list).map((x) => ({ id: x.id, title: sessionTitle(x) }));
 }
 
 /** Sessions as `/sessions` numbers them: the most recently active first. */
@@ -467,17 +490,30 @@ export function renderSessionList(list: readonly AgentSession[], current: string
   rows.forEach((x, i) => {
     // updated_at is in seconds on the wire; accept milliseconds too.
     const at = x.updated_at > 1e12 ? x.updated_at : x.updated_at * 1000;
-    const title = x.title?.trim() ? cleanCell(x.title) : x.kind === 'owner' ? 'owner chat' : '(untitled)';
-    lines.push(`  ${x.id === current ? '*' : ' '} ${String(i + 1).padStart(2)}  ${cleanCell(shortSessionId(x.id)).padEnd(15)}${cleanCell(x.state).padEnd(9)}${(x.updated_at ? agoText(at, nowMs) : '-').padEnd(13)}${x.kind === 'task' ? `[task] ${title}` : title}`);
+    lines.push(`  ${x.id === current ? '*' : ' '} ${String(i + 1).padStart(2)}  ${cleanCell(shortSessionId(x.id)).padEnd(15)}${cleanCell(x.state).padEnd(9)}${(x.updated_at ? agoText(at, nowMs) : '-').padEnd(13)}${sessionTitle(x)}`);
   });
   return lines;
 }
 
-/** The session `/sessions switch <arg>` means: its number in the listing, its id or id prefix, else a title containing it. */
-export function pickSession(list: readonly AgentSession[], arg: string): AgentSession | undefined {
+/**
+ * The session `/sessions switch <arg>` means: a number counts in the list
+ * the owner last saw (`shown`; the title Tab adds after it is ignored),
+ * else an id, id prefix or words of a title. `number` without `shown`: no
+ * list was shown yet; `gone`: the one shown under that number is no more.
+ */
+export function pickSession(list: readonly AgentSession[], arg: string, shown?: readonly ShownSession[] | null): { hit?: AgentSession; number?: number; gone?: ShownSession } {
+  const num = /^(\d+)(?:\s|$)/.exec(arg);
+  if (num) {
+    const number = Number(num[1]);
+    if (!shown) return { number };
+    const row = shown[number - 1];
+    if (!row) return { number };
+    const hit = list.find((x) => x.id === row.id);
+    return hit ? { hit, number } : { number, gone: row };
+  }
   const rows = orderSessions(list);
-  if (/^\d+$/.test(arg)) return rows[Number(arg) - 1];
-  return rows.find((x) => x.id === arg) ?? rows.find((x) => x.id.startsWith(arg)) ?? rows.find((x) => (x.title || '').toLowerCase().includes(arg.toLowerCase()));
+  const hit = rows.find((x) => x.id === arg) ?? rows.find((x) => x.id.startsWith(arg)) ?? rows.find((x) => (x.title || '').toLowerCase().includes(arg.toLowerCase()));
+  return hit ? { hit } : {};
 }
 
 export function renderSchedules(list: AgentSchedule[], nowMs: number): string[] {
@@ -510,8 +546,11 @@ export function noNoticesText(all: boolean): string {
 }
 
 /** /files' heading for a listing (empty: what it says instead). */
-export function filesText(dir: 'outbox' | 'inbox', empty: boolean): string {
-  if (dir === 'outbox') return empty ? 'the agent has left no files for you — ask it to put one in ~/outbox\n' : 'files the agent left for you (~/outbox):\n';
+export function filesText(dir: 'outbox' | 'inbox', empty: boolean, savedTo?: string): string {
+  if (dir === 'outbox') {
+    if (!empty) return 'files the agent left for you (~/outbox):\n';
+    return savedTo ? `nothing from the agent yet — files it makes for you are saved to ${savedTo}\n` : 'nothing from the agent yet — /download <name> saves one it leaves for you\n';
+  }
   return empty ? 'you have sent no files (~/inbox) — /attach sends one with your next message\n' : 'files you sent (~/inbox):\n';
 }
 
@@ -653,7 +692,7 @@ const L1_ARGS: Record<string, string[] | (() => string[])> = {
   cred: () => [...AGENT(), 'pending', 'notify ', 'presets'],
   list: ['--mine'],
 };
-const L2_ARGS: Record<string, string[] | (() => string[])> = {
+const L2_ARGS: Record<string, string[] | ((rest: string) => string[])> = {
   '/hello': ['full'],
   '/think': ['low', 'high', 'max'],
   '/reset': ['pick'],
@@ -666,17 +705,25 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/files': ['inbox', 'auto', 'auto on', 'auto off'],
   // What the outbox held when /files listed it or a turn reported it.
   '/download': () => outboxNames,
-  // Subcommands, and the sessions last seen (entering the session, /sessions).
-  '/sessions': () => sessionCompletions(sessionsSeen),
+  // Subcommands; after `switch `, the sessions numbered as last shown (the
+  // offer is a list shown too, when no /sessions list was).
+  '/sessions': (rest: string) => {
+    const offer = sessionCompletions(sessionsSeen, rest, sessionsShown);
+    if (rest.startsWith('switch ') && !sessionsShown && sessionsSeen.length) sessionsShown = shownSessions(sessionsSeen);
+    return offer;
+  },
   '/tasks': () => ['list', 'all', 'new ', ...['show', 'input', 'cancel', 'archive'].flatMap((w) => [`${w} `, ...tasksSeen.map((id) => `${w} ${id}`)])],
 };
 /** The sessions last listed in this agent's session, for `/sessions` completion. */
 let sessionsSeen: AgentSession[] = [];
+/** The `/sessions` list last shown in this agent's session, in its order:
+ *  what `/sessions switch <#>` counts in. */
+let sessionsShown: ShownSession[] | null = null;
 // The ids of the agent's tasks last listed, for Tab after /tasks show|input|cancel|archive.
 let tasksSeen: string[] = [];
 /** The outbox names last seen in this session (/files, a turn's notice), for completion. */
 let outboxNames: string[] = [];
-let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
+let activeArgs: Record<string, string[] | ((rest: string) => string[])> = L1_ARGS;
 
 const YES_NO = ['yes', 'no'];
 const CRED_VALUES: Record<string, () => string[]> = {
@@ -760,11 +807,13 @@ export function completeTail(cmd: string, word: string, models: string[], provid
 // completer is a one-line adapter that hands it the mutable module state.
 export function completeLine(
   line: string,
-  state: { completions: string[]; args: Record<string, string[] | (() => string[])>; models: string[]; provider?: string; providerModels?: Record<string, string[]>; providers?: string[]; credNames?: (agent?: string) => string[] },
+  state: { completions: string[]; args: Record<string, string[] | ((rest: string) => string[])>; models: string[]; provider?: string; providerModels?: Record<string, string[]>; providers?: string[]; credNames?: (agent?: string) => string[] },
 ): [string[], string] {
   const sp = line.indexOf(' ');
   if (sp === -1) {
     const hits = state.completions.filter((c) => c.startsWith(line));
+    // One command fits: it is completed with a space after it, as a shell does.
+    if (hits.length === 1 && line) return [[`${hits[0]} `], line];
     return [hits.length ? hits : state.completions, line];
   }
   const cmd = line.slice(0, sp);
@@ -799,7 +848,7 @@ export function completeLine(
     return [hits, word];
   }
   const cand = state.args[cmd];
-  const list = typeof cand === 'function' ? cand() : (cand ?? []);
+  const list = typeof cand === 'function' ? cand(rest) : (cand ?? []);
   const hits = list.filter((c) => c.startsWith(rest));
   // What was typed up to its last space is shared by the candidates that
   // match: only what follows is offered (`/sessions switch ` lists the
@@ -1403,6 +1452,8 @@ const term = (s: string): void => {
 const out = (s: string): void => term(cleanStream(s));
 
 interface Session {
+  /** What the last failed turn's error pointed at (null after a turn that did not fail). */
+  lastFailKind?: FailureKind | null;
   ag: AgenticID;
   attestorUrl: string;
   sealId: `0x${string}`;
@@ -1617,9 +1668,63 @@ export function followUpNote(f: FollowUp, canFollow: boolean): string {
     note = n > 1
       ? `the agent finished before reading ${n} of your messages — they go next, together`
       : 'the agent finished before reading this — it goes next';
+  } else {
+    note = "the agent wasn't working on anything — sent as a new message";
   }
   if (!canFollow) note = `${note ? `${note}; ` : ''}/result ${f.id} shows the answer`;
   return note ? `(${note})` : '';
+}
+
+/** What a failed turn's error points at: the model service (5xx, the
+ *  provider's own error), an overloaded model (429), the agent's model
+ *  settings (unknown model, a key, a bad request), or none of these. */
+export type FailureKind = 'service' | 'overloaded' | 'config' | 'other';
+
+/** The HTTP status in a model error, where the text names one: at its
+ *  start, after `HTTP`/`status`/`upstream`/`code`, or after a colon. */
+function failureStatus(msg: string): number | null {
+  const m = /(?:^|\bhttp\s*|\bstatus(?:\s*code)?\s*[:=]?\s*|\bupstream\s+|\bcode\s*[:=]\s*|:\s*)\(?([1-5]\d\d)\b/i.exec(msg);
+  return m ? Number(m[1]) : null;
+}
+
+/** Sort a failed turn's error (the agent's text for it) by what it points
+ *  at. Exported for the tests. */
+export function failureKind(message: string): FailureKind {
+  const msg = message.replace(/^chat:\s*/, '');
+  const low = msg.toLowerCase();
+  const status = failureStatus(msg);
+  if (/overload|rate[ _-]?limit|too many requests/.test(low) || status === 429 || status === 529) return 'overloaded';
+  if (/provider_error|bad gateway|service unavailable|gateway time-?out|internal server error/.test(low) || (status !== null && status >= 500)) return 'service';
+  if (/unknown model|model[ _]not[ _]found|no such model|model .*not (?:supported|available)|invalid[ _]api[ _]key|api key|unauthori[sz]ed|authenticat|forbidden|permission|invalid_request|bad request/.test(low)
+    || (status !== null && [400, 401, 402, 403, 404, 422].includes(status))) return 'config';
+  return 'other';
+}
+
+/** A model error's own words: the message inside a JSON body, without the JSON. */
+function failureWords(message: string): string {
+  const msg = message.replace(/^chat:\s*/, '').trim();
+  const at = msg.indexOf('{');
+  if (at < 0) return msg;
+  try {
+    const j = JSON.parse(msg.slice(at)) as { error?: { message?: unknown } | string; message?: unknown };
+    const inner = typeof j.error === 'string' ? j.error : typeof j.error?.message === 'string' ? j.error.message : typeof j.message === 'string' ? j.message : '';
+    if (inner) return `${msg.slice(0, at).trim()} ${inner}`.trim();
+  } catch { /* not JSON to the end: as it is */ }
+  return msg;
+}
+
+/** The line for a failed turn, by what its error points at. `model`: the
+ *  agent's model and provider, when known; `repeated`: the turn before
+ *  failed the same way. Exported for the tests. */
+export function failureText(message: string, opts: { model?: string; provider?: string; repeated?: boolean } = {}): string {
+  const kind = failureKind(message);
+  if (kind === 'service') {
+    const which = opts.model ? ` (${opts.model}${opts.provider ? ` via ${opts.provider}` : ''})` : '';
+    return `the model service failed${which} — try again in a moment`;
+  }
+  if (kind === 'overloaded') return 'the model is overloaded — try again shortly';
+  const base = `(chat failed: ${cleanCell(failureWords(message))}) — /agentlog has the agent's full error`;
+  return kind === 'config' && opts.repeated ? `${base}; failing again the same way usually means the model or settings just set — /settings shows them` : base;
 }
 
 /** A turn that ended without text because the model's output budget ran out. */
@@ -1711,6 +1816,8 @@ export function activityText(label: string): string {
     ?? (/^bash_command_start/.test(l) ? 'bash' : undefined);
   if (tool) return TOOL_TEXT[tool] ?? (/^memory|remember/i.test(tool) ? 'updating its memory' : `using ${tool}`);
   if (/subagent|rlm_child/i.test(l)) return 'asking a subagent';
+  // A tool returned: the model reads its result next.
+  if (/^tool\/result\b|tool_execution_end|bash_command_end/.test(l)) return 'thinking';
   return 'working';
 }
 
@@ -1750,6 +1857,24 @@ export function activitySummary(labels: readonly string[]): string {
     if (used) return k === 1 ? `used ${used}` : `used ${used} ${k} times`;
     return k === 1 ? what : `${what} (${k} times)`;
   }).join(', ');
+}
+
+/** The line for a failed turn (failureText) with the agent's model named
+ *  where the model service failed; remembers the kind, so a config error
+ *  says what usually causes it only when it comes again. */
+async function turnFailureText(s: Session, message: string): Promise<string> {
+  const kind = failureKind(message);
+  let named: { model?: string; provider?: string } = {};
+  if (kind === 'service') {
+    const doc = await Promise.race([
+      s.ag.agent.getSettings(s.sealId).then((d) => d.settings, () => null),
+      new Promise<null>((r) => setTimeout(() => r(null), 2000)),
+    ]);
+    if (typeof doc?.model === 'string' && doc.model) named = { model: cleanCell(doc.model), ...(typeof doc.provider === 'string' && doc.provider ? { provider: cleanCell(doc.provider) } : {}) };
+  }
+  const text = failureText(message, { ...named, repeated: s.lastFailKind === kind });
+  s.lastFailKind = kind;
+  return text;
 }
 
 /**
@@ -1805,7 +1930,7 @@ async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (v
       if (back) out(`${back}\n`);
     } else {
       const empty = await emptyTurnText(client, r.id, e);
-      out(empty ? `\n${empty}\n` : `\n(turn failed: ${cleanCell((e as Error).message)})\n`);
+      out(empty ? `\n${empty}\n` : `\n${await turnFailureText(s, (e as Error).message)}\n`);
     }
   } finally {
     view.end();
@@ -3184,6 +3309,40 @@ let cachedClient: { key: string; ag: AgenticID } | null = null;
  * Returns the document now in force (unchanged on a bare show), so a caller
  * like /think can report the level that actually landed.
  */
+/**
+ * A spinner line while something slow runs, on a terminal: `⠹ applying the
+ * settings… (6s)`, from 0.4 s on. The returned function clears it; `clear`
+ * on it takes it off for a line printed meanwhile (the next tick draws it
+ * again under that line).
+ */
+function progressLine(label: string): { stop(): void; clear(): void } {
+  if (!process.stdout.isTTY) return { stop() {}, clear() {} };
+  const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+  const t0 = Date.now();
+  let spin = 0;
+  let shown = false;
+  let timer: NodeJS.Timeout | null = null;
+  // Under the Ink view: its status row.
+  const clear = (): void => {
+    if (!shown) return;
+    if (activeInk) activeInk.status(null);
+    else term('\r\x1b[2K');
+    shown = false;
+  };
+  const paint = (): void => {
+    spin = (spin + 1) % SPIN.length;
+    const line = cleanCell(`${SPIN[spin]} ${label}… (${Math.floor((Date.now() - t0) / 1000)}s)`);
+    if (activeInk) activeInk.status(line);
+    else term(`\r\x1b[2K  ${line}`);
+    shown = true;
+  };
+  const first = setTimeout(() => { paint(); timer = setInterval(paint, 1000); }, 400);
+  return {
+    stop() { clearTimeout(first); if (timer) clearInterval(timer); clear(); },
+    clear,
+  };
+}
+
 async function settingsOp(
   ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null, ask?: (q: string) => Promise<string>,
   versionsCmd = '/settings versions',
@@ -3229,11 +3388,14 @@ async function settingsOp(
       pendingReset = true;
     }
   }
+  // Writing and pushing take a while (a signature, the attestor, the
+  // container applying it): a spinner says it is under way.
+  let busy = progressLine('writing the settings');
   try {
     const { version: written } = await ag.agent.setSettings(sealId, next, {
       baseVersion: version,
-      onWarn: (w) => out(`⚠ ${w}\n`),
-    });
+      onWarn: (w) => { busy.clear(); out(`⚠ ${w}\n`); },
+    }).finally(() => busy.stop());
     for (const l of renderSettings(next)) out(`  ${l}\n`);
     if (providerChanged) {
       completionProvider = next.provider ?? '0g-compute';
@@ -3252,11 +3414,14 @@ async function settingsOp(
     // agent was running).
     if (serveBase) {
       try {
-        const agentId = await ag.agent.getAgentIdBySealId(sealId);
-        const r = await ag.agent.pushSettingsToContainer(serveBase, agentId, next);
+        busy = progressLine('applying them to the running agent');
+        const r = await ag.agent.getAgentIdBySealId(sealId)
+          .then((agentId) => ag.agent.pushSettingsToContainer(serveBase, agentId, next))
+          .finally(() => busy.stop());
         out(`written — version ${written}; ${r.note ?? 'applied to the running container'}\n`);
       } catch (e2) {
-        const msg = (e2 as Error).message;
+        // One line (a chain read's error is many).
+        const msg = plainError(e2);
         if (requiresProviderReset(e2)) {
           out(`written — version ${written}; provider change pending — run reset with the ${next.provider} key\n`);
           return next;
@@ -3917,18 +4082,47 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   if (failure) s.failure = failure;
   const fields = sessionCardFields({ agentId, name: row.name, phase: s.phase, sealId: row.sealId, gasWei, warning, connected, failure, warningAt: mine ? mine.containerStatus?.at : undefined });
   out('\n');
-  if (art) {
-    for (let i = 0; i < Math.max(art.length, fields.length); i++) {
+  // On a terminal the fields wrap at words; beside the avatar while at least
+  // 28 columns are left for them.
+  const cols = process.stdout.isTTY ? (process.stdout.columns || 80) : Infinity;
+  const beside = art && cols - 22 >= 28 ? art : null;
+  const cardRows = wrapCard(fields, beside ? cols - 22 : cols - 3);
+  if (beside) {
+    for (let i = 0; i < Math.max(beside.length, cardRows.length); i++) {
       // The avatar's cells are the CLI's own colour codes (svgPixelLines):
       // written as they are; the fields are cleaned.
-      term(`  ${art[i] ?? ' '.repeat(16)}   `);
-      out(`${fields[i] ?? ''}\n`);
+      term(`  ${beside[i] ?? ' '.repeat(16)}   `);
+      out(`${cardRows[i] ?? ''}\n`);
     }
   } else {
-    for (const f of fields) out(`  ${f}\n`);
+    for (const f of cardRows) out(`  ${f}\n`);
   }
   out('\n');
   return s;
+}
+
+/** The entry card's field lines, wrapped at words to `width` columns: a
+ *  field's further rows line up under its value (`gas      1.2 OG (…`).
+ *  Exported for the tests. */
+export function wrapCard(fields: readonly string[], width: number): string[] {
+  if (!Number.isFinite(width)) return [...fields];
+  const rows: string[] = [];
+  for (const f of fields) {
+    const key = /^[A-Za-z]+ {2,}/.exec(f)?.[0].length ?? 0;
+    if (key && width - key >= 16) {
+      const parts = wrapWords(f.slice(key), width - key);
+      parts.forEach((p, i) => rows.push(`${i ? ' '.repeat(key) : f.slice(0, key)}${p}`));
+    } else {
+      rows.push(...wrapWords(f, width));
+    }
+  }
+  return rows;
+}
+
+/** The session's first line, wrapped at words on a terminal. */
+function sessionHeader(s: Session): string {
+  const line = `agent ${s.agentId} session — ${s.phase} · ${hostOf(s.attestorUrl)}`;
+  return process.stdout.isTTY ? wrapWords(line, (process.stdout.columns || 80) - 1).join('\n') : line;
 }
 
 /** The last recorded container failure reason, if any (public detail). */
@@ -4130,7 +4324,7 @@ const L2_HELP_FULL = `session commands
   /quit                   exit`;
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
-  out(`\nagent ${s.agentId} session — ${s.phase} · ${hostOf(s.attestorUrl)}\n`);
+  out(`\n${sessionHeader(s)}\n`);
   // Low-gas heads-up WITH the entry card. It used to run detached and could
   // land mid-turn, reading like the agent said it (feedback.md F17) — so wait
   // for it, but bounded: advisory reads must not hold the prompt hostage.
@@ -4584,6 +4778,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!sub || sub === 'list') {
           const list = await s.client.sessions();
           sessionsSeen = list;
+          sessionsShown = shownSessions(list);
           for (const l of renderSessionList(list, s.sessionId ?? 'owner-chat', Date.now())) out(`${l}\n`);
           out('/sessions switch <#|id|title> · new [title] · fork [id] · default\n');
           continue;
@@ -4592,7 +4787,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const src = sub === 'fork' ? (arg || s.sessionId || 'owner-chat') : undefined;
           const made = await s.client.createSession!({ ...(sub === 'new' && arg ? { title: arg } : {}), ...(src ? { fork: src } : {}) });
           s.sessionId = made.id; s.sessionTitle = made.title || (src ? `fork of ${src}` : '');
-          out(`→ ${made.title ? cleanCell(made.title) : src ? `a copy of ${src === 'owner-chat' ? 'owner-chat' : 'that session'}` : 'a new session (titled by your first message)'}: chat now goes there\n`);
+          const short = cleanCell(shortSessionId(made.id));
+          out(`→ ${made.title ? `${cleanCell(made.title)} · ${short}` : src ? `a copy of ${src === 'owner-chat' ? 'owner-chat' : 'that session'} · ${short}` : `a new session · ${short} (titled by your first message)`}: chat now goes there\n`);
           continue;
         }
         if (sub === 'default') { s.sessionId = undefined; s.sessionTitle = undefined; out('→ owner-chat\n'); continue; }
@@ -4600,8 +4796,20 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (!arg) { out('usage: /sessions switch <#|id|title>\n'); continue; }
           const list = await s.client.sessions();
           sessionsSeen = list;
-          const hit = pickSession(list, arg);
-          if (!hit) { out(`no session matches ${cleanCell(arg)}\n`); continue; }
+          const picked = pickSession(list, arg, sessionsShown);
+          let hit = picked.hit;
+          if (picked.gone) { out(`#${picked.number} in the list you saw (${cleanCell(picked.gone.title)}) is gone — /sessions lists them again\n`); continue; }
+          if (!hit && picked.number !== undefined && !sessionsShown) {
+            // No list shown in this CLI yet: show it, and ask about that number in it.
+            sessionsShown = shownSessions(list);
+            for (const l of renderSessionList(list, s.sessionId ?? 'owner-chat', Date.now())) out(`${l}\n`);
+            const row = sessionsShown[picked.number - 1];
+            if (!row) { out(`there is no #${picked.number} — /sessions switch <#> with a number above\n`); continue; }
+            const yes = !(await ask(`switch to #${picked.number}, ${row.title}? [Y/n] `)).trim().toLowerCase().startsWith('n');
+            if (!yes) continue;
+            hit = list.find((x) => x.id === row.id);
+          }
+          if (!hit) { out(picked.number !== undefined ? `there is no #${picked.number} in the list you saw — /sessions lists them\n` : `no session matches ${cleanCell(arg)}\n`); continue; }
           s.sessionId = hit.id === 'owner-chat' ? undefined : hit.id; s.sessionTitle = hit.title;
           out(`→ ${hit.id === 'owner-chat' ? 'owner-chat' : hit.title ? cleanCell(hit.title) : shortSessionId(hit.id)}\n`);
           continue;
@@ -4988,9 +5196,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             if (!filesAuto) outbox?.listed(files);
           }
           if (!files.length) {
-            out(filesText(dir, true));
-            // Saved by themselves: they left the agent's outbox for this folder.
-            if (dir === 'outbox' && outbox && filesAuto) out(`the ones saved here are in ${tildePath(outbox.dir)}\n`);
+            // Saved by themselves: they leave the agent's outbox for this folder.
+            out(filesText(dir, true, dir === 'outbox' && outbox && filesAuto ? cleanCell(tildePath(outbox.dir)) : undefined));
             continue;
           }
           out(filesText(dir, false));
@@ -5102,11 +5309,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           (r) => {
             if (r.merged && r.id) { unread.push({ id: r.id, text: e.text, turn: r.turn }); return; }
             unshow(e.text);
-            if (r.queued) {
-              addFollowUp(after, r.queued, e.text, 'idle');
-              view.note("(the agent wasn't working on anything — sent as a new message)\n");
-              return;
-            }
+            // Said after the message, when its turn is followed (followUpNote).
+            if (r.queued) { addFollowUp(after, r.queued, e.text, 'idle'); return; }
             back(e, r.reason ?? '');
           },
           (err: Error) => { unshow(e.text); back(e, err.message); },
@@ -5176,12 +5380,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     for (let i = 0; i < after.length; i++) {
       const f = after[i];
       (s.tasks ??= []).push({ id: f.id, prompt: '(inserted)', at: Date.now() });
+      // What it answers (under the Ink view the messages go to the transcript
+      // as the owner's; at readline's prompt one line each), then what
+      // became of it.
+      if (activeInk) for (const t of f.texts) activeInk.owner(t);
+      else if (process.stdout.isTTY) for (const t of f.texts) out(`↳ ${oneLine(t)}\n`);
       const note = followUpNote(f, !!s.client?.followTask);
       if (note) out(`${note}\n`);
-      // What it answers: under the Ink view the messages go to the transcript
-      // as the owner's; at readline's prompt one line each.
-      if (activeInk) for (const t of f.texts) activeInk.owner(t);
-      else if (f.why === 'unread' && process.stdout.isTTY) for (const t of f.texts) out(`↳ ${oneLine(t)}\n`);
       if (!s.client?.followTask) continue;
       const fac = new AbortController();
       irq.streaming = fac;
@@ -5217,7 +5422,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (kept) out(`${kept}\n`);
         } else {
           const empty = await emptyTurnText(s.client, f.id, e);
-          out(`\n${empty ?? `(${cleanCell((e as Error).message)})`}\n`);
+          out(`\n${empty ?? await turnFailureText(s, (e as Error).message)}\n`);
         }
       } finally {
         view.end();
@@ -5233,6 +5438,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     activeArgs = L2_ARGS;
     if (sessionSealId !== s.sealId) {
       sessionsSeen = [];
+      sessionsShown = null;
       tasksSeen = [];
       // Prefetch the session and task lists for Tab; failures just leave them empty.
       s.client?.sessions?.().then((l) => { sessionsSeen = l; }).catch(() => undefined);
@@ -5565,7 +5771,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // while the actual cause (the 400 body) is only in the container log. A
       // turn that fails EVERY time is usually the model or config it was just
       // given, so point at the log the way the connection-drop branches do.
-      if (failure) out(`\n(chat failed: ${cleanCell(failure)}) — /agentlog has the agent's full error (a turn that fails every time usually means the model or config just set)`);
+      if (failure) {
+        out(`\n${await turnFailureText(s, failure)}`);
+      } else if (!interrupted) {
+        s.lastFailKind = null;
+      }
       out('\n');
       messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
       break;
