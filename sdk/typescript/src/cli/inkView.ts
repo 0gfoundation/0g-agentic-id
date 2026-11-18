@@ -36,7 +36,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { cleanCell, cleanStream } from './commands/cells';
-import { charCols, completeAt, fitRow, splitRows, type TurnView } from './livePrompt';
+import { charCols, completeAt, fitRow, splitRows, wrapProse, wrapText, type TurnView } from './livePrompt';
 
 /** The fewest milliseconds between two frames (Ink throttles at 32). */
 export const FRAME_MS = 40;
@@ -290,6 +290,7 @@ export class InkEditor extends EventEmitter {
 /** What the shell's line queue answers for the view (interactive.ts Ask). */
 export interface InkAsk {
   unwind?(): boolean;
+  clearBox?(): boolean;
   queued?(): Array<{ text: string }>;
   drafting?(): string[];
   recall?(): boolean;
@@ -438,10 +439,16 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     if (nl < 0) {
       this.tail = all;
     } else {
-      this.pending += all.slice(0, nl + 1);
+      // Finished lines stay in the scrollback: broken between words.
+      this.pending += wrapText(all.slice(0, nl + 1), this.wrapCols());
       this.tail = all.slice(nl + 1);
     }
     this.schedule();
+  }
+
+  /** The width text for the transcript is wrapped to: the terminal's, less one. */
+  private wrapCols(): number {
+    return Math.max(20, (this.o.stdout.columns || 80) - 1);
   }
 
   /**
@@ -464,15 +471,17 @@ export class InkScreen<A extends InkAsk = InkAsk> {
   /** A block for the transcript now, after the line being written (printAbovePrompt). */
   print(text: string): void {
     this.breakTail();
-    const t = text.replace(CSI, '').replace(/\r/g, '').replace(/^\n+/, '');
+    let t = text.replace(CSI, '').replace(/\r/g, '').replace(/^\n+/, '');
     if (!t) return;
+    // Broken between words, unless it carries a link (the shell's own sequence).
+    if (!/\u001b/.test(t)) t = wrapText(t, this.wrapCols());
     this.pending += t.endsWith('\n') ? t : `${t}\n`;
     this.schedule();
   }
 
   /** A whole line above the line being written (a turn's note). */
   note(text: string): void {
-    this.pending += `${text}\n`;
+    this.pending += `${/\u001b/.test(text) ? text : wrapText(text, this.wrapCols())}\n`;
     this.schedule();
   }
 
@@ -484,8 +493,10 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     let lines = cleanStream(shown).split('\n');
     // A long one (a big paste): its first lines and how many more.
     if (lines.length > OWNER_LINES + 2) lines = [...lines.slice(0, OWNER_LINES), `… (+${lines.length - OWNER_LINES} more lines)`];
+    // Each line broken between words, its further rows under its text.
+    const rows = lines.flatMap((l) => wrapProse(l, Math.max(18, this.wrapCols() - 2)));
     const [on, off] = this.colors ? ['\u001b[100m', '\u001b[49m'] : ['', ''];
-    this.pending += `${lines.map((l, i) => `${on}${i ? '  ' : INK_PROMPT}${l} ${off}`).join('\n')}\n`;
+    this.pending += `${rows.map((l, i) => `${on}${i ? '  ' : INK_PROMPT}${l} ${off}`).join('\n')}\n`;
     this.schedule();
   }
 
@@ -500,7 +511,7 @@ export class InkScreen<A extends InkAsk = InkAsk> {
   /** The line being written ends here. */
   breakTail(): void {
     if (!this.tail) return;
-    this.pending += `${this.tail}\n`;
+    this.pending += `${wrapText(this.tail, this.wrapCols())}\n`;
     this.tail = '';
   }
 
@@ -518,9 +529,9 @@ export class InkScreen<A extends InkAsk = InkAsk> {
   }
 
   /** A chat turn's view. `steers`: Enter puts a message into the turn. */
-  turn(o: { steered?: () => readonly string[]; steers?: boolean } = {}): InkTurn {
+  turn(o: { steered?: () => readonly string[]; steers?: boolean; next?: () => readonly string[] } = {}): InkTurn {
     this.turnView?.end();
-    const t = new InkTurn(this, o.steered ?? (() => []), !!o.steers);
+    const t = new InkTurn(this, o.steered ?? (() => []), !!o.steers, o.next ?? (() => []));
     this.turnView = t;
     this.schedule();
     return t;
@@ -588,6 +599,8 @@ export class InkScreen<A extends InkAsk = InkAsk> {
       else this.complete();
     } else if (key.name === 'backspace' && plain && !e.pasting && e.cursor === 0 && this.ask.unwind?.()) {
       // The line before comes back, joined.
+    } else if (key.ctrl && !key.meta && key.name === 'u' && !e.pasting && this.ask.drafting?.().length && this.ask.clearBox?.()) {
+      // Ctrl-U on a message of several lines: all of it goes, not only this line.
     } else if (key.name === 'up' && plain && !e.pasting && !this.ask.waiting?.() && e.line === ''
       && !this.ask.drafting?.().length && this.ask.queued?.().length) {
       // ↑ on an empty line while the shell is busy: the newest queued entry, back to edit.
@@ -681,6 +694,8 @@ export class InkScreen<A extends InkAsk = InkAsk> {
     const waiting: Array<{ text: string; how: string }> = [
       ...(turn ? turn.steered().map((text) => ({ text, how: WAITING_AGENT })) : []),
       ...(this.ask.queued?.() ?? []).map((q) => ({ text: q.text, how: WAITING_TURN })),
+      // Taken by the agent as a new message: it waits for its own turn.
+      ...(turn ? turn.next().map((text) => ({ text, how: WAITING_TURN })) : []),
     ];
     const shownWaiting = waiting.length > 4 ? [...waiting.slice(0, 3), { text: '', how: `… and ${waiting.length - 3} more` }] : waiting;
     const named = (t: string): string => { try { return this.o.ownerText?.(t) ?? t; } catch { return t; } };
@@ -857,7 +872,7 @@ export class InkTurn implements TurnView {
   private readonly t0 = Date.now();
   private readonly tick: ReturnType<typeof setInterval>;
 
-  constructor(private readonly screen: InkScreen, readonly steered: () => readonly string[], readonly steers: boolean) {
+  constructor(private readonly screen: InkScreen, readonly steered: () => readonly string[], readonly steers: boolean, readonly next: () => readonly string[] = () => []) {
     this.tick = setInterval(() => { this.spin++; screen.refresh(); }, 1000);
     this.tick.unref?.();
   }

@@ -5,7 +5,7 @@
 // completes as readline does.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { NO_ANSWER_MAX_TOKENS, PHASE_WATCH_MS, addFollowUp, askedFor, nextPhaseWait, phaseMovedText, emptyTurnText, failureKind, failureText, followUpNote, keptNote, readOnlyCommand, renderActivityTable, steerFollowUp, stoppedSteers, wrapCard } from '../dist/cli/commands/interactive.js';
+import { NO_ANSWER_MAX_TOKENS, PHASE_WATCH_MS, addFollowUp, askedFor, filesText, shortIds, yesNo, nextPhaseWait, phaseMovedText, emptyTurnText, failureKind, failureText, followUpNote, keptNote, readOnlyCommand, renderActivityTable, steerFollowUp, stoppedSteers, wrapCard } from '../dist/cli/commands/interactive.js';
 import { completeAt } from '../dist/cli/livePrompt.js';
 
 test('readOnlyCommand: the commands that only read run during a turn; the rest wait for its end', () => {
@@ -25,8 +25,8 @@ test('follow-ups: messages the agent answers in one turn are followed once; the 
   const after = [];
   addFollowUp(after, 'resp_a', 'first', 'unread');
   addFollowUp(after, 'resp_a', 'second', 'unread'); // the harness answers unread steers together
-  addFollowUp(after, 'resp_b', 'later', 'idle');
-  assert.deepEqual(after, [{ id: 'resp_a', texts: ['first', 'second'], why: 'unread' }, { id: 'resp_b', texts: ['later'], why: 'idle' }]);
+  addFollowUp(after, 'resp_b', 'later', 'idle', { reason: 'no turn is running' });
+  assert.deepEqual(after, [{ id: 'resp_a', texts: ['first', 'second'], why: 'unread' }, { id: 'resp_b', texts: ['later'], why: 'idle', reason: 'no turn is running' }]);
   assert.equal(followUpNote(after[0], true), '(the agent finished before reading 2 of your messages — they go next, together)');
   assert.equal(followUpNote({ id: 'resp_c', texts: ['x'], why: 'unread' }, true), '(the agent finished before reading this — it goes next)');
   // Taken as a new message: said after the message's line, when its turn is followed.
@@ -246,4 +246,36 @@ test('an idle session re-reads a running agent\'s phase every 30 s, slower after
   assert.equal(phaseMovedText('offline'), '  phase   offline — /reset\n');
   assert.equal(phaseMovedText('failed'), '  phase   failed — /reset\n');
   assert.equal(phaseMovedText('deploying'), '  phase   deploying\n');
+});
+
+test('the switch question takes y, yes, n, no or Enter; anything else is asked again', () => {
+  for (const a of ['y', 'Y', 'yes', ' YES ']) assert.equal(yesNo(a, true), true, a);
+  for (const a of ['n', 'No', 'no']) assert.equal(yesNo(a, true), false, a);
+  assert.equal(yesNo('', true), true);
+  assert.equal(yesNo('', false), false);
+  for (const a of ['/quit', 'nope', 'sure', 'queued text']) assert.equal(yesNo(a, true), null, a);
+});
+
+test('a message the agent took as new says why, by what it said; a failed turn\'s unread ones say the turn failed', () => {
+  assert.equal(followUpNote({ id: 'r', texts: ['x'], why: 'idle', reason: "the running turn is the agent's own" }, true), '(the agent was busy with its own work — this goes next)');
+  assert.equal(followUpNote({ id: 'r', texts: ['x'], why: 'idle', reason: 'no turn is running' }, true), "(the agent wasn't working on anything — sent as a new message)");
+  assert.equal(followUpNote({ id: 'r', texts: ['x'], why: 'idle' }, true), '(sent as a new message)');
+  assert.equal(followUpNote({ id: 'r', texts: ['x'], why: 'unread', failed: true }, true), '(the turn failed before the agent read this — it goes next)');
+  assert.equal(followUpNote({ id: 'r', texts: ['x', 'y'], why: 'unread', failed: true }, true), '(the turn failed before the agent read 2 of your messages — they go next, together)');
+});
+
+test('/activities ids are short, longer only where two would read the same', () => {
+  assert.deepEqual(shortIds(['resp_4702745b899bd6193d8f2a66', 'bash-c917aa00c683c3c1a95c3562762519b3', '6f1c2a3b-0d4e-4f5a-9b8c-7d6e5f4a3b2c', 'x1']),
+    ['resp_4702745b', 'bash-c917aa00', '6f1c2a3b-0d4e', 'x1']);
+  assert.deepEqual(shortIds(['resp_4702745b899b', 'resp_4702745b12aa']), ['resp_4702745b8', 'resp_4702745b1']);
+  const now = 2_000_000;
+  const row = renderActivityTable([{ id: 'bash-c917aa00c683c3c1a95c3562762519b3', type: 'command', status: 'in_progress', actor: 'agent', trigger: 'agent', label: 'npm test -- --watch=false and more words', created_at: now - 40 }], now * 1000, 79)[1];
+  assert.ok(row.length <= 79, row);
+  assert.match(row, /^ {2}bash-c917aa00 {2}in_progress {2}agent {5}agent {5}40s {3}npm test -- --watch/);
+});
+
+test('/files with nothing on the agent says what was saved here this session', () => {
+  assert.equal(filesText('outbox', true, '~/agentdna/625/outbox', ['notes.md', 'report.txt']), 'nothing waiting on the agent — 2 files saved to ~/agentdna/625/outbox this session (latest: report.txt)\n');
+  assert.equal(filesText('outbox', true, '~/agentdna/625/outbox', ['report.txt']), 'nothing waiting on the agent — 1 file saved to ~/agentdna/625/outbox this session (latest: report.txt)\n');
+  assert.equal(filesText('outbox', true, '~/agentdna/625/outbox', []), 'nothing from the agent yet — files it makes for you are saved to ~/agentdna/625/outbox\n');
 });
