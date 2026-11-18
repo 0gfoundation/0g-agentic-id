@@ -1775,7 +1775,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
               // every later command see a "malformed" key until restart.
               const k = normalizeKey(typed);
               if (!k) {
-                out('  not a private key: it is 64 hex characters (0x optional) — type it again, or Enter to skip\n');
+                out('  not a private key (64 hex, 0x optional) — try again, or Enter to skip\n');
                 continue;
               }
               saveKey(k);
@@ -1848,7 +1848,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           ag.agent.estimateCosts(),
           ag.agent.listMyDeployments(),
           ag.getBalanceDetail().catch(() => null),
-          ag.getEffectiveBalance().catch((e: Error) => { effErr = explainError(e).message; return null; }),
+          ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; }),
         ]);
         rememberAgentIds(rows);
         const running = rows.filter((r) => r.phase === 'running').length;
@@ -1875,7 +1875,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const amountWei = parseOgAmount(amt);
         const native = await ag.nativeBalance().catch(() => null);
         if (native != null && native <= amountWei) {
-          out(`the wallet holds ${ogAmount(native)} OG — not enough to deposit ${ogAmount(amountWei)} OG and pay its gas\n`);
+          out(`the wallet holds ${og(native)} — not enough to deposit ${ogAmount(amountWei)} OG and pay its gas\n`);
           continue;
         }
         const tx = await ag.deposit({ amountWei });
@@ -1923,7 +1923,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // The bare form's question says a request restarts the pending lock;
         // with the amount given as an argument, ask before restarting it.
         if (args[0] && pending > 0n) {
-          const yn = (await ask(`${ogAmount(amountWei)} OG joins the pending ${og(pending)} and restarts its time lock — proceed? [y/N]: `)).trim().toLowerCase();
+          const yn = (await ask(`${ogAmount(amountWei)} OG joins the pending ${og(pending)}; its lock restarts — proceed? [y/N]: `)).trim().toLowerCase();
           if (yn !== 'y' && yn !== 'yes') { out('withdraw cancelled — the pending refund and its lock are unchanged\n'); continue; }
         }
         const tx = await ag.requestRefund({ amountWei: amountWei + pending });
@@ -2037,7 +2037,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const layout = listLayout(termWidth(), 2, ownerColumnWidth(merged.map((m) => m.owner), sealToAgent));
         out(renderListHeader(layout));
         for (const m of merged) out(renderListRow(m.row, m.owner, m.mark, sealToAgent, layout));
-        if (mine && !mineOnly) out('(* = owned by your wallet · `list --mine` filters to them)\n');
+        if (mine && !mineOnly) out(`${wrap('(* = owned by your wallet · `list --mine` filters to them)', termWidth()).join('\n')}\n`);
         continue;
       }
 
@@ -2050,7 +2050,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Still deploying (minted or not): the deploy brings it up itself;
         // start/reset would act on a container that is not there yet.
         if (row.phase === 'deploying' && cmd !== 'stop') {
-          out(`agent ${row.agentId} is still deploying — ${cmd} is for a deployed agent; \`list\` shows when it is up\n`);
+          out(`agent ${row.agentId} is still deploying — \`list\` shows when it is up\n`);
           continue;
         }
         // No agentId: its deploy failed before the mint — retry resumes it.
@@ -2976,7 +2976,7 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
         continue;
       }
       if (native != null && native <= amountWei) {
-        out(`  the wallet holds ${ogAmount(native)} OG — not enough to deposit ${ogAmount(amountWei)} OG and pay its gas\n`);
+        out(`  the wallet holds ${og(native)} — not enough to deposit ${ogAmount(amountWei)} OG and pay its gas\n`);
         continue;
       }
       break;
@@ -3035,7 +3035,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
 
   const apiKey = provision ? (await pickModelKey(provider, keyPrompt(ask), { optional: mayGoKeyless(framework, provider) })) ?? undefined : undefined;
   if (provision && !(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
-  out(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only, no container'}…\n`);
+  out(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only'}…\n`);
   const { deployment: dep, agentId } = await deployWithInference(ag, { name, framework, provider, model, provision, apiKey });
   if (!provision) {
     out(`minted agentId ${agentId} — offline (no container). Bring it online with: reset ${agentId}\n`);

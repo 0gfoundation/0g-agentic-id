@@ -396,7 +396,7 @@ test('shell: amounts are checked before any transaction', async () => {
     assert.match(r.stdout, /error: the amount must be above 0 OG/);
     assert.match(r.stdout, /error: "abc" is not an amount of OG/);
     assert.match(r.stdout, /error: "-5" is not an amount of OG/);
-    assert.match(r.stdout, /the wallet holds 0 OG — not enough to deposit 5 OG and pay its gas/);
+    assert.match(r.stdout, /the wallet holds 0\.000000 OG — not enough to deposit 5 OG and pay its gas/);
     assert.doesNotMatch(r.stdout, /Request Arguments|viem@|Docs: https/);
   } finally { close(att.server); }
 });
@@ -406,8 +406,8 @@ test('shell: an agent without an agentId shows its sealId prefix and is not star
   try {
     const r = await run([], { AGENTIC_ATTESTOR_URL: att.url, AGENTIC_PRIVATE_KEY: KEY }, 'list\nstart 0x0025786d4d\nreset 0x0025786d4d\nuse 0x0025786d4d\nquit\n');
     assert.match(r.stdout, /^\* 0x0025786d4d\s+deploying/m, r.stdout);
-    assert.match(r.stdout, /agent 0x0025786d4d is still deploying — start is for a deployed agent/);
-    assert.match(r.stdout, /agent 0x0025786d4d is still deploying — reset is for a deployed agent/);
+    assert.match(r.stdout, /> start 0x0025786d4d\nagent 0x0025786d4d is still deploying — `list` shows when it is up/);
+    assert.match(r.stdout, /> reset 0x0025786d4d\nagent 0x0025786d4d is still deploying — `list` shows when it is up/);
     assert.match(r.stdout, /error: agent 0x0025786d4d has no agentId yet — it is still being minted/);
     assert.doesNotMatch(r.stdout, /\?|BigInt|framework:/);
   } finally { close(att.server); }
@@ -441,7 +441,7 @@ test('shell: login checks the URL and the key before saving them, and asks again
     const r = await run([], {}, input);
     assert.match(r.stdout, /not a url: not a URL \(https:\/\/… or http:\/\/…\) — try again/);
     assert.match(r.stdout, new RegExp(`http://127\\.0\\.0\\.1:${port}: connection refused — try again`));
-    assert.match(r.stdout, /not a private key: it is 64 hex characters \(0x optional\) — type it again, or Enter to skip/);
+    assert.match(r.stdout, /not a private key \(64 hex, 0x optional\) — try again, or Enter to skip/);
     assert.match(r.stdout, new RegExp(`wallet ${ME}`));
     const cfg = JSON.parse(readFileSync(join(r.home, '.config', '0g-agentdna', 'config.json'), 'utf8'));
     assert.equal(cfg.attestorUrl, att.url, 'only the attestor that answered is saved');
