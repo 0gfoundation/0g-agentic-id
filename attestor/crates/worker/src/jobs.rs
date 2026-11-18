@@ -1,11 +1,16 @@
 //! Job handlers. Worker core logic.
 
 use alloy::primitives::{Address, Bytes, B256};
+use attestor_shared::auth::operator::{
+    authorize_runtime, create_permission, revalidate_runtime_principal, validate_operator_snapshot,
+    LifecyclePermission, RuntimeAuthorizationError, RuntimePrincipal,
+};
 use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
     auth::status::NOT_RESUMABLE,
     credentials_repo::CredentialRepo,
     oss::OssClient,
+    runtime_creates::{PendingRuntimeCreate, RuntimeCreateRepo},
     sandbox::{envelope_names_sandbox, SandboxError, NOT_CURRENT_SANDBOX},
     AgentId, ChainClient, CloneFromParams, CloneRetryParams, Config, CryptoModule, DeploymentRepo,
     EventBus, IDataArtifact, IDataInput, IntelligentData, JobCloneAuth, JobId, JobPayload,
@@ -50,24 +55,430 @@ pub struct Ctx {
 
     /// The owners' credential sets: a deploy's container may wait for one.
     pub credentials: Arc<dyn CredentialRepo>,
+    pub runtime_creates: Arc<dyn RuntimeCreateRepo>,
 }
 
-/// Jobs may wait past a transfer. Recheck the live owner immediately before
-/// granting a new boot generation or sending a queued owner lifecycle call.
-async fn recheck_job_owner(
+/// Owner jobs arrive through the authenticated, encrypted queue. Delegated
+/// work additionally binds its original signature to an agent and grant
+/// revision, rechecked here so revoke/regrant cannot revive queued work.
+async fn authorize_job(
     ctx: &Ctx,
     seal: SealId,
     envelope: &SandboxEnvelope,
-) -> anyhow::Result<()> {
-    if let Some(d) = ctx.deployments.get(seal).await? {
-        if let Some(agent) = d.agent_id {
-            anyhow::ensure!(
-                ctx.chain.owner_of(agent).await? == envelope.wallet_address,
-                "queued lifecycle signer is no longer the on-chain owner"
-            );
+    permission: LifecyclePermission,
+) -> anyhow::Result<RuntimePrincipal> {
+    let d = ctx
+        .deployments
+        .get(seal)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("unknown runtime deployment"))?;
+    let owner = match d.agent_id {
+        Some(agent) => ctx.chain.owner_of(agent).await?,
+        None => envelope.wallet_address,
+    };
+    if owner == envelope.wallet_address {
+        return Ok(RuntimePrincipal {
+            owner,
+            actor: envelope.wallet_address,
+            operator_version: None,
+        });
+    }
+    let principal = authorize_runtime(
+        ctx.chain.as_ref(),
+        ctx.crypto.as_ref(),
+        ctx.deployments.as_ref(),
+        ctx.cfg.chain_id,
+        ctx.cfg.agentic_id_addr,
+        &d,
+        envelope,
+        permission,
+    )
+    .await?;
+    if matches!(
+        permission,
+        LifecyclePermission::Provision | LifecyclePermission::Recreate
+    ) {
+        let message = attestor_shared::sandbox::verify_envelope(envelope, ctx.crypto.as_ref())?;
+        validate_operator_snapshot(&ctx.cfg, d.framework.as_deref(), &message.payload)?;
+    }
+    Ok(principal)
+}
+
+async fn prepare_runtime_boot(
+    ctx: &Ctx,
+    seal: SealId,
+    ticket: Option<[u8; 32]>,
+    principal: RuntimePrincipal,
+) -> anyhow::Result<Option<i64>> {
+    match principal.operator_version {
+        Some(version) => {
+            ctx.deployments
+                .prepare_operator_boot(seal, ticket, principal.owner, principal.actor, version)
+                .await
+        }
+        None => {
+            ctx.deployments
+                .prepare_status_boot(seal, ticket, principal.owner)
+                .await
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CreateBindError {
+    #[error("{0}")]
+    Denied(anyhow::Error),
+    #[error("{0}")]
+    Unavailable(anyhow::Error),
+    #[error("{0}")]
+    Unjournaled(anyhow::Error),
+}
+
+impl CreateBindError {
+    fn dependency(error: anyhow::Error) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+async fn try_bind_created_runtime(
+    ctx: &Ctx,
+    result: &PendingRuntimeCreate,
+) -> Result<(), CreateBindError> {
+    let deployment = ctx
+        .deployments
+        .get(result.seal_id)
+        .await
+        .map_err(CreateBindError::dependency)?
+        .ok_or_else(|| CreateBindError::Denied(anyhow::anyhow!("unknown runtime deployment")))?;
+    let boot = ctx
+        .deployments
+        .boot_authorization(result.seal_id)
+        .await
+        .map_err(CreateBindError::dependency)?;
+    // A commit acknowledgement can be lost. A later stop may even have
+    // changed the generation; a response already mapped to this same physical
+    // sandbox must never be deleted as an unbound create.
+    if deployment.sandbox_id.as_deref() == Some(result.sandbox_id.as_str())
+        && boot
+            .as_ref()
+            .is_some_and(|boot| boot.sandbox_id.as_deref() == Some(result.sandbox_id.as_str()))
+    {
+        return Ok(());
+    }
+    if !boot
+        .as_ref()
+        .is_some_and(|boot| boot.enabled && boot.generation == result.generation)
+    {
+        return Err(CreateBindError::Denied(anyhow::anyhow!(
+            "sandbox authorization changed during create"
+        )));
+    }
+    let principal = RuntimePrincipal {
+        owner: result.owner,
+        actor: result.actor,
+        operator_version: result.operator_version,
+    };
+    revalidate_runtime_principal(
+        ctx.chain.as_ref(),
+        ctx.crypto.as_ref(),
+        ctx.deployments.as_ref(),
+        ctx.cfg.chain_id,
+        ctx.cfg.agentic_id_addr,
+        &deployment,
+        &principal,
+    )
+    .await
+    .map_err(|error| match error {
+        RuntimeAuthorizationError::Denied(error) => CreateBindError::Denied(error),
+        error => CreateBindError::Unavailable(error.into()),
+    })?;
+    if result.operator_version.is_some() && result.container_pubkey.is_none() {
+        return Err(CreateBindError::Denied(anyhow::anyhow!(
+            "provider did not return the created container's certificate"
+        )));
+    }
+    let bound = ctx
+        .deployments
+        .bind_runtime_sandbox(
+            result.seal_id,
+            result.sandbox_id.clone(),
+            result.generation,
+            result.container_pubkey.clone(),
+        )
+        .await
+        .map_err(CreateBindError::dependency)?;
+    if !bound {
+        return Err(CreateBindError::Denied(anyhow::anyhow!(
+            "sandbox authorization changed during create"
+        )));
+    }
     Ok(())
+}
+
+async fn bind_created_runtime(
+    ctx: &Ctx,
+    seal: SealId,
+    principal: RuntimePrincipal,
+    response: &attestor_shared::SandboxCreateResponse,
+    generation: i64,
+    old_sandbox_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let old_sandbox_id = old_sandbox_id.map(str::to_owned);
+    let result = PendingRuntimeCreate {
+        seal_id: seal,
+        generation,
+        sandbox_id: response.id.clone(),
+        container_pubkey: response.container_pubkey.clone(),
+        owner: principal.owner,
+        actor: principal.actor,
+        operator_version: principal.operator_version,
+        old_sandbox_id,
+    };
+    // Save the accepted response before any extra chain reads. This outbox
+    // permits recovery without resending the paid create or its consumed nonce.
+    let mut last = None;
+    for attempt in 0..3u32 {
+        let persist = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.runtime_creates.record(&result),
+        )
+        .await;
+        match persist {
+            Ok(Ok(())) => {
+                last = None;
+                break;
+            }
+            Ok(Err(error)) => last = Some(error),
+            Err(error) => last = Some(error.into()),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
+        }
+    }
+    if let Some(error) = last {
+        tracing::error!(?seal, sandbox_id=%response.id, generation, error=%error,
+            "paid create could not be journaled; preserving provider resource for recovery");
+        return Err(
+            CreateBindError::Unjournaled(error.context("persist accepted create result")).into(),
+        );
+    }
+    for attempt in 0..3u32 {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            try_bind_created_runtime(ctx, &result),
+        )
+        .await;
+        let outcome = match outcome {
+            Ok(result) => result,
+            Err(error) => Err(CreateBindError::Unavailable(error.into())),
+        };
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(CreateBindError::Denied(error)) => {
+                return Err(CreateBindError::Denied(error).into());
+            }
+            Err(error) if attempt == 2 => return Err(error.into()),
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await,
+        }
+    }
+    unreachable!()
+}
+
+fn binding_is_unavailable(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<CreateBindError>(),
+        Some(CreateBindError::Unavailable(_) | CreateBindError::Unjournaled(_))
+    )
+}
+
+fn create_recovery_warning(error: &anyhow::Error, sandbox: &str) -> String {
+    if matches!(
+        error.downcast_ref::<CreateBindError>(),
+        Some(CreateBindError::Unjournaled(_))
+    ) {
+        format!("sandbox {sandbox} was created, but its recovery record could not be saved; attestor admin intervention is required")
+    } else {
+        "sandbox created; dependency unavailable, binding recovery pending".into()
+    }
+}
+
+async fn acknowledge_created_runtime(
+    ctx: &Ctx,
+    seal: SealId,
+    generation: i64,
+    sandbox: &str,
+) -> bool {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ctx.runtime_creates.complete_key(seal, generation, sandbox),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(?seal, error=%error, "create acknowledgement deferred");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(?seal, error=%error, "create acknowledgement timed out");
+            false
+        }
+    }
+}
+
+async fn complete_denied_create(ctx: &Ctx, seal: SealId, generation: i64, sandbox: &str) {
+    acknowledge_created_runtime(ctx, seal, generation, sandbox).await;
+}
+
+pub async fn recover_created_runtimes(ctx: &Ctx) -> anyhow::Result<usize> {
+    let mut recovered = 0;
+    for result in ctx.runtime_creates.pending().await? {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.runtime_creates.mark_attempt(&result),
+        )
+        .await??;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            try_bind_created_runtime(ctx, &result),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(())) => {
+                if let Some(old) = result
+                    .old_sandbox_id
+                    .as_deref()
+                    .filter(|old| !old.is_empty() && *old != result.sandbox_id)
+                {
+                    ctx.deployments
+                        .enqueue_operator_teardown(result.seal_id, old)
+                        .await?;
+                }
+                if let Some(deployment) = ctx.deployments.get(result.seal_id).await? {
+                    // Identity finalization remains the deploy/retry job's
+                    // responsibility; recovery does not submit a second URI tx.
+                    let current = ctx.deployments.boot_authorization(result.seal_id).await?;
+                    if deployment.sandbox_id.as_deref() == Some(result.sandbox_id.as_str())
+                        && current
+                            .as_ref()
+                            .is_some_and(|boot| boot.generation == result.generation)
+                        && !deployment.agent_uri.is_empty()
+                    {
+                        if let Err(error) =
+                            refresh_agent_card_url(ctx, result.seal_id, &result.sandbox_id).await
+                        {
+                            tracing::warn!(seal_id=?result.seal_id, error=%error, "deferred create card refresh skipped");
+                        }
+                    }
+                }
+                if acknowledge_created_runtime(
+                    ctx,
+                    result.seal_id,
+                    result.generation,
+                    &result.sandbox_id,
+                )
+                .await
+                {
+                    recovered += 1;
+                }
+            }
+            Ok(Err(CreateBindError::Denied(error))) => {
+                let _ = ctx
+                    .deployments
+                    .transition_runtime(
+                        result.seal_id,
+                        result.old_sandbox_id.as_deref(),
+                        Some(result.generation),
+                        StageStatus::Failed {
+                            at: Utc::now(),
+                            reason: format!("deferred create denied: {error}"),
+                        },
+                        None,
+                    )
+                    .await;
+                // A changed authority/generation is a real denial; an outage
+                // is not. Never delete a result now mapped to a current boot.
+                cleanup_unbound_runtime(ctx, result.seal_id, &result.sandbox_id).await?;
+                acknowledge_created_runtime(
+                    ctx,
+                    result.seal_id,
+                    result.generation,
+                    &result.sandbox_id,
+                )
+                .await;
+                tracing::info!(seal_id=?result.seal_id, error=%error, "denied deferred create retired");
+            }
+            Ok(Err(CreateBindError::Unavailable(error) | CreateBindError::Unjournaled(error))) => {
+                tracing::warn!(seal_id=?result.seal_id,
+                error=%error, "accepted create remains pending after dependency failure")
+            }
+            Err(error) => {
+                tracing::warn!(seal_id=?result.seal_id, error=%error, "accepted create recovery timed out")
+            }
+        }
+    }
+    Ok(recovered)
+}
+
+async fn cleanup_unbound_runtime(ctx: &Ctx, seal: SealId, sandbox: &str) -> anyhow::Result<()> {
+    if ctx
+        .deployments
+        .get(seal)
+        .await?
+        .and_then(|d| d.sandbox_id)
+        .as_deref()
+        == Some(sandbox)
+    {
+        return Ok(());
+    }
+    let queued = ctx
+        .deployments
+        .enqueue_operator_teardown(seal, sandbox)
+        .await;
+    match ctx.sandbox.admin_delete(sandbox).await {
+        Ok(()) => {
+            if queued.is_ok() {
+                ctx.deployments
+                    .complete_operator_teardown(seal, sandbox)
+                    .await?;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            queued?;
+            tracing::warn!(?seal, %sandbox, error = %e, "unbound sandbox cleanup persisted for retry");
+            Ok(())
+        }
+    }
+}
+
+pub async fn reap_operator_teardowns(ctx: &Ctx) -> anyhow::Result<usize> {
+    let mut removed = 0;
+    for (seal, sandbox) in ctx.deployments.pending_operator_teardowns().await? {
+        if ctx
+            .deployments
+            .get(seal)
+            .await?
+            .and_then(|d| d.sandbox_id)
+            .as_deref()
+            == Some(sandbox.as_str())
+        {
+            tracing::warn!(?seal, %sandbox, "operator cleanup target is currently bound; refusing to delete");
+            continue;
+        }
+        match ctx.sandbox.admin_delete(&sandbox).await {
+            Ok(()) => {
+                ctx.deployments
+                    .complete_operator_teardown(seal, &sandbox)
+                    .await?;
+                removed += 1;
+            }
+            Err(e) => {
+                tracing::warn!(?seal, %sandbox, error = %e, "operator cleanup deferred; will retry")
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// Refuse an owner's start or stop whose envelope names a sandbox other than
@@ -250,6 +661,8 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             sandbox_envelope,
         } => {
+            let principal =
+                authorize_job(ctx, seal_id, &sandbox_envelope, LifecyclePermission::Resume).await?;
             let deployment = ctx.deployments.get(seal_id).await?;
             let sandbox_id = deployment.as_ref().and_then(|d| d.sandbox_id.clone());
             match deployment.as_ref().map(|d| &d.container_stage) {
@@ -280,7 +693,6 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 }
                 _ => {}
             }
-            recheck_job_owner(ctx, seal_id, &sandbox_envelope).await?;
             // The provider starts the sandbox the envelope names, and all of
             // the bookkeeping below is for the deployment's sandbox. /start
             // refuses an envelope for another one; the row can change after
@@ -291,17 +703,35 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             // and this keeps a job that slipped past it (or a reset that
             // failed after it was queued) from starting a container that can
             // only go offline.
-            let resumable = ctx
-                .deployments
-                .boot_authorization(seal_id)
-                .await?
-                .is_some_and(|a| a.holds_current_ticket(sandbox_id.as_deref()));
-            let generation = if resumable {
-                ctx.deployments
-                    .prepare_status_boot(seal_id, None, sandbox_envelope.wallet_address)
-                    .await?
-            } else {
-                None
+            let boot = ctx.deployments.boot_authorization(seal_id).await?;
+            let generation = match (sandbox_id.as_deref(), boot) {
+                (Some(sandbox), Some(boot)) if boot.holds_current_ticket(Some(sandbox)) => {
+                    match principal.operator_version {
+                        Some(version) => {
+                            ctx.deployments
+                                .prepare_operator_resume(
+                                    seal_id,
+                                    sandbox,
+                                    boot.generation,
+                                    principal.owner,
+                                    principal.actor,
+                                    version,
+                                )
+                                .await?
+                        }
+                        None => {
+                            ctx.deployments
+                                .prepare_status_resume(
+                                    seal_id,
+                                    sandbox,
+                                    boot.generation,
+                                    principal.owner,
+                                )
+                                .await?
+                        }
+                    }
+                }
+                _ => None,
             };
             if generation.is_none() {
                 tracing::warn!(
@@ -318,18 +748,21 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             }
             // Publish the pending stage before start can invoke provisioning;
             // a fast Running callback must never be demoted after start returns.
-            ctx.deployments
-                .set_container_stage(
-                    seal_id,
-                    StageStatus::Submitted {
-                        tx_hash: None,
-                        at: Utc::now(),
-                    },
-                )
-                .await?;
-            ctx.deployments
-                .set_provision_deadline(seal_id, Some(Utc::now() + PROVISION_TIMEOUT))
-                .await?;
+            anyhow::ensure!(
+                ctx.deployments
+                    .transition_runtime(
+                        seal_id,
+                        sandbox_id.as_deref(),
+                        generation,
+                        StageStatus::Submitted {
+                            tx_hash: None,
+                            at: Utc::now(),
+                        },
+                        Some(Utc::now() + PROVISION_TIMEOUT),
+                    )
+                    .await?,
+                "runtime authorization changed before start"
+            );
             ctx.events
                 .publish(WsEvent::ContainerStarting { seal_id })
                 .await?;
@@ -349,15 +782,22 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     // offline, as the heartbeat sweep does for a missing
                     // sandbox, so the owner is offered a new container
                     // instead of another resume. Nothing is deleted here.
-                    ctx.deployments
-                        .set_container_stage(
+                    if !ctx
+                        .deployments
+                        .transition_runtime(
                             seal_id,
+                            sandbox_id.as_deref(),
+                            generation,
                             StageStatus::Failed {
                                 at: Utc::now(),
                                 reason: failure.hint.to_string(),
                             },
+                            None,
                         )
-                        .await?;
+                        .await?
+                    {
+                        return Ok(());
+                    }
                     tracing::warn!(?seal_id, error = %e, ?view, "sandbox.start failed and the sandbox is gone or broken; c=Failed");
                     ctx.events
                         .publish(WsEvent::ContainerFailed {
@@ -367,15 +807,22 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                         .await?;
                     anyhow::bail!("resume not started: {e}");
                 }
-                ctx.deployments
-                    .set_container_stage(
+                if !ctx
+                    .deployments
+                    .transition_runtime(
                         seal_id,
+                        sandbox_id.as_deref(),
+                        generation,
                         StageStatus::Stopped {
                             at: Utc::now(),
                             reason: "resume_not_started".into(),
                         },
+                        None,
                     )
-                    .await?;
+                    .await?
+                {
+                    return Ok(());
+                }
                 tracing::warn!(?seal_id, error = %e, transient = failure.transient, "sandbox.start did not take effect; staying Stopped");
                 ctx.events
                     .publish(WsEvent::ContainerWarning {
@@ -394,6 +841,8 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             sandbox_envelope,
         } => {
+            let principal =
+                authorize_job(ctx, seal_id, &sandbox_envelope, LifecyclePermission::Stop).await?;
             let deployment = ctx.deployments.get(seal_id).await?;
             // Double-click guard: if a previous stop already landed,
             // skip the sandbox call entirely. The string-match fallback
@@ -422,7 +871,6 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             // sandbox stopped or archived, with no start pending, after an
             // error. Fall through to the success path so the UI doesn't flip
             // Failed and force a recreate.
-            recheck_job_owner(ctx, seal_id, &sandbox_envelope).await?;
             // The provider stops the sandbox the envelope names; the stage
             // written below is the deployment's. Same check as /stop, repeated
             // because the row can change while the job waits.
@@ -433,6 +881,11 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 deployment.as_ref().and_then(|d| d.sandbox_id.as_deref()),
             )
             .await?;
+            let sandbox_id = deployment.as_ref().and_then(|d| d.sandbox_id.clone());
+            // A stop can finish a disabled or pre-ticket boot too. Capture
+            // its actual row revision so the completion cannot affect a newer
+            // boot, while still recording the provider's successful stop.
+            let generation = ctx.deployments.runtime_generation(seal_id).await?;
             if let Err(e) = ctx.sandbox.stop(seal_id, &sandbox_envelope).await {
                 let msg = e.to_string();
                 let already_stopped = msg.contains("not started")
@@ -486,15 +939,21 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     let now = Utc::now();
                     let reason = format!("sandbox stop: {e}");
                     tracing::warn!(?seal_id, error = %e, "sandbox.stop failed; flipping c=Failed");
-                    ctx.deployments
-                        .set_container_stage(
+                    if !ctx
+                        .deployments
+                        .complete_runtime_stop(
                             seal_id,
+                            sandbox_id.as_deref(),
+                            generation,
                             StageStatus::Failed {
                                 at: now,
                                 reason: reason.clone(),
                             },
                         )
-                        .await?;
+                        .await?
+                    {
+                        return Ok(());
+                    }
                     ctx.events
                         .publish(WsEvent::ContainerFailed {
                             seal_id,
@@ -505,16 +964,27 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 }
             }
             let now = Utc::now();
-            let reason = "user_stop".to_string();
-            ctx.deployments
-                .set_container_stage(
+            let reason = if principal.operator_version.is_some() {
+                "operator_stop"
+            } else {
+                "user_stop"
+            }
+            .to_string();
+            if !ctx
+                .deployments
+                .complete_runtime_stop(
                     seal_id,
+                    sandbox_id.as_deref(),
+                    generation,
                     StageStatus::Stopped {
                         at: now,
                         reason: reason.clone(),
                     },
                 )
-                .await?;
+                .await?
+            {
+                return Ok(());
+            }
             ctx.events
                 .publish(WsEvent::ContainerStopped { seal_id, reason })
                 .await?;
@@ -652,8 +1122,9 @@ async fn handle_resume_deploy(
             };
             finish_submitted_mint(ctx, seal_id, *tx_hash).await?;
         }
-        d = ctx.deployments.get(seal_id).await?
-            .ok_or_else(|| anyhow::anyhow!("resume: deployment vanished after mint reconciliation"))?;
+        d = ctx.deployments.get(seal_id).await?.ok_or_else(|| {
+            anyhow::anyhow!("resume: deployment vanished after mint reconciliation")
+        })?;
     }
 
     // ── Clone rows: re-drive the original clone, not the deploy tracks ──
@@ -886,35 +1357,63 @@ async fn handle_sandbox_recreate(
 ) -> anyhow::Result<()> {
     // Capture the old sandbox_id BEFORE we overwrite — needed for
     // best-effort orphan cleanup at the end of this handler.
-    recheck_job_owner(ctx, seal_id, &envelope).await?;
     let deployment = ctx.deployments.get(seal_id).await?;
     let old_sandbox_id = deployment.as_ref().and_then(|d| d.sandbox_id.clone());
-
-    let now = Utc::now();
-    ctx.deployments
-        .set_container_stage(
-            seal_id,
-            StageStatus::Submitted {
-                tx_hash: None,
-                at: now,
-            },
-        )
-        .await?;
-    ctx.events
-        .publish(WsEvent::ContainerStarting { seal_id })
-        .await?;
+    let permission = create_permission(
+        deployment
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("unknown runtime deployment"))?,
+    );
+    let principal = authorize_job(ctx, seal_id, &envelope, permission).await?;
+    if let Some(boot) = ctx.deployments.boot_authorization(seal_id).await? {
+        if boot.enabled
+            && boot.sandbox_id.is_none()
+            && ctx
+                .runtime_creates
+                .has_pending(seal_id, boot.generation)
+                .await?
+        {
+            ctx.events
+                .publish(WsEvent::ContainerWarning {
+                    seal_id,
+                    reason: "sandbox already created; authority verification recovery is pending"
+                        .into(),
+                })
+                .await?;
+            return Ok(());
+        }
+    }
 
     // Spawn the new sandbox. On failure we keep the old sandbox_id in
     // place — its container is presumably still wherever it was, and
     // we don't want to leave the deployment pointing at a sandbox that
     // never came up.
     let boot_ticket = attestor_shared::auth::status::new_boot_ticket();
-    ctx.deployments
-        .prepare_status_boot(
-            seal_id,
-            Some(attestor_shared::auth::status::binding_hash(&boot_ticket)),
-            envelope.wallet_address,
-        )
+    let generation = prepare_runtime_boot(
+        ctx,
+        seal_id,
+        Some(attestor_shared::auth::status::binding_hash(&boot_ticket)),
+        principal,
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("new sandbox requires a boot generation"))?;
+    anyhow::ensure!(
+        ctx.deployments
+            .transition_runtime(
+                seal_id,
+                old_sandbox_id.as_deref(),
+                Some(generation),
+                StageStatus::Submitted {
+                    tx_hash: None,
+                    at: Utc::now()
+                },
+                Some(Utc::now() + PROVISION_TIMEOUT)
+            )
+            .await?,
+        "runtime authorization changed before create"
+    );
+    ctx.events
+        .publish(WsEvent::ContainerStarting { seal_id })
         .await?;
     // Fence the previous boot before granting this revision its fresh attempt.
     if let Some(d) = &deployment {
@@ -948,15 +1447,22 @@ async fn handle_sandbox_recreate(
             } else {
                 format!("sandbox recreate: {e}")
             };
-            ctx.deployments
-                .set_container_stage(
+            if !ctx
+                .deployments
+                .transition_runtime(
                     seal_id,
+                    old_sandbox_id.as_deref(),
+                    Some(generation),
                     StageStatus::Failed {
                         at: now,
                         reason: reason.clone(),
                     },
+                    None,
                 )
-                .await?;
+                .await?
+            {
+                return Ok(());
+            }
             if transient {
                 tracing::warn!(?seal_id, error = %e, "sandbox recreate: transient condition; awaiting retry");
                 ctx.events
@@ -979,35 +1485,47 @@ async fn handle_sandbox_recreate(
     // records its own certificate, which must be for the key the provider
     // certified in this response.
     warn_uncertified_create(seal_id, &resp);
-    if let Err(e) = ctx
-        .deployments
-        .set_sandbox_id(seal_id, resp.id.clone(), resp.container_pubkey.clone())
-        .await
+    if let Err(e) = bind_created_runtime(
+        ctx,
+        seal_id,
+        principal,
+        &resp,
+        generation,
+        old_sandbox_id.as_deref(),
+    )
+    .await
     {
-        ctx.deployments
-            .set_container_stage(
+        if binding_is_unavailable(&e) {
+            ctx.events
+                .publish(WsEvent::ContainerWarning {
+                    seal_id,
+                    reason: create_recovery_warning(&e, &resp.id),
+                })
+                .await?;
+            return Err(e.context("accepted create awaiting recovery"));
+        }
+        let _ = ctx
+            .deployments
+            .transition_runtime(
                 seal_id,
+                old_sandbox_id.as_deref(),
+                Some(generation),
                 StageStatus::Failed {
                     at: Utc::now(),
                     reason: "failed to persist new sandbox ID".into(),
                 },
+                None,
             )
-            .await?;
-        let _ = ctx.sandbox.admin_delete(&resp.id).await;
+            .await;
+        match cleanup_unbound_runtime(ctx, seal_id, &resp.id).await {
+            Ok(()) => complete_denied_create(ctx, seal_id, generation, &resp.id).await,
+            Err(cleanup) => {
+                tracing::error!(?seal_id, sandbox_id = %resp.id, error = %cleanup, "unbound sandbox cleanup remains pending")
+            }
+        }
         return Err(e.context("persist new sandbox ID"));
     }
     let persisted_new = true;
-
-    // Reset the provision deadline so the sweep doesn't immediately
-    // refire on a deployment whose previous deadline has long passed.
-    let new_deadline = Utc::now() + PROVISION_TIMEOUT;
-    if let Err(e) = ctx
-        .deployments
-        .set_provision_deadline(seal_id, Some(new_deadline))
-        .await
-    {
-        tracing::warn!(?seal_id, error = %e, "failed to reset provision_deadline on recreate");
-    }
 
     // Best-effort orphan cleanup. Only fires when:
     //   - we actually had a previous sandbox_id (Some)
@@ -1109,6 +1627,7 @@ async fn handle_sandbox_recreate(
         }
     }
 
+    acknowledge_created_runtime(ctx, seal_id, generation, &resp.id).await;
     Ok(())
 }
 
@@ -1122,6 +1641,10 @@ async fn refresh_agent_card_url(
         .get(seal_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("deployment vanished mid-recreate"))?;
+    anyhow::ensure!(
+        d.sandbox_id.as_deref() == Some(new_sandbox_id),
+        "runtime changed before card refresh"
+    );
     if d.agent_card.is_null() || d.agent_card.as_object().map_or(true, |o| o.is_empty()) {
         // Phase 2 never ran — nothing cached to mutate. Bail; the user
         // can subsequently /retry to build the AgentCard from scratch.
@@ -2068,28 +2591,38 @@ async fn run_container_track(
     seal_id: SealId,
     envelope: &SandboxEnvelope,
 ) -> anyhow::Result<()> {
-    let now = Utc::now();
-    ctx.deployments
-        .set_container_stage(
-            seal_id,
-            StageStatus::Submitted {
-                tx_hash: None,
-                at: now,
-            },
-        )
-        .await?;
+    let target = ctx
+        .deployments
+        .get(seal_id)
+        .await?
+        .and_then(|d| d.sandbox_id);
+    let principal = authorize_job(ctx, seal_id, envelope, LifecyclePermission::Provision).await?;
+    let boot_ticket = attestor_shared::auth::status::new_boot_ticket();
+    let generation = prepare_runtime_boot(
+        ctx,
+        seal_id,
+        Some(attestor_shared::auth::status::binding_hash(&boot_ticket)),
+        principal,
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("new sandbox requires a boot generation"))?;
+    anyhow::ensure!(
+        ctx.deployments
+            .transition_runtime(
+                seal_id,
+                target.as_deref(),
+                Some(generation),
+                StageStatus::Submitted {
+                    tx_hash: None,
+                    at: Utc::now()
+                },
+                Some(Utc::now() + PROVISION_TIMEOUT)
+            )
+            .await?,
+        "runtime authorization changed before create"
+    );
     ctx.events
         .publish(WsEvent::ContainerStarting { seal_id })
-        .await?;
-
-    recheck_job_owner(ctx, seal_id, envelope).await?;
-    let boot_ticket = attestor_shared::auth::status::new_boot_ticket();
-    ctx.deployments
-        .prepare_status_boot(
-            seal_id,
-            Some(attestor_shared::auth::status::binding_hash(&boot_ticket)),
-            envelope.wallet_address,
-        )
         .await?;
     let resp = match ctx
         .sandbox
@@ -2116,15 +2649,22 @@ async fn run_container_track(
             } else {
                 format!("sandbox create: {e}")
             };
-            ctx.deployments
-                .set_container_stage(
+            if !ctx
+                .deployments
+                .transition_runtime(
                     seal_id,
+                    target.as_deref(),
+                    Some(generation),
                     StageStatus::Failed {
                         at: now,
                         reason: reason.clone(),
                     },
+                    None,
                 )
-                .await?;
+                .await?
+            {
+                return Ok(());
+            }
             ctx.events
                 .publish(WsEvent::ContainerFailed {
                     seal_id,
@@ -2139,39 +2679,50 @@ async fn run_container_track(
     // Its first `/provision` must present the key the provider certified in
     // this response.
     warn_uncertified_create(seal_id, &resp);
-    if let Err(e) = ctx
-        .deployments
-        .set_sandbox_id(seal_id, resp.id.clone(), resp.container_pubkey.clone())
-        .await
+    if let Err(e) = bind_created_runtime(
+        ctx,
+        seal_id,
+        principal,
+        &resp,
+        generation,
+        target.as_deref(),
+    )
+    .await
     {
-        ctx.deployments
-            .set_container_stage(
+        if binding_is_unavailable(&e) {
+            ctx.events
+                .publish(WsEvent::ContainerWarning {
+                    seal_id,
+                    reason: create_recovery_warning(&e, &resp.id),
+                })
+                .await?;
+            return Err(e.context("accepted create awaiting recovery"));
+        }
+        let _ = ctx
+            .deployments
+            .transition_runtime(
                 seal_id,
+                target.as_deref(),
+                Some(generation),
                 StageStatus::Failed {
                     at: Utc::now(),
                     reason: "failed to persist sandbox ID".into(),
                 },
+                None,
             )
-            .await?;
-        let _ = ctx.sandbox.admin_delete(&resp.id).await;
+            .await;
+        match cleanup_unbound_runtime(ctx, seal_id, &resp.id).await {
+            Ok(()) => complete_denied_create(ctx, seal_id, generation, &resp.id).await,
+            Err(cleanup) => {
+                tracing::error!(?seal_id, sandbox_id = %resp.id, error = %cleanup, "unbound sandbox cleanup remains pending")
+            }
+        }
         return Err(e.context("persist sandbox ID"));
-    }
-
-    // Provision deadline. Sweep loop flips container_stage to Failed if
-    // the container hasn't called /provision by this timestamp. Best-
-    // effort: a write failure just means the timeout wouldn't fire;
-    // /status: Error or user-driven recreate would still recover.
-    let deadline = Utc::now() + PROVISION_TIMEOUT;
-    if let Err(e) = ctx
-        .deployments
-        .set_provision_deadline(seal_id, Some(deadline))
-        .await
-    {
-        tracing::warn!(?seal_id, error = %e, "failed to write provision_deadline");
     }
 
     // Container will POST /status with "running" via api-server; that path
     // updates container_stage to Confirmed. Worker's job ends here.
+    acknowledge_created_runtime(ctx, seal_id, generation, &resp.id).await;
     Ok(())
 }
 
@@ -2419,6 +2970,7 @@ mod tests {
             credentials: Arc::new(
                 attestor_shared::credentials_repo::InMemoryCredentialRepo::default(),
             ),
+            runtime_creates: attestor_shared::runtime_creates::in_memory(),
         };
         TestCtx {
             ctx,
@@ -2447,7 +2999,10 @@ mod tests {
             self.inner.register_with_seal(params).await
         }
 
-        async fn wait_receipt(&self, tx_hash: B256) -> anyhow::Result<attestor_shared::ReceiptSummary> {
+        async fn wait_receipt(
+            &self,
+            tx_hash: B256,
+        ) -> anyhow::Result<attestor_shared::ReceiptSummary> {
             let first_request = {
                 let mut hashes = self.receipt_hashes.lock().unwrap();
                 hashes.push(tx_hash);
@@ -2465,7 +3020,10 @@ mod tests {
             self.inner.wait_receipt(tx_hash).await
         }
 
-        async fn get_agent_id_by_seal_id(&self, seal_id: SealId) -> anyhow::Result<Option<AgentId>> {
+        async fn get_agent_id_by_seal_id(
+            &self,
+            seal_id: SealId,
+        ) -> anyhow::Result<Option<AgentId>> {
             self.inner.get_agent_id_by_seal_id(seal_id).await
         }
 
@@ -2485,11 +3043,21 @@ mod tests {
             self.inner.identity_registry_of(registry).await
         }
 
-        async fn is_acknowledged(&self, registry: Address, user: Address, app_id: &str) -> anyhow::Result<bool> {
+        async fn is_acknowledged(
+            &self,
+            registry: Address,
+            user: Address,
+            app_id: &str,
+        ) -> anyhow::Result<bool> {
             self.inner.is_acknowledged(registry, user, app_id).await
         }
 
-        async fn sandbox_balance(&self, serving: Address, user: Address, provider: Address) -> anyhow::Result<U256> {
+        async fn sandbox_balance(
+            &self,
+            serving: Address,
+            user: Address,
+            provider: Address,
+        ) -> anyhow::Result<U256> {
             self.inner.sandbox_balance(serving, user, provider).await
         }
 
@@ -2497,7 +3065,10 @@ mod tests {
             self.inner.token_uri(agent_id).await
         }
 
-        async fn intelligent_datas_of(&self, agent_id: AgentId) -> anyhow::Result<Vec<IntelligentData>> {
+        async fn intelligent_datas_of(
+            &self,
+            agent_id: AgentId,
+        ) -> anyhow::Result<Vec<IntelligentData>> {
             self.inner.intelligent_datas_of(agent_id).await
         }
 
@@ -2509,8 +3080,17 @@ mod tests {
             self.inner.clone_authorizer_of(agent_id).await
         }
 
-        async fn can_clone(&self, authorizer: Address, source: AgentId, target: Address, caller: Address, data: Bytes) -> anyhow::Result<bool> {
-            self.inner.can_clone(authorizer, source, target, caller, data).await
+        async fn can_clone(
+            &self,
+            authorizer: Address,
+            source: AgentId,
+            target: Address,
+            caller: Address,
+            data: Bytes,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .can_clone(authorizer, source, target, caller, data)
+                .await
         }
 
         async fn clone_from(&self, params: CloneFromParams) -> anyhow::Result<B256> {
@@ -2678,6 +3258,644 @@ mod tests {
             created_at: now,
             updated_at: now,
         });
+    }
+
+    const OP_OWNER_KEY: [u8; 32] = [0x11; 32];
+    const OP_KEY: [u8; 32] = [0x22; 32];
+
+    fn sign_operator_json(key: [u8; 32], value: serde_json::Value) -> SandboxEnvelope {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+        let signer = PrivateKeySigner::from_bytes(&B256::from(key)).unwrap();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let digest = attestor_shared::sandbox::eip191_digest(&bytes);
+        let sig: Vec<u8> = signer.sign_hash_sync(&B256::from(digest)).unwrap().into();
+        SandboxEnvelope {
+            wallet_address: signer.address(),
+            signed_message_b64: B64.encode(bytes),
+            wallet_signature: Bytes::from(sig),
+        }
+    }
+
+    async fn install_operator(
+        t: &TestCtx,
+        base: i64,
+        operator: Option<Address>,
+        recreate: bool,
+        expires: i64,
+    ) -> i64 {
+        use attestor_shared::auth::operator::OperatorGrant;
+        let d = t.deployments.get(dummy_seal()).await.unwrap().unwrap();
+        let checkpoint = t.ctx.chain.operator_checkpoint().await.ok();
+        let proof = sign_operator_json(
+            OP_OWNER_KEY,
+            serde_json::json!({
+                "domain": "AgenticID.Operator.v1", "chain_id": t.ctx.cfg.chain_id,
+                "contract": t.ctx.cfg.agentic_id_addr, "seal_id": dummy_seal(),
+                "owner": d.owner, "base_version": base, "operator": operator,
+                "allow_recreate": recreate, "expires_at": expires, "issued_at": Utc::now().timestamp(),
+                "checkpoint": checkpoint,
+            }),
+        );
+        let mut grant = OperatorGrant {
+            version: base + 1,
+            owner: d.owner,
+            signed_message_b64: proof.signed_message_b64,
+            signature: proof.wallet_signature,
+            checkpoint_acceptance: None,
+        };
+        if operator.is_some() && checkpoint.is_some() {
+            grant.checkpoint_acceptance = Some(
+                attestor_shared::auth::operator::checkpoint_acceptance_digest(&grant).unwrap(),
+            );
+        }
+        t.deployments
+            .compare_and_swap_operator(dummy_seal(), base, grant)
+            .await
+            .unwrap()
+            .unwrap()
+            .version
+    }
+
+    async fn operator_fixture() -> (TestCtx, Address, Address) {
+        let mut t = make_test_ctx();
+        let owner = sign_operator_json(OP_OWNER_KEY, serde_json::json!({})).wallet_address;
+        let operator = sign_operator_json(OP_KEY, serde_json::json!({})).wallet_address;
+        let chain = Arc::new(attestor_shared::mocks::MockChain::new());
+        chain.set_owner_of(owner);
+        t.ctx.chain = chain;
+        seed_deployment(
+            &t.deployments,
+            dummy_seal(),
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(42)),
+            None,
+        );
+        {
+            let mut rows = t.deployments.by_seal.lock().unwrap();
+            let d = rows.get_mut(&dummy_seal()).unwrap();
+            d.owner = owner;
+            d.framework = Some("openclaw".into());
+        }
+        *t.sandbox.create_container_pubkey.lock().unwrap() = Some(
+            hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap(),
+        );
+        install_operator(&t, 0, Some(operator), false, 0).await;
+        (t, owner, operator)
+    }
+
+    fn operator_envelope(
+        t: &TestCtx,
+        action: &str,
+        resource: &str,
+        version: i64,
+    ) -> SandboxEnvelope {
+        sign_operator_json(
+            OP_KEY,
+            serde_json::json!({
+                "action": action,
+                "agentic_id": {"chain_id": t.ctx.cfg.chain_id, "contract": t.ctx.cfg.agentic_id_addr,
+                    "seal_id": dummy_seal(), "operator_version": version},
+                "expires_at": Utc::now().timestamp()+180,
+                "nonce": "worker-operator-test",
+                "payload": if action == "create" { serde_json::json!({"snapshot": t.ctx.cfg.sandbox_snapshot, "sealed": true}) } else { serde_json::json!({}) },
+                "provider": Address::repeat_byte(9), "resource_id": resource,
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn operator_create_completion_survives_request_expiry_but_not_revocation() {
+        let (t, owner, operator) = operator_fixture().await;
+        let seal = dummy_seal();
+        let mut canonical = attestor_shared::sandbox::verify_envelope(
+            &operator_envelope(&t, "create", "", 1),
+            t.ctx.crypto.as_ref(),
+        )
+        .unwrap();
+        canonical.expires_at = Utc::now().timestamp() + 2;
+        let envelope = sign_operator_json(OP_KEY, serde_json::to_value(canonical).unwrap());
+        let principal = authorize_job(&t.ctx, seal, &envelope, LifecyclePermission::Provision)
+            .await
+            .unwrap();
+        assert_eq!(principal.owner, owner);
+        assert_eq!(principal.actor, operator);
+        let generation = prepare_runtime_boot(&t.ctx, seal, Some([7; 32]), principal)
+            .await
+            .unwrap()
+            .unwrap();
+        let response = t.ctx.sandbox.create(seal, &envelope, None).await.unwrap();
+        // The provider has accepted the request; only its response/persistence
+        // is delayed beyond the signed envelope's validity window.
+        tokio::time::sleep(std::time::Duration::from_millis(2050)).await;
+        assert!(
+            authorize_job(&t.ctx, seal, &envelope, LifecyclePermission::Provision)
+                .await
+                .is_err(),
+            "an expired request cannot start new work"
+        );
+        bind_created_runtime(&t.ctx, seal, principal, &response, generation, None)
+            .await
+            .expect("accepted create may finish after its request expires");
+        assert_eq!(
+            t.deployments
+                .get(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .sandbox_id
+                .as_deref(),
+            Some(response.id.as_str())
+        );
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+
+        // Request expiry is different from losing the delegation: revocation
+        // must still prevent this same paid response from renewing authority.
+        install_operator(&t, 1, None, false, 0).await;
+        assert!(
+            bind_created_runtime(&t.ctx, seal, principal, &response, generation, None)
+                .await
+                .is_err()
+        );
+        assert!(t
+            .deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .sandbox_id
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn operator_grant_expiring_during_create_retires_the_unbound_sandbox() {
+        let (t, _, operator) = operator_fixture().await;
+        let seal = dummy_seal();
+        install_operator(&t, 1, Some(operator), false, Utc::now().timestamp() + 2).await;
+        t.sandbox.create_delay_ms.store(2050, Ordering::SeqCst);
+        let error = run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: seal,
+                sandbox_envelope: operator_envelope(&t, "create", "", 2),
+            },
+        )
+        .await
+        .expect_err("the owner grant expires while create is in flight");
+        assert!(
+            error.to_string().contains("persist new sandbox ID"),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("expired"), "{error:#}");
+        assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 1);
+        let deployment = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(deployment.sandbox_id.is_none());
+        assert!(matches!(
+            deployment.container_stage,
+            StageStatus::Failed { .. }
+        ));
+        assert!(
+            !t.deployments
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+    }
+
+    struct UnavailableCreateJournal;
+    #[async_trait::async_trait]
+    impl RuntimeCreateRepo for UnavailableCreateJournal {
+        async fn record(&self, _: &PendingRuntimeCreate) -> anyhow::Result<()> {
+            anyhow::bail!("journal unavailable")
+        }
+        async fn pending(&self) -> anyhow::Result<Vec<PendingRuntimeCreate>> {
+            Ok(Vec::new())
+        }
+        async fn has_pending(&self, _: SealId, _: i64) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn mark_attempt(&self, _: &PendingRuntimeCreate) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn complete_key(&self, _: SealId, _: i64, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_create_journal_preserves_compute_and_reports_manual_recovery() {
+        let (mut t, _, _) = operator_fixture().await;
+        t.ctx.runtime_creates = Arc::new(UnavailableCreateJournal);
+        run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: dummy_seal(),
+                sandbox_envelope: operator_envelope(&t, "create", "", 1),
+            },
+        )
+        .await
+        .expect_err("an unpersisted result requires attestor admin recovery");
+        assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            t.deployments
+                .get(dummy_seal())
+                .await
+                .unwrap()
+                .unwrap()
+                .container_stage,
+            StageStatus::Submitted { .. }
+        ));
+        assert!(t.events.events.lock().unwrap().iter().any(|event|
+            matches!(event, WsEvent::ContainerWarning { reason, .. } if reason.contains("attestor admin intervention"))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_create_binding_write_is_retried_without_another_paid_create() {
+        let (t, _, _) = operator_fixture().await;
+        t.deployments
+            .fail_set_sandbox_id
+            .store(true, Ordering::SeqCst);
+        let repo = t.deployments.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            repo.fail_set_sandbox_id.store(false, Ordering::SeqCst);
+        });
+        run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: dummy_seal(),
+                sandbox_envelope: operator_envelope(&t, "create", "", 1),
+            },
+        )
+        .await
+        .expect("transient persistence failure is retried on the same response");
+        assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+        assert!(t
+            .deployments
+            .get(dummy_seal())
+            .await
+            .unwrap()
+            .unwrap()
+            .sandbox_id
+            .is_some());
+        assert!(t.ctx.runtime_creates.pending().await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_create_verification_is_durable_and_recovery_never_recreates() {
+        for revoke in [false, true] {
+            let (mut t, owner, _) = operator_fixture().await;
+            let chain = Arc::new(attestor_shared::mocks::MockChain::new());
+            chain.set_owner_of(owner);
+            t.ctx.chain = chain.clone();
+            t.sandbox.create_delay_ms.store(100, Ordering::SeqCst);
+            let outage = chain.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                outage.set_checkpoint_canonical_failure(true);
+            });
+            let error = run(
+                &t.ctx,
+                JobPayload::SandboxRecreate {
+                    seal_id: dummy_seal(),
+                    sandbox_envelope: operator_envelope(&t, "create", "", 1),
+                },
+            )
+            .await
+            .expect_err("exhausted availability retries defer the accepted result");
+            assert!(format!("{error:#}").contains("awaiting recovery"));
+            assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(t.ctx.runtime_creates.pending().await.unwrap().len(), 1);
+            assert!(matches!(
+                t.deployments
+                    .get(dummy_seal())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .container_stage,
+                StageStatus::Submitted { .. }
+            ));
+            chain.set_checkpoint_canonical_failure(false);
+            if revoke {
+                install_operator(&t, 1, None, false, 0).await;
+                assert_eq!(recover_created_runtimes(&t.ctx).await.unwrap(), 0);
+                assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 1);
+                assert!(t
+                    .deployments
+                    .get(dummy_seal())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .sandbox_id
+                    .is_none());
+            } else {
+                // A retry cannot pay for a second create while the first
+                // accepted response is still waiting for authority verification.
+                run(
+                    &t.ctx,
+                    JobPayload::SandboxRecreate {
+                        seal_id: dummy_seal(),
+                        sandbox_envelope: operator_envelope(&t, "create", "", 1),
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(recover_created_runtimes(&t.ctx).await.unwrap(), 1);
+                assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+                assert!(t
+                    .deployments
+                    .get(dummy_seal())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .sandbox_id
+                    .is_some());
+            }
+            assert!(t.ctx.runtime_creates.pending().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_result_acknowledgement_cannot_delete_a_later_stopped_binding() {
+        let (t, owner, operator) = operator_fixture().await;
+        run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: dummy_seal(),
+                sandbox_envelope: operator_envelope(&t, "create", "", 1),
+            },
+        )
+        .await
+        .unwrap();
+        let boot = t
+            .deployments
+            .boot_authorization(dummy_seal())
+            .await
+            .unwrap()
+            .unwrap();
+        let result = PendingRuntimeCreate {
+            seal_id: dummy_seal(),
+            generation: boot.generation,
+            sandbox_id: boot.sandbox_id.clone().unwrap(),
+            container_pubkey: boot.container_pubkey,
+            owner,
+            actor: operator,
+            operator_version: Some(1),
+            old_sandbox_id: None,
+        };
+        t.ctx.runtime_creates.record(&result).await.unwrap();
+        run(
+            &t.ctx,
+            JobPayload::SandboxStop {
+                seal_id: dummy_seal(),
+                sandbox_envelope: operator_envelope(&t, "stop", &result.sandbox_id, 1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(recover_created_runtimes(&t.ctx).await.unwrap(), 1);
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            t.deployments
+                .get(dummy_seal())
+                .await
+                .unwrap()
+                .unwrap()
+                .container_stage,
+            StageStatus::Stopped { .. }
+        ));
+        assert!(t.ctx.runtime_creates.pending().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn operator_funded_provision_stop_resume_preserves_nft_owner() {
+        let (t, owner, operator) = operator_fixture().await;
+        run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: dummy_seal(),
+                sandbox_envelope: operator_envelope(&t, "create", "", 1),
+            },
+        )
+        .await
+        .unwrap();
+        let d = t.deployments.get(dummy_seal()).await.unwrap().unwrap();
+        assert_eq!(d.owner, owner);
+        let id = d.sandbox_id.clone().unwrap();
+        let first = t
+            .deployments
+            .boot_authorization(dummy_seal())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.owner, Some(owner));
+        assert_eq!(first.operator, Some(operator));
+        assert_eq!(first.operator_version, Some(1));
+        attestor_shared::auth::operator::validate_boot_operator(
+            t.ctx.chain.as_ref(),
+            t.ctx.crypto.as_ref(),
+            t.deployments.as_ref(),
+            t.ctx.cfg.chain_id,
+            t.ctx.cfg.agentic_id_addr,
+            &d,
+            &first,
+        )
+        .await
+        .unwrap();
+        run(
+            &t.ctx,
+            JobPayload::SandboxStop {
+                seal_id: dummy_seal(),
+                sandbox_envelope: operator_envelope(&t, "stop", &id, 1),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            t.deployments
+                .get(dummy_seal())
+                .await
+                .unwrap()
+                .unwrap()
+                .container_stage,
+            StageStatus::Stopped { .. }
+        ));
+        run(
+            &t.ctx,
+            JobPayload::SandboxStart {
+                seal_id: dummy_seal(),
+                sandbox_envelope: operator_envelope(&t, "start", &id, 1),
+            },
+        )
+        .await
+        .unwrap();
+        let resumed = t
+            .deployments
+            .boot_authorization(dummy_seal())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.owner, Some(owner));
+        assert_eq!(resumed.operator, Some(operator));
+        assert!(resumed.generation > first.generation);
+        assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(t.sandbox.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_old_queued_create_stays_revoked_after_same_wallet_regrant() {
+        let (t, _, operator) = operator_fixture().await;
+        let queued = operator_envelope(&t, "create", "", 1);
+        install_operator(&t, 1, None, false, 0).await;
+        install_operator(&t, 2, Some(operator), false, 0).await;
+        let err = run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: dummy_seal(),
+                sandbox_envelope: queued,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("version mismatch"), "{err:#}");
+        assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn operator_cross_agent_scope_and_recreate_permission_are_enforced() {
+        let (t, _, _) = operator_fixture().await;
+        let envelope = operator_envelope(&t, "create", "", 1);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&B64.decode(&envelope.signed_message_b64).unwrap()).unwrap();
+        value["agentic_id"]["seal_id"] = serde_json::json!(B256::repeat_byte(5));
+        let err = run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: dummy_seal(),
+                sandbox_envelope: sign_operator_json(OP_KEY, value),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("agent or authorization version mismatch"));
+        run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: dummy_seal(),
+                sandbox_envelope: envelope.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let err = run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: dummy_seal(),
+                sandbox_envelope: envelope,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not authorized to recreate"));
+        assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_revocation_fences_provision_and_cleanup_retries_without_harming_replacement()
+    {
+        let (t, _, operator) = operator_fixture().await;
+        run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: dummy_seal(),
+                sandbox_envelope: operator_envelope(&t, "create", "", 1),
+            },
+        )
+        .await
+        .unwrap();
+        let prior = t
+            .deployments
+            .boot_authorization(dummy_seal())
+            .await
+            .unwrap()
+            .unwrap();
+        let old_id = t
+            .deployments
+            .get(dummy_seal())
+            .await
+            .unwrap()
+            .unwrap()
+            .sandbox_id
+            .unwrap();
+        install_operator(&t, 1, None, false, 0).await;
+        let retired = t.deployments.get(dummy_seal()).await.unwrap().unwrap();
+        assert!(retired.sandbox_id.is_none());
+        assert!(attestor_shared::auth::operator::validate_boot_operator(
+            t.ctx.chain.as_ref(),
+            t.ctx.crypto.as_ref(),
+            t.deployments.as_ref(),
+            t.ctx.cfg.chain_id,
+            t.ctx.cfg.agentic_id_addr,
+            &retired,
+            &prior
+        )
+        .await
+        .is_err());
+        t.sandbox.admin_delete_fails.store(true, Ordering::SeqCst);
+        assert_eq!(reap_operator_teardowns(&t.ctx).await.unwrap(), 0);
+        assert_eq!(
+            t.deployments
+                .pending_operator_teardowns()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        install_operator(&t, 2, Some(operator), false, 0).await;
+        *t.sandbox.create_id.lock().unwrap() = "replacement-sandbox".into();
+        run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: dummy_seal(),
+                sandbox_envelope: operator_envelope(&t, "create", "", 3),
+            },
+        )
+        .await
+        .unwrap();
+        t.sandbox.admin_delete_fails.store(false, Ordering::SeqCst);
+        assert_eq!(reap_operator_teardowns(&t.ctx).await.unwrap(), 1);
+        assert_eq!(
+            t.sandbox.last_admin_delete_id.lock().unwrap().as_deref(),
+            Some(old_id.as_str())
+        );
+        assert_eq!(
+            t.deployments
+                .get(dummy_seal())
+                .await
+                .unwrap()
+                .unwrap()
+                .sandbox_id
+                .as_deref(),
+            Some("replacement-sandbox")
+        );
+        assert!(t
+            .deployments
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     fn dummy_envelope(action: &str) -> SandboxEnvelope {
@@ -5371,6 +6589,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_stop_records_completion_for_disabled_and_legacy_boots() {
+        for legacy in [false, true] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_confirmed_deployment(&t, seal, 105, "sb-old-boot").await;
+            if legacy {
+                t.deployments
+                    .boot_authorizations
+                    .lock()
+                    .unwrap()
+                    .remove(&seal);
+                t.deployments
+                    .status_bindings
+                    .lock()
+                    .unwrap()
+                    .insert(seal, [9; 32]);
+            } else {
+                t.deployments
+                    .set_container_stage(
+                        seal,
+                        StageStatus::Failed {
+                            at: Utc::now(),
+                            reason: "provision failed before owner stopped compute".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    !t.deployments
+                        .boot_authorization(seal)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .enabled
+                );
+            }
+            run_stop(&t, seal)
+                .await
+                .expect("the provider stopped the current sandbox");
+            assert_eq!(t.sandbox.stop_calls.load(Ordering::SeqCst), 1);
+            let deployment = t.deployments.get(seal).await.unwrap().unwrap();
+            assert!(
+                matches!(deployment.container_stage,
+                StageStatus::Stopped { ref reason, .. } if reason == "user_stop"),
+                "legacy={legacy}: {:?}",
+                deployment.container_stage
+            );
+            assert!(t.events.events.lock().unwrap().iter().any(|event|
+                matches!(event, WsEvent::ContainerStopped { seal_id, .. } if *seal_id == seal)));
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_stop_fatal_refusal_records_failure_for_disabled_and_legacy_boots() {
+        for legacy in [false, true] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_confirmed_deployment(&t, seal, 105, "sb-old-boot").await;
+            if legacy {
+                t.deployments
+                    .boot_authorizations
+                    .lock()
+                    .unwrap()
+                    .remove(&seal);
+                t.deployments
+                    .status_bindings
+                    .lock()
+                    .unwrap()
+                    .insert(seal, [9; 32]);
+            } else {
+                t.deployments
+                    .set_container_stage(
+                        seal,
+                        StageStatus::Failed {
+                            at: Utc::now(),
+                            reason: "old boot could not provision".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            t.sandbox.stop_fails.store(true, Ordering::SeqCst);
+            *t.sandbox.fail_status.lock().unwrap() = Some(400);
+            *t.sandbox.fail_msg.lock().unwrap() = Some("permanent provider refusal".into());
+            set_provider_state(&t, Some("started"), Some("started"));
+            run_stop(&t, seal)
+                .await
+                .expect_err("fatal provider refusal remains a failed job");
+            let deployment = t.deployments.get(seal).await.unwrap().unwrap();
+            assert!(
+                matches!(deployment.container_stage,
+                StageStatus::Failed { ref reason, .. } if reason.contains("permanent provider refusal")),
+                "legacy={legacy}: {:?}",
+                deployment.container_stage
+            );
+            assert!(emitted_container_failed(&t));
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_stop_records_outcomes_without_a_boot_despite_grant_history() {
+        for fatal in [false, true] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_confirmed_deployment(&t, seal, 105, "sb-owner-legacy").await;
+            t.deployments
+                .boot_authorizations
+                .lock()
+                .unwrap()
+                .remove(&seal);
+            t.deployments.status_bindings.lock().unwrap().remove(&seal);
+            t.deployments.operator_grants.lock().unwrap().insert(
+                seal,
+                attestor_shared::auth::operator::OperatorGrant {
+                    version: 1,
+                    owner: Address::ZERO,
+                    signed_message_b64: String::new(),
+                    signature: Bytes::new(),
+                    checkpoint_acceptance: None,
+                },
+            );
+            if fatal {
+                t.sandbox.stop_fails.store(true, Ordering::SeqCst);
+                *t.sandbox.fail_status.lock().unwrap() = Some(400);
+                *t.sandbox.fail_msg.lock().unwrap() = Some("permanent provider refusal".into());
+                set_provider_state(&t, Some("started"), Some("started"));
+            }
+            let outcome = run_stop(&t, seal).await;
+            assert_eq!(outcome.is_err(), fatal);
+            let deployment = t.deployments.get(seal).await.unwrap().unwrap();
+            if fatal {
+                assert!(matches!(
+                    deployment.container_stage,
+                    StageStatus::Failed { .. }
+                ));
+                assert!(emitted_container_failed(&t));
+            } else {
+                assert!(matches!(
+                    deployment.container_stage,
+                    StageStatus::Stopped { .. }
+                ));
+                assert!(t.events.events.lock().unwrap().iter().any(|event|
+                    matches!(event, WsEvent::ContainerStopped { seal_id, .. } if *seal_id == seal)));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sandbox_stop_proceeds_when_confirmed() {
         // Confirmed (running) → legitimate stop request.
         let t = make_test_ctx();
@@ -6421,6 +7787,15 @@ mod tests {
             None,
             None,
         );
+        // This is a pre-mint owner create: the authenticated signer must be
+        // the deployment's recorded owner during the completion recheck too.
+        t.deployments
+            .by_seal
+            .lock()
+            .unwrap()
+            .get_mut(&seal)
+            .unwrap()
+            .owner = dummy_envelope("create").wallet_address;
         run_container_track(&t.ctx, seal, &dummy_envelope("create"))
             .await
             .expect("ok");
@@ -6432,12 +7807,6 @@ mod tests {
         assert!(
             (240..=360).contains(&elapsed),
             "deadline ~5min in future (got {elapsed}s)"
-        );
-        assert_eq!(
-            t.deployments
-                .set_provision_deadline_calls
-                .load(Ordering::SeqCst),
-            1
         );
     }
     #[tokio::test]
@@ -6505,7 +7874,7 @@ mod tests {
         assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]
-    async fn create_or_persistence_failure_revokes_the_new_ticket() {
+    async fn create_failure_retires_ticket_but_persistence_outage_preserves_the_paid_result() {
         for fail_create in [true, false] {
             let t = make_test_ctx();
             let seal = dummy_seal();
@@ -6533,32 +7902,48 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(!auth.enabled);
+            assert_eq!(auth.enabled, !fail_create);
             assert!(!t
                 .deployments
                 .status_bindings
                 .lock()
                 .unwrap()
                 .contains_key(&seal));
-            assert!(matches!(
-                t.deployments
-                    .get(seal)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .container_stage,
-                StageStatus::Failed { .. }
-            ));
+            let stage = t
+                .deployments
+                .get(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .container_stage;
+            if fail_create {
+                assert!(matches!(stage, StageStatus::Failed { .. }));
+                assert!(t.ctx.runtime_creates.pending().await.unwrap().is_empty());
+            } else {
+                assert!(matches!(stage, StageStatus::Submitted { .. }));
+                assert_eq!(t.ctx.runtime_creates.pending().await.unwrap().len(), 1);
+            }
             let tickets = t.sandbox.boot_tickets.lock().unwrap();
             assert_eq!(tickets.len(), 1);
             assert_eq!(
                 auth.ticket_hash,
                 attestor_shared::auth::status::binding_hash(&tickets[0])
             );
-            assert_eq!(
-                t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
-                if fail_create { 0 } else { 1 }
-            );
+            drop(tickets);
+            assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+            if !fail_create {
+                t.deployments
+                    .fail_set_sandbox_id
+                    .store(false, Ordering::SeqCst);
+                assert_eq!(recover_created_runtimes(&t.ctx).await.unwrap(), 1);
+                assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(reap_operator_teardowns(&t.ctx).await.unwrap(), 1);
+                assert_eq!(
+                    t.sandbox.last_admin_delete_id.lock().unwrap().as_deref(),
+                    Some("old-sandbox")
+                );
+                assert!(t.ctx.runtime_creates.pending().await.unwrap().is_empty());
+            }
         }
     }
     #[tokio::test]

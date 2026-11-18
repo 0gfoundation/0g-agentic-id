@@ -90,6 +90,10 @@ pub trait CredentialRepo: Send + Sync {
     async fn clear(&self, seal_id: SealId) -> anyhow::Result<()>;
     async fn epoch(&self, seal_id: SealId) -> anyhow::Result<i64>;
     async fn set_epoch(&self, seal_id: SealId, epoch: i64) -> anyhow::Result<()>;
+    /// Atomically advance the ownership epoch and discard the previous
+    /// owner's set, writebacks, pending count and reminders. Replayed or older
+    /// events do nothing, preserving data stored under the current epoch.
+    async fn advance_ownership_epoch(&self, seal_id: SealId, epoch: i64) -> anyhow::Result<bool>;
     /// The boot id of the container currently bound to this seal.
     async fn current_boot_id(&self, seal_id: SealId) -> anyhow::Result<Option<B256>>;
 }
@@ -364,6 +368,37 @@ impl CredentialRepo for PostgresCredentialRepo {
         Ok(())
     }
 
+    async fn advance_ownership_epoch(&self, seal_id: SealId, epoch: i64) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        // The conditional upsert serializes simultaneous transfer events for
+        // this seal. An absent epoch is equivalent to zero, as in epoch().
+        let advanced: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO credential_epochs (seal_id, epoch)
+             SELECT $1, $2::BIGINT WHERE $2::BIGINT > 0
+             ON CONFLICT (seal_id) DO UPDATE SET epoch = EXCLUDED.epoch
+               WHERE credential_epochs.epoch < EXCLUDED.epoch
+             RETURNING epoch",
+        )
+        .bind(seal_id.as_slice())
+        .bind(epoch)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if advanced.is_some() {
+            for table in [
+                "credential_sets",
+                "credential_pending",
+                "credential_reminders",
+            ] {
+                sqlx::query(&format!("DELETE FROM {table} WHERE seal_id = $1"))
+                    .bind(seal_id.as_slice())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(advanced.is_some())
+    }
+
     async fn current_boot_id(&self, seal_id: SealId) -> anyhow::Result<Option<B256>> {
         let v: Option<Option<Vec<u8>>> = sqlx::query_scalar(
             "SELECT boot_id FROM container_status_bindings WHERE seal_id = $1 AND enabled = TRUE",
@@ -566,6 +601,18 @@ impl CredentialRepo for InMemoryCredentialRepo {
         Ok(())
     }
 
+    async fn advance_ownership_epoch(&self, seal_id: SealId, epoch: i64) -> anyhow::Result<bool> {
+        let mut state = self.inner.lock().unwrap();
+        if epoch <= state.epochs.get(&seal_id).copied().unwrap_or(0) {
+            return Ok(false);
+        }
+        state.epochs.insert(seal_id, epoch);
+        state.sets.remove(&seal_id);
+        state.pending.remove(&seal_id);
+        state.reminders.retain(|reminder| reminder.0 != seal_id);
+        Ok(true)
+    }
+
     async fn current_boot_id(&self, seal_id: SealId) -> anyhow::Result<Option<B256>> {
         Ok(self.inner.lock().unwrap().boots.get(&seal_id).copied())
     }
@@ -597,6 +644,84 @@ mod tests {
             if url.contains('?') { '&' } else { '?' },
             hex::encode(rand::random::<[u8; 8]>())
         )
+    }
+
+    async fn exercise_idempotent_ownership_advance(repo: &dyn CredentialRepo) {
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        let owner = Address::from(rand::random::<[u8; 20]>());
+        let expires_at = 1_900_000_000;
+        assert_eq!(repo.epoch(seal).await.unwrap(), 0);
+        assert!(!repo.advance_ownership_epoch(seal, 0).await.unwrap());
+        repo.put(
+            seal,
+            owner,
+            0,
+            0,
+            json!({"old":true}),
+            json!({"rt":{"c":"old"}}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        repo.set_pending(seal, 1).await.unwrap();
+        assert!(repo
+            .claim_reminder(seal, "rt", 1, expires_at)
+            .await
+            .unwrap());
+
+        assert!(repo.advance_ownership_epoch(seal, 100).await.unwrap());
+        assert_eq!(repo.epoch(seal).await.unwrap(), 100);
+        assert!(repo.get(seal).await.unwrap().is_none());
+        assert!(repo.pending_counts(&[seal]).await.unwrap().is_empty());
+        assert!(repo
+            .claim_reminder(seal, "rt", 1, expires_at)
+            .await
+            .unwrap());
+
+        repo.put(seal, owner, 100, 0, json!({"current":true}), json!({}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(repo
+            .put_writeback(seal, "rt", 1, json!({"c":"current"}))
+            .await
+            .unwrap());
+        repo.set_pending(seal, 2).await.unwrap();
+        assert_eq!(repo.claim_notification(seal, 0).await.unwrap(), Some(2));
+        let current = repo.get(seal).await.unwrap();
+        let pending = repo.pending_counts(&[seal]).await.unwrap();
+        for epoch in [100, 50] {
+            assert!(!repo.advance_ownership_epoch(seal, epoch).await.unwrap());
+            assert_eq!(repo.epoch(seal).await.unwrap(), 100);
+            assert_eq!(repo.get(seal).await.unwrap(), current);
+            assert_eq!(repo.pending_counts(&[seal]).await.unwrap(), pending);
+            assert_eq!(repo.claim_notification(seal, 3600).await.unwrap(), None);
+            assert!(!repo
+                .claim_reminder(seal, "rt", 1, expires_at)
+                .await
+                .unwrap());
+        }
+
+        assert!(repo.advance_ownership_epoch(seal, 101).await.unwrap());
+        assert_eq!(repo.epoch(seal).await.unwrap(), 101);
+        assert!(repo.get(seal).await.unwrap().is_none());
+        assert!(repo.pending_counts(&[seal]).await.unwrap().is_empty());
+        assert!(repo
+            .claim_reminder(seal, "rt", 1, expires_at)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn ownership_epoch_replay_preserves_current_credentials_and_notifications() {
+        exercise_idempotent_ownership_advance(&InMemoryCredentialRepo::default()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_ownership_epoch_replay_preserves_current_credentials_and_notifications() {
+        let repo = PostgresCredentialRepo::new(connect(&test_database_url()).await.unwrap());
+        exercise_idempotent_ownership_advance(repo.as_ref()).await;
     }
 
     // Every statement of the Postgres repository against a real database:

@@ -45,7 +45,7 @@ pub fn settings_digest(document: &[u8]) -> B256 {
     B256::from(<[u8; 32]>::from(Sha256::digest(document)))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootAuthorization {
     pub generation: i64,
     pub ticket_hash: [u8; 32],
@@ -60,6 +60,10 @@ pub struct BootAuthorization {
     /// attestor's create under the current ticket. None until that sandbox
     /// is persisted, or when the response carried no certificate.
     pub container_pubkey: Option<Vec<u8>>,
+    /// Delegation does not change the NFT owner above: the sandbox payer
+    /// and the exact owner-signed authorization revision are separate.
+    pub operator: Option<Address>,
+    pub operator_version: Option<i64>,
 }
 
 /// Why a resume (`/start` with `start`) is refused: the deployment's sandbox

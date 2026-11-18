@@ -120,10 +120,10 @@ await ag.agent.balanceOf(owner);            // → 5n      agents owned by `owne
 // agent-seal gas — the agent's own on-chain-write budget
 await ag.agent.topUpAgentSeal(await ag.agent.getAgentSeal(agentId), parseEther('0.01'));   // → "0x…"
 
-// runtime lifecycle (owner-signed; on-chain identity preserved)
+// runtime lifecycle (owner or appointed operator; on-chain identity preserved)
 await ag.agent.stop(sealId, sandboxId);
 await ag.agent.start(sealId, sandboxId);      // resume a STOPPED container
-await ag.agent.start(sealId, { apiKey });     // FIRST provision of a mint-only agent
+await ag.agent.start(sealId, { apiKey });     // owner: resume current sandbox, or first provision if no mapping
 await ag.agent.reset(sealId, { framework, apiKey });   // recreate an EXISTING container
 // start/reset of an agent with no settings document that is a clone or has
 // provisioned before first store the default model (0g-compute) as its settings
@@ -154,6 +154,13 @@ await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3
 Every write is a **compare-and-swap** on `baseVersion` — the version you read before editing (0 = "no document yet"). If the stored version has moved on, the write is refused with `SettingsConflictError`, which carries the document that is actually there. Re-read, re-apply, write again; do not loop on it, or the other writer's change is the one that disappears.
 
 The [lifecycle guide](./GUIDE.md#agagent--lifecycle--reads) covers async phases, transfer teardown, mint-only vs first-provision, `apiKey` handling, and failure reasons.
+
+For operator-funded hosting, the owner mints without a sandbox, configures its
+settings and credentials, then calls `agent.setOperator(sealId, operatorAddress)`.
+The operator funds its own sandbox balance and calls `agent.start(sealId)` /
+`agent.stop(sealId)` without model-key options. Every grant update retires the
+current runtime; provision again after a change. See [runtime operators](./OPERATORS.md)
+([中文](./OPERATORS.zh.md)).
 
 A model key given to `deploy` / `start` / `reset` / `retry` is stored in the agent's credential set. While older images are in use it also rides the request: `start` / `reset` / `retry` seal it to the agent (`SEAL_SECRET_ENV`) when the attestor advertises `secret_env_scheme`, so the owner's wallet prompt never shows it. A one-shot `deploy` with `sandbox` still signs it in clear; to avoid that, deploy without `sandbox`, then `start(sealId, { apiKey })`. When your server supplies the key and a user signs, seal it on the server with `credentials.sealModelKey(sealId, { owner, provider, apiKey })` and have the browser store the result with `credentials.setModelKey` (or pass it to `start` / `reset` / `retry` as `sealedModelKey`), so the key never reaches the browser. See the [guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes) for `secretEnv: 'sealed' | 'plaintext'` and `SecretEnvRefusedError`.
 
