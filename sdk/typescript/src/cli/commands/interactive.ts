@@ -498,13 +498,16 @@ export function shortSessionId(id: string): string {
  * when it was last active, and its title (the harness names a session after
  * its first message), `*` on the one chat goes to.
  */
-export function renderSessionList(list: readonly AgentSession[], current: string, nowMs: number): string[] {
+export function renderSessionList(list: readonly AgentSession[], current: string, nowMs: number, width = Infinity): string[] {
   const rows = orderSessions(list);
   const lines = [`    #  ${'SESSION'.padEnd(15)}${'STATE'.padEnd(9)}${'ACTIVE'.padEnd(13)}TITLE`];
   rows.forEach((x, i) => {
     // updated_at is in seconds on the wire; accept milliseconds too.
     const at = x.updated_at > 1e12 ? x.updated_at : x.updated_at * 1000;
-    lines.push(`  ${x.id === current ? '*' : ' '} ${String(i + 1).padStart(2)}  ${cleanCell(shortSessionId(x.id)).padEnd(15)}${cleanCell(x.state).padEnd(9)}${(x.updated_at ? agoText(at, nowMs) : '-').padEnd(13)}${sessionTitle(x)}`);
+    const head = `  ${x.id === current ? '*' : ' '} ${String(i + 1).padStart(2)}  ${cleanCell(shortSessionId(x.id)).padEnd(15)}${cleanCell(x.state).padEnd(9)}${(x.updated_at ? agoText(at, nowMs) : '-').padEnd(13)}`;
+    // A long title goes on under the TITLE column.
+    const title = Number.isFinite(width) && width - head.length >= 12 ? wrapProse(sessionTitle(x), width - head.length) : [sessionTitle(x)];
+    title.forEach((t, j) => lines.push(`${j ? ' '.repeat(head.length) : head}${t}`));
   });
   return lines;
 }
@@ -924,7 +927,7 @@ export function printAbovePrompt(
 }
 import type { CommandContext } from '../types';
 import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
-import { CONT_PROMPT, LiveTurn, PlainTurn, fitRow, liveKeys, wrapText, wrapWords, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
+import { CONT_PROMPT, LiveTurn, PlainTurn, fitRow, liveKeys, wrapProse, wrapText, wrapWords, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
 import { INK_PROMPT, MIN_COLS, MIN_ROWS, inkLoadError, loadInk, openInkScreen, type InkScreen, type Key as InkKey } from '../inkView';
 import { OUTBOX_POLL_MS, makeOutboxSync, renderOutboxEvent, supportsHyperlinks, tildePath, type OutboxSync } from '../outboxSync';
 
@@ -1506,6 +1509,11 @@ const term = (s: string): void => {
  * nothing of that may restyle, hide or rewrite what the owner reads.
  */
 const out = (s: string): void => term(termWrap(cleanStream(s)));
+
+/** The width the shell wraps to on a terminal (its own less one); unbounded otherwise. */
+function termWidth(): number {
+  return process.stdout.isTTY ? Math.max(20, (process.stdout.columns || 80) - 1) : Infinity;
+}
 
 /** On a terminal, text broken between words at its width (wrapProse); as it
  *  is when the output is piped or captured. */
@@ -4931,7 +4939,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const list = await s.client.sessions();
           sessionsSeen = list;
           sessionsShown = shownSessions(list);
-          for (const l of renderSessionList(list, s.sessionId ?? 'owner-chat', Date.now())) out(`${l}\n`);
+          for (const l of renderSessionList(list, s.sessionId ?? 'owner-chat', Date.now(), termWidth())) out(`${l}\n`);
           out('/sessions switch <#|id|title> · new [title] · fork [id] · default\n');
           continue;
         }
@@ -4954,7 +4962,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (!hit && picked.number !== undefined && !sessionsShown) {
             // No list shown in this CLI yet: show it, and ask about that number in it.
             sessionsShown = shownSessions(list);
-            for (const l of renderSessionList(list, s.sessionId ?? 'owner-chat', Date.now())) out(`${l}\n`);
+            for (const l of renderSessionList(list, s.sessionId ?? 'owner-chat', Date.now(), termWidth())) out(`${l}\n`);
             const row = sessionsShown[picked.number - 1];
             if (!row) { out(`there is no #${picked.number} — /sessions switch <#> with a number above\n`); continue; }
             const yes = await askYesNo(ask, `switch to #${picked.number}, ${row.title}? [Y/n] `, true);
