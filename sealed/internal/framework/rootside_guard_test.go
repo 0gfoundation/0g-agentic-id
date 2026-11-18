@@ -100,7 +100,7 @@ var allowedDirectCalls = map[string]struct {
 	"internal/servicehost/runtime.go diskUsage unix.Open":                           {1, "opens O_DIRECTORY|O_NOFOLLOW a service identity's private work or temporary directory, whose path sealed made, only to list it"},
 	"internal/servicehost/runtime.go addBlocks unix.Fstatat":                        {1, "stats entries of that tree relative to an open directory without following links, to sum allocated blocks; nothing is read"},
 	"internal/servicehost/runtime.go addBlocks unix.Openat":                         {1, "opens O_DIRECTORY|O_NOFOLLOW a subdirectory relative to its open parent, so a swapped link cannot steer the walk outside the identity's tree"},
-	"internal/servicehost/runtime.go ReadFreeSpace unix.Statfs":                     {1, "reads the free space of the filesystem holding sealed's own task directories, or the agent's home (sealed's disk warning); nothing is opened, and a link there could only change a figure"},
+	"internal/servicehost/runtime.go diskLow unix.Statfs":                           {1, "reads the free space of the filesystem holding sealed's own task directories; nothing is opened"},
 	"internal/servicesandbox/confine_linux.go ABI unix.Syscall":                     {1, "queries the kernel's Landlock ABI; no path"},
 	"internal/servicesandbox/confine_linux.go newRuleset unix.Syscall":              {1, "creates a Landlock ruleset; no path"},
 	"internal/servicesandbox/confine_linux.go newRuleset unsafe.Pointer":            {1, "passes the ruleset attributes to the kernel"},

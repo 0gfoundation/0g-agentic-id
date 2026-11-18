@@ -199,7 +199,7 @@ func (m *Manager) admission() error {
 }
 
 // ErrDiskLow refuses a new service process while the filesystem of the task
-// directories has less than DiskReserveBytes free.
+// directories has less than diskReserveBytes free.
 var ErrDiskLow = errors.New("sandbox disk space is low; service processes are refused until space is freed")
 
 // prepareLaunch does the slow part of starting a service process (probe, free
