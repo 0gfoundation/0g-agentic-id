@@ -2032,14 +2032,14 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
 
 
       if (cmd === 'whoami') {
-        out(`attestor: ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+        out(`attestor    ${ctx.env.attestorUrl ?? '(unset — run `login`)'}\n`);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
-        out(`wallet  : ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
-        out(`provider: ${loadConfig().inferenceProvider ?? '0g-compute'} (default for deploy/login)\n`);
-        // Model keys saved on THIS machine (login), offered at deploy and
-        // reset. A running agent uses the key in its own credential set.
-        for (const provider of knownProviders) out(`key ${provider.id}: ${configuredInferenceKey(provider.id) ? 'saved on this machine' : 'none saved on this machine'}\n`);
-        out('  (an agent uses the model key in its own credential set: cred <agent>)\n');
+        out(`wallet      ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
+        // The providers the platform offers; new agents default to the first
+        // named. Model keys are each agent's own (cred <agent>), not shown here.
+        const dflt = loadConfig().inferenceProvider ?? '0g-compute';
+        const ids = knownProviders.map((p) => p.id);
+        out(`providers   ${[dflt, ...ids.filter((id) => id !== dflt)].map((id, i) => (i === 0 ? `${id} (new agents)` : id)).join(', ')}\n`);
         if (key && ctx.env.attestorUrl) {
           // The three status reads are independent — fetch them in parallel
           // (they were serial: 2.9s measured; parallel is bounded by the
@@ -2052,9 +2052,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           ]);
           if (ackRes.ok) {
             const { allAcked, missing } = ackRes.r;
-            out(`ack     : ${allAcked ? 'ok (trust root acknowledged)' : `missing ${missing.join(', ')} — run \`ack\``}\n`);
+            out(`trust root  ${allAcked ? 'acknowledged' : `missing ${missing.join(', ')} — run \`ack\``}\n`);
           } else {
-            out(`ack     : (unreadable: ${ackRes.e.message})\n`);
+            out(`trust root  (unreadable: ${ackRes.e.message})\n`);
           }
           try {
             if (!dRes.ok) throw dRes.e;
@@ -2062,12 +2062,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
             const effNote = eff && eff.availableWei < eff.balanceWei
               ? ` — AVAILABLE ${og(eff.availableWei)} (${og(eff.outstandingDebtWei + eff.pendingSettlementWei + eff.reservedWei)} owed/queued off-chain)`
               : '';
-            out(`balance : ${og(d.balance)} prepaid${d.pendingRefund > 0n ? ` (+${og(d.pendingRefund)} pending refund)` : ''}${effNote}\n`);
+            out(`balance     ${og(d.balance)} prepaid${d.pendingRefund > 0n ? ` (+${og(d.pendingRefund)} pending refund)` : ''}${effNote}\n`);
           } catch { /* serving not configured — skip the line */ }
         } else {
           // Degrade like the other lines instead of silently omitting the
           // fourth one (feedback.md F7).
-          out(`ack     : ${key ? '(needs an attestor URL — run `login`)' : '(needs a wallet — run `login`)'}\n`);
+          out(`trust root  ${key ? '(needs an attestor URL — run `login`)' : '(needs a wallet — run `login`)'}\n`);
         }
         continue;
       }

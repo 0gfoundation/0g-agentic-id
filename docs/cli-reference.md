@@ -150,7 +150,7 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 | `balance` / `deposit [og]` / `withdraw [og]` | prepaid account: balance + burn rate / fund / refund withdrawal (time-locked; bare argument claims everything) |
 | `ack` | acknowledge the TEE trust root (implicit in deploy/start/reset) |
 | `login [provider]` | guided setup: attestor URL (required; asked again while unset) → owner key (needed to manage your agents) → a model key for each provider the platform lists (optional; Enter keeps a set key or skips an unset one) → the default provider for new agents (asked when more than one has a key) → a summary of what is set. Key input echoes `*`. `login <provider>` asks that provider's key only. These keys are the ones every other step offers first (see `cred <agent> set model`) |
-| `whoami` / `help` / `quit` | — |
+| `whoami` / `help` / `quit` | `whoami`: the attestor, your wallet, the providers the platform offers (new agents default to the first), whether the trust root is acknowledged, and the prepaid balance. Model keys are each agent's own (`cred <agent>`), not listed here |
 
 ### Session level (`agent 286 ›` prompt)
 
