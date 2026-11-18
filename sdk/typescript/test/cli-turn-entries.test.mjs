@@ -5,7 +5,7 @@
 // completes as readline does.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { NO_ANSWER_MAX_TOKENS, PHASE_WATCH_MS, addFollowUp, askedFor, changeWith, filesText, renderTaskNotice, renderTaskTable, sayer, shortIds, yesNo, nextPhaseWait, phaseMovedText, emptyTurnText, failureKind, failureText, followUpNote, keptNote, readOnlyCommand, renderActivityTable, steerFollowUp, stoppedSteers, wrapCard } from '../dist/cli/commands/interactive.js';
+import { L2_HELP_FULL, NO_ANSWER_MAX_TOKENS, PHASE_WATCH_MS, addFollowUp, askedFor, changeWith, helpRows, filesText, renderTaskNotice, renderTaskTable, sayer, shortIds, yesNo, nextPhaseWait, phaseMovedText, emptyTurnText, failureKind, failureText, followUpNote, keptNote, readOnlyCommand, renderActivityTable, steerFollowUp, stoppedSteers, wrapCard } from '../dist/cli/commands/interactive.js';
 import { completeAt } from '../dist/cli/livePrompt.js';
 
 test('readOnlyCommand: the commands that only read run during a turn; the rest wait for its end', () => {
@@ -343,4 +343,37 @@ test('wrapProse: the CLI\'s own marks hang their further rows under the text', a
     assert.ok(rows.length > 1, mark);
     for (const r of rows.slice(1)) assert.match(r, /^ {2}\S/, `${mark}: ${JSON.stringify(rows)}`);
   }
+});
+
+test('/tasks at 60 columns drops AGE, RUNS and OPEN before it squeezes TITLE', () => {
+  const now = 2_000_000_000;
+  const tasks = [
+    { id: 'task-weekly-report', state: 'working', reason: null, title: 'Weekly report from the sales sheet', records: [], runs: { count: 1 }, created_at: now / 1000 - 120 },
+    { id: 'task-translate-docs', state: 'done', reason: null, title: '把 README 翻译成中文', records: [{}], runs: { count: 1 }, created_at: now / 1000 - 7200 },
+  ];
+  const rows = renderTaskTable(tasks, now, 59);
+  assert.match(rows[0], /^ {2}ID\s+STATE\s+TITLE$/);
+  for (const r of rows) assert.ok(r.length <= 59, r);
+  assert.match(rows[1], /^ {2}task-weekly-report {3}working {6}Weekly report from/);
+  assert.match(renderTaskTable(tasks, now, 100)[0], /OPEN\s+RUNS\s+AGE\s+TITLE/);
+});
+
+test('/help rows: each description joined back and wrapped once, under the description column', () => {
+  const at60 = helpRows(L2_HELP_FULL, 59);
+  for (const r of at60) assert.ok(r.length <= 59, r);
+  // A description's further rows start at column 26, never before.
+  const i = at60.findIndex((r) => r.startsWith('  /cred'));
+  assert.ok(i > 0);
+  for (let j = i + 1; j < at60.length && !/^ {2}\S/.test(at60[j]); j++) assert.match(at60[j], /^ {26}\S/, at60[j]);
+  // The rows are the description re-broken, not the 80-column rows broken again.
+  let j = i + 1;
+  while (j < at60.length && /^ {26}\S/.test(at60[j])) j++;
+  const joined = at60.slice(i, j).map((r, k) => (k ? r.trim() : r.slice(26))).join(' ');
+  assert.ok(joined.startsWith("this agent's credentials — same as `cred <id>` in the manager: bare lists, set <name> [k=v …], rm,"), joined);
+  assert.match(at60[i + 1], /^ {26}as `cred <id>` in the manager:$/);
+  // Piped: as written.
+  assert.deepEqual(helpRows(L2_HELP_FULL, Infinity), L2_HELP_FULL.split('\n'));
+  // Too narrow for the column: the description under the command.
+  const at40 = helpRows('  /files [inbox]          files the agent left for you, in its ~/outbox', 39);
+  assert.deepEqual(at40, ['  /files [inbox]', '    files the agent left for you, in', '    its ~/outbox']);
 });
