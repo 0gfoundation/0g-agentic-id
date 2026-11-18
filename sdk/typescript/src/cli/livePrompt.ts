@@ -250,7 +250,8 @@ function afterCommas(run: string, room: number): string[] {
  * A line of prose in rows of at most `cols` columns, broken between words (as
  * Claude Code does), for text that stays in the scrollback: further rows start
  * under the line's text — its indent, a list item's text after `- `, `* ` or
- * `1. ` (also right after `agent> `), a value after a label and two spaces
+ * `1. ` (also right after `agent> `) or the CLI's own marks (`⚠ `, `◆ `, `· `,
+ * `↳ `, `⏹ `, `→ `), a value after a label and two spaces
  * (`gas      1.2 OG …`, also `pending refund  : 0.2 OG …`), the text after an
  * `error:` / `fix:` / `usage:` / `hint:` / `→` the CLI's messages start with,
  * or what was typed after a prompt (`agent 625 › `).
@@ -265,7 +266,9 @@ export function wrapProse(line: string, cols: number): string[] {
   // A speaker (`agent> `) or a prompt (`agent 625 › `) first, then the indent
   // and a list marker.
   const speaker = /^(?:[\w-]+> |[^›\n]{1,40}› )/.exec(line)?.[0] ?? '';
-  const marker = /^\s*(?:(?:[-*•]|\d{1,3}[.)])\s+)?/.exec(line.slice(speaker.length))![0];
+  // List markers, and the marks the CLI's own lines start with (a warning, a
+  // notice, a tool run, a read message, a step): further rows go under the text.
+  const marker = /^\s*(?:(?:[-*•⚠◆·↳⏹→]|\d{1,3}[.)])\s+)?/.exec(line.slice(speaker.length))![0];
   const lead = speaker + marker;
   let indentW = speaker.includes('›') ? textCols(lead) : textCols(marker);
   const label = speaker ? undefined : /^\s*(?:\S+(?: \S+){0,3}? {2,}(?::\s+)?|(?:error(?: \([A-Z_]+\))?|fix|usage|hint):\s+|→\s+)(?=\S)/.exec(line)?.[0];
