@@ -4960,15 +4960,17 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   screen.interrupted = (extra: readonly string[] = []): string => {
     // A message with a dragged file comes back with the file staged and its
     // name where the path was (`[image: cat.png]`), as when it was sent.
+    const attached: string[] = [];
     const form = (text: string): string => {
       if (!s.client?.uploadFile) return text;
       const parts = findDroppedFiles(text);
       if (!parts.some((p) => typeof p !== 'string')) return text;
-      const r = stageDropped(parts, (s.attached ??= []), (one) => out(`attached ${cleanCell(one.name)} (${one.image ? 'image' : 'file'})\n`));
+      const r = stageDropped(parts, (s.attached ??= []), (one) => attached.push(cleanCell(one.name)));
       return 'refused' in r ? text : r.text;
     };
     const n = (ask as Ask).recallAll?.(extra, form) ?? 0;
-    return n ? `(${n === 1 ? 'your message is' : `${n} of your messages are`} back to edit, not sent — Enter sends)` : '';
+    const files = attached.length ? `, ${attached.join(', ')} attached` : '';
+    return n ? `(${n === 1 ? 'your message is' : `${n} of your messages are`} back to edit, not sent${files} — Enter sends)` : '';
   };
   // What waited prints before the prompt comes up.
   const flushHeld = (): void => {
