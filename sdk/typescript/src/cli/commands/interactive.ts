@@ -330,11 +330,13 @@ export function askedFor(t: AgentActivityInfo, all: readonly AgentActivityInfo[]
   return ASKED_BY[t.trigger] ?? t.trigger;
 }
 
-/** Ids as a list shows them: their first 13 characters (`resp_4702745b`,
- *  `bash-c917aa00`), longer where two would read the same. /result and
- *  /cancel take a unique start of an id. Exported for the tests. */
+/** Ids as a list shows them: a long one (a uuid in it) by its first 13
+ *  characters (`resp_4702745b`, `bash-c917aa00`), longer where two would read
+ *  the same; one of 20 characters or fewer (`task-weekly-report`) whole.
+ *  /result, /cancel and /tasks take a unique start of an id. Exported for the tests. */
 export function shortIds(ids: readonly string[]): string[] {
   return ids.map((id) => {
+    if (id.length <= 20) return id;
     let n = Math.min(13, id.length);
     while (n < id.length && ids.some((o) => o !== id && o.startsWith(id.slice(0, n)))) n++;
     return id.slice(0, n);
