@@ -533,7 +533,7 @@ test('QA pass 1 (Ink): a reply line too tall for the room goes to the scrollback
 test('QA pass 1 (Ink): the footer, the waiting rows, Tab\'s candidates, a long paste', async () => {
   const v = await view({ cols: 60, ownerText: (t) => t.replace(/\/\S+\/cat\.png/, '[image: cat.png]'), complete: () => [Array.from({ length: 30 }, (_, i) => `/${String.fromCharCode(97 + (i % 26))}x${i}`), '/'] });
   v.scr.context = { agent: () => 'agent 625', counts: () => '', state: () => 'stopped — /start' };
-  v.scr.status('⠋ deploying… (3s · Esc stops waiting, not the deploy)');
+  v.scr.status('⠋ deploying… (3s · Esc stops the wait, not the agent)');
   let s = await v.read();
   assert.equal(s.shown.at(-1), 'agent 625'); // no "stopped" while the wait says what happens
   v.scr.status(null);

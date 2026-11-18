@@ -470,3 +470,51 @@ test('shell: a generic API_KEY is not a model key; an unbound AGENTDNA_API_KEY d
     assert.match(unbound.stdout, /model key {2}\(AGENTDNA_API_KEY is set without AGENTDNA_API_KEY_PROVIDER\)/);
   } finally { close(att.server); }
 });
+
+// ── keys at questions and during waits (one tree with #251/#254) ──
+
+test('historyAside: a question sets the command history aside; a wait keeps type-ahead', async () => {
+  const { historyAside } = await import('../dist/cli/commands/interactive.js');
+  const rl = { history: ['list', 'whoami'] };
+  const q = historyAside(rl);
+  assert.deepEqual(rl.history, [], '↑ at the question finds nothing');
+  rl.history.unshift('0g-harness'); // readline records the answer
+  q(false);
+  assert.deepEqual(rl.history, ['list', 'whoami'], 'the answer does not join the history');
+  const w = historyAside(rl);
+  rl.history.unshift('use 286'); // typed ahead during the wait
+  w(true);
+  w(true);
+  assert.deepEqual(rl.history, ['use 286', 'list', 'whoami'], 'type-ahead stays, newest first; a second call is a no-op');
+  assert.equal(historyAside({}), null);
+});
+
+test('lineQueue: ↑ at a question recalls no command; the history is back at the prompt', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { PassThrough, Writable } = await import('node:stream');
+  const readline = await import('node:readline');
+  const { lineQueue } = await import('../dist/cli/commands/interactive.js');
+  const input = new PassThrough();
+  input.isTTY = true;
+  input.setRawMode = () => input;
+  const output = new Writable({ write(_c, _e, cb) { cb(); } });
+  output.isTTY = true; output.columns = 100; output.rows = 30;
+  const rl = readline.createInterface({ input, output, terminal: true });
+  const ask = lineQueue(rl, () => true, input);
+  void EventEmitter;
+  const later = (ms) => new Promise((r) => setTimeout(r, ms));
+  const cmd = ask.main('0g-agentdna> ');
+  input.write('deploy\r');
+  assert.equal(await cmd, 'deploy');
+  const answer = ask('framework [0]: ');
+  input.write('\x1b[A'); // ↑
+  await later(20);
+  input.write('\r');
+  assert.equal(await answer, '', '↑ brought back no command into the answer');
+  const next = ask.main('0g-agentdna> ');
+  input.write('\x1b[A');
+  await later(20);
+  input.write('\r');
+  assert.equal(await next, 'deploy', 'at the prompt ↑ recalls the command again');
+  rl.close();
+});

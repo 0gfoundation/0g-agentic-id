@@ -865,9 +865,33 @@ export function completeLine(
   return cut ? [hits.map((c) => c.slice(cut)), rest.slice(cut)] : [hits.length ? hits : list, rest];
 }
 
+/**
+ * Set readline's command history aside until the returned function is
+ * called: a question's answer and a wait are no place for a recalled command
+ * (↑ at a question put an old command into the answer; ↑ during a wait drew
+ * one under the wait's output, a line nothing would take). `keepNew`: lines
+ * entered meanwhile stay, newest first (type-ahead during a wait); without
+ * it they are dropped (a question's answer). null when there is no history.
+ * Exported for the tests.
+ */
+export function historyAside(rl: object | null | undefined): ((keepNew: boolean) => void) | null {
+  const h = (rl as { history?: unknown } | null | undefined)?.history;
+  if (!Array.isArray(h)) return null;
+  const kept = h.splice(0);
+  let done = false;
+  return (keepNew: boolean) => {
+    if (done) return;
+    done = true;
+    const added = keepNew ? h.splice(0) : (h.splice(0), []);
+    h.push(...added, ...kept);
+  };
+}
+
 /** The shell's Tab completion with its current state (the level's words,
  *  argument lists, models, providers, credential names). */
 function shellComplete(line: string): [string[], string] {
+  // At a question (a wizard's, an amount) the shell's commands are no answer.
+  if (activeAsk?.waiting?.()?.kind === 'q') return [[], line];
   return completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor });
 }
 
@@ -1305,10 +1329,18 @@ export function lineQueue(
       say(`${q}${draft.join('\n')}\n`);
       q = CONT;
     }
+    // A question's answer is not a command: ↑ at a question recalls no
+    // command from the history, and the answer does not join it.
+    // (Once: a second question waiting behind the first leaves it to that one.)
+    const restore = kind === 'q' && !waiters.some((w) => w.kind === 'q') ? historyAside(edit) : null;
     rl.setPrompt(q);
     // A line typed during a turn is shown again with the cursor where it was.
     rl.prompt(kind === 'message' && (q === CONT || editLine() !== ''));
-    return new Promise((res, rej) => waiters.push({ res, rej, kind, q, first }));
+    return new Promise((res, rej) => waiters.push({
+      res: (e) => { restore?.(false); res(e); },
+      rej: (e) => { restore?.(false); rej(e); },
+      kind, q, first,
+    }));
   };
   const ask: Ask = (q: string): Promise<string> => wait(q, 'q').then((e) => e.text);
   ask.main = (q: string): Promise<string> => wait(q, 'main').then((e) => e.text);
@@ -2129,7 +2161,7 @@ export async function pollRunning(
     ? setInterval(() => {
         if (signal?.aborted) return;
         spin = (spin + 1) % SPIN.length;
-        const line = cleanCell(`${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · Esc stops waiting, not the deploy)`);
+        const line = cleanCell(`${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · Esc stops the wait, not the agent)`);
         // Under the Ink view: its status row.
         if (activeInk) activeInk.status(line);
         else term(`\r\x1b[2K  ${line}`);
@@ -2195,6 +2227,7 @@ export async function pollRunning(
 async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sealId: `0x${string}`, agentId: string, baseline?: LifecycleBaseline): Promise<{ url: string } | null> {
   const ac = new AbortController();
   irq.streaming = ac;
+  const restore = historyAside(activeRl);
   try {
     return await pollRunning(attestorUrl, sealId, agentId, 360000, ac.signal, { baseline });
   } catch (e) {
@@ -2204,6 +2237,7 @@ async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sea
     }
     throw e;
   } finally {
+    restore?.(true);
     irq.streaming = null;
   }
 }
@@ -3885,9 +3919,11 @@ async function credInShell(irq: Interrupt, sub: string[], run: (io: { wait?: boo
   if (!connect && !modelSet) return run({});
   const ac = new AbortController();
   irq.streaming = ac;
+  const restore = historyAside(activeRl);
   try {
     await run({ ...(connect ? { wait: true } : {}), signal: ac.signal });
   } finally {
+    restore?.(true);
     irq.streaming = null;
   }
 }
