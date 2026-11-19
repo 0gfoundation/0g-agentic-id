@@ -2,7 +2,7 @@
 
 [中文](cli-reference.zh.md)
 
-> Matches `@0gfoundation/0g-agentdna` ≥ 0.4.0 · the CLI ships inside the SDK package — no separate install
+> Matches `@0gfoundation/0g-agentdna` ≥ 0.5.0 · the CLI ships inside the SDK package — no separate install
 > Every command, flag, and exit code below was verified against `sdk/typescript/src/cli/` source
 
 ## 1. Installation & Mental Model

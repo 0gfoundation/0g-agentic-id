@@ -2,7 +2,7 @@
 
 [English](cli-reference.md)
 
-> 适用于 `@0gfoundation/0g-agentdna` ≥ 0.4.0 · CLI 随 SDK 包一起发布，无需单独安装
+> 适用于 `@0gfoundation/0g-agentdna` ≥ 0.5.0 · CLI 随 SDK 包一起发布，无需单独安装
 > 下文每条命令、flag 和退出码都已对照 `sdk/typescript/src/cli/` 源码核实
 
 ## 1. 安装与基本概念
