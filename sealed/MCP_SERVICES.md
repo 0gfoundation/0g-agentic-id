@@ -63,7 +63,8 @@ from container UIDs 20001–64999 (20000 is the confinement probe's); the
 provider's UID/GID maps must include 20000–64999.
 The kernel counts `RLIMIT_NPROC` per UID across every sandbox of a runner
 (measured on the dev runner), so fixed slots would let one sandbox's processes
-block another's. The trusted launcher clears supplementary groups, drops UID/GID,
+block another's. The trusted launcher (sealed's own program in its launcher mode:
+`sealed/isolation/README.md`) clears supplementary groups, drops UID/GID,
 sets no-new-privs, `oom_score_adj` 1000 and nice 19 (with `RLIMIT_NICE` 0, so it
 cannot raise its priority), then confines the process with Landlock (ABI 6 or
 later) and a seccomp filter before executing the interpreter. Service processes
@@ -393,7 +394,8 @@ SMC and vsock sockets, System V IPC, message queues, keyrings, `fallocate`,
 `clone` with `CLONE_PARENT`, signals and abstract sockets outside the domain,
 and cleanup by identity.
 `SEALED_SERVICE_TESTS=1` checks real confinement, identities, stdin, deduplication, limits,
-cancellation, atomic private-input handoff, repeated Stop/Start and GC. `SEALED_LOOP_TESTS=1` adds the public DSH/tool path and a
+cancellation, atomic private-input handoff, repeated Stop/Start and GC; the servicehost test
+binary is the launcher there, run from a copy it makes in a root-only directory under `/var/lib`. `SEALED_LOOP_TESTS=1` adds the public DSH/tool path and a
 complete paid MCP path: real SDKs/signatures, wallet isolation, concurrent retry,
 private stdin, progress, cancellation, receipt verification/tamper rejection and
 lost settlement responses before/after broadcast. Local chain/facilitator fixtures spend no funds and

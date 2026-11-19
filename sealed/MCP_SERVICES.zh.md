@@ -47,7 +47,7 @@ start/stop/logs 接收 id。不公开管理接口。logs 为空：协调进程�
 
 每个服务进程都用自己的服务身份运行，从容器 UID 20001–64999 中随机抽取（20000 留给隔离
 探测）；provider 的 UID/GID 映射必须覆盖 20000–64999。内核按 UID 在同一 runner 的所有沙箱之间合计 `RLIMIT_NPROC`
-（在 dev runner 上实测），固定编号会让一个沙箱的进程卡住另一个沙箱。可信 launcher 清除
+（在 dev runner 上实测），固定编号会让一个沙箱的进程卡住另一个沙箱。可信 launcher（sealed 程序自身的 launcher 模式，见 `sealed/isolation/README.zh.md`）清除
 附加组、切换 UID/GID、启用 no-new-privs、把 `oom_score_adj` 设为 1000、nice 设为 19（`RLIMIT_NICE`
 为 0，无法调高优先级），再用 Landlock（ABI 6 及以上）和 seccomp 过滤器限制进程，然后才执行解释器。
 服务进程与 sealed、owner 共用沙箱的 CPU 配额：在 dev runner 上，自开会话、nice 19 的进程和
@@ -268,7 +268,8 @@ x402 **不是付款和交付的跨系统原子公平交换**。保存结果让�
 SEALED_LANDLOCK_TESTS=1（internal/servicesandbox）测限制本身：文件、`/proc`、`oom_score_adj`、nice、run 目录里的链接、
 inet/UDP、SMC 和 vsock socket、System V IPC、消息队列、keyring、`fallocate`、带 `CLONE_PARENT` 的 `clone`、
 对域外的信号和抽象 socket，以及按身份清理。
-SEALED_SERVICE_TESTS=1 测真实限制、身份、stdin、去重、限额、取消、原子私有输入交接、反复 Stop/Start 和回收。
+SEALED_SERVICE_TESTS=1 测真实限制、身份、stdin、去重、限额、取消、原子私有输入交接、反复 Stop/Start 和回收；
+这时 servicehost 的测试程序自己充当 launcher，从它在 `/var/lib` 下只有 root 能进的目录里复制出的副本运行。
 SEALED_LOOP_TESTS=1 加测公开 DSH/tool 链路和完整收费 MCP 链路：真实 SDK/签名、钱包
 隔离、并发重试、私有 stdin、进度、取消、证明校验/拒绝篡改及广播前/后的结算响应丢失。
 链和 facilitator 为本地模拟，不花资金、不证明已真实部署。本地测试挂载配套源码 checkout

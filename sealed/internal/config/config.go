@@ -36,7 +36,7 @@
 //	                            sealed is PID 1. Reported at /provision under the
 //	                            layered runtime (sealed/LAYERS.md)
 //	SEALED_TRIAL                set by the loader ("1") when it starts a sealed version
-//	                            it switched to and has not seen come up yet
+//	                            that has not come up in this container yet
 //
 // CHAIN_RPC_URL and INDEXER_URL are public and must not embed credentials
 // (an API token in the URL's userinfo, path or query). sealed prints both in
@@ -133,15 +133,10 @@ type Bootstrap struct {
 	// verified it, 64 lowercase hex, or "" when sealed is PID 1 (no loader).
 	// A malformed value is passed on as is, and provisioning refuses it.
 	SealedHash string
-	// Trial is SEALED_TRIAL=1: the loader switched to this version and rolls
-	// back to the previous one if it exits before it has come up
-	// (layers.go).
+	// Trial is SEALED_TRIAL=1: this version has not come up in this
+	// container yet, and the loader moves to another one if it exits before
+	// it has (layers.go).
 	Trial bool
-	// InsteadOf is SEALED_INSTEAD_OF: the version this program (the image's
-	// own sealed) runs in place of, because the loader could not read the
-	// sealed list as it started; 64 lowercase hex, "" when it runs in place
-	// of nothing (or the value is malformed).
-	InsteadOf string
 }
 
 // Load reads env vars and runs the certificate self-check (Phase 0). Returns
@@ -196,18 +191,7 @@ func Load() (*Bootstrap, error) {
 		PublicURL:            composePublicURL(),
 		SealedHash:           os.Getenv("SEALED_HASH"),
 		Trial:                os.Getenv("SEALED_TRIAL") == "1",
-		InsteadOf:            versionHash(os.Getenv("SEALED_INSTEAD_OF")),
 	}, nil
-}
-
-// versionHash is s when it is a version hash as the loader writes one, 64
-// lowercase hex, else "".
-func versionHash(s string) string {
-	b, err := hex.DecodeString(s)
-	if err != nil || len(b) != 32 || hex.EncodeToString(b) != s {
-		return ""
-	}
-	return s
 }
 
 // AttestorAnchor is what the attestor TLS statement must be signed under:

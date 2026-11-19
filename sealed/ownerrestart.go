@@ -8,10 +8,10 @@ package main
 //   - sealed: sealed stops the agent as a stop signal would (shutdown.go) and
 //     exits with layers.RestartRequestedExit; the loader starts this version
 //     again at once, and does not count it as a crash. Without the layered
-//     flow the loader stops with sealed, so the restart is refused. While
-//     this boot is still coming up (on trial, its version not yet confirmed
-//     to the loader) it is refused too: an exit then would read as a failed
-//     version and send the loader back.
+//     flow there is no loader to start it again, so the restart is refused.
+//     While this boot is still coming up (on trial, its version not yet
+//     confirmed to the loader) it is refused too: an exit then would read as
+//     a failed version and send the loader back.
 //
 // Either way what the agent changed since its last commit stays on disk, and
 // the next start keeps it (synced.go).
@@ -62,8 +62,9 @@ func ownerRestarter(mgr interface{ Reload(context.Context) error }, lr *layeredR
 			return nil
 		case "sealed":
 			if lr == nil {
-				// LEGACY(pre-1.4.0): an attestor without the layered flow.
-				return fmt.Errorf("%w: without the layered flow the loader stops with sealed; stop and start the agent instead", proxy.ErrRestartUnavailable)
+				// LEGACY(v1): sealed is PID 1 itself, in an image without the
+				// loader.
+				return fmt.Errorf("%w: sealed runs without the loader here; stop and start the agent instead", proxy.ErrRestartUnavailable)
 			}
 			if !sealedSettled.Load() {
 				return fmt.Errorf("%w: this sealed is still starting", proxy.ErrRestartBusy)

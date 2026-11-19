@@ -157,7 +157,7 @@ func (c *isolatedCommand) resourcesReleased() bool {
 // trusted launcher (which becomes that identity to signal them all), then
 // confirms from root that none is left.
 func reapIdentity(ctx context.Context, uid uint32) error {
-	cmd, err := privsep.RootCommand(ctx, "sealed-service-launcher", "reap", fmt.Sprintf("--uid=%d", uid))
+	cmd, err := privsep.RootSelf(ctx, "sealed-service-launcher", "reap", fmt.Sprintf("--uid=%d", uid))
 	if err != nil {
 		return err
 	}
