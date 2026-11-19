@@ -9,7 +9,7 @@
  */
 
 import { buildClient } from '../sdk';
-import { CliError } from '../errors';
+import { CliError, setAgentAtHand } from '../errors';
 import { print } from '../envelope';
 import { parseAgentRef } from '../ref';
 import { commandKeyPrompt, CRED_USAGE, credOp, credOwnerOp, readSecret } from '../credentials';
@@ -37,6 +37,7 @@ export async function run(ctx: CommandContext): Promise<void> {
 
   // Grammar errors before any network work.
   const ref = parseAgentRef(first);
+  setAgentAtHand(first);
   const ag = await buildClient(ctx.env, { withWallet: true });
   const sealId = await resolveSealId(ag, ref, first);
   await credOp(ag, sealId, rest, { json: ctx.json, wait: !ctx.json, out: show, secret: readSecret, keyPrompt: commandKeyPrompt(ctx.json, show, { readPipe: true }) });

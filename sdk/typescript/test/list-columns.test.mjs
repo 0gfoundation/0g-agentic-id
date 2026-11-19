@@ -469,9 +469,10 @@ test('REPL listing: FRAMEWORK, AGENTSEAL and the ⇄ annotation, aligned with it
   const own = renderListRow(parent, HUMAN_OWNER, '*', map);
   assert.match(own, /^\* 466 /, 'own rows keep the * mark');
   assert.doesNotMatch(own, /⇄/, 'a human owner is not annotated');
-  // unminted, walletless: no agentId, owner or agentSeal — placeholders, not a crash
+  // unminted, walletless: no agentId, owner or agentSeal — placeholders, not a crash;
+  // the sealId prefix stands in the id column (the handle commands accept)
   const bare = renderListRow({ agentId: null, phase: 'deploying', sealId: `0x${'15'.repeat(32)}`, name: null }, null);
-  assert.match(bare, /^  \? /, 'unminted rows show ?');
+  assert.match(bare, /^  0x1515151515 /, 'unminted rows show their sealId prefix');
   assert.equal((bare.match(/—/g) ?? []).length, 3, 'FRAMEWORK, AGENTSEAL and OWNER render the placeholder');
 });
 
@@ -495,14 +496,14 @@ test('REPL list loop: owner-tier fields for an unminted own row, the annotation,
     const lines = r.stdout.split('\n');
     const short = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
     // Both listings print the same header; slice the output by its line numbers.
-    const at = lines.flatMap((l, i) => (/ID\s+PHASE\s+FRAMEWORK\s+SEAL\s+AGENTSEAL\s+OWNER\s+NAME/.test(l) ? [i] : []));
+    const at = lines.flatMap((l, i) => (/AGENTID\s+PHASE\s+FRAMEWORK\s+AGENTSEAL\s+OWNER\s+NAME/.test(l) ? [i] : []));
     assert.equal(at.length, 2, `both listings print the new header:\n${r.stdout}\n${r.stderr}`);
     const all = lines.slice(at[0] + 1, at[1]).join('\n');
     const mineOnly = lines.slice(at[1] + 1).join('\n');
     const child = all.split('\n').find((l) => /selftest-agent/.test(l));
     assert.match(child ?? '', /⇄ #466/, `the agent-owned row is annotated:\n${all}`);
     const pending = all.split('\n').find((l) => /pending-mine/.test(l));
-    assert.match(pending, /^\* \? /, 'own unminted row: * mark and no agentId');
+    assert.match(pending, /^\* 0x1616161616 /, 'own unminted row: * mark and its sealId prefix');
     assert.ok(pending.includes(short(MINE_SEAL)), 'AGENTSEAL from the owner tier');
     assert.ok(pending.includes(short(MY_WALLET)), 'OWNER from the owner tier');
     assert.match(all, /\(\* = owned by your wallet/, 'ownership footer');

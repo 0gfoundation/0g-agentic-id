@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { makeAgentClient, withImages } from '../dist/AgentClient.js';
-import { ATTACH_LIMITS, completePath, prepareAttachments, sniffImage, stageFile } from '../dist/cli/attach.js';
+import { ATTACH_LIMITS, completePath, dropRoots, findDroppedFiles, prepareAttachments, sniffImage, stageDropped, stageFile } from '../dist/cli/attach.js';
 import { assertOthersFitFramework, parseAssignments } from '../dist/cli/settings.js';
 
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
@@ -43,7 +43,9 @@ async function mockAgent(handle) {
       handle(req, res);
     });
   });
-  await new Promise((r) => srv.listen(0, r));
+  // On 127.0.0.1, the address the client is given: a port the OS hands out for
+  // all addresses can be taken on 127.0.0.1 by another test file's server.
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   return { seen, base: `http://127.0.0.1:${srv.address().port}`, stop: () => { srv.closeAllConnections?.(); srv.close(); } };
 }
 const json = (res, status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
@@ -149,14 +151,106 @@ test('/attach: images by their bytes, limits when staged, files uploaded and nam
   const sent = await prepareAttachments(staged, 'please read', client);
   assert.deepEqual(uploads, [['report.pdf', '%PDF-1.4 tiny']]);
   assert.equal(sent.text, 'please read\n[file uploaded: /home/agent/inbox/report.pdf]');
-  assert.deepEqual(sent.images, [{ mediaType: 'image/png', data: PNG.toString('base64') }]);
+  assert.deepEqual(sent.images, [{ mediaType: 'image/png', data: PNG.toString('base64'), name: 'shot.dat' }]);
   await assert.rejects(prepareAttachments(staged, 'x', {}), /takes no files/);
 
   assert.deepEqual(completePath(join(dir, 're')), [join(dir, 'report.pdf')]);
   assert.deepEqual(completePath(join(dir, 'su')), [join(dir, 'sub') + '/']);
 });
 
+test('an image\'s file name goes as `filename` only where the agent says it reads it (features.image_names)', async () => {
+  const named = { ...IMAGE, name: 'flag test.png' };
+  const msgs = [{ role: 'user', content: 'what flag?' }];
+  // The shape: on the part, both transports; never without `names`, never without a name.
+  assert.deepEqual(withImages(msgs, [named], 'chat', true)[0].content[1], { type: 'image_url', image_url: { url: `data:image/png;base64,${IMAGE.data}` }, filename: 'flag test.png' });
+  assert.deepEqual(withImages(msgs, [named], 'responses', true)[0].content[1], { type: 'input_image', image_url: `data:image/png;base64,${IMAGE.data}`, filename: 'flag test.png' });
+  assert.equal(withImages(msgs, [named], 'chat')[0].content[1].filename, undefined);
+  assert.equal(withImages(msgs, [IMAGE], 'responses', true)[0].content[1].filename, undefined);
+
+  // Over the wire, by what GET /v1/harness says.
+  for (const [transport, routes] of [['responses', HARNESS], ['chat', CHAT_ONLY]]) {
+    for (const features of [{ images: false, image_names: true }, { images: false }, null]) {
+      const agent = await mockAgent((req, res) => {
+        const path = req.url.split('?')[0];
+        if (path === '/v1/harness') return features ? json(res, 200, { name: '0g-harness', features }) : json(res, 404, { error: 'not found' });
+        if (req.method === 'POST' && path === '/v1/responses') return json(res, 200, { id: 'resp_01', object: 'response', status: 'queued', output_text: '' });
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        if (path === '/v1/chat/completions') return res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n\ndata: [DONE]\n\n`);
+        res.end(`id: 1\nevent: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', sequence_number: 1, response: { id: 'resp_01', status: 'completed', output_text: 'ok' } })}\n\n`);
+      });
+      try {
+        const c = makeAgentClient({ base: agent.base, services: [], routes, token: 't' });
+        for (let i = 0; i < 2; i++) for await (const _ of c.chatStream(msgs, { images: [named] })) { /* drain */ }
+        const sent = agent.seen.filter((r) => r.method === 'POST').map((r) => (transport === 'responses' ? r.body.input : r.body.messages)[0].content[1]);
+        assert.equal(sent.length, 2);
+        for (const part of sent) assert.equal(part.filename, features?.image_names ? 'flag test.png' : undefined, `${transport} ${JSON.stringify(features)}`);
+        // Asked once, not per message.
+        assert.equal(agent.seen.filter((r) => r.url === '/v1/harness').length, 1, `${transport} ${JSON.stringify(features)}`);
+      } finally {
+        agent.stop();
+      }
+    }
+  }
+  // An image without a name never asks.
+  const agent = await mockAgent((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n\ndata: [DONE]\n\n`);
+  });
+  try {
+    const c = makeAgentClient({ base: agent.base, services: [], routes: CHAT_ONLY, token: 't' });
+    for await (const _ of c.chatStream(msgs, { images: [IMAGE] })) { /* drain */ }
+    assert.deepEqual(agent.seen.map((r) => r.url), ['/v1/chat/completions']);
+  } finally {
+    agent.stop();
+  }
+});
+
 test('modelImages is a 0g-harness switch', () => {
   assert.throws(() => assertOthersFitFramework(parseAssignments(['others={"modelImages":true}']), 'openclaw'), /0g-harness switch/);
   assert.doesNotThrow(() => assertOthersFitFramework(parseAssignments(['others={"modelImages":true}']), '0g-harness'));
+});
+
+test('a file dragged into the terminal is found in the message, as a drag or a paste leaves its path', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'drop-'));
+  const spaced = join(dir, 'My File (1).png');
+  const plain = join(dir, 'report.pdf');
+  writeFileSync(spaced, 'x');
+  writeFileSync(plain, 'y');
+  const roots = [dir];
+  const escaped = spaced.replace(/([ ()])/g, '\\$1');
+  // Escaped (Terminal), at the start of the line, then text.
+  assert.deepEqual(findDroppedFiles(`${escaped} what is this?`, roots), [{ path: spaced, raw: escaped }, ' what is this?']);
+  // Quoted (some terminals), in the middle; a plain path at the end.
+  assert.deepEqual(findDroppedFiles(`compare '${spaced}' and ${plain}`, roots), ['compare ', { path: spaced, raw: `'${spaced}'` }, ' and ', { path: plain, raw: plain }]);
+  // Not files to attach: missing, outside the roots, in backquotes, not a whole word.
+  for (const line of [`see ${join(dir, 'nope.png')}`, `${plain}, ok`, `read \`${plain}\` please`, `x${plain}`]) {
+    assert.ok(findDroppedFiles(line, roots).every((p) => typeof p === 'string'), line);
+  }
+  assert.ok(findDroppedFiles('/etc/hosts', dropRoots()).every((p) => typeof p === 'string'), '/etc/hosts is never a dropped file');
+  assert.deepEqual(findDroppedFiles('just text', roots), ['just text']);
+  assert.deepEqual(findDroppedFiles('', roots), []);
+});
+
+test('dropped files are staged with the message: images named in place, other files left to the upload line', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'drop-stage-'));
+  const png = join(dir, 'cat.png');
+  const pdf = join(dir, 'report.pdf');
+  writeFileSync(png, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]));
+  writeFileSync(pdf, '%PDF-1.4');
+  const staged = [];
+  const seen = [];
+  const r = stageDropped(findDroppedFiles(`what is in ${png}   and ${pdf}`, [dir]), staged, (s) => seen.push(s.name));
+  assert.deepEqual(r, { text: 'what is in [image: cat.png] and' });
+  assert.deepEqual(seen, ['cat.png', 'report.pdf']);
+  assert.deepEqual(staged.map((s) => [s.name, !!s.image]), [['cat.png', true], ['report.pdf', false]]);
+  // The upload line names the file once sent.
+  const uploaded = [];
+  const out = await prepareAttachments(staged, r.text, { uploadFile: async (name) => { uploaded.push(name); return { path: `/home/agent/inbox/${name}`, bytes: 8 }; } });
+  assert.equal(out.text, 'what is in [image: cat.png] and\n[file uploaded: /home/agent/inbox/report.pdf]');
+  assert.equal(out.images.length, 1);
+  assert.deepEqual(uploaded, ['report.pdf']);
+  // One that cannot go (already attached): nothing staged by this line stays.
+  const again = stageDropped(findDroppedFiles(`${pdf} ${png}`, [dir]), staged);
+  assert.match(again.refused, /already attached/);
+  assert.equal(staged.length, 2);
 });

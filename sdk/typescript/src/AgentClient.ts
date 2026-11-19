@@ -148,6 +148,11 @@ export interface ChatMessage {
 export interface ChatImage {
   mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
   data: string;
+  /** Its file name on the owner's side (`flag test.png`). Sent as the part's
+   *  `filename` only to an agent that says it reads one (0g-harness
+   *  `GET /v1/harness` → `features.image_names`): a model that cannot view
+   *  images gets the file under this name in `~/inbox`. */
+  name?: string;
 }
 
 /**
@@ -308,9 +313,13 @@ export interface SteerState {
   id: string;
   /** pending: not read yet. merged: read in `turn`. turn: the turn it was
    *  meant for ended first, so it opened `turn`, an owner turn of its own.
-   *  dropped: an interrupt came first. */
+   *  dropped: an interrupt, or a cancel of its turn, came first (a cancel
+   *  drops them from 0g-harness #12 on; an older one leaves them pending and
+   *  gives them to the next turn). */
   state: 'pending' | 'merged' | 'turn' | 'dropped';
   turn: string;
+  /** The text as sent (0g-harness #12 on). */
+  text?: string;
 }
 
 /**
@@ -352,6 +361,13 @@ export interface AgentActivityInfo {
   /** Who asked. A turn: `user` | `job` | `schedule` | `plugin`. A command or
    *  a subagent: `agent` (the main agent started it). */
   trigger: string;
+  /** A turn: the session it ran in (`owner-chat`, another of the owner's, a task's). */
+  session?: string;
+  /** A command or subagent (0g-harness #12 on): the turn that started it,
+   *  who asked for that turn (`user` for an owner turn) and its session. */
+  parent_turn?: string;
+  parent_trigger?: string;
+  parent_session?: string;
   /** What the activity is: the prompt, the job notice, the reminder's text. */
   label: string;
   /** Unix seconds. */
@@ -734,6 +750,13 @@ export interface AgentClient {
   listFiles?(dir?: AgentFileDir): Promise<AgentFile[]>;
   /** One file's bytes (at most 50 MiB). See {@link AgentClient.listFiles}. */
   downloadFile?(dir: AgentFileDir, name: string): Promise<Uint8Array>;
+  /**
+   * Remove one file from the agent's outbox or file inbox (0g-harness
+   * `DELETE /v1/files/{dir}/{name}`). `deleted`: it is gone; `missing`: there
+   * was no such file; `unsupported`: this agent's runtime has no delete
+   * route (an older image).
+   */
+  deleteFile?(dir: AgentFileDir, name: string): Promise<'deleted' | 'missing' | 'unsupported'>;
 }
 
 /** Longest-prefix match over declared routes, or undefined if none match. */
@@ -854,14 +877,16 @@ const imageUrl = (im: ChatImage): string => `data:${im.mediaType};base64,${im.da
  * shape: chat/completions `image_url` parts, or Responses `input_text` /
  * `input_image` parts. No images: the messages as they are.
  */
-export function withImages(messages: ChatMessage[], images: ChatImage[] | undefined, shape: 'chat' | 'responses'): unknown[] {
+export function withImages(messages: ChatMessage[], images: ChatImage[] | undefined, shape: 'chat' | 'responses', names = false): unknown[] {
   if (!images?.length) return messages;
   let i = messages.length - 1;
   while (i >= 0 && messages[i].role !== 'user') i--;
   const text = i >= 0 ? messages[i].content : '';
+  // `filename` only where the agent reads it (`names`): another runtime may refuse a field it does not know.
+  const named = (im: ChatImage): { filename?: string } => (names && im.name ? { filename: im.name } : {});
   const content = shape === 'chat'
-    ? [{ type: 'text', text }, ...images.map((im) => ({ type: 'image_url', image_url: { url: imageUrl(im) } }))]
-    : [{ type: 'input_text', text }, ...images.map((im) => ({ type: 'input_image', image_url: imageUrl(im) }))];
+    ? [{ type: 'text', text }, ...images.map((im) => ({ type: 'image_url', image_url: { url: imageUrl(im) }, ...named(im) }))]
+    : [{ type: 'input_text', text }, ...images.map((im) => ({ type: 'input_image', image_url: imageUrl(im), ...named(im) }))];
   const out: unknown[] = messages.slice();
   if (i >= 0) out[i] = { role: 'user', content };
   else out.push({ role: 'user', content });
@@ -1018,10 +1043,31 @@ export function makeAgentClient(params: {
   // deploy. There's no framework-agnostic default (/hello doesn't declare it),
   // so omit the field when the caller doesn't set one rather than sending a
   // bogus value the framework rejects.
-  const chatBody = (messages: ChatMessage[], opts?: { model?: string; images?: ChatImage[] }) => {
-    const sent = withImages(messages, opts?.images, 'chat');
+  const chatBody = async (messages: ChatMessage[], opts?: { model?: string; images?: ChatImage[] }) => {
+    const sent = withImages(messages, opts?.images, 'chat', await imageNames(opts?.images));
     return JSON.stringify(opts?.model ? { model: opts.model, messages: sent, stream: true } : { messages: sent, stream: true });
   };
+
+  // What the agent's runtime says it reads (0g-harness `GET /v1/harness`,
+  // `features`), asked once; null where there is no such route.
+  let featuresAsked: Promise<Record<string, unknown> | null> | null = null;
+  const harnessFeatures = (): Promise<Record<string, unknown> | null> => {
+    const r = routes.find((x) => x.kind === 'chat') ?? routes.find((x) => x.kind === 'responses');
+    if (!r || !canAuth) return Promise.resolve(null);
+    const path = r.kind === 'chat' ? `${r.prefix.replace(/\/?$/, '/')}harness` : r.prefix.replace(/responses\/?$/, 'harness');
+    featuresAsked ??= doFetch(path, { signal: AbortSignal.timeout(5000) })
+      .then(async (res) => {
+        if (res.status === 404) return null; // not a harness: it never will be
+        if (!res.ok) throw new Error(`harness: HTTP ${res.status}`);
+        const f = ((await res.json()) as { features?: unknown }).features;
+        return f && typeof f === 'object' ? f as Record<string, unknown> : null;
+      })
+      .catch(() => { featuresAsked = null; return null; }); // asked again next time
+    return featuresAsked;
+  };
+  /** Whether image parts carry their file name: only where the agent says it reads it. */
+  const imageNames = async (images?: ChatImage[]): Promise<boolean> =>
+    !!images?.some((im) => im.name) && (await harnessFeatures())?.image_names === true;
 
   const chat = routes.find((r) => r.kind === 'chat');
   if (chat && canAuth) {
@@ -1055,7 +1101,7 @@ export function makeAgentClient(params: {
       const r = await doFetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: chatBody(messages, opts),
+        body: await chatBody(messages, opts),
         signal: opts?.signal,
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
@@ -1073,7 +1119,7 @@ export function makeAgentClient(params: {
       const r = await doFetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: chatBody(messages, opts),
+        body: await chatBody(messages, opts),
         signal: opts?.signal,
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
@@ -1370,7 +1416,7 @@ export function makeAgentClient(params: {
       // returns the id in milliseconds, so every long-lived byte after that
       // travels on a GET we can always resume by id. One extra round trip
       // buys the guarantee that a task is never lost to a dropped connection.
-      const payload: Record<string, unknown> = { input: withImages(messages, opts?.images, 'responses') };
+      const payload: Record<string, unknown> = { input: withImages(messages, opts?.images, 'responses', await imageNames(opts?.images)) };
       if (opts?.model) payload.model = opts.model;
       if (opts?.thinking) payload.reasoning = { effort: opts.thinking };
       const r = await doFetch(rPrefix, {
@@ -1518,6 +1564,19 @@ export function makeAgentClient(params: {
       const r = await doFetch(`${filesBase}/${dir}/${encodeURIComponent(name)}`);
       if (!r.ok) throw noDownloads('downloadFile', r.status, await r.text());
       return new Uint8Array(await r.arrayBuffer());
+    };
+    client.deleteFile = async (dir, name) => {
+      if (dir !== 'outbox' && dir !== 'inbox') throw new Error('deleteFile: dir is outbox or inbox');
+      if (!name || name.includes('/') || name.includes('\\') || name.startsWith('.')) throw new Error('deleteFile: a file name is one path segment, without a leading dot');
+      const r = await doFetch(`${filesBase}/${dir}/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      if (r.ok) return 'deleted';
+      const text = await r.text();
+      // The harness answers a missing file with "no file …"; anything else
+      // that is not found (or a method the route does not take) is a runtime
+      // without the delete route.
+      if (r.status === 404 && /no file /i.test(text)) return 'missing';
+      if (r.status === 404 || r.status === 405) return 'unsupported';
+      throw new Error(`deleteFile: HTTP ${r.status}: ${plainText(text)}`);
     };
   }
 

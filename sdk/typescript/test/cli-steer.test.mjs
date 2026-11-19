@@ -94,13 +94,15 @@ test('steer: only on a declared steer route, with a way to authenticate', () => 
 
 test('steer posts the text; steerState reads one id', async () => {
   const seen = [];
+  let dropped = false;
   const srv = createServer((req, res) => {
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       seen.push({ method: req.method, url: req.url, body: body ? JSON.parse(body) : undefined });
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(req.method === 'POST' ? { merged: true, id: 'm-1', turn: 'resp_1' } : { id: 'm-1', state: 'merged', turn: 'resp_1' }));
+      res.end(JSON.stringify(req.method === 'POST' ? { merged: true, id: 'm-1', turn: 'resp_1' }
+        : dropped ? { id: 'm-1', state: 'dropped', turn: 'resp_1', text: 'use v2' } : { id: 'm-1', state: 'merged', turn: 'resp_1' }));
     });
   });
   await new Promise((r) => srv.listen(0, r));
@@ -110,6 +112,9 @@ test('steer posts the text; steerState reads one id', async () => {
     assert.deepEqual(await c.steerState('m-1'), { id: 'm-1', state: 'merged', turn: 'resp_1' });
     assert.deepEqual(seen.map((x) => [x.method, x.url]), [['POST', '/v1/steer'], ['GET', '/v1/steer/m-1']]);
     assert.deepEqual(seen[0].body, { text: 'use v2' });
+    // 0g-harness #12: a dropped one comes with its text.
+    dropped = true;
+    assert.deepEqual(await c.steerState('m-1'), { id: 'm-1', state: 'dropped', turn: 'resp_1', text: 'use v2' });
   } finally {
     srv.closeAllConnections?.(); srv.close();
   }

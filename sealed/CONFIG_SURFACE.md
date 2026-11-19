@@ -337,8 +337,7 @@ one — the signed message is the authority, and a mismatch is a 400 rather
 than a quietly-preferred value.
 
 A write here reaches the agent at its next boot, not now. The CLI says so in
-as many words: *"written — version N. The container applies it on its next
-boot (reset to apply now)."*
+as many words: *"saved. The container applies it on its next boot."*
 
 ### 5.2 The hot path — the container
 
