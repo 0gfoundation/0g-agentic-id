@@ -10,7 +10,8 @@ mainnet after it.
 
 - Everything the version ships is merged into `dev` and was tested live on
   dev's default images: agents reset onto the attestor's default snapshot,
-  not onto per-agent test snapshots.
+  not onto per-agent test snapshots. Those framework images are the ones the
+  release ships (§3).
 
 ## 2. The release pull request (into `dev`)
 
@@ -41,18 +42,22 @@ mainnet after it.
   2. Tag `main` with `v<version>`.
   3. Merge `main` back into `dev`.
 
-## 3. Build from the tag
+## 3. Images and the tag
 
-- **Images.** Build the four framework images (`sealed/images/*`) and the
-  attestor image from a clean checkout of `v<version>`, and push them to the
-  registry. The 0g-harness image takes the harness commit `HARNESS_REF`
-  names (`sealed/images/harness/Dockerfile`).
-- **Packages.** Publish the sealed programs and the harness package as assets
-  of the `artifacts` release, each named by its sha256 (see
-  [`sealed/LAYERS.md`](sealed/LAYERS.md), "Download"). Take the harness
-  package from the image build's `harness-package` stage, as the Dockerfile's
-  header says.
-- **Records.** Note every digest and hash in the deployment records.
+- **Framework images.** The release ships the framework images
+  (`sealed/images/*`) that were tested live on dev as dev's defaults (§1);
+  they are not rebuilt. The tag `v<version>` marks the code.
+- **Attestor image.** Build it from a clean checkout of `v<version>` and push
+  it to the registry. It carries the version: `/config` reports it as
+  `attestor_version`.
+- **Packages.** The sealed programs and the harness package that the shipped
+  images carry are assets of the `artifacts` release, each named by its sha256
+  (see [`sealed/LAYERS.md`](sealed/LAYERS.md), "Download"). They are published
+  when those images are built; the harness package comes from the image
+  build's `harness-package` stage, as the Dockerfile's header says.
+- **Records.** In the deployment records, map each framework image digest to
+  the commit it was built from, with its sealed and harness hashes, and note
+  the attestor image digest built from the tag.
 
 ## 4. Each environment (testnet, then mainnet)
 
@@ -65,7 +70,8 @@ mainnet after it.
    [`contracts/README.md`](contracts/README.md)), before the images become the
    default. A hash that is already listed makes `list` revert, so batch only
    the new ones.
-3. **Snapshots.** Import the images as the environment's sandbox snapshots.
+3. **Snapshots.** Import the release's framework images (§3) as the
+   environment's sandbox snapshots.
 4. **Attestor.**
    - Deploy the new attestor image.
    - Point `ATTESTOR_FRAMEWORKS` / `ATTESTOR_SANDBOX_SNAPSHOT` at the new
