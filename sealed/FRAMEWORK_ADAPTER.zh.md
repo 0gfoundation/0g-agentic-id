@@ -191,7 +191,7 @@ sealed 的五个组件各自通过一个窄切面消费它:
   | openclaw(`openclaw.go:164`) | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `~/.openclaw/openclaw.json`,每次 spawn 重新渲染 |
   | hermes(`hermes.go:143`) | `framework`、`SOUL.md`、`memories/`、`skills/` | `~/.hermes/config.yaml`,每次 spawn 重新渲染 |
   | prime-agent(`prime.go:162`) | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `~/.prime/agent/models.json`,每次 spawn 重新渲染 |
-  | 0g-harness(`harness.go:167`) | `framework`、`APPEND_SYSTEM.md`、`skills/` | 没有——harness 进程的环境变量 |
+  | 0g-harness(`harness.go:208`) | `framework`、`APPEND_SYSTEM.md`、`skills/`、`memory/`、`memory-public/` | 没有——harness 进程的环境变量 |
 
   `openclaw.json`、`config.yaml`、`models.json`、`settings.yaml` 曾经都是
   role,直到 owner 的 settings 文档成为推理 pin 的持久归宿。把一个派生产物
@@ -1319,6 +1319,21 @@ overlay 解析、以及从已下线 role 回收 pin)。
    是目录包(`<name>/SKILL.md`),要么是扁平文件(`<name>.md`)——这个角色两种
    entry 形状都追踪。provider 自己保留的子目录(`.system`)被排除,跟 hermes
    排除 `skills/.bundled_manifest` 是同一个套路。
+5. **`memory/`** —— `DirectoryManifest`,指向 `$DSH_HOME/memory/`,agent 的私有
+   长期记忆(只在 owner 自己的会话和任务里用):每条记忆一个 `<name>.md`,直接放在
+   这个目录里,再加上索引 `MEMORY.md`,每个文件一个 entry——和 hermes 的
+   `memories/` 同一种形状。子目录、点文件、链接和空文件不追踪(`harness/memory.go`)。
+   DSH 自己没有记忆;harness 用自己的系统提示段把记忆(超过一定大小时改为索引)放进
+   模型上下文,每个模型步骤都重新读取(0g-harness `src/memory.mjs`)。这个角色出现
+   之前铸造的 agent 链上没有这一项:bootstrap round B 落下空的默认值,它和空目录的
+   演化结果相同,所以 agent 写下第一条记忆之前什么都不会提交。和人设、skills 一样,
+   它是 agent 自己写的内容(`KeepsUncommitted`)。
+6. **`memory-public/`** —— 同样的形状,指向 `$DSH_HOME/memory-public/`:agent 的
+   公开长期记忆,在 owner 会话之外也可以用的知识。harness 只在 owner 明确要求时
+   才写这里。两个角色里的每条记忆都写明确认它的 owner(`trusted_by`);只有它是
+   当前 owner(sealed 作为 `SEAL_OWNER` 传入)时 harness 才信任它,所以转让后前任
+   owner 的记忆不用改写就成了参考。可信度是 harness 的事:对 sealed 来说两个角色
+   都只是文件。默认值、缺失条目的恢复和 `KeepsUncommitted` 都和 `memory/` 一样。
 
 **动手写代码之前,第五个样本教会的一件关于范围的事。**DSH 是这里第一个
 **设计者主动邀请** agent 自己改写 harness 源码的框架——它有一段系统提示专门

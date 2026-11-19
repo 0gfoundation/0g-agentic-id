@@ -17,10 +17,12 @@ mod deploy;
 mod deployment;
 mod deployments;
 mod lifecycle_auth;
+mod operator;
 mod preflight;
 mod probe;
 mod providers;
 mod provision;
+pub(crate) mod releases;
 mod reset;
 mod retry;
 mod settings;
@@ -82,12 +84,14 @@ pub fn router(state: AppState) -> Router {
         .route("/avatar/:seed", get(avatar::keyed_avatar))
         .route("/health", get(health))
         .route("/config", get(config::handle))
+        .route("/releases", get(releases::handle))
         .route("/inference/providers", get(providers::read))
         .route(
             "/admin/inference/providers",
             axum::routing::put(providers::update),
         )
         .route("/deploy", post(deploy::handle))
+        .route("/operator", get(operator::handle_get).put(operator::handle_set))
         .route("/clone", post(clone::handle))
         .route(
             "/provision",

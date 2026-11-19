@@ -180,6 +180,10 @@ pub struct Config {
     /// hint (operator-written per release; e.g. "added: /clear · breaking:
     /// none"). Empty → no note.
     pub cli_notes: String,
+    /// The release file (`ATTESTOR_RELEASES_FILE`, see `releases.rs`):
+    /// served on GET /releases, matched against each agent's image for
+    /// owners, and the source of release emails. Empty → no releases.
+    pub releases_file: String,
     /// Sandbox snapshot identifier the attestor instantiates new agent
     /// containers from (passed into the sandbox `create` envelope's
     /// `snapshot` field). Bumping this points new deploys at a newer
@@ -341,6 +345,7 @@ impl Config {
             secret_env_enabled: parse_opt_in(env_opt("ATTESTOR_SECRET_ENV_ENABLED").as_deref()),
             cli_latest: env_opt("ATTESTOR_CLI_LATEST").unwrap_or_default(),
             cli_notes: env_opt("ATTESTOR_CLI_NOTES").unwrap_or_default(),
+            releases_file: env_opt("ATTESTOR_RELEASES_FILE").unwrap_or_default(),
             sandbox_snapshot: env_opt("ATTESTOR_SANDBOX_SNAPSHOT")
                 .unwrap_or_else(|| "0g-test-sealed".to_string()),
             sandbox_public_ports: env_opt("ATTESTOR_SANDBOX_PUBLIC_PORTS")

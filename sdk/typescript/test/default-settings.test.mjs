@@ -123,7 +123,7 @@ test('nothing is stored for an agent that has a document, a mint-only agent, or 
   // stop never reads the row.
   await withAttestor({ row: { clone_params: {}, settings_version: 0 } }, async ({ c, log }) => {
     await c.lifecycle('stop', { sealId: SEAL, sandboxId: 'sb-1' });
-    assert.deepEqual(log.map((r) => r.path).filter((p) => p !== '/config'), ['/stop']);
+    assert.deepEqual(log.map((r) => r.path).filter((p) => p !== '/config'), ['/operator', '/stop']);
   });
 });
 

@@ -3,6 +3,7 @@ package uploader
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -35,6 +36,7 @@ func (u *Uploader) pushManifest(
 	plaintext []byte,
 	dataKey []byte,
 	oldEntry *chain.IntelligentData,
+	basis string,
 ) (chain.IntelligentData, error) {
 	newManifest, err := manifest.Unmarshal(plaintext)
 	if err != nil {
@@ -53,6 +55,21 @@ func (u *Uploader) pushManifest(
 
 	resolveHeld(role, newManifest, oldManifest)
 
+	// What the committed manifest references is encrypted with this key
+	// too: an entry whose content moved to another path, or a later commit
+	// that comes back to this one, reuses it (uploaded.go).
+	kid := keyID(dataKey)
+	if oldManifest != nil {
+		for _, e := range oldManifest.Entries {
+			if !e.IsHeld() {
+				u.uploaded.keepEntry(role, kid, e.ContentHash, e.StoragePtr)
+			}
+		}
+		if prior, err := oldManifest.Marshal(); err == nil {
+			u.uploaded.keepWhole(role, kid, sha256Hex(prior), *oldEntry)
+		}
+	}
+
 	reused, fresh := 0, 0
 	for i := range newManifest.Entries {
 		e := &newManifest.Entries[i]
@@ -62,6 +79,18 @@ func (u *Uploader) pushManifest(
 				reused++
 				continue
 			}
+		}
+		// Uploaded by an earlier attempt that did not reach the chain.
+		if ptr, ok := u.pending.blob(role, e.Path, basis, e.ContentHash); ok {
+			e.StoragePtr = ptr
+			reused++
+			continue
+		}
+		// Uploaded earlier in this boot, at this path or another.
+		if ptr, ok := u.uploaded.entry(role, kid, e.ContentHash); ok {
+			e.StoragePtr = ptr
+			reused++
+			continue
 		}
 		content, err := u.adapter.LoadEntry(ctx, role, e.Path)
 		if err != nil {
@@ -79,6 +108,8 @@ func (u *Uploader) pushManifest(
 			RootHash: "0x" + hex.EncodeToString(root[:]),
 			Size:     len(ct),
 		}
+		u.pending.keepBlob(role, e.Path, basis, e.ContentHash, e.StoragePtr)
+		u.uploaded.keepEntry(role, kid, e.ContentHash, e.StoragePtr)
 		fresh++
 	}
 
@@ -95,6 +126,15 @@ func (u *Uploader) pushManifest(
 	if oldManifest != nil && fresh == 0 {
 		if prior, err := oldManifest.Marshal(); err == nil && bytes.Equal(prior, filled) {
 			return *oldEntry, nil
+		}
+	}
+	// The same manifest was uploaded before in this boot (every entry where
+	// it was then): commit that blob again.
+	filledSum := sha256Hex(filled)
+	if fresh == 0 {
+		if prior, ok := u.uploaded.whole(role, kid, filledSum); ok {
+			logger.Logf("uploader.Apply: %s reuses the manifest uploaded earlier for this content (%s)", role, rootHexOf(prior))
+			return prior, nil
 		}
 	}
 	mCT, err := dataplane.Encrypt(filled, dataKey)
@@ -126,11 +166,20 @@ func (u *Uploader) pushManifest(
 	if err != nil {
 		return chain.IntelligentData{}, fmt.Errorf("marshal dataDescription: %w", err)
 	}
-	return chain.IntelligentData{
+	entry := chain.IntelligentData{
 		DataDescription: string(descJSON),
 		DataHash:        mRoot,
-	}, nil
+	}
+	u.uploaded.keepWhole(role, kid, filledSum, entry)
+	return entry, nil
 }
+
+func sha256Hex(b []byte) string {
+	s := sha256.Sum256(b)
+	return hex.EncodeToString(s[:])
+}
+
+func rootHexOf(e chain.IntelligentData) string { return "0x" + hex.EncodeToString(e.DataHash[:]) }
 
 // resolveHeld replaces each held entry of m (manifest.Held: an entry over
 // its size limit, whose committed version is to be kept) with the entry for

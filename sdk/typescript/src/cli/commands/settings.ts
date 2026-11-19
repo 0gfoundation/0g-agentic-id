@@ -21,12 +21,13 @@
 import type { Hash } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import { buildClient } from '../sdk';
-import { CliError } from '../errors';
+import { CliError, cmdStep, setAgentAtHand, shellStep } from '../errors';
+import { explainError } from '../plain';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef, type AgentRef } from '../ref';
 import {
-  VERSION_KEYS, applyAssignments, assertModelPresent, assertOthersFitFramework, assertVersionsFitFramework,
-  isHarnessFramework, parseAssignments, renderListedVersions, renderSettings,
+  VERSION_KEYS, applyAssignments, assertModelFitsFramework, touchesModel, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework,
+  isHarnessFramework, renderListedVersions, renderSettings, renderVersionsLine, settingsArgs,
 } from '../settings';
 import { SettingsConflictError } from '../../Settings';
 import type { CommandContext } from '../types';
@@ -48,8 +49,8 @@ export async function resolveSealId(ag: AgenticID, ref: AgentRef, raw: string): 
         hits.length ? 'BAD_AGENT_REF' : 'AGENT_NOT_FOUND',
         hits.length
           ? `"${raw}" matches ${hits.length} agents — add more hex chars`
-          : `no agent matching ${raw} on this attestor`,
-        { remedy: '0g-agentdna list   # to discover existing agents' },
+          : `agent ${raw} does not exist on this attestor`,
+        { remedy: `${cmdStep('list')} shows the agents here` },
       );
     }
     return hits[0].sealId;
@@ -57,7 +58,7 @@ export async function resolveSealId(ag: AgenticID, ref: AgentRef, raw: string): 
   const seal = await ag.agent.getSealId(ref.agentId).catch(() => ZERO_HASH);
   if (seal === ZERO_HASH) {
     throw new CliError('AGENT_NOT_FOUND', `agent ${ref.agentId} has no sealId on chain`, {
-      remedy: '0g-agentdna list   # to discover existing agents',
+      remedy: `${cmdStep('list')} shows the agents here`,
     });
   }
   return seal;
@@ -66,8 +67,10 @@ export async function resolveSealId(ag: AgenticID, ref: AgentRef, raw: string): 
 export async function run(ctx: CommandContext): Promise<void> {
   const raw = ctx.positionals[0];
   const ref = parseAgentRef(raw);
+  setAgentAtHand(raw ?? null);
   // Grammar errors are usage errors — raise them before any network work.
-  const assignments = parseAssignments(ctx.positionals.slice(1));
+  // `versions` alone asks for the versions to pick from.
+  const { versions: versionsView, assignments } = settingsArgs(ctx.positionals.slice(1));
   const writing = assignments.length > 0;
 
   // The document is owner-gated in both directions, so a show needs the key
@@ -78,24 +81,34 @@ export async function run(ctx: CommandContext): Promise<void> {
     // No row for this seal — a wrong attestor or a wrong id, not an internal fault.
     if (/HTTP 404/.test(e.message)) {
       throw new CliError('AGENT_NOT_FOUND', `no deployment for seal ${sealId} on this attestor`, {
-        remedy: '0g-agentdna list   # to discover existing agents',
+        remedy: `${cmdStep('list')} shows the agents here`,
       });
     }
     throw e;
   });
 
   if (!writing) {
-    // A 0g-harness agent can be pinned to versions the trust registry lists;
-    // show them. Advisory: no registry, or an unreadable one, shows nothing.
-    const listed = isHarnessFramework(await frameworkOf(ctx.env.attestorUrl, sealId))
-      ? await ag.agent.listedVersions().catch(() => null)
-      : null;
+    // A 0g-harness agent can be pinned to versions the trust registry lists:
+    // the show says which it runs on one line, `versions` lists them all.
+    // Advisory: no registry, or an unreadable one, shows nothing.
+    const framework = await frameworkOf(ctx.env.attestorUrl, sealId);
+    const harness = isHarnessFramework(framework);
+    const listed = harness ? await ag.agent.listedVersions().catch(() => null) : null;
     if (ctx.json) {
       emitOk({ sealId, settings: current, version, ...(listed ? { listedVersions: { sealed: listed.sealed, harness: listed.harness } } : {}) });
       return;
     }
+    if (versionsView) {
+      if (!harness) print(`this agent runs ${framework ?? 'another framework'} — only a 0g-harness agent has versions to pick`);
+      else if (!listed) print('the trust registry could not be read — no versions to show');
+      else for (const line of renderListedVersions(listed, current?.versions)) print(line);
+      return;
+    }
     for (const line of renderSettings(current)) print(line);
-    if (listed) for (const line of renderListedVersions(listed, current?.versions)) print(line);
+    if (listed) {
+      print(renderVersionsLine(listed, current?.versions));
+      print(`pin a version: 0g-agentdna settings ${raw} versions`);
+    }
     return;
   }
 
@@ -112,8 +125,11 @@ export async function run(ctx: CommandContext): Promise<void> {
   }
   const next = applyAssignments(current, assignments);
   // Before anything is signed: a document with no model is the one state the
-  // container cannot boot from and last-known-good cannot cover.
+  // container cannot boot from and last-known-good cannot cover; a model
+  // that cannot call tools fails every turn of a tool-driven framework.
   assertModelPresent(next, current !== null);
+  assertSubagentDefaultOffered(next);
+  await assertModelFitsFramework(assignments, next, await frameworkOf(ctx.env.attestorUrl, sealId), (provider) => ag.agent.listModelCaps({ provider }));
   const base = await runningServeBase(ctx.env.attestorUrl, sealId);
   // The agent takes a provider switch only with a key for the new provider
   // in its credential set: asked for (Enter takes the key login saved) and
@@ -133,10 +149,14 @@ export async function run(ctx: CommandContext): Promise<void> {
   const written = await ag.agent
     .setSettings(sealId, next, {
       baseVersion: version,
-      onWarn: (w) => {
-        warnings.push(w);
-        note(`warning: ${w}`);
-      },
+      // Only a write that sets the model or the provider: the advisory is
+      // about that choice, not repeated on every later write.
+      ...(touchesModel(assignments) ? {
+        onWarn: (w: string) => {
+          warnings.push(w);
+          note(`warning: ${w}`);
+        },
+      } : {}),
     })
     .catch((e: unknown) => {
       // Someone else wrote this document since the read a moment ago. Report
@@ -174,11 +194,11 @@ export async function run(ctx: CommandContext): Promise<void> {
           pendingReset = true;
           return;
         }
-        const msg = e instanceof Error ? e.message : String(e);
+        const msg = explainError(e).message;
         // pushSettingsToContainer throws `… HTTP <n>: …` when the container
         // ANSWERED and refused; a bare fetch failure (no HTTP status) means
         // it was unreachable.
-        rejected = /HTTP \d/.test(msg);
+        rejected = /HTTP \d/.test(e instanceof Error ? e.message : String(e));
         const w = rejected
           ? `stored, but the running container REFUSED it: ${msg} — a refused document does not boot, so the agent keeps its current configuration until you store one it accepts (e.g. an openai-format model for hermes)`
           : `stored, but the running container was unreachable: ${msg} — it applies on the next boot`;
@@ -194,12 +214,12 @@ export async function run(ctx: CommandContext): Promise<void> {
   for (const line of renderSettings(next)) print(line);
   note(
     pendingReset
-      ? `written — version ${written.version}; provider change pending — run reset ${raw} with the ${next.provider} key`
+      ? `saved; provider change pending — reset agent ${raw} with the ${next.provider} key (${shellStep(`reset ${raw}`)})`
       : applied
-      ? `written — version ${written.version}; ${applied}`
+      ? `saved; ${applied}`
       : rejected
-        ? `written — version ${written.version}, but the running container refused it (see the warning above); it will not boot as-is.`
-        : `written — version ${written.version}. The container applies it on its next boot.`,
+        ? 'saved, but the running container refused it (see the warning above); it will not boot as-is.'
+        : 'saved. The container applies it on its next boot.',
   );
 }
 

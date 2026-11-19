@@ -169,6 +169,9 @@ func TestLargestExecutionRecordFits(t *testing.T) {
 		InputHash: strings.Repeat("i", 64), State: "quarantined", StartedAt: 1 << 62, Deadline: 1 << 62, FinishedAt: 1 << 62, ExitCode: &code,
 		Reason: "resource_cleanup_failed", OutputBytes: MaxExecutionOutput, OutputHash: strings.Repeat("o", 64), OutputAvailable: true, UID: 64999,
 		Receipt: strings.Repeat("r", 16<<10)}
+	for _, kind := range []string{AgentDataPersona, AgentDataSkills, AgentDataPublicMemory} {
+		status.AgentData = append(status.AgentData, AgentDataVersion{Kind: kind, ContentHash: strings.Repeat("c", 64), DataHash: "0x" + strings.Repeat("d", 64), SnapshotHash: strings.Repeat("s", 64), Files: maxAgentDataFiles})
+	}
 	isolation := landlockProfile(man)
 	isolation.WorkerRuntimeHash = strings.Repeat("w", 64)
 	b, err := json.Marshal(executionRecord{"0x" + strings.Repeat("a", 40) + ":" + strings.Repeat("s", 64), status, isolation})

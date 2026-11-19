@@ -49,7 +49,7 @@
 - **谁定**：mint 时 owner 给初始值，之后由 agent 自己写；owner 想改，经聊天让 agent 改。
 - **加载和校验**：sealed 从链上恢复、解密到磁盘，harness 读取。不设白名单，完整性靠链上的 `dataHash`。
 - **进 ServeProof**：照旧经 `dataHashes`（密文根哈希）。验证方按它找到链上条目，再读条目里加盐的明文承诺（7.1）。
-- **更新**：变动最频繁。检测器每 30 秒把变化提交上链；什么时候生效由 harness 决定，比如人设在 harness 启动时读入。
+- **更新**：变动最频繁。检测器每 30 秒把变化提交上链（提交失败时退避重试，最长 30 分钟一次）；什么时候生效由 harness 决定，比如人设在 harness 启动时读入。
 
 本文的全部改动只用于 0g-harness，包括分层、sealed 和 harness 名单、ServeProof v2、不许导出的规则和服务字段上限。openclaw、hermes 和 prime-agent 继续用现在的单一镜像，ServeProof 和行为都不变（兼容要求见第 8 节）。四个框架共用的只有信任合约：它接管 AgenticID 原有的 attestor 名单和镜像名单，内容和行为不变（第 10 节）。
 
@@ -68,7 +68,7 @@
 
 内容：
 - Debian 和固定版本的 node；python3；给 owner 的 agent 用的浏览器（Chromium 和 Playwright MCP
-  服务器，由 `sealed-browser-mcp` 启动）；
+  服务器，由 `sealed-browser-mcp` 启动）；读 owner 上传的 PDF 用的 `pdftotext`（poppler-utils）；
 - sealed 要用的工具：git、procps、0g-storage-client（编镜像时 sealed 的 `go.mod` 固定的那个版本；要用别的版本的 sealed，就要新镜像）；
 - 加载器。
 
@@ -93,7 +93,7 @@ base 不带 sealed，也不带 harness 包：两者都按信任合约的名单�
 
 owner 可以直接重启 harness 或 sealed（`POST /_seal/restart`，第 10 节）。sealed 自己卡住、连这个接口也连不上时，用 attestor 的 stop/start。
 
-后三级都不丢磁盘：正在跑的回合和后台任务会中断，对话、收件箱和提醒存在磁盘上，重启后还在。agent 在最后一次提交之后改的人设和技能也还在：sealed 在磁盘上（只有 root 能读写）记着这个容器最后和链上一致的版本，下次启动时链上没变而磁盘变了，就保留磁盘上的，由检测器提交上链，不拿链上版本覆盖。停止信号到来时，sealed 只停掉 harness、等手上那一轮检测跑完，不另起提交：平台发出停止信号约 10 秒后就杀掉容器，来不及上传和上链。重建容器只留下链上的 iData，最后一次提交之后的改动随旧容器一起丢掉，最多是 30 秒的量。
+后三级都不丢磁盘：正在跑的回合和后台任务会中断，对话、收件箱和提醒存在磁盘上，重启后还在。agent 在最后一次提交之后改的人设、技能和记忆也还在：sealed 在磁盘上（只有 root 能读写）记着这个容器最后和链上一致的版本，下次启动时链上没变而磁盘变了，就保留磁盘上的，由检测器提交上链，不拿链上版本覆盖。停止信号到来时，sealed 只停掉 harness、等手上那一轮检测跑完，不另起提交：平台发出停止信号约 10 秒后就杀掉容器，来不及上传和上链。重建容器只留下链上的 iData，最后一次提交之后的改动随旧容器一起丢掉，最多是 30 秒的量。
 
 ### 3.1 原地更新 sealed
 
@@ -126,8 +126,8 @@ owner 可以直接重启 harness 或 sealed（`POST /_seal/restart`，第 10 节
 ### 4.2 中立代理
 
 1. **入口**：外部只能连 8080。sealed 只转发清单里的 harness 路由和方法。清单写在 sealed 的 adapter 里，harness 不能自己加。对外服务的响应签 ServeProof。
-2. **推理**：harness 只能经 sealed 调模型。sealed 代填 key，只转发到 owner 设置的路由，模型名也按 owner 的设置，并在每个模型请求里放入平台说明和 doctrine。harness 改了自己的代码，也去不掉这两样。只放行模型调用，按路由下的精确路径：`chat/completions`、`messages`、`responses` 和模型列表。
-3. **出站**：harness 除调模型以外的外发请求，比如搜网页、调第三方 API、装依赖，也经过 sealed，由 sealed 代填凭证、按白名单放行。这一条依赖网络层能拦住 harness 绕过 sealed 直连外网（见第 9 节）。
+2. **推理**：harness 只能经 sealed 调模型。sealed 代填 key，只转发到 owner 设置的路由，模型名也按 owner 的设置，并在每个模型请求里放入平台说明和 doctrine。harness 改了自己的代码，也去不掉这两样。只放行模型调用，按路由下的精确路径：`chat/completions`、`messages`、`responses` 和模型列表；还有 owner 选的搜索服务的网页搜索（`web/search`，只带查询词，不放平台说明）。owner 给子 agent 提供的其他模型各有自己的路由，各自固定模型，也都带平台说明。
+3. **出站**：harness 除调模型以外的外发请求，比如读网页、调第三方 API、装依赖，也经过 sealed，由 sealed 代填凭证、按白名单放行。这一条依赖网络层能拦住 harness 绕过 sealed 直连外网（见第 9 节）。
 4. **签名**：签名 socket 只签三种格式：personal_sign、EIP-712 和交易；不签任意哈希，也签不了 ServeProof 所在的那一类。三种格式之内，它拒签发往 AgenticID `update` 或 `updateAt` 的交易（iData 由 drift watcher 提交），并把签出的每个签名和拒绝的每个请求记下来给 owner 看。其余能签什么，由签名策略决定（第 9 节第 4 条）。
 
 签名 socket 和凭据 socket 的端点也作为 MCP 工具提供（socket 上的 `POST /mcp`）。工具定义在 sealed 里，经对应端点执行，harness 挂载即可，不会多出 socket 不允许的事。
@@ -202,7 +202,7 @@ agent 自己愿意把数据交给 owner，也就是导出自己，硬限制挡�
 - agent 注册的对外服务返回的内容。谁都能调。
 - 出站请求里带的内容。白名单只限制发给谁；harness 还能借 sealed 代填的凭证，往允许的地址写数据。
 - 签名交易里夹带的数据。交易谁都能看，签名策略只能限制签哪类交易，挡不住把数据编码进参数。
-- 发给模型 provider 的请求本身带着人设和技能。owner 用自己的 provider 账号时，provider 那边能否看到请求内容，不由平台控制。
+- 发给模型 provider 的请求本身带着人设、技能和记忆索引。owner 用自己的 provider 账号时，provider 那边能否看到请求内容，不由平台控制。
 
 owner 怎么都拿不到的，是 agent 身份私钥和数据密钥：owner 不能离开平台解密 iData，也不能冒充 agent。也没有绕过 agent 的导出路径，要导出只能让 agent 配合。要硬保护某部分数据，只能让模型读不到它。
 
@@ -252,7 +252,7 @@ owner 怎么都拿不到的，是 agent 身份私钥和数据密钥：owner 不�
 - 放在 `dataDescription` 的 JSON 里，按算法列出多个值，合约不用改；
 - 目录角色用文件级 Merkle 根，可以单独证明其中一个文件；
 - 人设、技能、记忆这类私有角色加盐。不加盐的话，谁猜到内容都能拿公开的哈希核对；同样的道理，盐不能公开。
-- 盐不存，用该角色的数据密钥现算：`HMAC(数据密钥, 标签 ‖ 角色 ‖ dataHash)`；目录角色每个文件用自己的存储根各算一个。内容没变时 sealed 复用原来的密文，dataHash 不变，盐和承诺也不变；
+- 盐不存，用该角色的数据密钥现算：`HMAC(数据密钥, 标签 ‖ 角色 ‖ dataHash)`；目录角色每个文件用自己的存储根各算一个。内容没变时 sealed 复用原来的密文，dataHash 不变，盐和承诺也不变；内容回到本次启动中较早一次提交时的样子、数据密钥没变时也一样；
 - 数据密钥只在 TEE 里，所以由 sealed 给出证明：向谁证明某一版或某个文件，就交出那一个盐，其他版本和文件不受影响；或者在 sealed 里生成 ZK 证明，盐作为私有输入；
 - `harness/` 角色记的是 diff：只含相对官方版本新增、修改和删除的文件，没出现的文件和官方版本一样。它的明文承诺按文件级 Merkle 根算，和其他私有角色一样加盐。它基于哪个官方版本，由 `harnessHash` 公开；
 - 先放 sha256。ZK 友好的哈希（如 Poseidon）参数跟 ZK 系统有关，选定系统后再加；
@@ -311,7 +311,7 @@ salt(root) = HMAC-SHA256(数据密钥, "AgentDNA.Commitment.v1" ‖ 0x00 ‖ 角
 ### 中立代理：可以单独发布
 
 harness 只跑官方版本，原来写在 harness 里的规则都还在，所以中立代理不必和第一步同一个版本发布：
-- 推理代理覆盖所有 provider：sealed 在本机回环端口开推理代理，作为 harness 的模型地址；每个请求按 owner 设置的模型名转发到 owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方地址，第 7 节），key 由凭证代理在出去时代填，harness 拿到的 key 是个占位值；只放行 chat/completions、messages、responses 和模型列表这几类调用，按精确路径；
+- 推理代理覆盖所有 provider：sealed 在本机回环端口开推理代理，作为 harness 的模型地址；每个请求按 owner 设置的模型名转发到 owner 的路由（0G Compute 用注册表里的地址，openai、anthropic 用写在 sealed 里的官方地址，第 7 节），key 由凭证代理在出去时代填，harness 拿到的 key 是个占位值；只放行 chat/completions、messages、responses 和模型列表这几类调用，按精确路径，还放行 owner 选的搜索服务的网页搜索（`web/search`）；owner 给子 agent 提供的其他模型是同一代理上的命名路由，各有自己的 key 和模型；
 - doctrine 由推理代理注入：平台说明（含 doctrine）放在每个模型请求的系统提示末尾，sealed 不再给 0g-harness 写 `/run` 下的平台说明文件；
 - 令牌不交给 harness：owner 经 `/_seal/auth` 拿到的令牌和 harness 校验的令牌是两个，proxy 在入口核对 owner 的令牌，换成 harness 的再转发；
 - 0g-harness 的路由逐条列出：方法加路径，按 harness 协议第 1 版，清单以外的请求返回 404；

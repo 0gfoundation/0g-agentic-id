@@ -124,3 +124,88 @@ export function ownerCellText(owner: string | null | undefined, sealToAgent: Rea
 export function trustedCell(t: string, w: number): string {
   return `${cleanCell(t)} `.padEnd(w);
 }
+
+/** A row of either listing (`list` and the shell's `list`). */
+export interface ListRow {
+  agentId: bigint | number | null;
+  phase?: string | null;
+  sealId: string;
+  name?: string | null;
+  framework?: string | null;
+  agentSeal?: string | null;
+}
+
+/** Which columns a listing shows, and how wide OWNER and NAME are. */
+export interface ListLayout {
+  framework: boolean;
+  agentSeal: boolean;
+  owner: boolean;
+  ownerWidth: number;
+  /** undefined: NAME is not cut (piped output). */
+  nameWidth?: number;
+}
+
+const ID_W = 13;
+const PHASE_W = 11;
+const FRAMEWORK_W = 12;
+const SEAL_W = 13;
+const NAME_MIN = 10;
+
+/** The OWNER column's width for these owners: the widest cell plus a space, at least 14. */
+export function ownerColumnWidth(owners: ReadonlyArray<string | null | undefined>, sealToAgent: ReadonlyMap<string, string>): number {
+  return Math.max(14, ...owners.map((o) => [...ownerCellText(o, sealToAgent)].length + 1));
+}
+
+/**
+ * The columns that fit a terminal `width` wide after `lead` columns (the
+ * shell's ownership mark); without a width (piped output) every column shows
+ * and NAME is cut at `pipedNameWidth` (not at all without it). AGENTID, PHASE and NAME always show; FRAMEWORK, OWNER
+ * and AGENTSEAL join, in that order, while NAME keeps at least 10 columns,
+ * and NAME takes what is left. A row never reaches the last column, so the
+ * terminal does not wrap it.
+ */
+export function listLayout(width: number | undefined, lead: number, ownerWidth: number, pipedNameWidth?: number): ListLayout {
+  if (!width) return { framework: true, owner: true, agentSeal: true, ownerWidth, nameWidth: pipedNameWidth };
+  let used = lead + ID_W + PHASE_W;
+  const take = (w: number): boolean => {
+    if (used + w + NAME_MIN >= width) return false;
+    used += w;
+    return true;
+  };
+  const framework = take(FRAMEWORK_W);
+  const owner = take(ownerWidth);
+  const agentSeal = take(SEAL_W);
+  return { framework, owner, agentSeal, ownerWidth, nameWidth: Math.max(NAME_MIN, width - used - 1) };
+}
+
+/** The listing's header for a layout. */
+export function listHeader(l: ListLayout): string {
+  return 'AGENTID'.padEnd(ID_W) + 'PHASE'.padEnd(PHASE_W) +
+    (l.framework ? 'FRAMEWORK'.padEnd(FRAMEWORK_W) : '') +
+    (l.agentSeal ? 'AGENTSEAL'.padEnd(SEAL_W) : '') +
+    (l.owner ? 'OWNER'.padEnd(l.ownerWidth) : '') + 'NAME';
+}
+
+/**
+ * One listing row for a layout, trailing spaces trimmed. An unminted row has
+ * no agentId: its sealId prefix (`0x` + 10 hex) stands in the AGENTID cell —
+ * the handle every command accepts for it. `noName` is what a row without a
+ * name shows.
+ */
+export function listCells(
+  r: ListRow,
+  owner: string | null | undefined,
+  sealToAgent: ReadonlyMap<string, string>,
+  l: ListLayout,
+  noName = '—',
+): string {
+  const id = r.agentId != null ? cellText(r.agentId, ID_W) : cellText(`0x${r.sealId.slice(2, 12)}`, ID_W);
+  const name = r.name == null ? noName : l.nameWidth ? cellText(r.name, l.nameWidth) : cleanCell(r.name);
+  return (
+    id + cellText(r.phase ?? '?', PHASE_W) +
+    (l.framework ? cellText(r.framework, FRAMEWORK_W) : '') +
+    (l.agentSeal ? cellText(shortAddr(r.agentSeal), SEAL_W) : '') +
+    (l.owner ? trustedCell(ownerCellText(owner, sealToAgent), l.ownerWidth) : '') +
+    name
+  ).trimEnd();
+}

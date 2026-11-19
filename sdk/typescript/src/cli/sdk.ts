@@ -8,9 +8,10 @@
  */
 
 import { AgenticID } from '../AgenticID';
-import { CliError } from './errors';
+import { CliError, shellTo } from './errors';
 import { credentialMarksPath, loadCredentialMarks, loadSecretEnvPins, recordCredentialMark, recordSecretEnvPin } from './config';
 import { requireAttestorUrl, requirePrivateKey, type CliEnv } from './env';
+import { explainError } from './plain';
 
 /**
  * Build an SDK facade from the CLI environment.
@@ -24,6 +25,8 @@ import { requireAttestorUrl, requirePrivateKey, type CliEnv } from './env';
  */
 export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = {}): Promise<AgenticID> {
   const attestorUrl = requireAttestorUrl(env);
+  // An address that is not http(s) is refused before anything is sent to it.
+  if (!isWebAddress(attestorUrl)) throw attestorUnreachable(env, new Error('Invalid URL'));
   // Wallet-requiring callers get the strict check (named error + remedy).
   // Read-only callers proceed WALLETLESS on a malformed key instead of dying —
   // public surfaces like `list`/`hello` must not be hostage to a bad env var.
@@ -63,10 +66,80 @@ export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = 
     });
   } catch (e) {
     if (e instanceof CliError) throw e;
-    throw new CliError(
-      'ATTESTOR_UNREACHABLE',
-      `could not bootstrap from ${attestorUrl}/config: ${(e as Error).message}`,
-      { remedy: 'verify AGENTIC_ATTESTOR_URL points at a reachable attestor, then retry' },
-    );
+    throw attestorUnreachable(env, e);
+  }
+}
+
+/**
+ * The attestor did not answer (or answered something that is not an
+ * attestor's /config): one line naming it, and the remedy where its URL came
+ * from — the env var the owner set, or `login`, which saved it. The full
+ * reason stays in `details.cause` for `--json`.
+ */
+export function attestorUnreachable(env: Pick<CliEnv, 'attestorUrl' | 'attestorUrlSource'>, e: unknown): CliError {
+  const url = env.attestorUrl ?? '(unset)';
+  const why = unreachableReason(e);
+  const notUrl = !isWebAddress(url) || why === 'not a valid URL';
+  const fromEnv = env.attestorUrlSource === 'env';
+  return new CliError('ATTESTOR_UNREACHABLE', notUrl
+    ? `"${url}" is not a web address (https://… or http://…) — an attestor's is like https://agentdna.0g.ai`
+    : `the attestor at ${url} did not answer (${why})`, {
+    remedy: notUrl
+      ? (fromEnv ? 'set AGENTIC_ATTESTOR_URL to the attestor\'s address' : shellTo('login', 'set the address again'))
+      : fromEnv
+        ? 'check AGENTIC_ATTESTOR_URL and your network, then try again'
+        : `check your network and try again, or ${shellTo('login', 'change the address')}`,
+    details: { cause: e instanceof Error ? e.message : String(e) },
+  });
+}
+
+/** An http(s) URL with a host: the only kind of address an attestor has. */
+export function isWebAddress(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return (u.protocol === 'https:' || u.protocol === 'http:') && !!u.hostname;
+  } catch {
+    return false;
+  }
+}
+
+/** Why a request to a URL got nowhere, in a few words. */
+export function unreachableReason(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e);
+  // The system error's code sits somewhere down the cause chain (fetch wraps
+  // it; the SDK may wrap fetch).
+  let code: string | undefined;
+  let badPort = false;
+  for (let x = e as { cause?: unknown; code?: unknown; message?: unknown } | undefined, i = 0; x && i < 6 && !code; x = x.cause as typeof x, i++) {
+    if (typeof x.code === 'string' && /^E[A-Z_]+$|^UND_ERR/.test(x.code)) code = x.code;
+    if (x.message === 'bad port') badPort = true;
+  }
+  if (badPort) return 'a port web requests are not allowed to use';
+  if (/Failed to parse URL|Invalid URL/i.test(msg)) return 'not a valid URL';
+  if (code === 'ECONNREFUSED') return 'connection refused';
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'unknown host';
+  if (/abort|timeout|timed out/i.test(msg) || code === 'UND_ERR_CONNECT_TIMEOUT') return 'no answer in time';
+  if (/^fetch failed$/i.test(msg.trim())) return 'no answer';
+  if (/JSON|Unexpected token/i.test(msg)) return 'what answered is not an attestor';
+  return explainError(e).message;
+}
+
+/**
+ * Whether `url` is an attestor: its /config answers JSON with the fields one
+ * serves. null when it is; otherwise the reason in a few words (`login`
+ * checks an address with this before saving it).
+ */
+export async function probeAttestor(url: string, timeoutMs = 8000): Promise<string | null> {
+  if (!/^https?:\/\/[^\s/]+/i.test(url) || !isWebAddress(url)) return 'not a web address (https://… or http://…)';
+  try {
+    const r = await fetch(`${url.replace(/\/+$/, '')}/config`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!r.ok) return `its /config answered HTTP ${r.status}`;
+    const c = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!c || typeof c !== 'object' || !('chain_id' in c || 'agentic_id_addr' in c || 'chain_rpc' in c)) {
+      return 'what answered is not an attestor';
+    }
+    return null;
+  } catch (e) {
+    return unreachableReason(e);
   }
 }

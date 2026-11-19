@@ -13,6 +13,7 @@ import { getAddress, hexToBytes, isAddress, keccak256 } from 'viem';
 import { requireWallet, type Ctx, type AttestorPublicConfig } from './context';
 import { listInferenceProviders, ProviderRegistryClient, routeHash, registrySigningMessage, acceptedRegistryDigest, validateProvider, type InferenceProvider, type ProviderRegistrySnapshot } from './Providers';
 import { SDK_VERSION } from './constants';
+import { OPERATOR_DOMAIN, OperatorConflictError, OperatorCheckpointSupersededError, assertOperatorComputeOptions, type OperatorOptions, type OperatorState, type RuntimeBinding } from './Operators';
 import { agenticIDAbi, cloneGateAbi, tappRegistryAbi } from './abi';
 import {
   canonicalSettings, modelAdvisory, settingsAuthMessage, SettingsConflictError, sha256Hex,
@@ -337,6 +338,16 @@ const SEALED_NEEDS_AGENT =
   '(and its agentSeal key) exists, so the key cannot be sealed. Deploy without `sandbox`, ' +
   'wait for the mint, then call start(sealId, { apiKey }).';
 
+/**
+ * An HTTP refusal from the attestor or the sandbox provider. The message is
+ * `<what>[ failed]: HTTP <status> <body>` as before; the answer is also kept
+ * apart (`httpStatus`, `httpWhat`, `httpBody`), so a caller that shows it to
+ * a person (the CLI) can say what the server said instead of its raw body.
+ */
+function httpRefusal(what: string, status: number, body: string, failed = true): Error & { httpStatus: number; httpWhat: string; httpBody: string } {
+  return Object.assign(new Error(`${what}${failed ? ' failed' : ''}: HTTP ${status} ${body}`), { httpStatus: status, httpWhat: what, httpBody: body });
+}
+
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -398,7 +409,7 @@ export class AttestorClient {
       },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!r.ok) throw new Error(`provider /api/balance: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw httpRefusal('provider /api/balance', r.status, await r.text().catch(() => ''), false);
     const b = (await r.json()) as { balance?: string; reserved?: string; outstanding_debt?: string; pending_settlement?: string; available?: string };
     return {
       balanceWei: BigInt(b.balance ?? '0'),
@@ -448,6 +459,7 @@ export class AttestorClient {
     resourceId: string,
     payload: Record<string, unknown>,
     ttlSec: number,
+    agenticBinding?: RuntimeBinding,
   ) {
     const { walletClient, account } = requireWallet(this.ctx);
     // Provider binding (0g-sandbox#93, anti cross-provider replay): inserted
@@ -456,6 +468,7 @@ export class AttestorClient {
     const provider = await this.resolveProviderAddr();
     const canonical = JSON.stringify({
       action,
+      ...(agenticBinding ? { agentic_id: agenticBinding } : {}),
       expires_at: Math.floor(Date.now() / 1000) + ttlSec,
       nonce: randHex(16),
       payload,
@@ -468,6 +481,143 @@ export class AttestorClient {
       signed_message_b64: b64encode(canonical),
       wallet_signature: signature,
     };
+  }
+
+  /** Public routing metadata; runtime requests are independently authorized by the attestor. */
+  async getOperator(sealId: `0x${string}`): Promise<OperatorState> {
+    return this.fetchOperator(sealId);
+  }
+
+  private async fetchOperator(sealId: `0x${string}`, checkpoint = false): Promise<OperatorState> {
+    const res = await fetch(`${this.baseUrl()}/operator?seal_id=${encodeURIComponent(sealId)}${checkpoint ? '&checkpoint=true' : ''}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      const error = httpRefusal('/operator', res.status, await res.text().catch(() => ''));
+      Object.assign(error, { status: res.status });
+      throw error;
+    }
+    const body = await res.json() as {
+      owner: Address; operator: Address | null; version: number; allow_recreate: boolean;
+      expires_at: number;
+      checkpoint?: { number?: unknown; hash?: unknown } | null;
+    };
+    const anchor = body.checkpoint;
+    if (!isAddress(body.owner) || (body.operator !== null && !isAddress(body.operator)) ||
+        !Number.isSafeInteger(body.version) || body.version < 0 ||
+        !Number.isSafeInteger(body.expires_at) || body.expires_at < 0 ||
+        typeof body.allow_recreate !== 'boolean' ||
+        (anchor != null && (!Number.isSafeInteger(anchor.number) || Number(anchor.number) < 0 ||
+          typeof anchor.hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(anchor.hash)))) {
+      throw new Error('/operator returned an invalid authorization summary');
+    }
+    return {
+      sealId, owner: getAddress(body.owner), operator: body.operator === null ? null : getAddress(body.operator),
+      version: body.version, allowRecreate: body.allow_recreate, expiresAt: body.expires_at,
+      checkpoint: anchor == null ? null : {
+        number: anchor.number as number, hash: anchor.hash as `0x${string}`,
+      },
+    };
+  }
+
+  /** Owner-only. A successful grant update retires the current runtime; provision again with its controller wallet. */
+  async setOperator(sealId: `0x${string}`, operator: Address, opts: OperatorOptions = {}): Promise<OperatorState> {
+    if (!isAddress(operator) || /^0x0{40}$/i.test(operator)) throw new Error('setOperator: operator must be a nonzero wallet address');
+    return this.writeOperator(sealId, getAddress(operator), opts);
+  }
+
+  /** Owner-only. Revokes future operations and retires the current runtime. */
+  async revokeOperator(sealId: `0x${string}`, opts: { baseVersion?: number } = {}): Promise<OperatorState> {
+    return this.writeOperator(sealId, null, opts);
+  }
+
+  private async writeOperator(sealId: `0x${string}`, operator: Address | null, opts: OperatorOptions): Promise<OperatorState> {
+    const { account, walletClient } = requireWallet(this.ctx);
+    const current = await this.fetchOperator(sealId, operator !== null);
+    if (getAddress(account.address) !== current.owner) throw new Error('operator authorization requires the current NFT owner');
+    if (operator !== null && !current.checkpoint) {
+      throw new Error('operator authorization requires a minted agent and an ownership checkpoint from the attestor');
+    }
+    const base = opts.baseVersion ?? current.version;
+    const expiry = operator === null ? 0 : opts.expiresAt ?? 0;
+    if (!Number.isSafeInteger(base) || base < 0) throw new Error('operator baseVersion must be a nonnegative safe integer');
+    if (!Number.isSafeInteger(expiry) || expiry < 0 || (expiry !== 0 && expiry <= Math.floor(Date.now() / 1000))) {
+      throw new Error('operator expiresAt must be 0 or a future Unix timestamp');
+    }
+    if (opts.allowRecreate !== undefined && typeof opts.allowRecreate !== 'boolean') {
+      throw new Error('operator allowRecreate must be a boolean');
+    }
+    const contract = this.ctx.addresses?.agenticID;
+    const chainId = this.ctx.chain?.id;
+    if (!contract || !isAddress(contract) || !Number.isSafeInteger(chainId) || chainId <= 0) {
+      throw new Error('operator authorization requires an AgenticID contract and chain');
+    }
+    const canonical = JSON.stringify({
+      domain: OPERATOR_DOMAIN, chain_id: chainId, contract, seal_id: sealId,
+      owner: account.address, base_version: base, operator,
+      allow_recreate: operator === null ? false : opts.allowRecreate ?? false,
+      expires_at: expiry, issued_at: Math.floor(Date.now() / 1000),
+      checkpoint: operator === null ? null : current.checkpoint,
+    });
+    const signature = await walletClient.signMessage({ account, message: canonical });
+    const res = await fetch(`${this.baseUrl()}/operator`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ seal_id: sealId, signed_message_b64: b64encode(canonical), signature }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      if (res.status === 409) {
+        let body: { error?: { code?: unknown }; minimum_block?: unknown } | undefined;
+        try { body = JSON.parse(text); } catch { /* Preserve the ordinary conflict for non-JSON responses. */ }
+        if (body?.error?.code === 'operator_checkpoint_superseded') {
+          const minimum = body.minimum_block;
+          throw new OperatorCheckpointSupersededError(sealId, base, text,
+            Number.isSafeInteger(minimum) && Number(minimum) >= 0 ? minimum as number : undefined);
+        }
+        throw new OperatorConflictError(sealId, base, text);
+      }
+      throw httpRefusal('/operator', res.status, text);
+    }
+    // Re-read public routing metadata after the write.
+    return this.getOperator(sealId);
+  }
+
+  private async runtimeAuthority(sealId: `0x${string}`): Promise<{ owner: Address; binding?: RuntimeBinding }> {
+    const { account } = requireWallet(this.ctx);
+    let state: OperatorState;
+    try {
+      state = await this.getOperator(sealId);
+    } catch (e) {
+      // Older attestors have no operator route and remain owner-only. Other
+      // failures must not produce an unbound operator envelope.
+      if ((e as { status?: number }).status === 404) return { owner: account.address };
+      throw e;
+    }
+    if (state.owner === getAddress(account.address)) return { owner: state.owner };
+    if (state.operator !== getAddress(account.address) || (state.expiresAt !== 0 && state.expiresAt <= Math.floor(Date.now() / 1000))) {
+      throw new Error('connected wallet is neither the current NFT owner nor its active operator');
+    }
+    const contract = this.ctx.addresses?.agenticID;
+    const chainId = this.ctx.chain?.id;
+    if (!contract || !isAddress(contract) || !Number.isSafeInteger(chainId) || chainId <= 0) {
+      throw new Error('operator lifecycle requires an AgenticID contract and chain');
+    }
+    return { owner: state.owner, binding: {
+      chain_id: chainId, contract, seal_id: sealId, operator_version: state.version,
+    } };
+  }
+
+  /** Whether the connected wallet is this agent's effective, paying operator. */
+  async isRuntimeOperator(sealId: `0x${string}`): Promise<boolean> {
+    return !!(await this.runtimeAuthority(sealId)).binding;
+  }
+
+  /** Public deployment routing, for callers that only retain the agent's seal. */
+  async currentSandboxId(sealId: `0x${string}`): Promise<string | null> {
+    const res = await fetch(`${this.baseUrl()}/deployment/${sealId}`, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) throw new Error(`/deployment/${sealId} failed: HTTP ${res.status}`);
+    const row = await res.json() as { sandbox_id?: string | null };
+    return row.sandbox_id || null;
   }
 
   /**
@@ -1000,6 +1150,8 @@ export class AttestorClient {
     params: {
       sealId: `0x${string}`;
       sandboxId?: string;
+      /** Resolve the current mapping inside this request, without a second deployment read. */
+      resolveSandbox?: boolean;
       /** Framework name for `reset`/first `start` — the SDK resolves its
        *  sealed image from GET /config's frameworks[] (same as deploy), so a
        *  non-default framework doesn't need `sealedImage` passed. */
@@ -1020,6 +1172,10 @@ export class AttestorClient {
       /** Run once every check that can refuse has passed, before the first
        *  write or signature (the model key going into the credential set). */
       beforeWrite?: () => Promise<void>;
+      /** SDK owner-only model-key planning after runtime identity has been resolved. Never run for an operator. */
+      prepareModelKey?: () => Promise<{ keyInCredentials: boolean; beforeWrite?: () => Promise<void> }>;
+      /** Original facade options, checked without running owner callbacks for an operator. */
+      operatorOptions?: Parameters<typeof assertOperatorComputeOptions>[0];
       /** LEGACY(model-key): the key already sealed to this agent (the value
        *  {@link sealApiKey} returned, e.g. on an integrator's server), in place
        *  of `apiKey`: signed verbatim as `SEAL_SECRET_ENV`, so the key never
@@ -1031,15 +1187,33 @@ export class AttestorClient {
       envelopeTtlSec?: number;
     },
   ): Promise<void> {
-    const { account } = requireWallet(this.ctx);
+    // Resolve identity and deployment once for this call. Never reuse a grant
+    // across calls; API and worker still revalidate at their own boundaries.
+    const deploymentPurpose = op === 'stop' ? 'resolve the sandbox'
+      : (op === 'reset' || !params.sandboxId) && !params.sealedImage && !params.framework
+        ? "pick the sealed image and check the agent's settings" : "check the agent's settings";
+    const [authority, row] = await Promise.all([
+      this.runtimeAuthority(params.sealId),
+      op !== 'stop' || (params.resolveSandbox && !params.sandboxId)
+        ? this.deploymentRow(params.sealId, deploymentPurpose)
+        : Promise.resolve(undefined),
+    ]);
+    const operator = !!authority.binding;
+    if (operator) {
+      assertOperatorComputeOptions(params);
+      assertOperatorComputeOptions(params.operatorOptions ?? {});
+    }
+    const keyPlan = operator ? undefined : await params.prepareModelKey?.();
+    const keyInCredentials = keyPlan?.keyInCredentials ?? params.keyInCredentials;
+    const sandboxId = params.sandboxId ?? (params.resolveSandbox ? row?.sandbox_id as string | undefined : undefined);
     const ttl = params.envelopeTtlSec ?? 180;
     // `reset`, OR a first-time `start` of a never-provisioned (mint-only)
     // agent: both spin a FRESH container via the `create` envelope. A `start`
     // WITH a sandboxId resumes an existing (stopped) container instead.
-    const create = op === 'reset' || (op === 'start' && !params.sandboxId);
-    if (!create && !params.sandboxId) throw new Error(`${op}: sandboxId is required`);
+    const create = op === 'reset' || (op === 'start' && !sandboxId);
+    if (!create && !sandboxId) throw new Error(`${op}: sandboxId is required`);
     const requestKey = carriesRequestKey(params);
-    if (create && params.provider && params.provider !== '0g-compute' && !requestKey && !params.keyInCredentials) {
+    if (create && !operator && params.provider && params.provider !== '0g-compute' && !requestKey && !keyInCredentials) {
       throw new SecretEnvRefusedError('invalid_input', `reset/start for ${params.provider} requires its API key`);
     }
     // Every boot a start or reset brings about is served the agent's settings
@@ -1047,15 +1221,8 @@ export class AttestorClient {
     // one stored first (see needsDefaultSettings). The row is read, and every
     // check below that can refuse runs, before anything is written or signed.
     let seed: { provider: string; model: string } | null = null;
-    let row: Record<string, unknown> | undefined;
     if (op !== 'stop') {
-      row = await this.deploymentRow(
-        params.sealId,
-        create && !params.sealedImage && !params.framework
-          ? "pick the sealed image and check the agent's settings"
-          : "check the agent's settings",
-      );
-      seed = this.defaultSettingsFor(row);
+      seed = operator ? null : this.defaultSettingsFor(row!);
       if (seed && params.provider && params.provider !== seed.provider) {
         throw new Error(
           `${op}: agent ${params.sealId} has no settings document and could boot with no model; ` +
@@ -1064,7 +1231,7 @@ export class AttestorClient {
       }
     }
     let action: string = op;
-    let resourceId = params.sandboxId ?? '';
+    let resourceId = sandboxId ?? '';
     let payload: Record<string, unknown> = {};
     if (create) {
       const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId, row);
@@ -1089,14 +1256,17 @@ export class AttestorClient {
           : {}),
       };
     }
-    await params.beforeWrite?.();
+    if (!operator) {
+      await params.beforeWrite?.();
+      await keyPlan?.beforeWrite?.();
+    }
     if (seed) {
       await storeDefaultSettings(
         { setSettings: (sealId, settings, opts) => this.setSettings({ sealId, settings, baseVersion: opts.baseVersion }) },
         params.sealId,
       );
     }
-    const envelope = await this.signEnvelope(action, resourceId, payload, ttl);
+    const envelope = await this.signEnvelope(action, resourceId, payload, ttl, authority.binding);
     // A no-sandboxId `start` still POSTs /start; the attestor dispatches on the
     // envelope action (create → fresh provision, start → resume).
     const path = op === 'reset' ? '/reset' : `/${op}`;
@@ -1106,11 +1276,11 @@ export class AttestorClient {
       // `framework` rides along so the attestor can keep the row's recorded
       // framework in sync when a reset switches harness (review #154 F1) —
       // optional; old attestors ignore unknown fields.
-      body: JSON.stringify({ seal_id: params.sealId, owner: account.address, sandbox_envelope: envelope, ...(params.framework ? { framework: params.framework } : {}) }),
+      body: JSON.stringify({ seal_id: params.sealId, owner: authority.owner, sandbox_envelope: envelope, ...(params.framework ? { framework: params.framework } : {}) }),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`${path} failed: HTTP ${res.status} ${text}`);
+      throw httpRefusal(path, res.status, text);
     }
   }
 
@@ -1265,7 +1435,7 @@ export class AttestorClient {
           detail: live ? undefined : `could not re-read the current document: ${text.slice(0, 200)}`,
         });
       }
-      throw new Error(`/settings failed: HTTP ${res.status} ${text}`);
+      throw httpRefusal('/settings', res.status, text);
     }
     const body = (await res.json()) as { version?: number | string };
     return { version: Number(body.version ?? 0) };
@@ -1340,7 +1510,7 @@ export class AttestorClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`/retry failed: HTTP ${res.status} ${text}`);
+      throw httpRefusal('/retry', res.status, text);
     }
   }
 
@@ -1536,7 +1706,7 @@ export class AttestorClient {
       }
       if (res.ok) return (await res.json()) as DeployCloneResponse;
       const text = await res.text().catch(() => '');
-      const err = new Error(`${path} failed: HTTP ${res.status} ${text}`);
+      const err = httpRefusal(path, res.status, text);
       if (res.status < 500) throw err; // 4xx — client/business error, retry won't help
       lastErr = err; // 5xx — server transient, retry
     }

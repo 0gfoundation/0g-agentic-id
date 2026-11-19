@@ -11,7 +11,7 @@ sealed 在 agent 自己的沙箱里运行每个托管服务进程（`internal/se
 | rlimit | 虚拟内存、每个身份的进程和线程数（`RLIMIT_NPROC`）、256 描述符、单文件 64 MiB、不生成 core；由 launcher 离开 root 之后设置 |
 | CPU 优先级 | nice 19，`RLIMIT_NICE` 为 0：服务进程无法调高自己的优先级；它们与 sealed、owner Harness 共用沙箱的 CPU 配额（见下面的实测） |
 | 进程额度 | 所有服务进程合计最多 2048 个进程和线程，每次启动按 manifest 的 `processes` 占用 |
-| Landlock（ABI 6 及以上） | 只读/执行镜像系统目录、版本目录和租用的运行包；读四个 `/etc` 条目（`resolv.conf`、`hosts`、`ssl/certs`、`ssl/openssl.cnf`）和 sealed 的网络适配器；无害的 `/dev` 节点；在私有 run 目录里只能列目录、建 socket 和删除条目；只在私有 `$HOME` 和 `$TMPDIR` 下有完整权限（写、建、执行）；`/proc` 不可读；TCP bind/connect 被拒；抽象 Unix socket 和信号限于自身域 |
+| Landlock（ABI 6 及以上） | 只读/执行镜像系统目录、版本目录和租用的运行包；读临时 worker 自己那份 agent 数据副本（版本申请了 `agent_data` 时，只读，见 MCP_SERVICES.zh.md "agent 数据"）；读四个 `/etc` 条目（`resolv.conf`、`hosts`、`ssl/certs`、`ssl/openssl.cnf`）和 sealed 的网络适配器；无害的 `/dev` 节点；在私有 run 目录里只能列目录、建 socket 和删除条目；只在私有 `$HOME` 和 `$TMPDIR` 下有完整权限（写、建、执行）；`/proc` 不可读；TCP bind/connect 被拒；抽象 Unix socket 和信号限于自身域 |
 | seccomp 过滤器 | 只能建 `AF_UNIX` 协议族的 socket；不能用 io_uring、System V IPC、POSIX 消息队列、内核 keyring 和任何 x32 调用；不能带 `CLONE_PARENT` 调 `clone`，`clone3` 返回 ENOSYS，libc 随即使用 `clone`；`fallocate` 返回 EOPNOTSUPP |
 | `oom_score_adj` 1000 | 内核 OOM 先杀服务进程，再轮到 sealed 或 owner Harness；Landlock 使其无法调低 |
 | 资源监视 | sealed 每 500 ms 读该身份的驻留内存、每 2 s 统计私有目录（`$HOME`、`$TMPDIR`、run 目录；每个条目至少按 4 KiB 计）下实际分配的块，超限即杀掉该身份；任务目录所在文件系统剩余不足 1 GiB 或不足 65536 个 inode 时停掉所有服务进程并拒绝新的启动 |

@@ -214,25 +214,26 @@ await ag.agent.balanceOf(owner);            // → 5n       agents owned by `own
 const agentSeal = await ag.agent.getAgentSeal(agentId);
 await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → tx hash "0x…"
 
-// runtime start / stop / reset (owner-signed; on-chain identity preserved):
+// runtime start / stop / reset (owner or appointed operator; identity preserved):
 await ag.agent.stop(sealId, sandboxId);     // stop a running container
 await ag.agent.start(sealId, sandboxId);    // resume a STOPPED container
-await ag.agent.start(sealId, { apiKey });   // FIRST provision: bring a mint-only /
-                                            // never-provisioned agent online with a fresh
-                                            // container (apiKey: see "The model key" below).
-                                            // The semantic counterpart to a sandbox-less
-                                            // deploy; distinct from reset ("recreate an
-                                            // EXISTING one").
+await ag.agent.start(sealId, { apiKey });   // owner: resume the mapped sandbox, or first
+                                            // provision when there is no mapping.
+                                            // A failed resume never implicitly creates
+                                            // another paid sandbox; use reset explicitly.
+                                            // apiKey: see "The model key" below.
 await ag.agent.reset(sealId, { apiKey });   // recreate an EXISTING container: re-read iData
                                             // from chain, reselect the framework adapter.
                                             // sealedImage optional.
 // A booting agent with no settings document uses the model pinned in its minted
-// persona, which leaves the chain at its first commit. So start and reset of an
+// persona, which leaves the chain at its first commit. So OWNER start and reset of an
 // agent that has no document and is a clone or has provisioned before first
 // store DEFAULT_PERSONA_INFERENCE (0g-compute) as its settings: one more owner
 // signature, after every check that can refuse the call; an existing document is
 // never replaced. To start such an agent on another provider, write its settings
 // (setSettings) first. The CLI's reset applies the same rule (needsDefaultSettings).
+// Operators call start(sealId)/stop(sealId) after owner configuration; they cannot
+// supply model-key options or write settings/credentials. See OPERATORS.md.
 await ag.agent.listDeployments();
 // → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError,
 //      containerStatus }, …]
@@ -736,6 +737,22 @@ const agentUrl = me?.url;               // null until the container is provision
 if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 ```
 
+When a release replaces an image, your agents on the old one keep running
+through a transition period, and the owner listing marks them: `migrate` is
+`{ version, framework, until, urgent, state }` (`state`: `recommended`, `soon`
+in the last 7 days, `overdue` after `until`). Reset such an agent before
+`until`: after it the old image may be retired, and the agent's next boot is
+then refused until it is reset. `urgent` means the image may be retired sooner
+(a security fix).
+`ag.agent.releases()` reads the attestor's release notices (`GET /releases`):
+each release's `notes` (and `notesZh`) and the images it replaces.
+
+```ts
+const toMove = (await ag.agent.listMyDeployments()).filter((d) => d.migrate);
+for (const d of toMove) console.log(d.agentId, d.migrate!.until, d.migrate!.state);
+const [latest] = await ag.agent.releases();   // newest first
+```
+
 - **`GET {agentUrl}/hello`** — public identity card: who I am, my owner, and
   the surface I expose. Buffered responses carry a signed `X-Agent-Proof`
   (a framework route's SSE stream doesn't — a signature needs a complete
@@ -761,9 +778,12 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   - `routes` — the framework's declared prefixes:
     `{ prefix, kind?, auth?, signed, description? }`, e.g. a `kind:"chat"` API
     at `/v1/` (auth `bearer`). `auth` tells you how to present the owner token;
-    `signed` says whether responses on that route carry an `X-Agent-Proof`.
-    Shipped frameworks are chat-only; a framework could declare a UI route,
-    but none currently do.
+    `signed` says whether responses on that route carry an `X-Agent-Proof`;
+    `description` is one plain sentence on what the route is for. Every
+    shipped framework declares a `chat` route, and `/hello` lists a
+    `responses` route next to it (the runtime serves one where the framework
+    does not); prime adds `activity`, 0g-harness `tasks`, `inbox`, `files`
+    and more. A framework could declare a UI route, but none currently do.
 
 - **`ag.agent.client(agentId)`** — one handle (`AgentClient`) for every caller.
   Whether it can do owner ops is inherited from `ag`, exactly like `ag`'s
@@ -927,14 +947,65 @@ for await (const e of agent.events!({ after: box.cursor, signal })) {
   if (e.type === 'reset') { /* the agent could not serve the position: re-read the inbox */ }
 }
 
-const tasks = await agent.tasks!({ status: 'active' });
-// every turn (yours and the agent's), command (bash-N) and subagent (subagent-N):
+const running = await agent.activities!({ status: 'active' });
+// every turn (yours and the agent's), command (bash-<hex>) and subagent (its session id, a UUID):
 // actor = who does the work (agent | subagent), trigger = who asked
-await agent.taskInfo!('subagent-1');   // includes a finished subagent's answer
-await agent.stopTask!('bash-2');       // a turn is cancelled, a command or subagent is killed
-await agent.stopAllTasks!();           // everything running
+await agent.activity!(running[0].id);     // a finished subagent's entry includes its answer
+await agent.stopActivity!('bash-2');      // a turn is cancelled, a command or subagent is killed
+await agent.stopAllActivities!();         // everything running
+// tasks/taskInfo/stopTask/stopAllTasks are the deprecated names of these; "task"
+// is kept for zgh-style tasks (a unit of work with its own session and outcome)
 await agent.schedules!();              // { enabled, data }: the reminders the agent set for itself
 ```
+
+A 0g-harness owner's `others` section also picks the agent's web search service
+(`webSearch`: the 0G router by default, or OpenAI or Anthropic) and the further
+models its subagents may run on (`subagentModels`, `subagentDefault`); each is
+paid with the model key or a named owner credential, never a key the agent
+holds. sealed's harness adapter README lists the fields; the CLI checks their
+shape before signing.
+
+A 0g-harness agent also takes **images and files** from its owner. Images ride
+a message: `chat` / `chatStream` take `images: [{ mediaType, data }]` (PNG, JPEG,
+WebP or GIF, base64; at most 8 per message, 10 MiB each, 32 MiB together),
+sent on the last user message in the transport's own shape. Whether the model
+sees them is what the provider's model list says (the 0G router's
+`architecture.input_modalities`: glm-5.3 takes text only, glm-5.3-flash images
+too); the owner's `others.modelImages` overrides it. A model that cannot view
+images gets each one saved as a file in the agent's file inbox `~/inbox` instead; the
+`onNotice` callback receives `{ imagesSavedAsFiles: [paths] }`. An image may
+carry its file name (`{ mediaType, data, name: 'flag test.png' }`): the SDK
+sends it as the part's `filename` when the agent's `GET /v1/harness` lists
+`features.image_names` (asked once per client), so the saved file keeps that
+name instead of `image-<ms>-<n>.png`; elsewhere the name is left out. Any other file
+goes through `uploadFile(name, bytes)` (present when `/hello` declares kind
+`files`; at most 25 MiB): it lands in `~/inbox` under a new name, never over
+an existing file, and returns `{ path, bytes }` — name the path in your
+message. Both live in the container only: a reset loses them.
+
+**Steering a running turn** (0g-harness, present when `/hello` declares kind
+`steer`): `agent.steer(text)` puts the owner's word into the turn that is
+running now; the agent reads it before that turn's next model call — when the
+current model answer or tool call finishes, not in the middle of a long
+command. It returns `{ merged: true, id, turn }`; with no owner turn running
+it is queued as an ordinary turn instead, `{ merged: false, queued, reason }`.
+`agent.steerState(id)` tells what became of it: `pending`, `merged` (read in
+`turn`), `turn` (the turn ended first, so it opened `turn`, an owner turn of
+its own) or `dropped` (an interrupt came first).
+
+The way back: the agent puts files for its owner in its `~/outbox`.
+`listFiles(dir?)` lists them (`'outbox'`, the default, or `'inbox'` for the
+owner's own files), newest first, as `{ name, bytes, mtime, sha256? }`;
+`downloadFile(dir, name)` returns one file's bytes (at most 50 MiB; one flat
+name, no leading dot). A turn that leaves files new or changed in the outbox
+says so: `onNotice` receives `{ outboxFiles: [names] }` when the turn ends.
+`deleteFile(dir, name)` removes one (`'deleted'`, `'missing'`, or
+`'unsupported'` from a runtime without the delete route). The methods share
+the `files` route; an agent whose runtime predates downloads answers with an
+error saying so. The outbox lives in the container only, like the file
+inbox, and the runtime removes files older than 30 days from both and keeps
+the file inbox under 1 GiB. The file inbox `~/inbox` is not the message inbox
+(`inbox()`, what the agent said in turns it opened itself).
 
 ## Agents as owners (nested agents)
 
@@ -1063,7 +1134,7 @@ The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`
 
 ## CLI: `0g-agentdna`
 
-The package ships a CLI — no separate install, zero extra dependencies. Bare `0g-agentdna` opens an **interactive shell** (Claude-Code style); `doctor`/`status`/`list`/`settings` remain scriptable diagnostics subcommands.
+The package ships a CLI — no separate install, zero extra dependencies. Bare `0g-agentdna` opens an **interactive shell** (Claude-Code style) at its manager prompt; `doctor`/`status`/`list`/`settings`/`cred`/`providers`/`releases`/`update` are scriptable one-shot commands. A word of the shell's own (`0g-agentdna login`, `whoami`, `deploy`, …) is refused with where to type it (run `0g-agentdna`, then type it there); any other word is an unknown command, with the nearest command named when it looks like a typo.
 
 ```bash
 npm install @0gfoundation/0g-agentdna
@@ -1077,9 +1148,9 @@ For the old CLI update path and automatic local-config migration, see
 
 ### Interactive shell
 
-Two levels. The **manager** (`0g-agentdna>`): `list` (public listing with sealIds and the same FRAMEWORK/AGENTSEAL/OWNER columns as `0g-agentdna list`, `⇄ #<agentId>` on agent-owned agents, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `settings <id> [key=value …]` (show or change the agent's configuration document), `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login [provider]` (guided setup: attestor URL → owner key → provider → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
+Two levels. The **manager** (`0g-agentdna>`): `list` (the same columns as `0g-agentdna list`, fitted to the terminal, `⇄ #<agentId>` on agent-owned agents, an agent without an agentId yet shown by its sealId prefix, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase; an agent still being minted is entered once it has its agentId), `hello <id> [full]` (any agent's public /hello: identity, proof check, services one per line and owner routes on one line by kind; `full` prints every field — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework → provider → model wizard: a listed number or name, anything else asked again), `start`/`stop`/`reset <id>` (not on an agent still deploying), `settings <id> [key=value …]` (show or change the agent's configuration document), `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account; an amount is checked before any transaction, a bare `deposit`/`withdraw` asks for it with no default — Enter cancels — and `withdraw <og>` asks before restarting a pending refund's time lock), `ack`, `status <id>` / `doctor` / `providers` / `releases` (the one-shot commands), `login [provider]` (guided setup: attestor URL → owner key → each provider's model key → the default provider for new agents; each answer is checked before it is saved and asked again when wrong, Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`. Errors are one or two plain lines with a remedy typed at that prompt.
 
-The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/compact` (keep the conversation but have the framework summarize its older part now — 0g-harness, and openclaw 2026.7.1 or later; one or more model calls, can take minutes) `/restart harness|sealed` (0g-harness: restart one layer of the runtime in place) `/tasks` `/result [id]` `/cancel [id|all]` `/inbox [all]` `/schedules` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed. On a 0g-harness agent, what the agent says on its own (a background job finished, a reminder came due) prints above the prompt as it arrives, and what came while you were away prints when you enter; `/tasks` lists every turn, background command and subagent with who did it, `/cancel <id>` stops any of them and `/cancel all` everything running. On the other frameworks `/inbox` and `/schedules` say the agent has none.
+The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. A message can span lines: a paste stays one message (shown as pasted, sent with the next Enter, never run as a command, whatever its first line starts with), and a line ending in `\` or Option/Alt+Enter goes on to a new line; Backspace at the start of a line joins it to the line before, and Ctrl-C or Esc with text in the box clears it, all its lines. On a terminal the session is drawn with Ink like Claude Code's input area: the `❯ ` input line between two rules at the bottom, a footer under it (it also says when the agent is not running, and the way out: `stopped — /start`; a bare Enter re-reads the phase and prints nothing), a status line above it during a turn (`⠹ running a command… (14s · Esc to stop)`, with `2 notices · 1 new file` at its right), the messages sent during the turn waiting above that, and the transcript scrolling above all of it — your messages as `❯ text`, replies, command output, notices, and one line per run of the agent's tool calls (`· ran 3 commands, read a file`); what you type stays in the box and can be edited while the agent replies. `AGENTDNA_INK=off`, a terminal under 30 columns or 12 rows, CI, or an `ink` package that does not load keep readline's prompt line, which stays on screen during a turn (`agent 286 (replying, Esc stops) › `) with the reply printing above it. On a 0g-harness agent a message you finish while the agent is working goes into the running turn of owner-chat (`agent.steer(text)` over `POST /v1/steer`): the agent reads it before the turn's next model call — shown as waiting for the agent until then (in the framed view it then moves into the transcript as your message; at readline's prompt `waiting for the agent: …`, then `↳ read by the agent: …`) — not in the middle of a long command; if the turn ends first, the agent answers it in the turn after (several such messages may be answered together) and the CLI follows it; an empty Enter waits for the next turn, and Esc stops the turn, the turns that would answer what was inserted and not read with it; those messages, and the ones queued, come back to be edited as one (a command that waited runs next, on its own). Which inserted messages come back is what the agent says after the stop: the ones it dropped (0g-harness drops them with the turn); one it read just before the stop prints as read; one an older 0g-harness still holds — it gives those to its next turn — is listed under `(not put back — …)` and stays out of the box, so it is not sent twice. A command alone on its line during a turn never goes to the agent: one that only reads (`/files`, `/tasks`, `/inbox`, `/hello`, …) runs at once, any other when the turn ends; Tab completes it. A turn that ends with no text because the model's output budget ran out says so (`no answer: …`); a failed turn says in one line whether the model service failed, the model is overloaded (try again for both), or what the error says (with `/agentlog`). Tab queues what you typed instead (shown as next turn, sent as your next message when the turn ends; Esc puts it back to edit, without blank lines), and ↑ on an empty prompt takes the newest queued entry back to edit. Option+Enter needs the Option key to send Meta: in macOS Terminal, Settings → Profiles → Keyboard → "Use Option as Meta key"; in iTerm2, Profiles → Keys → Left Option key: Esc+. Other questions take one line: several pasted lines are not their answer, and a paste does not answer a yes/no question or one that signs. Piped input stays one line per command. Slash commands: `/hello [full]` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …|versions]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/compact` (keep the conversation but have the framework summarize its older part now — 0g-harness, and openclaw 2026.7.1 or later; one or more model calls, can take minutes) `/restart harness|sealed` (0g-harness: restart one layer of the runtime in place) `/activities` `/tasks` `/result [id]` `/cancel [id|all]` `/inbox [all]` `/schedules` `/attach [path …|clear]` (0g-harness: files and images for your next message — an image goes with it, any other file is uploaded to the agent's file inbox `~/inbox` first and the message names its path) `/files [inbox]` (0g-harness: the files the agent left for you in its `~/outbox`; with `inbox`, the ones you sent) `/download <name> [path]` (0g-harness: save one locally, never over an existing file) `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed. On a 0g-harness agent, what the agent says on its own (a notice: a background job finished, a reminder came due) prints above the prompt as it arrives, and what came while you were away prints when you enter (`/inbox` or `/notices` lists them); files it leaves in its `~/outbox` are saved by themselves to `~/agentdna/<agentId>/outbox` on a terminal and, once verified, removed from the agent's outbox (`/files auto off` stops that), and the status line (or, at readline's prompt, the prompt) counts what waits (`2 notices · 1 new file`); `/activities` lists every turn, background command and subagent with who did it, `/cancel <id>` stops any of them and `/cancel all` everything running. On the other frameworks `/inbox` and `/schedules` say the agent has none.
 
 Configuration persists under `~/.config/0g-agentdna/` — `config.json` (attestor URL), `credentials` (owner key + provider-scoped inference keys, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. `rate` checks a ticket on what the registry checks — expiry and the signature — and discards one that fails on its own merits (bad signature — e.g. one banked from a pre-1.2.0 sealed image — or expiry), but keeps one that fails only because no VerifiedFeedbackRegistry, or a different one, is configured on this side. A ticket whose data hashes the agent has since replaced (it commits state drift every 30 s) still redeems — the registry records the version that served you without comparing it to current chain state — so `rate` only notes it and goes ahead. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 
@@ -1088,9 +1159,9 @@ Configuration persists under `~/.config/0g-agentdna/` — `config.json` (attesto
 | Command | What |
 |---|---|
 | `doctor` | Checks every deploy prerequisite — attestor reachable, RPC, wallet, gas, trust-root ack, sandbox balance ≥ 0.1 OG — and prints a remedy per failing item. Exit 0 when all green, 3 otherwise. |
-| `status <agent>` | One agent's full picture: phase, all three coordinates (agentId / sealId / agentSeal), url, failure reason. `<agent>` is a decimal agentId **or** a `0x…` sealId — the CLI converts between them. When a failed deployment's reason is withheld from the public listing (#64), a configured key makes the CLI fetch it via the owner-signed listing automatically. |
+| `status <agent>` | One agent's full picture: phase, all three coordinates (agentId / sealId / agentSeal), failure reason (`--json` also carries the container `url`). `<agent>` is a decimal agentId **or** a `0x…` sealId — the CLI converts between them. When a failed deployment's reason is withheld from the public listing (#64), a configured key makes the CLI fetch it via the owner-signed listing automatically. |
 | `list [--mine] [--phase p]` | Deployment listing; `--mine` (owner-signed, needs the key) adds the owner-only fields. Empty result is `[]` + exit 0. |
-| `settings <agent> [k=v …]` | Show the agent's configuration document; with `key=value` assignments, change it. Keys: `provider`, `model`, `thinking` (`low\|high\|max`), `others` (opaque JSON — quote it: `others='{"a": 1}'`, in the REPL too), and on a 0g-harness agent `sealed` / `harness` (a version's sha256 from the trust registry's lists, which a bare show prints; refused for an agent of another framework). Assignments **merge** onto the stored document; an empty value (`thinking=`) clears a field. **Both** directions are owner-signed (needs the key). A write is a compare-and-swap against the version just read: a concurrent edit by another client is refused with `SETTINGS_CONFLICT` (exit 3), never overwritten. A merged document with no `model` is refused before signing — that is the one state the container hard-fails on. The chosen model is checked against its provider's configured catalog before signing — an absence is a warning on stderr. Native providers without a catalog accept a manual model ID. A provider change requires a registered matching key and image support, then reports pending reset; execute `reset` with that provider's key. |
+| `settings <agent> [k=v …]` | Show the agent's configuration document; with `key=value` assignments, change it. Keys: `provider`, `model`, `thinking` (`low\|high\|max`), `others` (opaque JSON — quote it: `others='{"a": 1}'`, in the REPL too), and on a 0g-harness agent `sealed` / `harness` (a version's sha256 from the trust registry's lists, which `settings <agent> versions` prints — a bare show says on one line which versions run; refused for an agent of another framework). Assignments **merge** onto the stored document; an empty value (`thinking=`) clears a field. **Both** directions are owner-signed (needs the key). A write is a compare-and-swap against the version just read: a concurrent edit by another client is refused with `SETTINGS_CONFLICT` (exit 3), never overwritten. A merged document with no `model` is refused before signing — that is the one state the container hard-fails on. The chosen model is checked against its provider's configured catalog before signing — an absence is a warning on stderr. Native providers without a catalog accept a manual model ID. A provider change requires a registered matching key and image support, then reports pending reset; execute `reset` with that provider's key. |
 
 Environment variables (override the config files):
 

@@ -36,8 +36,10 @@ import { CredentialsApi, checkModelKeyInput, type SealedModelKey } from './Crede
 import { requestKey, requestOnly, storeAfterMint } from './legacy/modelKey';
 import { sha256Hex, type SettingsDoc } from './Settings';
 import { SecretEnvRefusedError, type SecretEnvMode } from './secretEnv';
+import { assertOperatorComputeOptions, type OperatorOptions, type OperatorState } from './Operators';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader, type TaskExchange } from './ServeSession';
 import { listedHashes, trustRegistryOf } from './TrustRegistry';
+import { agentMigrationOf, fetchReleases, type AgentMigration, type ReleaseNotice } from './Releases';
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
 import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
 import type {
@@ -184,7 +186,13 @@ export class AgentApi {
    * the key a running container got with its own create does not count, as
    * the new container will not have it.
    */
-  private async modelKeyPlan(sealId: Hash, opts: ModelKeyLifecycleOpts): Promise<{ keyInCredentials: boolean; beforeWrite?: () => Promise<void> }> {
+  private async modelKeyPlan(sealId: Hash, opts: ModelKeyLifecycleOpts, ownerResolved = false): Promise<{ keyInCredentials: boolean; beforeWrite?: () => Promise<void> }> {
+    if (!ownerResolved && await this.attestor.isRuntimeOperator(sealId)) {
+      assertOperatorComputeOptions(opts);
+      // Owner-provisioned credentials reach the runtime through /provision.
+      // The operator neither reads nor writes the owner's credential set.
+      return { keyInCredentials: true };
+    }
     const sealed = opts.sealedModelKey;
     if (sealed && opts.apiKey) throw new SecretEnvRefusedError('conflicting_inputs', 'pass apiKey or sealedModelKey, not both');
     if (sealed && opts.provider && opts.provider !== sealed.provider) {
@@ -255,7 +263,7 @@ export class AgentApi {
    * read errors fail open — the attestor re-checks at accept anyway.
    * Opt out per call with `{ preflight: false }`.
    */
-  private async preflightOwnerReady(): Promise<void> {
+  private async preflightOwnerReady(checkSandboxBalance = true): Promise<void> {
     const who = this.ctx.account?.address;
     if (!who) return; // browser-wallet flows preflight in their own UI
     if (this.ctx.addresses.tappRegistry !== ZERO) {
@@ -271,7 +279,7 @@ export class AgentApi {
         // chain read failed — fail open, attestor re-checks at accept
       }
     }
-    if (this.ctx.addresses.sandboxServing !== ZERO) {
+    if (checkSandboxBalance && this.ctx.addresses.sandboxServing !== ZERO) {
       try {
         // Prefer the provider's EFFECTIVE balance (on-chain minus reservations
         // minus outstanding off-chain debt) — the number its create/start
@@ -374,7 +382,7 @@ export class AgentApi {
         "deploy: wait:'running' needs a sandbox to provision — a mint-only deploy (no sandbox) has no container to wait on; use wait:'minted'",
       );
     }
-    if (opts?.preflight !== false) await this.preflightOwnerReady();
+    if (opts?.preflight !== false) await this.preflightOwnerReady(!!params.sandbox);
     // The key goes into the credential set as the agent is created: the
     // attestor takes the deploying owner's set before the mint, and holds
     // the container until it is stored (`awaitCredentials`), so the first
@@ -1089,11 +1097,23 @@ export class AgentApi {
     agentSeal: Address | null;
     createdAt: string | null; lastProvisionError: string | null;
     containerStatus: ContainerStatus | null;
+    migrate: AgentMigration | null;
   }>> {
     // slim=1 drops the embedded avatar data-URIs (~95% of the payload); servers
     // predating the param ignore it.
     const rows = (await (await fetch(`${this.attestorBase()}/deployments?slim=1`)).json()) as Array<Record<string, unknown>>;
     return rows.map((r) => this.normalizeDeploymentRow(r));
+  }
+
+  /**
+   * The attestor's published release notices, newest first: what each
+   * release changed, and the images it replaces with the end of their
+   * transition period. Which of your agents run one of those images is on
+   * {@link AgentApi.listMyDeployments} (`migrate`). Empty from an attestor
+   * without release notices.
+   */
+  async releases(): Promise<ReleaseNotice[]> {
+    return fetchReleases(this.attestorBase());
   }
 
   /**
@@ -1131,6 +1151,7 @@ export class AgentApi {
     agentSeal: Address | null;
     createdAt: string | null; lastProvisionError: string | null;
     containerStatus: ContainerStatus | null;
+    migrate: AgentMigration | null;
   } {
     const card = (r.agent_card as Record<string, unknown>) ?? {};
     // The card's url points at the /hello card endpoint; the base (origin)
@@ -1174,6 +1195,9 @@ export class AgentApi {
       createdAt: (r.created_at as string) ?? null,
       lastProvisionError: failureReason,
       containerStatus: containerStatusOf(r.container_status),
+      // Owner tier only: the release that asks this agent to move to a
+      // newer image, and by when (GET /releases has the notes).
+      migrate: agentMigrationOf(r.migrate),
       // No `settings`: the owner's configuration document is owner-gated on
       // READ as well as write and is served only by {@link getSettings}. No
       // listing tier carries it, so advertising it here would have meant a
@@ -1181,15 +1205,33 @@ export class AgentApi {
     };
   }
 
-  /** Stop a running agent's sandbox (owner-signed). Identity is preserved. */
-  stop(sealId: Hash, sandboxId: string): Promise<void> {
-    return this.attestor.lifecycle('stop', { sealId, sandboxId });
+  /** Public runtime delegation. NFT ownership and private settings are not delegated. */
+  getOperator(sealId: Hash): Promise<OperatorState> {
+    return this.attestor.getOperator(sealId);
+  }
+
+  /** Owner-only. Updating a grant retires the current runtime; its controller must provision again. */
+  setOperator(sealId: Hash, operator: Address, opts: OperatorOptions = {}): Promise<OperatorState> {
+    return this.attestor.setOperator(sealId, operator, opts);
+  }
+
+  /** Owner-only. Revokes the operator and retires the current runtime. */
+  revokeOperator(sealId: Hash, opts: { baseVersion?: number } = {}): Promise<OperatorState> {
+    return this.attestor.revokeOperator(sealId, opts);
+  }
+
+  /** Stop a running sandbox with its controller wallet (the owner or appointed, paying operator). */
+  async stop(sealId: Hash, sandboxId?: string): Promise<void> {
+    await this.attestor.lifecycle('stop', { sealId, sandboxId, resolveSandbox: !sandboxId });
   }
   /**
-   * Bring an agent's container online (owner-signed). Two shapes:
+   * Bring an agent online with its owner or appointed operator wallet.
+   * The signing wallet controls and pays for the sandbox. Two shapes:
    *  - `start(sealId, sandboxId)` — resume a STOPPED container.
-   *  - `start(sealId, { apiKey, sealedImage? })` — FIRST provision of a
-   *    mint-only / never-provisioned agent (no sandbox yet): spins a fresh
+   *  - `start(sealId, options?)` — resumes the mapped sandbox, or first
+   *    provisions a mint-only agent when there is no sandbox mapping. It never
+   *    resets a mapped sandbox automatically after a failed resume.
+   *    A first provision spins a fresh
    *    container. The semantic counterpart to a sandbox-less `deploy` —
    *    use this, not `reset` (which means "recreate an existing container").
    *    `apiKey`, the model key, goes into the agent's credential set (see
@@ -1198,27 +1240,31 @@ export class AgentApi {
    *    `credentials.sealModelKey` output as `sealedModelKey` instead of
    *    `apiKey`, so the key never reaches the signer at all.
    *
-   * Both shapes, like {@link reset}, first store the default model
+   * Owner calls, like {@link reset}, first store the default model
    * (`DEFAULT_PERSONA_INFERENCE`) as the agent's settings document when it
    * has none and could boot without a model: a clone, or an agent that has
    * provisioned before (`needsDefaultSettings`). That write is one more
    * owner signature, made after every check that can refuse the call; an
-   * existing document is never replaced.
+   * existing document is never replaced. Operator calls do not write settings
+   * or credentials; the owner must configure the model before delegation.
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
   start(sealId: Hash, opts?: ModelKeyLifecycleOpts): Promise<void>;
   async start(sealId: Hash, arg?: string | ModelKeyLifecycleOpts): Promise<void> {
     if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
-    const key = await this.modelKeyPlan(sealId, arg ?? {});
     // `framework` resolves the right sealed image for a first provision (a
     // mint-only hermes/prime agent otherwise boots the default snapshot) —
     // same resolution deploy/reset use. (review #154 opportunity)
-    return this.attestor.lifecycle('start', { sealId, provider: arg?.provider ?? arg?.sealedModelKey?.provider, framework: arg?.framework, sealedImage: arg?.sealedImage, ...requestKey(arg ?? {}), ...key });
+    return this.attestor.lifecycle('start', { sealId, resolveSandbox: true,
+      provider: arg?.provider ?? arg?.sealedModelKey?.provider, framework: arg?.framework, sealedImage: arg?.sealedImage,
+      ...requestKey(arg ?? {}), operatorOptions: arg ?? {},
+      prepareModelKey: () => this.modelKeyPlan(sealId, arg ?? {}, true) });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
    * identity — a fresh boot that re-reads iData from chain and reselects
-   * the framework adapter from the binding. Owner-signed. The new
+   * the framework adapter from the binding. An operator needs the owner's
+   * `allowRecreate` permission and cannot supply model or credential changes. The new
    * container takes its model key from the agent's credential set at boot:
    * a key held there needs no `apiKey`. A given `apiKey` (or
    * `sealedModelKey`) is stored there first, as for {@link start}.
@@ -1237,8 +1283,10 @@ export class AgentApi {
    * with {@link setSettings} first.
    */
   async reset(sealId: Hash, opts?: ModelKeyLifecycleOpts): Promise<void> {
-    const key = await this.modelKeyPlan(sealId, opts ?? {});
-    return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider ?? opts?.sealedModelKey?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, ...requestKey(opts ?? {}), ...key });
+    return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider ?? opts?.sealedModelKey?.provider,
+      framework: opts?.framework, sealedImage: opts?.sealedImage, ...requestKey(opts ?? {}),
+      operatorOptions: opts ?? {},
+      prepareModelKey: () => this.modelKeyPlan(sealId, opts ?? {}, true) });
   }
 
   /**

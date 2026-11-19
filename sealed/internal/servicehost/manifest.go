@@ -67,6 +67,9 @@ type Manifest struct {
 	InferenceBudget *inferproxy.TaskLimits `json:"inference_budget,omitempty"`
 	// Bounds temporary request/task workers, never the service coordinator.
 	RequestTimeoutSeconds int `json:"request_timeout_seconds,omitempty"`
+	// Optional read-only copies of the agent's committed persona, skills and
+	// public memory for every temporary worker (agentdata.go).
+	AgentData *AgentDataGrant `json:"agent_data,omitempty"`
 }
 
 // checkPublish holds the rules Publish applies to a new release on top of
@@ -91,6 +94,9 @@ func (m *Manifest) normalize() (string, error) {
 		if err := m.InferenceBudget.Validate(); err != nil {
 			return "", err
 		}
+	}
+	if m.AgentData != nil && len(m.AgentData.Kinds()) == 0 {
+		return "", fmt.Errorf("agent_data: grant persona, skills or public_memory")
 	}
 	if !validID.MatchString(m.ID) {
 		return "", fmt.Errorf("id: use a lowercase service name, up to 32 characters")

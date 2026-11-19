@@ -181,6 +181,9 @@ async fn main() -> anyhow::Result<()> {
         events,
         oss,
         credentials: attestor_shared::credentials_repo::PostgresCredentialRepo::new(pool.clone()),
+        runtime_creates: attestor_shared::runtime_creates::PostgresRuntimeCreateRepo::new(
+            pool.clone(),
+        ),
     };
 
     // background sweep task — four responsibilities, same 60s tick:
@@ -200,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
         let sandbox = ctx.sandbox.clone();
         let sandbox_proxy_addr = cfg.sandbox_proxy_addr.clone();
         let agent_serve_port = cfg.agent_serve_port;
+        let reaper_ctx = ctx.clone();
         // sealed reports through the provider-signed attestor TLS statement;
         // the sweep checks that the provider serves one, as the api relay
         // does, before it reads a stale heartbeat as a dead agent.
@@ -217,6 +221,24 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
+
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    jobs::recover_created_runtimes(&reaper_ctx),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "accepted create recovery sweep failed")
+                    }
+                    Err(_) => {
+                        tracing::warn!("accepted create recovery sweep deferred remaining records")
+                    }
+                }
+                if let Err(e) = jobs::reap_operator_teardowns(&reaper_ctx).await {
+                    tracing::warn!(error = %e, "operator sandbox cleanup sweep failed");
+                }
 
                 // (a) Job retention.
                 match queue.sweep_expired(retention).await {
@@ -420,6 +442,7 @@ mod tests {
             secret_env_enabled: false,
             cli_latest: String::new(),
             cli_notes: String::new(),
+            releases_file: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],

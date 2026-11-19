@@ -39,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 
+	"seal-verify/internal/agentdata"
 	"seal-verify/internal/attestorhttp"
 	"seal-verify/internal/chain"
 	"seal-verify/internal/config"
@@ -797,14 +798,16 @@ func startAgent(
 	}
 
 	// What the watcher hashes and the uploader commits is scrubbed of the
-	// credential values sealed holds (internal/scrub). Built before Phase A,
-	// which reads the disk the way the watcher does to find the agent's
-	// uncommitted edits. The drift handler keeps the adapter itself: it asks
-	// it for optional interfaces.
-	var idata framework.Framework = adapter
+	// credential values sealed holds and of secrets of known formats
+	// (internal/scrub), for every framework, with or without credentials.
+	// Built before Phase A, which reads the disk the way the watcher does to
+	// find the agent's uncommitted edits. The drift handler keeps the
+	// adapter itself: it asks it for optional interfaces.
+	var heldValues scrub.Values
 	if credValues != nil {
-		idata = scrub.Wrap(adapter, credValues)
+		heldValues = credValues
 	}
+	var idata framework.Framework = scrub.Wrap(adapter, heldValues)
 
 	// An adapter whose roles keep the agent's uncommitted edits
 	// (framework.UncommittedKeeper) reads what this container last had in
@@ -1011,6 +1014,22 @@ func startAgent(
 		currentStatus.SettingsIssue(fmt.Sprintf("owner settings unusable (%v); write the agent's settings (provider and model)", err))
 	}
 
+	// The agent's committed data for hosted programs that ask for it
+	// (servicehost agent_data): kept per committed version, built after every
+	// confirmed commit and on boot (internal/agentdata).
+	var agentData *agentdata.Provider
+	if adapter.Name() == "0g-harness" || adapter.Name() == "dsh" {
+		agentData = agentdata.New(privsep.StateDir+"/agent-data", idata, func(role string) (string, string) {
+			e := agent.ChainEntry(role)
+			return e.ContentHash, e.DataHash
+		})
+	}
+	observeCommit := func(dim string) {
+		if agentData != nil {
+			go agentData.Observe(context.Background(), dim)
+		}
+	}
+
 	// The record of what this container has in sync with the chain starts
 	// from what Phase A and B seeded, and follows every confirmed commit.
 	if keeper != nil {
@@ -1020,7 +1039,17 @@ func startAgent(
 			inSync[r.Name] = agent.ChainEntry(r.Name).ContentHash
 		}
 		synced.setAll(inSync)
-		agent.SetChainUploadHook(synced.set)
+		agent.SetChainUploadHook(func(dim, contentHash string) {
+			synced.set(dim, contentHash)
+			observeCommit(dim)
+		})
+	} else if agentData != nil {
+		agent.SetChainUploadHook(func(dim, _ string) { observeCommit(dim) })
+	}
+	if agentData != nil {
+		for _, role := range []string{agentdata.RolePersona, agentdata.RoleSkills, agentdata.RolePublicMemory} {
+			observeCommit(role)
+		}
 	}
 
 	// Build the uploader. The watcher tick handler reuses this single
@@ -1080,6 +1109,15 @@ func startAgent(
 				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 				defer cancel()
 				return lr.acquireServiceRuntime(ctx, harness)
+			},
+			Owner: strings.ToLower(res.owner),
+			AgentData: func(ctx context.Context, g servicehost.AgentDataGrant) ([]servicehost.AgentDataPart, func(), error) {
+				if agentData == nil {
+					return nil, nil, fmt.Errorf("agent data is unavailable for this framework")
+				}
+				ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				return agentData.Parts(ctx, g)
 			},
 		})
 		if err != nil {
@@ -1567,13 +1605,12 @@ func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte,
 //     next watcher tick re-detects divergence (chainSnapshot stays
 //     stale, currentSnapshot still differs) and Apply re-runs naturally.
 //
-// All errors are logged. Error classification follows severityOf:
-//   - "warning" (owner-recoverable, e.g. insufficient funds): reported
-//     to the attestor immediately on first occurrence so the UI can
-//     surface the owner-action prompt without delay; the failure
-//     counter is NOT advanced (it's not a system failure).
-//   - "error" (genuine system failure): reported after failureEscalateAt
-//     consecutive Apply failures so transient blips don't false-alarm.
+// All errors are logged. A failed commit makes the status a "warning", never
+// an "error" (commitFailureStatus): the agent runs; only its data is not on
+// chain yet. An owner-recoverable cause (the seal wallet cannot pay) shows at
+// once; any other after failureEscalateAt consecutive failures, so a
+// transient blip does not show. Retries of the same content back off
+// (commitretry.go); new content is tried at once.
 const failureEscalateAt = 5
 
 var consecutiveApplyFailures int
@@ -1657,34 +1694,30 @@ func handleDrift(
 	// zero — a death loop of "10 OKs + 1 kill" with no progress to chain.
 	// Inheriting ctx (watchCtx) here is effectively unbounded, gated only
 	// by the per-blob timeout downstream.
-	if err := upload.Apply(ctx, plaintexts); err != nil {
-		sev := severityOf(err)
-		summary := summarizeError(err)
-		logger.Logf("drift: upload.Apply: %v (severity=%s)", err, sev)
-
-		if sev == "warning" {
-			// Owner-recoverable. Don't count it toward the system-failure
-			// threshold (a chronically-unfunded agent shouldn't ratchet
-			// up consecutiveApplyFailures forever). Push the status
-			// immediately on the first transition so the UI prompts the
-			// owner without waiting for the next heartbeat.
-			if prev := currentStatus.Set("warning", summary); prev != "warning" {
-				level, msg := currentStatus.Get()
-				report.Status(attestorURL, agentSealPriv, sealID, level, msg, binding)
-			}
-			return
-		}
-
-		// Real system error: keep the 5-failure threshold to ride out
-		// transient network / chain blips.
-		consecutiveApplyFailures++
-		if consecutiveApplyFailures == failureEscalateAt {
-			msg := fmt.Sprintf("upload.Apply failed %d times: %s", failureEscalateAt, summary)
-			currentStatus.Set("error", msg)
-			report.Status(attestorURL, agentSealPriv, sealID, "error", msg, binding)
+	key := driftKey(plaintexts)
+	if wait, first := commitRetry.Wait(time.Now(), key); wait > 0 {
+		if first {
+			logger.Logf("drift: the last commit of this content failed; the next attempt is in %s", wait.Round(time.Second))
 		}
 		return
 	}
+	if err := upload.Apply(ctx, plaintexts); err != nil {
+		consecutiveApplyFailures++
+		next := commitRetry.Failed(time.Now(), key)
+		level, msg := commitFailureStatus(err, consecutiveApplyFailures, fundsShortfall(ctx, upload.FundsFor, err))
+		logger.Logf("drift: upload.Apply: %v (failure %d; next attempt in %s unless the content changes)", err, consecutiveApplyFailures, next)
+		if level == "" {
+			return
+		}
+		// Push the status on the transition so the owner sees it without
+		// waiting for the next heartbeat; later failures only update it.
+		if prev := currentStatus.Set(level, msg); prev != level {
+			level, msg := currentStatus.Get()
+			report.Status(attestorURL, agentSealPriv, sealID, level, msg, binding)
+		}
+		return
+	}
+	commitRetry.Succeeded()
 	consecutiveApplyFailures = 0
 	// Success: if we were previously in warning / error, push a "running"
 	// status now so the UI clears without waiting for the next heartbeat.

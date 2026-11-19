@@ -110,7 +110,8 @@ only base, sealed and the official harness get fields of their own.
 - **In the ServeProof**: through `dataHashes` (ciphertext roots), as before. A
   verifier finds the entry on chain by it, then reads the entry's salted
   plaintext commitment (§7.1).
-- **Update**: changes most often. The watcher commits changes every 30 s; when
+- **Update**: changes most often. The watcher commits changes every 30 s (a
+  failing commit retries with backoff, up to every 30 min); when
   a change applies is up to the harness, e.g. the persona is read when the
   harness starts.
 
@@ -163,6 +164,7 @@ release, and hands it to the loader only if it hashes to that name.
 Contents:
 - Debian and a pinned node; python3; a browser for the owner's agent
   (Chromium and the Playwright MCP server, started by `sealed-browser-mcp`);
+  `pdftotext` (poppler-utils) for the PDFs the owner uploads;
 - the tools sealed runs: git, procps, 0g-storage-client (the CLI at the
   version sealed's `go.mod` pinned when the image was built; a sealed version
   that needs another needs a new image);
@@ -228,7 +230,7 @@ attestor's stop/start remains.
 
 The last three keep the disk: turns and background tasks in progress stop,
 while the conversation, inbox and reminders live on disk and survive. So do
-the persona and skills the agent changed after its last commit: sealed keeps,
+the persona, skills and memory the agent changed after its last commit: sealed keeps,
 on disk and root-only, the version this container last had in sync with the
 chain, and when on the next boot the chain has not moved but the disk has, it
 keeps the disk and lets the watcher commit it, instead of restoring the chain
@@ -320,8 +322,11 @@ sealed that exits, so sealed keeps writing it for them
    name, and puts the platform doc and the doctrine into every model request.
    The harness cannot remove either by changing its own code. Only model calls
    pass, by exact path under the route: `chat/completions`, `messages` and
-   `responses`, and the model list.
-3. **Egress**: the harness's other outbound requests, such as web search,
+   `responses`, and the model list; also the web search of the service the
+   owner picks (`web/search`, a query only, with no platform doc). The
+   owner's further subagent models are routes of their own, each pinning its
+   models and carrying the platform doc.
+3. **Egress**: the harness's other outbound requests, such as fetching web pages,
    third-party APIs and dependency installs, also go through sealed, which fills
    in credentials and lets listed destinations through. This depends on the
    network layer blocking the harness from connecting out directly (§9).
@@ -530,7 +535,7 @@ encode it into normal-looking traffic. The channels:
   and credentials sealed fills in can write data to allowed hosts.
 - Data inside signed transactions. Transactions are public, and the signing
   policy can limit which kinds are signed but not data encoded in parameters.
-- Model requests themselves carry the persona and skills. With the owner's own
+- Model requests themselves carry the persona, the skills and the memory index. With the owner's own
   provider account, what the provider sees is outside the platform's control.
 
 What the owner can never get is the agent identity key and the data key: the
@@ -644,7 +649,9 @@ the plaintext. Each entry therefore also carries a plaintext commitment:
 - the salt is not stored but derived from the role's data key:
   `HMAC(data key, label ‖ role ‖ dataHash)`, one per file for directory roles,
   each from that file's own storage root. Unchanged content reuses its
-  ciphertext, so its `dataHash`, salt and commitment stay the same;
+  ciphertext, so its `dataHash`, salt and commitment stay the same; so does
+  content that comes back to what an earlier commit of the same boot held,
+  under the same data key;
 - only TEEs hold the data key, so sealed produces proofs: to prove one version
   or one file to someone, it hands over that one salt, leaving other versions
   and files unaffected; or it generates a ZK proof inside, with the salt as a
@@ -781,7 +788,10 @@ hold, so the neutral proxies need not ship with step one:
   their official addresses fixed in sealed, §7) with the model name the
   owner's settings pin, the credential proxy fills the key on the way out, and
   the harness holds a placeholder for a key. Only chat/completions,
-  messages, responses and model-list calls pass, by exact path;
+  messages, responses and model-list calls pass, by exact path, and the web
+  search of the owner's chosen service (`web/search`); the owner's further
+  subagent models are named routes of the same proxy, each with its own key
+  and models;
 - the doctrine injected by the inference proxy: the platform doc, doctrine
   included, goes at the end of every model request's system prompt, and sealed
   no longer writes the `/run` platform-doc file for 0g-harness;

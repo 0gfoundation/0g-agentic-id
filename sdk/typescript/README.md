@@ -120,10 +120,10 @@ await ag.agent.balanceOf(owner);            // → 5n      agents owned by `owne
 // agent-seal gas — the agent's own on-chain-write budget
 await ag.agent.topUpAgentSeal(await ag.agent.getAgentSeal(agentId), parseEther('0.01'));   // → "0x…"
 
-// runtime lifecycle (owner-signed; on-chain identity preserved)
+// runtime lifecycle (owner or appointed operator; on-chain identity preserved)
 await ag.agent.stop(sealId, sandboxId);
 await ag.agent.start(sealId, sandboxId);      // resume a STOPPED container
-await ag.agent.start(sealId, { apiKey });     // FIRST provision of a mint-only agent
+await ag.agent.start(sealId, { apiKey });     // owner: resume current sandbox, or first provision if no mapping
 await ag.agent.reset(sealId, { framework, apiKey });   // recreate an EXISTING container
 // start/reset of an agent with no settings document that is a clone or has
 // provisioned before first store the default model (0g-compute) as its settings
@@ -131,7 +131,10 @@ await ag.agent.reset(sealId, { framework, apiKey });   // recreate an EXISTING c
 await ag.agent.retry(sealId, { apiKey });     // resume a 'failed' deploy (do NOT redeploy — that orphans the mint)
 await ag.agent.listDeployments();             // public listing; sandboxId/lastProvisionError/containerStatus null (owner+agentSeal present on minted rows)
 await ag.agent.listMyDeployments();           // owner-signed; full detail
-// row → { agentId, sealId, phase, sandboxId, url, owner, agentSeal, name, createdAt, lastProvisionError, containerStatus }
+// row → { agentId, sealId, phase, sandboxId, url, owner, agentSeal, name, createdAt, lastProvisionError, containerStatus, migrate }
+// migrate (owner listing only): { version, framework, until, urgent, state } | null — a published
+// release replaces this agent's image: reset it by `until` (state 'recommended' | 'soon' | 'overdue').
+await ag.agent.releases();                    // the attestor's release notices, newest first (GET /releases)
 // phase: 'deploying' | 'running' | 'stopped' | 'offline' | 'failed'
 // containerStatus: { level, reason, at } | null — the container's last report. phase
 // shows a 'warning' as 'running' (e.g. reason "owner settings unusable…": no model).
@@ -154,6 +157,13 @@ await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3
 Every write is a **compare-and-swap** on `baseVersion` — the version you read before editing (0 = "no document yet"). If the stored version has moved on, the write is refused with `SettingsConflictError`, which carries the document that is actually there. Re-read, re-apply, write again; do not loop on it, or the other writer's change is the one that disappears.
 
 The [lifecycle guide](./GUIDE.md#agagent--lifecycle--reads) covers async phases, transfer teardown, mint-only vs first-provision, `apiKey` handling, and failure reasons.
+
+For operator-funded hosting, the owner mints without a sandbox, configures its
+settings and credentials, then calls `agent.setOperator(sealId, operatorAddress)`.
+The operator funds its own sandbox balance and calls `agent.start(sealId)` /
+`agent.stop(sealId)` without model-key options. Every grant update retires the
+current runtime; provision again after a change. See [runtime operators](./OPERATORS.md)
+([中文](./OPERATORS.zh.md)).
 
 A model key given to `deploy` / `start` / `reset` / `retry` is stored in the agent's credential set. While older images are in use it also rides the request: `start` / `reset` / `retry` seal it to the agent (`SEAL_SECRET_ENV`) when the attestor advertises `secret_env_scheme`, so the owner's wallet prompt never shows it. A one-shot `deploy` with `sandbox` still signs it in clear; to avoid that, deploy without `sandbox`, then `start(sealId, { apiKey })`. When your server supplies the key and a user signs, seal it on the server with `credentials.sealModelKey(sealId, { owner, provider, apiKey })` and have the browser store the result with `credentials.setModelKey` (or pass it to `start` / `reset` / `retry` as `sealedModelKey`), so the key never reaches the browser. See the [guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes) for `secretEnv: 'sealed' | 'plaintext'` and `SecretEnvRefusedError`.
 
@@ -353,14 +363,45 @@ await agent.cancelTask!(taskId);                  // stop the turn
 
 // The agent's own work (0g-harness): turns it opens by itself (a background job
 // finished, a reminder came due) and what runs in the background. Each method
-// is present only when /hello declares its kind (inbox / events / tasks /
+// is present only when /hello declares its kind (inbox / events / activities /
 // schedules) and this handle holds the owner key:
 const box = await agent.inbox!();                 // unread messages + the cursor
 if (box.data.length) await agent.ackInbox!(box.data[box.data.length - 1].seq);  // read, for every client
-for await (const e of agent.events!({ after: box.cursor, signal })) { /* inbox.message, turn.*, task.updated, … */ }
-await agent.tasks!();                             // turns, commands, subagents: who did each, who asked
-await agent.stopTask!('subagent-1');              // one task; stopAllTasks() for everything running
+for await (const e of agent.events!({ after: box.cursor, signal })) { /* inbox.message, turn.*, activity.updated, … */ }
+await agent.activities!();                        // turns, commands, subagents: who did each, who asked
+await agent.stopActivity!('subagent-1');          // one of them; stopAllActivities() for everything running
+// (tasks()/stopTask() are their deprecated names; zgh-style tasks are createTask() and friends, below)
 await agent.schedules!();                         // reminders the agent set for itself
+
+// Images and files (0g-harness). Images ride the message (PNG/JPEG/WebP/GIF,
+// base64; 8 per message, 10 MiB each). A model that cannot view images gets
+// them as files instead, and onNotice says so. uploadFile (present when /hello
+// declares kind "files") puts a file in the agent's file inbox ~/inbox; tell it the path:
+const { path } = await agent.uploadFile!('report.pdf', bytes);   // ≤ 25 MiB
+for await (const d of agent.chatStream!([{ role: 'user', content: `read ${path}; what is in this screenshot?` }], {
+  images: [{ mediaType: 'image/png', data: pngBase64 }],
+  onNotice: (n) => { if (n.imagesSavedAsFiles) console.log('model cannot see images:', n.imagesSavedAsFiles); },
+})) process.stdout.write(d);
+
+// Steer the running turn (0g-harness, kind "steer"): read before its next model call.
+const r = await agent.steer!('use the v2 API instead');  // { merged: true, id, turn } | { merged: false, queued, reason }
+if (r.merged) console.log((await agent.steerState!(r.id!)).state);   // pending | merged | turn | dropped
+
+// The owner's sessions (0g-harness, kind "sessions"): each its own conversation,
+// sharing persona, skills and memory. owner-chat is the default one behind chatStream.
+const s = await agent.createSession!({ title: 'research' });   // or { fork: 'owner-chat', at?: n }
+const p = await agent.promptSession!(s.id, 'look into X');     // { merged, id: response id, session }; mode 'steer' reaches a running turn
+for await (const d of agent.followTask!(p.id)) process.stdout.write(d);
+await agent.sessions!();                          // owner-chat and the rest, newest first
+await agent.cancelSession!(s.id);                 // stop its running turn
+
+// Tasks (0g-harness, kinds "tasks" + "task-feed", zgh's task model): a piece of work
+// in a session and workspace of its own, ending each run with an outcome record.
+const { task, created } = await agent.createTask!({ prompt: 'migrate the db', id: 'task-migrate-1' });  // id taken → created: false
+const t = await agent.getTask!(task.id);          // state: queued | working | idle | needs-input | done | failed | archived; records, outcome
+await agent.taskInput!(task.id, 'use option a');  // answers open questions; steers a working run ({ mode: 'next' }: its next turn)
+for await (const e of agent.taskFeed!({ signal })) { /* { type: 'task', task } … { type: 'ready' } … */ }
+await agent.cancelTaskRun!(task.id);              // stop the run; archiveTask() puts it away
 
 // opinionated shortcuts over client():
 const auth = await ag.agent.authenticate(agentId);   // mints the owner token up front (needs a wallet)

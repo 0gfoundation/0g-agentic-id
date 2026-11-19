@@ -221,7 +221,7 @@ Conventions and rules:
   | openclaw (`openclaw.go:164`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `~/.openclaw/openclaw.json`, re-rendered every spawn |
   | hermes (`hermes.go:143`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `~/.hermes/config.yaml`, re-rendered every spawn |
   | prime-agent (`prime.go:162`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `~/.prime/agent/models.json`, re-rendered every spawn |
-  | 0g-harness (`harness.go:167`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | none — the harness's process environment |
+  | 0g-harness (`harness.go:208`) | `framework`, `APPEND_SYSTEM.md`, `skills/`, `memory/`, `memory-public/` | none — the harness's process environment |
 
   `openclaw.json`, `config.yaml`, `models.json` and `settings.yaml` were all
   roles until the owner's settings document became the pin's durable home.
@@ -1600,6 +1600,28 @@ retired role's pin).
    (`<name>.md`) — this role tracks both entry shapes. The provider's own
    reserved child (`.system`) is excluded, the same pattern hermes uses for
    `skills/.bundled_manifest`.
+5. **`memory/`** — `DirectoryManifest` over `$DSH_HOME/memory/`, the agent's
+   private long-term memory (used only in the owner's own sessions and
+   tasks): one `<name>.md` per memory directly in the directory, plus the
+   `MEMORY.md` index, one file entry each — hermes's `memories/` shape.
+   Subdirectories, dotfiles, links and empty files are not tracked
+   (`harness/memory.go`). DSH has no memory of its own; the harness keeps the
+   memories, or above a size their index, in the model's context through its
+   own system-prompt section, read at every model step (0g-harness
+   `src/memory.mjs`). An agent minted before the role existed has no such
+   chain entry: bootstrap round B lands the empty default, which equals the
+   empty directory's evolution, so nothing is committed until the agent
+   writes a memory. Like the persona and skills it is the agent's own writing
+   (`KeepsUncommitted`).
+6. **`memory-public/`** — the same shape over `$DSH_HOME/memory-public/`: the
+   agent's public long-term memory, knowledge that may also be used outside
+   the owner's sessions. The harness writes it only on the owner's explicit
+   request. Each memory in either role names the owner who confirmed it
+   (`trusted_by`); the harness trusts it only while that is the current owner,
+   which sealed passes as `SEAL_OWNER`, so a transfer turns the previous
+   owner's memories into reference without rewriting them. That trust is the
+   harness's business: to sealed both roles are files. Defaults, restore of an
+   absent entry and `KeepsUncommitted` are as for `memory/`.
 
 **What a fifth data point taught about scope, before any code was written.**
 DSH is the first framework here whose own designers explicitly *invite*

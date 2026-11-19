@@ -21,8 +21,9 @@
  * same quotes rather than breaking the JSON on its spaces.
  */
 
-import { CliError } from './errors';
+import { CliError, agentCmd } from './errors';
 import { THINKING_LEVELS, type SettingsDoc, type ThinkingLevel, type VersionPicks } from '../Settings';
+import { MODEL_KEY_PREFIX } from '../Credentials';
 
 /** The layered runtime's version picks, spelled as their own keys and
  *  written into the document's `versions` (0g-harness only). */
@@ -43,13 +44,13 @@ export interface Assignment {
   value: string | ThinkingLevel | unknown | undefined;
 }
 
-const USAGE = '0g-agentdna settings <agent> [provider=… model=… thinking=low|high|max others=<json> sealed=0x… harness=0x…]';
+/** The command's grammar, as typed where the owner is (`settings 286 […]` in the shell). */
+const usage = (): string => `${agentCmd('settings')} [provider=… model=… thinking=low|high|max others=<json> sealed=0x… harness=0x… | versions]`;
 
 const isVersionKey = (key: string): key is VersionKey => (VERSION_KEYS as readonly string[]).includes(key);
 
-/** How to quote a JSON value, in either place it can be typed. */
-const FRAMEWORK_QUOTING =
-  `settings <agent> others='{"key": "value"}'   # quote it — inside the REPL too`;
+/** How to quote a JSON value, as typed where the owner is. */
+const frameworkQuoting = (): string => `${agentCmd('settings', `others='{"key": "value"}'`)}   # quote it`;
 
 /**
  * Parse `key=value` positionals. Throws `BAD_FLAG` (exit 2) on an unknown
@@ -62,7 +63,7 @@ export function parseAssignments(args: string[]): Assignment[] {
   for (const arg of args) {
     const eq = arg.indexOf('=');
     if (eq < 1) {
-      throw new CliError('BAD_FLAG', `not a setting assignment: "${arg}" (expected key=value)`, { remedy: USAGE });
+      throw new CliError('BAD_FLAG', `not a setting assignment: "${arg}" (expected key=value)`, { remedy: usage() });
     }
     const key = arg.slice(0, eq);
     const raw = arg.slice(eq + 1);
@@ -71,7 +72,7 @@ export function parseAssignments(args: string[]): Assignment[] {
         'BAD_FLAG',
         `unknown setting "${key}" — the platform's named fields are ${SETTINGS_KEYS.join(', ')} ` +
           '(anything framework-specific goes inside others=<json>)',
-        { remedy: USAGE },
+        { remedy: usage() },
       );
     }
     if (raw === '') {
@@ -80,12 +81,12 @@ export function parseAssignments(args: string[]): Assignment[] {
     }
     if (key === 'thinking' && !(THINKING_LEVELS as readonly string[]).includes(raw)) {
       throw new CliError('BAD_FLAG', `thinking must be one of ${THINKING_LEVELS.join('|')}, got "${raw}"`, {
-        remedy: USAGE,
+        remedy: usage(),
       });
     }
     if (isVersionKey(key) && !/^0x[0-9a-fA-F]{64}$/.test(raw)) {
       throw new CliError('BAD_FLAG', `${key}= takes a version's sha256 hash, "0x" + 64 hex, got "${raw}"`, {
-        remedy: `settings <agent>   # on a 0g-harness agent, lists the versions the trust registry has; ${key}= clears the pick`,
+        remedy: `${agentCmd('settings')} on a 0g-harness agent lists the versions the trust registry has; ${key}= clears the pick`,
       });
     }
     if (key === 'others') {
@@ -94,9 +95,10 @@ export function parseAssignments(args: string[]): Assignment[] {
         parsed = JSON.parse(raw);
       } catch (e) {
         throw new CliError('BAD_FLAG', `others= must be JSON: ${(e as Error).message}`, {
-          remedy: FRAMEWORK_QUOTING,
+          remedy: frameworkQuoting(),
         });
       }
+      assertHarnessKnobShapes(parsed);
       out.push({ key, value: parsed });
       continue;
     }
@@ -106,7 +108,93 @@ export function parseAssignments(args: string[]): Assignment[] {
 }
 
 /** `others` keys only the 0g-harness adapter reads (sealed `harness/settings.go`). */
-export const HARNESS_ONLY_KEYS = ['toolJobs', 'subagents', 'schedule', 'maxParallelToolCalls'] as const;
+export const HARNESS_ONLY_KEYS = ['toolJobs', 'subagents', 'schedule', 'maxParallelToolCalls', 'modelImages', 'memoryExtract', 'memoryExtractMinMessages', 'memoryInlineBytes', 'memoryRecall', 'memoryTidy', 'webTools', 'webSearch', 'subagentModels', 'subagentDefault'] as const;
+
+/** Search services `others.webSearch.service` may name (sealed `inference.SearchServices`), and `off`. */
+export const WEB_SEARCH_SERVICES = ['0g-router', 'openai', 'anthropic', 'off'] as const;
+/** At most this many `others.subagentModels` (sealed `maxSubagentModels`). */
+export const MAX_SUBAGENT_MODELS = 8;
+const PROVIDER_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$/;
+const CREDENTIAL_NAME = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+
+function knobError(message: string): CliError {
+  return new CliError('BAD_FLAG', message, {
+    remedy:
+      'others={"webSearch":{"service":"0g-router|openai|anthropic|off","credential":"<name>","model":"<id>"},' +
+      '"subagentModels":[{"provider":"<id>","model":"<id>","credential":"<name>"}],"subagentDefault":{"provider":"<id>","model":"<id>"}}',
+  });
+}
+
+/**
+ * A model key entry (`model.<provider>`) pays only the agent's own model:
+ * the credential proxy has no placeholder for it, so sealed refuses it here.
+ */
+function assertNotModelKey(credential: unknown, field: string): void {
+  if (typeof credential === 'string' && credential.startsWith(MODEL_KEY_PREFIX)) {
+    throw knobError(`${field} "${credential}" is a model key, which pays only the agent's own model: leave "credential" out to use the model key, or store the key as an owner credential (cred <agent> set <name> preset=<provider>) and name that`);
+  }
+}
+
+function onlyKeys(v: unknown, keys: string[]): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).every((k) => keys.includes(k));
+}
+
+/**
+ * Check the shape of the 0g-harness model knobs in `others`, before anything
+ * is signed, the way sealed reads them (`harness/settings.go`): sealed would
+ * drop a malformed one at boot and log why; here the owner hears it first.
+ */
+export function assertHarnessKnobShapes(others: unknown): void {
+  if (!others || typeof others !== 'object' || Array.isArray(others)) return;
+  const o = others as Record<string, unknown>;
+  if ('webSearch' in o) {
+    const ws = o.webSearch;
+    if (!onlyKeys(ws, ['service', 'credential', 'model']) || !(WEB_SEARCH_SERVICES as readonly unknown[]).includes(ws.service)) {
+      throw knobError(`webSearch must be {"service": ${WEB_SEARCH_SERVICES.join('|')}, "credential"?, "model"?}`);
+    }
+    if (ws.credential !== undefined && (typeof ws.credential !== 'string' || !CREDENTIAL_NAME.test(ws.credential))) throw knobError('webSearch.credential must name a credential');
+    assertNotModelKey(ws.credential, 'webSearch.credential');
+    if (ws.model !== undefined && (typeof ws.model !== 'string' || !MODEL_ID.test(ws.model))) throw knobError('webSearch.model must be a model id');
+    if (ws.model !== undefined && ws.service !== 'openai' && ws.service !== 'anthropic') throw knobError('webSearch.model applies only to the openai and anthropic services');
+  }
+  if ('subagentModels' in o) {
+    const list = o.subagentModels;
+    if (!Array.isArray(list) || list.length > MAX_SUBAGENT_MODELS) throw knobError(`subagentModels must be an array of at most ${MAX_SUBAGENT_MODELS} models`);
+    const seen = new Set<string>();
+    for (const m of list) {
+      if (!onlyKeys(m, ['provider', 'model', 'credential']) || typeof m.provider !== 'string' || !PROVIDER_ID.test(m.provider) ||
+          typeof m.model !== 'string' || !MODEL_ID.test(m.model) ||
+          (m.credential !== undefined && (typeof m.credential !== 'string' || !CREDENTIAL_NAME.test(m.credential)))) {
+        throw knobError('each subagentModels entry is {"provider", "model", "credential"?}');
+      }
+      assertNotModelKey(m.credential, 'subagentModels credential');
+      const key = `${m.provider}\0${m.model}\0${m.credential ?? ''}`;
+      if (seen.has(key)) throw knobError(`subagentModels repeats ${m.provider}/${m.model}`);
+      seen.add(key);
+    }
+  }
+  if ('subagentDefault' in o) {
+    const d = o.subagentDefault;
+    if (!onlyKeys(d, ['provider', 'model']) || typeof d.provider !== 'string' || !PROVIDER_ID.test(d.provider) || typeof d.model !== 'string' || !MODEL_ID.test(d.model)) {
+      throw knobError('subagentDefault must be {"provider", "model"}');
+    }
+  }
+}
+
+/**
+ * Refuse a subagentDefault that is neither the document's model nor one of
+ * its subagentModels: sealed would ignore it and default to the main model.
+ */
+export function assertSubagentDefaultOffered(next: SettingsDoc): void {
+  const others = next.others as Record<string, unknown> | undefined;
+  const d = others?.subagentDefault as { provider?: string; model?: string } | undefined;
+  if (!d || typeof d !== 'object') return;
+  const list = Array.isArray(others?.subagentModels) ? (others!.subagentModels as Array<{ provider?: string; model?: string }>) : [];
+  const isMain = d.model === next.model && (d.provider === next.provider || (!next.provider && d.provider === '0g-compute'));
+  if (isMain || list.some((m) => m.provider === d.provider && m.model === d.model)) return;
+  throw knobError(`subagentDefault ${d.provider}/${d.model} is neither the agent's model nor one of subagentModels`);
+}
 
 /**
  * Whether `framework` names the 0g-harness adapter. `dsh` is its name before
@@ -117,6 +205,48 @@ export const HARNESS_ONLY_KEYS = ['toolJobs', 'subagents', 'schedule', 'maxParal
  */
 export function isHarnessFramework(framework: string | null | undefined): boolean {
   return framework === '0g-harness' || framework === 'dsh';
+}
+
+/**
+ * Whether `framework` works through tool calls, so its model must be able to
+ * call tools: the tool-driven frameworks, the harness under either of its
+ * names (`dsh` on a network still on AgenticID 1.3, see `isHarnessFramework`).
+ * The deploy wizard offers such a framework only models with tool use.
+ */
+export function frameworkNeedsToolModels(framework: string): boolean {
+  return framework === 'openclaw' || framework === 'prime-agent' || isHarnessFramework(framework);
+}
+
+/** Whether these assignments set the model or the provider. */
+export function touchesModel(assignments: Assignment[]): boolean {
+  return assignments.some((a) => a.key === 'model' || a.key === 'provider');
+}
+
+/**
+ * Refuse, before signing, a model change to one its provider's catalog lists
+ * without tool use on an agent whose framework works through tools: it would
+ * fail every turn there (the deploy wizard does not offer such a model
+ * either). Only a write that sets the model or the provider is checked; a
+ * model the catalog does not list, an unreadable catalog or an unknown
+ * framework passes — the catalog advisory speaks to the first.
+ */
+export async function assertModelFitsFramework(
+  assignments: Assignment[],
+  next: SettingsDoc,
+  framework: string | null | undefined,
+  caps: (provider: string) => Promise<Array<{ id: string; chat: boolean; tools: boolean }>>,
+): Promise<void> {
+  const model = next.model?.trim();
+  if (!model || !framework || !frameworkNeedsToolModels(framework)) return;
+  if (!touchesModel(assignments)) return;
+  const listed = await caps(next.provider ?? '0g-compute').catch(() => null);
+  const entry = listed?.find((m) => m.id.toLowerCase() === model.toLowerCase());
+  if (!listed || !entry || entry.tools) return;
+  const able = listed.filter((m) => m.chat && m.tools).map((m) => m.id);
+  const an = /^[aeiou]/i.test(framework) ? 'an' : 'a';
+  throw new CliError('BAD_FLAG', `${model} cannot call tools, and ${an} ${framework} agent works through tool calls — it would fail every turn`, {
+    remedy: able.length ? `pick a model that can: ${able.slice(0, 4).join(', ')}` : 'pick a model that can call tools',
+  });
 }
 
 /**
@@ -208,8 +338,8 @@ export function assertModelPresent(next: SettingsDoc, hadStored: boolean): void 
     {
       remedy:
         'include the model in the same command, e.g. ' +
-        '`settings <agent> model=0gm-1.0-35b-a3b thinking=high` (the agent\'s current model is whatever its ' +
-        'image was built or last configured with — `hello <agent>` and `/agentlog` show what it is running)',
+        `\`${agentCmd('settings', 'model=0gm-1.0-35b-a3b thinking=high')}\` (the agent's current model is whatever its ` +
+        'image was built or last configured with)',
     },
   );
 }
@@ -245,6 +375,49 @@ export function renderSettings(doc: SettingsDoc | null): string[] {
 }
 
 /**
+ * A settings command's words after the agent: `versions` alone asks for the
+ * versions the trust registry lists; anything else is assignments
+ * ({@link parseAssignments}). `versions` is never an assignment, and goes
+ * alone.
+ */
+export function settingsArgs(args: string[]): { versions: boolean; assignments: ReturnType<typeof parseAssignments> } {
+  if (args.length === 1 && args[0] === 'versions') return { versions: true, assignments: [] };
+  if (args.includes('versions')) {
+    throw new CliError('BAD_FLAG', '`versions` goes on its own: it shows the versions to pick from, and writes nothing', { remedy: usage() });
+  }
+  return { versions: false, assignments: parseAssignments(args) };
+}
+
+/**
+ * The versions a 0g-harness agent runs, on one line of the settings view:
+ * with no pick, the trust registry's newest (what an agent with no pick
+ * moves to); with picks, the picks — one no longer listed is not run — and
+ * the newest for a layer without one. `none listed` for an empty list.
+ */
+export function renderVersionsLine(
+  listed: { sealed: readonly string[]; harness: readonly string[] },
+  picks?: VersionPicks,
+): string {
+  const short = (h: string): string => `${h.slice(0, 10)}…`;
+  const newest = (layer: VersionKey): string => {
+    const hashes = listed[layer];
+    return hashes.length ? short(hashes[hashes.length - 1]) : 'none listed';
+  };
+  const pick = (layer: VersionKey): string | undefined => {
+    const p = picks?.[layer];
+    return typeof p === 'string' && p ? p : undefined;
+  };
+  const head = `${'versions '.padEnd(11)}`;
+  if (!VERSION_KEYS.some(pick)) return `${head}newest listed (${VERSION_KEYS.map((k) => `${k} ${newest(k)}`).join(', ')})`;
+  return `${head}pinned: ${VERSION_KEYS.map((k) => {
+    const p = pick(k);
+    if (!p) return `${k} newest listed (${newest(k)})`;
+    const isListed = listed[k].some((h) => h.toLowerCase() === p.toLowerCase());
+    return `${k} ${short(p)}${isListed ? '' : ' (not listed: not run)'}`;
+  }).join(', ')}`;
+}
+
+/**
  * The versions an owner can pick (0g-harness): the trust registry's sealed
  * and harness lists in listing order, the last one the newest — what an
  * agent with no pick moves to once its own version is delisted. The picks in
@@ -254,7 +427,7 @@ export function renderListedVersions(
   listed: { sealed: readonly string[]; harness: readonly string[] },
   picks?: VersionPicks,
 ): string[] {
-  const lines = ['versions the trust registry lists (oldest first; pick with sealed=<hash> harness=<hash>):'];
+  const lines = ['listed versions, oldest first (pick with sealed=<hash> harness=<hash>):'];
   for (const layer of VERSION_KEYS) {
     const hashes = listed[layer];
     const pick = picks?.[layer]?.toLowerCase();

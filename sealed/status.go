@@ -21,13 +21,15 @@ import (
 //	          (e.g., agent wallet has insufficient funds for the
 //	          drift-publish transaction — only owner can fix by funding
 //	          the address)
-//	error     genuine system failure, owner can't act on it directly
-//	          (sealed / openclaw / 0G chain / attestor link broken)
+//	error     the agent itself cannot serve (its framework stopped, the
+//	          agent belongs to another owner); the attestor shows it
+//	          offline
 //
-// Heartbeat now reflects current state instead of hard-coding "running",
-// and handleDrift uses the severity classifier to decide whether to
-// escalate immediately (warning, first occurrence) or after the
-// 5-failure threshold (error, defended against transient blips).
+// A failed commit of the agent's data to chain is a warning, never an error:
+// the agent runs and answers, only its data is not on chain yet
+// (commitFailureStatus, commitretry.go). handleDrift shows it at once when
+// the seal wallet cannot pay (severityOf), after failureEscalateAt
+// consecutive failures otherwise. Heartbeat reflects the current state.
 
 // runtimeStatus is the single source of truth for what the next /status
 // report (drift, heartbeat, or recovery) should declare. Zero value is
@@ -167,11 +169,10 @@ func (s *runtimeStatus) SettingsIssue(message string) string {
 	return prev
 }
 
-// severityOf classifies a runtime error into one of the 3 severity
-// levels. Owner-recoverable conditions (insufficient funds, etc.) are
-// "warning" so the UI can prompt the owner to act without escalating
-// the alarm; everything else is "error" by default (defensive — we'd
-// rather false-alarm than silently miss a real failure).
+// severityOf tells an owner-recoverable commit failure ("warning":
+// insufficient funds, etc., shown to the owner at once) from any other
+// ("error": possibly transient, shown after failureEscalateAt failures).
+// Either way the agent's status is a warning (commitFailureStatus).
 //
 // nil error → "running" (caller's success path).
 func severityOf(err error) string {

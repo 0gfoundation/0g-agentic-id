@@ -22,15 +22,20 @@ pub mod nonce_submit;
 pub mod notify;
 pub mod oss;
 pub mod provider_registry;
+pub mod releases;
 pub mod pinned_tls;
 pub mod repo;
 pub mod retry;
+pub mod runtime_creates;
 pub mod sandbox;
 pub mod storage_zg;
 pub mod tapp_grpc;
 pub mod tee;
 pub mod traits;
 pub mod types;
+
+#[cfg(test)]
+mod chain_i_data_tests;
 
 pub use config::{Config, Framework};
 pub use error::{AttestorError, Result};

@@ -613,7 +613,7 @@ the reason in §5 ("What is iData, and what is a deployment parameter"):
 | openclaw (`openclaw.go:164`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `openclaw.json` |
 | hermes (`hermes.go:143`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `config.yaml` |
 | prime-agent (`prime.go:162`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `models.json` |
-| 0g-harness (`harness.go:167`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | `settings.yaml` |
+| 0g-harness (`harness.go:208`) | `framework`, `APPEND_SYSTEM.md`, `skills/`, `memory/`, `memory-public/` | `settings.yaml` |
 
 All four reduce to the same shape — *binding + persona + memory + skills* —
 which the per-framework config files were obscuring.
@@ -661,7 +661,7 @@ container's `:8080`.
 | `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth; responses never proof-signed — the owner↔agent steering channel); every undeclared path 404s — there is no catch-all relay |
 | `/api/*` | external callers | agent-registered services (exact path, registered over the sign socket's `/services`), reverse-proxied to the agent's loopback backend; responses buffered and proof-signed (`X-Agent-Proof`), even when the backend emits SSE |
 | `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, 0g-harness), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |
-| `/v1/inbox`, `/v1/events`, `/v1/tasks`, `/v1/schedules` | owner | 0g-harness only (declared as the kinds `inbox` / `events` / `tasks` / `schedules`): the words of turns the agent opened itself (a background job finished, a reminder came due), a resumable live feed of turn, task, inbox and reminder changes, every turn, background command and subagent with who did it, and the agent's reminders. The other frameworks declare none of them, and the SDK offers them only where they are declared (`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
+| `/v1/inbox`, `/v1/events`, `/v1/activities`, `/v1/tasks`, `/v1/task-feed`, `/v1/schedules`, `/v1/files`, `/v1/memory`, `/v1/steer`, `/v1/sessions` | owner | 0g-harness only (declared as the kinds `inbox` / `events` / `activities` / `tasks` / `task-feed` / `schedules` / `files` / `memory` / `steer` / `sessions`): the words of turns the agent opened itself (a background job finished, a reminder came due), a resumable live feed of turn, activity, inbox and reminder changes, every turn, background command and subagent with who did it (`/v1/activities`), the owner's tasks (zgh's task model: a piece of work in a session and workspace of its own, ended by an outcome record) and the feed of their changes, the owner's other sessions, the agent's reminders, and file upload into the agent's file inbox `~/inbox` (not the message inbox `/v1/inbox`) plus download and deletion of what the agent put in `~/outbox` (or of the owner's own files in `~/inbox`), a long-term memory consolidation pass on request (`POST /v1/memory/tidy`), and the owner's word for the turn already running (`POST /v1/steer`, read before that turn's next model call; queued as an ordinary turn when no owner turn runs). The other frameworks declare none of them, and the SDK offers them only where they are declared (`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
 | `/log/agent` + `/log/agent.html` | ops | agent subprocess stdout/stderr (live); path resolved via the adapter's `SubprocessLogPath()`. `/log/openclaw`(`.html`) survives as a legacy alias |
 | `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`; never a raw hash and never EIP-191 version `0x00`, the serve-proof's domain — see below) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) + `/harness/restart` and `/mcp` (0g-harness only: a restart of the harness, and the same endpoints and the credential socket's as MCP tools; the reveal socket serves its own) |
@@ -827,18 +827,41 @@ includes things like agentSeal wallet running out of gas
 (insufficient gas → `chain.Update` tx won't go in → Apply fails), so
 wallet balance falls under its scope too.
 
-Apply's three outcomes correspond to three severities:
+A failed commit is never an `error`: the agent runs and answers, only its
+latest data is not on chain yet, and an `error` report would make the
+attestor show it offline (its container stage failed) and the CLI refuse to
+chat. Apply's outcomes:
 
-| Apply outcome | severity | When reported | Failure counter |
+| Apply outcome | status | When reported | Failure counter |
 |---|---|---|---|
-| **success** (drift on chain, or no drift) | `running` | not reported immediately; runHeartbeat will replay it | accumulated errors cleared |
-| **failure, owner-recoverable** — typical: agentSeal wallet out of gas, wrong API key, provider rate limit | `warning` | reported **immediately** on first occurrence, doesn't wait for heartbeat | **does not** accumulate (not a system failure, the owner has to handle it) |
-| **failure, system-level** — typical: 0g-storage upload timeout, RPC anomaly, indexer unreachable | `error` | escalates to error only after **5 consecutive** Apply failures, to avoid single-network-jitter misjudgments | accumulates; clears on recovery |
+| **success** (drift on chain, or no drift) | `running` | reported on the transition back | cleared; the retry backoff starts over |
+| **failure, owner-recoverable** — typical: agentSeal wallet out of gas | `warning`, "agent data not committed to chain: …" | **immediately** | counted |
+| **failure, other** — typical: 0g-storage upload timeout, RPC anomaly, indexer unreachable | `warning`, "agent data not committed to chain (N attempts): …" | after **5 consecutive** failures, so a single network blip does not show | counted |
 
-`status.go::severityOf` is the classifier that maps a specific error
-string to one of these three severities — recognizing "insufficient
-funds" → `warning`, "connection refused" → `error`, and so on. The
-classification fallback is `error`.
+`status.go::severityOf` tells the owner-recoverable causes ("insufficient
+funds", a data-less revert of the seal wallet's own transaction) from the
+rest; `commitretry.go::commitFailureStatus` turns either into the warning.
+Every failure is also checked against the seal wallet (`fundsShortfall`):
+when its balance is under the failed step's gas (a storage submit 450k, an
+update 350k, the largest measured on Galileo, rounded up) at the current gas
+price, it is the funds case at once, and the warning names the wallet and
+both amounts ("the agent's wallet 0x… has 0.10 OG, about 0.90 OG is needed
+for its next transaction"). That covers a failure whose error names no
+cause, and replaces an "insufficient funds" error's own amount, which is the
+blob's storage fee (a few wei), not what a commit needs. If the balance
+cannot be read, the error's own grading stands.
+
+Retries back off (`commitretry.go`): after n consecutive failures of the same
+content the next attempt waits 30 s·2^(n-1), at most 30 min; new content to
+commit is tried on the next tick, and a success starts over. A retry uploads
+only what the failed attempt did not (`internal/uploader/pending.go`): the
+blobs an attempt uploaded before a later upload or the update failed are
+reused, with the data key minted for a role not yet on chain, so each blob
+is paid for once. Content that comes back to what an earlier commit of the
+boot held (a memory added and removed again, a change undone) is committed by
+reference to the blobs uploaded then, under the same data key, whatever path
+an entry is at (`internal/uploader/uploaded.go`): only the update is sent.
+Both are kept in memory for the boot.
 
 ### `runHeartbeat`'s 5-min ticker
 

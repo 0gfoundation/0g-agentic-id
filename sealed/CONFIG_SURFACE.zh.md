@@ -106,7 +106,13 @@ managed provider 转发到 `Resolved.Endpoint`；`openai` 和 `anthropic` 转发
 回环地址；代理给每个请求写上 owner 的模型、在 system prompt 末尾附上 agent doc，并设置
 密钥（`harness/spawn.go` `modelEndpoint`）。它只转发模型调用，按代理基地址下的精确路径：
 POST `chat/completions`、`messages`、`responses`，GET `models`，前面带不带 `/v1` 都行
-（`inferproxy.endpoint`）。只有 sealed 不知道 endpoint 的 provider 仍由 harness 自己拨。
+（`inferproxy.endpoint`）。owner 的 `webTools` 开关打开、且 `others.webSearch` 选的搜索服务能付费时，
+还提供 POST `web/search`（harness 的 `web_search`）：只收 `{"query"}` 请求体，不附 agent doc，发给
+0G router 的搜索，或作为一次带该 provider 网页搜索工具的 OpenAI / Anthropic 模型调用，并按 router 的
+结果格式回答（`inferproxy` `websearch.go`）；否则这条路径返回 404。`others.subagentModels` 提供的
+其他模型是同一个代理上的路由：和主模型同 endpoint、同密钥的，由主路由多接一个模型；其余的各是
+`/p/<id>` 下的一条命名路由，有自己的上游、密钥和模型（`harness/modelroutes.go`）。
+只有 sealed 不知道 endpoint 的 provider 仍由 harness 自己拨。
 其他三个框架的 native provider 仍用框架自带接线。
 
 
@@ -260,7 +266,7 @@ SDK 抛 `SettingsConflictError`,并**刻意不重试** —— 盲目重放同一
 被签的那一份一致 —— **被签的消息才是权威**,不一致就是 400,而不是悄悄采信其中一个。
 
 这里写入的东西**下次开机**才到达 agent,不是现在。CLI 就是这么说的:
-*"written — version N. The container applies it on its next boot (reset to apply now)."*
+*"saved. The container applies it on its next boot."*
 
 ### 5.2 热路径 —— 容器
 
@@ -616,7 +622,7 @@ attestor 已存的文档。
 | openclaw | `framework`、`openclaw.json`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/`(`openclaw/openclaw.go:164`) |
 | hermes | `framework`、`config.yaml`、`SOUL.md`、`memories/`、`skills/` | `framework`、`SOUL.md`、`memories/`、`skills/`(`hermes/hermes.go:143`) |
 | prime-agent | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`models.json`、`skills/` | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/`(`prime/prime.go:162`) |
-| 0g-harness | `framework`、`APPEND_SYSTEM.md`、`settings.yaml`、`skills/` | `framework`、`APPEND_SYSTEM.md`、`skills/`(`harness/harness.go:167`) |
+| 0g-harness | `framework`、`APPEND_SYSTEM.md`、`settings.yaml`、`skills/` | `framework`、`APPEND_SYSTEM.md`、`skills/`、`memory/`、`memory-public/`(`harness/harness.go:208`) |
 
 **没有任何配置角色。**四家统一收敛成「读法 + 人格 + 记忆 + 技能」—— 这个共性以前被各家
 形状各异的配置文件盖住了。

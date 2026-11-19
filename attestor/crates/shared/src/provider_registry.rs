@@ -42,7 +42,15 @@ pub struct Provider {
     pub models: Vec<Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub compatibility: BTreeMap<String, Value>,
+    /// The web search service this provider's key pays for (one of
+    /// `WEB_SEARCH_SERVICES`; sealed `inference.SearchServices`). Not part
+    /// of the route hash.
+    #[serde(rename = "webSearch", default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<String>,
 }
+
+/// Web search services sealed's inference route can call.
+pub const WEB_SEARCH_SERVICES: [&str; 3] = ["0g-router", "openai", "anthropic"];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -167,6 +175,13 @@ pub fn validate_providers(providers: &[Provider]) -> anyhow::Result<()> {
         anyhow::ensure!(
             provider.model_catalog.as_ref().is_none_or(|u| https_url(u)),
             "modelCatalog must be a public HTTPS URL"
+        );
+        anyhow::ensure!(
+            provider
+                .web_search
+                .as_deref()
+                .is_none_or(|s| WEB_SEARCH_SERVICES.contains(&s)),
+            "webSearch must name a known web search service"
         );
         for model in &provider.models {
             anyhow::ensure!(
@@ -352,6 +367,29 @@ impl ProviderRegistryRepo for MemoryProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_search_is_a_known_service_or_absent() {
+        let builtin: Vec<Provider> = serde_json::from_str(BUILTIN).unwrap();
+        validate_providers(&builtin).unwrap();
+        let service = |id: &str| {
+            builtin
+                .iter()
+                .find(|p| p.id == id)
+                .and_then(|p| p.web_search.clone())
+        };
+        assert_eq!(service("0g-compute").as_deref(), Some("0g-router"));
+        assert_eq!(service("openai").as_deref(), Some("openai"));
+        assert_eq!(service("anthropic").as_deref(), Some("anthropic"));
+        let mut unknown = builtin.clone();
+        unknown[0].web_search = Some("bing".into());
+        assert!(validate_providers(&unknown).is_err());
+        let mut absent = builtin;
+        for p in &mut absent {
+            p.web_search = None;
+        }
+        validate_providers(&absent).unwrap();
+    }
 
     #[tokio::test]
     #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]

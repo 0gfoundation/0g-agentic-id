@@ -26,9 +26,10 @@
 //! the orphan. That's a Reset-twice-in-a-row footgun, mitigated by the
 //! frontend disabling the button while a Reset job is queued.
 
-use super::lifecycle_auth::authorize_lifecycle;
+use super::lifecycle_auth::{authorize_runtime_lifecycle, validate_operator_create};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use attestor_shared::auth::operator::LifecyclePermission;
 use attestor_shared::sandbox::{check_owner_env, CanonicalSignedMessage};
 use attestor_shared::{JobPayload, LifecycleRequest};
 use axum::extract::State;
@@ -67,18 +68,29 @@ pub async fn handle(
     check_owner_env(&canonical.payload)
         .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
 
-    // Real owner authorization: the create envelope must be signed by the
-    // current on-chain owner. The previous `req.owner == d.owner` check
-    // trusted an unsigned, attacker-supplied field and was forgeable — see
-    // {lifecycle_auth}.
-    authorize_lifecycle(&state, &d, &req.sandbox_envelope).await?;
+    // Replacing compute is a separate capability from resuming it or
+    // provisioning the first sandbox under an operator's grant.
+    let principal = authorize_runtime_lifecycle(
+        &state,
+        &d,
+        &req.sandbox_envelope,
+        LifecyclePermission::Recreate,
+    )
+    .await?;
+    validate_operator_create(
+        &state,
+        &d,
+        &principal,
+        req.framework.as_deref(),
+        &canonical.payload,
+    )?;
 
     // The recreate's sandbox is billed to the envelope signer (the owner
     // just authorized above) — preflight ack + balance so a transferred
     // agent's NEW owner learns "you haven't acked / deposited" right here,
     // not from a worker 402 after "accepted". (The exact failure mode our
     // lifecycle e2e used to hit.)
-    super::preflight::check_owner_ready(&state, req.sandbox_envelope.wallet_address).await?;
+    super::preflight::check_owner_ready(&state, principal.actor).await?;
 
     // Keep the row's recorded framework in sync when the owner switches
     // harness on reset (review #154 F1): without this the next default reset
@@ -163,6 +175,7 @@ mod tests {
 
             cli_latest: String::new(),
             cli_notes: String::new(),
+            releases_file: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             frameworks: vec![attestor_shared::Framework {

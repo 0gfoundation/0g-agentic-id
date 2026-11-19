@@ -168,7 +168,7 @@ appId、registeredAt、signer）。
 同一容器之后的启动不带证书。必须由已记录的公钥签 boot claim，已记录的 provider 实例
 必须仍是当前发现的实例（否则 `403 provider instance no longer trusted; reset required`；
 discovery 不可用时 503），已记录的镜像必须仍在白名单中（否则 `401 recorded image_hash
-not in validFrameworkHashes; reset required`）。证书对应已记录的公钥时按之后的启动处理，
+not in validFrameworkHashes: the image was retired; reset required`）。证书对应已记录的公钥时按之后的启动处理，
 覆盖首次响应丢失的情况；对应另一把公钥则返回 `403 container key differs from record;
 reset required`；没有记录也没有证书返回 `409 certificate_required`。新的启动票据
 （create 或 recreate）、reset 与所有权撤销都会清除记录，因此每个新容器都要出示自己的

@@ -200,7 +200,7 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			// signed" regardless of this flag; false here just keeps the
 			// declaration honest.
 			Signed:      false,
-			Description: "OpenAI-compatible chat/completions API.",
+			Description: "The owner's chat with the agent.",
 		},
 	}
 }

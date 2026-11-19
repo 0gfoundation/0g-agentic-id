@@ -198,11 +198,11 @@ agent 上的 owner 路由（`/_seal/*`，经 `:8080`）使用 `X-Auth-Message` /
 
 `/provision` 在每次启动时交给容器 `{document, owner_epoch}` 及其写回，用 ECIES 加密给容器。状态上报（`StatusReport.v3`）带待办数量；数量上升时，attestor 给 owner 的地址发邮件（每个 agent 在 `ATTESTOR_NOTIFY_COOLDOWN_SECONDS` 内最多一封），只写明是哪个 agent、有几条，不包含 agent 写的内容。每小时检查一次，在条目 `expires_at` 前一周提醒 owner。
 
-SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-agentdna cred`（`docs/cli-reference.md`）。
+SDK 为 `ag.credentials`（`sdk/typescript/src/Credentials.ts`）；CLI 为 `0g-agentdna cred`（`docs/cli-reference.zh.md`）。
 
 ## 范围之外
 
-- **响应与上链数据。** 经 `:8080` 转发的 HTTP 响应（已注册的服务、框架路由、事件流、合成的 `/v1/responses` 及其保存的结果、`/hello` 的服务列表）在计算 serve-proof 之前去掉 sealed 持有的每个值（名字里含值的响应头整个丢弃，不分大小写）；对升级请求返回的非 `101` 响应和其他响应一样处理（trailer 也一样），接受了的 WebSocket 升级原样转发。框架对压缩上下文（`/_seal/compact`）的说明，在 owner 或公开日志看到之前也会去掉这些值。模型分段流式输出的值，在保存的结果中会被去掉，在流式输出的各段中不会。sealed 上链的内容同样去掉这些值（leaf 角色、manifest 中的文件、目录归档里的文件），漂移判断也基于去掉值之后的内容。从 sealed 删除的值（新凭据集不再包含、owner 变更）仍会被去掉，但不再代填，直到 sealed 重启（owner 条目和 sealed 条目的最近 1024 个值，另外换出条目的最近 1024 个值；每个名字最多 32 个）。
+- **响应与上链数据。** 经 `:8080` 转发的 HTTP 响应（已注册的服务、框架路由、事件流、合成的 `/v1/responses` 及其保存的结果、`/hello` 的服务列表）在计算 serve-proof 之前去掉 sealed 持有的每个值（名字里含值的响应头整个丢弃，不分大小写）；对升级请求返回的非 `101` 响应和其他响应一样处理（trailer 也一样），接受了的 WebSocket 升级原样转发。框架对压缩上下文（`/_seal/compact`）的说明，在 owner 或公开日志看到之前也会去掉这些值。模型分段流式输出的值，在保存的结果中会被去掉，在流式输出的各段中不会。sealed 上链的内容同样去掉这些值（leaf 角色、manifest 中的文件、目录归档里的文件），所有框架都一样；之后，sealed 不持有但格式可识别的秘密，在上链的副本里换成 `[redacted:<类型>]`，不论是否持有凭据：PEM 私钥块，代理在响应里遮盖的 token 格式（GitHub、GitLab、Slack、Stripe、`sk-` 密钥、Google、Hugging Face、Notion、npm）以及 AWS access key id，JWT，紧挨着表明它是密钥的词的 64 位十六进制值（单独的哈希不算），以及 BIP39 助记词（12 个以上词表中的词，通过校验和或前面有表明它是助记词的词）。只处理文本：含 NUL 字节或不是合法 UTF-8 的文件按原样上链。磁盘上的文件保留 agent 写的内容，所以 reset 后恢复的是替换后的内容。漂移判断也基于去掉之后的内容。从 sealed 删除的值（新凭据集不再包含、owner 变更）仍会被去掉，但不再代填，直到 sealed 重启（owner 条目和 sealed 条目的最近 1024 个值，另外换出条目的最近 1024 个值；每个名字最多 32 个）。
 - **不经过代理的工具。** 不认 `HTTPS_PROXY` 或钉死证书的工具会带着占位符直连目标并失败；可以改用显式形式，或使用交出的值。
 - **普通 API 返回的 token。** 普通 API 调用（不是换 token）返回的 token 原样到达 agent；如果它属于代理遮盖的常见格式，agent 拿到的是 `[[redacted]]`，无法使用，要拿这类 token 需用换 token。
 - **不限制用途。** 在密钥本身的权限范围内，agent 可以做任何事，包括派生新密钥、用签名条目签任意内容。

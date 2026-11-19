@@ -2,7 +2,7 @@
 
 [English](credentials.md)
 
-本文用通俗的话说明 AgentDNA 怎样让 agent 使用 owner 的第三方密钥。字段、接口和格式以 [`sealed/CREDENTIALS.zh.md`](../sealed/CREDENTIALS.zh.md) 为准，命令以 [`docs/cli-reference.md`](cli-reference.md) 为准。
+本文用通俗的话说明 AgentDNA 怎样让 agent 使用 owner 的第三方密钥。字段、接口和格式以 [`sealed/CREDENTIALS.zh.md`](../sealed/CREDENTIALS.zh.md) 为准，命令以 [`docs/cli-reference.zh.md`](cli-reference.zh.md) 为准。
 
 ## 解决什么问题
 

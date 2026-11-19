@@ -21,11 +21,14 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, renameSy
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { CliError } from './errors';
 
 export interface FileConfig {
   attestorUrl?: string;
   rpcUrl?: string;
   inferenceProvider?: string;
+  /** `off`: new files from an agent are not saved by themselves (`/files auto off`). */
+  filesAuto?: 'off';
 }
 
 /** Resolve on-disk locations and move an existing legacy directory once.
@@ -59,6 +62,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FileConfig {
       attestorUrl: c.attestorUrl?.replace(/\/$/, ''),
       rpcUrl: c.rpcUrl,
       inferenceProvider: c.inferenceProvider,
+      filesAuto: c.filesAuto === 'off' ? 'off' : undefined,
     };
   } catch {
     return {};
@@ -99,6 +103,47 @@ export function recordSecretEnvPin(attestorUrl: string, env: NodeJS.ProcessEnv =
 }
 
 type CredentialMark = { epoch: number; version: number; digest?: string };
+
+/**
+ * Which model key this machine last stored for an agent and provider: the
+ * stored entry's value hash and a fingerprint of the key (a hash salted with
+ * the agent and provider, never the key), so storing the same key again can
+ * be told apart and skipped. Not secret: one small file, 0600. A file that
+ * does not parse reads as empty.
+ */
+export type ModelKeyMark = { valueHash: string; keyMark: string };
+
+function modelKeyMarksPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(configPaths(env).dir, 'model-key-marks.json');
+}
+
+export function loadModelKeyMarks(env: NodeJS.ProcessEnv = process.env): Record<string, ModelKeyMark> {
+  try {
+    const all = JSON.parse(readFileSync(modelKeyMarksPath(env), 'utf8')) as unknown;
+    if (!all || typeof all !== 'object' || Array.isArray(all)) return {};
+    const out: Record<string, ModelKeyMark> = {};
+    for (const [k, m] of Object.entries(all as Record<string, ModelKeyMark>)) {
+      if (m && typeof m.valueHash === 'string' && typeof m.keyMark === 'string') out[k] = { valueHash: m.valueHash, keyMark: m.keyMark };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function recordModelKeyMark(key: string, mark: ModelKeyMark, env: NodeJS.ProcessEnv = process.env): void {
+  try {
+    const { dir } = configPaths(env);
+    mkdirSync(dir, { recursive: true });
+    const marks = { ...loadModelKeyMarks(env), [key]: mark };
+    const file = modelKeyMarksPath(env);
+    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(marks, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch {
+    /* best-effort */
+  }
+}
 
 /** Where the newest credential set seen per agent is kept. */
 export function credentialMarksPath(env: NodeJS.ProcessEnv = process.env): string {
@@ -310,12 +355,22 @@ export function saveApiKey(providerOrKey: string, keyOrEnv?: string | NodeJS.Pro
   saveCredentials({ inferenceKeys: { [provider]: key } }, source);
 }
 
-/** Global legacy variables only belong to compute; new overrides are bound. */
+/**
+ * A model key from the environment: `AGENTDNA_API_KEY` for the provider
+ * `AGENTDNA_API_KEY_PROVIDER` names, or the legacy compute-only
+ * `AGENTIC_API_KEY`. A generic `API_KEY` is never read — it belongs to
+ * whatever else set it, not to this CLI. A key without its provider is
+ * refused (the remedy says how to set both).
+ */
 export function inferenceKeyFromEnv(provider: string, env: NodeJS.ProcessEnv = process.env): string | null {
   const key = env.AGENTDNA_API_KEY?.trim();
   const binding = env.AGENTDNA_API_KEY_PROVIDER?.trim();
-  if (key && !binding) throw new Error('AGENTDNA_API_KEY requires AGENTDNA_API_KEY_PROVIDER');
+  if (key && !binding) {
+    throw new CliError('INFERENCE_KEY_REQUIRED', 'AGENTDNA_API_KEY is set without AGENTDNA_API_KEY_PROVIDER — the CLI cannot tell which provider the key is for', {
+      remedy: 'export AGENTDNA_API_KEY_PROVIDER=<provider> (e.g. openai) with it, or unset AGENTDNA_API_KEY',
+    });
+  }
   if (key && binding === provider) return key;
-  if (provider === '0g-compute') return env.AGENTIC_API_KEY?.trim() || env.API_KEY?.trim() || null;
+  if (provider === '0g-compute') return env.AGENTIC_API_KEY?.trim() || null;
   return null;
 }

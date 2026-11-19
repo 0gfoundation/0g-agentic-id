@@ -28,12 +28,15 @@ if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
 // ── Facade + namespaces ──
 export { AgenticID as AgentDNA, AgenticID, AgentApi, AdminApi, ReputationApi } from './AgenticID';
 export type { ContainerStatus, DeployAccepted, WaitLevel, ModelKeyLifecycleOpts } from './AgenticID';
+export { fetchReleases, releaseNoticeOf, agentMigrationOf } from './Releases';
+export type { ReleaseNotice, ReleaseMigration, AgentMigration, MigrationState } from './Releases';
 export { makeAgentClient } from './AgentClient';
 export type {
   AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask,
-  AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
+  AgentActivityInfo, AgentActivityStop, AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
+  ChatImage, ChatNotice, UploadedFile, SteerResult, AgentSession, SessionPromptResult, HarnessTask, HarnessTaskState, HarnessTaskRecord, HarnessTaskSummary, HarnessTaskFeedEvent, CreateTaskOptions, TaskInputResult, SteerState, AgentFile, AgentFileDir,
 } from './AgentClient';
-export { mcpServices } from './AgentClient';
+export { mcpServices, withImages } from './AgentClient';
 export { defaultIData, DEFAULT_PERSONA_INFERENCE, deploymentFactsOf, needsDefaultSettings, storeDefaultSettings } from './AttestorClient';
 export type { DeploymentFacts } from './AttestorClient';
 export type { DefaultIDataParams } from './AttestorClient';
@@ -46,6 +49,8 @@ export type { IntelligentDataResult } from './AgenticIDClient';
 export { ReputationClient, MAX_ABS_FEEDBACK_VALUE } from './ReputationClient';
 export { AttestorClient, CLONE_DOMAIN, CLONE_CONTRACT_DOMAIN, DEPLOY_DOMAIN, b64encode } from './AttestorClient';
 export type { CloneParams, DeployParams, IDataInput, DeployCloneResponse } from './AttestorClient';
+export { OPERATOR_DOMAIN, OperatorConflictError, OperatorCheckpointSupersededError } from './Operators';
+export type { OperatorState, OperatorOptions, OperatorCheckpoint, RuntimeBinding } from './Operators';
 // Sealed secret env (issue #166): the inference key sealed to the agent's
 // agentSeal key instead of riding the signed envelope in clear.
 export { SECRET_ENV_SCHEME, SECRET_ENV_VAR, SecretEnvRefusedError, sealSecretEnv } from './secretEnv';
@@ -167,5 +172,5 @@ export {
   sandboxServingAbi,
 } from './abi';
 
-export { listInferenceProviders, inferenceProvider, routeHash } from './Providers';
+export { listInferenceProviders, inferenceProvider, providerWebSearch, routeHash } from './Providers';
 export type { InferenceProvider, InferenceFormat, InferenceModel, ProviderRegistrySnapshot, ProviderRegistryPin } from './Providers';

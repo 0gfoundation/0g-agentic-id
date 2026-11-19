@@ -167,7 +167,29 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		if upstream == "" {
 			upstream = ep.BaseURL
 		}
-		route.SetRoute(inferproxy.Route{Upstream: upstream, Headers: inferenceHeaders(ep.Format, apiKey), Model: model, System: doc})
+		r := inferproxy.Route{Upstream: upstream, Headers: inferenceHeaders(ep.Format, apiKey), Model: model, System: doc}
+		// What the owner's web search and further subagent models can be
+		// paid with, one rule for both (modelroutes.go).
+		keys := keySource{mainProvider: provider, key: apiKey, held: modelBaseURL != "", proxy: rt.CredProxy, mainHost: hostOf(ep.BaseURL)}
+		// web/search on the main route goes to the owner's search service;
+		// the harness's web_search posts there (src/web.mjs).
+		if ws, why := planWebSearch(rendered.knobs, keys, ep, upstream, model); ws != nil {
+			r.WebSearch = ws
+			be.webSearchURL = route.BaseURL() + "/v1/web/search"
+			logger.Logf("harness: web_search through %s", ws.Service)
+		} else {
+			be.webSearchOff = why
+			logger.Logf("harness: no web_search: %s", why)
+		}
+		// Further models for subagents: the main route takes those on its
+		// own endpoint and key, named routes the rest.
+		plan := planRoutes(ctx, rendered.knobs, keys, rendered.resolved, ep, doc, route.BaseURL(), route.NamedBaseURL)
+		r.Models = plan.mainModels
+		if err := route.SetRoutes(r, plan.named); err != nil {
+			return framework.StartResult{}, fmt.Errorf("harness.Start: inference routes: %w", err)
+		}
+		be.routesEnv = plan.env()
+		be.docRouted = true
 		be.apiKey, be.modelBaseURL, be.modelAPI = routedKeyPlaceholder, route.BaseURL(), wireAPI(ep.Format)
 		inferURL = ep.BaseURL
 	} else {
@@ -263,9 +285,20 @@ type bridgeEnv struct {
 	// agentDoc is the path of the agent doc file, "" when the doc rides the
 	// inference route instead.
 	agentDoc string
+	// docRouted is true when the agent doc rides the inference route (sealed
+	// adds it to every model request), so the harness has no file to read.
+	docRouted bool
 	// modelAPI, when set, replaces the rendered SEAL_MODEL_API: the wire
 	// protocol of the endpoint the inference route forwards to.
 	modelAPI string
+	// webSearchURL, when set, is where the harness's web_search posts: the
+	// inference route's web/search (modelroutes.go planWebSearch).
+	webSearchURL string
+	// webSearchOff is why there is no web search when Start found none
+	// (planWebSearch); the harness tells the agent.
+	webSearchOff string
+	// routesEnv carries the further subagent models (modelroutes.go routePlan.env).
+	routesEnv []string
 }
 
 // modelEndpoint is the endpoint sealed's inference route forwards the
@@ -310,6 +343,18 @@ func inferenceHeaders(f inference.WireFormat, key string) map[string]string {
 	return map[string]string{"Authorization": "Bearer " + key}
 }
 
+// webSearchOffMax is the most of SEAL_HARNESS_WEB_SEARCH_OFF the harness
+// reads (its docs/PROTOCOL.md).
+const webSearchOffMax = 300
+
+// clipRunes is s cut to at most n runes.
+func clipRunes(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n])
+	}
+	return s
+}
+
 // environ builds the harness process's whole environment.
 //
 // A strict whitelist, NOT the inherited env: a leaked SANDBOX_SEAL_KEY must
@@ -334,6 +379,9 @@ func (be bridgeEnv) environ() []string {
 	if be.agentDoc != "" {
 		env = append(env, "SEAL_AGENT_DOC="+be.agentDoc)
 	}
+	if be.docRouted {
+		env = append(env, "SEAL_AGENT_DOC_ROUTE=inference")
+	}
 	// Everything the owner's settings decide (pin, endpoint, reasoning bound,
 	// composition knobs) — rendered once, deterministically, before Start.
 	for _, kv := range be.settingsEnv {
@@ -356,6 +404,13 @@ func (be bridgeEnv) environ() []string {
 		// layer), so the key never touches a credentials file.
 		env = append(env, "SEAL_MODEL_API_KEY="+be.apiKey)
 	}
+	env = append(env, be.routesEnv...)
+	if be.webSearchURL != "" {
+		env = append(env, "SEAL_HARNESS_WEB_SEARCH_URL="+be.webSearchURL)
+	}
+	if be.webSearchOff != "" {
+		env = append(env, "SEAL_HARNESS_WEB_SEARCH_OFF="+clipRunes(be.webSearchOff, webSearchOffMax))
+	}
 	// Public on-chain facts the agent (and seal-tools) benefit from knowing.
 	if be.rt.PublicURL != "" {
 		env = append(env, "AGENT_PUBLIC_URL="+be.rt.PublicURL)
@@ -365,6 +420,12 @@ func (be bridgeEnv) environ() []string {
 	}
 	if be.rt.AgentSeal != "" {
 		env = append(env, "AGENT_SEAL="+be.rt.AgentSeal)
+	}
+	// The NFT owner at this boot (a public chain fact): a memory item is
+	// trusted only while its trusted_by names this address, so after a
+	// transfer what the previous owner confirmed is reference only.
+	if be.rt.Owner != "" {
+		env = append(env, "SEAL_OWNER="+strings.ToLower(be.rt.Owner))
 	}
 	return append(env, be.rt.CredentialEnv()...)
 }
@@ -595,7 +656,9 @@ func (a *Adapter) SubprocessLogPath() string { return framework.LogPath(logName)
 // docs/PROTOCOL.md in 0g-harness (protocol 1) is the contract, and each
 // route lists its endpoints from it: the proxy forwards those requests only
 // (sealed/LAYERS.md §4.3), so an endpoint the harness's code adds is not
-// reachable from outside until sealed lists it.
+// reachable from outside until sealed lists it. /hello is public, so each
+// description is one plain sentence on what the route is for; the requests
+// and their fields are PROTOCOL.md's.
 func (a *Adapter) FrameworkRoutes() []framework.Route {
 	backend := fmt.Sprintf("http://127.0.0.1:%d", bridgePort)
 	route := func(prefix, kind, description string, endpoints ...framework.Endpoint) framework.Route {
@@ -603,24 +666,56 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 	}
 	get := func(path string) framework.Endpoint { return framework.Endpoint{Method: http.MethodGet, Path: path} }
 	post := func(path string) framework.Endpoint { return framework.Endpoint{Method: http.MethodPost, Path: path} }
+	del := func(path string) framework.Endpoint { return framework.Endpoint{Method: http.MethodDelete, Path: path} }
 	return []framework.Route{
 		// STATEFUL, like prime: the conversation lives in the harness's DSH
 		// session and only the last user message of `messages` is read, so
 		// re-sending an edited history does not rewind it.
-		route("/v1/", "chat", "OpenAI-compatible chat/completions API (0g-harness). STATEFUL: the conversation lives in a server-side session and only the last user message is read. Owner turns run one at a time.",
+		route("/v1/", "chat", "The owner's chat with the agent, which keeps the conversation itself.",
 			get("/v1/harness"), post("/v1/chat/completions"), post("/v1/interrupt"), post("/v1/compact")),
 		// The SDK picks Responses over chat/completions when it sees this kind
 		// (the long-task surface: the turn is owned by a server-side response
 		// id, not by the HTTP connection).
-		route("/v1/responses", "responses", "OpenAI Responses API subset (0g-harness): POST /v1/responses {input, stream} → events with sequence_number; GET /{id} polls; GET /{id}?stream=true&starting_after=N resumes; POST /{id}/cancel stops the turn. Same stateful session as the chat route.",
+		route("/v1/responses", "responses", "The same chat, with replies that keep running when the connection drops.",
 			post("/v1/responses"), get("/v1/responses/{id}"), post("/v1/responses/{id}/cancel")),
-		route("/v1/inbox", "inbox", "Messages from turns the agent opened itself — a background job finishing, a reminder coming due: GET /v1/inbox?after=N, POST /v1/inbox/ack {through}.",
+		route("/v1/inbox", "inbox", "What the agent said on its own, such as when a background job finished or a reminder came due.",
 			get("/v1/inbox"), post("/v1/inbox/ack")),
-		route("/v1/events", "events", "Server-sent feed of turn, inbox, task and schedule changes, resumable from a cursor: GET /v1/events?after=N.",
+		route("/v1/events", "events", "A live feed of changes to the agent's replies, inbox, work and reminders.",
 			get("/v1/events")),
-		route("/v1/tasks", "tasks", "Turns, background commands and subagents, with who did each: GET /v1/tasks, GET /v1/tasks/{id}, POST /v1/tasks/{id}/cancel (id `all` cancels everything running).",
-			get("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/cancel")),
-		route("/v1/schedules", "schedules", "Reminders the agent set for itself: GET /v1/schedules (enabled:false unless the owner's `schedule` knob is on).",
+		// What runs or ran: turns, background commands, subagents.
+		route("/v1/activities", "activities", "What the agent is doing and has done, and who asked for it.",
+			get("/v1/activities"), get("/v1/activities/{id}"), post("/v1/activities/{id}/cancel")),
+		// zgh-style tasks: a piece of work the owner hands the agent, with
+		// its own session, workspace, state and outcome records. The feed's
+		// own kind, task-feed, tells a client that /v1/tasks names these
+		// tasks: before them, a runtime declared kind "tasks" for the
+		// activity list's old name.
+		route("/v1/tasks", "tasks", "The owner's long-running tasks.",
+			get("/v1/tasks"), post("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/input"), post("/v1/tasks/{id}/cancel"), post("/v1/tasks/{id}/archive"), get("/v1/tasks/{id}/events")),
+		route("/v1/task-feed", "task-feed", "A live feed of changes to the owner's tasks.",
+			get("/v1/task-feed")),
+		route("/v1/schedules", "schedules", "Reminders the agent set for itself.",
 			get("/v1/schedules"), framework.Endpoint{Method: http.MethodDelete, Path: "/v1/schedules/{id}"}),
+		// Long-term memory upkeep on the owner's request: one consolidation
+		// pass now (the automatic one follows others.memoryTidy).
+		route("/v1/memory", "memory", "Tidying the agent's long-term memory on request.",
+			post("/v1/memory/tidy")),
+		// Owner files: written by the harness (the agent user) to a new name
+		// in the file inbox ~/inbox, where the agent reads them; and the way
+		// back, the files the agent puts in ~/outbox (or the owner's own, in
+		// ~/inbox), which the owner downloads. The file inbox is not the
+		// message inbox above. Images ride the chat and Responses messages
+		// themselves.
+		route("/v1/files", "files", "Files the owner sends the agent, and files the agent leaves for the owner.",
+			post("/v1/files"), get("/v1/files"), get("/v1/files/{id}/{id}"), del("/v1/files/{id}/{id}")),
+		// The owner's word for the turn already running: read before that
+		// turn's next model call (DSH next-step input); queued as an
+		// ordinary turn when no owner turn is running.
+		route("/v1/steer", "steer", "A message from the owner, added to the reply the agent is working on.",
+			post("/v1/steer"), get("/v1/steer/{id}")),
+		// The owner's other conversations (zgh-style sessions): each its own
+		// history, all sharing persona, skills, memory and credentials.
+		route("/v1/sessions", "sessions", "The owner's other conversations with the agent.",
+			get("/v1/sessions"), post("/v1/sessions"), get("/v1/sessions/{id}"), post("/v1/sessions/{id}/prompt"), get("/v1/sessions/{id}/events"), post("/v1/sessions/{id}/cancel")),
 	}
 }

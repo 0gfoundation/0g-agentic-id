@@ -27,9 +27,11 @@
 
 ## 进程
 
-`spawn.go` 以 agent 用户身份运行 `node /opt/0g-harness/<sha256>/bin/0g-harness.mjs`,监听本机回环端口 8794(没有选定包时什么都不启动,直接失败),环境变量由 `environ()` 生成。这些环境变量的约定写在 harness 的 `docs/PROTOCOL.md` 里。
+`spawn.go` 以 agent 用户身份运行 `node /opt/0g-harness/<sha256>/bin/0g-harness.mjs`,监听本机回环端口 8794(没有选定包时什么都不启动,直接失败),环境变量由 `environ()` 生成。这些环境变量的约定写在 harness 的 `docs/PROTOCOL.md` 里。其中 `SEAL_OWNER` 是启动时从链上读到的 owner(小写),harness 拿它核对每条记忆的 `trusted_by`。
 
-- 只要 sealed 知道 provider 的 endpoint,harness 就通过 sealed 的推理代理(`internal/inferproxy`,一个回环地址)调用模型:注册表里的 managed provider,以及 `openai` 和 `anthropic`(sealed 固定的官方 endpoint)。代理写上 owner 的模型,在 system prompt 末尾附上 agent doc,并设置密钥;harness 手里只有占位符(`../../CONFIG_SURFACE.zh.md` §3、§7)。
+- 只要 sealed 知道 provider 的 endpoint,harness 就通过 sealed 的推理代理(`internal/inferproxy`,一个回环地址)调用模型:注册表里的 managed provider,以及 `openai` 和 `anthropic`(sealed 固定的官方 endpoint)。代理写上 owner 的模型,在 system prompt 末尾附上 agent doc,并设置密钥;harness 手里只有占位符(`../../CONFIG_SURFACE.zh.md` §3、§7)。`webTools` 打开、且 owner 选的搜索服务能付费时，代理还为 `web_search` 提供 `POST /v1/web/search`：只收 `{"query"}` 请求体，发给该服务，不附 agent doc(`inferproxy` `websearch.go`)，并按 0G router 的结果格式回答；harness 从 `SEAL_HARNESS_WEB_SEARCH_URL` 拿到这个地址。
+- owner 给子 agent 提供的其他模型(`subagentModels`)是同一个代理上的路由(`modelroutes.go`)：和主模型同 endpoint、同密钥的模型，由主路由多接一个模型；其余的各是 `/p/<id>` 下的一条命名路由，有自己的上游、密钥和模型。每条路由固定自己的模型并附上 agent doc；命名路由拒绝其他模型名。harness 从 `SEAL_HARNESS_MODEL_ROUTES` 拿到它们(不含密钥)。每条路由第一次为某个其他模型转发请求时，日志记一行 `inference route <id>: first request for model <model>`(主路由的 id 记为 `main`)。
+- 搜索服务和每个其他模型怎么付费，按同一条规则：和主模型同 provider、没指定凭据时用模型 key；指定了 owner 的凭据时，经凭证代理带上它的占位符，代理只在 owner 允许的 host 和位置上代填；都不满足就不提供，日志里写明原因。模型 key 条目（`model.<provider>`）不能被指定：它没有占位符，指定它的搜索或模型不提供。指定的凭据在请求发出时才检查：owner 没有这个凭据时凭证代理拒绝，`web_search` 返回拒绝的代码和原因，0G router 也一样。
 - harness 在 `/v1/*` 上检查它自己的 token(`SEAL_BRIDGE_TOKEN`)。owner 从 `/_seal/auth` 拿到的是另一个 token,sealed 的 proxy 在请求进来时把它换成 harness 的,所以 harness 运行的任何东西都看不到 owner 的 token。
 
 harness 做三件事:
@@ -37,9 +39,9 @@ harness 做三件事:
 - 把这段对话和它的轮次记录存在一起(`../../CONVERSATION.zh.md`);
 - 把每一轮的输出交给开启这一轮的一方。owner 开启的轮次,交给 owner 的那个请求;agent 自己开启的轮次(后台任务结束、提醒到点),进收件箱。
 
-`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`tasks`、`schedules`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后四种,对它们没有任何改变。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。
+`FrameworkRoutes()` 在 `/hello` 里公布这些接口,每种能力对应一种 kind:`chat`、`responses`、`inbox`、`events`、`activities`、`tasks`、`task-feed`、`schedules`、`files`、`memory`、`steer`、`sessions`。客户端只在 agent 声明了某种 kind 时,才启用对应的功能。其他框架不声明后十种,对它们没有任何改变。`activities` 是正在运行和运行过的活动列表(轮次、后台命令、子 agent)。`tasks` 是 zgh 式任务:owner 交给 agent 的一件工作,在自己的会话和工作区(默认 `~/tasks/<id>`)里运行,最多同时四件,以 agent 记下的结果收尾(`raise_question`、`request_action`、`report_complete`);状态有 queued、working、idle、needs-input、done、failed、archived。`task-feed` 是任务变化的事件流;声明了这个 kind,客户端也就知道 `/v1/tasks` 指的是这种任务(更早的运行时曾用 kind `tasks` 声明活动列表的旧名)。`steer` 是 owner 给正在运行的那一轮的话:harness 在这一轮下一次调用模型之前读到它;没有 owner 的轮次在运行时,它作为普通轮次排队。`sessions` 是 owner 的其他对话(照 zgh):新开、从另一个会话的记录分叉、或恢复;每次发消息要么是这个会话的下一轮,要么插进它正在跑的一轮;每个会话有自己的事件流。所有会话都是同一个 agent、同一个 owner(人设、skills、记忆、家目录和凭据共用);`owner-chat` 是 `chat` 和 `responses` 背后的默认会话(CONVERSATION.zh.md 不变量 2)。每个路由列出确切的 endpoint,即 harness protocol v1 的那些(`routes_test.go`),sealed 的 proxy 只转发这些:没列的路径返回 404,没列的方法返回 405。`/hello` 是公开的,所以每个路由的描述只用一句平实的话说明它的用途;请求和字段写在 harness 的 `docs/PROTOCOL.md` 里。
 
-harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)和 `skills/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
+harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`):sealed 停掉进程,再从它当前要运行的包启动(`../../LAYERS.zh.md` §5.3)。启动时,agent 在上次提交之后改过的人设(`APPEND_SYSTEM.md`)、`skills/`、`memory/` 和 `memory-public/` 会保留,前提是链上仍是这个容器上次提交的内容(`../../LAYERS.zh.md` §3)。
 
 ## 当前组合
 
@@ -51,7 +53,9 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | 推理 | `dsh-llm-pi-ai`(路由由适配器按 owner 的 settings 渲染好传进去)、`dsh-credentials-local` |
 | shell | `dsh-subprocess-local` + `dsh-bash-local` + `dsh-sandbox-policy: danger-full-access` |
 | 文件读写 | `dsh-fs-local` + `dsh-tool-fs` |
+| owner 发的图片和文件 | `dsh-attachment-local`（owner 发的图片规整后存在 agent 家目录的 `~/.dsh-attachments` 下，不进链；同时让 `read_image` 可用）。owner 上传的文件（`POST /v1/files`）放在文件收件箱 `~/inbox`（不是消息收件箱 `/v1/inbox`），不进链；镜像带 `pdftotext`，用来读其中的 PDF。agent 交给 owner 的文件放在 `~/outbox`，不进链；owner 列出、下载并删除（`GET /v1/files`、`GET /v1/files/{outbox|inbox}/{name}`，最多 50 MiB；`DELETE /v1/files/{outbox|inbox}/{name}`），某一轮在那里新增或改动了文件时会告诉 owner（`harness.outbox_files`）。两个目录都不长期保存文件：harness 删除两处超过 30 天的文件，`~/inbox` 超过 1 GiB 时从最旧的删起（`SEAL_HARNESS_FILES_MAX_AGE_DAYS`、`SEAL_HARNESS_INBOX_MAX_BYTES`；sealed 两个都不设置，所以按这些默认值）。给 agent 的 `~/inbox`、`~/outbox` 说明（`platformtext.go`）告诉它这些规则，以及要长期保留的内容属于记忆或 skill |
 | 技能 | `dsh-skill-filesystem`(对应 `skills/` 这个 iData role:agent 自己装的,会上链) |
+| 长期记忆 | harness 自己的系统提示段(`src/memory.mjs`):说明,以及正文合计不超过 `memoryInlineBytes` 时的每条完整记忆,超过时改为两个 `MEMORY.md` 索引,每个模型步骤都重新读取;记忆文件是两个 iData role(`memory.go`):`memory/`(私有,只在 owner 的会话和任务里用)和 `memory-public/`(公开,只在 owner 明确要求时写入):每条记忆一个 `<name>.md`,直接放在 `$DSH_HOME/memory/` 或 `$DSH_HOME/memory-public/` 里,会上链;每条记忆的 `trusted_by` 写明确认它的 owner,不是当前 owner(`SEAL_OWNER`)确认的只作参考;上链的副本里凭据值换成占位符,格式可识别的秘密换成 `[redacted:<类型>]`(`../../../CREDENTIALS.zh.md`「范围之外」);agent 空闲时不定期整理一次(`src/memory-tidy.mjs`,开关 `memoryTidy`),也可以用 `POST /v1/memory/tidy`(kind `memory`)立刻整理 |
 | 上下文余量 | `dsh-token-meter` + `dsh-compaction-basic` |
 | 循环兜底 | `dsh-tool-call-timeout-policy` |
 | 后台任务(打开 `toolJobs` 时) | `dsh-tool-jobs`:命令可以放到后台跑;agent 空闲时任务结束,会开启新的一轮,这一轮的回复进收件箱 |
@@ -77,8 +81,18 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 |---|---|---|
 | `toolJobs` | `false` | 命令可以放到后台跑(`run_in_background`),并提供 `job_*` 工具 |
 | `subagents` | `false` | 打开 `subagent` 工具:主 agent 派出去在后台跑的只读助手(会同时打开任务工具) |
-| `schedule` | `false` | 打开 `schedule_create` / `schedule_list` / `schedule_delete`:agent 给自己设的提醒 |
-| `maxParallelToolCalls` | `1` | 模型一步里最多同时运行几个工具调用。只对声明了可以并发的工具生效：`read`、`read_image`、`subagent`。`bash`、`write`、`edit`、`seal_*` 工具以及任务和提醒工具总是单独运行，等前面的调用结束才开始 |
+| `schedule` | `false` | 打开 `schedule_create` / `schedule_list` / `schedule_view` / `schedule_edit`、`schedule_create_task` 和 `schedule_runs`:agent 给自己设的提醒和定时工作,投给设它的会话、一个新会话,或每次到点新建一个任务;任务给自己设的提醒到点时会启动它的一次运行 |
+| `maxParallelToolCalls` | `1` | 模型一步里最多同时运行几个工具调用。只对声明了可以并发的工具生效：`read`、`read_image`、`web_search`、`web_fetch`、`subagent`。`bash`、`write`、`edit`、`seal_*` 工具以及任务和提醒工具总是单独运行，等前面的调用结束才开始 |
+| `modelImages` | 不设置 | 覆盖 owner 的模型能不能看图（`true`/`false`）。不设置时由服务商的模型列表决定（0G router 上是 `architecture.input_modalities`：glm-5.3 只收文字，glm-5.3-flash 能看图）；列表里没写时按 pi-ai 的模型目录。能看图时 owner 发的图片交给模型；不能时每张图存到 `~/inbox`，并告诉 agent 它看不到 |
+| `memoryExtract` | `true` | owner 会话压缩之前，以及某一轮没存记忆、且新消息够多之后，harness 调用一次模型，把这些消息里值得长期保留的内容写进长期记忆（0g-harness `src/memory-extract.mjs`）；设为 `false` 两者都关闭。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT`。 |
+| `memoryExtractMinMessages` | `6` | 某一轮没存记忆时，自上次提取以来 owner 和 agent 的新消息至少要有多少条，才读一遍找记忆（1 到 1000）。渲染为 `SEAL_HARNESS_MEMORY_EXTRACT_MIN_MESSAGES`。 |
+| `memoryRecall` | `true` | 超过 `memoryInlineBytes` 后，每条 owner 消息之前，harness 调用一次模型挑出最多 5 条有用的记忆，把正文放在消息前面（0g-harness `src/memory-recall.mjs`）；设为 `false` 关闭。渲染为 `SEAL_HARNESS_MEMORY_RECALL`。 |
+| `memoryTidy` | `true` | agent 空闲时，harness 不定期为每个记忆角色调用一次模型，整理这个角色里当前 owner 可信的记忆：合并重复的，删掉过时或被推翻的，从不在两个角色之间移动（0g-harness `src/memory-tidy.mjs`；距上次整理 24 小时且记忆有变化时到期，某个索引接近上限时提前）；设为 `false` 关闭自动整理，`POST /v1/memory/tidy` 仍可按需整理一次。渲染为 `SEAL_HARNESS_MEMORY_TIDY`。 |
+| `webTools` | `true` | 打开 `web_fetch` 工具（把一个公网 http(s) 页面读成文本；私网和回环地址拒绝，DNS 解析之后也查；经凭证代理出站）和 `web_search`（走 `webSearch` 选的服务）（0g-harness `src/web.mjs`）；设为 `false` 两个都关。渲染为 `SEAL_HARNESS_WEB`。 |
+| `webSearch` | `{"service":"0g-router"}` | `{"service", "credential"?, "model"?}`。`service`：`0g-router`（router 的结果列表）、`openai`（一次带 `web_search` 工具的 Responses 调用）或 `anthropic`（一次带 `web_search_20250305` 服务端工具的 Messages 调用），后两者先返回模型写的回答，再返回它引用的来源；`off` 去掉 `web_search`。模型的 provider 就是该服务、且没指定 `credential` 时用模型 key 付费，否则用指定的 owner 凭据，该凭据必须允许该服务的 host 和 key 所在的请求头。`model` 是执行 `openai`/`anthropic` 搜索的模型；默认：主模型在该 provider 上时用主模型。provider 注册表的 `webSearch` 字段写明每个 provider 的 key 能付哪个服务（`0g-agentdna providers`）。没有 `web_search` 时（`off`，或配置付不了所选服务），sealed 把原因作为 `SEAL_HARNESS_WEB_SEARCH_OFF` 传给 harness（最多 300 个字符；`off` 时为 "your owner turned it off (settings: webSearch.service = off)"），harness 告诉 agent 哪个工具关了、为什么；`webTools` 关闭时它说的是那个开关。 |
+| `subagentModels` | 无 | 子 agent 可以指定的其他模型，最多 8 个 `{"provider", "model", "credential"?}`，付费规则同 `webSearch`；主模型始终可用。需要打开 `subagents`。格式不对时整个列表作废。 |
+| `subagentDefault` | 主模型 | `{"provider", "model"}`：调用没指定模型时子 agent 用它；必须是主模型或 `subagentModels` 中的一个，否则忽略。 |
+| `memoryInlineBytes` | `8192` | 两个记忆角色的正文合计不超过这个字节数时，每条记忆整条放进系统提示，不做回忆；超过时放索引并回忆（256 到 65536）。渲染为 `SEAL_HARNESS_MEMORY_INLINE_BYTES`。 |
 
 这里填错,不会让 agent 起不来。`RenderSettings` 每次 spawn 前都会运行,要是在这里报错,agent 就开不了机,而不是"这次推送被拒"。所以解析不了或超出范围的值,一律退回出厂默认值,在日志里说明,其他开关照常生效(`settings.go`)。
 
@@ -103,5 +117,4 @@ privsep 让框架子进程以低权限的 `agent` 用户运行。把它和 seale
 
 其他还没做的:
 - 把 `~/.dsh/AGENTS.md` 做成 persona role;
-- 加一个 `memory/` DirectoryManifest role;
 - 补上 e2b 工具沙盒,它是 habitat 模型里"工具沙盒"那一侧。

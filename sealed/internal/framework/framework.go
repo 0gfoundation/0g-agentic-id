@@ -385,7 +385,9 @@ type Route struct {
 	// route rather than to one upstream. Mirrors an agent service's
 	// per-backend routing, which the proxy already does.
 	Backend string
-	// Description is a one-line human summary for /hello.
+	// Description is what the route is for, in one plain sentence, as
+	// /hello shows it to anyone who asks: no request shapes, status codes or
+	// internal names (those belong in the framework's protocol document).
 	Description string
 	// Endpoints, when set, are the only requests the route forwards: a
 	// method and a path, where a segment written {id} stands for any one

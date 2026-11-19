@@ -153,9 +153,9 @@ test('Esc brake while displaced: notice, never a second prompt', async () => {
   assert.equal(waiters.length, 0);
 });
 
-test('Esc brake: a non-seat failure keeps the old raw line', () => {
+test('Esc brake: a non-seat failure says so in plain words', () => {
   const line = brakeInterruptLine(new Error('interrupt: HTTP 500: gateway broke'));
-  assert.match(line, /\(interrupt failed: interrupt: HTTP 500: gateway broke\)/);
+  assert.match(line, /\(could not reach the agent to stop anything: gateway broke \(HTTP 500\)\)/);
   assert.doesNotMatch(line, /driven by another client/);
 });
 

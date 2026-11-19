@@ -74,7 +74,7 @@ async fn load(state: &AppState, seal_id: SealId) -> ApiResult<Deployment> {
 /// go into the set as the agent is created. That set stays good after the mint
 /// (the mint starts no new credential epoch, indexer `watcher.rs`), and sealed
 /// checks its signer against the chain again before it loads it.
-async fn live_owner(state: &AppState, d: &Deployment) -> ApiResult<Address> {
+pub(crate) async fn live_owner(state: &AppState, d: &Deployment) -> ApiResult<Address> {
     let Some(agent_id) = d.agent_id else {
         return Ok(d.owner);
     };
@@ -257,6 +257,24 @@ pub async fn handle_writeback(
     let d = load(&state, req.seal_id).await?;
     verify_writeback(req.seal_id, &req.name, &req.writeback, d.agent_seal_addr)
         .map_err(|e| ApiError::unauthorized(e.to_string()))?;
+    // A retained agentSeal signature and boot ID do not extend an operator's
+    // authority after grant expiry, revocation or NFT ownership changes.
+    // Owner-managed legacy boots keep their existing authorization path.
+    if let Some(auth) = state.deployments.boot_authorization(req.seal_id).await? {
+        if auth.operator.is_some() {
+            attestor_shared::auth::operator::validate_boot_operator(
+                state.chain.as_ref(),
+                state.crypto.as_ref(),
+                state.deployments.as_ref(),
+                state.cfg.chain_id,
+                state.cfg.agentic_id_addr,
+                &d,
+                &auth,
+            )
+            .await
+            .map_err(super::lifecycle_auth::boot_authorization_error)?;
+        }
+    }
     let boot = state.credentials.current_boot_id(req.seal_id).await?;
     if boot.map(|b| format!("{b:#x}")).as_deref()
         != Some(req.writeback.boot_id.to_ascii_lowercase().as_str())
@@ -927,6 +945,80 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    /// Model a running operator-funded boot, including one whose grant has
+    /// elapsed since startup. The credentials repository deliberately retains
+    /// the boot ID so the tests exercise the grant gate rather than only its
+    /// existing current-boot guard.
+    async fn delegated_writeback_setup(expires_at: i64) -> (Setup, String) {
+        use attestor_shared::auth::operator::OperatorGrant;
+        let s = setup();
+        write(&s, &s.owner, 0, &document(&s, &s.owner, 1, 0, true))
+            .await
+            .unwrap();
+        let operator = PrivateKeySigner::random().address();
+        let canonical = json!({
+            "domain": "AgenticID.Operator.v1", "chain_id": s.state.cfg.chain_id,
+            "contract": s.state.cfg.agentic_id_addr, "seal_id": s.seal_id,
+            "owner": s.owner.address(), "base_version": 0, "operator": operator,
+            "allow_recreate": false, "expires_at": expires_at,
+            "issued_at": Utc::now().timestamp() - 60,
+        });
+        let bytes = serde_json::to_vec(&canonical).unwrap();
+        let signature: Vec<u8> = s.owner.sign_hash_sync(&B256::from(eip191_digest(&bytes))).unwrap().into();
+        s.state.deployments.compare_and_swap_operator(s.seal_id, 0, OperatorGrant {
+            version: 1, owner: s.owner.address(), signed_message_b64: b64e(&bytes), signature: signature.into(),
+            checkpoint_acceptance: None,
+        }).await.unwrap().unwrap();
+        let generation = s.state.deployments.prepare_operator_boot(
+            s.seal_id, Some([9; 32]), s.owner.address(), operator, 1,
+        ).await.unwrap().unwrap();
+        assert!(s.state.deployments.bind_runtime_sandbox(
+            s.seal_id, "operator-runtime".into(), generation, Some(vec![2; 33]),
+        ).await.unwrap());
+        let boot = B256::repeat_byte(0x42);
+        s.creds.set_boot_id(s.seal_id, boot);
+        (s, format!("{boot:#x}"))
+    }
+
+    #[tokio::test]
+    async fn active_operator_boot_may_writeback_owner_allowed_credentials() {
+        let (s, boot) = delegated_writeback_setup(0).await;
+        handle_writeback(State(s.state.clone()), Json(writeback(&s, &s.agent_seal, &boot)))
+            .await
+            .unwrap();
+        assert!(s.creds.get(s.seal_id).await.unwrap().unwrap().writebacks.get("gcp").is_some());
+    }
+
+    #[tokio::test]
+    async fn delegated_writeback_rejects_expired_revoked_or_transferred_authority() {
+        use attestor_shared::auth::operator::OperatorGrant;
+        for cause in ["expired", "revoked", "transferred"] {
+            let expiry = if cause == "expired" { Utc::now().timestamp() - 1 } else { 0 };
+            let (s, boot) = delegated_writeback_setup(expiry).await;
+            if cause == "transferred" {
+                s.chain.set_owner_of(PrivateKeySigner::random().address());
+            } else if cause == "revoked" {
+                let canonical = json!({
+                    "domain": "AgenticID.Operator.v1", "chain_id": s.state.cfg.chain_id,
+                    "contract": s.state.cfg.agentic_id_addr, "seal_id": s.seal_id,
+                    "owner": s.owner.address(), "base_version": 1, "operator": null,
+                    "allow_recreate": false, "expires_at": 0, "issued_at": Utc::now().timestamp(),
+                });
+                let bytes = serde_json::to_vec(&canonical).unwrap();
+                let signature: Vec<u8> = s.owner.sign_hash_sync(&B256::from(eip191_digest(&bytes))).unwrap().into();
+                s.state.deployments.compare_and_swap_operator(s.seal_id, 1, OperatorGrant {
+                    version: 2, owner: s.owner.address(), signed_message_b64: b64e(&bytes), signature: signature.into(),
+                    checkpoint_acceptance: None,
+                }).await.unwrap().unwrap();
+            }
+            let error = handle_writeback(State(s.state.clone()), Json(writeback(&s, &s.agent_seal, &boot)))
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::FORBIDDEN, "writeback accepted after {cause}");
+            assert!(s.creds.get(s.seal_id).await.unwrap().unwrap().writebacks.get("gcp").is_none());
+        }
     }
 
     #[tokio::test]

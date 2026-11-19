@@ -36,6 +36,14 @@ export type ErrorCode =
   | 'CREDENTIALS_CONFLICT'
   | 'INFERENCE_KEY_REQUIRED'
   | 'INFERENCE_PROVIDER_UNSUPPORTED'
+  /** The agent has no agentId yet (still being minted, or its deploy failed
+   *  before the mint): what needs one waits, or `retry` resumes it. */
+  | 'AGENT_NOT_READY'
+  /** The agent's runtime image predates what was asked; a reset moves it to
+   *  the current image. */
+  | 'RUNTIME_TOO_OLD'
+  /** What was asked needs the agent running; start (or reset) it. */
+  | 'AGENT_NOT_RUNNING'
   // exit 4 — timeout
   | 'TIMEOUT'
   // exit 5 — auth/ownership
@@ -74,6 +82,9 @@ const EXIT_BY_CODE: Record<ErrorCode, number> = {
   CREDENTIALS_CONFLICT: EXIT.REMEDIABLE,
   INFERENCE_KEY_REQUIRED: EXIT.REMEDIABLE,
   INFERENCE_PROVIDER_UNSUPPORTED: EXIT.REMEDIABLE,
+  AGENT_NOT_READY: EXIT.REMEDIABLE,
+  RUNTIME_TOO_OLD: EXIT.REMEDIABLE,
+  AGENT_NOT_RUNNING: EXIT.REMEDIABLE,
   TIMEOUT: EXIT.TIMEOUT,
   AUTH_REJECTED: EXIT.AUTH,
 };
@@ -114,6 +125,75 @@ export function toCliError(e: unknown): CliError {
     });
   }
   return new CliError('UNKNOWN', e instanceof Error ? e.message : String(e));
+}
+
+/**
+ * Where the owner reads an error: at the shell's prompt (`0g-agentdna>` or an
+ * agent's session), or back in their own shell after a one-shot command. A
+ * remedy names a command the owner can type THERE: `deposit 0.1` at the
+ * prompt, `run \`0g-agentdna\` and type \`deposit 0.1\` there` outside it.
+ * The interactive shell switches to 'shell' once it is up; errors are built
+ * where they are thrown, so the surface at that moment is the one that counts.
+ */
+export type Surface = 'shell' | 'oneshot';
+let surface: Surface = 'oneshot';
+export function setSurface(s: Surface): void {
+  surface = s;
+}
+export function currentSurface(): Surface {
+  return surface;
+}
+
+/** A command that exists only inside the shell, as a remedy. */
+export function shellStep(cmd: string): string {
+  return surface === 'shell' ? `\`${cmd}\`` : `run \`0g-agentdna\` and type \`${cmd}\` there`;
+}
+
+/**
+ * A shell command and what it is for, as a whole sentence for where the
+ * owner is: at the prompt "type `retry 288` to resume it"; outside it "run
+ * `0g-agentdna` and type `retry 288` there to resume it". `purpose` is a
+ * verb phrase.
+ */
+export function shellTo(cmd: string, purpose: string): string {
+  return surface === 'shell'
+    ? `type \`${cmd}\` to ${purpose}`
+    : `run \`0g-agentdna\` and type \`${cmd}\` there to ${purpose}`;
+}
+
+/**
+ * The agent a command works on, and whether it runs in that agent's session,
+ * so a message can name the next command with its id filled in. Set by the
+ * cred and settings commands (one-shot, manager, session); null otherwise.
+ */
+let agentAtHand: { ref: string; session: boolean } | null = null;
+export function setAgentAtHand(ref: string | null, session = false): void {
+  agentAtHand = ref ? { ref, session } : null;
+}
+
+/**
+ * A `cred` or `settings` command for the agent at hand, as typed where the
+ * owner is: `/cred ls` in its session, `cred 286 ls` at the manager,
+ * `0g-agentdna cred 286 ls` outside the shell (`<agent>` when no agent is
+ * at hand).
+ */
+export function agentCmd(kind: 'cred' | 'settings', rest = ''): string {
+  const tail = rest ? ` ${rest}` : '';
+  if (agentAtHand?.session) return `/${kind}${tail}`;
+  const ref = agentAtHand?.ref ?? '<agent>';
+  return surface === 'shell' ? `${kind} ${ref}${tail}` : `0g-agentdna ${kind} ${ref}${tail}`;
+}
+
+/** A shell-only lifecycle step (`start`, `reset`) for the agent at hand, as
+ *  a whole sentence: `/reset` in its session, else shellTo's form. */
+export function lifecycleTo(kind: 'start' | 'reset', purpose: string): string {
+  if (agentAtHand?.session) return `type \`/${kind}\` to ${purpose}`;
+  return shellTo(`${kind} ${agentAtHand?.ref ?? '<agent>'}`, purpose);
+}
+
+/** A command that exists both in the shell and as a one-shot command. */
+export function cmdStep(cmd: string): string {
+  return surface === 'shell' ? `\`${cmd}\`` : `\`0g-agentdna ${cmd}\``;
 }
 
 /** What a question the owner cancelled (Ctrl-C or Esc in the shell) rejects with. */

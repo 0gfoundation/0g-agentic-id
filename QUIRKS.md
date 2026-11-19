@@ -161,6 +161,29 @@ command links instead can fail with npm `EEXIST`. Keep both release versions
 aligned while supporting this path. See the [migration release order](sdk/typescript/MIGRATION.md#release-order)
 ([中文](sdk/typescript/MIGRATION.zh.md#发布顺序)).
 
+### The CLI's Ink session view (`sdk/typescript/src/cli/inkView.ts`)
+
+- `ink` is an ES module with a top-level await (yoga-layout), and the SDK
+  compiles to CommonJS, where TypeScript turns `import()` into `require`.
+  `loadInk` imports it with `new Function('url', 'return import(url)')` on
+  `require.resolve('ink')`. Do not write `await import('ink')` there.
+- Ink draws a change at once only when its last render is more than 32 ms old,
+  and `useStdout().write` redraws Ink's last *rendered* frame under the text it
+  writes. Frames are `FRAME_MS` (40 ms) apart so that frame is always the
+  current one; closer frames showed a stale frame for a moment (a reply line
+  twice). `close()` hides the region before it waits out that gap, or
+  unmounting draws once more and leaves an empty row.
+- Transcript text goes through `useStdout().write`, not `<Text>` or `<Static>`:
+  Ink's text layout (`@alcalzone/ansi-tokenize` 0.1) cuts OSC 8 links apart.
+- Ink clears the whole terminal, scrollback included, when its output is as
+  tall as the screen. Every row of the region is cut to the width in
+  `inkView.ts`, and the region is kept below the screen's height.
+- While the view is up, `run()` hands every keypress to it alone
+  (`routeKeys`) and unhooks readline's resize redraw: readline would edit and
+  redraw a line nobody sees.
+- Ink 5.2.1 with React 18.3.1 is the last Ink that runs on Node 18, which the
+  package's `engines` allows (Ink 6 needs Node 20; Ink 7 and 8 need Node 22).
+
 ### 0g-storage Rust SDK dependency patch
 
 The `core2` crate that `zg-storage-client` pulls in upstream was yanked from

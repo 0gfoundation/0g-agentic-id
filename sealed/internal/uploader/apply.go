@@ -40,9 +40,11 @@ import (
 // when watcher polls find no actual change.
 //
 // Failure handling: any error (encrypt, 0g-storage upload, chain.Update)
-// returns immediately without mutating state. The next tick will re-
-// compute and retry — because chainSnapshot is unchanged on failure, the
-// drift signal persists and Apply is naturally re-invoked.
+// returns immediately without mutating the agent's state. The next tick will
+// re-compute and retry — because chainSnapshot is unchanged on failure, the
+// drift signal persists and Apply is naturally re-invoked. What the failed
+// attempt already uploaded is kept (pending.go) and reused by the retry, so
+// a blob is paid for once.
 //
 // plaintexts: caller (watcher tick) has already invoked adapter.EvolutionFor
 // for every declared role this tick to seed currentSnapshot for /hello.
@@ -128,20 +130,39 @@ func (u *Uploader) Apply(ctx context.Context, plaintexts map[string][]byte) erro
 			newSealedKeys = append(newSealedKeys, sk)
 
 		default:
-			// Diverged from chain. Encrypt + upload + build fresh entry.
-			dataKey, sealedKey, err := u.resolveKey(chainEntry, chainSealedKeys)
+			// Diverged from chain. Encrypt + upload + build fresh entry,
+			// unless an earlier attempt that did not reach the chain built
+			// it already for this plaintext (pending.go).
+			dataKey, sealedKey, err := u.resolveKey(r.Name, chainEntry, chainSealedKeys)
 			if err != nil {
 				return err
 			}
-			var newEntry chain.IntelligentData
-			switch u.shapeOf(r.Name) {
-			case framework.DirectoryManifest:
-				newEntry, err = u.pushManifest(ctx, r.Name, plaintext, dataKey, chainEntry)
-			default:
-				newEntry, err = u.pushLeaf(ctx, r.Name, plaintext, dataKey)
+			basis := basisOf(chainEntry)
+			kid := keyID(dataKey)
+			leaf := u.shapeOf(r.Name) != framework.DirectoryManifest
+			newEntry, reused := u.pending.leaf(r.Name, basis, contentHashHex)
+			if reused {
+				logger.Logf("uploader.Apply: %s reuses the blob an earlier attempt uploaded (0x%x)", r.Name, newEntry.DataHash)
+			} else if e, ok := u.uploaded.whole(r.Name, kid, contentHashHex); ok && leaf {
+				// This content was uploaded before in this boot (uploaded.go).
+				newEntry, reused = e, true
+				logger.Logf("uploader.Apply: %s reuses the blob uploaded earlier for this content (0x%x)", r.Name, newEntry.DataHash)
 			}
-			if err != nil {
-				return err
+			if !reused {
+				if leaf {
+					newEntry, err = u.pushLeaf(ctx, r.Name, plaintext, dataKey)
+				} else {
+					newEntry, err = u.pushManifest(ctx, r.Name, plaintext, dataKey, chainEntry, basis)
+				}
+				if err != nil {
+					return err
+				}
+				if chainEntry == nil || newEntry.DataHash != chainEntry.DataHash {
+					u.pending.keepLeaf(r.Name, basis, contentHashHex, newEntry)
+				}
+				if leaf {
+					u.uploaded.keepWhole(r.Name, kid, contentHashHex, newEntry)
+				}
 			}
 			newEntries = append(newEntries, newEntry)
 			newSealedKeys = append(newSealedKeys, sealedKey)
@@ -177,6 +198,10 @@ func (u *Uploader) Apply(ctx context.Context, plaintexts map[string][]byte) erro
 
 	if u.commitGate != nil {
 		if err := u.commitGate(); err != nil {
+			// Commits stop here (the agent belongs to another owner, say):
+			// nothing uploaded for them is to be reused.
+			u.pending.reset()
+			u.uploaded.reset()
 			return fmt.Errorf("uploader.Apply: %w", err)
 		}
 	}
@@ -185,6 +210,8 @@ func (u *Uploader) Apply(ctx context.Context, plaintexts map[string][]byte) erro
 	if _, err = u.chain.Update(ctx, u.tokenID, newEntries, newSealedKeys, u.agentSealPriv); err != nil {
 		return fmt.Errorf("uploader.Apply: chain.Update: %w", err)
 	}
+	// Everything kept for a retry is on chain now.
+	u.pending.reset()
 
 	// Sync chainSnapshot for every role whose state changed (added,
 	// rebuilt, or dropped).
@@ -196,8 +223,11 @@ func (u *Uploader) Apply(ctx context.Context, plaintexts map[string][]byte) erro
 
 // resolveKey decides whether to reuse the chain entry's existing data_key
 // (essential for manifest mode child-blob continuity) or mint a fresh one.
+// A key minted for a role with no chain entry is kept until the role is on
+// chain, so a retry seals the key its earlier uploads were encrypted with.
 // Returns (dataKey, sealedKey, err).
 func (u *Uploader) resolveKey(
+	role string,
 	chainEntry *chain.IntelligentData,
 	chainSealedKeys map[[32]byte][]byte,
 ) ([]byte, []byte, error) {
@@ -212,6 +242,9 @@ func (u *Uploader) resolveKey(
 		}
 		return dataKey, sealedKey, nil
 	}
+	if k, ok := u.pending.key(role); ok {
+		return k.dataKey, k.sealedKey, nil
+	}
 	dataKey, err := dataplane.NewDataKey()
 	if err != nil {
 		return nil, nil, fmt.Errorf("uploader.Apply: new data_key: %w", err)
@@ -220,6 +253,7 @@ func (u *Uploader) resolveKey(
 	if err != nil {
 		return nil, nil, fmt.Errorf("uploader.Apply: seal data_key: %w", err)
 	}
+	u.pending.keepKey(role, pendingKey{dataKey: dataKey, sealedKey: sealedKey})
 	return dataKey, sealedKey, nil
 }
 
