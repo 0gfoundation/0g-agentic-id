@@ -335,6 +335,15 @@ async fn main() -> anyhow::Result<()> {
                         }
                         tracing::info!(%job_id, kind, ?seal_id, "job done");
                     }
+                    Some(Err(e)) if jobs::is_revoked_during_create(&e) => {
+                        tracing::warn!(
+                            %job_id,
+                            kind,
+                            ?seal_id,
+                            "job stopped: the agent was stopped, reset or its grant changed while a sandbox was being created, so the new sandbox was discarded"
+                        );
+                        let _ = queue.fail(job_id, &e.to_string()).await;
+                    }
                     Some(Err(e)) => {
                         tracing::error!(error = ?e, %job_id, kind, ?seal_id, "job failed");
                         let _ = queue.fail(job_id, &e.to_string()).await;
