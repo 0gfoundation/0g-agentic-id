@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { privateKeyToAccount } from 'viem/accounts';
 import { agentMigrationOf, fetchReleases, type AgentMigration, type ReleaseNotice } from '../Releases';
 import { configPaths } from './config';
+import { currentSurface } from './errors';
 import type { CliEnv } from './env';
 
 /** One of the owner's agents that a release asks to move. */
@@ -71,7 +72,11 @@ export function planReleaseNotice(p: {
   now: Date;
   stamp: NoticeStamp | null;
   zh: boolean;
+  /** Printed inside the interactive shell: its commands are named as typed
+   *  there (`reset <agent>`, `releases`), not as one-shot commands. */
+  shell?: boolean;
 }): { lines: string[]; stamp: NoticeStamp } | null {
+  const details = p.shell ? 'Details: `releases`' : 'Details: 0g-agentdna releases';
   const shownAgo = p.stamp ? p.now.getTime() - Date.parse(p.stamp.at) : Infinity;
   if (p.agents.length) {
     const worst = p.agents.some((a) => a.migrate.state === 'overdue')
@@ -92,10 +97,12 @@ export function planReleaseNotice(p: {
       worst === 'overdue'
         ? `Agent(s) ${names(p.agents)} still run the previous version, whose transition period ended ${until}: it may be retired any time, and their next boot is then refused until they are reset.`
         : `Agent(s) ${names(p.agents)} still run the previous version. They keep running; please reset them onto the new one by ${until} (${left} day${left === 1 ? '' : 's'} left).`,
-      'To reset one: run 0g-agentdna, then `reset <agent>` (persona, skills, settings and memory stay).',
+      p.shell
+        ? 'To reset one: `reset <agent>` (persona, skills, settings and memory stay).'
+        : 'To reset one: run 0g-agentdna, then `reset <agent>` (persona, skills, settings and memory stay).',
     ];
     if (p.agents.some((a) => a.migrate.urgent)) lines.push('This release fixes a security issue: the previous version may be retired sooner.');
-    lines.push('Details: 0g-agentdna releases');
+    lines.push(details);
     return { lines, stamp: { key, at: p.now.toISOString() } };
   }
   const latest = p.releases[0];
@@ -103,7 +110,7 @@ export function planReleaseNotice(p: {
   const key = `${latest.version}|info`;
   if (p.stamp?.key === key) return null;
   return {
-    lines: [`AgentDNA ${latest.version} is out: ${firstLine(notesOf(latest, p.zh))}`, 'Details: 0g-agentdna releases'],
+    lines: [`AgentDNA ${latest.version} is out: ${firstLine(notesOf(latest, p.zh))}`, details],
     stamp: { key, at: p.now.toISOString() },
   };
 }
@@ -184,7 +191,7 @@ export async function dueReleaseNotice(env: CliEnv, signal?: AbortSignal): Promi
       try { agents = await myMigrations(url, env.privateKey, signal); } catch { /* releases alone */ }
     }
     const key = stampKey(url, agents.length ? 'agents' : 'news');
-    const plan = planReleaseNotice({ releases, agents, now: new Date(), stamp: readStamp(key), zh: zhLocale() });
+    const plan = planReleaseNotice({ releases, agents, now: new Date(), stamp: readStamp(key), zh: zhLocale(), shell: currentSurface() === 'shell' });
     if (!plan) return null;
     return { lines: plan.lines, shown: () => writeStamp(key, plan.stamp) };
   } catch {

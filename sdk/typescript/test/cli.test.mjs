@@ -169,16 +169,20 @@ test('--version: exit 0, semver on stdout', async () => {
   assert.match(r.stdout.trim(), /^\d+\.\d+\.\d+/);
 });
 
-test('non-command token routes to interactive, which rejects --json (exit 2, envelope)', async () => {
-  // There is no UNKNOWN_COMMAND anymore by design: any non-command token is
-  // an agent ref for the interactive default, and interactive has no --json.
+test('a word that is neither a command nor an agent ref: UNKNOWN_COMMAND (exit 2, envelope)', async () => {
   const r = await run(['nope', '--json']);
   assert.equal(r.code, 2);
   const env = JSON.parse(r.stdout);
   assert.equal(env.ok, false);
-  assert.equal(env.error.code, 'BAD_FLAG');
+  assert.equal(env.error.code, 'UNKNOWN_COMMAND');
   assert.ok(env.error.remedy.length > 0);
   assert.equal(r.stderr, '');
+});
+
+test('an agent ref with --json still reaches the shell, which has no --json (BAD_FLAG)', async () => {
+  const r = await run(['286', '--json']);
+  assert.equal(r.code, 2);
+  assert.equal(JSON.parse(r.stdout).error.code, 'BAD_FLAG');
 });
 
 test('unknown flag --json: exit 2, BAD_FLAG', async () => {

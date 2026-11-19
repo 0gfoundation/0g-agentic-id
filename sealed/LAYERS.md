@@ -625,7 +625,9 @@ the plaintext. Each entry therefore also carries a plaintext commitment:
 - the salt is not stored but derived from the role's data key:
   `HMAC(data key, label ‖ role ‖ dataHash)`, one per file for directory roles,
   each from that file's own storage root. Unchanged content reuses its
-  ciphertext, so its `dataHash`, salt and commitment stay the same;
+  ciphertext, so its `dataHash`, salt and commitment stay the same; so does
+  content that comes back to what an earlier commit of the same boot held,
+  under the same data key;
 - only TEEs hold the data key, so sealed produces proofs: to prove one version
   or one file to someone, it hands over that one salt, leaving other versions
   and files unaffected; or it generates a ZK proof inside, with the salt as a

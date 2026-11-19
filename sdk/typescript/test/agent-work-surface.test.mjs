@@ -533,7 +533,10 @@ test('a notice prints above the prompt and keeps what is typed', () => {
     assert.deepEqual(s.lines, [
       'earlier output',
       '',
-      ...wrap('◆ agent · job finished · bash job9 [status: completed, exit code: 0]'),
+      // Broken between words at the terminal's width, less one, the further
+      // row under the text after ◆.
+      '◆ agent · job finished · bash job9',
+      '  [status: completed, exit code: 0]',
       'report 9',
       '',
       ...promptRows,
@@ -559,7 +562,7 @@ test('without a terminal a notice is just written', () => {
   rl.close();
 });
 
-test('/tasks table: who did it and who asked, ids whole, labels cleaned', () => {
+test('/tasks table: who did it and who asked, ids short (13 characters, more where two would read the same), labels cleaned', () => {
   const now = 1_000_000_000;
   const lines = renderActivityTable([
     { id: 'resp_0123456789abcdef01234567', type: 'turn', status: 'in_progress', actor: 'agent', trigger: 'user', label: 'summarize the repo', created_at: now / 1000 - 12 },
@@ -567,7 +570,8 @@ test('/tasks table: who did it and who asked, ids whole, labels cleaned', () => 
     { id: 'resp_ffffffffffffffffffffffff', type: 'turn', status: 'completed', actor: 'agent', trigger: 'schedule', label: 'stand-up', created_at: now / 1000 - 7200 },
   ], now);
   assert.match(lines[0], /ID\s+STATUS\s+BY\s+FOR\s+AGE\s+WHAT/);
-  assert.match(lines[1], /resp_0123456789abcdef01234567\s+in_progress\s+agent\s+you\s+12s\s+summarize the repo/);
+  assert.match(lines[1], /^ {2}resp_01234567 {2}in_progress\s+agent\s+you\s+12s\s+summarize the repo/);
+  assert.match(lines[3], /^ {2}resp_ffffffff {2}completed/);
   assert.match(lines[2], /subagent-1\s+completed\s+subagent\s+agent\s+5m\s+review tests$/);
   assert.match(lines[3], /agent\s+reminder\s+2h\s+stand-up/);
   assert.ok(!lines.join('').includes('\u001b'), 'no escape sequence reaches the terminal');

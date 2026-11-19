@@ -87,6 +87,8 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/files", "GET", "/v1/files"},
 		{"/v1/files", "GET", "/v1/files/outbox/report.pdf"},
 		{"/v1/files", "GET", "/v1/files/inbox/notes.txt"},
+		{"/v1/files", "DELETE", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "DELETE", "/v1/files/inbox/notes.txt"},
 		{"/v1/sessions", "GET", "/v1/sessions"},
 		{"/v1/sessions", "POST", "/v1/sessions"},
 		{"/v1/sessions", "GET", "/v1/sessions/sess-1"},
@@ -117,8 +119,12 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/files", "POST", "/v1/files/x"},
 		{"/v1/files", "GET", "/v1/files/outbox"},
 		{"/v1/files", "GET", "/v1/files/outbox/a/b"},
-		{"/v1/files", "DELETE", "/v1/files/outbox/report.pdf"},
 		{"/v1/files", "POST", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "PATCH", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "PUT", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "DELETE", "/v1/files"},
+		{"/v1/files", "DELETE", "/v1/files/outbox"},
+		{"/v1/files", "DELETE", "/v1/files/outbox/a/b"},
 	}
 	for _, f := range refused {
 		if ok, _ := routes[f.prefix].Allows(f.method, f.path); ok {

@@ -14,27 +14,33 @@
  */
 
 import * as readline from 'node:readline';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
-import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
+import { parseEther, keccak256, isAddress, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
-import type { AgentClient, AgentInboxMessage, AgentSchedule, AgentActivityInfo, AgentActivityStop, HarnessTask, HarnessTaskRecord, HarnessTaskSummary, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
+import type { AgentClient, AgentInboxMessage, AgentSession, AgentSchedule, AgentActivityInfo, AgentActivityStop, HarnessTask, HarnessTaskRecord, HarnessTaskSummary, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
 import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
-import { buildClient } from '../sdk';
+import { buildClient, probeAttestor } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
-import { CliError, cancelled, isCancelled } from '../errors';
+import { CliError, cancelled, cmdStep, currentSurface, isCancelled, setAgentAtHand, setSurface, shellStep, shellTo } from '../errors';
 import { requireAttestorUrl } from '../env';
+import { ogAmount, parseOgAmount, explainError } from '../plain';
+import { fitHelp, termWidth, didYouMean } from '../textfit';
+import { run as doctorCommand } from './doctor';
+import { run as statusCommand } from './status';
+import { run as providersCommand } from './providers';
+import { run as releasesCommand } from './releases';
 import { dueReleaseNotice } from '../releaseNotice';
-import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
+import { loadKey, saveKey, normalizeKey, saveApiKey, loadApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
-import { applyAssignments, assertModelPresent, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework, isHarnessFramework, parseAssignments, renderListedVersions, renderSettings } from '../settings';
+import { applyAssignments, assertModelFitsFramework, assertModelPresent, touchesModel, assertSubagentDefaultOffered, assertOthersFitFramework, assertVersionsFitFramework, frameworkNeedsToolModels, isHarnessFramework, renderListedVersions, renderSettings, renderVersionsLine, settingsArgs } from '../settings';
 import { answerPending, cachedCredNames, CRED_KEYS, CRED_PRESETS, credOp, credOwnerOp, ensureModelKey } from '../credentials';
 import { mayGoKeyless, pickModelKey, replKeyPrompt, resetModelKey } from '../modelkey';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
-import { completePath, describeStaged, prepareAttachments, stageFile, type Staged } from '../attach';
+import { completePath, describeStaged, findDroppedFiles, prepareAttachments, stageDropped, stageFile, type Staged } from '../attach';
 import { parseDownloadName, renderFiles, saveDownload } from '../download';
 import { pandaLines, svgPixelLines } from '../logo';
 import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
@@ -42,8 +48,8 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePl
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
-const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/sessions', '/activities', '/tasks', '/result', '/cancel', '/inbox', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
+const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'status ', 'doctor', 'providers', 'releases', 'help', 'quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/sessions', '/activities', '/tasks', '/result', '/cancel', '/inbox', '/notices', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -59,59 +65,59 @@ const clientInstanceId = (globalThis.crypto?.randomUUID?.() ?? `cli-${Date.now()
  *  is ALWAYS shown ("couldn't check" ≠ "nothing owed"). */
 type EffBalance = Awaited<ReturnType<AgenticID['getEffectiveBalance']>>;
 function moneyBlock(prepaidWei: bigint | null, eff: EffBalance | null, effErr: string | null): void {
-  out(`prepaid balance : ${prepaidWei == null ? '(unreadable)' : og(prepaidWei)}\n`);
+  say(`prepaid balance   : ${prepaidWei == null ? '(unreadable)' : og(prepaidWei)}\n`);
   if (eff && eff.availableWei < eff.balanceWei) {
-    if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
-    if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
-    if (eff.reservedWei > 0n) out(`reserved        : ${og(eff.reservedWei)}\n`);
-    out(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
+    if (eff.outstandingDebtWei > 0n) say(`outstanding debt  : ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
+    if (eff.pendingSettlementWei > 0n) say(`pending settles   : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
+    if (eff.reservedWei > 0n) say(`reserved          : ${og(eff.reservedWei)}\n`);
+    say(`AVAILABLE         : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
   } else if (eff) {
-    out(`AVAILABLE       : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
+    say(`AVAILABLE         : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
   } else {
-    out(`AVAILABLE       : (couldn't reach the provider's effective view: ${effErr ?? 'unknown'} — the chain number above may be optimistic)\n`);
+    say(`AVAILABLE         : (unknown: ${effErr ? explainError(effErr).message : 'no answer'} — the chain number above may be optimistic)\n`);
   }
 }
 
 /** Once-a-day update hint, driven by the attestor's /config (cli_latest +
  *  cli_notes — operator-set per release). Deliberately minimal: no npm, no
- *  semver lib (numeric dot-compare), silent on any failure. */
-// Deterministic latch for the update hint: Promise.race does NOT cancel the
-// loser, so a fetch resolving just past the deadline could still print into
-// the prompt. The banner closes the window; a late hint then stays silent.
-let updateHintWindowOpen = false;
-
-async function maybePrintUpdateHint(attestorUrl?: string): Promise<void> {
-  if (!attestorUrl) return;
-  updateHintWindowOpen = true;
-  {
+ *  semver lib (numeric dot-compare), silent on any failure. Returns the
+ *  lines to print and `shown()` to call once they are printed, so a hint
+ *  that comes too late for the banner is neither printed nor counted. */
+async function updateHint(attestorUrl?: string): Promise<{ lines: string[]; shown: () => void } | null> {
+  if (!attestorUrl) return null;
+  try {
+    const cfg = (await (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(4000) })).json()) as {
+      cli_latest?: string; cli_notes?: string;
+    };
+    const latest = cfg.cli_latest?.trim();
+    if (!latest) return null;
+    const mine = SDK_VERSION;
+    if (compareVersions(mine, latest) >= 0) return null;
+    // once per (day, latest)
+    const stamp = join(configPaths().dir, 'update-hint.json');
+    const today = new Date().toISOString().slice(0, 10);
     try {
-      const cfg = (await (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(4000) })).json()) as {
-        cli_latest?: string; cli_notes?: string;
-      };
-      const latest = cfg.cli_latest?.trim();
-      if (!latest) return;
-      const mine = SDK_VERSION;
-      if (compareVersions(mine, latest) >= 0) return;
-      // once per (day, latest)
-      const stamp = join(configPaths().dir, 'update-hint.json');
-      const today = new Date().toISOString().slice(0, 10);
-      try {
-        const prev = JSON.parse(readFileSync(stamp, 'utf8')) as { day?: string; latest?: string };
-        if (prev.day === today && prev.latest === latest) return;
-      } catch { /* first time */ }
-      if (!updateHintWindowOpen) return; // banner already closed — stay silent
+      const prev = JSON.parse(readFileSync(stamp, 'utf8')) as { day?: string; latest?: string };
+      if (prev.day === today && prev.latest === latest) return null;
+    } catch { /* first time */ }
+    const lines = [`update available: ${mine} → ${latest} — quit, then run: 0g-agentdna update`];
+    if (cfg.cli_notes?.trim()) lines.push(cfg.cli_notes.trim());
+    return {
+      lines,
       // Create the config dir first: a user whose attestorUrl comes from
       // AGENTIC_* env has never hit a write path, so the dir may not exist —
       // without this the stamp write ENOENTs, the once-a-day guard never
       // records, and the hint nags every start (review #170). Don't swallow
       // silently either.
-      try {
-        mkdirSync(configPaths().dir, { recursive: true });
-        writeFileSync(stamp, JSON.stringify({ day: today, latest }));
-      } catch (e) { console.error(`(update-hint stamp unwritable: ${(e as Error).message} — the hint may repeat)`); }
-      out(`\n  update available: ${mine} → ${latest}   0g-agentdna update\n`);
-      if (cfg.cli_notes?.trim()) out(`  ${cfg.cli_notes.trim()}\n`);
-    } catch { /* a down attestor never blocks or complains here */ }
+      shown: () => {
+        try {
+          mkdirSync(configPaths().dir, { recursive: true });
+          writeFileSync(stamp, JSON.stringify({ day: today, latest }));
+        } catch (e) { console.error(`(update-hint stamp unwritable: ${(e as Error).message} — the hint may repeat)`); }
+      },
+    };
+  } catch {
+    return null; // a down attestor never blocks or complains here
   }
 }
 
@@ -193,7 +199,7 @@ export function makeBrake(
     const client = getClient();
     if (!client?.interrupt) { print('\n(this agent image has no interrupt endpoint — /reset is the only stop)\n'); return; }
     client.interrupt().then(
-      (r) => print(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + cleanCell(r.note ?? 'not supported') + ')\n'),
+      (r) => print(r.aborted ? '\n⏹ stopped the running task\n' : `\n(nothing was running${r.note && !/nothing|no task|not running/i.test(r.note) ? ` — ${cleanCell(r.note)}` : ''})\n`),
       // NOT a prompt: the loop's ask() is pending right now — a notice only.
       // The seat argument is deliberately NOT called from here.
       (e) => print(brakeInterruptLine(e)),
@@ -211,7 +217,28 @@ export function brakeInterruptLine(e: unknown): string {
     // reclaims and resends.
     return '\n⚠ this agent is now driven by another client — send a message to take the seat back\n';
   }
-  return `\n(interrupt failed: ${cleanCell(msg)})\n`;
+  return `\n(could not reach the agent to stop anything: ${cleanCell(plainError(e))})\n`;
+}
+
+/**
+ * An error in the words a person reads: viem's first line (its short
+ * message), an HTTP error's message without the request detail; no stack,
+ * no raw call arguments. Exported for the tests.
+ */
+export function plainError(e: unknown): string {
+  const err = e as { shortMessage?: string; message?: string };
+  let msg = (err?.shortMessage ?? err?.message ?? String(e)).split('\n')[0].trim();
+  // "<what>: HTTP 404: {"error":{"message":"unknown task"}}" → "unknown task (HTTP 404)"
+  const http = /^(?:[\w.]+: )?HTTP (\d{3}):?\s*(.*)$/s.exec(msg);
+  if (http) {
+    let why = http[2].trim();
+    try {
+      const j = JSON.parse(why) as { error?: { message?: string } | string; message?: string };
+      why = (typeof j.error === 'string' ? j.error : j.error?.message) ?? j.message ?? why;
+    } catch { /* not JSON: as it is */ }
+    msg = `${why || 'no reason given'} (HTTP ${http[1]})`;
+  }
+  return msg;
 }
 
 /**
@@ -287,27 +314,69 @@ const ASKED_BY: Record<string, string> = { user: 'you', job: 'job', schedule: 'r
  * reminder, the agent itself). Ids print whole: they are what /result and
  * /cancel take. Exported for the tests.
  */
-export function renderActivityTable(tasks: AgentActivityInfo[], nowMs: number): string[] {
-  const idw = Math.max(2, ...tasks.map((t) => cleanCell(t.id).length)) + 2;
-  const head = `  ${'ID'.padEnd(idw)}${'STATUS'.padEnd(13)}${'BY'.padEnd(10)}${'FOR'.padEnd(10)}${'AGE'.padEnd(6)}WHAT`;
+/**
+ * Who asked for an activity, as /activities' FOR column says it. A command
+ * or subagent: `you` when the turn that started it was the owner's
+ * (`parent_trigger: user`, 0g-harness #12 on), `agent` otherwise. An older
+ * harness names no parent turn; there one started while only the owner's
+ * turns ran (by their start and end) counts as the owner's. Exported for the tests.
+ */
+export function askedFor(t: AgentActivityInfo, all: readonly AgentActivityInfo[], nowSec: number): string {
+  if (t.type !== 'turn' && typeof t.parent_trigger === 'string') return t.parent_trigger === 'user' ? 'you' : 'agent';
+  if (t.type !== 'turn' && t.trigger === 'agent') {
+    const during = all.filter((x) => x.type === 'turn' && x.started_at !== undefined && x.started_at <= t.created_at && t.created_at <= (x.finished_at ?? nowSec));
+    if (during.length && during.every((x) => x.trigger === 'user')) return 'you';
+  }
+  return ASKED_BY[t.trigger] ?? t.trigger;
+}
+
+/** Ids as a list shows them: a long one (a uuid in it) by its first 13
+ *  characters (`resp_4702745b`, `bash-c917aa00`), longer where two would read
+ *  the same; one of 20 characters or fewer (`task-weekly-report`) whole.
+ *  /result, /cancel and /tasks take a unique start of an id. Exported for the tests. */
+export function shortIds(ids: readonly string[]): string[] {
+  return ids.map((id) => {
+    if (id.length <= 20) return id;
+    let n = Math.min(13, id.length);
+    while (n < id.length && ids.some((o) => o !== id && o.startsWith(id.slice(0, n)))) n++;
+    return id.slice(0, n);
+  });
+}
+
+export function renderActivityTable(tasks: AgentActivityInfo[], nowMs: number, width = 1000): string[] {
+  const ids = shortIds(tasks.map((t) => cleanCell(t.id)));
+  const idw = Math.max(2, ...ids.map((id) => id.length)) + 2;
+  // Narrow: AGE goes first, then FOR, then BY, before WHAT is squeezed.
+  const show = { by: true, for: true, age: true };
+  const room = (): number => width - 2 - idw - 13 - (show.by ? 10 : 0) - (show.for ? 10 : 0) - (show.age ? 6 : 0);
+  for (const k of ['age', 'for', 'by'] as const) if (room() < 18) show[k] = false;
+  const whatW = Math.max(10, Math.min(70, room()));
+  const head = `  ${'ID'.padEnd(idw)}${'STATUS'.padEnd(13)}${show.by ? 'BY'.padEnd(10) : ''}${show.for ? 'FOR'.padEnd(10) : ''}${show.age ? 'AGE'.padEnd(6) : ''}WHAT`;
   return [
     head,
-    ...tasks.map((t) =>
-      `  ${cleanCell(t.id).padEnd(idw)}${cellText(t.status, 13)}${cellText(t.actor, 10)}` +
-      `${cellText(ASKED_BY[t.trigger] ?? t.trigger, 10)}${span(nowMs / 1000 - t.created_at).padEnd(6)}` +
-      `${[...cleanCell(t.label)].slice(0, 70).join('')}`),
+    ...tasks.map((t, i) =>
+      `  ${ids[i].padEnd(idw)}${cellText(t.status, 13)}${show.by ? cellText(t.actor, 10) : ''}` +
+      `${show.for ? cellText(askedFor(t, tasks, nowMs / 1000), 10) : ''}${show.age ? span(nowMs / 1000 - t.created_at).padEnd(6) : ''}` +
+      `${fitRow(cleanCell(activityLabel(t.label)), whatW)}`),
   ];
 }
 
 /** The /tasks list: id, state, open records, age, title. Exported for the tests. */
-export function renderTaskTable(tasks: HarnessTask[], nowMs: number): string[] {
-  const idw = Math.max(2, ...tasks.map((t) => cleanCell(t.id).length)) + 2;
+export function renderTaskTable(tasks: HarnessTask[], nowMs: number, width = 1000): string[] {
+  // Ids as /activities shows them: short, a unique start (/tasks show takes it).
+  const ids = shortIds(tasks.map((t) => cleanCell(t.id)));
+  const idw = Math.max(2, ...ids.map((id) => id.length)) + 2;
+  // Narrow: AGE goes first, then RUNS, then OPEN, before TITLE is squeezed.
+  const show = { open: true, runs: true, age: true };
+  const room = (): number => width - 2 - idw - 13 - (show.open ? 6 : 0) - (show.runs ? 6 : 0) - (show.age ? 6 : 0);
+  for (const k of ['age', 'runs', 'open'] as const) if (room() < 18) show[k] = false;
+  const titleW = Math.max(10, Math.min(60, room()));
   return [
-    `  ${'ID'.padEnd(idw)}${'STATE'.padEnd(13)}${'OPEN'.padEnd(6)}${'RUNS'.padEnd(6)}${'AGE'.padEnd(6)}TITLE`,
-    ...tasks.map((t) =>
-      `  ${cleanCell(t.id).padEnd(idw)}${cellText(t.state + (t.reason ? ` (${t.reason})` : ''), 13)}` +
-      `${String(t.records?.length ?? 0).padEnd(6)}${String(t.runs?.count ?? 0).padEnd(6)}` +
-      `${span(nowMs / 1000 - t.created_at).padEnd(6)}${[...cleanCell(t.title)].slice(0, 60).join('')}`),
+    `  ${'ID'.padEnd(idw)}${'STATE'.padEnd(13)}${show.open ? 'OPEN'.padEnd(6) : ''}${show.runs ? 'RUNS'.padEnd(6) : ''}${show.age ? 'AGE'.padEnd(6) : ''}TITLE`,
+    ...tasks.map((t, i) =>
+      `  ${ids[i].padEnd(idw)}${cellText(t.state + (t.reason ? ` (${t.reason})` : ''), 13)}` +
+      `${show.open ? String(t.records?.length ?? 0).padEnd(6) : ''}${show.runs ? String(t.runs?.count ?? 0).padEnd(6) : ''}` +
+      `${show.age ? span(nowMs / 1000 - t.created_at).padEnd(6) : ''}${fitRow(cleanCell(t.title), titleW)}`),
   ];
 }
 
@@ -363,7 +432,7 @@ export function renderTask(t: HarnessTask): string[] {
   const last = t.runs?.last;
   const lines = [
     `${cleanCell(t.id)} — ${cleanCell(t.state)}${t.reason ? ` (${cleanCell(t.reason)})` : ''} · ${cleanCell(t.title)}`,
-    `  workspace ${cleanCell(t.workspace?.path ?? '')} · runs ${t.runs?.count ?? 0}${t.pending ? ` · ${t.pending} input(s) waiting` : ''}`,
+    `  runs ${t.runs?.count ?? 0}${t.pending ? ` · ${t.pending} input(s) waiting` : ''}`,
   ];
   if (last?.error) lines.push(`  last run: ${cleanCell(last.error)}`);
   const shown = new Set<number>();
@@ -380,13 +449,25 @@ export function renderTask(t: HarnessTask): string[] {
  * One inbox message as the session prints it: why the agent spoke up, then
  * what it said. Exported for the tests.
  */
+/** A notice's text in plain words: a subagent's end (its id short, for /result). */
+/** An activity's label in plain words: a subagent's wake-up turn as `subagent finished (a3d11469)`. */
+function activityLabel(label: string): string {
+  const m = /^Background subagent ([0-9a-f][0-9a-f-]{7,}) finished\b/.exec(label);
+  return m ? `subagent finished (${m[1].slice(0, 8)})` : label;
+}
+
+function plainNotice(text: string): string {
+  return text.replace(/Background subagent ([0-9a-f][0-9a-f-]{7,}) finished and will do no further work unless you send it more\.?/g,
+    (_m, id: string) => `a subagent finished — /result ${id.slice(0, 8)}`);
+}
+
 export function renderInboxMessage(m: AgentInboxMessage): string {
-  const label = cleanCell(m.label);
+  const label = cleanCell(plainNotice(m.label ?? ''));
   const why = m.trigger === 'job' ? `job finished · ${label}`
     : m.trigger === 'schedule' ? `reminder · ${label}`
     : label || cleanCell(m.trigger);
   const lines = [`◆ agent · ${why}`];
-  if (m.text?.trim()) lines.push(cleanStream(m.text).replace(/\s+$/, ''));
+  if (m.text?.trim()) lines.push(cleanStream(plainNotice(m.text)).replace(/\s+$/, ''));
   if (m.status === 'failed') lines.push(`(that turn failed: ${cleanCell(m.error ?? 'no reason given')})`);
   else if (m.status === 'cancelled') lines.push('(that turn was cancelled)');
   return `${lines.join('\n')}\n`;
@@ -394,6 +475,90 @@ export function renderInboxMessage(m: AgentInboxMessage): string {
 
 /** The /schedules lines: id, how often, when next, the reminder's text.
  *  Exported for the tests. */
+/** "just now", "5 min ago", "3 h ago", "2 d ago": how long since `atMs`. */
+export function agoText(atMs: number, nowMs: number): string {
+  const s = Math.max(0, Math.round((nowMs - atMs) / 1000));
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86_400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86_400)} d ago`;
+}
+
+/**
+ * What Tab offers after `/sessions`: its subcommands, and `switch <short id>`
+ * and `switch <title>` for each session in `list` (as {@link orderSessions}
+ * orders them).
+ */
+export function sessionCompletions(list: readonly AgentSession[], rest = '', shown?: readonly ShownSession[] | null): string[] {
+  if (!rest.startsWith('switch ')) return ['list', 'new ', 'fork ', 'default', 'switch '];
+  // After `switch `: the sessions, numbered as the list the owner last saw.
+  return (shown ?? shownSessions(list)).map((x, i) => `switch ${i + 1} ${x.title}`);
+}
+
+/** One row of a `/sessions` listing as shown: its id, and its title as the list prints it. */
+export interface ShownSession { id: string; title: string }
+
+/** A session's title as the list prints it, on one line. */
+function sessionTitle(x: AgentSession): string {
+  const title = x.title?.trim() ? cleanCell(x.title).replace(/\s+/g, ' ') : x.kind === 'owner' ? 'owner chat' : '(untitled)';
+  return x.kind === 'task' ? `[task] ${title}` : title;
+}
+
+/** The listing's rows in the order `/sessions` numbers them. */
+export function shownSessions(list: readonly AgentSession[]): ShownSession[] {
+  return orderSessions(list).map((x) => ({ id: x.id, title: sessionTitle(x) }));
+}
+
+/** Sessions as `/sessions` numbers them: the most recently active first. */
+export function orderSessions(list: readonly AgentSession[]): AgentSession[] {
+  return [...list].sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0));
+}
+
+/** A session's id as the list shows it: owner-chat whole, others their first 13 characters (`sess-5d25f787`). */
+export function shortSessionId(id: string): string {
+  return id === 'owner-chat' ? id : id.slice(0, 13);
+}
+
+/**
+ * The `/sessions` listing: a number to switch by, the short id, its state,
+ * when it was last active, and its title (the harness names a session after
+ * its first message), `*` on the one chat goes to.
+ */
+export function renderSessionList(list: readonly AgentSession[], current: string, nowMs: number, width = Infinity): string[] {
+  const rows = orderSessions(list);
+  const lines = [`    #  ${'SESSION'.padEnd(15)}${'STATE'.padEnd(9)}${'ACTIVE'.padEnd(13)}TITLE`];
+  rows.forEach((x, i) => {
+    // updated_at is in seconds on the wire; accept milliseconds too.
+    const at = x.updated_at > 1e12 ? x.updated_at : x.updated_at * 1000;
+    const head = `  ${x.id === current ? '*' : ' '} ${String(i + 1).padStart(2)}  ${cleanCell(shortSessionId(x.id)).padEnd(15)}${cleanCell(x.state).padEnd(9)}${(x.updated_at ? agoText(at, nowMs) : '-').padEnd(13)}`;
+    // A long title goes on under the TITLE column.
+    const title = Number.isFinite(width) && width - head.length >= 12 ? wrapProse(sessionTitle(x), width - head.length) : [sessionTitle(x)];
+    title.forEach((t, j) => lines.push(`${j ? ' '.repeat(head.length) : head}${t}`));
+  });
+  return lines;
+}
+
+/**
+ * The session `/sessions switch <arg>` means: a number counts in the list
+ * the owner last saw (`shown`; the title Tab adds after it is ignored),
+ * else an id, id prefix or words of a title. `number` without `shown`: no
+ * list was shown yet; `gone`: the one shown under that number is no more.
+ */
+export function pickSession(list: readonly AgentSession[], arg: string, shown?: readonly ShownSession[] | null): { hit?: AgentSession; number?: number; gone?: ShownSession } {
+  const num = /^(\d+)(?:\s|$)/.exec(arg);
+  if (num) {
+    const number = Number(num[1]);
+    if (!shown) return { number };
+    const row = shown[number - 1];
+    if (!row) return { number };
+    const hit = list.find((x) => x.id === row.id);
+    return hit ? { hit, number } : { number, gone: row };
+  }
+  const rows = orderSessions(list);
+  const hit = rows.find((x) => x.id === arg) ?? rows.find((x) => x.id.startsWith(arg)) ?? rows.find((x) => (x.title || '').toLowerCase().includes(arg.toLowerCase()));
+  return hit ? { hit } : {};
+}
+
 export function renderSchedules(list: AgentSchedule[], nowMs: number): string[] {
   const idw = Math.max(2, ...list.map((r) => cleanCell(r.id).length)) + 2;
   return list.map((r) => {
@@ -415,7 +580,25 @@ export function renderTaskNotice(t: HarnessTaskSummary): string | null {
   const headline = last ? cleanCell(textArg(objArg(last.arguments).headline)) : '';
   const what = t.state === 'needs-input' ? (last?.tool === 'request_action' ? 'needs you to act' : 'has a question')
     : t.state === 'done' ? 'reports done' : `failed${t.reason ? ` (${cleanCell(t.reason)})` : ''}`;
-  return `◆ task ${cleanCell(t.id)} ${what}${headline ? ` · ${headline}` : ''} — /tasks show ${cleanCell(t.id)}\n`;
+  const id = shortIds([cleanCell(t.id)])[0];
+  return `◆ task ${id} ${what}${headline ? ` · ${headline}` : ''} — /tasks show ${id}\n`;
+}
+
+/** What /inbox (or /notices) says when there is nothing to show; all: `/inbox all`. */
+export function noNoticesText(all: boolean): string {
+  return all ? 'no notices from the agent yet\n' : 'no unread notices from the agent (/inbox all lists the ones you\'ve seen)\n';
+}
+
+/** /files' heading for a listing (empty: what it says instead). */
+export function filesText(dir: 'outbox' | 'inbox', empty: boolean, savedTo?: string, saved: readonly string[] = []): string {
+  if (dir === 'outbox') {
+    if (!empty) return 'files the agent left for you (~/outbox):\n';
+    if (savedTo && saved.length) {
+      return `nothing waiting on the agent — ${saved.length === 1 ? '1 file' : `${saved.length} files`} saved to ${savedTo} this session (latest: ${saved[saved.length - 1]})\n`;
+    }
+    return savedTo ? `nothing from the agent yet — files it makes for you are saved to ${savedTo}\n` : 'nothing from the agent yet — /download <name> saves one it leaves for you\n';
+  }
+  return empty ? 'you have sent no files (~/inbox) — /attach sends one with your next message\n' : 'files you sent (~/inbox):\n';
 }
 
 /** What stopping an activity did, in words. */
@@ -426,16 +609,17 @@ const STOP_OUTCOME: Record<AgentActivityStop['outcome'], string> = {
 };
 
 /**
- * Follows one agent's inbox for a session: first the messages that came in
- * while nobody was looking, then each new one as the agent's live feed
- * announces it. `show` prints a rendered message, now or at the next prompt,
- * and calls `shown` once it is on screen; the message is acked then, so
+ * Follows one agent's notices (its inbox) for a session: first the messages
+ * that came in while nobody was looking, then each new one as the agent's
+ * live feed announces it. `show` prints a rendered message, now or at the
+ * next prompt, and calls `shown` once it is on screen (`count`: how many
+ * notices the text holds); the message is acked then, so
  * another window does not show it again. A message is shown once per feed.
  * `follow` is called with the session's current client before every prompt
  * and restarts the feed when the client changed (/start, /reset); an agent
  * without an inbox gets no feed. Exported for the tests.
  */
-export function makeInboxFeed(show: (text: string, shown: () => void) => void): {
+export function makeInboxFeed(show: (text: string, shown: () => void, count: number) => void): {
   follow(client: AgentClient | undefined): void;
   stop(): void;
 } {
@@ -450,14 +634,14 @@ export function makeInboxFeed(show: (text: string, shown: () => void) => void): 
       if (!fresh.length || signal.aborted) return;
       for (const m of fresh) seen.add(m.seq);
       const through = Math.max(...fresh.map((m) => m.seq));
-      const text = (away ? `\nwhile you were away (${fresh.length}):\n` : '\n') + fresh.map(renderInboxMessage).join('\n');
+      const text = (away ? `\nnotices while you were away (${fresh.length}):\n` : '\n') + fresh.map(renderInboxMessage).join('\n');
       show(text, () => {
         if (through <= acked) return;
         acked = through;
         // Best-effort: a window that lost the seat cannot ack (409), and the
         // owner's next window shows the message again.
         client.ackInbox?.(through).catch(() => undefined);
-      });
+      }, fresh.length);
     };
     const readUnread = async (away: boolean): Promise<number | undefined> => {
       const page = await client.inbox!();
@@ -478,7 +662,7 @@ export function makeInboxFeed(show: (text: string, shown: () => void) => void): 
         // A task's run ended where the owner acts on it.
         else if (e.type === 'task.updated' && (e.data as { change?: string }).change === 'run-ended') {
           const text = renderTaskNotice(e.data as unknown as HarnessTaskSummary);
-          if (text && !signal.aborted) show(`\n${text}`, () => undefined);
+          if (text && !signal.aborted) show(`\n${text}`, () => undefined, 1);
         }
         // The agent could not serve our position: what we may have missed
         // is in the inbox itself.
@@ -549,27 +733,46 @@ function prefetchModelIds(ag: AgenticID): void {
 }
 const CRED_SUBS = ['ls', 'set ', 'rm ', 'connect ', 'disconnect ', 'reveal ', 'pending', 'approve ', 'deny ', 'log', 'presets'];
 const L1_ARGS: Record<string, string[] | (() => string[])> = {
-  use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT,
+  use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT, status: AGENT,
   retry: AGENT, clone: AGENT, transfer: AGENT, call: AGENT, rate: AGENT,
   grant: AGENT, revoke: AGENT, authorizer: AGENT, settings: AGENT,
   cred: () => [...AGENT(), 'pending', 'notify ', 'presets'],
   list: ['--mine'],
 };
-const L2_ARGS: Record<string, string[] | (() => string[])> = {
+const L2_ARGS: Record<string, string[] | ((rest: string) => string[])> = {
+  '/hello': ['full'],
   '/think': ['low', 'high', 'max'],
   '/reset': ['pick'],
   '/cancel': ['all'],
   '/inbox': ['all'],
+  '/notices': ['all'],
   '/settings': ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness='],
   '/restart': ['harness', 'sealed'],
   '/cred': CRED_SUBS,
-  '/files': ['inbox'],
+  '/files': ['inbox', 'auto', 'auto on', 'auto off'],
   // What the outbox held when /files listed it or a turn reported it.
   '/download': () => outboxNames,
+  // Subcommands; after `switch `, the sessions numbered as last shown (the
+  // offer is a list shown too, when no /sessions list was).
+  '/sessions': (rest: string) => {
+    const offer = sessionCompletions(sessionsSeen, rest, sessionsShown);
+    if (rest.startsWith('switch ') && !sessionsShown && sessionsSeen.length) sessionsShown = shownSessions(sessionsSeen);
+    return offer;
+  },
+  '/tasks': () => ['list', 'all', 'new ', ...['show', 'input', 'cancel', 'archive'].flatMap((w) => [`${w} `, ...tasksSeen.map((id) => `${w} ${id}`)])],
 };
+/** Each agent's session history (↑), kept apart from the manager's. */
+const sessionHistories = new Map<string, string[]>();
+/** The sessions last listed in this agent's session, for `/sessions` completion. */
+let sessionsSeen: AgentSession[] = [];
+/** The `/sessions` list last shown in this agent's session, in its order:
+ *  what `/sessions switch <#>` counts in. */
+let sessionsShown: ShownSession[] | null = null;
+// The ids of the agent's tasks last listed, for Tab after /tasks show|input|cancel|archive.
+let tasksSeen: string[] = [];
 /** The outbox names last seen in this session (/files, a turn's notice), for completion. */
 let outboxNames: string[] = [];
-let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
+let activeArgs: Record<string, string[] | ((rest: string) => string[])> = L1_ARGS;
 
 const YES_NO = ['yes', 'no'];
 const CRED_VALUES: Record<string, () => string[]> = {
@@ -620,7 +823,7 @@ export function completeCred(words: string[], names: string[], providers: string
 // argument only; the rest is free-form" — right for prompts and amounts,
 // wrong for settings' k=v list, where the keys are a closed set the user
 // should never have to remember).
-const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness='];
+const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others=', 'sealed=', 'harness=', 'versions'];
 const TAIL_ARGS: Record<string, string[]> = {
   'settings': SETTING_KEYS,  // L1: settings <agent> k=v k=v …
   '/settings': SETTING_KEYS, // L2: /settings k=v k=v …
@@ -653,11 +856,13 @@ export function completeTail(cmd: string, word: string, models: string[], provid
 // completer is a one-line adapter that hands it the mutable module state.
 export function completeLine(
   line: string,
-  state: { completions: string[]; args: Record<string, string[] | (() => string[])>; models: string[]; provider?: string; providerModels?: Record<string, string[]>; providers?: string[]; credNames?: (agent?: string) => string[] },
+  state: { completions: string[]; args: Record<string, string[] | ((rest: string) => string[])>; models: string[]; provider?: string; providerModels?: Record<string, string[]>; providers?: string[]; credNames?: (agent?: string) => string[] },
 ): [string[], string] {
   const sp = line.indexOf(' ');
   if (sp === -1) {
     const hits = state.completions.filter((c) => c.startsWith(line));
+    // One command fits: it is completed with a space after it, as a shell does.
+    if (hits.length === 1 && line) return [[hits[0].endsWith(' ') ? hits[0] : `${hits[0]} `], line];
     return [hits.length ? hits : state.completions, line];
   }
   const cmd = line.slice(0, sp);
@@ -692,14 +897,56 @@ export function completeLine(
     return [hits, word];
   }
   const cand = state.args[cmd];
-  const list = typeof cand === 'function' ? cand() : (cand ?? []);
+  const list = typeof cand === 'function' ? cand(rest) : (cand ?? []);
   const hits = list.filter((c) => c.startsWith(rest));
-  return [hits.length ? hits : list, rest];
+  // What was typed up to its last space is shared by the candidates that
+  // match: only what follows is offered (`/sessions switch ` lists the
+  // sessions, not `switch …` each).
+  const cut = hits.length ? rest.lastIndexOf(' ') + 1 : 0;
+  return cut ? [hits.map((c) => c.slice(cut)), rest.slice(cut)] : [hits.length ? hits : list, rest];
+}
+
+/**
+ * Set readline's command history aside until the returned function is
+ * called: a question's answer and a wait are no place for a recalled command
+ * (↑ at a question put an old command into the answer; ↑ during a wait drew
+ * one under the wait's output, a line nothing would take). `keepNew`: lines
+ * entered meanwhile stay, newest first (type-ahead during a wait); without
+ * it they are dropped (a question's answer). null when there is no history.
+ * Exported for the tests.
+ */
+export function historyAside(rl: object | null | undefined): ((keepNew: boolean) => void) | null {
+  const h = (rl as { history?: unknown } | null | undefined)?.history;
+  if (!Array.isArray(h)) return null;
+  const kept = h.splice(0);
+  let done = false;
+  return (keepNew: boolean) => {
+    if (done) return;
+    done = true;
+    const added = keepNew ? h.splice(0) : (h.splice(0), []);
+    h.push(...added, ...kept);
+  };
+}
+
+/** The shell's Tab completion with its current state (the level's words,
+ *  argument lists, models, providers, credential names). */
+function shellComplete(line: string): [string[], string] {
+  // At a question (a wizard's, an amount) the shell's commands are no answer.
+  if (activeAsk?.waiting?.()?.kind === 'q') return [[], line];
+  return completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor });
 }
 
 // The live readline interface — askSecret scrubs submitted secrets out of
 // its history (display masking alone leaves the plaintext one ↑ away).
 let activeRl: readline.Interface | null = null;
+// The shell's line queue: a turn's live prompt shows what waits in it.
+let activeAsk: Ask | null = null;
+// The Ink session view while it is up (inkView.ts): everything printed goes
+// to its transcript, and the keys to it.
+let activeInk: InkScreen<Ask> | null = null;
+// While a command that only reads runs during a turn: where its output goes
+// (gathered, then printed above the prompt as one block).
+let outRedirect: ((s: string) => void) | null = null;
 
 /**
  * Print a block above the live prompt, keeping what the user has typed. The
@@ -716,6 +963,7 @@ export function printAbovePrompt(
   rl: readline.Interface | null = activeRl,
   output: NodeJS.WritableStream = process.stdout,
 ): void {
+  if (activeInk && rl === activeRl) { activeInk.print(text); return; }
   if (!rl || !rl.terminal) {
     output.write(text.startsWith('\n') ? text : `\n${text}`);
     return;
@@ -724,21 +972,39 @@ export function printAbovePrompt(
   readline.moveCursor(output, 0, -rows);
   readline.cursorTo(output, 0);
   readline.clearScreenDown(output);
-  output.write(text.endsWith('\n') ? text : `${text}\n`);
+  // Broken between words, unless it carries the shell's own sequences (a link).
+  const shown = /\x1b/.test(text) ? text : wrapText(text, Math.max(20, ((output as { columns?: number }).columns || 80) - 1));
+  output.write(shown.endsWith('\n') ? shown : `${shown}\n`);
   output.write('\n'.repeat(rows));
   rl.prompt(true);
 }
 import type { CommandContext } from '../types';
-import { cellText, cleanCell, cleanStream, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
+import { cellText, cleanCell, cleanStream, listCells, listHeader, listLayout, ownerColumnWidth, sealToAgentMap, type ListLayout } from './cells';
+import { CONT_PROMPT, LiveTurn, PlainTurn, fitRow, liveKeys, textCols, wrapProse, wrapText, wrapWords, type LiveInput, type LiveState, type TurnView } from '../livePrompt';
+import { INK_PROMPT, MIN_COLS, MIN_ROWS, inkLoadError, loadInk, openInkScreen, type InkScreen, type Key as InkKey } from '../inkView';
+import { OUTBOX_POLL_MS, makeOutboxSync, renderOutboxEvent, supportsHyperlinks, tildePath, type OutboxSync } from '../outboxSync';
 
-/** Column widths of the REPL listing; its header and every row share them. */
-const LIST_COLS = { id: 6, phase: 11, framework: 12, seal: 13, agentSeal: 13, owner: 24 } as const;
+/**
+ * whoami's providers: the ones this machine has a model key for (`login`
+ * saved them; `hasKey` reads that store, never a value), the default for new
+ * agents first — marked when it has no key — then the others in registry
+ * order. The platform's whole list is the `providers` command; an agent's own
+ * keys are `cred <agent>`. Exported for the tests.
+ */
+export function configuredProvidersText(dflt: string, ids: readonly string[], hasKey: (id: string) => boolean): string {
+  const others = ids.filter((id) => id !== dflt && hasKey(id));
+  const own = hasKey(dflt);
+  if (!own && !others.length) return 'none — run login';
+  return [`${dflt} (new agents${own ? '' : ', no key'})`, ...others].join(', ');
+}
+
+/** Every column, OWNER 24 wide: the REPL listing's layout when no terminal
+ *  width is given (piped output, the tests). */
+const ALL_COLUMNS = listLayout(undefined, 2, 24);
 
 /** The REPL listing's header line, aligned with {@link renderListRow}. */
-export function renderListHeader(): string {
-  const c = LIST_COLS;
-  return `  ${'ID'.padEnd(c.id)} ${'PHASE'.padEnd(c.phase)}${'FRAMEWORK'.padEnd(c.framework)}` +
-    `${'SEAL'.padEnd(c.seal)}${'AGENTSEAL'.padEnd(c.agentSeal)}${'OWNER'.padEnd(c.owner)}NAME\n`;
+export function renderListHeader(layout: ListLayout = ALL_COLUMNS): string {
+  return `  ${listHeader(layout)}\n`;
 }
 
 /**
@@ -747,10 +1013,9 @@ export function renderListHeader(): string {
  * with `list`: a name cannot forge rows in this listing either, and an
  * agent-owned agent reads the same way — its OWNER is another row's
  * AGENTSEAL, annotated `⇄ #<agentId>` (`sealToAgent`, from the full listing).
- * SEAL is the sealId PREFIX (`0x` + 10 hex), the form commands accept as a
- * reference, so unminted rows stay referenceable without a 66-char column
- * blowout (F12).
- * AGENTSEAL is the agent's on-chain signing address.
+ * An unminted row shows its sealId PREFIX (`0x` + 10 hex) as its id, the form
+ * commands accept as a reference (F12). AGENTSEAL is the agent's on-chain
+ * signing address. `layout` fits the columns to the terminal (./cells).
  */
 export function renderListRow(
   r: {
@@ -760,12 +1025,9 @@ export function renderListRow(
   owner: string | null | undefined,
   owned = ' ',
   sealToAgent: ReadonlyMap<string, string> = new Map(),
+  layout: ListLayout = ALL_COLUMNS,
 ): string {
-  const c = LIST_COLS;
-  const seal = `0x${r.sealId.slice(2, 12)}`;
-  return `${owned} ${String(r.agentId ?? '?').padEnd(c.id)} ${cellText(r.phase ?? '?', c.phase)}` +
-    `${cellText(r.framework, c.framework)}${cellText(seal, c.seal)}${cellText(shortAddr(r.agentSeal), c.agentSeal)}` +
-    `${trustedCell(ownerCellText(owner, sealToAgent), c.owner)}${cleanCell(r.name)}\n`;
+  return `${owned} ${listCells(r, owner, sealToAgent, layout, '')}\n`;
 }
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
@@ -797,12 +1059,50 @@ type Ask = ((q: string) => Promise<string>) & {
   whileBusy?: (take: ((e: Entry) => boolean) | null) => void;
   /** Put an entry back to wait for the next prompt. */
   later?: (e: Entry) => void;
+  /** Entries already handed to the agent (taken as new messages, queued on
+   *  its side): ↑ takes the newest back only by cancelling the agent's copy
+   *  first. Set while a turn runs. */
+  held?: { count(): number; takeBack(): boolean } | null;
+  /** A message taken back from the agent, into the empty box (or, when
+   *  something is being edited, to wait for the next prompt). */
+  putBack?: (text: string) => void;
+  /** The lines of a message begun and not sent yet (during a turn). */
+  drafting?: () => string[];
+  /** Entries waiting for the next prompt, oldest first. */
+  queued?: () => Entry[];
+  /** Take the newest waiting entry back to be edited (its last line on the
+   *  line being edited, the others as the message's earlier lines); false
+   *  when none waits or something is being edited. */
+  recall?: () => boolean;
+  /** What is being edited (earlier lines and the line) waits for the next
+   *  prompt as an entry; false when there is nothing. */
+  queueEdit?: () => boolean;
+  /** Every waiting entry back to be edited, as one message ahead of what is
+   *  being edited (a turn was interrupted: nothing goes on its own); how
+   *  many there were. */
+  recallAll?: (extra?: readonly string[], form?: (text: string) => string) => number;
+  /** Empty the message being typed (its earlier lines too); false when there is nothing. */
+  clearBox?: () => boolean;
+  /** Backspace at the start of a message's line: it joins the line before; false when there is none. */
+  unwind?: () => boolean;
+  /** The shell's prompt now says q (its status changed): redrawn in place
+   *  when it is up, used from the next prompt otherwise. */
+  retitle?: (q: string) => void;
+  /** The question up, if any: its kind and its text. */
+  waiting?: () => { kind: 'q' | 'main' | 'message'; q: string } | null;
+  /** Take every entry waiting for the next prompt out of the queue. */
+  drain?: () => Entry[];
 };
 
 /** What the owner entered: its text (newlines kept), whether it spans lines,
  *  and whether any of it was pasted. An agent message that spans lines or was
  *  pasted is never a command. */
-export type Entry = { text: string; multi: boolean; pasted: boolean };
+export type Entry = {
+  text: string; multi: boolean; pasted: boolean;
+  /** Entered while a turn ran (queued, put back, or a command that waits for
+   *  its end): never the answer to a question asked after it. */
+  during?: boolean;
+};
 
 /** Whether an entry finished during a turn goes into that turn (steer): any
  *  message, but not an empty line or a command typed alone on its line —
@@ -810,13 +1110,14 @@ export type Entry = { text: string; multi: boolean; pasted: boolean };
 export function steerable(e: Entry): boolean {
   const t = e.text.trim();
   if (!t) return false;
-  return e.multi || e.pasted || !t.startsWith('/');
+  // A dragged file's path first is a message, not a command.
+  return e.multi || e.pasted || !t.startsWith('/') || findDroppedFiles(t).some((p) => typeof p !== 'string');
 }
 
 /** An answer to a signing question this soon after it is shown was typed before it. */
 const READ_MS = 300;
 /** The prompt of a message's next line. */
-const CONT = '… ';
+const CONT = CONT_PROMPT;
 /** The terminal's bracketed paste mode (xterm): on, off. */
 const PASTE_ON = '\x1b[?2004h';
 const PASTE_OFF = '\x1b[?2004l';
@@ -828,7 +1129,10 @@ const PASTE_GAP_MS = 30;
 const YES_NO_QUESTION = /\[(?:y\/n|y)\]/i;
 
 type Key = { name?: string; meta?: boolean; ctrl?: boolean; sequence?: string };
-type KeySource = { on(ev: 'keypress', f: (s: string | undefined, key: Key | undefined) => void): unknown };
+type KeySource = {
+  on(ev: 'keypress', f: (s: string | undefined, key: Key | undefined) => void): unknown;
+  prependListener?(ev: 'keypress', f: (s: string | undefined, key: Key | undefined) => void): unknown;
+};
 
 /**
  * The shell's `ask` as a QUEUE, not rl.question: lines that arrive while no
@@ -853,6 +1157,12 @@ type KeySource = { on(ev: 'keypress', f: (s: string | undefined, key: Key | unde
  * question takes one line: several pasted lines are not its answer, and a
  * paste does not answer a yes/no question. Without keys (piped input) every
  * line is one answer, as before.
+ *
+ * `boxed`: the line being edited is drawn by the Ink session view
+ * (inkView.ts), which shows the message's earlier lines itself, so nothing
+ * readline would need to show them is written; `echo` puts what a question
+ * was given into the transcript (readline leaves it on the screen as typed);
+ * `say` is where the queue's own notes go (default: the shell's output).
  */
 export function lineQueue(
   rl: {
@@ -861,10 +1171,12 @@ export function lineQueue(
   },
   tty: () => boolean,
   keys?: KeySource,
+  opts: { boxed?: boolean; echo?: (kind: 'q' | 'main' | 'message', q: string, e: Entry) => void; say?: (s: string) => void } = {},
 ): Ask {
+  const { boxed = false, echo, say = out } = opts;
   type Kind = 'q' | 'main' | 'message';
   const pending: Entry[] = [];
-  const waiters: Array<{ res: (e: Entry) => void; rej: (e: Error) => void; kind: Kind; q: string }> = [];
+  const waiters: Array<{ res: (e: Entry) => void; rej: (e: Error) => void; kind: Kind; q: string; first: string }> = [];
   const edit = rl as { line?: unknown; cursor?: unknown; prevRows?: unknown; history?: unknown };
   // readline keeps keys typed so far as the line being edited (and would
   // show them after the next question, ready for Enter), and its offset from
@@ -896,17 +1208,18 @@ export function lineQueue(
     const w = waiters[0];
     if (!w) {
       if (busy && busy(e)) return;
-      pending.push(e);
+      pending.push(busy ? { ...e, during: true } : e);
       return;
     }
     const refused = accepts(w, e);
     if (refused) {
-      out(`  (${refused}: type it)\n`);
+      say(`  (${refused}: type it)\n`);
       rl.setPrompt(w.q);
       rl.prompt();
       return;
     }
     waiters.shift();
+    echo?.(w.kind, w.q, e);
     w.res(e);
   };
   // The next line of a message: under its own prompt, when a prompt is up
@@ -949,7 +1262,7 @@ export function lineQueue(
       // One line and its newline: as if typed (a pasted key, an address).
       if (lines.length === 1 && !tail) { touched = false; deliver({ text: lines[0], multi: false, pasted: true }); return; }
       clearEdit();
-      out(`\n  (${w.kind === 'main' ? 'several pasted lines are not a command' : 'several pasted lines are an answer only at the agent prompt'}: type it)\n`);
+      say(`\n  (${w.kind === 'main' ? 'several pasted lines are not a command' : 'several pasted lines are an answer only at the agent prompt'}: type it)\n`);
       touched = false;
       rl.setPrompt(w.q);
       rl.prompt();
@@ -957,13 +1270,13 @@ export function lineQueue(
     }
     draft.push(...lines);
     draftPasted = true;
-    if (!w) return; // during a turn: the agent prompt shows it
+    if (!w || boxed) return; // during a turn the agent prompt shows it; the Ink view shows it always
     // The pasted lines are on the screen as readline echoed them; say how it
     // is sent, then the line being edited goes on under the next-line prompt.
     if (tail) term('\r\x1b[K');
     // The last pasted line, when no newline ended it, is the line being edited.
     const n = draft.length + (tail ? 1 : 0);
-    out(`  [pasted ${n} line${n === 1 ? '' : 's'} · Enter sends]\n`);
+    say(`  [pasted ${n} line${n === 1 ? '' : 's'} · Enter sends]\n`);
     rl.setPrompt(CONT);
     if (typeof edit.cursor === 'number') edit.cursor = tail.length;
     if (typeof edit.prevRows === 'number') edit.prevRows = 0;
@@ -993,8 +1306,14 @@ export function lineQueue(
     chunk.open = true;
     queueMicrotask(endChunk);
   };
+  let cursorBefore = -1;
+  keys?.prependListener?.('keypress', () => { cursorBefore = typeof edit.cursor === 'number' ? edit.cursor : -1; });
   keys?.on('keypress', (s, key) => {
     if (!multiline()) return;
+    if (key?.name === 'backspace' && !key.ctrl && !key.meta && cursorBefore === 0 && !boxed && messageHere()) { ask.unwind?.(); return; }
+    // Ctrl-U on a message of several lines clears all of it, not only the
+    // line the cursor is on (its earlier lines would go with the next one).
+    if (key?.name === 'u' && key.ctrl && !key.meta && draft.length && !boxed && messageHere()) { ask.clearBox?.(); return; }
     if (key?.name === 'paste-start') { pasting = true; pasteLines = []; return; }
     if (key?.name === 'paste-end') {
       pasting = false;
@@ -1013,8 +1332,8 @@ export function lineQueue(
       draftPasted ||= touched;
       touched = false;
       clearEdit();
-      if (!waiters[0]) return;
-      out('\n');
+      if (!waiters[0] || boxed) return;
+      say('\n');
       goOn();
       return;
     }
@@ -1041,30 +1360,183 @@ export function lineQueue(
       w.rej(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
     }
   });
+  // A message being written when a question comes (put back after Esc,
+  // say): out of the box while the question is asked, back at the next prompt.
+  let stashed: { draft: string[]; line: string; pasted: boolean; touched: boolean } | null = null;
   const wait = (q: string, kind: Kind): Promise<Entry> => {
-    for (let buffered = pending.shift(); buffered !== undefined; buffered = pending.shift()) {
+    const first = q;
+    if (kind === 'q' && multiline()) {
+      if (draft.length || editLine()) {
+        stashed = { draft, line: editLine(), pasted: draftPasted, touched };
+        draft = [];
+        draftPasted = false;
+        touched = false;
+        clearEdit();
+      }
+    } else if (stashed && !draft.length && !editLine()) {
+      ({ draft } = stashed);
+      draftPasted = stashed.pasted;
+      touched = stashed.touched;
+      if (typeof edit.line === 'string') edit.line = stashed.line;
+      if (typeof edit.cursor === 'number') edit.cursor = stashed.line.length;
+      stashed = null;
+    }
+    // What was entered during a turn answers no question asked after it (on
+    // a terminal): it waits for the prompt. What was typed ahead otherwise does.
+    const next = (): Entry | undefined => {
+      if (kind !== 'q' || !multiline()) return pending.shift();
+      const at = pending.findIndex((e) => !e.during);
+      return at < 0 ? undefined : pending.splice(at, 1)[0];
+    };
+    for (let buffered = next(); buffered !== undefined; buffered = next()) {
       const refused = accepts({ kind, q }, buffered);
-      if (refused) { out(`  (an earlier entry was dropped: ${refused})\n`); continue; }
-      out(`${q}${buffered.text}\n`); // keep the transcript readable in pipes/logs
-      return Promise.resolve(buffered);
+      if (refused) { say(`  (an earlier entry was dropped: ${refused})\n`); continue; }
+      // At the agent prompt on a terminal, the messages that waited (typed
+      // while nothing took them, or put back) go as one, blank lines between;
+      // a command among them stays its own entry.
+      if (kind === 'message' && multiline() && steerable(buffered)) {
+        while (pending.length && steerable(pending[0])) {
+          const next = pending.shift()!;
+          buffered = { text: `${buffered.text}\n\n${next.text}`, multi: true, pasted: buffered.pasted || next.pasted };
+        }
+      }
+      if (echo) echo(kind, q, buffered);
+      // keep the transcript readable in pipes/logs; a long one shortened on a terminal
+      // (a dragged file by its name on a terminal).
+      else say(`${q}${multiline() ? collapsed(droppedShown(buffered.text)) : buffered.text}\n`);
+      const { during: _during, ...entry } = buffered;
+      return Promise.resolve(entry);
     }
     if (stdinClosed) {
       return Promise.reject(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
     }
-    if (kind === 'message' && draft.length) {
+    if (kind === 'message' && draft.length && !boxed) {
       // A message begun during the turn: show what it holds so far.
-      out(`${q}${draft.join('\n')}\n`);
+      say(`${q}${draft.join('\n')}\n`);
       q = CONT;
     }
+    // A question's answer is not a command: ↑ at a question recalls no
+    // command from the history, and the answer does not join it.
+    // (Once: a second question waiting behind the first leaves it to that one.)
+    const restore = kind === 'q' && !waiters.some((w) => w.kind === 'q') ? historyAside(edit) : null;
     rl.setPrompt(q);
-    rl.prompt(kind === 'message' && q === CONT);
-    return new Promise((res, rej) => waiters.push({ res, rej, kind, q }));
+    // A line typed during a turn is shown again with the cursor where it was.
+    rl.prompt(kind === 'message' && (q === CONT || editLine() !== ''));
+    return new Promise((res, rej) => waiters.push({
+      res: (e) => { restore?.(false); res(e); },
+      rej: (e) => { restore?.(false); rej(e); },
+      kind, q, first,
+    }));
   };
   const ask: Ask = (q: string): Promise<string> => wait(q, 'q').then((e) => e.text);
   ask.main = (q: string): Promise<string> => wait(q, 'main').then((e) => e.text);
   ask.message = (q: string): Promise<Entry> => wait(q, 'message');
   ask.whileBusy = (take) => { busy = take; };
-  ask.later = (e) => { pending.push(e); };
+  ask.later = (e) => { pending.push({ ...e, during: true }); };
+  ask.drafting = () => [...draft];
+  ask.queued = () => [...pending];
+  ask.waiting = () => (waiters[0] ? { kind: waiters[0].kind, q: waiters[0].q } : null);
+  ask.drain = () => pending.splice(0);
+  ask.recall = (): boolean => {
+    if (waiters[0] || draft.length || editLine()) return false;
+    // Nothing waits here: the newest one with the agent, if any (taken back
+    // by cancelling its copy there; never copied).
+    if (!pending.length) return ask.held?.takeBack() ?? false;
+    const e = pending.pop()!;
+    const lines = e.text.split('\n');
+    const last = lines.pop() ?? '';
+    draft = lines;
+    draftPasted = !!lines.length && e.pasted;
+    touched = !lines.length && e.pasted;
+    if (typeof edit.line === 'string') edit.line = last;
+    if (typeof edit.cursor === 'number') edit.cursor = last.length;
+    return true;
+  };
+  ask.putBack = (text: string): void => {
+    if (waiters[0]?.kind === 'q' || draft.length || editLine()) { pending.push({ text, multi: text.includes('\n'), pasted: false, during: true }); return; }
+    const lines = text.split('\n');
+    const last = lines.pop() ?? '';
+    draft = lines;
+    if (typeof edit.line === 'string') edit.line = last;
+    if (typeof edit.cursor === 'number') edit.cursor = last.length;
+    if (waiters[0] && !boxed && rl.terminal !== false) rl.prompt(true);
+  };
+  ask.queueEdit = (): boolean => {
+    if (waiters[0]) return false;
+    const line = editLine();
+    if (!draft.length && !line.trim()) return false;
+    const e: Entry = { text: [...draft, line].join('\n'), multi: draft.length > 0, pasted: draftPasted || touched };
+    draft = [];
+    draftPasted = false;
+    touched = false;
+    clearEdit();
+    pending.push({ ...e, during: true });
+    return true;
+  };
+  // `form`: how a message comes back into the box (a dragged file by its name, say).
+  ask.recallAll = (extra: readonly string[] = [], form: (text: string) => string = (t) => t): number => {
+    if (waiters[0]) return 0;
+    // Messages come back to edit (`extra` first: sent into the turn and not
+    // read); a command that waited stays its own entry and runs at the next
+    // prompt, never merged into the text.
+    const back = pending.filter((e) => steerable(e));
+    if (!extra.length && !back.length) return 0;
+    const keep = pending.filter((e) => !steerable(e) && e.text.trim());
+    pending.splice(0, pending.length, ...keep);
+    const line = editLine();
+    // As typed, without the blank lines.
+    const lines = [...extra.flatMap((t) => form(t).split('\n')), ...back.flatMap((e) => form(e.text).split('\n')), ...draft, ...(line ? [line] : [])]
+      .filter((l) => l.trim() !== '');
+    const last = lines.pop() ?? '';
+    const pastedAny = back.some((e) => e.pasted) || draftPasted || touched;
+    draft = lines;
+    draftPasted = !!lines.length && pastedAny;
+    touched = !lines.length && pastedAny;
+    if (typeof edit.line === 'string') edit.line = last;
+    if (typeof edit.cursor === 'number') edit.cursor = last.length;
+    return extra.length + back.length;
+  };
+  ask.clearBox = (): boolean => {
+    if (!draft.length && !editLine()) return false;
+    draft = [];
+    draftPasted = false;
+    touched = false;
+    clearEdit();
+    const w = waiters[0];
+    if (w && !boxed && rl.terminal !== false) {
+      // What was typed stays on the screen as it was; a fresh prompt below.
+      term('\n');
+      rl.setPrompt(w.first);
+      rl.prompt();
+    }
+    return true;
+  };
+  ask.unwind = (): boolean => {
+    if (!draft.length || (typeof edit.cursor === 'number' && edit.cursor !== 0)) return false;
+    const prev = draft.pop()!;
+    const line = editLine();
+    if (typeof edit.line === 'string') edit.line = prev + line;
+    if (typeof edit.cursor === 'number') edit.cursor = prev.length;
+    const w = waiters[0];
+    if (w && !boxed && rl.terminal !== false) {
+      // The line before is on the screen above this one: both go, and the
+      // joined line is drawn where the earlier one was.
+      term('\r\x1b[2K\x1b[1A\r\x1b[2K');
+      if (typeof edit.prevRows === 'number') edit.prevRows = 0;
+      rl.setPrompt(draft.length ? CONT : w.first);
+      rl.prompt(true);
+    }
+    return true;
+  };
+  ask.retitle = (q: string): void => {
+    const w = waiters[0];
+    if (!w || w.kind === 'q' || w.q === q) return;
+    const up = (rl as { getPrompt?: () => string }).getPrompt?.() === w.q;
+    w.q = q;
+    if (!up) return; // a message's next line is up: the new prompt comes with the next one
+    rl.setPrompt(q);
+    rl.prompt(true);
+  };
   ask.cancel = (): boolean => {
     const i = waiters.findIndex((w) => w.kind === 'q');
     if (i < 0) return false;
@@ -1087,18 +1559,24 @@ export function lineQueue(
       const shown = Date.now();
       const a = await wait(q, 'q');
       if (a.pasted && a.text.trim()) {
-        out('  (a paste is not an answer to this question: type it)\n');
+        say('  (a paste is not an answer to this question: type it)\n');
         continue;
       }
       if (!a.text.trim() || Date.now() - shown >= READ_MS) return a.text;
-      out('  (that came in before the question could be read: answer again)\n');
+      say('  (that came in before the question could be read: answer again)\n');
     }
   };
   return ask;
 }
 
-/** Writes to the terminal as is: only for the shell's own control sequences. */
-const term = (s: string): void => void process.stdout.write(s);
+/** Writes to the terminal as is: only for the shell's own control sequences.
+ *  Under the Ink view its text goes to the transcript (inkView.ts raw). */
+const term = (s: string): void => {
+  const to = outRedirect as ((t: string) => void) | null;
+  if (to) to(s);
+  else if (activeInk) activeInk.raw(s);
+  else process.stdout.write(s);
+};
 /**
  * Writes text to the terminal with escape sequences, control characters
  * (newlines and tabs kept) and bidi controls removed. Everything the shell
@@ -1106,9 +1584,72 @@ const term = (s: string): void => void process.stdout.write(s);
  * (term): much of what it prints comes from the agent or its server, and
  * nothing of that may restyle, hide or rewrite what the owner reads.
  */
-const out = (s: string): void => term(cleanStream(s));
+const out = (s: string): void => term(termWrap(cleanStream(s)));
+/** The shell's own whole lines: `out` already wraps them between words. */
+const say = out;
+
+/** The width the shell wraps to on a terminal (its own less one); unbounded
+ *  otherwise (textfit.termWidth, shared with the one-shot commands). */
+const wrapWidth = (): number => termWidth() ?? Infinity;
+
+/**
+ * A help text written for 80 columns (`  /cmd …` with its description from
+ * column 26, further lines of it indented to there) in rows of at most
+ * `width` columns: each description joined back into one and wrapped once,
+ * its further rows under the description column; at a width too narrow for
+ * that, the description goes under the command. Other lines as they are.
+ * Exported for the tests.
+ */
+export function helpRows(text: string, width: number): string[] {
+  if (!Number.isFinite(width)) return text.split('\n');
+  const COL = 26;
+  const entries: Array<{ head: string; desc: string } | string> = [];
+  for (const l of text.split('\n')) {
+    const last = entries[entries.length - 1];
+    if (/^ {26}\S/.test(l) && last && typeof last !== 'string') { last.desc += ` ${l.trim()}`; continue; }
+    if (/^ {2}\S/.test(l) && l.length > COL && / $/.test(l.slice(0, COL)) && /^\S/.test(l.slice(COL))) {
+      entries.push({ head: l.slice(0, COL), desc: l.slice(COL).trim() });
+      continue;
+    }
+    entries.push(l);
+  }
+  const rows: string[] = [];
+  for (const e of entries) {
+    if (typeof e === 'string') { rows.push(...wrapProse(e, width)); continue; }
+    if (width - COL >= 24) {
+      wrapProse(e.desc, width - COL).forEach((r, i) => rows.push(`${i ? ' '.repeat(COL) : e.head}${r}`));
+    } else {
+      rows.push(e.head.trimEnd());
+      for (const r of wrapProse(e.desc, width - 4)) rows.push(`    ${r}`);
+    }
+  }
+  return rows;
+}
+
+/** `/settings`' way to change them: the items after "change with:", in rows
+ *  of at most `width` columns, further rows under the first item. Exported for the tests. */
+export function changeWith(items: readonly string[], width: number): string[] {
+  const head = '  change with: ';
+  const rows: string[] = [];
+  let row = '';
+  for (const it of items) {
+    const next = row ? `${row} · ${it}` : it;
+    if (row && head.length + textCols(next) > width) { rows.push(row); row = it; } else row = next;
+  }
+  if (row) rows.push(row);
+  return rows.map((r, i) => `${i ? ' '.repeat(head.length) : head}${r}`);
+}
+
+/** On a terminal, text broken between words at its width (wrapProse); as it
+ *  is when the output is piped or captured. */
+function termWrap(s: string): string {
+  if (!process.stdout.isTTY || outRedirect) return s;
+  return wrapText(s, Math.max(20, (process.stdout.columns || 80) - 1));
+}
 
 interface Session {
+  /** What the last failed turn's error pointed at (null after a turn that did not fail). */
+  lastFailKind?: FailureKind | null;
   ag: AgenticID;
   attestorUrl: string;
   sealId: `0x${string}`;
@@ -1127,7 +1668,7 @@ interface Session {
   /** Tasks started from THIS session on the responses transport (newest
    *  last): lets /tasks list them and /result re-attach after a drop. The
    *  agent itself keeps the authoritative ring; this is just the ids. */
-  tasks?: Array<{ id: string; prompt: string; at: number }>;
+  tasks?: Array<{ id: string; prompt: string; at: number; session?: string }>;
   /** The reasoning level /think last wrote to the settings document, mirrored
    *  here ONLY as the per-message override for frameworks whose bridge takes
    *  one (prime). The durable copy is the document; this is a session echo of
@@ -1141,13 +1682,423 @@ interface Session {
    *  default `owner-chat`. */
   sessionId?: string;
   sessionTitle?: string;
+  /** The session's prompt and the turn on screen (sessionRepl). */
+  screen?: SessionScreen;
+  /** Why the container failed, when its last stage did (refreshSession). */
+  failure?: string;
+  /** The last refresh could not reach the attestor. */
+  stale?: boolean;
+}
+
+/** What a session's turns need from its prompt. */
+interface SessionScreen {
+  /** The prompt's text (no leading newline); busy: a turn runs. */
+  prompt(busy: boolean): string;
+  /** The turn on screen, told when what the prompt counts changes. */
+  turn: TurnView | null;
+  /** A turn ran since the prompt was last up. */
+  turnRan: boolean;
+  /** A turn was interrupted: what was queued during it comes back to be
+   *  edited; what to say about it ('' when nothing was queued). */
+  interrupted?: (extra?: readonly string[]) => string;
+}
+
+/** What the session prompt counts: notices waiting to be shown, new files. */
+export interface PromptCounts { notices: number; files: number }
+
+/** The prompt's status: ` · 2 notices · 1 new file`, nothing for zeros. */
+export function promptStatus(c: PromptCounts): string {
+  const parts: string[] = [];
+  if (c.notices > 0) parts.push(`${c.notices} notice${c.notices === 1 ? '' : 's'}`);
+  if (c.files > 0) parts.push(`${c.files} new file${c.files === 1 ? '' : 's'}`);
+  return parts.map((p) => ` · ${p}`).join('');
+}
+
+/** The session prompt without its leading newline, e.g.
+ *  `agent 625 (replying, Esc stops) · 1 notice › `. busy: a turn runs. */
+export function sessionPromptText(agentId: string, label: string, busy: boolean, c: PromptCounts): string {
+  return `agent ${agentId}${label}${busy ? ' (replying, Esc stops)' : ''}${promptStatus(c)} › `;
+}
+
+/** An entry in one line: its first line and how many follow. */
+function oneLine(text: string): string {
+  const lines = text.split('\n');
+  return lines.length > 1 ? `${lines[0]} (+${lines.length - 1} line${lines.length === 2 ? '' : 's'})` : lines[0];
+}
+
+/** A message of many lines as it is echoed back: its first lines and how many more. Exported for the tests. */
+export function collapsed(text: string, keep = 8): string {
+  const lines = text.split('\n');
+  if (lines.length <= keep + 2) return text;
+  return [...lines.slice(0, keep), `… (+${lines.length - keep} more lines)`].join('\n');
+}
+
+/** A word that names a path rather than a command: a second `/` in it, or a
+ *  file extension. Exported for the tests. */
+export function looksLikePath(word: string): boolean {
+  return word.indexOf('/', 1) > 0 || /\.[A-Za-z0-9]{1,5}$/.test(word);
+}
+
+/** The live prompt's lines for what the owner sent during a turn: inserted
+ *  into it with Enter and waiting for the agent to read it, and what waits
+ *  for the next turn (Tab, or a command). Exported for the tests. */
+export function turnNotes(steered: readonly string[], queued: ReadonlyArray<{ text: string }>): string[] {
+  // A dragged file by its name (`[image: cat.png]`), not its path.
+  return [...steered.map((t) => `waiting for the agent: ${oneLine(droppedShown(t))}`), ...queued.map((e) => `next turn: ${oneLine(droppedShown(e.text))}`)];
+}
+
+/**
+ * Whether a command typed while a turn runs only reads, and so runs at once
+ * (its output above the prompt) rather than when the turn ends: it neither
+ * touches the running turn nor asks anything. Exported for the tests.
+ */
+export function readOnlyCommand(line: string): boolean {
+  const [cmd, ...rest] = line.trim().split(/\s+/);
+  const arg = rest.join(' ');
+  switch (cmd) {
+    case '/help': case '/activities': case '/schedules': case '/balance': case '/think': return !arg;
+    case '/hello': return !arg || arg === 'full';
+    case '/inbox': case '/notices': return !arg || arg === 'all';
+    case '/files': return !arg || arg === 'inbox' || arg === 'outbox';
+    case '/sessions': return !arg || arg === 'list';
+    case '/tasks': return !arg || arg === 'list' || arg === 'all' || /^show \S+$/.test(arg);
+    case '/agentlog': case '/startuplog': case '/signatures': return !arg || /^\d+$/.test(arg);
+    case '/settings': return !arg || arg === 'versions';
+    default: return false;
+  }
+}
+
+/** A turn the agent runs for messages the owner inserted into another one:
+ *  ones it finished before reading (`unread`), or one it took as a new
+ *  message as nothing was running (`idle`). One turn may answer several. */
+export interface FollowUp {
+  id: string; texts: string[]; why: 'unread' | 'idle';
+  /** idle: why the agent took it as a new message (its steer reason). */
+  reason?: string;
+  /** unread: the turn it went into failed before the agent read it. */
+  failed?: boolean;
+}
+
+/** Messages inserted into one running turn (0g-harness steering). */
+interface Steering {
+  /** Inserted and not read yet, as typed: shown until the agent reads them. */
+  texts: string[];
+  /** Insert an entry into the turn. */
+  take(e: Entry): void;
+  /** The agent read the oldest one: its text. */
+  read(): string | undefined;
+  /** The turn ended: the ones it did not read go to the follow-ups. */
+  settle(after: FollowUp[], failed?: boolean): Promise<void>;
+  /** Taken as a new message (no owner turn to go into): waits for its turn. */
+  next: string[];
+  /** ↑ on these: the newest back to the box, by cancelling the agent's copy. */
+  held: { count(): number; takeBack(): boolean };
+  /** The turn was cancelled (Esc): what became of the ones not read
+   *  ({@link stoppedSteers}); turns they opened go to `after`. */
+  stop(after: FollowUp[]): Promise<StoppedSteers>;
+}
+
+/** The inserted messages not read when Esc cancelled their turn, by what
+ *  the agent says became of each. */
+export interface StoppedSteers {
+  /** Dropped with the turn: back to the box. */
+  back: string[];
+  /** Read after all, before the stop. */
+  read: string[];
+  /** Still held by the agent (an older 0g-harness keeps them pending and
+   *  gives them to its next turn), or not known: not put back, so they are
+   *  not sent twice. */
+  kept: string[];
+  /** Answered in a turn of their own, which the stop cancels too: back to
+   *  the box with that turn's other texts. */
+  turns: Array<{ turn: string; text: string }>;
+}
+
+/** Sort the inserted messages not read at a cancel by their steer states,
+ *  read after the cancel (`null`: not known). A dropped one comes back as the
+ *  agent sends it back (`text`, 0g-harness #12 on), else as it was typed.
+ *  Exported for the tests. */
+export function stoppedSteers(left: ReadonlyArray<{ text: string; turn?: string }>, states: ReadonlyArray<SteerState | null>): StoppedSteers {
+  const r: StoppedSteers = { back: [], read: [], kept: [], turns: [] };
+  left.forEach((u, i) => {
+    const st = states[i] ?? null;
+    if (st?.state === 'dropped') {
+      const own = typeof st.text === 'string' ? st.text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '') : '';
+      r.back.push(own.trim() ? own : u.text);
+      return;
+    }
+    const turn = steerFollowUp(u.turn, st);
+    if (turn) r.turns.push({ turn, text: u.text });
+    else if (st?.state === 'merged') r.read.push(u.text);
+    else r.kept.push(u.text);
+  });
+  return r;
+}
+
+/** The line for inserted messages the agent may still read (an older
+ *  0g-harness keeps them for its next turn): not put back. Exported for the tests. */
+export function keptNote(kept: readonly string[]): string {
+  if (!kept.length) return '';
+  const n = kept.length;
+  const head = `(not put back — the agent may still read ${n === 1 ? 'this' : `these ${n}`} in its next turn)`;
+  return [head, ...kept.map((t) => `↳ ${oneLine(t)}`)].join('\n');
+}
+
+/**
+ * Which turn answers a message inserted into turn `inserted` and not read
+ * there, from its steer state: the turn it opened (`turn`), or the one it
+ * joined when the agent answers several in one follow-up (`merged` into a
+ * turn other than the one it went into). null: read where it went, dropped,
+ * or not known yet. Exported for the tests.
+ */
+export function steerFollowUp(inserted: string | undefined, st: SteerState | null): string | null {
+  if (!st) return null;
+  if (st.state === 'turn') return st.turn || null;
+  if (st.state === 'merged' && st.turn && inserted && st.turn !== inserted) return st.turn;
+  return null;
+}
+
+/** Add `text` to the follow-up turn `id`, or start it: several inserted
+ *  messages the agent answers in one turn are followed once. Exported for the tests. */
+export function addFollowUp(list: FollowUp[], id: string, text: string, why: FollowUp['why'], more: { reason?: string; failed?: boolean } = {}): void {
+  const f = list.find((x) => x.id === id);
+  if (f) f.texts.push(text);
+  else list.push({ id, texts: [text], why, ...(more.reason ? { reason: more.reason } : {}), ...(more.failed ? { failed: true } : {}) });
+}
+
+/** What the shell says before it follows a follow-up turn, in the owner's
+ *  words; an id only where a command takes it. Exported for the tests. */
+export function followUpNote(f: FollowUp, canFollow: boolean): string {
+  const n = f.texts.length;
+  let note = '';
+  if (f.why === 'unread') {
+    const what = f.failed ? 'the turn failed before the agent read' : 'the agent finished before reading';
+    note = n > 1 ? `${what} ${n} of your messages — they go next, together` : `${what} this — it goes next`;
+  } else if (/agent'?s own/i.test(f.reason ?? '')) {
+    note = 'the agent was busy with its own work — this goes next';
+  } else if (/no turn/i.test(f.reason ?? '')) {
+    note = "the agent wasn't working on anything — sent as a new message";
+  } else {
+    note = 'sent as a new message';
+  }
+  if (!canFollow) note = `${note ? `${note}; ` : ''}/result ${f.id} shows the answer`;
+  return note ? `(${note})` : '';
+}
+
+/** What a failed turn's error points at: the model service (5xx, the
+ *  provider's own error), an overloaded model (429), the agent's model
+ *  settings (unknown model, a key, a bad request), or none of these. */
+export type FailureKind = 'service' | 'overloaded' | 'config' | 'other';
+
+/** The HTTP status in a model error, where the text names one: at its
+ *  start, after `HTTP`/`status`/`upstream`/`code`, or after a colon. */
+function failureStatus(msg: string): number | null {
+  const m = /(?:^|\bhttp\s*|\bstatus(?:\s*code)?\s*[:=]?\s*|\bupstream\s+|\bcode\s*[:=]\s*|:\s*)\(?([1-5]\d\d)\b/i.exec(msg);
+  return m ? Number(m[1]) : null;
+}
+
+/** Sort a failed turn's error (the agent's text for it) by what it points
+ *  at. Exported for the tests. */
+export function failureKind(message: string): FailureKind {
+  const msg = message.replace(/^chat:\s*/, '');
+  const low = msg.toLowerCase();
+  const status = failureStatus(msg);
+  if (/overload|rate[ _-]?limit|too many requests/.test(low) || status === 429 || status === 529) return 'overloaded';
+  if (/provider_error|bad gateway|service unavailable|gateway time-?out|internal server error/.test(low) || (status !== null && status >= 500)) return 'service';
+  if (/unknown model|model[ _]not[ _]found|no such model|model .*not (?:supported|available)|invalid[ _]api[ _]key|api key|unauthori[sz]ed|authenticat|forbidden|permission|invalid_request|bad request/.test(low)
+    || (status !== null && [400, 401, 402, 403, 404, 422].includes(status))) return 'config';
+  return 'other';
+}
+
+/** A model error's own words: the message inside a JSON body, without the JSON. */
+function failureWords(message: string): string {
+  const msg = message.replace(/^chat:\s*/, '').trim();
+  const at = msg.indexOf('{');
+  if (at < 0) return msg;
+  try {
+    const j = JSON.parse(msg.slice(at)) as { error?: { message?: unknown } | string; message?: unknown };
+    const inner = typeof j.error === 'string' ? j.error : typeof j.error?.message === 'string' ? j.error.message : typeof j.message === 'string' ? j.message : '';
+    if (inner) return `${msg.slice(0, at).trim()} ${inner}`.trim();
+  } catch { /* not JSON to the end: as it is */ }
+  return msg;
+}
+
+/** The line for a failed turn, by what its error points at. `model`: the
+ *  agent's model and provider, when known; `repeated`: the turn before
+ *  failed the same way. Exported for the tests. */
+export function failureText(message: string, opts: { model?: string; provider?: string; repeated?: boolean } = {}): string {
+  const kind = failureKind(message);
+  if (kind === 'service') {
+    const which = opts.model ? ` (${opts.model}${opts.provider ? ` via ${opts.provider}` : ''})` : '';
+    return `the model service failed${which} — try again in a moment`;
+  }
+  if (kind === 'overloaded') return 'the model is overloaded — try again shortly';
+  const base = `(chat failed: ${cleanCell(failureWords(message))}) — /agentlog has the agent's full error`;
+  return kind === 'config' && opts.repeated ? `${base}; failing again the same way usually means the model or settings just set — /settings shows them` : base;
+}
+
+/** A turn that ended without text because the model's output budget ran out. */
+export const NO_ANSWER_MAX_TOKENS = "no answer: the model's thinking used the whole output budget — ask again or /think high";
+
+/** The line for a turn that ended with no text (`err`, when given, says
+ *  so) because it ran out of output budget: its activity record (0g-harness)
+ *  says `max-tokens`. null for anything else. Exported for the tests. */
+export async function emptyTurnText(client: AgentClient | undefined, id: string | null | undefined, err?: unknown): Promise<string | null> {
+  if (!client?.activity || !id) return null;
+  if (err !== undefined && !/without any output/.test((err as Error)?.message ?? '')) return null;
+  const t = await client.activity(id).catch(() => null);
+  return t?.detail === 'max-tokens' ? NO_ANSWER_MAX_TOKENS : null;
+}
+
+/** Whether a turn keeps the prompt on screen: on a terminal, unless
+ *  AGENTDNA_LIVE_PROMPT=off. */
+function livePromptOn(): boolean {
+  return !!activeRl?.terminal && process.env.TERM !== 'dumb' && !/^(0|off|false|no)$/i.test(process.env.AGENTDNA_LIVE_PROMPT ?? '');
+}
+
+/** A turn's output: under a live prompt on a terminal, else written as it
+ *  comes. `steered`: what went into this turn and was not read yet. */
+function openTurn(s: Session, steered: () => readonly string[] = () => [], steers = false, next: () => readonly string[] = () => []): TurnView {
+  const screen = s.screen;
+  if (screen) screen.turnRan = true;
+  const a = activeAsk;
+  // Tab on a command during the turn completes it (livePrompt.ts tab).
+  const input: LiveInput = {
+    drafting: () => a?.drafting?.() ?? [],
+    queued: () => a?.queued?.() ?? [],
+    recall: () => a?.recall?.() ?? false,
+    held: () => a?.held?.count() ?? 0,
+    queueEdit: () => a?.queueEdit?.() ?? false,
+    complete: shellComplete,
+  };
+  const view = activeInk ? activeInk.turn({ steered, steers, next }) : livePromptOn() && activeRl
+    ? new LiveTurn(activeRl, process.stdout, input, (): LiveState => ({
+        prompt: screen?.prompt(true) ?? sessionPromptText(s.agentId, sessionLabel(s), true, { notices: 0, files: 0 }),
+        notes: turnNotes(steered(), [...(activeAsk?.queued?.() ?? []), ...next().map((text) => ({ text }))]),
+      }))
+    : new PlainTurn(term);
+  if (screen) screen.turn = view;
+  return view;
 }
 
 /** The session the prompt names, when chat goes to one other than owner-chat. */
 function sessionLabel(s: Session): string {
   if (!s.sessionId) return '';
-  const t = s.sessionTitle ? cleanCell(s.sessionTitle).slice(0, 24) : s.sessionId.slice(0, 13);
+  const title = s.sessionTitle ? cleanCell(s.sessionTitle) : '';
+  const t = title ? (title.length > 24 ? `${title.slice(0, 23)}…` : title) : s.sessionId.slice(0, 13);
   return ` [${t}]`;
+}
+
+/** A writer that puts `agent> ` before the turn's first text, not before
+ *  it: a status line may come first, and a turn with no text shows none. */
+/** Exported for the tests. */
+export function sayer(view: TurnView): (text: string) => void {
+  let said = false;
+  let seen = 0;
+  return (text) => {
+    if (!text) return;
+    const b = view.breaks ?? 0;
+    // Lines came between (a message read, a command's output): what the
+    // agent writes next is marked as its own again, on a line of its own.
+    if (said && b !== seen) {
+      const t = text.replace(/^\n+/, '');
+      if (!t) return;
+      seen = b;
+      view.write(`agent> ${t}`);
+      return;
+    }
+    if (!said) { view.write('agent> '); said = true; seen = b; }
+    view.write(text);
+  };
+}
+
+const TOOL_TEXT: Record<string, string> = {
+  bash: 'running a command',
+  bash_persistent: 'running a command',
+  pwsh: 'running a command',
+  terminal: 'running a command',
+  web_search: 'searching the web',
+  web_fetch: 'reading a web page',
+  read: 'reading a file',
+  read_image: 'looking at an image',
+  write: 'writing a file',
+  edit: 'editing a file',
+  subagent: 'asking a subagent',
+  list_subagent_models: 'checking subagent models',
+  job_output: 'checking a background job',
+  job_list: 'checking background jobs',
+};
+
+/** What the agent is doing, in plain words, from an activity label as the
+ *  frameworks report it ("tool/call bash", "tool_execution_start — bash",
+ *  "tool/result", "thinking"). */
+export function activityText(label: string): string {
+  const l = label.trim();
+  if (!l || /^thinking/i.test(l)) return 'thinking';
+  const tool = /^tool\/call\s+(\S+)/.exec(l)?.[1]
+    ?? /tool_execution_start\s*[—-]\s*(\S+)/.exec(l)?.[1]
+    ?? (/^bash_command_start/.test(l) ? 'bash' : undefined);
+  if (tool) return TOOL_TEXT[tool] ?? (/^memory|remember/i.test(tool) ? 'updating its memory' : `using ${tool}`);
+  if (/subagent|rlm_child/i.test(l)) return 'asking a subagent';
+  // A tool returned: the model reads its result next.
+  if (/^tool\/result\b|tool_execution_end|bash_command_end/.test(l)) return 'thinking';
+  return 'working';
+}
+
+/** What {@link activityText}'s words become once done: one, and several ({n}). */
+const TOOL_DONE: Record<string, [string, string]> = {
+  'running a command': ['ran a command', 'ran {n} commands'],
+  'searching the web': ['searched the web', 'searched the web {n} times'],
+  'reading a web page': ['read a web page', 'read {n} web pages'],
+  'reading a file': ['read a file', 'read {n} files'],
+  'looking at an image': ['looked at an image', 'looked at {n} images'],
+  'writing a file': ['wrote a file', 'wrote {n} files'],
+  'editing a file': ['edited a file', 'edited {n} files'],
+  'asking a subagent': ['asked a subagent', 'asked {n} subagents'],
+  'checking subagent models': ['checked the subagent models', 'checked the subagent models {n} times'],
+  'checking a background job': ['checked a background job', 'checked background jobs {n} times'],
+  'checking background jobs': ['checked the background jobs', 'checked the background jobs {n} times'],
+  'updating its memory': ['updated its memory', 'updated its memory {n} times'],
+};
+
+/**
+ * One run of the agent's tool calls in plain words, as the Ink view's
+ * transcript shows it: "ran 3 commands, read a file". Only the calls count
+ * (a tool's result, thinking and the like do not); '' when there were none.
+ */
+export function activitySummary(labels: readonly string[]): string {
+  const n = new Map<string, number>();
+  for (const label of labels) {
+    const l = label.trim();
+    if (!/^tool\/call\s+\S/.test(l) && !/tool_execution_start\s*[—-]\s*\S/.test(l)) continue;
+    const what = activityText(l);
+    n.set(what, (n.get(what) ?? 0) + 1);
+  }
+  return [...n].map(([what, k]) => {
+    const done = TOOL_DONE[what];
+    if (done) return k === 1 ? done[0] : done[1].replace('{n}', String(k));
+    const used = /^using (.+)$/.exec(what)?.[1];
+    if (used) return k === 1 ? `used ${used}` : `used ${used} ${k} times`;
+    return k === 1 ? what : `${what} (${k} times)`;
+  }).join(', ');
+}
+
+/** The line for a failed turn (failureText) with the agent's model named
+ *  where the model service failed; remembers the kind, so a config error
+ *  says what usually causes it only when it comes again. */
+async function turnFailureText(s: Session, message: string): Promise<string> {
+  const kind = failureKind(message);
+  let named: { model?: string; provider?: string } = {};
+  if (kind === 'service') {
+    const doc = await Promise.race([
+      s.ag.agent.getSettings(s.sealId).then((d) => d.settings, () => null),
+      new Promise<null>((r) => setTimeout(() => r(null), 2000)),
+    ]);
+    if (typeof doc?.model === 'string' && doc.model) named = { model: cleanCell(doc.model), ...(typeof doc.provider === 'string' && doc.provider ? { provider: cleanCell(doc.provider) } : {}) };
+  }
+  const text = failureText(message, { ...named, repeated: s.lastFailKind === kind });
+  s.lastFailKind = kind;
+  return text;
 }
 
 /**
@@ -1156,13 +2107,13 @@ function sessionLabel(s: Session): string {
  * staged with /attach are uploaded and named in the text; images go only to
  * owner-chat.
  */
-async function chatInSession(s: Session, line: string, irq: Interrupt): Promise<void> {
+async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (view: TurnView) => (e: Entry) => boolean): Promise<void> {
   const client = s.client!;
   let sent = line;
   if (s.attached?.length) {
     if (s.attached.some((a) => !!a.image)) { out('images go with owner-chat messages only — /sessions default, or /attach clear\n'); return; }
     try {
-      ({ text: sent } = await prepareAttachments(s.attached, line, client, (a, path) => out(`uploaded ${cleanCell(a.name)} → ${cleanCell(path)}\n`)));
+      ({ text: sent } = await prepareAttachments(s.attached, line, client, (a) => out(`uploaded ${cleanCell(a.name)}\n`)));
     } catch (e) {
       out(`not sent: ${cleanCell((e as Error).message)} — the attachments stay staged (/attach lists them)\n`);
       return;
@@ -1171,22 +2122,56 @@ async function chatInSession(s: Session, line: string, irq: Interrupt): Promise<
   }
   const sid = s.sessionId!;
   const r = await client.promptSession!(sid, sent);
+  // Its id, for /result and /cancel in this session.
+  (s.tasks ??= []).push({ id: r.id, prompt: line.slice(0, 60), at: Date.now(), session: sid });
   const ac = new AbortController();
   irq.streaming = ac;
-  out('agent> ');
+  // What is typed meanwhile waits for the next turn; a command that only
+  // reads runs at once (`busy`, the session's busyEntries).
+  const view = openTurn(s);
+  if (busy) activeAsk?.whileBusy?.(busy(view));
+  const say = sayer(view);
   let reply = '';
+  // What the agent does, on the status line (as in owner-chat): a spinner,
+  // its last activity, the seconds since the message went.
+  const t0 = Date.now();
+  const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+  let spin = 0;
+  let doing: string | null = 'replying';
+  const paint = (): void => {
+    if (!doing) return;
+    spin = (spin + 1) % SPIN.length;
+    view.status(`${SPIN[spin]} ${doing}… (${Math.floor((Date.now() - t0) / 1000)}s${view.stopHint ?? (view.live ? '' : ' · esc to interrupt')})`);
+  };
+  const ticker = process.stdout.isTTY ? setInterval(paint, 1000) : null;
+  const onActivity = process.stdout.isTTY
+    ? (label: string): void => {
+        if (label.startsWith('turn/end')) { doing = null; view.status(null); return; }
+        view.activity?.(label);
+        doing = cleanCell(activityText(label));
+        paint();
+      }
+    : undefined;
   try {
-    for await (const d of client.followTask!(r.id, { signal: ac.signal })) { reply += d; out(cleanStream(d)); }
+    for await (const d of client.followTask!(r.id, { signal: ac.signal, ...(onActivity ? { onActivity } : {}) })) { reply += d; doing = null; view.status(null); say(d); }
+    view.end();
     if (reply && !reply.endsWith('\n')) out('\n');
   } catch (e) {
+    view.end();
     if (ac.signal.aborted) {
       await client.cancelSession!(sid).catch(() => undefined);
       out('\n⏹ interrupted — the turn stopped\n');
+      const back = s.screen?.interrupted?.();
+      if (back) out(`${back}\n`);
     } else {
-      out(`\n(turn failed: ${cleanCell((e as Error).message)})\n`);
+      const empty = await emptyTurnText(client, r.id, e);
+      out(empty ? `\n${empty}\n` : `\n${await turnFailureText(s, (e as Error).message)}\n`);
     }
   } finally {
+    if (ticker) clearInterval(ticker);
+    view.end();
     irq.streaming = null;
+    if (busy) activeAsk?.whileBusy?.(null);
   }
 }
 
@@ -1229,11 +2214,36 @@ function proxyAddrOf(attestorUrl: string): Promise<string | undefined> {
   return p;
 }
 
-/** Re-read the deployment row and resync the session, printing the result:
- *  phase always; the container URL as soon as a sandbox exists (the sealed
- *  runtime serves /log while still `deploying`); the chat client only when
- *  running (and dropped again when not, so a stale connection can't linger). */
-async function refreshSession(s: Session, quiet = false): Promise<void> {
+/** The agent's phase on one line, with why the container failed when it did. */
+export function phaseLine(phase: string, failure?: string): string {
+  return `  phase   ${phase}${failure ? ` — last error: ${failure}` : ''}\n`;
+}
+
+/** What the Ink view's footer says about an agent that is not running, with
+ *  the way out ('' while it runs). */
+export function phaseNote(phase: string, failure?: string): string {
+  if (phase === 'running') return '';
+  if (phase === 'stopped') return 'stopped — /start';
+  if (phase === 'offline') return 'offline — /reset';
+  if (phase === 'failed') return `failed — /reset${failure ? ` · ${failure}` : ''}`;
+  if (phase === 'deploying') return 'deploying…';
+  return phase;
+}
+
+/**
+ * Re-read the deployment row and resync the session: the phase; the
+ * container URL as soon as a sandbox exists (the sealed runtime serves /log
+ * while still `deploying`), kept for the session's own requests and never
+ * printed; the chat client only when running (and dropped again when not,
+ * so a stale connection can't linger). What it says: the phase on one line,
+ * every time (`always`) or when it moved (`moved`); under the Ink view
+ * (`view`) nothing, as its footer shows the phase. Exported for the tests.
+ */
+export async function refreshSession(
+  s: Session,
+  say: 'always' | 'moved' | 'never' = 'always',
+  view: { refresh(): void } | null = activeInk,
+): Promise<void> {
   const before = s.phase;
   const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`)).json()) as {
     phase?: string; url?: string; sandbox_id?: string;
@@ -1254,11 +2264,46 @@ async function refreshSession(s: Session, quiet = false): Promise<void> {
     s.sandboxId = d.sandbox_id ?? s.sandboxId;
     s.client = undefined;
   }
-  if (quiet && s.phase === before) return; // background refresh: report only movement
-  out(`  phase   ${s.phase}\n`);
-  if (s.url) out(`  url     ${s.url}\n`);
-  const reason = d.container_stage?.state === 'failed' ? d.container_stage.reason : undefined;
-  if (reason) out(`  last error: ${reason}\n`);
+  s.failure = d.container_stage?.state === 'failed' ? d.container_stage.reason ?? undefined : undefined;
+  s.stale = false;
+  if (view) { view.refresh(); return; }
+  if (say === 'never' || (say === 'moved' && s.phase === before)) return; // background refresh: report only movement
+  out(phaseLine(s.phase, s.failure));
+}
+
+/** How often an idle session re-reads the phase of an agent it believes running. */
+export const PHASE_WATCH_MS = 30_000;
+
+/** What an answer to a yes/no question says: y/yes, n/no, Enter (the
+ *  default); null for anything else (asked again). Exported for the tests. */
+export function yesNo(answer: string, dflt: boolean): boolean | null {
+  const a = answer.trim().toLowerCase();
+  if (!a) return dflt;
+  if (a === 'y' || a === 'yes') return true;
+  if (a === 'n' || a === 'no') return false;
+  return null;
+}
+
+/** A yes/no question asked until it is answered y, yes, n, no or Enter. */
+async function askYesNo(ask: (q: string) => Promise<string>, q: string, dflt: boolean): Promise<boolean> {
+  for (;;) {
+    const r = yesNo(await ask(q), dflt);
+    if (r !== null) return r;
+    out('  (y or n)\n');
+  }
+}
+
+/** The wait before the next phase read: the base one after a read that
+ *  worked, doubling after each that failed, up to five minutes. Exported for the tests. */
+export function nextPhaseWait(prev: number, ok: boolean): number {
+  return ok ? PHASE_WATCH_MS : Math.min(Math.max(prev, PHASE_WATCH_MS) * 2, 300_000);
+}
+
+/** The line for an agent the session believed running that is not any
+ *  more, with the way back. Exported for the tests. */
+export function phaseMovedText(phase: string): string {
+  const back = phase === 'stopped' ? ' — /start' : phase === 'offline' || phase === 'failed' ? ' — /reset' : '';
+  return `  phase   ${phase}${back}\n`;
 }
 
 /** An agent's container state just before a lifecycle request was sent. */
@@ -1324,12 +2369,20 @@ export async function pollRunning(
   const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
   let spin = 0;
   let spinnerShown = false;
-  const clearSpinner = (): void => { if (spinnerShown) { term('\r\x1b[2K'); spinnerShown = false; } };
+  const clearSpinner = (): void => {
+    if (!spinnerShown) return;
+    if (activeInk) activeInk.status(null);
+    else term('\r\x1b[2K');
+    spinnerShown = false;
+  };
   const ticker = process.stdout.isTTY
     ? setInterval(() => {
         if (signal?.aborted) return;
         spin = (spin + 1) % SPIN.length;
-        term(`\r\x1b[2K  ${cleanCell(`${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · esc stops waiting, not the deploy)`)}`);
+        const line = cleanCell(`${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · Esc stops the wait, not the agent)`);
+        // Under the Ink view: its status row.
+        if (activeInk) activeInk.status(line);
+        else term(`\r\x1b[2K  ${line}`);
         spinnerShown = true;
       }, 1000)
     : null;
@@ -1392,8 +2445,9 @@ export async function pollRunning(
 async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sealId: `0x${string}`, agentId: string, baseline?: LifecycleBaseline): Promise<{ url: string } | null> {
   const ac = new AbortController();
   irq.streaming = ac;
+  const restore = historyAside(activeRl);
   try {
-    return await pollRunning(attestorUrl, sealId, agentId, 360000, ac.signal, { baseline });
+    return await duringWait(() => pollRunning(attestorUrl, sealId, agentId, 360000, ac.signal, { baseline }));
   } catch (e) {
     if (e instanceof WaitCancelled || ac.signal.aborted) {
       out('\n(wait cancelled — the operation continues server-side; check with `list` or re-enter with `use`)\n');
@@ -1401,9 +2455,261 @@ async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sea
     }
     throw e;
   } finally {
+    restore?.(true);
     irq.streaming = null;
   }
 }
+
+type KeyFn = (s: string | undefined, key: InkKey | undefined) => void | false;
+
+/** What one stretch with the keys set aside has seen. */
+type Aside = { typed: boolean; busyNoted?: boolean };
+let aside: Aside | null = null;
+let droppedNote = false;
+type WaitIO = Pick<NonNullable<typeof shellIO>, 'keys' | 'onEscape' | 'cancelWait'> & { ask?: Ask };
+
+/** The keys while they are set aside: a question the command asks takes
+ *  them as usual (false: on to readline); otherwise Esc and Ctrl-C act, and
+ *  any other key is dropped. Ctrl-C stops a wait, as Esc does; anything else
+ *  in flight (a transaction, a write) cannot be stopped now, and one line
+ *  says so. It never counts toward the double Ctrl-C that exits: that is the
+ *  idle prompt's. */
+function asideKeys(io: WaitIO, a: Aside): KeyFn {
+  return (s, key) => {
+    if ((activeAsk ?? io.ask)?.waiting?.()) return false;
+    if (key?.name === 'escape') { io.onEscape(); return; }
+    if (key?.ctrl && key.name === 'c') {
+      if (io.cancelWait()) return;
+      if (!a.busyNoted) {
+        a.busyNoted = true;
+        term('\r\x1b[2K'); // over a progress line, if one is showing; it draws again below
+        out("(still working — this can't be stopped now)\n");
+      }
+      return;
+    }
+    if (typeof s === 'string' && /[^\x00-\x1f\x7f]/.test(s) && !key?.ctrl && !key?.meta) a.typed = true;
+  };
+}
+
+/**
+ * Set the plain prompt's keyboard aside while a command runs (the shell does
+ * this for every manager command; duringWait for a wait elsewhere): readline
+ * would echo a key typed meanwhile onto the command's output (`xyzdeposited
+ * 0.1 OG`) and keep it as the start of the next command, which the prompt
+ * then showed with the cursor before it. A question the command asks takes
+ * keys as usual; Esc and Ctrl-C stop a wait (asideKeys); any other key is
+ * dropped, and before the next prompt one line says so (flushDroppedNote).
+ * Under the Ink view nothing is set aside: its editor keeps what is typed as
+ * an editable line. Returns the function that gives the keys back; null when
+ * nothing was set aside (no terminal, the Ink view, already aside).
+ * Exported for the tests.
+ */
+export function keysAside(io: WaitIO | null = shellIO): (() => void) | null {
+  const keys = io?.keys;
+  if (!io || !keys || activeInk || aside) return null;
+  const a: Aside = { typed: false };
+  aside = a;
+  keys.use(asideKeys(io, a));
+  return () => {
+    if (aside === a) {
+      aside = null;
+      if (!activeInk) keys.use(null);
+    }
+    if (a.typed) droppedNote = true;
+  };
+}
+
+/** Runs `f` (a wait) with the keys set aside, as keysAside says. Exported for the tests. */
+export async function duringWait<T>(f: () => Promise<T>, io: WaitIO | null = shellIO): Promise<T> {
+  const back = keysAside(io);
+  try {
+    return await f();
+  } finally {
+    back?.();
+  }
+}
+
+/** The note for keys dropped so far, now (before a session's entry card:
+ *  the session's view has no readline prompt to note them at). */
+function noteDroppedKeys(): void {
+  if (aside?.typed) { aside.typed = false; droppedNote = true; }
+  flushDroppedNote();
+}
+
+/** Runs `f` (a session entered from a command) with the keys back; aside
+ *  again after. Keys dropped before it are noted first. */
+async function keysBack<T>(f: () => Promise<T>, io: WaitIO | null = shellIO): Promise<T> {
+  const a = aside;
+  if (!io?.keys || !a) return f();
+  noteDroppedKeys();
+  aside = null;
+  io.keys.use(null);
+  try {
+    return await f();
+  } finally {
+    if (!activeInk && !aside) {
+      aside = a;
+      io.keys.use(asideKeys(io, a));
+    }
+  }
+}
+
+/** The note that keys typed while they were aside were dropped: once, right
+ *  before the next prompt, after what the command printed last. Exported for the tests. */
+export function flushDroppedNote(): void {
+  if (!droppedNote) return;
+  droppedNote = false;
+  out('(what was typed during the wait is not kept — type it again)\n');
+}
+
+/**
+ * Every keypress through one listener that calls the shell's listeners in
+ * the order they were added, or, while the Ink session view is up, only the
+ * view's (`use`): readline must not edit a line it does not show. `drop`
+ * takes listeners out for good (readline's, once it is closed).
+ */
+function routeKeys(stdin: NodeJS.ReadStream): { use(f: KeyFn | null): void; drop(fs: unknown[]): void } {
+  let shell = stdin.listeners('keypress') as KeyFn[];
+  stdin.removeAllListeners('keypress');
+  let only: KeyFn | null = null;
+  stdin.on('keypress', (s: string | undefined, key: InkKey | undefined) => {
+    // `false` from the one in use: the key goes on to the shell's listeners.
+    if (only && only(s, key) !== false) return;
+    for (const f of shell) f.call(stdin, s, key);
+  });
+  return {
+    use: (f) => { only = f; },
+    drop: (fs) => { shell = shell.filter((f) => !fs.includes(f)); },
+  };
+}
+
+/** What run() sets up that the Ink session view takes over while it is up. */
+let shellIO: {
+  rl: readline.Interface;
+  ask: Ask;
+  keys: { use(f: KeyFn | null): void } | null;
+  rlResize: Array<() => void>;
+  onInterrupt(): void;
+  onEscape(): void;
+  /** Stop the wait under way (a cancellable one); false when there is none. */
+  cancelWait(): boolean;
+} | null = null;
+let inkNoticeShown = false;
+let inkEof = false;
+
+/** is-in-ci's rule: there Ink prints only its last frame. */
+function inCi(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CI !== '0' && env.CI !== 'false'
+    && ('CI' in env || 'CONTINUOUS_INTEGRATION' in env || Object.keys(env).some((k) => k.startsWith('CI_')));
+}
+
+/** Whether a session gets the Ink view: where a turn keeps its prompt on
+ *  screen (livePromptOn), with both ends a terminal of a usable size, unless
+ *  AGENTDNA_INK=off. */
+function inkWanted(): boolean {
+  return livePromptOn() && !!process.stdin.isTTY && !/^(0|off|false|no)$/i.test(process.env.AGENTDNA_INK ?? '') && !inCi()
+    && (process.stdout.rows ?? 0) >= MIN_ROWS && (process.stdout.columns ?? 0) >= MIN_COLS;
+}
+
+/** Put the Ink view up for a session; null when it is not wanted or cannot start (the readline prompt then). */
+async function openInk(agentId?: string): Promise<InkScreen<Ask> | null> {
+  const io = shellIO;
+  if (!io?.keys || activeInk || !inkWanted()) return null;
+  const lib = await loadInk();
+  const say = (why: string): null => {
+    if (!inkNoticeShown) out(`(the framed session view is not available: ${cleanCell(why)} — the plain prompt instead)\n`);
+    inkNoticeShown = true;
+    return null;
+  };
+  if (!lib) return say(inkLoadError() ?? 'Ink did not load');
+  let screen: InkScreen<Ask>;
+  try {
+    screen = openInkScreen<Ask>({
+      lib,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      makeAsk: (editor, echo) => lineQueue(editor, () => true, editor, { boxed: true, echo }),
+      complete: (line) => completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor }),
+      onInterrupt: io.onInterrupt,
+      onEscape: io.onEscape,
+      summarize: activitySummary,
+      ownerText: droppedShown,
+      colors: !process.env.NO_COLOR,
+    });
+  } catch (e) {
+    return say((e as Error).message);
+  }
+  // What was typed ahead goes along; the history is the session's own
+  // (per agent), apart from the manager's.
+  for (const e of io.ask.drain?.() ?? []) screen.ask.later?.(e);
+  screen.editor.history = [...(agentId ? sessionHistories.get(agentId) ?? [] : [])];
+  inkAgent = agentId;
+  inkEof = false;
+  screen.editor.once('close', () => { inkEof = true; });
+  for (const f of io.rlResize) process.stdout.off('resize', f);
+  io.keys.use((s, key) => screen.key(s, key ?? {}));
+  activeInk = screen;
+  activeAsk = screen.ask;
+  return screen;
+}
+
+/** The agent whose session the Ink view is up for (its history goes back there). */
+let inkAgent: string | undefined;
+
+/** Take the Ink view down and give the terminal back to readline. */
+async function closeInk(screen: InkScreen<Ask>): Promise<void> {
+  if (activeInk !== screen) return;
+  await screen.close();
+  activeInk = null;
+  const io = shellIO;
+  if (!io) return;
+  activeAsk = io.ask;
+  for (const e of screen.ask.drain?.() ?? []) io.ask.later?.(e);
+  // The session's history stays the session's; the manager's is left as it was.
+  if (inkAgent) sessionHistories.set(inkAgent, [...screen.editor.history]);
+  inkAgent = undefined;
+  for (const f of io.rlResize) process.stdout.on('resize', f);
+  io.keys?.use(null);
+  (io.rl as unknown as { prevRows?: number }).prevRows = 0;
+  // Ctrl-D at the view's empty prompt leaves the shell, as at readline's.
+  if (inkEof) { endedInInk = true; io.rl.close(); }
+}
+
+/** How often the Ink view re-reads the phase of an agent that is not running. */
+const PHASE_POLL_MS = 10_000;
+
+/** The owner's message as the Ink view's transcript shows it: a file dragged
+ *  in (attach.ts findDroppedFiles) by its name, `[image: cat.png]`, not its path. */
+export function droppedShown(text: string): string {
+  const parts = findDroppedFiles(text);
+  if (!parts.some((p) => typeof p !== 'string')) return text;
+  return parts.map((p) => {
+    if (typeof p === 'string') return p;
+    const name = basename(p.path);
+    return /\.(png|jpe?g|gif|webp)$/i.test(name) ? `[image: ${name}]` : `[file: ${name}]`;
+  }).join('');
+}
+
+/** Leave the shell: the Ink view first, so the terminal is left clean. */
+async function quitShell(code: number, closeRl = false): Promise<never> {
+  if (activeInk) await closeInk(activeInk);
+  if (closeRl) shellIO?.rl.close();
+  process.exit(code);
+}
+
+/** A session, under the Ink view when it can be up (inkView.ts), else at readline's prompt. */
+async function enterSession(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
+  const ink = await openInk(s.agentId);
+  if (!ink) return sessionRepl(s, ask, irq, ctx);
+  try {
+    await sessionRepl(s, ink.ask, irq, ctx);
+  } finally {
+    await closeInk(ink);
+  }
+}
+
+/** The shell ended from the Ink view (its last frame ends the line). */
+let endedInInk = false;
 
 /** Shared interrupt state: set while an L2 turn streams; Esc/Ctrl-C abort it.
  *  `brake` is the server-side stop for the CURRENT session's agent — wired
@@ -1421,6 +2727,10 @@ export async function run(ctx: CommandContext): Promise<void> {
     });
   }
 
+  // readline's own key and resize handlers, told apart from the shell's:
+  // the Ink session view sets them aside while it is up.
+  const keysBefore = process.stdin.listeners('keypress');
+  const resizeBefore = process.stdout.listeners('resize');
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -1434,40 +2744,79 @@ export async function run(ctx: CommandContext): Promise<void> {
     // Tab completion on the command word. One readline serves both levels,
     // so the candidate set is swapped by whichever REPL loop is active
     // (activeCompletions); empty line + Tab lists everything.
-    completer: (line: string): [string[], string] =>
-      completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds, credNames: credNamesFor }),
+    // While a turn runs with the prompt on screen, Tab queues what is typed
+    // instead (livePrompt.ts).
+    completer: (line: string): [string[], string] => (liveKeys.tab() ? [[], line] : shellComplete(line)),
   });
+  const rlKeys = process.stdin.listeners('keypress').filter((f) => !keysBefore.includes(f));
+  const rlResize = process.stdout.listeners('resize').filter((f) => !resizeBefore.includes(f)) as Array<() => void>;
   activeRl = rl;
   const ask = lineQueue(rl, () => !!process.stdin.isTTY, process.stdin);
+  activeAsk = ask;
   // Bracketed paste: the terminal marks a paste, so its lines stay one
   // message (lineQueue). Off again on every way out — exit, Ctrl-C twice, a
   // crash (the exit event), SIGTERM — so the owner's shell is not left in it.
   if (rl.terminal) {
     term(PASTE_ON);
-    process.on('exit', () => term(PASTE_OFF));
-    process.once('SIGTERM', () => process.exit(143));
+    process.on('exit', () => { process.stdout.write(PASTE_OFF); });
+    process.once('SIGTERM', () => { activeInk?.closeNow(); process.exit(143); });
   }
   const irq: Interrupt = { streaming: null, brake: null };
 
+  // A question (not the shell's prompt) is waiting: cancel it, and the
+  // command that asked. Under the Ink view it stays in the transcript as asked.
+  const cancelQuestion = (): boolean => {
+    const a = activeAsk ?? ask;
+    const w = a.waiting?.();
+    const typed = activeInk?.editor.line ?? '';
+    if (!a.cancel?.()) return false;
+    if (activeInk) activeInk.cancelled(w?.q ?? '', typed);
+    else out('\n');
+    return true;
+  };
   let lastSigint = 0;
-  rl.on('SIGINT', () => {
-    // A question (not the shell's prompt) is waiting: cancel it, and the
-    // command that asked.
-    if (ask.cancel?.()) { out('\n'); return; }
+  const onInterrupt = (): void => {
+    if (cancelQuestion()) return;
     if (irq.streaming) { irq.streaming.abort(); return; } // interrupt the turn, stay in the REPL
+    // Text in the box: Ctrl-C clears it (its earlier lines too) first.
+    if ((activeAsk ?? ask).clearBox?.()) return;
     const now = Date.now();
-    if (now - lastSigint < 2000) { rl.close(); process.exit(0); }
+    if (now - lastSigint < 2000) { if (!activeInk && rl.terminal) term('\n'); void quitShell(0, true); return; }
     lastSigint = now;
-    out('\n(press Ctrl-C again to exit)\n');
-    rl.prompt();
-  });
-  readline.emitKeypressEvents(process.stdin, rl);
-  process.stdin.on('keypress', (_s, key) => {
-    if (key?.name !== 'escape') return;
-    if (ask.cancel?.()) { out('\n'); return; }
+    if (activeInk) { out('(press Ctrl-C again to exit)\n'); return; }
+    // Above the prompt: written below it, readline's redraw of a prompt that
+    // starts with a newline would erase it.
+    printAbovePrompt('(press Ctrl-C again to exit)', rl);
+  };
+  const onEscape = (): void => {
+    if (cancelQuestion()) return;
     if (irq.streaming) { irq.streaming.abort(); return; }
+    if ((activeAsk ?? ask).clearBox?.()) return; // text in the box: Esc clears it
     irq.brake?.(); // idle Esc in a session: stop a background/orphaned task
+  };
+  rl.on('SIGINT', onInterrupt);
+  // Keys dropped while a command ran are noted right before the next prompt.
+  const promptLine = rl.prompt.bind(rl);
+  rl.prompt = (preserveCursor?: boolean): void => { flushDroppedNote(); promptLine(preserveCursor); };
+  readline.emitKeypressEvents(process.stdin, rl);
+  // The live prompt sees each key before readline handles it and after
+  // readline and the line queue have (livePrompt.ts).
+  process.stdin.prependListener('keypress', (_s, key) => liveKeys.before(key));
+  process.stdin.on('keypress', (_s, key) => liveKeys.after(key));
+  process.stdin.on('keypress', (_s, key) => {
+    if (key?.name === 'escape') onEscape();
   });
+  // One route for the keys on a terminal: the listeners above in their
+  // order, or, while the Ink session view is up, the view alone.
+  const keys = rl.terminal ? routeKeys(process.stdin) : null;
+  rl.on('close', () => keys?.drop(rlKeys));
+  const cancelWait = (): boolean => {
+    if (!irq.streaming) return false;
+    irq.streaming.abort();
+    return true;
+  };
+  shellIO = { rl, ask, keys, rlResize, onInterrupt, onEscape, cancelWait };
+  if (keys && inkWanted()) void loadInk(); // loaded while the banner prints
 
   try {
     // Shortcut: `0g-agentdna <agent>` links straight into L2, then drops to L1.
@@ -1479,7 +2828,7 @@ export async function run(ctx: CommandContext): Promise<void> {
       const ag = await withWallet(ctx);
       try {
         const s = await attach(ag, requireAttestorUrl(ctx.env), ctx.positionals[0], ask);
-        await sessionRepl(s, ask, irq, ctx);
+        await enterSession(s, ask, irq, ctx);
       } catch (e) {
         if (!isCancelled(e)) throw e;
         out('cancelled\n');
@@ -1488,8 +2837,12 @@ export async function run(ctx: CommandContext): Promise<void> {
     await managerRepl(ctx, ask, irq);
   } catch (e) {
     // stdin EOF (piped input, Ctrl-D) closes readline while a question is
-    // pending — that's a normal way to leave, not an error.
+    // pending — that's a normal way to leave, not an error. On a terminal the
+    // owner's shell prompt starts on a line of its own.
     if ((e as { code?: string }).code !== 'ERR_USE_AFTER_CLOSE') throw e;
+    // At readline's prompt the cursor sits after it: the owner's shell
+    // prompt starts on a line of its own.
+    if (rl.terminal && !endedInInk) term('\n');
   } finally {
     rl.close();
   }
@@ -1497,7 +2850,7 @@ export async function run(ctx: CommandContext): Promise<void> {
 
 /** Resolve an agent ref to this wallet's deployment row (owner listing —
  *  lifecycle verbs need sandboxId, which the public listing withholds). */
-async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; phase: string; sandboxId?: string; framework?: string | null }> {
+async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; minted: boolean; phase: string; sandboxId?: string; framework?: string | null }> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listMyDeployments();
   rememberAgentIds(rows);
@@ -1510,25 +2863,50 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
     throw new CliError(
       'AGENT_NOT_FOUND',
       exists
-        ? `agent ${refInput} is not yours`
-        : `agent ${refInput} does not exist`,
-      { remedy: exists ? 'check `whoami` — are you on the right wallet? `list` marks yours with *' : 'check `list` for the agents that exist here' },
+        ? `agent ${cleanCell(refInput)} is not yours`
+        : `agent ${cleanCell(refInput)} does not exist on this attestor`,
+      { remedy: exists ? 'check `whoami` — are you on the right wallet? `list` marks yours with *' : '`list` shows the agents here (* marks yours)' },
     );
   }
-  return { sealId: row.sealId, agentId: String(row.agentId ?? '?'), phase: row.phase ?? 'unknown', sandboxId: (row as { sandboxId?: string | null }).sandboxId ?? undefined, framework: (row as { framework?: string | null }).framework ?? null };
+  // An agent without an agentId yet is named by its sealId prefix, the
+  // handle every command accepts for it (`list` shows the same).
+  const minted = row.agentId !== undefined && row.agentId !== null;
+  return { sealId: row.sealId, agentId: minted ? String(row.agentId) : sealPrefixOf(row.sealId), minted, phase: row.phase ?? 'unknown', sandboxId: (row as { sandboxId?: string | null }).sandboxId ?? undefined, framework: (row as { framework?: string | null }).framework ?? null };
+}
+
+/** `0x` + the first 10 hex of a sealId: an unminted agent's handle. */
+function sealPrefixOf(sealId: string): string {
+  return `0x${sealId.slice(2, 12)}`;
 }
 
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · hello <id> · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · cred <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
+  'commands: list · use <id> · hello <id> [full] · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · cred <id> · status <id> · balance · deposit · withdraw · ack · login · whoami · doctor · providers · releases · help · quit';
+
+/** A `·`-separated list wrapped to `width` between items, never inside one. */
+export function fitItems(text: string, width: number | undefined): string {
+  if (!width) return text;
+  // Items packed onto rows; a row after the first starts under the list.
+  const rows: string[] = [];
+  let row = '';
+  for (const item of text.split(' · ')) {
+    const next = row ? `${row} · ${item}` : item;
+    if (row && textCols(next) + 2 > width) { rows.push(`${row} ·`); row = `  ${item}`; } else row = next;
+  }
+  rows.push(row);
+  return rows.join('\n');
+}
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
   use <agentId|sealId>    enter YOUR agent's session — works in ANY phase
-  hello <agentId|sealId>  any agent's public /hello: identity, services,
-                          routes, serve-proof verification (with a wallet
-                          configured it also banks a rating ticket, see rate)
+  hello <agentId|sealId> [full]
+                          any agent's public /hello: identity, serve-proof
+                          verification, its services one per line and its
+                          owner routes on one line, by kind; full prints
+                          every field (with a wallet configured it also
+                          banks a rating ticket, see rate)
   call <id> [path [body]] use an agent's public service as a client; the
                           response banks a rating ticket (bare call = list
                           its services)
@@ -1547,19 +2925,22 @@ const L1_HELP_FULL = `manager commands
   settings <id> [k=v …]   show the agent's configuration document (which model
                           it thinks with, and how hard); with assignments —
                           model=… provider=… thinking=low|high|max
-                          others=<json> — merge and write it (owner-signed)
+                          others=<json> — merge and write it (owner-signed).
+                          settings <id> versions lists the versions a
+                          0g-harness agent can be pinned to (sealed=…
+                          harness=…)
   cred <id> [sub …]       the agent's credentials (API keys, tokens): bare
                           lists them (never values); set <name> [k=v …] adds
-                          or changes one (preset=<name> — cred presets lists them,
-                          host=, header='Name: … {v}', basic=, query=, body=,
-                          path=yes, use=sign signer=<json>, reveal=yes|no,
-                          expires=, desc=; the value
-                          is asked for, not echoed); rm <name>; connect <name>
-                          <mcp-url> (prints a link to open); disconnect <name>; reveal <name>
-                          on|off; pending; approve|deny [<id>]; log [n].
-                          cred pending: counts on all your agents; cred
-                          notify [email|off]: where you are emailed;
-                          cred presets: the presets
+                          or changes one (preset=<name> — cred presets lists
+                          them, host=, header='Name: … {v}', basic=, query=,
+                          body=, path=yes, use=sign signer=<json>,
+                          reveal=yes|no, expires=, desc=; the value is asked
+                          for, not echoed); rm <name>; connect <name>
+                          <mcp-url> (prints a link to open); disconnect
+                          <name>; reveal <name> on|off; pending;
+                          approve|deny [<id>]; log [n]. cred pending: counts
+                          on all your agents; cred notify [email|off]: where
+                          you are emailed; cred presets: the presets
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
                           Someone else's: goes through its fork policy — works
                           iff the seller granted YOUR wallet. Lands offline
@@ -1572,19 +2953,34 @@ const L1_HELP_FULL = `manager commands
                           policy only; a switch — revoke closes it again)
   revoke <id> <buyer>     seller: close the door for <buyer>
   balance                 prepaid sandbox balance, burn rate, runway
-  deposit [og]            fund the prepaid balance (default 1 OG)
+  deposit [og]            fund the prepaid balance (bare: asks how much;
+                          Enter cancels)
   withdraw [og]           get prepaid funds back: shows balance + pending,
                           offers to claim matured refunds, then asks how
                           much (more) to withdraw (time-locked)
   ack                     acknowledge the TEE trust root (deploy/start/reset
                           do this implicitly; re-run after an attestor upgrade)
-  login [provider]        setup: attestor URL, owner key, each provider's model key
-                          (Enter keeps the current value; secrets echo *)
-  whoami                  show attestor / wallet / api-key / ack status
+  status <id>             one agent's full picture: phase, agentId, sealId,
+                          agentSeal, failure reason
+  doctor                  check every deploy prerequisite, each failing one
+                          with its remedy
+  providers               the inference providers this attestor offers
+  releases                release notices: what changed, and which of your
+                          agents to reset by when
+  login [provider]        setup: attestor URL, owner key, each provider's model
+                          key (Enter keeps the current value; secrets echo *)
+  whoami                  show attestor / wallet / the providers with a model
+                          key on this machine / ack status
   help                    this text
   quit                    exit (Ctrl-C twice also works)
 At a question a command asks (a value, an amount, a confirmation), Ctrl-C or
 Esc cancels it and the command.`;
+
+/** The manager's `help`, fitted to a terminal `width` wide (textfit.ts).
+ *  Exported for the tests. */
+export function managerHelp(width?: number): string {
+  return fitHelp(L1_HELP_FULL, width);
+}
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   // The environment marker in every prompt: cross-environment mistakes (a
@@ -1593,8 +2989,18 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   // agent. Recomputed per prompt, NOT frozen once: `login` can change the
   // attestor mid-session, and a stale label then disagrees with the real
   // backend (the exact confusion this marker exists to prevent).
+  // From here on errors and notices name commands as typed at this prompt.
+  setSurface('shell');
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
-  const hasApiKey = !!configuredInferenceKey(loadConfig().inferenceProvider ?? '0g-compute');
+  // A model key from the environment that names no provider is refused when
+  // it is used; the banner only says so.
+  let modelKey = '(none)';
+  try {
+    if (configuredInferenceKey(loadConfig().inferenceProvider ?? '0g-compute')) modelKey = 'set';
+  } catch {
+    modelKey = '(AGENTDNA_API_KEY is set without AGENTDNA_API_KEY_PROVIDER)';
+  }
+  const hasApiKey = modelKey === 'set';
   const wallet = key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : null;
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
   // Pixel splash (the avatar generator's panda) when the terminal can show
@@ -1602,13 +3008,13 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   if (process.stdout.isTTY && !process.env.NO_COLOR) {
     const art = pandaLines();
     const caption = ['', '', '', '   \x1b[1m0G AgentDNA\x1b[0m', '   interactive shell', '', '', ''];
-    out('\n');
+    say('\n');
     art.forEach((l, i) => term(`  ${l}${caption[i] ?? ''}\n`));
-    out('\n');
+    say('\n');
   } else {
-    out('\n╭──────────────────────────────────────╮\n');
-    out(`│${'   0G AgentDNA — interactive shell'.padEnd(38)}│\n`);
-    out('╰──────────────────────────────────────╯\n\n');
+    say('\n╭──────────────────────────────────────╮\n');
+    say(`│${'   0G AgentDNA — interactive shell'.padEnd(38)}│\n`);
+    say('╰──────────────────────────────────────╯\n\n');
   }
   // Ack read and the update hint both hit the attestor; they start before the
   // first await and share ONE wall-clock ceiling (sequential races cost 8s on
@@ -1616,46 +3022,54 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   // must work for a keyless user too, where no wallet client exists to share
   // one. A hanging (vs refusing) attestor must not stall the banner.
   let ack = '';
-  out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+  // The update hint and the release notice print after the banner block,
+  // not inside it; `out` wraps what the banner prints at the terminal's width.
+  const notices: string[][] = [];
+  say(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
   {
     const started = Date.now();
+    // Each way the read can fail says which: the attestor did not answer,
+    // the chain read failed, or no answer within the banner's 4 s.
     const readAck = key && ctx.env.attestorUrl
-      ? withWallet(ctx)
-          .then((ag) => ag.ackStatus())
-          .then(({ allAcked }) => (allAcked ? 'ok' : 'MISSING — run `ack`'))
-          .catch(() => '(unreachable)')
+      ? withWallet(ctx).then(
+          (ag) => ag.ackStatus().then(
+            ({ allAcked }) => (allAcked ? 'ok' : 'MISSING — run `ack`'),
+            () => '(could not read it from the chain)',
+          ),
+          (e: unknown) => ((e as CliError).code === 'WALLET_REQUIRED' ? '(needs a valid owner key — `login`)' : '(the attestor did not answer)'),
+        )
       : Promise.resolve('');
     // The hint is NOT key-gated: a pre-login user with an attestor configured
     // is exactly who may need the newer CLI.
-    const hintDone = maybePrintUpdateHint(ctx.env.attestorUrl).catch(() => {});
+    const hint = updateHint(ctx.env.attestorUrl).catch(() => null);
     // The release notice (releaseNotice.ts) shares the same 4 s window.
     const noticeAbort = new AbortController();
     const noticeDue = dueReleaseNotice(ctx.env, noticeAbort.signal);
-    ack = await Promise.race([readAck, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
+    ack = await Promise.race([readAck, new Promise<string>((r) => setTimeout(() => r('(no answer within 4 s)'), 4000).unref())]);
     const left = Math.max(0, 4000 - (Date.now() - started));
-    await Promise.race([hintDone, new Promise<void>((r) => setTimeout(r, left).unref())]);
-    updateHintWindowOpen = false; // a losing fetch that resolves later stays silent
+    const hinted = await Promise.race([hint, new Promise<null>((r) => setTimeout(() => r(null), left).unref())]);
+    if (hinted) { notices.push(hinted.lines); hinted.shown(); }
     const noticeLeft = Math.max(0, 4000 - (Date.now() - started));
     const due = await Promise.race([noticeDue, new Promise<null>((r) => setTimeout(() => r(null), noticeLeft).unref())]);
     noticeAbort.abort();
-    if (due) {
-      out(`\n${due.lines.map((l) => `  ${l}`).join('\n')}\n`);
-      due.shown();
-    }
+    if (due) { notices.push(due.lines); due.shown(); }
   }
-  out(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
-  out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
-  if (ack) out(`  ack        ${ack}\n`);
-  out('\n');
-  if (!ctx.env.attestorUrl || !key) {
-    out('  first run? type `login` — one guided setup for the attestor + keys\n\n');
-  } else if (!hasApiKey) {
-    // API key is only needed for deploy/reset — don't re-onboard a
-    // configured user over an optional item (feedback.md F8).
-    out('  `help` commands · `use <id>` chat · (no inference API key — `login` adds one when you deploy)\n\n');
-  } else {
-    out('  `help` commands · `use <id>` chat · Esc interrupts a turn\n\n');
+  say(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
+  say(`  model key  ${modelKey}\n`);
+  if (ack) say(`  ack        ${ack}\n`);
+  say('\n');
+  for (const lines of notices) {
+    for (const l of lines) say(`  ${l}\n`);
+    say('\n');
   }
+  const hello = !ctx.env.attestorUrl || !key
+    ? 'first run? type `login` — one guided setup for the attestor + keys'
+    : !hasApiKey
+      // A model key is only needed for deploy/reset — don't re-onboard a
+      // configured user over an optional item (feedback.md F8).
+      ? '`help` commands · `use <id>` chat · (no model key — `login` adds one when you deploy)'
+      : '`help` commands · `use <id>` chat · Esc interrupts a turn';
+  say(`  ${hello}\n\n`);
   // Prefill the completion id cache in the background: without it, `use
   // <Tab>` is dead until the first list/balance/agent op of the session.
   // Fire-and-forget — a slow attestor costs the completions, never the prompt.
@@ -1665,7 +3079,14 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       prefetchModelIds(ag); // so `model=<Tab>` has the catalog ready
     }).catch(() => { /* completions only */ });
   }
+  // While a command runs the keyboard is set aside (keysAside): a key typed
+  // during a transaction or a wait is neither echoed into the output nor
+  // kept as the start of the next command; a question the command asks
+  // takes keys as usual. Given back before each prompt.
+  let keysBackAtPrompt: (() => void) | null = null;
   for (;;) {
+    keysBackAtPrompt?.();
+    keysBackAtPrompt = null;
     activeCompletions = L1_WORDS;
     activeArgs = L1_ARGS;
     sessionSealId = null;
@@ -1675,9 +3096,11 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     // Quote-aware, so a value with a space in it (`settings 286
     // others='{"a": 1}'`) survives the way it does in a real shell.
     const [cmd, ...args] = line ? tokenize(line) : ['whoami'];
+    setAgentAtHand(cmd === 'cred' || cmd === 'settings' ? args[0] ?? null : null);
+    if (cmd !== 'quit' && cmd !== 'exit') keysBackAtPrompt = keysAside();
     try {
       if (cmd === 'quit' || cmd === 'exit') return;
-      if (cmd === 'help') { out(`${L1_HELP_FULL}\n`); continue; }
+      if (cmd === 'help') { say(`${managerHelp(termWidth())}\n`); continue; }
 
       if (cmd === 'login' || cmd === 'config') {
         // Guided setup. The attestor URL is required; the owner key is
@@ -1686,49 +3109,93 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // `cred set model` and a settings switch, cli/modelkey.ts). Enter
         // keeps a value or skips an unset one; a typed value replaces it.
         // Secrets masked. `login <provider>` asks that provider's key only.
+        // Each answer is checked before it is saved — the URL must be an
+        // attestor that answers, the key a private key — and asked again
+        // until it passes or is skipped. A step left with Ctrl-C or Esc saves
+        // nothing; the steps finished before it stay saved, and the
+        // cancellation says which.
         const only = args[0];
-        if (!only) {
-          for (;;) {
-            const url = (await ask(`attestor URL (required) [${ctx.env.attestorUrl ?? 'unset'}]: `)).trim();
-            if (url) { saveConfig({ attestorUrl: url.replace(/\/$/, '') }); ctx.env.attestorUrl = url.replace(/\/$/, ''); break; }
-            if (ctx.env.attestorUrl) break;
-            out('every command needs the attestor URL\n');
-          }
-          const hasKey = !!(ctx.env.privateKey ?? loadKey());
-          const key = (await askSecret(ask, `owner private key (needed to manage your agents) [${hasKey ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
-          if (key) {
-            // Cache what was SAVED, not what was typed — saveKey normalizes
-            // (0x prefix optional), and a raw un-prefixed value in ctx.env
-            // makes every later command see a "malformed" key until restart.
-            try { saveKey(key); ctx.env.privateKey = normalizeKey(key)!; ctx.env.privateKeySource = 'file'; }
-            catch (e) { out(`private key not saved: ${(e as Error).message}\n`); }
-          }
-        }
-
-        if (ctx.env.attestorUrl) {
-          const client = await buildClient(ctx.env);
-          knownProviders = await client.agent.refreshProviders();
-        } else { knownProviders = listInferenceProviders(); }
-        if (only && !knownProviders.some((provider) => provider.id === only)) throw new CliError('BAD_FLAG', `unknown inference provider: ${only}`);
-        if (!only) out('model keys (optional: creating or resetting an agent asks for the one its provider needs)\n');
-        for (const id of only ? [only] : knownProviders.map((provider) => provider.id)) {
-          const has = !!configuredInferenceKey(id);
-          const api = (await askSecret(ask, `  ${id} key [${has ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
-          if (api) saveApiKey(id, api);
-        }
-        const withKey = knownProviders.map((provider) => provider.id).filter((id) => configuredInferenceKey(id));
+        const saved: string[] = [];
+        let withKey: string[] = [];
         let preferred = loadConfig().inferenceProvider ?? '0g-compute';
-        if (!only) {
-          // New agents default to a provider there is a key for.
-          if (withKey.length > 1) preferred = await pickInferenceProvider(ask, withKey.includes(preferred) ? preferred : withKey[0], withKey);
-          else if (withKey.length === 1) preferred = withKey[0];
-          saveConfig({ inferenceProvider: preferred });
+        try {
+          if (!only) {
+            for (;;) {
+              const url = (await ask(`attestor URL (required) [${ctx.env.attestorUrl ?? 'unset'}]: `)).trim().replace(/\/+$/, '');
+              if (!url) {
+                if (ctx.env.attestorUrl) break;
+                say('  every command needs the attestor URL — type it, e.g. https://agentdna.0g.ai\n');
+                continue;
+              }
+              const problem = await probeAttestor(url);
+              if (problem) {
+                say(`  ${cleanCell(url)}: ${problem} — try again${ctx.env.attestorUrl ? ' (Enter keeps the current one)' : ''}\n`);
+                continue;
+              }
+              saveConfig({ attestorUrl: url });
+              ctx.env.attestorUrl = url;
+              ctx.env.attestorUrlSource = 'file';
+              saved.push('the attestor URL');
+              break;
+            }
+            const hasKey = !!(ctx.env.privateKey ?? loadKey());
+            for (;;) {
+              const typed = (await askSecret(ask, `owner private key (needed to manage your agents) [${hasKey ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
+              if (!typed) break;
+              // Cache what was SAVED, not what was typed — normalizeKey adds
+              // the optional 0x, and a raw un-prefixed value in ctx.env makes
+              // every later command see a "malformed" key until restart.
+              const k = normalizeKey(typed);
+              if (!k) {
+                say('  not a private key (64 hex, 0x optional) — try again, or Enter to skip\n');
+                continue;
+              }
+              saveKey(k);
+              ctx.env.privateKey = k;
+              ctx.env.privateKeySource = 'file';
+              saved.push('the owner key');
+              say(`  wallet ${await addressOf(k)}\n`);
+              break;
+            }
+          }
+
+          knownProviders = listInferenceProviders();
+          if (ctx.env.attestorUrl) {
+            try {
+              const client = await buildClient(ctx.env);
+              knownProviders = await client.agent.refreshProviders();
+            } catch (e) {
+              say(`  (${explainError(e).message} — the providers below are the built-in list)\n`);
+            }
+          }
+          if (only && !knownProviders.some((provider) => provider.id === only)) {
+            throw new CliError('BAD_FLAG', `unknown inference provider: ${only}`, { remedy: `one of: ${knownProviders.map((p) => p.id).join(', ')}` });
+          }
+          if (!only) say('model keys (optional: deploy and reset ask for the one they need)\n');
+          for (const id of only ? [only] : knownProviders.map((provider) => provider.id)) {
+            const has = !!configuredInferenceKey(id);
+            const api = (await askSecret(ask, `  ${id} key [${has ? 'set — Enter keeps' : 'unset — Enter skips'}]: `)).trim();
+            if (api) { saveApiKey(id, api); saved.push(`the ${id} key`); }
+          }
+          withKey = knownProviders.map((provider) => provider.id).filter((id) => configuredInferenceKey(id));
+          if (!only) {
+            // New agents default to a provider there is a key for.
+            if (withKey.length > 1) preferred = await pickInferenceProvider(ask, withKey.includes(preferred) ? preferred : withKey[0], withKey, 'default provider for new agents');
+            else if (withKey.length === 1) preferred = withKey[0];
+            saveConfig({ inferenceProvider: preferred });
+          }
+        } catch (e) {
+          if (isCancelled(e) && saved.length) {
+            say(`cancelled — ${saved.join(', ')} ${saved.length === 1 ? 'was' : 'were'} saved before it; the rest is as it was\n`);
+            continue;
+          }
+          throw e;
         }
-        out(`saved to ${configPaths().dir} (credentials chmod 600)\n`);
-        out(`  attestor    ${ctx.env.attestorUrl ?? '(unset)'}\n`);
-        out(`  owner key   ${ctx.env.privateKey ?? loadKey() ? 'set' : '(none — needed to manage your agents)'}\n`);
-        out(`  model keys  ${withKey.join(', ') || '(none — creating or resetting an agent asks for one)'}\n`);
-        out(`  new agents  ${preferred}\n`);
+        say(`saved to ${configPaths().dir} (credentials chmod 600)\n`);
+        say(`  attestor    ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+        say(`  owner key   ${ctx.env.privateKey ?? loadKey() ? 'set' : '(none — needed to manage your agents)'}\n`);
+        say(`  model keys  ${withKey.join(', ') || '(none — creating or resetting an agent asks for one)'}\n`);
+        say(`  new agents  ${preferred}\n`);
         // Re-seed the startup-time caches that were filled from the OLD
         // attestor or wallet: without this, Tab completion keeps offering the
         // previous environment's (or wallet's — listMyDeployments is
@@ -1761,21 +3228,32 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const runway = burnPerMin > 0n && est.prepaidBalanceWei != null ? Number(est.prepaidBalanceWei / burnPerMin) : null;
         moneyBlock(est.prepaidBalanceWei, eff, effErr);
         if (detail && detail.pendingRefund > 0n) {
-          out(`pending refund  : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
+          say(`pending refund    : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
         }
-        out(`running agents  : ${running}  (× ${og(est.costPerMinWei)}/min each)\n`);
-        out(`burn rate       : ${og(burnPerMin)}/min\n`);
-        out(`runway          : ${runway == null ? (running === 0 ? '∞ (nothing running)' : 'n/a') : `~${runway} min`}\n`);
-        out('add funds with `deposit [amount OG]` · withdraw with `withdraw [amount OG]`\n');
+        say(`running agents    : ${running}  (× ${og(est.costPerMinWei)}/min each)\n`);
+        say(`burn rate         : ${og(burnPerMin)}/min\n`);
+        say(`runway            : ${runway == null ? (running === 0 ? '∞ (nothing running)' : 'n/a') : `~${runway} min`}\n`);
+        say('add funds with `deposit [amount OG]` · withdraw with `withdraw [amount OG]`\n');
         continue;
       }
 
       if (cmd === 'deposit') {
+        if (args.length > 1) { say('usage: deposit [amount OG]\n'); continue; }
+        // The amount is checked before any transaction: a positive number
+        // of OG, within what the wallet holds.
+        if (args[0]) parseOgAmount(args[0]);
         const ag = await withWallet(ctx);
-        const amt = args[0] || (await ask('amount OG [1]: ')).trim() || '1';
-        const tx = await ag.deposit({ amountWei: parseEther(amt) });
+        // A money question has no default: Enter cancels it.
+        const amountWei = args[0] ? parseOgAmount(args[0]) : await askAmount(ask, 'deposit how much OG? [Enter cancels]: ');
+        if (amountWei === null) { say('deposit cancelled\n'); continue; }
+        const native = await ag.nativeBalance().catch(() => null);
+        if (native != null && native <= amountWei) {
+          say(`the wallet holds ${og(native)} — not enough for ${ogAmount(amountWei)} OG plus gas\n`);
+          continue;
+        }
+        const tx = await ag.deposit({ amountWei });
         await ag.waitForTransaction(tx);
-        out(`deposited ${amt} OG to the prepaid sandbox balance (tx ${tx})\n`);
+        say(`deposited ${ogAmount(amountWei)} OG to the prepaid sandbox balance (tx ${tx})\n`);
         continue;
       }
 
@@ -1784,51 +3262,64 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // time-locked pending pot; withdrawRefund claims it after the lock.
         // `withdraw <og>` starts one, bare `withdraw` claims (or reports the
         // lock) — the pending state decides which step the user is on.
+        if (args.length > 1) { say('usage: withdraw [amount OG]\n'); continue; }
+        if (args[0]) parseOgAmount(args[0]);
         const ag = await withWallet(ctx);
         const d = await ag.getBalanceDetail();
         const unlockMs = Number(d.refundUnlockAt) * 1000;
         let pending = d.pendingRefund;
+        let claimed = false;
         // Status first: spendable, the pending pot (one per provider — the
         // contract holds a single pot, not a list) and its lock state.
-        out(`spendable : ${og(d.balance)}\n`);
-        out(`pending   : ${pending > 0n ? `${og(pending)} ${Date.now() >= unlockMs ? '(unlocked — claimable now)' : `(locked until ${new Date(unlockMs).toLocaleString()})`}` : '(none)'}\n`);
+        say(`spendable : ${og(d.balance)}\n`);
+        say(`pending   : ${pending > 0n ? `${og(pending)} ${Date.now() >= unlockMs ? '(unlocked — claimable now)' : `(locked until ${new Date(unlockMs).toLocaleString()})`}` : '(none)'}\n`);
         // Matured funds are offered FIRST: requestRefund re-absorbs the pot
         // and re-locks it, so requesting before claiming would freeze money
         // that was already free.
         if (pending > 0n && Date.now() >= unlockMs) {
-          const yn = (await ask(`claim ${og(pending)} to your wallet now? [Y/n]: `)).trim().toLowerCase();
-          if (!yn || yn === 'y' || yn === 'yes') {
+          // A money question never acts on a bare Enter.
+          const yn = (await ask(`claim ${og(pending)} to your wallet now? [y/N]: `)).trim().toLowerCase();
+          if (yn === 'y' || yn === 'yes') {
             const tx = await ag.withdrawRefund();
             await ag.waitForTransaction(tx);
-            out(`withdrew ${og(pending)} to your wallet (tx ${tx})\n`);
+            say(`withdrew ${og(pending)} to your wallet (tx ${tx})\n`);
             pending = 0n;
+            claimed = true;
           }
         }
         // Then the request. The amount asked is the INCREMENT, drawn from the
         // spendable balance — the contract itself only takes a new total
         // (re-absorbing the pot, restarting the lock), so we submit
         // pending + amount on the user's behalf.
-        const more = pending > 0n ? ` more (joins the pending ${og(pending)}; lock restarts)` : '';
-        const amt = args[0] || (await ask(`withdraw how much${more}? [max ${og(d.balance)}, empty to skip]: `)).trim();
-        if (!amt) continue;
-        const amountWei = parseEther(amt);
-        if (amountWei > d.balance) { out(`only ${og(d.balance)} spendable — cannot withdraw ${amt} OG\n`); continue; }
+        if (!args[0] && pending > 0n) say(`a new request joins the pending ${og(pending)} and restarts its time lock\n`);
+        // The most it can be is the spendable line just above.
+        const amountWei = args[0] ? parseOgAmount(args[0]) : await askAmount(ask, 'withdraw how much OG? [Enter cancels]: ');
+        if (amountWei === null) { say(claimed ? 'no further withdrawal requested\n' : 'withdraw cancelled\n'); continue; }
+        if (amountWei > d.balance) { say(`only ${og(d.balance)} spendable — cannot withdraw ${ogAmount(amountWei)} OG\n`); continue; }
+        // The bare form's question says a request restarts the pending lock;
+        // with the amount given as an argument, ask before restarting it.
+        if (args[0] && pending > 0n) {
+          const yn = (await ask(`${ogAmount(amountWei)} OG joins the pending ${og(pending)}; its lock restarts — proceed? [y/N]: `)).trim().toLowerCase();
+          if (yn !== 'y' && yn !== 'yes') { say('withdraw cancelled — the pending refund and its lock are unchanged\n'); continue; }
+        }
         const tx = await ag.requestRefund({ amountWei: amountWei + pending });
         await ag.waitForTransaction(tx);
         const after = await ag.getBalanceDetail();
-        if (pending > 0n) out(`pending refund: ${og(pending)} → ${og(after.pendingRefund)} (lock restarted)\n`);
-        else out(`${amt} OG moved to pending refund (tx ${tx})\n`);
-        out(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
+        if (pending > 0n) say(`pending refund: ${og(pending)} → ${og(after.pendingRefund)} (lock restarted)\n`);
+        else say(`${ogAmount(amountWei)} OG moved to pending refund (tx ${tx})\n`);
+        say(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
         continue;
       }
 
 
       if (cmd === 'whoami') {
-        out(`attestor: ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+        out(`attestor    ${ctx.env.attestorUrl ?? '(unset — run `login`)'}\n`);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
-        out(`wallet  : ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
-        out(`provider: ${loadConfig().inferenceProvider ?? '0g-compute'} (default for deploy/login)\n`);
-        for (const provider of knownProviders) out(`key ${provider.id}: ${configuredInferenceKey(provider.id) ? 'set' : '(not registered)'}\n`);
+        out(`wallet      ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
+        // The providers this machine has a model key for (login saved them),
+        // the default for new agents first. Never a key's value.
+        const dflt = loadConfig().inferenceProvider ?? '0g-compute';
+        out(`providers   ${configuredProvidersText(dflt, knownProviders.map((p) => p.id), (id) => !!loadApiKey(id))}\n`);
         if (key && ctx.env.attestorUrl) {
           // The three status reads are independent — fetch them in parallel
           // (they were serial: 2.9s measured; parallel is bounded by the
@@ -1841,9 +3332,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           ]);
           if (ackRes.ok) {
             const { allAcked, missing } = ackRes.r;
-            out(`ack     : ${allAcked ? 'ok (trust root acknowledged)' : `missing ${missing.join(', ')} — run \`ack\``}\n`);
+            out(`trust root  ${allAcked ? 'acknowledged' : `missing ${missing.join(', ')} — run \`ack\``}\n`);
           } else {
-            out(`ack     : (unreadable: ${ackRes.e.message})\n`);
+            out(`trust root  (could not be read: ${cleanCell(explainError(ackRes.e).message)})\n`);
           }
           try {
             if (!dRes.ok) throw dRes.e;
@@ -1851,12 +3342,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
             const effNote = eff && eff.availableWei < eff.balanceWei
               ? ` — AVAILABLE ${og(eff.availableWei)} (${og(eff.outstandingDebtWei + eff.pendingSettlementWei + eff.reservedWei)} owed/queued off-chain)`
               : '';
-            out(`balance : ${og(d.balance)} prepaid${d.pendingRefund > 0n ? ` (+${og(d.pendingRefund)} pending refund)` : ''}${effNote}\n`);
+            out(`balance     ${og(d.balance)} prepaid${d.pendingRefund > 0n ? ` (+${og(d.pendingRefund)} pending refund)` : ''}${effNote}\n`);
           } catch { /* serving not configured — skip the line */ }
         } else {
           // Degrade like the other lines instead of silently omitting the
           // fourth one (feedback.md F7).
-          out(`ack     : ${key ? '(needs an attestor URL — run `login`)' : '(needs a wallet — run `login`)'}\n`);
+          out(`trust root  ${key ? '(needs an attestor URL — run `login`)' : '(needs a wallet — run `login`)'}\n`);
         }
         continue;
       }
@@ -1867,11 +3358,11 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // a redeploy) — this is the explicit re-ack.
         const ag = await withWallet(ctx);
         const { allAcked, missing } = await ag.ackStatus();
-        if (allAcked) { out('trust root already acknowledged — nothing to do\n'); continue; }
-        out(`acknowledging: ${missing.join(', ')}\n`);
+        if (allAcked) { say('trust root already acknowledged — nothing to do\n'); continue; }
+        say(`acknowledging: ${missing.join(', ')}\n`);
         const tx = await ag.ack();
-        if (tx) { out(`ack() → ${tx} (waiting…)\n`); await ag.waitForTransaction(tx); }
-        out('acknowledged\n');
+        if (tx) { say(`acknowledging the trust root (tx ${tx}, waiting…)\n`); await ag.waitForTransaction(tx); }
+        say('acknowledged\n');
         continue;
       }
 
@@ -1879,18 +3370,27 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Public listing — no wallet needed. Minted rows carry owner (chain-
         // public via ownerOf); "mine" marks still come from the owner-signed
         // listing so unminted rows attribute correctly too.
+        const extra = args.filter((a) => a !== '--mine' && a !== 'mine');
+        if (extra.length) {
+          say(/^(?:\d+|0x[0-9a-fA-F]{8,64})$/.test(extra[0])
+            ? `usage: list [--mine] — one agent's details: status ${cleanCell(extra[0])}\n`
+            : 'usage: list [--mine]\n');
+          continue;
+        }
         let key = ctx.env.privateKey ?? loadKey() ?? undefined;
         let ag: AgenticID;
         try {
           ag = key ? await withWallet(ctx) : await clientFor(ctx, false);
         } catch (e) {
-          // Malformed key must not block a PUBLIC listing — warn, go walletless.
-          out(`warning: ${(e as CliError).message} — listing without ownership marks\n`);
+          // A malformed key must not block a PUBLIC listing — warn, go
+          // walletless. Anything else (no attestor, no answer) is the error.
+          if ((e as CliError).code !== 'WALLET_REQUIRED') throw e;
+          say(`warning: ${(e as CliError).message} — listing without ownership marks\n`);
           key = undefined;
           ag = await clientFor(ctx, false);
         }
         const mineOnly = args.includes('--mine') || args.includes('mine');
-        if (mineOnly && !key) { out('list --mine needs a wallet — run `login` first\n'); continue; }
+        if (mineOnly && !key) { say('list --mine needs a wallet — run `login` first\n'); continue; }
         // The two listings are independent — fetch them in parallel. The
         // owner-signed rows carry `owner` for UNMINTED rows too (the public
         // tier shows it only once minted); keyed by sealId for the table.
@@ -1904,46 +3404,58 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // A failed owner listing must not read as an empty wallet (F2): with
         // --mine it aborts with the reason; without, fall back unmarked.
         if (key && !mine) {
-          if (mineOnly) { out('could not fetch your owner-signed listing — try again or check the attestor\n'); continue; }
-          out('warning: owner listing unavailable — showing unmarked rows\n');
+          if (mineOnly) { say('could not fetch your owner-signed listing — try again or check the attestor\n'); continue; }
+          say('warning: owner listing unavailable — showing unmarked rows\n');
         }
         const shown = mineOnly ? rows.filter((r) => mine?.has(r.sealId)) : rows;
         if (!shown.length) { out(mineOnly ? 'no agents owned by this wallet here\n' : 'no agents on this attestor\n'); continue; }
         // From the full public listing, as in `list`: a --mine view must not
         // strip the annotation off a child whose parent it hides.
         const sealToAgent = sealToAgentMap(rows);
-        out(renderListHeader());
-        for (const r of shown) {
+        // The owner tier carries owner and agentSeal for UNMINTED rows too.
+        const merged = shown.map((r) => {
           const own = mine?.get(r.sealId);
-          // The owner tier carries owner and agentSeal for UNMINTED rows too.
-          out(renderListRow({ ...r, agentSeal: own?.agentSeal ?? r.agentSeal }, own?.owner ?? r.owner, own ? '*' : ' ', sealToAgent));
-        }
-        if (mine && !mineOnly) out('(* = owned by your wallet · `list --mine` filters to them)\n');
-        if (shown.some((r) => r.agentId == null)) out("('?' rows have no agentId yet — reference them by sealId prefix, e.g. retry 0x" + shown.find((r) => r.agentId == null)!.sealId.slice(2, 12) + ')\n');
+          return { row: { ...r, agentSeal: own?.agentSeal ?? r.agentSeal }, owner: own?.owner ?? r.owner, mark: own ? '*' : ' ' };
+        });
+        const layout = listLayout(termWidth(), 2, ownerColumnWidth(merged.map((m) => m.owner), sealToAgent));
+        out(renderListHeader(layout));
+        for (const m of merged) out(renderListRow(m.row, m.owner, m.mark, sealToAgent, layout));
+        if (mine && !mineOnly) say('(* = owned by your wallet · `list --mine` filters to them)\n');
         continue;
       }
 
       if (cmd === 'stop' || cmd === 'start' || cmd === 'reset') {
         // Manager-level lifecycle: act and stay at L1 (enter with `use` to chat).
-        if (!args[0]) { out(`usage: ${cmd} <agentId|sealId>\n`); continue; }
+        if (!args[0]) { say(`usage: ${cmd} <agentId|sealId>\n`); continue; }
         const ag = await withWallet(ctx);
         const attestorUrl = requireAttestorUrl(ctx.env);
         const row = await myRow(ag, args[0]);
+        // Still deploying (minted or not): the deploy brings it up itself;
+        // start/reset would act on a container that is not there yet.
+        if (row.phase === 'deploying' && cmd !== 'stop') {
+          say(`agent ${row.agentId} is still deploying — \`list\` shows when it is up\n`);
+          continue;
+        }
+        // No agentId: its deploy failed before the mint — retry resumes it.
+        if (!row.minted && cmd !== 'stop') {
+          say(`agent ${row.agentId} has no agentId — its deploy stopped before the mint; resume it with: retry ${row.agentId}\n`);
+          continue;
+        }
         if (cmd === 'stop') {
-          if (row.phase !== 'running' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — nothing to stop\n`); continue; }
+          if (row.phase !== 'running' || !row.sandboxId) { say(`agent ${row.agentId} is ${row.phase} — nothing to stop\n`); continue; }
           await ag.agent.stop(row.sealId, row.sandboxId);
-          out(`agent ${row.agentId} stopped\n`);
+          say(`agent ${row.agentId} stopped\n`);
           continue;
         }
         if (cmd === 'start') {
-          if (row.phase === 'running') { out(`agent ${row.agentId} is already running\n`); continue; }
-          if (row.phase !== 'stopped' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
-          if (!(await ensureOwnerReady(ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
-          out(`starting agent ${row.agentId}… (Esc cancels the wait)\n`);
+          if (row.phase === 'running') { say(`agent ${row.agentId} is already running\n`); continue; }
+          if (row.phase !== 'stopped' || !row.sandboxId) { say(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
+          if (!(await ensureOwnerReady(ag, ask))) { say('start cancelled — prepaid balance too low\n'); continue; }
+          say(`starting agent ${row.agentId}…\n`);
           const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
           await ag.agent.start(row.sealId, row.sandboxId);
           const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
-          if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
+          if (r) out(`running — enter with: use ${row.agentId}\n`);
           continue;
         }
         // reset — the row remembers its framework; ask only when unknown
@@ -1952,7 +3464,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         let framework: string;
         if (row.framework && !forcePick) {
           framework = row.framework;
-          out(`framework: ${framework} (recorded — \`reset ${args[0]} pick\` to change)\n`);
+          say(`framework: ${framework} (recorded — \`reset ${args[0]} pick\` to change)\n`);
         } else {
           framework = await pickFramework(attestorUrl, ask, row.framework ?? undefined);
         }
@@ -1960,15 +3472,15 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const provider = plan.provider;
         await ag.agent.assertProviderSupported(provider, { sealId: row.sealId, framework });
         const key = await resetModelKey(ag.credentials, row.sealId, provider, framework, keyPrompt(ask));
-        if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
+        if (!(await ensureOwnerReady(ag, ask))) { say('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(ag, row.sealId, plan, out);
-        out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
+        say(`resetting agent ${row.agentId} as ${framework}…\n`);
         const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
-        await ag.agent.reset(row.sealId, { provider, framework, ...key, onWarn: (w) => out(`⚠ ${w}\n`) });
+        await ag.agent.reset(row.sealId, { provider, framework, ...key, onWarn: (w) => say(`⚠ ${w}\n`) });
         const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
         if (r) {
           await ag.credentials.resyncModelKey(row.sealId, { agentUrl: r.url }).catch(() => undefined);
-          out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
+          out(`running — enter with: use ${row.agentId}\n`);
         }
         continue;
       }
@@ -1979,19 +3491,22 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // setAgentURI). Never redeploy a failed row: that would orphan the
         // identity. Container work isn't retried here — once minted, use
         // `reset <id>` to bring the agent up.
-        if (!args[0]) { out('usage: retry <agentId|sealId>\n'); continue; }
+        if (!args[0]) { say('usage: retry <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
-        if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
-        if (row.phase !== 'failed') { out(`agent ${row.agentId ?? row.sealId} is ${row.phase} — retry only applies to failed rows\n`); continue; }
-        out(`retrying seal ${row.sealId} — re-running the failed stages… (Esc-proof; may take a minute)\n`);
+        if (!row) throw agentNotFound(args[0]);
+        const label = row.agentId != null ? String(row.agentId) : sealPrefixOf(row.sealId);
+        if (row.phase !== 'failed') { say(`agent ${label} is ${row.phase} — retry only applies to a deploy that failed\n`); continue; }
+        say(`retrying agent ${label}: running its failed steps again (Esc does not stop this; it can take a minute)…\n`);
         await ag.agent.retry(row.sealId);
         try {
           const agentId = await ag.agent.waitForMint(row.sealId);
-          out(`recovered: agent ${agentId} minted under the same seal\n`);
-          out(`it lands offline — bring it up with: reset ${agentId}\n`);
+          say(`recovered: agent ${agentId} minted under the same identity\n`);
+          say(`it lands offline — bring it up with: reset ${agentId}\n`);
         } catch (e) {
-          out(`still failing: ${(e as Error).message}\n`);
+          const p = explainError(e);
+          say(`error: still failing — ${p.message.replace(/^the deploy stopped before the mint: /, '')}\n`);
+          say(`  → once the cause is fixed, \`retry ${label}\` again; \`status ${label}\` shows it in full\n`);
         }
         continue;
       }
@@ -1999,22 +3514,22 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'settings') {
         // The document is the owner's in both directions — reading it is
         // owner-signed too — so the wallet is needed even for a bare show.
-        if (!args[0]) { out('usage: settings <agentId|sealId> [model=… thinking=low|high|max provider=… others=<json>]\n'); continue; }
+        if (!args[0]) { out('usage: settings <agentId|sealId> [model=… thinking=low|high|max provider=… others=<json> | versions]\n'); continue; }
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
-        if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
-        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework, ask);
+        if (!row) throw agentNotFound(args[0]);
+        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined, row.framework, ask, `settings ${args[0]} versions`);
         continue;
       }
 
       if (cmd === 'cred') {
         // The owner's credentials for an agent (cli/credentials.ts); every
         // subcommand is owner-signed.
-        if (!args[0]) { out('usage: cred <agentId|sealId> [ls|set|rm|connect|disconnect|reveal|pending|approve|deny|log] · cred pending · cred notify [email|off] · cred presets — `help` has the keys\n'); continue; }
+        if (!args[0]) { say('usage: cred <agentId|sealId> [ls|set|rm|connect|disconnect|reveal|pending|approve|deny|log] · cred pending · cred notify [email|off] · cred presets — `help` has the keys\n'); continue; }
         const ag = await withWallet(ctx);
         if (await credOwnerOp(ag, args, credIO(ask))) continue;
         const row = await findAgentRow(ag, args[0]);
-        if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
+        if (!row) throw agentNotFound(args[0]);
         await credInShell(irq, args.slice(1), (io) => credOp(ag, row.sealId, args.slice(1), { ...credIO(ask), ...io }, row.phase === 'running' && row.url ? row.url : undefined));
         continue;
       }
@@ -2022,7 +3537,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'authorizer') {
         // Extra args are ambiguous (`authorizer <id> <addr> off` — set or
         // clear?) — refuse rather than silently act on a guess.
-        if (!args[0] || args.length > 2) { out('usage: authorizer <agentId|sealId> [address|off]\n'); continue; }
+        if (!args[0] || args.length > 2) { say('usage: authorizer <agentId|sealId> [address|off]\n'); continue; }
         if (!args[1]) {
           // Read-only: anyone can inspect any agent's fork policy.
           const ag = await clientFor(ctx, false);
@@ -2041,13 +3556,13 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           // publishers don't hand-copy addresses out of DEPLOYMENT.md.
           const cfg = await (await fetch(`${requireAttestorUrl(ctx.env)}/config`)).json() as { standard_clone_authorizer_addr?: string };
           if (!cfg.standard_clone_authorizer_addr) {
-            out('this attestor does not advertise a standard clone policy (standard_clone_authorizer_addr missing from /config) — pass the policy address explicitly\n');
+            say('this attestor does not advertise a standard clone policy (standard_clone_authorizer_addr missing from /config) — pass the policy address explicitly\n');
             continue;
           }
           target = cfg.standard_clone_authorizer_addr;
-          out(`standard policy: ${target}\n`);
+          say(`standard policy: ${target}\n`);
         }
-        if (target !== ZERO_ADDR && !isAddress(target)) { out('authorizer must be an address, `standard`, or `off`\n'); continue; }
+        if (target !== ZERO_ADDR && !isAddress(target)) { say(`${addressProblem(target, 'the policy')} — or \`standard\`, or \`off\`\n`); continue; }
         const tx = await ag.agent.setCloneAuthorizer(id, target as Address);
         await ag.agent.waitForTransaction(tx);
         out(target === ZERO_ADDR
@@ -2058,10 +3573,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
 
       if (cmd === 'grant' || cmd === 'revoke') {
         if (!args[0] || !args[1]) {
-          out(`usage: ${cmd} <agentId|sealId> <buyer>\n`);
+          say(`usage: ${cmd} <agentId|sealId> <buyer>\n`);
           continue;
         }
-        if (!isAddress(args[1])) { out('buyer must be a 0x address\n'); continue; }
+        if (!isAddress(args[1])) { say(`${addressProblem(args[1], 'the buyer')}\n`); continue; }
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
         const tx = cmd === 'grant'
@@ -2075,22 +3590,24 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       if (cmd === 'transfer') {
-        if (!args[0] || !args[1]) { out('usage: transfer <agentId|sealId> <to>\n'); continue; }
-        if (!isAddress(args[1])) { out('to must be a 0x address\n'); continue; }
+        if (!args[0] || !args[1]) { say('usage: transfer <agentId|sealId> <to>\n'); continue; }
+        if (!isAddress(args[1])) { say(`${addressProblem(args[1], 'the new owner')}\n`); continue; }
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
         const from = await ag.agent.ownerOf(id);
-        const yn = (await ask(`transfer agent ${id} to ${args[1]} — IRREVERSIBLE. proceed? [y/N]: `)).trim().toLowerCase();
-        if (yn !== 'y' && yn !== 'yes') { out('transfer cancelled\n'); continue; }
+        // The address on its own line: with it, the question is wider than 80 columns.
+        say(`transfer agent ${id} to\n  ${args[1]}\n`);
+        const yn = (await ask('IRREVERSIBLE — proceed? [y/N]: ')).trim().toLowerCase();
+        if (yn !== 'y' && yn !== 'yes') { say('transfer cancelled\n'); continue; }
         const tx = await ag.agent.transferFrom(from, args[1] as Address, id);
         await ag.agent.waitForTransaction(tx);
-        out(`agent ${id} transferred to ${args[1]}\n`);
-        out('the new owner acks + resets to take over the runtime; any fork policy you set is now dormant\n');
+        say(`agent ${id} transferred to ${args[1]}\n`);
+        say('the new owner acks + resets to take over the runtime; any fork policy you set is now dormant\n');
         continue;
       }
 
       if (cmd === 'clone') {
-        if (!args[0]) { out('usage: clone <agentId|sealId> [to]\n'); continue; }
+        if (!args[0]) { say('usage: clone <agentId|sealId> [to]\n'); continue; }
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
         const key = ctx.env.privateKey ?? loadKey();
@@ -2102,35 +3619,35 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         let params: Parameters<typeof ag.agent.clone>[0];
         if (sourceOwner.toLowerCase() === me.toLowerCase()) {
           const to = args[1] ?? me;
-          if (!isAddress(to)) { out('to must be a 0x address\n'); continue; }
+          if (!isAddress(to)) { say(`${addressProblem(to, 'the new owner')}\n`); continue; }
           params = { sourceAgentId: id, targetOwner: to as Address };
         } else {
-          if (args[1]) { out('policy clones always mint to YOUR wallet — drop the <to> argument\n'); continue; }
+          if (args[1]) { say('policy clones always mint to YOUR wallet — drop the <to> argument\n'); continue; }
           params = { sourceAgentId: id, targetOwner: me, authorization: { authData: '0x' } };
         }
-        if (!(await ensureOwnerReady(ag, ask))) { out('clone cancelled — prepaid balance too low\n'); continue; }
-        out(`cloning agent ${id}… (TEE re-seal + on-chain mint, may take a minute)\n`);
+        if (!(await ensureOwnerReady(ag, ask))) { say('clone cancelled — prepaid balance too low\n'); continue; }
+        say(`cloning agent ${id}… (TEE re-seal + on-chain mint, may take a minute)\n`);
         const r = await ag.agent.clone(params, { wait: 'minted' });
-        out(`cloned: new agent ${r.agentId} → ${params.targetOwner}\n`);
-        out(`it lands offline — its owner brings it up with: reset ${r.agentId}\n`);
+        say(`cloned: new agent ${r.agentId} → ${params.targetOwner}\n`);
+        say(`it lands offline — its owner brings it up with: reset ${r.agentId}\n`);
         continue;
       }
 
       if (cmd === 'hello') {
         // Public inspection of ANY agent (yours or not) — no wallet needed.
-        if (!args[0]) { out('usage: hello <agentId|sealId>\n'); continue; }
+        if (!args[0] || args.length > 2 || (args[1] !== undefined && args[1] !== 'full')) { out('usage: hello <agentId|sealId> [full]\n'); continue; }
         const ag = await clientFor(ctx, false);
         const ref = parseAgentRef(args[0]);
         const rows = await ag.agent.listDeployments();
         rememberAgentIds(rows);
         const row = pickRow(ref, args[0], rows);
-        if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
-        if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
+        if (!row) throw agentNotFound(args[0]);
+        if (row.phase !== 'running' || !row.url) { say(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
         // With a wallet configured, declare it as the proof's redeemer so this
         // visit banks a rating ticket (see `rate`). Still no signing involved.
         const helloKey = ctx.env.privateKey ?? loadKey() ?? undefined;
         const helloAddr = helloKey ? ((await addressOf(helloKey)) as `0x${string}`) : undefined;
-        await showHello(ag, row.url, helloAddr);
+        await showHello(ag, row.url, { full: args[1] === 'full', more: `hello ${args[0]} full` }, helloAddr);
         continue;
       }
 
@@ -2138,24 +3655,24 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Use an agent's public service as a client — the experience that
         // earns the right to rate. The response banks a rating ticket bound
         // to your wallet; `call <id>` alone lists the services.
-        if (!args[0]) { out('usage: call <agentId|sealId> [</path> [json-body]]\n'); continue; }
+        if (!args[0]) { say('usage: call <agentId|sealId> [</path> [json-body]]\n'); continue; }
         const ag = await withWallet(ctx);
         const my = (await addressOf(ctx.env.privateKey!)) as `0x${string}`;
         const row = await findAgentRow(ag, args[0]);
-        if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
-        if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
+        if (!row) throw agentNotFound(args[0]);
+        if (row.phase !== 'running' || !row.url) { say(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
         // Service table for method resolution (no client address — this lookup
         // is not the interaction being rated, so it must not bank a ticket).
         const services = await servicesOf(row.url);
         if (!args[1]) {
-          if (!services.length) { out('this agent registers no public services (only /hello)\n'); continue; }
-          out('services:\n');
-          for (const sv of services) out(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.transport === 'mcp' ? '[mcp] ' : ''}${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
-          out(`call one with: call ${args[0]} <path> [json-body]${services.some((sv) => sv.transport === 'mcp') ? '\n[mcp] entries speak MCP (JSON-RPC over POST) — mount the path in an MCP client; a plain call posts raw JSON' : ''}\n`);
+          if (!services.length) { say('this agent registers no public services (only /hello)\n'); continue; }
+          say('services:\n');
+          for (const sv of services) say(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.transport === 'mcp' ? '[mcp] ' : ''}${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
+          say(`call one with: call ${args[0]} <path> [json-body]${services.some((sv) => sv.transport === 'mcp') ? '\n[mcp] entries speak MCP (JSON-RPC over POST) — mount the path in an MCP client; a plain call posts raw JSON' : ''}\n`);
           continue;
         }
         const path = args[1];
-        if (!path.startsWith('/')) { out('path must start with /\n'); continue; }
+        if (!path.startsWith('/')) { say('path must start with /\n'); continue; }
         // The body is free-form — take it VERBATIM from the line. Running it
         // through the shell-style splitter and re-joining the pieces eats the
         // quote characters a JSON body is made of (`{"a":1}` → `{a:1}`, POSTed
@@ -2164,19 +3681,19 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const body = splitHead(line, 3).rest || undefined;
         const registered = services.find((sv) => sv.path === path);
         const method = registered?.method ?? (body ? 'POST' : 'GET');
-        if (!registered && path !== '/hello') out(`note: ${path} is not in the agent's service table — calling anyway\n`);
+        if (!registered && path !== '/hello') say(`note: ${path} is not in the agent's service table — calling anyway\n`);
 
         const started = Date.now();
         const t = await callAgentWithTicket(ag, row.url, path, method, body, my);
-        out(`${method} ${path} → ${t.res.status} (${((Date.now() - started) / 1000).toFixed(1)}s)\n`);
+        say(`${method} ${path} → ${t.res.status} (${((Date.now() - started) / 1000).toFixed(1)}s)\n`);
         // Display only — hashing above used the full raw bytes.
         let pretty = t.bodyText;
         try { pretty = JSON.stringify(JSON.parse(t.bodyText), null, 2); } catch { /* not JSON */ }
         out(pretty.length > 4096 ? `${pretty.slice(0, 4096)}\n… (${pretty.length} chars total)\n` : `${pretty}\n`);
-        if (t.banked) out(`ticket  : banked (${method} ${path}) — spend with \`rate ${row.agentId}\` within ~60 min\n`);
+        if (t.banked) say(`ticket  : banked (${method} ${path}) — spend with \`rate ${row.agentId}\` within ~60 min\n`);
         else if (t.proof) out('ticket  : NOT banked — the signed taskHash does not match the transcript as sent from here ' +
                               '(something between here and the agent re-encoded the request URI or a body)\n');
-        else out('ticket  : NOT banked — no serve-proof on the response\n');
+        else say('ticket  : NOT banked — no serve-proof on the response\n');
         continue;
       }
 
@@ -2186,16 +3703,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // canonical 8004 feedback + the TEE verification mark — atomically
         // (EIP-7702) when the environment has a feedbackBatcher. No ticket,
         // no rating: experiencing the agent is what earns the right to rate.
-        if (!args[0]) { out('usage: rate <agentId|sealId> [score] [</endpoint>]\n'); continue; }
+        if (!args[0]) { say('usage: rate <agentId|sealId> [score] [</endpoint>]\n'); continue; }
         const ag = await withWallet(ctx);
         const my = (await addressOf(ctx.env.privateKey!)) as `0x${string}`;
         const row = await findAgentRow(ag, args[0]);
-        if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
-        if (row.agentId == null) { out(`agent ${args[0]} is not minted yet — nothing to rate\n`); continue; }
+        if (!row) throw agentNotFound(args[0]);
+        if (row.agentId == null) { say(`agent ${args[0]} is not minted yet — nothing to rate\n`); continue; }
         const agentId = BigInt(row.agentId);
         // The chain would reject this at the attest step (self-feedback); say it upfront.
         const agentOwner = await ag.agent.ownerOf(agentId);
-        if (agentOwner.toLowerCase() === my.toLowerCase()) { out(`agent ${row.agentId} is yours — owners cannot rate their own agent\n`); continue; }
+        if (agentOwner.toLowerCase() === my.toLowerCase()) { say(`agent ${row.agentId} is yours — owners cannot rate their own agent\n`); continue; }
 
         // `rate <id> [score] [endpoint]` — either trailing arg order works.
         let rawScore = '';
@@ -2217,18 +3734,18 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (tickets.length === 1) {
           ticket = tickets[0];
         } else {
-          out(`you hold ${tickets.length} tickets for agent ${row.agentId}:\n`);
+          say(`you hold ${tickets.length} tickets for agent ${row.agentId}:\n`);
           tickets.forEach((e, i) => {
             const at = new Date(e.capturedAt * 1000).toLocaleTimeString();
             const exp = new Date(e.deadline * 1000).toLocaleTimeString();
-            out(`  ${i + 1}. ${e.task.method.padEnd(4)} ${e.task.uri.padEnd(24)} ${at}  (expires ${exp})\n`);
+            say(`  ${i + 1}. ${e.task.method.padEnd(4)} ${e.task.uri.padEnd(24)} ${at}  (expires ${exp})\n`);
           });
           const pick = (await ask('which interaction are you rating? [1]: ')).trim() || '1';
           const n = Number(pick);
-          if (!Number.isInteger(n) || n < 1 || n > tickets.length) { out('invalid choice\n'); continue; }
+          if (!Number.isInteger(n) || n < 1 || n > tickets.length) { say('invalid choice\n'); continue; }
           ticket = tickets[n - 1];
         }
-        out(`rating the ${ticket.task.method} ${ticket.task.uri} interaction from ${new Date(ticket.capturedAt * 1000).toLocaleTimeString()}\n`);
+        say(`rating the ${ticket.task.method} ${ticket.task.uri} interaction from ${new Date(ticket.capturedAt * 1000).toLocaleTimeString()}\n`);
         const proof = toServeProof(ticket);
 
         // Free pre-check before spending gas, on the fields the registry
@@ -2239,7 +3756,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           // failure is this side's registry configuration (ticketDisposition).
           if (ticketDisposition(v) === 'burn') {
             removeProof(ticket.proof.signature);
-            out(`serve-proof failed verification (${v.reasons.join(', ')}) — ticket discarded\n`);
+            say(`serve-proof failed verification (${v.reasons.join(', ')}) — ticket discarded\n`);
           } else {
             out(`serve-proof not verifiable in this environment (${v.reasons.join(', ')}) — ticket kept\n` +
                 `  → check the attestor's verified_feedback_addr / AGENTIC_VERIFIED_FEEDBACK_ADDR\n`);
@@ -2258,70 +3775,60 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         }
 
         if (!rawScore) rawScore = (await ask('score [1-5]: ')).trim();
-        if (!/^-?\d+$/.test(rawScore)) { out('score must be an integer\n'); continue; }
-        out('submitting: canonical 8004 feedback + TEE attestation…\n');
+        if (!/^-?\d+$/.test(rawScore)) { say('score must be an integer\n'); continue; }
+        say('submitting: canonical 8004 feedback + TEE attestation…\n');
         const fb = await ag.reputation.giveFeedback({
           agentId, value: BigInt(rawScore), serveProof: proof, endpoint: ticket.endpoint, task: ticket.task,
         });
         await ag.reputation.waitForTransaction(fb.attestTx);
         removeProof(ticket.proof.signature);
         const atomic = fb.feedbackTx === fb.attestTx;
-        out(`rated agent ${row.agentId}: ${rawScore} — canonical index ${fb.feedbackIndex}, TEE-verified (endpoint ${ticket.task.uri})${atomic ? ', atomic' : ''} (tx ${fb.attestTx})\n`);
+        say(`rated agent ${row.agentId}: ${rawScore} — canonical index ${fb.feedbackIndex}, TEE-verified (endpoint ${ticket.task.uri})${atomic ? ', atomic' : ''} (tx ${fb.attestTx})\n`);
+        continue;
+      }
+
+      if (cmd === 'doctor' || cmd === 'status' || cmd === 'providers' || cmd === 'releases') {
+        // The one-shot commands, run here as from the OS shell. doctor ends
+        // with its own summary line, so its closing error is not repeated.
+        const runCommand = { doctor: doctorCommand, status: statusCommand, providers: providersCommand, releases: releasesCommand }[cmd];
+        try {
+          await runCommand({ env: ctx.env, json: false, positionals: args, flags: { mine: false } });
+        } catch (e) {
+          if (cmd === 'doctor' && e instanceof CliError && e.details) continue;
+          throw e;
+        }
         continue;
       }
 
       if (cmd === 'use' || cmd === 'link') {
-        if (!args[0]) { out('usage: use <agentId|sealId>\n'); continue; }
+        if (!args[0]) { say('usage: use <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
         const s = await attach(ag, requireAttestorUrl(ctx.env), args[0], ask);
-        await sessionRepl(s, ask, irq, ctx);
+        await keysBack(() => enterSession(s, ask, irq, ctx)); // the session's keys are its own
         continue;
       }
 
       if (cmd === 'deploy') {
         const ag = await withWallet(ctx);
         const s = await deployWizard(ag, requireAttestorUrl(ctx.env), ask, ctx, irq);
-        if (!s) { out('wait cancelled — the deploy continues in the background; watch it with `list`, enter later with `use <id>`\n'); continue; }
-        await sessionRepl(s, ask, irq, ctx);
+        if (!s) continue; // mint only, or the wait was stopped: the wizard said which
+        await keysBack(() => enterSession(s, ask, irq, ctx));
         continue;
       }
 
-      out(`unknown command: ${cmd}\n${L1_HELP}\n`);
+      const near = didYouMean(cmd, L1_WORDS.map((w) => w.trim()));
+      say(`unknown command: ${cleanCell(cmd)}${near ? ` — did you mean \`${near}\`?` : ''}\n${fitItems(L1_HELP, termWidth() ?? 80)}\n`);
     } catch (e) {
-      // Keep the REPL alive on operational errors; show the remedy if present.
-      const ce = e as CliError;
-      if (isCancelled(e)) out('cancelled\n');
-      else out(`error: ${friendlyChainError(e) ?? ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`);
+      // Keep the REPL alive on operational errors: one or two plain lines
+      // and the remedy, never a raw HTTP body or a viem dump (plain.ts).
+      // stdin closed (Ctrl-D, the end of piped input) ends the shell.
+      if ((e as { code?: string }).code === 'ERR_USE_AFTER_CLOSE') throw e;
+      if (isCancelled(e)) say('cancelled\n');
+      else {
+        const p = explainError(e);
+        say(`error: ${p.message}${p.remedy ? `\n  → ${p.remedy}` : ''}\n`);
+      }
     }
-  }
-}
-
-/**
- * Translate the custom contract errors our commands can hit into one human
- * sentence, instead of viem's raw revert dump (signature + arg tuple + call
- * frame). Returns undefined for anything unrecognized — caller falls back to
- * the error's own message.
- */
-function friendlyChainError(e: unknown): string | undefined {
-  const revert = (e as { walk?: (fn: (x: unknown) => boolean) => unknown }).walk?.(
-    (x) => x instanceof ContractFunctionRevertedError,
-  ) as ContractFunctionRevertedError | undefined;
-  const d = revert?.data;
-  if (!d?.errorName) return undefined;
-  const a = (d.args ?? []) as readonly unknown[];
-  switch (d.errorName) {
-    case 'CloneGateNotTokenOwner':
-      return `agent ${a[1]} is not yours — its owner is ${a[2]} (you signed as ${a[0]})`;
-    case 'StdCloneAuthNotSeller':
-      return `only agent ${a[1]}'s owner (${a[2]}) can manage its fork grants — you signed as ${a[0]}`;
-    case 'CloneGateDenied':
-      return a[1] === ZERO_ADDR
-        ? `agent ${a[0]} has no fork policy configured — its owner opens sales with: authorizer ${a[0]} <policy>`
-        : `agent ${a[0]}'s fork policy (${a[1]}) declined — ask the seller to: grant ${a[0]} <your wallet>`;
-    case 'CloneGateNotTrustedAttestor':
-      return 'cloneFrom may only be submitted by a trusted attestor — use the attestor /clone flow, not a direct tx';
-    default:
-      return `${d.errorName}(${a.map(String).join(', ')})`;
   }
 }
 
@@ -2344,20 +3851,66 @@ let cachedClient: { key: string; ag: AgenticID } | null = null;
  * Returns the document now in force (unchanged on a bare show), so a caller
  * like /think can report the level that actually landed.
  */
-async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null, ask?: (q: string) => Promise<string>): Promise<SettingsDoc | null> {
-  const assignments = parseAssignments(args); // throws CliError on a bad key/level
+/**
+ * A spinner line while something slow runs, on a terminal: `⠹ applying the
+ * settings… (6s)`, from 0.4 s on. The returned function clears it; `clear`
+ * on it takes it off for a line printed meanwhile (the next tick draws it
+ * again under that line).
+ */
+function progressLine(label: string): { stop(): void; clear(): void } {
+  if (!process.stdout.isTTY) return { stop() {}, clear() {} };
+  const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+  const t0 = Date.now();
+  let spin = 0;
+  let shown = false;
+  let timer: NodeJS.Timeout | null = null;
+  // Under the Ink view: its status row.
+  const clear = (): void => {
+    if (!shown) return;
+    if (activeInk) activeInk.status(null);
+    else term('\r\x1b[2K');
+    shown = false;
+  };
+  const paint = (): void => {
+    spin = (spin + 1) % SPIN.length;
+    const line = cleanCell(`${SPIN[spin]} ${label}… (${Math.floor((Date.now() - t0) / 1000)}s)`);
+    if (activeInk) activeInk.status(line);
+    else term(`\r\x1b[2K  ${line}`);
+    shown = true;
+  };
+  const first = setTimeout(() => { paint(); timer = setInterval(paint, 1000); }, 400);
+  return {
+    stop() { clearTimeout(first); if (timer) clearInterval(timer); clear(); },
+    clear,
+  };
+}
+
+async function settingsOp(
+  ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string, framework?: string | null, ask?: (q: string) => Promise<string>,
+  versionsCmd = '/settings versions',
+): Promise<SettingsDoc | null> {
+  // `versions` alone lists the versions to pick from; anything else is
+  // assignments (throws CliError on a bad key/level).
+  const { versions: versionsView, assignments } = settingsArgs(args);
   assertOthersFitFramework(assignments, framework);
   assertVersionsFitFramework(assignments, framework);
   const { settings: current, version } = await ag.agent.getSettings(sealId);
   if (!assignments.length) {
-    for (const l of renderSettings(current)) out(`  ${l}\n`);
-    out('  change with: model=<id> · thinking=low|high|max · provider=<name> · others=\'<json>\' (quote it)\n');
-    // The versions a 0g-harness agent can be pinned to. Advisory: a chain
-    // without a trust registry, or an unreadable one, just shows nothing.
-    if (isHarnessFramework(framework)) {
-      const listed = await ag.agent.listedVersions().catch(() => null);
-      if (listed) for (const l of renderListedVersions(listed, current?.versions)) out(`  ${l}\n`);
+    // The versions a 0g-harness agent can be pinned to: which it runs on one
+    // line, all of them with `versions`. Advisory: a chain without a trust
+    // registry, or an unreadable one, just shows nothing.
+    const harness = isHarnessFramework(framework);
+    const listed = harness ? await ag.agent.listedVersions().catch(() => null) : null;
+    if (versionsView) {
+      if (!harness) out(`this agent runs ${framework ?? 'another framework'} — only a 0g-harness agent has versions to pick\n`);
+      else if (!listed) out('the trust registry could not be read — no versions to show\n');
+      else for (const l of renderListedVersions(listed, current?.versions)) out(`  ${l}\n`);
+      return current;
     }
+    for (const l of renderSettings(current)) out(`  ${l}\n`);
+    if (listed) out(`  ${renderVersionsLine(listed, current?.versions)}\n`);
+    const items = ['model=<id>', 'thinking=low|high|max', 'provider=<name>', "others='<json>' (quote it)", ...(listed ? [`pin a version: ${versionsCmd}`] : [])];
+    for (const l of changeWith(items, wrapWidth())) out(`${l}\n`);
     return current;
   }
   const next = applyAssignments(current, assignments);
@@ -2365,6 +3918,7 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
   // last-known-good cannot cover — refuse before signing, and say so.
   assertModelPresent(next, current !== null);
   assertSubagentDefaultOffered(next);
+  await assertModelFitsFramework(assignments, next, framework, (provider) => ag.agent.listModelCaps({ provider }));
   const providerChanged = changesProvider(current, next);
   // The agent takes the switch only with a key for the new provider in its
   // credential set; an image from before model keys in the set takes it at
@@ -2372,24 +3926,29 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
   let pendingReset = false;
   if (providerChanged) {
     const provider = next.provider ?? '0g-compute';
-    const keyIO = ask ? credIO(ask) : { json: false, out: (l: string) => out(`${l}\n`), secret: async () => '' };
+    const keyIO = ask ? credIO(ask) : { json: false, out: (l: string) => say(`${l}\n`), secret: async () => '' };
     if (await ensureModelKey(ag, sealId, provider, keyIO, serveBase ? { agentUrl: serveBase } : undefined) === 'unsupported') {
       requireConfiguredInferenceKey(provider);
       pendingReset = true;
     }
   }
+  // Writing and pushing take a while (a signature, the attestor, the
+  // container applying it): a spinner says it is under way.
+  let busy = progressLine('writing the settings');
   try {
-    const { version: written } = await ag.agent.setSettings(sealId, next, {
+    // The catalog advisory speaks when this write sets the model or the
+    // provider, not again on every later write that leaves them alone.
+    await ag.agent.setSettings(sealId, next, {
       baseVersion: version,
-      onWarn: (w) => out(`⚠ ${w}\n`),
-    });
+      ...(touchesModel(assignments) ? { onWarn: (w: string) => { busy.clear(); out(`⚠ ${w}\n`); } } : {}),
+    }).finally(() => busy.stop());
     for (const l of renderSettings(next)) out(`  ${l}\n`);
     if (providerChanged) {
       completionProvider = next.provider ?? '0g-compute';
       chatModelIds = providerModelIds[completionProvider] ?? [];
     }
     if (pendingReset) {
-      out(`written — version ${written}; provider change pending — run reset with the ${next.provider} key\n`);
+      say(`saved; provider change pending — run reset with the ${next.provider} key\n`);
       return next;
     }
     // Push to the running container so a change made mid-conversation takes
@@ -2401,26 +3960,29 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
     // agent was running).
     if (serveBase) {
       try {
-        const agentId = await ag.agent.getAgentIdBySealId(sealId);
-        const r = await ag.agent.pushSettingsToContainer(serveBase, agentId, next);
-        out(`written — version ${written}; ${r.note ?? 'applied to the running container'}\n`);
+        busy = progressLine('applying them to the running agent');
+        const r = await ag.agent.getAgentIdBySealId(sealId)
+          .then((agentId) => ag.agent.pushSettingsToContainer(serveBase, agentId, next))
+          .finally(() => busy.stop());
+        out(`saved; ${r.note ?? 'applied to the running container'}\n`);
       } catch (e2) {
-        const msg = (e2 as Error).message;
+        // One line (a chain read's error is many).
+        const msg = explainError(e2).message;
         if (requiresProviderReset(e2)) {
-          out(`written — version ${written}; provider change pending — run reset with the ${next.provider} key\n`);
+          say(`saved; provider change pending — run reset with the ${next.provider} key\n`);
           return next;
         }
         // A container that ANSWERED and refused (HTTP status) will refuse the
         // same document on the next boot too and fall back to last-known-good;
         // only an UNREACHABLE container (no HTTP status) applies it next boot.
-        if (/HTTP \d/.test(msg)) {
-          out(`written — version ${written}; stored, but the running container REFUSED it (${msg}) — a refused document does not boot, so the agent keeps its current configuration until you store one it accepts\n`);
+        if (/HTTP \d/.test((e2 as Error).message)) {
+          say(`saved, but the running container REFUSED it (${msg}) — a refused document does not boot, so the agent keeps its current configuration until you store one it accepts\n`);
         } else {
-          out(`written — version ${written}; stored, but the running container was unreachable (${msg}) — it applies on the next boot\n`);
+          say(`saved, but the running container was unreachable (${msg}) — it applies on the next boot\n`);
         }
       }
     } else {
-      out(`written — version ${written}; the container applies it at its next boot (reset applies it now)\n`);
+      say(`saved; the container applies it at its next boot (reset applies it now)\n`);
     }
     return next;
   } catch (e) {
@@ -2428,9 +3990,9 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
     // Someone else edited this agent between the read and the write. Show
     // what is there now and let the owner decide — a quiet retry here would
     // be this REPL choosing to discard the other change.
-    out(`⚠ ${e.message}\n  the document now stored (version ${e.currentVersion}):\n`);
-    for (const l of renderSettings(e.current)) out(`    ${l}\n`);
-    out('  nothing was written — repeat your command to apply it on top of that\n');
+    say(`⚠ ${e.message}\n  the document now stored (version ${e.currentVersion}):\n`);
+    for (const l of renderSettings(e.current)) say(`    ${l}\n`);
+    say('  nothing was written — repeat your command to apply it on top of that\n');
     return e.current;
   }
 }
@@ -2527,6 +4089,36 @@ async function helloWithTicket(
   return callAgentWithTicket(ag, url, '/hello', 'GET', undefined, clientAddr);
 }
 
+/** The one way the shell says an agent reference names no agent. */
+function agentNotFound(refInput: string): CliError {
+  return new CliError('AGENT_NOT_FOUND', `agent ${cleanCell(refInput)} does not exist on this attestor`, {
+    remedy: listRemedy(),
+  });
+}
+
+/** Where to look up the agents: the shell's `list` marks yours with `*`;
+ *  the one-shot `list` has no marks. */
+function listRemedy(): string {
+  return currentSurface() === 'shell' ? '`list` shows the agents here (* marks yours)' : '`0g-agentdna list` shows the agents here';
+}
+
+/**
+ * Ask for an amount of OG until the answer is one (parseOgAmount says what
+ * is wrong with any other); Enter cancels (null) — a money question has no
+ * default.
+ */
+async function askAmount(ask: (q: string) => Promise<string>, q: string): Promise<bigint | null> {
+  for (;;) {
+    const a = (await ask(q)).trim();
+    if (!a) return null;
+    try {
+      return parseOgAmount(a);
+    } catch (e) {
+      say(`  ${(e as Error).message}\n`);
+    }
+  }
+}
+
 /** Public-listing row for an agentId/sealId(/unique-prefix) reference, or undefined. */
 async function findAgentRow(ag: AgenticID, refInput: string): Promise<Awaited<ReturnType<AgenticID['agent']['listDeployments']>>[number] | undefined> {
   const ref = parseAgentRef(refInput);
@@ -2565,47 +4157,121 @@ async function servicesOf(url: string): Promise<Array<{ path: string; method: st
   }
 }
 
+/** The two capability lists of a /hello body: services (agent-registered
+ *  endpoints, entry #0 is /hello itself) and routes (framework-declared
+ *  prefixes, the owner's API). */
+export interface HelloSurface {
+  services?: { path: string; method: string; description?: string; skill?: string; transport?: string }[];
+  routes?: { prefix: string; kind?: string; auth?: string; signed: boolean; description?: string }[];
+}
+
+/** `s` cut to `width` code points, ending in … when cut. */
+function fitLine(s: string, width: number): string {
+  const cps = [...s];
+  return cps.length <= width ? s : `${cps.slice(0, Math.max(0, width - 1)).join('')}…`;
+}
+
+/** `head` and as many of `names` as fit in `width`, comma-separated, ending
+ *  in `, …` when some are left out. */
+function fitNames(head: string, names: string[], width: number): string {
+  const all = head + names.join(', ');
+  if ([...all].length <= width) return all;
+  let line = head;
+  for (const [i, name] of names.entries()) {
+    const next = line + (i ? ', ' : '') + name;
+    if ([...next].length + 3 > width) break;
+    line = next;
+  }
+  return line === head ? `${head}…` : `${line}, …`;
+}
+
+/**
+ * The services and routes of a /hello as `/hello` and `hello <id>` print
+ * them, one string per line, without the line break. Compact (the default): one line per service,
+ * cut to `width`, and the routes folded into one line per auth mode, named by
+ * their kinds, then a pointer to `more` (the full form of the command). `full`:
+ * every field of every entry, as the agent's runtime sent it. Compact cells
+ * go through cleanCell, so nothing the agent wrote can add a line.
+ */
+export function renderHelloSurface(body: HelloSurface, opts: { full: boolean; width: number; more: string }): string[] {
+  const services = Array.isArray(body.services) ? body.services : [];
+  const routes = Array.isArray(body.routes) ? body.routes : [];
+  const lines: string[] = [];
+  if (opts.full) {
+    if (services.length) {
+      lines.push('services:');
+      for (const sv of services) {
+        lines.push(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}`);
+      }
+    }
+    if (routes.length) {
+      lines.push('routes:');
+      for (const rt of routes) {
+        const tags = [rt.kind, rt.auth ? `auth=${rt.auth}` : '', rt.signed ? 'signed' : ''].filter(Boolean).join(' · ');
+        lines.push(`  ${rt.prefix.padEnd(29)} ${tags}${rt.description ? `  — ${rt.description}` : ''}`);
+      }
+    }
+    return lines;
+  }
+  const width = Math.max(40, Math.floor(opts.width) || 80);
+  let hidden = routes.length > 0;
+  if (services.length) {
+    lines.push('services:');
+    for (const sv of services) {
+      const mcp = sv?.transport === 'mcp' ? '[mcp] ' : '';
+      const line = `  ${cleanCell(sv?.method).padEnd(4)} ${cleanCell(sv?.path).padEnd(24)} ${mcp}${cleanCell(sv?.description)}`.trimEnd();
+      const shown = fitLine(line, width);
+      if (shown !== line || sv?.skill) hidden = true;
+      lines.push(shown);
+    }
+  }
+  // One line per auth mode: on every shipped framework that is one line,
+  // `owner API (bearer): chat, responses, …`.
+  const byAuth = new Map<string, string[]>();
+  for (const rt of routes) {
+    const auth = cleanCell(rt?.auth) || 'none';
+    const name = cleanCell(rt?.kind) || cleanCell(rt?.prefix);
+    const names = byAuth.get(auth) ?? [];
+    if (name && !names.includes(name)) names.push(name);
+    byAuth.set(auth, names);
+  }
+  for (const [auth, names] of byAuth) {
+    lines.push(fitNames(auth === 'none' ? 'routes (no auth): ' : `owner API (${auth}): `, names, width));
+  }
+  if (hidden) lines.push(fitLine(`(details: ${opts.more})`, width));
+  return lines;
+}
+
 /** Fetch and print an agent's signed /hello: identity, proof verification,
- *  and its two capability tables — services (agent-registered endpoints,
- *  entry #0 is /hello itself) and routes (framework-declared prefixes).
+ *  and its two capability lists (renderHelloSurface: compact unless `full`).
  *  The public way to inspect ANY agent (L1 `hello <id>` and L2 /hello).
- *  With `clientAddr`, the serve-proof is banked as a rating ticket. */
-async function showHello(ag: AgenticID, url: string, clientAddr?: `0x${string}`): Promise<void> {
+ *  `more` is the command that prints the full form. With `clientAddr`, the
+ *  serve-proof is banked as a rating ticket. */
+async function showHello(
+  ag: AgenticID,
+  url: string,
+  view: { full: boolean; more: string },
+  clientAddr?: `0x${string}`,
+): Promise<void> {
   const { proof, bodyText, banked } = await helloWithTicket(ag, url, clientAddr);
-  let body: {
-    agent?: string; owner?: string; message?: string;
-    services?: { path: string; method: string; description?: string; skill?: string }[];
-    routes?: { prefix: string; kind?: string; auth?: string; signed: boolean; description?: string }[];
-  } = {};
+  let body: { agent?: string; owner?: string; message?: string } & HelloSurface = {};
   try { body = JSON.parse(bodyText); } catch { /* body printed fields stay empty */ }
   const valid = proof ? await ag.reputation.verifyProof(proof) : null;
   const proofLine = valid
     ? `${JSON.stringify(valid.ok)}${valid.ok ? '' : ` (${valid.reasons.join('; ')})`}`
     : '(no proof header)';
-  out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${proofLine}\n`);
+  say(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${proofLine}\n`);
   // A v2 proof names what each layer ran (sealed/LAYERS.md §7); the header
   // is the agent's, so every field goes through cleanCell. LEGACY(v1): a
   // proof without a version names none.
   if (proof?.version !== undefined) {
-    out(`sealed  : ${cleanCell(String(proof.sealedHash ?? '?'))}\nharness : ${cleanCell(String(proof.harnessHash ?? '?'))}\n`);
+    say(`sealed  : ${cleanCell(String(proof.sealedHash ?? '?'))}\nharness : ${cleanCell(String(proof.harnessHash ?? '?'))}\n`);
     if (proof.model || proof.inferenceURL) {
-      out(`model   : ${cleanCell(proof.model || '—')}${proof.inferenceURL ? ` via ${cleanCell(proof.inferenceURL)}` : ''}\n`);
+      say(`model   : ${cleanCell(proof.model || '—')}${proof.inferenceURL ? ` via ${cleanCell(proof.inferenceURL)}` : ''}\n`);
     }
   }
   if (banked) out(`ticket  : banked (GET /hello) — spend with \`rate\` within ~60 min\n`);
-  if (body.services?.length) {
-    out('services:\n');
-    for (const sv of body.services) {
-      out(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
-    }
-  }
-  if (body.routes?.length) {
-    out('routes:\n');
-    for (const rt of body.routes) {
-      const tags = [rt.kind, rt.auth ? `auth=${rt.auth}` : '', rt.signed ? 'signed' : ''].filter(Boolean).join(' · ');
-      out(`  ${rt.prefix.padEnd(29)} ${tags}${rt.description ? `  — ${rt.description}` : ''}\n`);
-    }
-  }
+  for (const line of renderHelloSurface(body, { ...view, width: process.stdout.columns || 80 })) out(`${line}\n`);
 }
 
 /** Build a wallet-backed client, turning a missing key into a `login` nudge. */
@@ -2615,8 +4281,15 @@ async function withWallet(ctx: CommandContext): Promise<AgenticID> {
     if (k) ctx.env.privateKey = k;
   }
   if (!ctx.env.privateKey) {
-    throw new CliError('WALLET_REQUIRED', 'this needs your owner wallet, and none is configured', {
-      remedy: 'run `login` here (stored 0600), or set AGENTIC_PRIVATE_KEY',
+    // With no attestor either (a first run), both are missing: one login sets both.
+    const none = !ctx.env.attestorUrl;
+    const shell = currentSurface() === 'shell';
+    throw new CliError(none ? 'MISSING_ATTESTOR_URL' : 'WALLET_REQUIRED', none
+      ? 'nothing is set up yet: no attestor URL and no owner key'
+      : 'this needs your owner key, and none is set', {
+      remedy: shell
+        ? `\`login\` sets ${none ? 'both' : 'it'}`
+        : `${shellTo('login', none ? 'set both' : 'save the key')}, or export ${none ? 'AGENTIC_ATTESTOR_URL and ' : ''}AGENTIC_PRIVATE_KEY`,
     });
   }
   return clientFor(ctx, true);
@@ -2640,15 +4313,17 @@ export async function ownerRouteUrl(ag: AgenticID, s: Session): Promise<string |
  * one-shot command does, and `set model` for the agent to take the key;
  * Ctrl-C or Esc stops the wait (the login goes on in the browser).
  */
-async function credInShell(irq: Interrupt, sub: string[], run: (io: { wait?: boolean; signal?: AbortSignal }) => Promise<void>): Promise<void> {
+async function credInShell(irq: Interrupt, sub: string[], run: (io: { wait?: boolean; signal?: AbortSignal; quiet?: <T>(f: () => Promise<T>) => Promise<T> }) => Promise<void>): Promise<void> {
   const connect = sub[0] === 'connect';
   const modelSet = sub[0] === 'set' && (sub[1] === 'model' || !!sub[1]?.startsWith('model.'));
   if (!connect && !modelSet) return run({});
   const ac = new AbortController();
   irq.streaming = ac;
+  const restore = historyAside(activeRl);
   try {
-    await run({ ...(connect ? { wait: true } : {}), signal: ac.signal });
+    await run({ ...(connect ? { wait: true } : {}), signal: ac.signal, quiet: duringWait });
   } finally {
+    restore?.(true);
     irq.streaming = null;
   }
 }
@@ -2656,7 +4331,7 @@ async function credInShell(irq: Interrupt, sub: string[], run: (io: { wait?: boo
 /** How credOp talks inside the REPL: lines out, values through askSecret. */
 function credIO(ask: (q: string) => Promise<string>) {
   return {
-    json: false, out: (l: string) => out(`${l}\n`), secret: (p: string) => askSecret(ask, p),
+    json: false, out: (l: string) => say(`${l}\n`), secret: (p: string) => askSecret(ask, p),
     // The credential prompts' terminal reset: on a terminal only.
     raw: (s: string) => { if (process.stdout.isTTY) term(s); },
     keyPrompt: keyPrompt(ask),
@@ -2666,6 +4341,16 @@ function credIO(ask: (q: string) => Promise<string>) {
 /** Prompt for a secret with the typed characters not echoed. readline has no
  *  native masking, so suppress stdout echo for the duration of the question. */
 function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise<string> {
+  // The Ink view draws what is typed as `*`, keeps it out of the history and
+  // writes the answer to the transcript masked.
+  const ink = activeInk;
+  if (ink) {
+    return ink.secret(() => ask(prompt)).then((ans) => {
+      const hist = ink.editor.history;
+      for (let i = hist.length - 1; i >= 0; i--) if (ans && hist[i] === ans) hist.splice(i, 1);
+      return ans;
+    });
+  }
   // A terminal whose line editing the shell does not do (its output is
   // redirected) shows what is typed as it is typed.
   if (process.stdin.isTTY && activeRl?.terminal === false) {
@@ -2706,7 +4391,9 @@ function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise
             if (hist[i] === ans) hist.splice(i, 1);
           }
         }
-        process.stdout.write('\n');
+        // A terminal's readline already ended the line on Enter; without one
+        // nothing did.
+        if (!activeRl?.terminal) process.stdout.write('\n');
         res(ans);
       },
       // stdin EOF mid-prompt: restore the write hook BEFORE surfacing, or
@@ -2721,11 +4408,20 @@ function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise
 
 const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
 
+/** Why `a` is not a usable address, for `what` (the buyer, the new owner…).
+ *  A 40-hex address whose mixed case does not match its checksum is a typo
+ *  the checksum caught, not a malformed value. Exported for the tests. */
+export function addressProblem(a: string, what: string): string {
+  return /^0x[0-9a-fA-F]{40}$/.test(a)
+    ? `${what} ${cleanCell(a)} fails its checksum (a mistyped character?) — check it, or type it all in lower case`
+    : `${what} must be a 0x address (0x and 40 hex digits)`;
+}
+
 /** Resolve an agent ref to its minted tokenId (works on ANY agent, not just mine). */
 async function mintedTokenId(ag: AgenticID, refInput: string): Promise<bigint> {
   const row = await findAgentRow(ag, refInput);
-  if (!row) throw new CliError('UNKNOWN', `no agent matching ${refInput} on this attestor`);
-  if (row.agentId == null) throw new CliError('UNKNOWN', `agent ${refInput} is not minted yet — nothing on-chain to act on`);
+  if (!row) throw agentNotFound(refInput);
+  if (row.agentId == null) throw new CliError('AGENT_NOT_READY', `agent ${cleanCell(refInput)} has no agentId yet — nothing on chain to act on`, { remedy: `${cmdStep('list')} shows its agentId once minted` });
   return BigInt(row.agentId);
 }
 
@@ -2736,20 +4432,51 @@ async function addressOf(key: `0x${string}`): Promise<string> {
 
 // ── deploy / attach (from the former chat command) ───────────────────────────
 
-async function pickInferenceProvider(ask: (q: string) => Promise<string>, preferred: string, among?: string[]): Promise<string> {
+/**
+ * Which listed option an answer names: Enter is the default, a number is the
+ * option shown with it, and otherwise an option's id or name (any case).
+ * null for anything else. Exported for the tests.
+ */
+export function choiceIndex(answer: string, options: ReadonlyArray<{ id: string; name?: string }>, defaultIndex: number): number | null {
+  const a = answer.trim();
+  if (!a) return defaultIndex;
+  if (/^\d+$/.test(a)) return Number(a) < options.length ? Number(a) : null;
+  const l = a.toLowerCase();
+  const hit = options.findIndex((o) => o.id.toLowerCase() === l || o.name?.toLowerCase() === l);
+  return hit >= 0 ? hit : null;
+}
+
+/**
+ * Show `options` numbered under `title` and ask for one (choiceIndex). An
+ * answer that names none of them is asked again — never replaced with the
+ * default. Returns the chosen option's id. Exported for the tests.
+ */
+export async function askChoice(
+  ask: (q: string) => Promise<string>,
+  title: string,
+  question: string,
+  options: ReadonlyArray<{ id: string; name?: string }>,
+  defaultIndex: number,
+): Promise<string> {
+  say(`${title}:\n`);
+  options.forEach((o, i) => say(`  ${i}. ${o.id}${o.name && o.name !== o.id ? ` (${o.name})` : ''}${i === defaultIndex ? '  (default)' : ''}\n`));
+  for (;;) {
+    const answer = await ask(`${question} [${defaultIndex}]: `);
+    const i = choiceIndex(answer, options, defaultIndex);
+    if (i !== null) return options[i].id;
+    say(`  "${cleanCell(answer.trim())}" is not in the list — type its number (0–${options.length - 1}) or its name\n`);
+  }
+}
+
+async function pickInferenceProvider(ask: (q: string) => Promise<string>, preferred: string, among?: string[], title = 'providers'): Promise<string> {
   const providers = among ? knownProviders.filter((provider) => among.includes(provider.id)) : knownProviders;
   const fallback = Math.max(0, providers.findIndex((provider) => provider.id === preferred));
-  out('providers:\n');
-  providers.forEach((provider, index) => out(`  ${index}. ${provider.id} (${provider.name})${index === fallback ? ' (default)' : ''}\n`));
-  const input = (await ask(`provider [${fallback}]: `)).trim();
-  const chosen = !input ? providers[fallback] : providers.find((provider) => provider.id === input) ?? providers[Number(input)];
-  if (!chosen) throw new CliError('BAD_FLAG', `unknown inference provider: ${input}`);
-  return chosen.id;
+  return askChoice(ask, title, 'provider', providers, fallback);
 }
 
 /** The model key prompt of the REPL (cli/modelkey.ts). */
 function keyPrompt(ask: (q: string) => Promise<string>) {
-  return replKeyPrompt(ask, (p: string) => askSecret(ask, p), (l: string) => out(`${l}\n`));
+  return replKeyPrompt(ask, (p: string) => askSecret(ask, p), (l: string) => say(`${l}\n`));
 }
 
 
@@ -2762,7 +4489,7 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
   // overlap them; the balance gate below still waits for both.
   const effPromise = ag.getEffectiveBalance().catch(() => null);
   const ackTx = await ag.ack();
-  if (ackTx) { out(`ack() → ${ackTx} (waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
+  if (ackTx) { say(`acknowledging the trust root (tx ${ackTx}, waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
   // Gate on the provider's EFFECTIVE balance (on-chain minus outstanding
   // off-chain debt) when reachable — that's what its create gate enforces;
   // the raw chain read is the fallback.
@@ -2771,9 +4498,9 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
   if (bal < parseEther('0.1')) {
     if (eff && eff.availableWei < eff.balanceWei) {
       const owed = eff.outstandingDebtWei + eff.pendingSettlementWei + eff.reservedWei;
-      out(`available balance is ${og(bal)} — on-chain ${og(eff.balanceWei)} minus ${og(owed)} owed/queued off-chain. Deposits settle those first.\n`);
+      say(`available balance is ${og(bal)} — on-chain ${og(eff.balanceWei)} minus ${og(owed)} owed/queued off-chain. Deposits settle those first.\n`);
     } else {
-      out(`prepaid sandbox balance is ${og(bal)} — deploy/run needs ≥ 0.1 OG.\n`);
+      say(`prepaid sandbox balance is ${og(bal)} — deploy/run needs ≥ 0.1 OG.\n`);
     }
     // What the wallet can actually afford: native balance minus a gas
     // reserve. A deposit's principal + fee both come out of native, so
@@ -2783,34 +4510,40 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
     const GAS_RESERVE = parseEther('0.05');
     const affordableWei = native != null && native > GAS_RESERVE ? native - GAS_RESERVE : 0n;
     if (native != null && affordableWei < shortfallWei) {
-      out(`wallet has only ${og(native)} native gas — not enough to cover a ${og(shortfallWei)} deposit plus fees. Fund the wallet, or use one with more OG.\n`);
+      say(`wallet has only ${og(native)} native gas — not enough to cover a ${og(shortfallWei)} deposit plus fees. Fund the wallet, or use one with more OG.\n`);
       return false;
     }
     // Suggest the shortfall (no arbitrary padding), capped at what's affordable.
     let suggestWei = shortfallWei > 0n ? shortfallWei : parseEther('0.1');
     if (affordableWei > 0n && suggestWei > affordableWei) suggestWei = affordableWei;
-    const suggest = og(suggestWei).replace(/ OG$/, '');
-    // Empty = cancel (as the prompt says). To deposit the suggested amount,
-    // the user types it — no silent default that contradicts "empty to cancel".
-    // Typing the amount IS the confirmation — the prompt already says empty
-    // cancels; a second [Y/n] was pure friction (review of the topup flows).
-    const amt = (await ask(`deposit how much OG now? (e.g. ${suggest}, empty to cancel): `)).trim();
-    if (!amt) { out('cancelled — deposit later with `deposit`.\n'); return false; }
-    const tx = await ag.deposit({ amountWei: parseEther(amt) });
-    out(`deposit ${amt} OG (tx ${tx}, waiting…)\n`);
+    // Enter cancels (a money question has no default). To deposit the
+    // suggested amount, the user types it. Typing the amount IS the
+    // confirmation; a second [Y/n] was pure friction (review of the topup flows).
+    say(`${og(suggestWei)} more brings it to 0.1 OG\n`);
+    let amountWei = 0n;
+    for (;;) {
+      const amt = (await ask('deposit how much OG now? [Enter cancels]: ')).trim();
+      if (!amt) { say('cancelled — deposit later with `deposit`.\n'); return false; }
+      try {
+        amountWei = parseOgAmount(amt);
+      } catch (e) {
+        say(`  ${(e as Error).message}\n`);
+        continue;
+      }
+      if (native != null && native <= amountWei) {
+        say(`  the wallet holds ${og(native)} — not enough for ${ogAmount(amountWei)} OG plus gas\n`);
+        continue;
+      }
+      break;
+    }
+    const tx = await ag.deposit({ amountWei });
+    say(`deposit ${ogAmount(amountWei)} OG (tx ${tx}, waiting…)\n`);
     await ag.waitForTransaction(tx);
   }
   return true;
 }
 
-/**
- * Whether the deploy wizard offers `framework` only models with tool use: the
- * tool-driven frameworks, the harness under either of its names (`dsh` on a
- * network still on AgenticID 1.3, see `isHarnessFramework`).
- */
-export function frameworkNeedsToolModels(framework: string): boolean {
-  return framework === 'openclaw' || framework === 'prime-agent' || isHarnessFramework(framework);
-}
+export { frameworkNeedsToolModels } from '../settings';
 
 async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string) => Promise<string>, ctx: CommandContext, irq: Interrupt): Promise<Session | null> {
   const cfg = (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(10_000) })
@@ -2818,13 +4551,11 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
     .catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
   let framework = 'openclaw';
+  say('\n');
   if (fws.length) {
-    const di = Math.max(0, fws.indexOf('openclaw'));
-    out('\nframeworks:\n');
-    fws.forEach((n, i) => out(`  ${i}. ${n}${i === di ? '  (default)' : ''}\n`));
-    const raw = (await ask(`framework [${di}]: `)).trim();
-    const i = Number(raw);
-    framework = !raw ? fws[di] : Number.isInteger(i) && fws[i] ? fws[i] : fws.includes(raw) ? raw : fws[di];
+    framework = await askChoice(ask, 'frameworks', 'framework', fws.map((id) => ({ id })), Math.max(0, fws.indexOf('openclaw')));
+  } else {
+    say('framework: openclaw (this attestor lists no others)\n');
   }
 
   // Only offer models the chosen framework can actually run: chatbots only
@@ -2846,9 +4577,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
     if (!model) throw new CliError('BAD_FLAG', 'model is required');
   } else {
     if (!models.length) throw new CliError('UNKNOWN', `no compatible models advertised for ${framework} on ${provider}`);
-    out('\nmodels:\n');
-    models.forEach((id, index) => out(`  ${index}. ${id}\n`));
-    model = models[Number((await ask('model [0]: ')).trim()) || 0] ?? models[0];
+    model = await askChoice(ask, '\nmodels', 'model', models.map((id) => ({ id })), 0);
   }
 
   const name = (await ask(`name [chat-${framework}]: `)).trim() || `chat-${framework}`;
@@ -2861,16 +4590,17 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
 
   const apiKey = provision ? (await pickModelKey(provider, keyPrompt(ask), { optional: mayGoKeyless(framework, provider) })) ?? undefined : undefined;
   if (provision && !(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
-  out(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only, no container'}…\n`);
+  say(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only'}…\n`);
   const { deployment: dep, agentId } = await deployWithInference(ag, { name, framework, provider, model, provision, apiKey });
   if (!provision) {
-    out(`minted agentId ${agentId} — offline (no container). Bring it online with: reset ${agentId}\n`);
+    say(`minted agentId ${agentId} — offline (no container). Bring it online with: reset ${agentId}\n`);
     return null;
   }
-  out(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
+  say(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
   const r = await waitRunningInterruptible(irq, attestorUrl, dep.sealId, agentId);
-  if (!r) return null; // Esc: the attestor keeps deploying — only the wait ends
+  if (!r) { say(`the deploy goes on — enter it later with: use ${agentId}\n`); return null; } // Esc: only the wait ends
   if (apiKey) await ag.credentials.resyncModelKey(dep.sealId, { agentUrl: r.url }).catch(() => undefined);
+  noteDroppedKeys(); // above the entry card, not inside it
   // Enter through attach so a fresh deploy gets the same entry card
   // (avatar / gas / status) as `use`; only the wizard knows the framework.
   const s = await attach(ag, attestorUrl, agentId, ask);
@@ -2887,17 +4617,71 @@ export function warningOf(status: { level: string; reason: string | null } | nul
   return line.length > 200 ? `${line.slice(0, 199)}…` : line;
 }
 
+/**
+ * The entry card's lines (beside the avatar): who the agent is, its phase,
+ * sealId, gas, a warning, and how to go on. No container URL: that is the
+ * session's own address for the agent, not one the owner uses. Exported for
+ * the tests.
+ */
+export function sessionCardFields(c: {
+  agentId: string; name?: string | null; phase: string; sealId: string; gasWei: bigint | null;
+  warning: string | null; connected: boolean; failure?: string;
+  /** When the container reported the warning (ISO time); `now` for the tests. */
+  warningAt?: string; now?: number;
+}): string[] {
+  const fields = [
+    `agent ${c.agentId}${c.name ? ` · ${c.name}` : ''}`,
+    `phase    ${c.phase}`,
+    `sealId   ${c.sealId.slice(0, 10)}…${c.sealId.slice(-6)}`,
+  ];
+  if (c.gasWei != null) fields.push(`gas      ${og(c.gasWei)} (agentSeal — fund with /topup)`);
+  if (c.warning) {
+    // The container's last report, which can be older than the gas above:
+    // when it was made, and, for a wallet that held too little, what it
+    // holds now (the warning clears at the agent's next commit).
+    const at = Date.parse(c.warningAt ?? '');
+    const age = Number.isFinite(at) ? ` (reported ${agoText(at, c.now ?? Date.now())})` : '';
+    const had = /(\d+(?:\.\d+)?) OG/.exec(c.warning)?.[1];
+    const topped = had && c.gasWei != null && Number(c.gasWei) / 1e18 > Number(had) + 1e-9
+      ? ` — it holds ${og(c.gasWei)} now; this clears at its next commit` : '';
+    fields.push(`warning  ${c.warning}${age}${topped}`);
+  }
+  if (c.connected) {
+    fields.push('type to chat · /help for commands · Esc interrupts a turn');
+  } else {
+    if (c.failure) fields.push(`last error: ${c.failure}`);
+    fields.push(c.phase === 'stopped'
+      ? '→ /start to bring it back'
+      : c.phase === 'deploying'
+        ? '→ still deploying — a bare Enter shows its phase'
+        : '→ /reset to recreate its container');
+  }
+  return fields;
+}
+
 async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask: (q: string) => Promise<string>): Promise<Session> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listDeployments();
   const row = pickRow(ref, refInput, rows as { agentId?: unknown; sealId?: string }[]) as
     { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string; name?: string | null; framework?: string | null } | undefined;
   if (!row) {
-    throw new CliError('AGENT_NOT_FOUND', `no deployment matches ${refInput} on this attestor`, {
-      remedy: 'use `list` to see the agents this wallet owns here',
+    throw new CliError('AGENT_NOT_FOUND', `agent ${cleanCell(refInput)} does not exist on this attestor`, {
+      remedy: listRemedy(),
     });
   }
-  const agentId = String(row.agentId ?? '?');
+  // A session is keyed by the agentId: an agent without one yet (still being
+  // minted, or its deploy failed before the mint) is entered once it has it.
+  if (row.agentId === undefined || row.agentId === null) {
+    const prefix = sealPrefixOf(row.sealId);
+    throw new CliError('AGENT_NOT_READY', row.phase === 'failed'
+      ? `agent ${prefix} has no agentId — its deploy stopped before the mint`
+      : `agent ${prefix} has no agentId yet — it is still being minted`, {
+      remedy: row.phase === 'failed'
+        ? shellTo(`retry ${prefix}`, 'resume it')
+        : `${cmdStep('list')} shows its agentId once minted; then ${cmdStep('use <agentId>')}`,
+    });
+  }
+  const agentId = String(row.agentId);
 
   // `use` selects the agent in ANY phase — lifecycle stays explicit inside
   // the session (/start, /reset). Only a running agent gets a connection.
@@ -2932,40 +4716,60 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   // anyway; the attestor's auth still guards every owner action.
   if (mine === false) {
     throw new CliError('AGENT_NOT_FOUND', `agent ${agentId} is not yours`, {
-      remedy: `talk to its public surface with: hello ${agentId}`,
+      remedy: shellTo(`hello ${agentId}`, 'see its public surface'),
     });
   }
-  const fields: string[] = [];
-  fields.push(`agent ${agentId}${row.name ? ` · ${row.name}` : ''}`);
-  fields.push(`phase    ${s.phase}`);
-  if (s.url) fields.push(`url      ${s.url}`);
-  fields.push(`sealId   ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}`);
-  if (gasWei != null) fields.push(`gas      ${og(gasWei)} (agentSeal — fund with /topup)`);
   // A running agent can still report a warning, e.g. its data not reaching
   // chain because the agentSeal wallet cannot pay: say so where the owner
   // looks first.
   const warning = mine ? warningOf(mine.containerStatus) : null;
-  if (warning) fields.push(`warning  ${warning}`);
-  if (s.phase === 'running' && s.url) {
-    fields.push('type to chat · /help for commands · Esc interrupts a turn');
-  } else {
-    const reason = await failureReasonOf(attestorUrl, row.sealId);
-    if (reason) fields.push(`last error: ${reason}`);
-    fields.push(s.phase === 'stopped' ? '→ /start to bring it back' : '→ /reset to recreate its container');
-  }
+  const connected = s.phase === 'running' && !!s.url;
+  const failure = connected ? undefined : await failureReasonOf(attestorUrl, row.sealId);
+  if (failure) s.failure = failure;
+  const fields = sessionCardFields({ agentId, name: row.name, phase: s.phase, sealId: row.sealId, gasWei, warning, connected, failure, warningAt: mine ? mine.containerStatus?.at : undefined });
   out('\n');
-  if (art) {
-    for (let i = 0; i < Math.max(art.length, fields.length); i++) {
+  // On a terminal the fields wrap at words; beside the avatar while at least
+  // 28 columns are left for them.
+  const cols = process.stdout.isTTY ? (process.stdout.columns || 80) : Infinity;
+  const beside = art && cols - 22 >= 28 ? art : null;
+  const cardRows = wrapCard(fields, beside ? cols - 22 : cols - 3);
+  if (beside) {
+    for (let i = 0; i < Math.max(beside.length, cardRows.length); i++) {
       // The avatar's cells are the CLI's own colour codes (svgPixelLines):
       // written as they are; the fields are cleaned.
-      term(`  ${art[i] ?? ' '.repeat(16)}   `);
-      out(`${fields[i] ?? ''}\n`);
+      term(`  ${beside[i] ?? ' '.repeat(16)}   `);
+      out(`${cardRows[i] ?? ''}\n`);
     }
   } else {
-    for (const f of fields) out(`  ${f}\n`);
+    for (const f of cardRows) out(`  ${f}\n`);
   }
   out('\n');
+  setSurface('shell'); // a direct `0g-agentdna <agent>` is in the shell from here
   return s;
+}
+
+/** The entry card's field lines, wrapped at words to `width` columns: a
+ *  field's further rows line up under its value (`gas      1.2 OG (…`).
+ *  Exported for the tests. */
+export function wrapCard(fields: readonly string[], width: number): string[] {
+  if (!Number.isFinite(width)) return [...fields];
+  const rows: string[] = [];
+  for (const f of fields) {
+    const key = /^[A-Za-z]+ {2,}/.exec(f)?.[0].length ?? 0;
+    if (key && width - key >= 16) {
+      const parts = wrapWords(f.slice(key), width - key);
+      parts.forEach((p, i) => rows.push(`${i ? ' '.repeat(key) : f.slice(0, key)}${p}`));
+    } else {
+      rows.push(...wrapWords(f, width));
+    }
+  }
+  return rows;
+}
+
+/** The session's first line, wrapped at words on a terminal. */
+function sessionHeader(s: Session): string {
+  const line = `agent ${s.agentId} session — ${s.phase} · ${hostOf(s.attestorUrl)}`;
+  return process.stdout.isTTY ? wrapWords(line, (process.stdout.columns || 80) - 1).join('\n') : line;
 }
 
 /** The last recorded container failure reason, if any (public detail). */
@@ -2987,13 +4791,11 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
     .then((r) => r.json())
     .catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
-  if (!fws.length) return current ?? 'openclaw';
-  const di = Math.max(0, current ? fws.indexOf(current) : 0);
-  out('frameworks:\n');
-  fws.forEach((n, i) => out(`  ${i}. ${n}${i === di ? '  (default)' : ''}\n`));
-  const raw = (await ask(`framework [${di}]: `)).trim();
-  const i = Number(raw);
-  return !raw ? fws[di] : Number.isInteger(i) && fws[i] ? fws[i] : fws.includes(raw) ? raw : fws[di];
+  if (!fws.length) {
+    say(`framework: ${current ?? 'openclaw'} (this attestor lists no others)\n`);
+    return current ?? 'openclaw';
+  }
+  return askChoice(ask, 'frameworks', 'framework', fws.map((id) => ({ id })), Math.max(0, current ? fws.indexOf(current) : 0));
 }
 
 // ── L2: session REPL ─────────────────────────────────────────────────────────
@@ -3001,24 +4803,46 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 const L2_HELP =
   'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /sessions /activities /tasks /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
-const L2_HELP_FULL = `session commands
+export const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
                           turn in flight (the runtime cancels server-side);
                           at a question a command asks, they cancel it
   (several lines)         a paste stays one message, sent with the next
                           Enter and never run as a command; a line ending
                           in \\ or Option/Alt+Enter goes on to a new line.
-                          Lines already entered are not edited again
-  (typing while it works) 0g-harness: a message you finish while the agent
-                          works goes into its turn, read before its next
-                          model call ("↳ inserted", then "(read)"); not in
-                          the middle of a long command. If the turn ends
-                          first, it runs as a turn of its own, shown here.
-                          A command alone on its line waits for the prompt
-  (bare Enter)            refresh this agent's phase/url from the attestor
-  /hello                  identity, routes/services, serve-proof verification
+                          Backspace at a line's start joins the line before;
+                          Ctrl-C or Esc with text in the box clears it
+  (while it works)        the input stays on screen (framed at the bottom,
+                          a status line above it saying what the agent does
+                          and Esc to stop); the reply prints above it and
+                          what you type stays on screen. Enter on 0g-harness
+                          owner-chat steers: the message goes into the turn,
+                          read before its next model call ("waiting for the
+                          agent" until then); not in the middle of a long
+                          command. If the turn ends first, the agent answers
+                          it next, shown here. Tab queues instead ("next
+                          turn"), sent as the next message when the turn
+                          ends (Esc puts it back to edit instead); ↑ on an
+                          empty prompt takes the newest queued one back to
+                          edit. A command alone on its line never goes to
+                          the agent: one that only reads (/files, /tasks,
+                          /inbox, …) runs at once, any other when the turn
+                          ends; Tab completes it. A message in another
+                          session or on another framework waits for the next
+                          turn. AGENTDNA_INK=off keeps the plain prompt line
+                          instead of the frame; AGENTDNA_LIVE_PROMPT=off
+                          prints turns as a plain stream
+  (status)                2 notices · 1 new file: notices waiting to print
+                          and files the agent left that are not saved yet
+                          (at the status line's right, or in the prompt)
+  (bare Enter)            refresh this agent's phase from the attestor (in
+                          the framed view its footer shows it)
+  /hello [full]           identity, serve-proof verification, services one
+                          per line, owner routes on one line by kind; full
+                          prints every field of every service and route
   /balance                this agent's agentSeal gas + the account prepaid
-  /topup [og]             fund this agent's agentSeal gas (default 0.1 OG)
+  /topup [og]             fund this agent's agentSeal gas (bare: asks how
+                          much; Enter cancels)
   /start                  start (only from stopped)
   /stop                   stop the running container
   /reset                  recreate the container (uses the recorded framework;
@@ -3028,24 +4852,26 @@ const L2_HELP_FULL = `session commands
                           this agent thinks with, and how hard. Bare shows it;
                           model=… provider=… thinking=low|high|max
                           others=<json> merge into it and write it back
-                          (owner-signed). Applies at the next boot — /reset
-                          applies it now. On 0g-harness, sealed=<hash>
-                          harness=<hash> pin the runtime's versions; bare
-                          /settings lists the ones the trust registry has
-  /cred [sub …]           this agent's credentials — same as \`cred <id>\` in the
-                          manager: bare lists, set <name> [k=v …], rm, connect,
-                          disconnect,
-                          reveal <name> on|off, pending, approve|deny [<id>],
-                          log [n], presets. The agent writes [[credential:<name>]]
-                          where a key goes; sealed fills it in on the way out.
+                          (owner-signed). A running agent takes it at once
+                          (its runtime restarts with it); a stopped one at its
+                          next start. On 0g-harness, bare /settings says
+                          which versions run; /settings versions lists the
+                          ones the trust registry has, and sealed=<hash>
+                          harness=<hash> pin them
+  /cred [sub …]           this agent's credentials — same as \`cred <id>\` in
+                          the manager: bare lists, set <name> [k=v …], rm,
+                          connect, disconnect, reveal <name> on|off, pending,
+                          approve|deny [<id>], log [n], presets. The agent
+                          writes [[credential:<name>]] where a key goes;
+                          sealed fills it in on the way out.
                           A request the agent waits on (to read a value, to get
                           a credential, to be connected) comes up here at the
                           prompt; your answer goes back to the agent
   /think [low|high|max]   reasoning depth for thinking models (glm etc.) —
                           shorthand for /settings thinking=…, so it is written
-                          to the owner's document (owner-signed) and applies at
-                          the agent's next boot; /reset applies it now. prime
-                          also takes it per message, from the next one on.
+                          to the owner's document (owner-signed) and a running
+                          agent takes it at once, a stopped one at its next
+                          start. prime also takes it per message.
                           No arg shows the level currently stored
   /clear                  wipe the agent's conversation and start fresh —
                           chain-tracked memory (what the agent chose to keep)
@@ -3062,7 +4888,8 @@ const L2_HELP_FULL = `session commands
                           start); either picks up version changes. 0g-harness
   /sessions               on 0g-harness: your sessions (* = the one chat goes
                           to). /sessions new [title] opens one and switches to
-                          it; /sessions switch <id|title> switches; /sessions
+                          it; /sessions switch <#|id|title> switches (# from
+                          the list, newest first); /sessions
                           fork [id] copies a session's history into a new one;
                           /sessions default goes back to owner-chat. Every
                           session shares the agent's memory, skills and
@@ -3102,13 +4929,19 @@ const L2_HELP_FULL = `session commands
                           /back + use. On 0g-harness an id can be anything
                           /activities lists, and /cancel all stops everything
                           running on the agent
-  /inbox [all]            what the agent said on its own (0g-harness): a
-                          background job finished, a reminder came due. It
-                          prints above the prompt as it arrives, and what
-                          came while you were away prints when you enter.
-                          Bare: unread messages; all: the read ones too
+  /inbox [all]            notices: what the agent said on its own
+                          (0g-harness) — a background job finished, a
+                          reminder came due. A notice prints above the
+                          prompt as it arrives, and what came while you were
+                          away prints when you enter. Bare: unread ones;
+                          all: the ones you've seen too. /notices is the same
   /schedules              the reminders the agent set for itself
                           (0g-harness)
+  (drag a file in)        a file dragged into the terminal, or a pasted path to
+                          one, goes with the message you are typing: images in
+                          it, other files uploaded as below. Only files under
+                          your home, /Volumes and the temp folders; a path in
+                          backquotes stays text (0g-harness)
   /attach [path …|clear]  files and images for your next message (0g-harness):
                           an image goes with the message (when the model takes
                           images, as its provider's model list says — else it
@@ -3117,21 +4950,28 @@ const L2_HELP_FULL = `session commands
                           and the message names its path. Bare lists what is
                           staged. Images: 8 per message, 10 MiB each, 32 MiB
                           together; a file: 25 MiB
-  /files [inbox]          the files the agent left for you in its ~/outbox (or,
-                          with inbox, the ones you sent, in its ~/inbox — not
-                          the message /inbox) — container-local,
-                          lost on a reset (0g-harness)
+  /files [inbox]          files the agent left for you, in its ~/outbox (or,
+                          with inbox, files you sent, in its ~/inbox) —
+                          container-local, lost on a reset (0g-harness). On a
+                          terminal, new ones are saved to
+                          ~/agentdna/<agent>/outbox by themselves (checked
+                          when a turn ends and every 30 s; never over a
+                          different file; over 50 MiB: skipped and said so)
+  /files auto [on|off]    whether new files are saved by themselves (this
+                          CLI's setting, for every agent; on by default)
   /download <name> [path] save one to the current directory (or path); never
                           overwrites: a taken name gets -1, -2, … Names from
                           your own files: inbox/<name>. At most 50 MiB
   /agentlog [n]           agent process log, last n lines (owner-only)
-  /signatures [n]         what the agent signed as itself and what the runtime refused, last n (owner-only; 0g-harness)
+  /signatures [n]         what the agent signed as itself and what the runtime
+                          refused, last n (owner-only; 0g-harness)
   /startuplog [n]         sealed runtime startup log, last n lines
   /back  (or /unuse)      return to the manager
   /quit                   exit`;
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
-  out(`\nagent ${s.agentId} session — ${s.phase} · ${hostOf(s.attestorUrl)} · type to chat · Tab completes /commands · /help for details\n`);
+  setAgentAtHand(s.agentId, true); // cred/settings messages name /cred, /settings
+  out(`\n${sessionHeader(s)}\n`);
   // Low-gas heads-up WITH the entry card. It used to run detached and could
   // land mid-turn, reading like the agent said it (feedback.md F17) — so wait
   // for it, but bounded: advisory reads must not hold the prompt hostage.
@@ -3188,21 +5028,147 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
     };
 
-  irq.brake = makeBrake(() => s.client, out, displacedSeat, () => seatPromptPending);
-  // What the agent says on its own (a background job finished, a reminder
-  // came due) arrives at any time. At the session prompt it prints above the
-  // prompt; during a command, a chat turn or any other question it waits for
-  // the next session prompt, so it never lands inside a reply.
+  // At the prompt its line goes above it, and the prompt stays.
+  irq.brake = makeBrake(() => s.client, (l) => (atPrompt ? printAbovePrompt(l.replace(/^\n+/, '')) : out(l)), displacedSeat, () => seatPromptPending);
+  // What the agent says on its own (notices: a background job finished, a
+  // reminder came due) and the files it leaves arrive at any time. At the
+  // session prompt they print above the prompt; during a command, a chat
+  // turn or any other question they wait for the next session prompt, so
+  // they never land inside a reply, and the prompt counts them meanwhile.
   let atPrompt = false;
-  const held: Array<{ text: string; shown: () => void }> = [];
-  const inbox = makeInboxFeed((text, shown) => {
+  const held: Array<{ text: string; shown: () => void; notices: number; files: number; raw: boolean }> = [];
+  const terminal = !!activeRl?.terminal;
+  // New files from the agent are saved by themselves (on a terminal, unless
+  // /files auto off): checked when a turn ends and every 30 s.
+  let filesAuto = loadConfig().filesAuto !== 'off';
+  const outbox: OutboxSync | null = terminal && /^\d+$/.test(s.agentId)
+    ? makeOutboxSync({
+        agentId: s.agentId,
+        list: () => s.client!.listFiles!('outbox'),
+        download: (name) => s.client!.downloadFile!('outbox', name),
+        auto: () => filesAuto,
+        ...(s.client?.deleteFile ? { remove: (name: string) => s.client!.deleteFile!('outbox', name) } : {}),
+      })
+    : null;
+  const counts = (): PromptCounts => ({
+    notices: held.reduce((n, h) => n + h.notices, 0),
+    files: held.reduce((n, h) => n + h.files, 0) + (outbox?.unseen() ?? 0),
+  });
+  const screen: SessionScreen = {
+    prompt: (busy) => sessionPromptText(s.agentId, sessionLabel(s), busy, terminal ? counts() : { notices: 0, files: 0 }),
+    turn: null,
+    turnRan: false,
+  };
+  s.screen = screen;
+  // Under the Ink view the counts are on its status row, the agent in its footer.
+  // Its footer also says when the agent is not running, and the way out.
+  if (activeInk) {
+    activeInk.context = {
+      agent: () => `agent ${s.agentId}${sessionLabel(s)}`,
+      counts: () => promptStatus(counts()).replace(/^ · /, ''),
+      state: () => {
+        const note = phaseNote(s.phase, s.failure);
+        return s.stale ? `${note ? `${note} · ` : ''}attestor unreachable` : note;
+      },
+    };
+  }
+  // What the prompt counts changed: the prompt on screen says so.
+  const recount = (): void => {
+    if (activeInk) activeInk.refresh();
+    else if (atPrompt) (ask as Ask).retitle?.(`\n${screen.prompt(false)}`);
+    else screen.turn?.refresh();
+  };
+  // Above the prompt now, or held for the next one. raw: the shell's own
+  // text (a link in it), its parts cleaned where it was made.
+  const show = (text: string, shown: () => void, what: { notices?: number; files?: number; raw?: boolean }): void => {
     if (atPrompt) {
       printAbovePrompt(text);
       shown();
-    } else {
-      held.push({ text, shown });
+      return;
     }
-  });
+    held.push({ text, shown, notices: what.notices ?? 0, files: what.files ?? 0, raw: !!what.raw });
+    recount();
+  };
+  const inbox = makeInboxFeed((text, shown, count) => show(text, shown, { notices: count }));
+  // Under the Ink view the footer follows the phase while the agent is not
+  // running: re-read quietly while the prompt is up (connecting once it runs).
+  let phaseBusy = false;
+  const phaseTimer = activeInk
+    ? setInterval(() => {
+        if (!atPrompt || s.client || phaseBusy) return;
+        phaseBusy = true;
+        refreshSession(s, 'never').then(
+          () => inbox.follow(s.client),
+          () => { s.stale = true; activeInk?.refresh(); },
+        ).finally(() => { phaseBusy = false; });
+      }, PHASE_POLL_MS)
+    : null;
+  phaseTimer?.unref();
+  // While the prompt is idle and the agent is believed running, its phase is
+  // re-read now and then (one attestor read), so a stop made elsewhere shows
+  // without a key press. Not during a turn or a command; slower after errors.
+  let phaseWait = PHASE_WATCH_MS;
+  let phaseWatch: NodeJS.Timeout | null = null;
+  const watchPhase = (): void => {
+    phaseWatch = setTimeout(() => {
+      void (async () => {
+        let ok = true;
+        if (atPrompt && s.client) {
+          try {
+            const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`, { signal: AbortSignal.timeout(10_000) })).json()) as { phase?: string };
+            if (d.phase && d.phase !== 'running' && atPrompt && s.client) {
+              // Under the Ink view its footer says so (refreshSession redraws it).
+              await refreshSession(s, 'never');
+              if (s.phase !== 'running' && !activeInk) printAbovePrompt(phaseMovedText(s.phase));
+            }
+          } catch { ok = false; }
+        }
+        phaseWait = nextPhaseWait(phaseWait, ok);
+        if (phaseWatch) watchPhase();
+      })();
+    }, phaseWait);
+    phaseWatch.unref();
+  };
+  if (terminal || activeInk) watchPhase();
+  // An interrupted turn sends nothing on its own: what was queued during it
+  // comes back to be edited at the next prompt.
+  screen.interrupted = (extra: readonly string[] = []): string => {
+    // A message with a dragged file comes back with the file staged and its
+    // name where the path was (`[image: cat.png]`), as when it was sent.
+    const attached: string[] = [];
+    const form = (text: string): string => {
+      if (!s.client?.uploadFile) return text;
+      const parts = findDroppedFiles(text);
+      if (!parts.some((p) => typeof p !== 'string')) return text;
+      const r = stageDropped(parts, (s.attached ??= []), (one) => attached.push(cleanCell(one.name)));
+      return 'refused' in r ? text : r.text;
+    };
+    const n = (ask as Ask).recallAll?.(extra, form) ?? 0;
+    const files = attached.length ? `, ${attached.join(', ')} attached` : '';
+    return n ? `(${n === 1 ? 'your message is' : `${n} of your messages are`} back to edit, not sent${files} — Enter sends)` : '';
+  };
+  // What waited prints before the prompt comes up.
+  const flushHeld = (): void => {
+    for (const h of held.splice(0)) {
+      if (h.raw) term(h.text);
+      else out(h.text);
+      h.shown();
+    }
+  };
+  const links = supportsHyperlinks();
+  // The files saved by themselves in this session, for /files.
+  const savedHere: string[] = [];
+  const checkOutbox = (): void => {
+    if (!outbox || !s.client?.listFiles || !s.client.downloadFile) return;
+    outbox.check().then((events) => {
+      for (const e of events) if (e.kind === 'saved') savedHere.push(cleanCell(e.name));
+      for (const e of events) show(renderOutboxEvent(e, links), () => undefined, { files: e.kind === 'saved' ? 1 : 0, raw: true });
+      recount();
+    }, () => undefined /* an agent without downloads, or unreachable: the next check */);
+  };
+  const outboxTimer = outbox ? setInterval(checkOutbox, OUTBOX_POLL_MS) : null;
+  outboxTimer?.unref();
+  checkOutbox();
   // A friendly message that hides WHICH failure happened costs a whole
   // debugging round trip: "no headers ever arrived" and "the stream was cut
   // mid-way" have different causes and used to print identically. Append the
@@ -3218,74 +5184,28 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   // prompt; what the owner decided goes to the agent as the next message.
   const credLater = new Set<string>();
   const queued: string[] = [];
-  try {
-  for (;;) {
-    activeCompletions = L2_WORDS;
-    activeArgs = L2_ARGS;
-    sessionSealId = s.sealId;
-    // While not connected (deploying/stopped/offline) the phase is in flux —
-    // auto-refresh before every prompt, printing only when it moves (and
-    // connecting the moment it reaches running). Once connected, skip: no
-    // per-chat-line attestor round-trip; bare Enter stays the manual refresh.
-    if (!s.client) { try { await refreshSession(s, true); } catch { /* prompt anyway */ } }
-    inbox.follow(s.client);
-    for (const h of held.splice(0)) {
-      out(h.text);
-      h.shown();
-    }
-    if (s.client && s.url && !queued.length) {
-      const ac = new AbortController();
-      irq.streaming = ac; // Esc stops waiting for a login
-      try {
-        const ag = await withWallet(ctx);
-        const tell = await answerPending(ag, s.sealId, { ...credIO(ask), ask: (ask as Ask).fresh ?? ask }, {
-          agentUrl: await ownerRouteUrl(ag, s), later: credLater, tokenize, signal: ac.signal,
-        });
-        if (tell.length) queued.push(tell.join('\n'));
-      } catch (e) {
-        // No owner wallet here: nothing to decide. Anything else the owner
-        // must see (a decision that did not go through).
-        if (!(e instanceof CliError && e.code === 'WALLET_REQUIRED')) {
-          out(`\n(credential requests: ${cleanCell(e instanceof Error ? e.message : String(e))})\n`);
-        }
-      } finally {
-        irq.streaming = null;
-      }
-    }
-    let line: string;
-    // A message of several lines, or a pasted one, goes to the agent as it
-    // is: never a command, whatever its first line starts with.
-    let asMessage = false;
-    if (queued.length) {
-      line = queued.shift()!;
-      out(`\nagent ${s.agentId}${sessionLabel(s)} › ${line}\n`);
-    } else {
-      atPrompt = true;
-      try {
-        const q = `\nagent ${s.agentId}${sessionLabel(s)} › `;
-        const entry = (ask as Ask).message ? await (ask as Ask).message!(q) : { text: await ((ask as Ask).main ?? ask)(q), multi: false, pasted: false };
-        line = entry.text.trim();
-        asMessage = entry.multi || entry.pasted;
-      } finally {
-        atPrompt = false;
-      }
-    }
-    if (!line) {
-      // Bare Enter = live status refresh (phase moves on its own during
-      // deploying/provisioning; the entry card only showed the initial one).
-      try { await refreshSession(s); } catch { out(`  phase   ${s.phase} (refresh failed — attestor unreachable)\n`); }
-      continue;
-    }
+  /**
+   * One entry as the session's command: 'next' once a command ran, 'back'
+   * for /back, 'chat' when it goes to the agent (`message`: several lines or
+   * a paste, never a command). Run from the prompt, and while a turn runs for
+   * a command that only reads (busyEntries).
+   */
+  const runCommand = async (line: string, message: boolean): Promise<'next' | 'back' | 'chat'> => {
+    let chat = false;
+    // A command ends with `continue`: this loop runs once, so that ends it.
+    do {
     commands: {
-    if (asMessage) break commands;
-    if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
-    if (line === '/quit' || line === '/exit') { process.exit(0); }
-    if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
+    if (message) break commands;
+    if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return 'back'; }
+    if (line === '/quit' || line === '/exit') { await quitShell(0); }
+    if (line === '/help') { for (const l of helpRows(L2_HELP_FULL, wrapWidth())) out(`${l}\n`); continue; }
 
     try {
-      if (line === '/hello') {
+      if (line === '/hello' || line.startsWith('/hello ')) {
+        const view = line.slice('/hello'.length).trim();
+        if (view && view !== 'full') { out('usage: /hello [full]\n'); continue; }
         if (s.phase !== 'running' || !s.url) { out(`agent is ${s.phase} — not reachable; /start or /reset first\n`); continue; }
-        await showHello(s.ag, s.url);
+        await showHello(s.ag, s.url, { full: view === 'full', more: '/hello full' });
         continue;
       }
       if (line === '/balance') {
@@ -3316,14 +5236,21 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             continue;
           }
         }
-        const amt = line.split(/\s+/)[1] || (await ask('  amount OG [0.1]: ')).trim() || '0.1';
-        const tx = await s.ag.agent.topUpAgentSeal(s.agentSeal, parseEther(amt));
-        out(`topUpAgentSeal(${s.agentSeal}, ${amt} OG) → ${tx} (waiting…)\n`);
-        // Parity with L1 `deposit`: return only once the chain agrees, so an
-        // immediate /balance shows the new number (feedback.md S2).
-        await s.ag.agent.waitForTransaction(tx);
-        const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId)).catch(() => null);
-        out(rc ? `confirmed — agentSeal gas now ${og(rc.sealGasWei)}\n` : 'confirmed\n');
+        // A money question has no default: Enter cancels it.
+        const given = line.split(/\s+/)[1];
+        const amountWei = given ? parseOgAmount(given) : await askAmount(ask, '  top up how much OG? [Enter cancels]: ');
+        if (amountWei === null) { out('top-up cancelled\n'); continue; }
+        const seal = s.agentSeal;
+        // The transaction and its receipt: a wait, keys set aside (plain prompt).
+        await duringWait(async () => {
+          const tx = await s.ag.agent.topUpAgentSeal(seal, amountWei);
+          out(`sending ${ogAmount(amountWei)} OG to agent ${s.agentId}'s gas wallet ${seal} (tx ${tx}, waiting…)\n`);
+          // Parity with L1 `deposit`: return only once the chain agrees, so an
+          // immediate /balance shows the new number (feedback.md S2).
+          await s.ag.agent.waitForTransaction(tx);
+          const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId)).catch(() => null);
+          out(rc ? `confirmed — agentSeal gas now ${og(rc.sealGasWei)}\n` : 'confirmed\n');
+        });
         continue;
       }
       if (line === '/stop') {
@@ -3350,13 +5277,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (s.phase === 'running') { out('already running\n'); continue; }
         if (s.phase !== 'stopped' || !s.sandboxId) { out(`agent is ${s.phase} — a plain start cannot revive it; use /reset\n`); continue; }
         if (!(await ensureOwnerReady(s.ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
-        out('starting… (Esc cancels the wait)\n');
+        out('starting…\n');
         const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
         await s.ag.agent.start(s.sealId, s.sandboxId);
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
         if (!r) continue;
         await connectSession(s, r.url);
-        out(`running at ${s.url}\n`); continue;
+        out('running — type to chat\n'); continue;
       }
       if (line === '/reset' || line === '/reset pick') {
         // Known framework (the attestor row remembers it, or this session
@@ -3374,14 +5301,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const key = await resetModelKey(s.ag.credentials, s.sealId, provider, s.framework, keyPrompt(ask));
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         await applyResetInference(s.ag, s.sealId, plan, out);
-        out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
+        out(`resetting as ${s.framework}…\n`);
         const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
         await s.ag.agent.reset(s.sealId, { provider, framework: s.framework, ...key, onWarn: (w) => out(`⚠ ${w}\n`) });
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
         if (!r) continue;
         await s.ag.credentials.resyncModelKey(s.sealId, { agentUrl: r.url }).catch(() => undefined);
         await connectSession(s, r.url);
-        messages.length = 0; out(`back up at ${s.url}\n`); continue;
+        messages.length = 0; out('back up — type to chat\n'); continue;
       }
       if (line === '/clear') {
         // Wipe the agent's persisted conversation (server-side) and this
@@ -3438,7 +5365,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           else if (status === 409) out(`compact refused: ${msg.replace(/^compactConversation: HTTP 409: /, '').trim()}\n`);
           else if (failed) out(`${failed[1].trim()}\n`);
           else if (unanswered) out(`no answer yet (${status ? `HTTP ${status} from a gateway on the way` : cause}); the agent may still be compacting — /startuplog shows the outcome (a "compact:" line). Wait for it before sending /compact again.\n`);
-          else out(`compact failed: ${msg}${cause ? ` (${cause})` : ''}\n`);
+          else out(`compact failed: ${plainError(new Error(msg))}${cause ? ` (${cause})` : ''}\n`);
         }
         continue;
       }
@@ -3533,9 +5460,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // override claiming a level the agent was never given.
         if (written?.thinking === arg) {
           s.thinking = arg as ThinkingLevel;
-          out(s.framework === 'prime-agent'
-            ? '  this framework also takes it per message, so your next message uses it already\n'
-            : '  /reset applies it now; otherwise it lands at the agent\'s next boot\n');
+          // Where it applies is said above (written, and pushed to a running agent).
+          if (s.framework === 'prime-agent') out('  this framework also takes it per message, so your next message uses it already\n');
         }
         continue;
       }
@@ -3545,31 +5471,44 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const arg = rest.join(' ').trim();
         if (!sub || sub === 'list') {
           const list = await s.client.sessions();
-          const cur = s.sessionId ?? 'owner-chat';
-          for (const x of list) {
-            out(`${x.id === cur ? '*' : ' '} ${x.id.padEnd(42)} ${x.state.padEnd(8)} ${cleanCell(x.title || (x.kind === 'owner' ? 'owner chat' : ''))}\n`);
-          }
-          out('/sessions new [title] · switch <id|title> · fork [id] · default\n');
+          sessionsSeen = list;
+          sessionsShown = shownSessions(list);
+          for (const l of renderSessionList(list, s.sessionId ?? 'owner-chat', Date.now(), wrapWidth())) out(`${l}\n`);
+          out('/sessions switch <#|id|title> · new [title] · fork [id] · default\n');
           continue;
         }
         if (sub === 'new' || sub === 'fork') {
           const src = sub === 'fork' ? (arg || s.sessionId || 'owner-chat') : undefined;
           const made = await s.client.createSession!({ ...(sub === 'new' && arg ? { title: arg } : {}), ...(src ? { fork: src } : {}) });
           s.sessionId = made.id; s.sessionTitle = made.title || (src ? `fork of ${src}` : '');
-          out(`→ ${made.id}${src ? ` (history of ${src})` : ''}: chat now goes to this session\n`);
+          const short = cleanCell(shortSessionId(made.id));
+          out(`→ ${made.title ? `${cleanCell(made.title)} · ${short}` : src ? `a copy of ${src === 'owner-chat' ? 'owner-chat' : 'that session'} · ${short}` : `a new session · ${short} (titled by your first message)`}: chat now goes there\n`);
           continue;
         }
         if (sub === 'default') { s.sessionId = undefined; s.sessionTitle = undefined; out('→ owner-chat\n'); continue; }
         if (sub === 'switch') {
-          if (!arg) { out('usage: /sessions switch <id|title>\n'); continue; }
+          if (!arg) { out('usage: /sessions switch <#|id|title>\n'); continue; }
           const list = await s.client.sessions();
-          const hit = list.find((x) => x.id === arg) ?? list.filter((x) => x.id.startsWith(arg) || x.title.toLowerCase().includes(arg.toLowerCase()))[0];
-          if (!hit) { out(`no session matches ${cleanCell(arg)}\n`); continue; }
+          sessionsSeen = list;
+          const picked = pickSession(list, arg, sessionsShown);
+          let hit = picked.hit;
+          if (picked.gone) { out(`#${picked.number} in the list you saw (${cleanCell(picked.gone.title)}) is gone — /sessions lists them again\n`); continue; }
+          if (!hit && picked.number !== undefined && !sessionsShown) {
+            // No list shown in this CLI yet: show it, and ask about that number in it.
+            sessionsShown = shownSessions(list);
+            for (const l of renderSessionList(list, s.sessionId ?? 'owner-chat', Date.now(), wrapWidth())) out(`${l}\n`);
+            const row = sessionsShown[picked.number - 1];
+            if (!row) { out(`there is no #${picked.number} — /sessions switch <#> with a number above\n`); continue; }
+            const yes = await askYesNo(ask, `switch to #${picked.number}, ${row.title}? [Y/n] `, true);
+            if (!yes) continue;
+            hit = list.find((x) => x.id === row.id);
+          }
+          if (!hit) { out(picked.number !== undefined ? `there is no #${picked.number} in the list you saw — /sessions lists them\n` : `no session matches ${cleanCell(arg)}\n`); continue; }
           s.sessionId = hit.id === 'owner-chat' ? undefined : hit.id; s.sessionTitle = hit.title;
-          out(`→ ${hit.id}${hit.title ? ` (${cleanCell(hit.title)})` : ''}\n`);
+          out(`→ ${hit.id === 'owner-chat' ? 'owner-chat' : hit.title ? cleanCell(hit.title) : shortSessionId(hit.id)}\n`);
           continue;
         }
-        out('usage: /sessions [list | new [title] | switch <id|title> | fork [id] | default]\n');
+        out('usage: /sessions [list | switch <#|id|title> | new [title] | fork [id] | default]\n');
         continue;
       }
       if ((line === '/tasks' || line.startsWith('/tasks ')) && s.client?.createTask) {
@@ -3582,16 +5521,22 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // An id, or a unique start of one (with or without `task-`).
         const resolve = async (arg: string | undefined): Promise<string | null> => {
           if (!arg) { out('which task? give its id (/tasks lists them)\n'); return null; }
-          if (/^(task-[a-z0-9][a-z0-9-]{0,62}|session-[a-z0-9][a-z0-9-]{0,90})$/.test(arg)) return arg;
-          const hits = (await c.listTasks!({ limit: 500 })).filter((t) => t.id.startsWith(arg) || t.id.startsWith(`task-${arg}`));
+          if (/^session-[a-z0-9][a-z0-9-]{0,90}$/.test(arg)) return arg;
+          // The full id, or a unique start of one (`task-` may be left out).
+          const list = await c.listTasks!({ limit: 500 }).catch(() => null);
+          if (!list) return arg; // the list could not be read: the id as given
+          if (list.some((t) => t.id === arg)) return arg;
+          const hits = list.filter((t) => t.id.startsWith(arg) || t.id.startsWith(`task-${arg}`));
           if (hits.length === 1) return hits[0].id;
-          out(hits.length ? `${hits.length} tasks start with ${cleanCell(arg)} — give more of the id\n` : `no task ${cleanCell(arg)}\n`);
+          out(hits.length ? `${hits.length} tasks start with ${cleanCell(arg)} — give more of the id\n` : `no task ${cleanCell(arg)} — /tasks lists them\n`);
           return null;
         };
         if (sub === 'list' || sub === 'all') {
-          const list = (await c.listTasks!({ limit: 50 })).filter((t) => sub === 'all' || t.state !== 'archived');
+          const all = await c.listTasks!({ limit: 50 });
+          tasksSeen = all.map((t) => t.id);
+          const list = all.filter((t) => sub === 'all' || t.state !== 'archived');
           if (!list.length) { out('no tasks yet — /tasks new <what to do>\n'); continue; }
-          for (const l of renderTaskTable(list, Date.now())) out(`${l}\n`);
+          for (const l of renderTaskTable(list, Date.now(), (process.stdout.columns || 80) - 1)) out(`${l}\n`);
           out('/tasks show <id> · input <id> [next] <text> · cancel <id> · archive <id>\n');
           continue;
         }
@@ -3599,7 +5544,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const prompt = after(1);
           if (!prompt) { out('usage: /tasks new <what to do>\n'); continue; }
           const { task } = await c.createTask!({ prompt });
-          out(`task ${cleanCell(task.id)} — ${cleanCell(task.state)}, workspace ${cleanCell(task.workspace.path)}\n`);
+          const short = shortIds([cleanCell(task.id)])[0];
+          out(`task ${short} — ${cleanCell(task.state)} (/tasks show ${short})\n`);
           continue;
         }
         if (sub === 'show') {
@@ -3637,8 +5583,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (s.client?.activities) {
           const list = await s.client.activities({ limit: 30 });
           if (!list.length) { out('nothing has run on this agent yet\n'); continue; }
-          for (const l of renderActivityTable(list, Date.now())) out(`${l}\n`);
-          out('/result <id> shows one · /cancel <id> stops one · /cancel all stops everything running\n');
+          for (const l of renderActivityTable(list, Date.now(), (process.stdout.columns || 80) - 1)) out(`${l}\n`);
+          out('/result <id> shows one · /cancel <id> stops one (an id as listed) · /cancel all stops everything running\n');
           continue;
         }
         if (line === '/activities') { out('(this agent has no activity list — /tasks shows this session\'s long tasks)\n'); continue; }
@@ -3668,19 +5614,32 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (line === '/result' || line.startsWith('/result ')) {
         // A background command or a subagent is not a turn: its record is
         // the activity list's, and it has no stream to follow.
-        const named = line.split(/\s+/)[1];
+        let named = line.split(/\s+/)[1];
+        // An id, or a unique start of one, from the agent's activity list.
+        if (named && s.client?.activity && s.client.activities) {
+          const known = await s.client.activity(named).then(() => true, () => false);
+          if (!known) {
+            const hits = (await s.client.activities({ limit: 200 }).catch(() => [])).filter((a) => a.id.startsWith(named!));
+            if (hits.length !== 1) {
+              out(hits.length ? `${hits.length} start with ${cleanCell(named)} — give more of the id\n` : `nothing with the id ${cleanCell(named)} — /activities lists them\n`);
+              continue;
+            }
+            named = hits[0].id;
+          }
+        }
         if (named && s.client?.activity) {
           const t = await s.client.activity(named).catch(() => null);
           if (t && t.type !== 'turn') {
-            out(`${cleanCell(t.id)} — ${cleanCell(t.status)} · by ${cleanCell(t.actor)} · ${cleanCell(t.label)}\n`);
+            out(`${shortIds([cleanCell(t.id)])[0]} — ${cleanCell(t.status)} · by ${cleanCell(t.actor)} · ${cleanCell(t.label)}\n`);
             if (t.output_text) out(`${cleanStream(t.output_text)}\n`);
-            else if (t.type === 'command') out('(a command\'s output goes to the agent, which reports on it when the command finishes — /inbox)\n');
+            else if (t.type === 'command') out('(a command\'s output goes to the agent, which reports on it in a notice when the command finishes — /inbox)\n');
             if (t.error) out(`error: ${cleanCell(t.error)}\n`);
             continue;
           }
         }
         if (!s.client?.task || !s.client.followTask) { out('(this agent has no task surface)\n'); continue; }
-        const id = named ?? s.tasks?.[s.tasks.length - 1]?.id;
+        // Bare: the newest turn of the session chat goes to now.
+        const id = named ?? [...(s.tasks ?? [])].reverse().find((t) => t.session === s.sessionId)?.id;
         if (!id) { out('no task to show — /result <id>, or start one by chatting\n'); continue; }
         // Adopt an explicitly-named id into this session's task memory: the
         // id may come from another window, a /tasks listing before a restart,
@@ -3692,12 +5651,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const snap = await s.client.task(id).catch(async (e: Error) => {
           // DEFENSIVE: ungated GET (see /tasks) — routed in case the gate widens
           if ((await displacedSeat(e.message ?? '', `retry /result ${id}`)) !== null) return null;
-          out(`(${e.message})\n`);
+          out(`(${cleanCell(plainError(e))})\n`);
           return null;
         });
         if (!snap) continue;
         if (snap.status === 'completed' || snap.status === 'cancelled' || snap.status === 'failed') {
-          out(`task ${id} — ${snap.status}\n`);
+          out(`task ${shortIds([cleanCell(id)])[0]} — ${cleanCell(snap.status)}\n`);
           if (snap.output_text) out(`${cleanStream(snap.output_text)}\n`);
           if (snap.error) out(`error: ${cleanCell(snap.error.message)}\n`);
           continue;
@@ -3706,19 +5665,40 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // (followTask starts at sequence 0), so don't pre-print the snapshot.
         // Esc here stops WATCHING only (the deliberate stop stays on the chat
         // turn's Esc / the task's cancel).
-        out(`task ${id} — ${snap.status}; following (esc stops watching, not the task; then /cancel ${id} stops it)\nagent> `);
+        const shortId = shortIds([cleanCell(id)])[0];
+        out(`task ${shortId} — ${cleanCell(snap.status)}; following (Esc stops watching, not the task; then /cancel ${shortId} stops it)\n`);
         const ac = new AbortController();
         irq.streaming = ac;
+        // What the owner enters meanwhile goes into it, as into any running
+        // owner turn; what it does not read is answered after, and followed.
+        const after: FollowUp[] = [];
+        let steering: Steering | null = null;
+        const view = openTurn(s, () => steering?.texts ?? [], !!(s.client.steer && process.stdin.isTTY), () => steering?.next ?? []);
+        steering = makeSteering(view, after);
+        if (process.stdin.isTTY) { (ask as Ask).whileBusy?.(busyEntries(view, steering)); (ask as Ask).held = steering?.held ?? null; }
+        view.write('agent> ');
+        let stopped = false;
         try {
-          for await (const delta of s.client.followTask(id, { signal: ac.signal })) out(cleanStream(delta));
+          const onActivity = (label: string): void => {
+            if (label === 'steer received') readNote(view, steering?.read());
+            else view.activity?.(label);
+          };
+          for await (const delta of s.client.followTask(id, { signal: ac.signal, onActivity })) view.write(delta);
+          view.end();
           out('\n');
         } catch (e) {
-          out(ac.signal.aborted
-            ? `\n(stopped watching — the task continues; /result re-attaches, then /cancel ${id} stops it)\n`
+          view.end();
+          stopped = ac.signal.aborted;
+          out(stopped
+            ? `\n(stopped watching — the task continues; /result re-attaches, then /cancel ${shortIds([cleanCell(id)])[0]} stops it)\n`
             : `\n(${(e as Error).message})\n`);
         } finally {
+          view.end();
           irq.streaming = null;
+          (ask as Ask).whileBusy?.(null); (ask as Ask).held = null;
         }
+        if (!stopped) await steering?.settle(after);
+        await followUps(after);
         continue;
       }
       if (line === '/cancel' || line.startsWith('/cancel ')) {
@@ -3734,6 +5714,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (id && s.client.stopActivity && s.client.stopAllActivities) {
           for (;;) {
             try {
+              // An id as /activities lists it: a unique start of one.
+              if (id !== 'all' && s.client.activities) {
+                const list = await s.client.activities({ limit: 200 }).catch(() => null);
+                const hits = list?.filter((a) => a.id.startsWith(id!)) ?? [];
+                if (list && !list.some((a) => a.id === id) && hits.length === 1) id = hits[0].id;
+                else if (list && hits.length > 1 && !list.some((a) => a.id === id)) { out(`${hits.length} activities start with ${cleanCell(id)} — give more of the id\n`); break; }
+              }
               const stopped = id === 'all' ? await s.client.stopAllActivities() : [await s.client.stopActivity(id)];
               if (!stopped.length) out('nothing running\n');
               for (const x of stopped) out(`⏹ ${cleanCell(x.id)} — ${STOP_OUTCOME[x.outcome] ?? x.outcome}\n`);
@@ -3751,7 +5738,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           continue;
         }
         if (!id && s.client?.task) {
-          if (!s.tasks?.length) { out('no task id given and none started from this session — /cancel <id>, or /tasks to list (after a CLI restart or /back+use, this session starts empty)\n'); continue; }
+          if (!s.tasks?.length) { out(`no task id given and none started from this session — /cancel <id>, or ${s.client.activities ? '/activities' : '/tasks'} to list (after a CLI restart or /back+use, this session starts empty)\n`); continue; }
           // Fetch live statuses; a fetch FAILURE is not "not in flight" —
           // only a 404 means the record is gone. Anything else (network
           // error, 5xx, 401, 409) means we could not CHECK, and the honest
@@ -3780,7 +5767,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // the newest would leave an older running turn alive (0g-harness and
           // prime serialize turns, so a queued one is waiting on the running one).
           const inFlight = inFlightIds(rows);
-          if (!inFlight.length) { out('nothing in flight from this session — /tasks to list; a finished task cannot be cancelled\n'); continue; }
+          if (!inFlight.length) { out(`nothing in flight from this session — ${s.client.activities ? '/activities' : '/tasks'} to list; a finished task cannot be cancelled\n`); continue; }
           if (s.client?.cancelTask) {
             let seatGone = false;
             for (const tid of inFlight) {
@@ -3836,15 +5823,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (await routeTaskFailure(out, displacedSeat, e, `(interrupt failed: ${(e as Error).message})\n`, 'retry the interrupt') !== 'raw') return null;
           return null;
         });
-        if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing to stop, or: ${cleanCell(r.note ?? 'not supported')})\n`);
+        if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing was running${r.note && !/nothing|no task|not running/i.test(r.note) ? ` — ${cleanCell(r.note)}` : ''})\n`);
         continue;
       }
-      if (line === '/inbox' || line === '/inbox all') {
+      if (line === '/inbox' || line === '/inbox all' || line === '/notices' || line === '/notices all') {
         if (!s.client) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
-        if (!s.client.inbox) { out('(no inbox on this agent: its framework does not run work in the background)\n'); continue; }
-        const all = line === '/inbox all';
+        if (!s.client.inbox) { out('(no notices on this agent: its framework does not run work in the background)\n'); continue; }
+        const all = line.endsWith(' all');
         const page = await s.client.inbox(all ? { after: 0 } : {});
-        if (!page.data.length) { out(all ? 'the inbox is empty\n' : 'no new messages — /inbox all shows the ones already read\n'); continue; }
+        if (!page.data.length) { out(noNoticesText(all)); continue; }
         out(page.data.map(renderInboxMessage).join('\n'));
         const through = Math.max(...page.data.map((m) => m.seq));
         if (through > page.read_through) await s.client.ackInbox?.(through).catch(() => undefined);
@@ -3882,42 +5869,416 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (staged.length) out('your next message carries them\n');
         continue;
       }
+      if (line === '/files auto' || line.startsWith('/files auto ')) {
+        // Whether new files from the agent are saved by themselves: this
+        // CLI's setting (config.json filesAuto), for every agent.
+        const to = line.slice('/files auto'.length).trim();
+        if (to && to !== 'on' && to !== 'off') { out('usage: /files auto [on|off]\n'); continue; }
+        if (to) {
+          filesAuto = to === 'on';
+          saveConfig({ filesAuto: filesAuto ? undefined : 'off' });
+        }
+        const where = outbox ? tildePath(outbox.dir) : `~/agentdna/${cleanCell(s.agentId)}/outbox`;
+        out(filesAuto
+          ? `new files the agent leaves for you are saved to ${where} by themselves${terminal ? '' : ' (when the session runs on a terminal)'} — /files auto off stops that\n`
+          : 'new files the agent leaves for you are not saved by themselves: the prompt counts them, /files lists them, /download saves one — /files auto on saves them again\n');
+        if (to) checkOutbox();
+        continue;
+      }
       if (line === '/files' || line.startsWith('/files ') || line === '/download' || line.startsWith('/download ')) {
         if (!s.client) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
         if (!s.client.listFiles || !s.client.downloadFile) { out('(this agent hands over no files: its framework has no files route — 0g-harness does)\n'); continue; }
         if (line === '/files' || line.startsWith('/files ')) {
           const which = line.slice('/files'.length).trim();
-          if (which && which !== 'inbox' && which !== 'outbox') { out('usage: /files [inbox]\n'); continue; }
+          if (which && which !== 'inbox' && which !== 'outbox') { out('usage: /files [inbox|auto [on|off]]\n'); continue; }
           const dir = which === 'inbox' ? 'inbox' : 'outbox';
           const files = await s.client.listFiles(dir);
-          if (dir === 'outbox') outboxNames = files.map((f) => f.name);
-          if (!files.length) { out(dir === 'outbox' ? 'the outbox is empty — ask the agent to put a file in ~/outbox for you\n' : 'the file inbox is empty\n'); continue; }
+          if (dir === 'outbox') {
+            outboxNames = files.map((f) => f.name);
+            // Listed: not new any more (when they are not saved by themselves).
+            if (!filesAuto) outbox?.listed(files);
+          }
+          if (!files.length) {
+            // Saved by themselves: they leave the agent's outbox for this folder.
+            out(filesText(dir, true, dir === 'outbox' && outbox && filesAuto ? cleanCell(tildePath(outbox.dir)) : undefined, savedHere));
+            continue;
+          }
+          out(filesText(dir, false));
           for (const l of renderFiles(files)) out(`${cleanCell(l)}\n`);
-          out(`/download ${dir === 'inbox' ? 'inbox/' : ''}<name> saves one here\n`);
+          out(`/download ${dir === 'inbox' ? 'inbox/' : ''}<name> saves one here${dir === 'outbox' && outbox && filesAuto ? ` · new ones are saved to ${tildePath(outbox.dir)} by themselves` : ''}\n`);
           continue;
         }
         const args = tokenize(line.slice('/download'.length).trim());
         if (!args.length || args.length > 2) { out('usage: /download <name> [local path]\n'); continue; }
         const { dir, name } = parseDownloadName(args[0]);
-        const bytes = await s.client.downloadFile(dir, name);
+        const bytes = await s.client.downloadFile(dir, name).catch((e: Error) => {
+          if (!/HTTP 404/.test(e.message)) throw e;
+          // Saved here by itself, and gone from the agent's outbox since.
+          const local = dir === 'outbox' && outbox ? join(outbox.dir, name) : '';
+          if (local && existsSync(local)) return null;
+          throw new CliError('UNKNOWN', `no file ${name} in the agent's ${dir === 'inbox' ? 'inbox' : 'outbox'} — /files${dir === 'inbox' ? ' inbox' : ''} lists them`);
+        });
+        if (!bytes) { out(`already saved to ${cleanCell(tildePath(join(outbox!.dir, name)))}\n`); continue; }
         const saved = saveDownload(bytes, name, args[1]);
-        out(`saved ${cleanCell(name)} (${bytes.length} bytes) → ${cleanCell(saved)}\n`);
+        out(`saved ${cleanCell(name)} (${bytes.length} bytes) → ${cleanCell(tildePath(saved))}\n`);
         continue;
       }
-      if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
+      if (line.startsWith('/')) {
+        // A path (a file dragged in that is gone, a screenshot's temporary
+        // copy): said so, not taken for a command.
+        const first = line.split(/\s+/)[0];
+        if (looksLikePath(first)) { out(`file not found: ${cleanCell(basename(first.replace(/\\(.)/g, '$1')))} — nothing sent\n`); continue; }
+        out(`unknown command ${cleanCell(first)}\n${wrapWords(L2_HELP, Math.max(40, (process.stdout.columns || 80) - 1)).join('\n')}\n`);
+        continue;
+      }
     } catch (e) {
       // Show the remedy too: an error whose whole point is "do this instead"
       // (a refused settings write, a missing wallet) is useless without it.
-      const ce = e as CliError;
       if (isCancelled(e)) { out('cancelled\n'); continue; }
-      out(`error: ${ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`); continue;
+      const p = explainError(e);
+      out(`error: ${cleanCell(p.message)}${p.remedy ? `\n  → ${p.remedy}` : ''}\n`); continue;
     }
     } // commands
+    chat = true;
+    } while (false);
+    return chat ? 'chat' : 'next';
+  };
+  // ── while a turn runs ──
+  // A command that only reads runs at once, its output gathered and printed
+  // above the prompt as one block, one command at a time.
+  let readsNow: Promise<void> = Promise.resolve();
+  const runNow = (line: string, view: TurnView): void => {
+    readsNow = readsNow.then(async () => {
+      let text = '';
+      outRedirect = (t) => { text += t; };
+      try {
+        await runCommand(line, false);
+      } catch (e) {
+        text += `error: ${(e as Error).message}\n`;
+      } finally {
+        outRedirect = null;
+      }
+      const block = `${activeInk ? INK_PROMPT : ''}${line}\n${cleanStream(text)}`;
+      if (atPrompt) printAbovePrompt(block);
+      // Below what the reply has written so far: its line ends there.
+      else if (view.after) view.after(block);
+      else view.note(block);
+    });
+  };
+  /**
+   * What the owner enters while a turn runs (on a terminal). A command alone
+   * on its line never goes to the agent: one that only reads runs now, any
+   * other when the turn ends, and it says so. Other text goes into the turn
+   * where the agent takes it (`steering`), else it waits for the next turn.
+   */
+  const busyEntries = (view: TurnView, steering: Steering | null, onTake?: () => void) => (e: Entry): boolean => {
+    const t = e.text.trim();
+    if (!t) return true; // an empty Enter during a turn: nothing to send or queue
+    // A file dragged in goes with the message, which is not inserted into
+    // the turn: it waits for the next one (its path is no command either).
+    if (findDroppedFiles(t).some((p) => typeof p !== 'string')) return false;
+    if (!e.multi && !e.pasted && t.startsWith('/')) {
+      if (readOnlyCommand(t)) { runNow(t, view); return true; }
+      // A switch by number with no list shown yet: the list now, so the
+      // number counts in it when the switch runs (no question then).
+      if (/^\/sessions\s+switch\s+\d+\b/.test(t) && !sessionsShown && s.client?.sessions) runNow('/sessions', view);
+      view.note(`(${t.split(/\s+/)[0]} runs when this turn ends)`);
+      return false;
+    }
+    if (!steering) return false;
+    onTake?.();
+    steering.take(e);
+    return true;
+  };
+  /** Steering into the running owner-chat turn (0g-harness, on a terminal):
+   *  an inserted message is read before the turn's next model call. */
+  const makeSteering = (view: TurnView, after: FollowUp[]): Steering | null => {
+    const steer = s.client?.steer && process.stdin.isTTY ? s.client.steer : undefined;
+    if (!steer) return null;
+    const texts: string[] = [];
+    const next: string[] = [];
+    const unread: Array<{ id: string; text: string; turn?: string }> = [];
+    const inflight = new Set<Promise<void>>();
+    const unshow = (text: string): void => {
+      const i = texts.indexOf(text);
+      if (i >= 0) texts.splice(i, 1);
+    };
+    const back = (e: Entry, why: string): void => {
+      view.note(`(not inserted${why ? `: ${cleanCell(why)}` : ''} — it waits for the next turn)\n`);
+      (ask as Ask).later?.(e);
+      view.refresh();
+    };
+    // ↑: the newest one taken as a new message comes back only if the agent's
+    // copy (its queued response) can be cancelled; it is never copied.
+    const held = {
+      count: (): number => next.length,
+      takeBack: (): boolean => {
+        const text = next[next.length - 1];
+        if (text === undefined) return false;
+        const f = after.find((x) => x.why === 'idle' && x.texts.includes(text));
+        const c = s.client;
+        const already = (): void => view.note("(that one is already with the agent — it runs next; Esc stops it)");
+        if (!f || !c?.cancelTask) { already(); return true; }
+        void (async () => {
+          const t = c.task ? await c.task(f.id).catch(() => null) : null;
+          const ok = (!c.task || t?.status === 'queued') && await c.cancelTask!(f.id).then((r) => r.status === 'cancelled', () => false);
+          if (!ok || !next.includes(text)) { already(); return; }
+          next.splice(next.lastIndexOf(text), 1);
+          f.texts.splice(f.texts.indexOf(text), 1);
+          if (!f.texts.length) after.splice(after.indexOf(f), 1);
+          (ask as Ask).putBack?.(text);
+          view.refresh();
+        })();
+        return true;
+      },
+    };
+    return {
+      texts,
+      next,
+      held,
+      take(e) {
+        if (view.live) {
+          texts.push(e.text);
+          view.refresh();
+        } else {
+          out('\n↳ inserted — the agent reads it at its next step\n');
+        }
+        const sent = steer(e.text).then(
+          (r) => {
+            if (r.merged && r.id) { unread.push({ id: r.id, text: e.text, turn: r.turn }); return; }
+            unshow(e.text);
+            // Shown as waiting for its turn; what the agent said comes after
+            // the message, when its turn is followed (followUpNote).
+            if (r.queued) {
+              next.push(e.text);
+              view.refresh();
+              addFollowUp(after, r.queued, e.text, 'idle', { reason: r.reason });
+              return;
+            }
+            back(e, r.reason ?? '');
+          },
+          (err: Error) => { unshow(e.text); back(e, err.message); },
+        );
+        inflight.add(sent);
+        void sent.finally(() => inflight.delete(sent));
+      },
+      read() {
+        unread.shift();
+        return texts.shift();
+      },
+      // Not read when the turn ended: the agent answers it in a turn after
+      // this one, which may answer several (one follow-up, followed once).
+      async settle(list, failed) {
+        const left = unread.splice(0);
+        if (!s.client?.steerState) return;
+        for (const u of left) {
+          let st: SteerState | null = null;
+          for (let i = 0; i < 20; i++) {
+            st = await s.client.steerState(u.id).catch(() => null);
+            if (!st || st.state !== 'pending') break;
+            await new Promise((r) => setTimeout(r, 150));
+          }
+          const follow = steerFollowUp(u.turn, st);
+          if (follow) addFollowUp(list, follow, u.text, 'unread', { failed });
+        }
+      },
+      // Esc cancelled the turn: ask the agent what became of each one not
+      // read. 0g-harness drops them with the cancel (#12 on) and says so; an
+      // older one leaves them pending and gives them to its next turn, so
+      // those are not put back.
+      async stop(list) {
+        if (inflight.size) await Promise.race([Promise.allSettled([...inflight]), new Promise((r) => setTimeout(r, 3000))]);
+        texts.splice(0);
+        const left = unread.splice(0);
+        const stateOf = async (id: string): Promise<SteerState | null> => {
+          if (!s.client?.steerState) return null;
+          let st: SteerState | null = null;
+          for (let i = 0; i < 5; i++) {
+            st = await s.client.steerState(id).catch(() => null);
+            if (!st || st.state !== 'pending') break;
+            await new Promise((r) => setTimeout(r, 150));
+          }
+          return st;
+        };
+        const r = stoppedSteers(left, await Promise.all(left.map((u) => stateOf(u.id))));
+        for (const t of r.turns) addFollowUp(list, t.turn, t.text, 'unread');
+        return r;
+      },
+    };
+  };
+  /** The agent read an inserted message. */
+  const readNote = (view: TurnView, text: string | undefined): void => {
+    // Under the Ink view the message moves from the waiting rows into the transcript.
+    if (activeInk && text) { activeInk.owner(text); return; }
+    if (!view.live) { view.note('  ↳ (read)\n'); return; }
+    // A read this CLI did not insert (one left over from an earlier turn): no line.
+    if (!text) return;
+    const line = `↳ read by the agent: ${oneLine(text)}`;
+    // At this point of the reply: after what it has written so far.
+    if (view.after) view.after(line);
+    else view.note(line);
+  };
+  /** Follow the turns that answer inserted messages; more inserted while
+   *  following one join the list. */
+  const followUps = async (after: FollowUp[]): Promise<void> => {
+    for (let i = 0; i < after.length; i++) {
+      const f = after[i];
+      (s.tasks ??= []).push({ id: f.id, prompt: '(inserted)', at: Date.now() });
+      // What it answers (under the Ink view the messages go to the transcript
+      // as the owner's; at readline's prompt one line each), then what
+      // became of it.
+      if (activeInk) for (const t of f.texts) activeInk.owner(t);
+      else if (process.stdout.isTTY) for (const t of f.texts) out(`↳ ${oneLine(t)}\n`);
+      const note = followUpNote(f, !!s.client?.followTask);
+      if (note) out(`${note}\n`);
+      if (!s.client?.followTask) continue;
+      const fac = new AbortController();
+      irq.streaming = fac;
+      let steering: Steering | null = null;
+      const view = openTurn(s, () => steering?.texts ?? [], !!(s.client?.steer && process.stdin.isTTY), () => steering?.next ?? []);
+      steering = makeSteering(view, after);
+      if (process.stdin.isTTY) { (ask as Ask).whileBusy?.(busyEntries(view, steering)); (ask as Ask).held = steering?.held ?? null; }
+      const say = sayer(view);
+      let stopped = false;
+      let followFailed = false;
+      try {
+        const onActivity = (label: string): void => {
+          if (label === 'steer received') readNote(view, steering?.read());
+          else view.activity?.(label);
+        };
+        for await (const delta of s.client.followTask(f.id, { signal: fac.signal, onActivity })) say(delta);
+        view.end();
+        out('\n');
+      } catch (e) {
+        view.end();
+        stopped = fac.signal.aborted;
+        followFailed = !stopped;
+        if (stopped) {
+          // Esc stops this turn, and the ones after it for messages not read
+          // yet; those messages come back to edit.
+          const ok = await s.client.cancelTask?.(f.id).then((t) => t.status === 'cancelled' || t.status === 'completed', () => false);
+          out(ok ? '\n⏹ interrupted — the turn stopped\n' : `\n(stopped watching — it may still be running; /cancel ${f.id} stops it)\n`);
+          const left = await steering?.stop(after);
+          const rest = after.splice(i + 1).filter((r) => r.id !== f.id);
+          for (const r of rest) await s.client.cancelTask?.(r.id).catch(() => undefined);
+          for (const t of left?.read ?? []) out(`↳ read by the agent: ${oneLine(t)}\n`);
+          const back = s.screen?.interrupted?.([...(left?.back ?? []), ...rest.flatMap((r) => r.texts)]);
+          if (back) out(`${back}\n`);
+          const kept = keptNote(left?.kept ?? []);
+          if (kept) out(`${kept}\n`);
+        } else {
+          const empty = await emptyTurnText(s.client, f.id, e);
+          out(`\n${empty ?? await turnFailureText(s, (e as Error).message)}\n`);
+        }
+      } finally {
+        view.end();
+        irq.streaming = null;
+        (ask as Ask).whileBusy?.(null); (ask as Ask).held = null;
+      }
+      if (!stopped) await steering?.settle(after, followFailed);
+    }
+  };
+  // The session's lines have a history of their own (per agent): ↑ at the
+  // manager never brings back a session's /back or messages, nor the other way.
+  const rlHistory = (activeRl as unknown as { history?: string[] } | null)?.history;
+  const managerHistory = rlHistory ? [...rlHistory] : null;
+  if (rlHistory) rlHistory.splice(0, rlHistory.length, ...(sessionHistories.get(s.agentId) ?? []));
+  try {
+  for (;;) {
+    activeCompletions = L2_WORDS;
+    activeArgs = L2_ARGS;
+    if (sessionSealId !== s.sealId) {
+      sessionsSeen = [];
+      sessionsShown = null;
+      tasksSeen = [];
+      // Prefetch the session and task lists for Tab; failures just leave them empty.
+      s.client?.sessions?.().then((l) => { sessionsSeen = l; }).catch(() => undefined);
+      s.client?.listTasks?.({ limit: 50 }).then((l) => { tasksSeen = l.map((t) => t.id); }).catch(() => undefined);
+    }
+    sessionSealId = s.sealId;
+    // While not connected (deploying/stopped/offline) the phase is in flux —
+    // auto-refresh before every prompt, printing only when it moves (and
+    // connecting the moment it reaches running). Once connected, skip: no
+    // per-chat-line attestor round-trip; bare Enter stays the manual refresh.
+    if (!s.client) { try { await refreshSession(s, 'moved'); } catch { /* prompt anyway */ } }
+    inbox.follow(s.client);
+    if (screen.turnRan) {
+      screen.turnRan = false;
+      checkOutbox();
+    }
+    flushHeld();
+    if (s.client && s.url && !queued.length) {
+      const ac = new AbortController();
+      irq.streaming = ac; // Esc stops waiting for a login
+      try {
+        const ag = await withWallet(ctx);
+        const tell = await answerPending(ag, s.sealId, { ...credIO(ask), ask: (ask as Ask).fresh ?? ask }, {
+          agentUrl: await ownerRouteUrl(ag, s), later: credLater, tokenize, signal: ac.signal,
+        });
+        if (tell.length) queued.push(tell.join('\n'));
+      } catch (e) {
+        // No owner wallet here: nothing to decide. Anything else the owner
+        // must see (a decision that did not go through).
+        if (!(e instanceof CliError && e.code === 'WALLET_REQUIRED')) {
+          out(`\n(credential requests: ${cleanCell(e instanceof Error ? e.message : String(e))})\n`);
+        }
+      } finally {
+        irq.streaming = null;
+      }
+    }
+    let line: string;
+    // A message of several lines, or a pasted one, goes to the agent as it
+    // is: never a command, whatever its first line starts with.
+    let asMessage = false;
+    if (queued.length) {
+      line = queued.shift()!;
+      if (activeInk) activeInk.owner(line);
+      else out(`\nagent ${s.agentId}${sessionLabel(s)} › ${line}\n`);
+    } else {
+      // What arrived while credential requests were looked at, too.
+      flushHeld();
+      atPrompt = true;
+      try {
+        const q = activeInk ? INK_PROMPT : `\n${screen.prompt(false)}`;
+        const entry = (ask as Ask).message ? await (ask as Ask).message!(q) : { text: await ((ask as Ask).main ?? ask)(q), multi: false, pasted: false };
+        line = entry.text.trim();
+        asMessage = entry.multi || entry.pasted;
+      } finally {
+        atPrompt = false;
+      }
+    }
+    if (!line) {
+      // Bare Enter = live status refresh (phase moves on its own during
+      // deploying/provisioning; the entry card only showed the initial one).
+      try {
+        await refreshSession(s);
+      } catch {
+        s.stale = true;
+        if (activeInk) activeInk.refresh();
+        else out(`  phase   ${s.phase} (refresh failed — attestor unreachable)\n`);
+      }
+      continue;
+    }
+    // Files dragged into the terminal (or pasted paths) go with this message,
+    // with no /attach step (attach.ts findDroppedFiles). A line that starts
+    // with one is a message, not a command.
+    const dropped = s.client?.uploadFile ? findDroppedFiles(line) : [];
+    const carriesFiles = dropped.some((p) => typeof p !== 'string');
+    const done = await runCommand(line, asMessage || (carriesFiles && typeof dropped[0] !== 'string'));
+    if (done === 'back') return;
+    if (done === 'next') continue;
 
     // a chat turn (interruptible)
     if (!s.client) { out(`agent is ${s.phase} — /start or /reset before chatting\n`); continue; }
+    if (carriesFiles) {
+      // Each dropped file joins the staged ones (attach.ts stageDropped); one
+      // that cannot go sends nothing.
+      const r = stageDropped(dropped, (s.attached ??= []), (one) => out(`attached ${cleanCell(one.name)} (${one.image ? 'image' : 'file'})\n`));
+      if ('refused' in r) { out(`not sent: ${cleanCell(r.refused)}\n`); continue; }
+      line = r.text;
+    }
     if (s.sessionId && s.client.promptSession && s.client.followTask) {
-      await chatInSession(s, line, irq);
+      await chatInSession(s, line, irq, process.stdin.isTTY ? (v) => busyEntries(v, null) : undefined);
       continue;
     }
     if (!s.client.chatStream) { out('(chat unavailable on this agent)\n'); continue; }
@@ -3928,7 +6289,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     let images: ChatImage[] = [];
     if (s.attached?.length) {
       try {
-        ({ text: sent, images } = await prepareAttachments(s.attached, line, s.client, (a, path) => out(`uploaded ${cleanCell(a.name)} → ${cleanCell(path)}\n`)));
+        ({ text: sent, images } = await prepareAttachments(s.attached, line, s.client, (a) => out(`uploaded ${cleanCell(a.name)}\n`)));
       } catch (e) {
         out(`not sent: ${cleanCell((e as Error).message)} — the attachments stay staged (/attach lists them)\n`);
         continue;
@@ -3940,13 +6301,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // does; 0g-harness and the prime bridge ignore it). Send it when known, omit it
     // otherwise — and only if the framework rejects that, ask once and retry.
     let retriedWithPick = false;
-    // Inserted texts this turn did not read: each runs as a turn of its own
-    // on the agent, followed here once this turn ends.
-    const afterTurn: string[] = [];
+    // The turns that answer messages inserted into this one and not read
+    // (or taken as a new message), followed here once this turn ends.
+    const after: FollowUp[] = [];
     for (;;) {
       const ac = new AbortController();
       irq.streaming = ac;
-      out('agent> ');
+      // Inserted into this turn and not read yet (texts, as typed): shown
+      // above the live prompt until the agent reads them.
+      let steering: Steering | null = null;
+      const view = openTurn(s, () => steering?.texts ?? [], !!(s.client.steer && process.stdin.isTTY), () => steering?.next ?? []);
+      // The turn's id on the responses transport (onTask).
+      let taskId: string | null = null;
+      const say = sayer(view);
       let reply = '';
       let interrupted = false;
       let failure: string | null = null;
@@ -3955,62 +6322,40 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // model thinking, tools running. One transient line keeps the wait
       // legible: a spinner, what it's doing (last activity label, or
       // "thinking" as the default guess), elapsed seconds, and the way out.
-      //     ⠹ tool/call bash… (14s · esc to interrupt)
+      //     ⠹ running a command… (14s · esc to interrupt)
       // Repainted once a second; any real output erases it. TTY only —
-      // pipes get the clean payload.
+      // pipes get the clean payload. Under the live prompt it is a row above
+      // the prompt, which itself says Esc stops.
       const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
       const turnT0 = Date.now();
       let spin = 0;
       let status = 'thinking';
-      let statusShown = false;
       let sawToolActivity = false;
-      const clearActivity = (): void => {
-        if (statusShown) { term('\r\x1b[2K'); statusShown = false; }
-      };
+      const clearActivity = (): void => view.status(null);
       const paintStatus = (): void => {
         if (!process.stdout.isTTY || ac.signal.aborted) return;
-        // Never overwrite the agent's own partial line — break to a fresh
-        // one first (the visual break marks where the status began).
-        if (!statusShown && reply && !reply.endsWith('\n')) out('\n');
         const secs = Math.floor((Date.now() - turnT0) / 1000);
         spin = (spin + 1) % SPIN.length;
-        term(`\r\x1b[2K  ${cleanCell(`${SPIN[spin]} ${status}… (${secs}s · esc to interrupt)`)}`);
-        statusShown = true;
+        // Never over the agent's own partial line: break to a fresh one
+        // first (the visual break marks where the status began).
+        view.status(`${SPIN[spin]} ${status}… (${secs}s${view.live ? (view.stopHint ?? '') : ' · esc to interrupt'})`, !!reply && !reply.endsWith('\n'));
       };
       // Steering (0g-harness, on a terminal): a message the owner finishes
       // while the turn runs goes into it, read before its next model call. A
-      // command alone on its line, or an empty Enter, waits for the next
-      // prompt as before.
-      const steered: string[] = []; // inserted into this turn, not read yet
-      const steer = s.client.steer && process.stdin.isTTY ? s.client.steer : undefined;
-      if (steer) {
-        (ask as Ask).whileBusy?.((e) => {
-          if (!steerable(e)) return false;
-          clearActivity();
-          out('\n↳ inserted — the agent reads it at its next step\n');
-          steer(e.text).then(
-            (r) => {
-              if (r.merged && r.id) { steered.push(r.id); return; }
-              if (r.queued) afterTurn.push(r.queued);
-              out(`(${cleanCell(r.reason ?? 'no turn of yours is running')} — it goes as a turn of its own)\n`);
-            },
-            (err: Error) => {
-              out(`(not inserted: ${cleanCell(err.message)} — it waits for the next prompt)\n`);
-              (ask as Ask).later?.(e);
-            },
-          );
-          return true;
-        });
-      }
+      // command alone on its line never does (busyEntries); an empty Enter
+      // and what Tab queues wait for the next turn.
+      steering = makeSteering(view, after);
+      if (process.stdin.isTTY) { (ask as Ask).whileBusy?.(busyEntries(view, steering, clearActivity)); (ask as Ask).held = steering?.held ?? null; }
       const onActivity = process.stdout.isTTY
         ? (label: string): void => {
             if (label === 'steer received') {
               // The agent read an inserted message.
               clearActivity();
-              out('  ↳ (read)\n');
-              steered.shift();
+              readNote(view, steering?.read());
               return;
             }
+            // A view that sums up the turn's tool calls sees every label.
+            view.activity?.(label);
             // "did work this turn" detector, across bridges' label dialects:
             // 0g-harness "tool/call bash", prime "tool_execution_start — bash" /
             // "bash_command_start", hermes "tool/call web_search". Thinking
@@ -4018,7 +6363,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             // a failure worth reporting.
             if (/tool|bash|subagent|rlm_child/i.test(label) && label !== 'thinking') sawToolActivity = true;
             if (label.startsWith('turn/end')) { clearActivity(); return; }
-            status = cleanCell(label);
+            status = cleanCell(activityText(label));
             paintStatus();
           }
         : undefined;
@@ -4043,30 +6388,36 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           onNotice: (n: ChatNotice): void => {
             if (n.imagesSavedAsFiles?.length) {
               clearActivity();
-              out(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map(cleanCell).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);
+              view.note(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map((f) => cleanCell(basename(f))).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);
             }
             if (n.outboxFiles?.length) {
-              clearActivity();
               outboxNames = [...new Set([...n.outboxFiles, ...outboxNames])];
-              out(`\n(the agent left ${n.outboxFiles.length === 1 ? 'a file' : 'files'} for you: ${n.outboxFiles.map(cleanCell).join(', ')} — /download <name> saves ${n.outboxFiles.length === 1 ? 'it' : 'one'} here)\n`);
+              // Saved by themselves when the turn ends (checkOutbox), and said so then.
+              if (!(outbox && filesAuto)) {
+                clearActivity();
+                view.note(`\n(the agent left ${n.outboxFiles.length === 1 ? 'a file' : 'files'} for you: ${n.outboxFiles.map(cleanCell).join(', ')} — /download <name> saves ${n.outboxFiles.length === 1 ? 'it' : 'one'} here)\n`);
+              }
             }
           },
           // Responses transport only: remember the server-side task id, so
           // Esc cancels THIS task and /tasks//result can re-attach to it.
           onTask: (id: string): void => {
             s.currentTask = id;
+            taskId = id;
             (s.tasks ??= []).push({ id, prompt: line.slice(0, 60), at: Date.now() });
           },
         };
         for await (const delta of s.client.chatStream(messages, opts)) {
           clearActivity();
-          out(cleanStream(delta)); reply += delta;
+          say(delta); reply += delta;
           lastOutputAt = Date.now();
           status = 'writing';
         }
         clearActivity();
       } catch (e) {
         clearActivity();
+        // What follows prints below the turn: the live prompt goes first.
+        view.end();
         if ((e as Error).name === 'AbortError' || ac.signal.aborted) {
           interrupted = true;
           // Esc means "stop the TASK", not "stop watching": tearing down the
@@ -4088,6 +6439,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           out(stopped?.aborted || (stopped && /disconnects/.test(stopped.note ?? ''))
             ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
             : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${cleanCell(stopped.note)}` : ''}; /cancel stops it${s.client?.cancelTask ? '' : ' (bare form — this image has no per-id cancel)'})`);
+          // Not read before Esc (the agent drops it), and the turns that would
+          // answer messages sent meanwhile: stopped, and back to edit.
+          const left = await steering?.stop(after);
+          const rest = after.splice(0);
+          for (const r of rest) await s.client.cancelTask?.(r.id).catch(() => undefined);
+          for (const t of left?.read ?? []) out(`\n↳ read by the agent: ${oneLine(t)}`);
+          const back = screen.interrupted?.([...(left?.back ?? []), ...rest.flatMap((r) => r.texts)]);
+          if (back) out(`\n${back}`);
+          const kept = keptNote(left?.kept ?? []);
+          if (kept) out(`\n${kept}`);
         } else if (/lost the agent while following/.test((e as Error).message)) {
           // Responses transport: the SDK already auto-resumed through drops
           // and only gives up after repeated reconnect failures — the agent
@@ -4119,22 +6480,18 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       } finally {
         if (ticker) clearInterval(ticker);
         clearActivity();
+        view.end();
         irq.streaming = null;
         s.currentTask = null;
-        (ask as Ask).whileBusy?.(null);
+        (ask as Ask).whileBusy?.(null); (ask as Ask).held = null;
       }
-      // Inserted but not read: the turn ended first, so the agent runs it as
-      // a turn of its own (an interrupt drops it instead).
-      if (!interrupted && s.client?.steerState) {
-        for (const id of steered) {
-          let st: SteerState | null = null;
-          for (let i = 0; i < 20; i++) {
-            st = await s.client.steerState(id).catch(() => null);
-            if (!st || st.state !== 'pending') break;
-            await new Promise((r) => setTimeout(r, 150));
-          }
-          if (st?.state === 'turn') afterTurn.push(st.turn);
-        }
+      // Inserted but not read: the turn ended first, so the agent answers it
+      // in a turn after this one (an interrupt drops it instead).
+      if (!interrupted) await steering?.settle(after, !!failure);
+      // No text because the model's output budget ran out: say so plainly.
+      if (failure && /without any output/.test(failure)) {
+        const empty = await emptyTurnText(s.client, taskId);
+        if (empty) { out(`${reply ? '\n' : ''}${empty}`); failure = null; }
       }
       if (failure && !s.framework && !retriedWithPick) {
         out(`\n(chat failed: ${cleanCell(failure)})\nthis framework may need a model selector — pick it:\n`);
@@ -4165,31 +6522,27 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // while the actual cause (the 400 body) is only in the container log. A
       // turn that fails EVERY time is usually the model or config it was just
       // given, so point at the log the way the connection-drop branches do.
-      if (failure) out(`\n(chat failed: ${cleanCell(failure)}) — /agentlog has the agent's full error (a turn that fails every time usually means the model or config just set)`);
+      if (failure) {
+        out(`\n${await turnFailureText(s, failure)}`);
+      } else if (!interrupted) {
+        s.lastFailKind = null;
+      }
       out('\n');
       messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
       break;
     }
-    for (const id of afterTurn) {
-      (s.tasks ??= []).push({ id, prompt: '(inserted)', at: Date.now() });
-      if (!s.client?.followTask) { out(`(your inserted message runs as ${id} — /result ${id} shows it)\n`); continue; }
-      out(`(your inserted message runs as a turn of its own, ${id})\nagent> `);
-      const fac = new AbortController();
-      irq.streaming = fac;
-      try {
-        for await (const delta of s.client.followTask(id, { signal: fac.signal })) out(cleanStream(delta));
-        out('\n');
-      } catch (e) {
-        out(fac.signal.aborted
-          ? `\n(stopped watching — it continues; /result ${id} re-attaches, /cancel ${id} stops it)\n`
-          : `\n(${cleanCell((e as Error).message)})\n`);
-      } finally {
-        irq.streaming = null;
-      }
-    }
+    await followUps(after);
   }
   } finally {
     irq.brake = null; // leaving the session: idle-Esc no longer targets this agent
+    if (rlHistory && managerHistory) {
+      sessionHistories.set(s.agentId, [...rlHistory]);
+      rlHistory.splice(0, rlHistory.length, ...managerHistory);
+    }
     inbox.stop();
+    if (outboxTimer) clearInterval(outboxTimer);
+    if (phaseTimer) clearInterval(phaseTimer);
+    if (phaseWatch) { clearTimeout(phaseWatch); phaseWatch = null; }
+    s.screen = undefined;
   }
 }

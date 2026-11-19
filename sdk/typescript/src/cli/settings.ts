@@ -21,7 +21,7 @@
  * same quotes rather than breaking the JSON on its spaces.
  */
 
-import { CliError } from './errors';
+import { CliError, agentCmd } from './errors';
 import { THINKING_LEVELS, type SettingsDoc, type ThinkingLevel, type VersionPicks } from '../Settings';
 import { MODEL_KEY_PREFIX } from '../Credentials';
 
@@ -44,13 +44,13 @@ export interface Assignment {
   value: string | ThinkingLevel | unknown | undefined;
 }
 
-const USAGE = '0g-agentdna settings <agent> [provider=… model=… thinking=low|high|max others=<json> sealed=0x… harness=0x…]';
+/** The command's grammar, as typed where the owner is (`settings 286 […]` in the shell). */
+const usage = (): string => `${agentCmd('settings')} [provider=… model=… thinking=low|high|max others=<json> sealed=0x… harness=0x… | versions]`;
 
 const isVersionKey = (key: string): key is VersionKey => (VERSION_KEYS as readonly string[]).includes(key);
 
-/** How to quote a JSON value, in either place it can be typed. */
-const FRAMEWORK_QUOTING =
-  `settings <agent> others='{"key": "value"}'   # quote it — inside the REPL too`;
+/** How to quote a JSON value, as typed where the owner is. */
+const frameworkQuoting = (): string => `${agentCmd('settings', `others='{"key": "value"}'`)}   # quote it`;
 
 /**
  * Parse `key=value` positionals. Throws `BAD_FLAG` (exit 2) on an unknown
@@ -63,7 +63,7 @@ export function parseAssignments(args: string[]): Assignment[] {
   for (const arg of args) {
     const eq = arg.indexOf('=');
     if (eq < 1) {
-      throw new CliError('BAD_FLAG', `not a setting assignment: "${arg}" (expected key=value)`, { remedy: USAGE });
+      throw new CliError('BAD_FLAG', `not a setting assignment: "${arg}" (expected key=value)`, { remedy: usage() });
     }
     const key = arg.slice(0, eq);
     const raw = arg.slice(eq + 1);
@@ -72,7 +72,7 @@ export function parseAssignments(args: string[]): Assignment[] {
         'BAD_FLAG',
         `unknown setting "${key}" — the platform's named fields are ${SETTINGS_KEYS.join(', ')} ` +
           '(anything framework-specific goes inside others=<json>)',
-        { remedy: USAGE },
+        { remedy: usage() },
       );
     }
     if (raw === '') {
@@ -81,12 +81,12 @@ export function parseAssignments(args: string[]): Assignment[] {
     }
     if (key === 'thinking' && !(THINKING_LEVELS as readonly string[]).includes(raw)) {
       throw new CliError('BAD_FLAG', `thinking must be one of ${THINKING_LEVELS.join('|')}, got "${raw}"`, {
-        remedy: USAGE,
+        remedy: usage(),
       });
     }
     if (isVersionKey(key) && !/^0x[0-9a-fA-F]{64}$/.test(raw)) {
       throw new CliError('BAD_FLAG', `${key}= takes a version's sha256 hash, "0x" + 64 hex, got "${raw}"`, {
-        remedy: `settings <agent>   # on a 0g-harness agent, lists the versions the trust registry has; ${key}= clears the pick`,
+        remedy: `${agentCmd('settings')} on a 0g-harness agent lists the versions the trust registry has; ${key}= clears the pick`,
       });
     }
     if (key === 'others') {
@@ -95,7 +95,7 @@ export function parseAssignments(args: string[]): Assignment[] {
         parsed = JSON.parse(raw);
       } catch (e) {
         throw new CliError('BAD_FLAG', `others= must be JSON: ${(e as Error).message}`, {
-          remedy: FRAMEWORK_QUOTING,
+          remedy: frameworkQuoting(),
         });
       }
       assertHarnessKnobShapes(parsed);
@@ -208,6 +208,48 @@ export function isHarnessFramework(framework: string | null | undefined): boolea
 }
 
 /**
+ * Whether `framework` works through tool calls, so its model must be able to
+ * call tools: the tool-driven frameworks, the harness under either of its
+ * names (`dsh` on a network still on AgenticID 1.3, see `isHarnessFramework`).
+ * The deploy wizard offers such a framework only models with tool use.
+ */
+export function frameworkNeedsToolModels(framework: string): boolean {
+  return framework === 'openclaw' || framework === 'prime-agent' || isHarnessFramework(framework);
+}
+
+/** Whether these assignments set the model or the provider. */
+export function touchesModel(assignments: Assignment[]): boolean {
+  return assignments.some((a) => a.key === 'model' || a.key === 'provider');
+}
+
+/**
+ * Refuse, before signing, a model change to one its provider's catalog lists
+ * without tool use on an agent whose framework works through tools: it would
+ * fail every turn there (the deploy wizard does not offer such a model
+ * either). Only a write that sets the model or the provider is checked; a
+ * model the catalog does not list, an unreadable catalog or an unknown
+ * framework passes — the catalog advisory speaks to the first.
+ */
+export async function assertModelFitsFramework(
+  assignments: Assignment[],
+  next: SettingsDoc,
+  framework: string | null | undefined,
+  caps: (provider: string) => Promise<Array<{ id: string; chat: boolean; tools: boolean }>>,
+): Promise<void> {
+  const model = next.model?.trim();
+  if (!model || !framework || !frameworkNeedsToolModels(framework)) return;
+  if (!touchesModel(assignments)) return;
+  const listed = await caps(next.provider ?? '0g-compute').catch(() => null);
+  const entry = listed?.find((m) => m.id.toLowerCase() === model.toLowerCase());
+  if (!listed || !entry || entry.tools) return;
+  const able = listed.filter((m) => m.chat && m.tools).map((m) => m.id);
+  const an = /^[aeiou]/i.test(framework) ? 'an' : 'a';
+  throw new CliError('BAD_FLAG', `${model} cannot call tools, and ${an} ${framework} agent works through tool calls — it would fail every turn`, {
+    remedy: able.length ? `pick a model that can: ${able.slice(0, 4).join(', ')}` : 'pick a model that can call tools',
+  });
+}
+
+/**
  * Refuse 0g-harness switches in `others=` for an agent known to run another
  * framework, before anything is signed. There `others` is that framework's
  * own configuration, so the switch does nothing, and openclaw goes further:
@@ -296,8 +338,8 @@ export function assertModelPresent(next: SettingsDoc, hadStored: boolean): void 
     {
       remedy:
         'include the model in the same command, e.g. ' +
-        '`settings <agent> model=0gm-1.0-35b-a3b thinking=high` (the agent\'s current model is whatever its ' +
-        'image was built or last configured with — `hello <agent>` and `/agentlog` show what it is running)',
+        `\`${agentCmd('settings', 'model=0gm-1.0-35b-a3b thinking=high')}\` (the agent's current model is whatever its ` +
+        'image was built or last configured with)',
     },
   );
 }
@@ -333,6 +375,49 @@ export function renderSettings(doc: SettingsDoc | null): string[] {
 }
 
 /**
+ * A settings command's words after the agent: `versions` alone asks for the
+ * versions the trust registry lists; anything else is assignments
+ * ({@link parseAssignments}). `versions` is never an assignment, and goes
+ * alone.
+ */
+export function settingsArgs(args: string[]): { versions: boolean; assignments: ReturnType<typeof parseAssignments> } {
+  if (args.length === 1 && args[0] === 'versions') return { versions: true, assignments: [] };
+  if (args.includes('versions')) {
+    throw new CliError('BAD_FLAG', '`versions` goes on its own: it shows the versions to pick from, and writes nothing', { remedy: usage() });
+  }
+  return { versions: false, assignments: parseAssignments(args) };
+}
+
+/**
+ * The versions a 0g-harness agent runs, on one line of the settings view:
+ * with no pick, the trust registry's newest (what an agent with no pick
+ * moves to); with picks, the picks — one no longer listed is not run — and
+ * the newest for a layer without one. `none listed` for an empty list.
+ */
+export function renderVersionsLine(
+  listed: { sealed: readonly string[]; harness: readonly string[] },
+  picks?: VersionPicks,
+): string {
+  const short = (h: string): string => `${h.slice(0, 10)}…`;
+  const newest = (layer: VersionKey): string => {
+    const hashes = listed[layer];
+    return hashes.length ? short(hashes[hashes.length - 1]) : 'none listed';
+  };
+  const pick = (layer: VersionKey): string | undefined => {
+    const p = picks?.[layer];
+    return typeof p === 'string' && p ? p : undefined;
+  };
+  const head = `${'versions '.padEnd(11)}`;
+  if (!VERSION_KEYS.some(pick)) return `${head}newest listed (${VERSION_KEYS.map((k) => `${k} ${newest(k)}`).join(', ')})`;
+  return `${head}pinned: ${VERSION_KEYS.map((k) => {
+    const p = pick(k);
+    if (!p) return `${k} newest listed (${newest(k)})`;
+    const isListed = listed[k].some((h) => h.toLowerCase() === p.toLowerCase());
+    return `${k} ${short(p)}${isListed ? '' : ' (not listed: not run)'}`;
+  }).join(', ')}`;
+}
+
+/**
  * The versions an owner can pick (0g-harness): the trust registry's sealed
  * and harness lists in listing order, the last one the newest — what an
  * agent with no pick moves to once its own version is delisted. The picks in
@@ -342,7 +427,7 @@ export function renderListedVersions(
   listed: { sealed: readonly string[]; harness: readonly string[] },
   picks?: VersionPicks,
 ): string[] {
-  const lines = ['versions the trust registry lists (oldest first; pick with sealed=<hash> harness=<hash>):'];
+  const lines = ['listed versions, oldest first (pick with sealed=<hash> harness=<hash>):'];
   for (const layer of VERSION_KEYS) {
     const hashes = listed[layer];
     const pick = picks?.[layer]?.toLowerCase();

@@ -124,7 +124,7 @@ func planWebSearch(k harnessKnobs, keys keySource, mainEp *inference.Endpoint, m
 		return nil, "the webTools setting is off"
 	}
 	if ws.Service == searchOff || ws.Service == "" {
-		return nil, "the webSearch setting is off"
+		return nil, "your owner turned it off (settings: webSearch.service = off)"
 	}
 	var url, value string
 	if ws.CredName == "" && mainEp != nil && mainEp.WebSearch == ws.Service {

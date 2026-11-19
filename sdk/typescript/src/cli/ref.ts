@@ -12,7 +12,8 @@
  * only classifies the input, so it is trivially unit-testable.
  */
 
-import { CliError } from './errors';
+import { CliError, cmdStep } from './errors';
+import { cleanCell } from './commands/cells';
 
 /** A classified agent reference. */
 export type AgentRef =
@@ -42,9 +43,9 @@ export function parseAgentRef(input: string | undefined): AgentRef {
   throw new CliError(
     'BAD_AGENT_REF',
     input
-      ? `not an agent reference: "${input}" (expected a decimal agentId or a 0x… 64-hex sealId; ≥8 hex chars work as a unique prefix)`
-      : 'missing <agent> argument (a decimal agentId or a 0x… 64-hex sealId)',
-    { remedy: '0g-agentdna status 33   |   0g-agentdna status 0x<64-hex sealId>' },
+      ? `not an agent reference: "${cleanCell(input)}" — an agent is named by its agentId (33) or its sealId (0x…, 8 or more hex digits)`
+      : 'missing <agent>: an agentId (33) or a sealId (0x…, 8 or more hex digits)',
+    { remedy: `${cmdStep('list')} shows the agents and their ids` },
   );
 }
 

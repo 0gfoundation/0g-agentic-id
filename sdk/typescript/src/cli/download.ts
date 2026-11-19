@@ -10,6 +10,9 @@ import { basename, extname, join, resolve } from 'node:path';
 import type { AgentFile, AgentFileDir } from '../AgentClient';
 import { expandHome } from './attach';
 
+/** The most one download carries (the agent's runtime serves no larger file). */
+export const DOWNLOAD_MAX_BYTES = 50 << 20;
+
 /** `/download` argument → where it comes from: `inbox/<name>` names a file in the agent's file inbox (the owner's own), anything else the outbox. */
 export function parseDownloadName(arg: string): { dir: AgentFileDir; name: string } {
   if (arg.startsWith('inbox/')) return { dir: 'inbox', name: arg.slice('inbox/'.length) };
@@ -66,7 +69,8 @@ export function saveDownload(bytes: Uint8Array, name: string, dest?: string, cwd
   throw new Error(`no free local name for ${file}`);
 }
 
-const size = (n: number): string =>
+/** A byte count for people: B, KiB, MiB. */
+export const size = (n: number): string =>
   n < 1024 ? `${n} B` : n < 1 << 20 ? `${(n / 1024).toFixed(1)} KiB` : `${(n / (1 << 20)).toFixed(1)} MiB`;
 
 /** `/files` lines: name, size, time. */

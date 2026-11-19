@@ -169,7 +169,7 @@ test('cli: cred set model takes the settings provider, offers the key on this ma
     await credOp(a, SEAL_ID, ['set', 'model'], { json: false, out: (l) => lines.push(l), secret: async () => '', keyPrompt: k.keyPrompt });
     assert.deepEqual(k.asked, [['confirm', 'use the 0g-compute key saved on this machine?']], 'only asked whether to use the draft');
     assert.ok(s.stored().document.defs['model.0g-compute'], 'stored under the settings provider');
-    assert.ok(lines.some((l) => /^added model\.0g-compute — version 4/.test(l)), lines.join('\n'));
+    assert.ok(lines.some((l) => /^added model\.0g-compute$/.test(l)), lines.join('\n'));
     assert.ok(lines.includes('in use now'), lines.join('\n'));
   } finally {
     s.server.close();
@@ -232,7 +232,7 @@ test('cli: cred <agent> lists model keys apart, with the one in use', () => {
   assert.match(text, /model\.0g-compute {2}in use/);
   assert.match(text, /model\.anthropic {3}kept, not in use/);
   assert.match(renderCredentials([], 1, undefined, { provider: '0g-compute', source: 'deploy' }).join('\n'), /the 0g-compute key given at create\/reset/);
-  assert.match(renderCredentials([], 1, undefined, { source: 'none' }).join('\n'), /add one: cred <agent> set model provider=0g-compute/);
+  assert.match(renderCredentials([], 1, undefined, { source: 'none' }).join('\n'), /add one: 0g-agentdna cred <agent> set model provider=0g-compute/);
   assert.match(renderCredentials(defs.slice(1), 1, undefined, null).join('\n'), /unknown — the agent is not running/);
   assert.match(renderCredentials(defs.slice(1), 1, undefined, 'old').join('\n'), /predates model keys/);
 });
@@ -474,4 +474,48 @@ test('sdk: with an attestor that seals no request keys, the sealed model key has
   assert.equal(sealed.secretEnv, undefined);
   const refused = integrator(async () => { throw new SecretEnvRefusedError('provider_binding_unsupported', 'no route'); });
   await assert.rejects(refused.server.sealModelKey(SEAL_ID, { owner: owner.address, apiKey: 'sk-1' }), /no route/);
+});
+
+test('cli: cred set model runs its wait through io.quiet, after the key is asked', async () => {
+  const s = await stub([], (doc) => doc.defs['model.0g-compute']
+    ? { provider: '0g-compute', source: 'credentials', value_hash: hashOf(doc, 'model.0g-compute') }
+    : { provider: '0g-compute', source: 'deploy' });
+  try {
+    const order = [];
+    const k = keys({ draft: { '0g-compute': 'sk-saved' }, interactive: true });
+    const confirm = k.keyPrompt.confirm;
+    k.keyPrompt.confirm = async (q, d) => { order.push('asked'); return confirm(q, d); };
+    let inside = false;
+    const quiet = async (f) => { order.push('quiet'); inside = true; try { return await f(); } finally { inside = false; } };
+    const lines = [];
+    await credOp(ag(s.port), SEAL_ID, ['set', 'model'], { json: false, out: (l) => lines.push([l, inside]), secret: async () => '', keyPrompt: k.keyPrompt, quiet });
+    assert.deepEqual(order, ['asked', 'quiet'], 'the question first, then the quiet stretch');
+    assert.deepEqual(lines.find(([l]) => l === 'in use now'), ['in use now', true], 'the wait ran inside it');
+  } finally {
+    s.server.close();
+  }
+});
+
+test('cli: cred set model with the key the set already holds from this machine is unchanged, not written again', async () => {
+  const s = await stub([], (doc) => doc.defs['model.0g-compute']
+    ? { provider: '0g-compute', source: 'credentials', value_hash: hashOf(doc, 'model.0g-compute') }
+    : { provider: '0g-compute', source: 'deploy' });
+  try {
+    const a = ag(s.port);
+    const set = async (draft) => {
+      const lines = [];
+      const k = keys({ draft: { '0g-compute': draft }, interactive: true });
+      await credOp(a, SEAL_ID, ['set', 'model'], { json: false, out: (l) => lines.push(l), secret: async () => '', keyPrompt: k.keyPrompt });
+      return lines;
+    };
+    const posts = () => s.seen.filter((r) => r.method === 'POST' || r.method === 'PUT').length;
+    assert.ok((await set('sk-same')).includes('added model.0g-compute'));
+    const before = posts();
+    const again = await set('sk-same');
+    assert.deepEqual(again, ["unchanged model.0g-compute: the agent's credential set already holds this key"]);
+    assert.equal(posts(), before, 'nothing written');
+    assert.ok((await set('sk-other')).includes('changed model.0g-compute'), 'another key is written');
+  } finally {
+    s.server.close();
+  }
 });
