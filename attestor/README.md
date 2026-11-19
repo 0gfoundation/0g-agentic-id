@@ -115,12 +115,15 @@ on dev would first meet the live provider with every agent already offline.
    (`list(keccak256("image"), <hash>)` on the TrustRegistry from AgenticID
    1.4.0, scheduled through the environment's Timelock, which owns the
    registry — mainnet waits 1 day; `addValidFrameworkHash` on AgenticID
-   before it). For the 0g-harness
-   image also list its sealed program and harness package hashes
-   (`keccak256("sealed")`, `keccak256("harness")`) and attach both files to
-   the `artifacts` release of `0gfoundation/0g-agentic-id`, each named by its
-   sha256. Check: `isValidFrameworkHash(<hash>)` returns `true` for every
-   image, and `https://github.com/0gfoundation/0g-agentic-id/releases/download/artifacts/<sha256>`
+   before it). The 0g-harness image carries no sealed and no harness package:
+   build both from its Dockerfile (the export commands are at the top of
+   `sealed/images/harness/Dockerfile`), attach both files to the `artifacts`
+   release of `0gfoundation/0g-agentic-id`, each named by its sha256, and
+   list their hashes (`keccak256("sealed")`, `keccak256("harness")`) before
+   any container of the image boots: until then it runs nothing. Check:
+   `isValidFrameworkHash(<hash>)` returns `true` for every image,
+   `isListed` returns `true` for the sealed and harness hashes, and
+   `https://github.com/0gfoundation/0g-agentic-id/releases/download/artifacts/<sha256>`
    serves both files.
 2. **Configuration.** Before the attestor is rolled in step 4, point
    `ATTESTOR_SANDBOX_SNAPSHOT` and `ATTESTOR_FRAMEWORKS` at the new snapshots,

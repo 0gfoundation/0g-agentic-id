@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"seal-verify/internal/servicesandbox"
 )
 
 // sealed runs as root, and the agent process can change any tree handed to
@@ -134,8 +136,12 @@ var allowedDirectCalls = map[string]struct {
 	"internal/logger/logger.go Flush os.OpenFile":                                   {1, "LogPath in the root-only state directory, opened O_NOFOLLOW"},
 	"internal/proxy/sign.go Server.ListenInternal net.Listen":                       {1, "the sign socket is created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link"},
 	"internal/proxy/agentsock.go ServeAgentSocket net.Listen":                       {1, "the credential sockets are created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link (as for the sign socket)"},
-	"cmd/loader/supervise.go verifyFile os.Open":                                    {1, "hashes /bootstrap, a root-only image file, or a program sealed staged in the loader's root-only state directory (/var/lib/loader, 0700), before it runs; the loader links only the standard library and x/sys (its TestLinkedPackages), so not privsep"},
-	"cmd/loader/supervise.go supervisor.runOnce exec.Command":                       {1, "starts the program verifyFile just matched against its hash: /bootstrap, a root-only image file, or a staged program in the root-only state directory; between sealed runs the loader has ended every other process (killLeftovers)"},
+	"cmd/loader/supervise.go verifyFile os.Open":                                    {1, "hashes a sealed program in the loader's root-only state directory (/var/lib/loader, 0700), downloaded by the loader or staged by sealed, before it runs; the loader links only the standard library and x/sys (its TestLinkedPackages), so not privsep"},
+	"cmd/loader/supervise.go supervisor.runOnce exec.Command":                       {1, "starts the program verifyFile just matched against its hash, in the root-only state directory; between sealed runs the loader has ended every other process (killLeftovers)"},
+	"cmd/loader/fetch.go fetchSealed os.MkdirAll":                                   {1, "creates the sealed/ directory inside /var/lib/loader, which only root can enter"},
+	"cmd/loader/fetch.go fetchSealed os.Remove":                                     {1, "removes a download's temporary file inside /var/lib/loader, which only root can enter"},
+	"cmd/loader/fetch.go fetchSealed os.Rename":                                     {1, "moves a download that hashed to its name into place within /var/lib/loader, which only root can enter"},
+	"cmd/loader/fetch.go download os.OpenFile":                                      {1, "creates a download's temporary file (O_EXCL) inside /var/lib/loader, which only root can enter"},
 	"cmd/loader/state.go stateDir.prepare os.MkdirAll":                              {1, "creates /var/lib/loader, the loader's state directory, under the root-only /var/lib before any sealed runs"},
 	"cmd/loader/state.go stateDir.prepare os.Chmod":                                 {1, "makes /var/lib/loader 0700: only root (the loader and sealed) enters it"},
 	"cmd/loader/state.go stateDir.read os.ReadFile":                                 {1, "reads a file in /var/lib/loader, which only root can enter"},
@@ -146,13 +152,19 @@ var allowedDirectCalls = map[string]struct {
 // rootCommands is everything root executes: the functions that may call
 // privsep.RootCommand, and the binaries (string literals) each may name.
 var rootCommands = map[string][]string{
-	"internal/servicehost.Manager.command":       {"sealed-service-launcher"},
-	"internal/servicehost.ProbeIsolation":        {"sealed-service-launcher"},
-	"internal/servicehost.reapIdentity":          {"sealed-service-launcher"},
 	"internal/dataplane.downloadTo":              {"0g-storage-client"},
 	"internal/framework/openclaw.installCommand": {"npm"},
 	"internal/framework/hermes.installHermes":    {"git", "uv"},
 	"internal/framework/prime.npmGlobalRoot":     {"npm"},
+}
+
+// rootSelfModes is everything root runs of sealed's own program: the
+// functions that may call privsep.RootSelf, and the modes (string literals)
+// each may name. The hosted-service launcher is the only one.
+var rootSelfModes = map[string][]string{
+	"internal/servicehost.Manager.command": {servicesandbox.LauncherMode},
+	"internal/servicehost.ProbeIsolation":  {servicesandbox.LauncherMode},
+	"internal/servicehost.reapIdentity":    {servicesandbox.LauncherMode},
 }
 
 // rootEnvHelpers are the functions whose result a rootCommands function may
@@ -752,8 +764,8 @@ func (s *moduleScan) inspectFile(rel, pkgDir string, f *ast.File, info *types.In
 					return true
 				}
 				if call == nil {
-					if name == "RootCommand" {
-						flag("privsep.RootCommand used as a value", n)
+					if name == "RootCommand" || name == "RootSelf" {
+						flag("privsep."+name+" used as a value", n)
 					}
 					return true
 				}
@@ -1009,29 +1021,34 @@ func TestRootRunsOnlyPinnedToolchainCommands(t *testing.T) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	seen := map[string]bool{}
-	for _, fn := range keys {
-		for _, c := range s.calls[fn] {
-			if c.name != "RootCommand" {
-				continue
-			}
-			allowed, ok := rootCommands[fn]
-			switch {
-			case !ok:
-				t.Errorf("%s: %s runs a command as root (privsep.RootCommand); only the functions in rootCommands may", c.pos, fn)
-			case !c.lit:
-				t.Errorf("%s: %s passes RootCommand a non-literal command name; name the binary literally", c.pos, fn)
-			case !contains(allowed, c.arg):
-				t.Errorf("%s: %s runs %q as root; rootCommands allows it only %v", c.pos, fn, c.arg, allowed)
-			default:
-				seen[fn+" "+c.arg] = true
+	for _, rule := range []struct {
+		call, list string
+		allowed    map[string][]string
+	}{{"RootCommand", "rootCommands", rootCommands}, {"RootSelf", "rootSelfModes", rootSelfModes}} {
+		seen := map[string]bool{}
+		for _, fn := range keys {
+			for _, c := range s.calls[fn] {
+				if c.name != rule.call {
+					continue
+				}
+				allowed, ok := rule.allowed[fn]
+				switch {
+				case !ok:
+					t.Errorf("%s: %s runs a command as root (privsep.%s); only the functions in %s may", c.pos, fn, rule.call, rule.list)
+				case !c.lit:
+					t.Errorf("%s: %s passes %s a non-literal name; name it literally", c.pos, fn, rule.call)
+				case !contains(allowed, c.arg):
+					t.Errorf("%s: %s runs %q as root; %s allows it only %v", c.pos, fn, c.arg, rule.list, allowed)
+				default:
+					seen[fn+" "+c.arg] = true
+				}
 			}
 		}
-	}
-	for fn, names := range rootCommands {
-		for _, n := range names {
-			if !seen[fn+" "+n] {
-				t.Errorf("rootCommands lists %s running %q, but no such call exists; update the list", fn, n)
+		for fn, names := range rule.allowed {
+			for _, n := range names {
+				if !seen[fn+" "+n] {
+					t.Errorf("%s lists %s running %q, but no such call exists; update the list", rule.list, fn, n)
+				}
 			}
 		}
 	}

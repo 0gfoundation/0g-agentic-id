@@ -410,7 +410,7 @@ func TestDiscardDirReturnsBeforeRemoval(t *testing.T) {
 func TestLeftoverIdentitiesAreReaped(t *testing.T) {
 	root(t)
 	if os.Getenv("SEALED_SERVICE_TESTS") != "1" {
-		t.Skip("set SEALED_SERVICE_TESTS=1 as root with sealed-service-launcher installed")
+		t.Skip("set SEALED_SERVICE_TESTS=1 as root on a kernel with Landlock ABI 6")
 	}
 	uid := uint32(serviceidentity.Base + 99)
 	leftover := exec.Command("/bin/sh", "-c", "sleep 300 & sleep 300")

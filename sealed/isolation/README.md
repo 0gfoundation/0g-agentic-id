@@ -2,9 +2,9 @@
 
 [中文](README.zh.md)
 
-Sealed runs each hosted service process (`internal/servicesandbox`, started by
-`sealed-service-launcher`) inside the agent's own sandbox, with no namespace, no
-capability beyond the provider's six and no change to the provider:
+Sealed runs each hosted service process (`internal/servicesandbox`) inside the
+agent's own sandbox, with no namespace, no capability beyond the provider's six
+and no change to the provider:
 
 | Mechanism | What it enforces |
 | --- | --- |
@@ -23,6 +23,11 @@ proxy, published hosts only, as CONNECT tunnels, and the per-task model proxy),
 and any path socket whose own file mode admits it, which Landlock does not cover.
 Sealed's own listeners on the container's loopback (shared with the owner) stay
 out of reach, since inet sockets and TCP connect are refused.
+
+The launcher is sealed's own program: sealed starts its own executable as root
+with `sealed-service-launcher` as the first argument (`privsep.RootSelf`), and
+`main` hands that run to the launcher before anything else runs. A sealed
+version therefore always runs with the launcher built with it.
 
 ## Measured on the dev runner (2026-11-13)
 

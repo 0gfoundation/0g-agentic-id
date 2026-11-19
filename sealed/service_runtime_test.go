@@ -20,7 +20,7 @@ func TestServiceRuntimeUsesListedActivePackageWithoutImageBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := &fakeHarness{running: hash}
-	l := &layeredRuntime{lists: fakeLists{harness: map[string]bool{hash: true}}}
+	l := &layeredRuntime{lists: fakeLists{harness: []string{hash}}}
 	lease, err := l.acquireServiceRuntime(context.Background(), h)
 	if err != nil {
 		t.Fatal(err)
@@ -32,7 +32,7 @@ func TestServiceRuntimeUsesListedActivePackageWithoutImageBase(t *testing.T) {
 	if !layers.HarnessInstalled(hash) {
 		t.Fatal("leased worker package pruned")
 	}
-	l.lists = fakeLists{harness: map[string]bool{hash: false}}
+	l.lists = fakeLists{}
 	if _, err := l.acquireServiceRuntime(context.Background(), h); err == nil {
 		t.Fatal("delisted package admitted a new worker")
 	}

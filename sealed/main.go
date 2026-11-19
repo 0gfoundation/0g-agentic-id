@@ -58,6 +58,7 @@ import (
 	"seal-verify/internal/scrub"
 	"seal-verify/internal/secretenv"
 	"seal-verify/internal/servicehost"
+	"seal-verify/internal/servicesandbox"
 	"seal-verify/internal/settings"
 	"seal-verify/internal/state"
 	"seal-verify/internal/uploader"
@@ -107,6 +108,16 @@ type storageDescription struct {
 }
 
 func main() {
+	// The sealed program is also the trusted launcher of hosted service
+	// processes: servicehost starts this executable as root with
+	// servicesandbox.LauncherMode first (privsep.RootSelf), so the launcher
+	// is always this build. That run is dispatched before anything else, so
+	// it registers no adapter, hardens nothing, logs nothing and touches none
+	// of sealed's state; the launcher refuses to run unless it is root.
+	if len(os.Args) > 1 && os.Args[1] == servicesandbox.LauncherMode {
+		os.Exit(servicesandbox.Launch(os.Args[2:]))
+	}
+
 	// Register the adapters this build bundles (adapters.go, or
 	// adapters_harnessonly.go for the 0g-harness image). Which one this
 	// deployment uses is resolved after the chain bootstrap, from the
@@ -241,6 +252,12 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	})
 	agentSealPriv := prov.AgentSealPriv
 	if agentSealPriv == nil {
+		if prov.LayeredRequired {
+			// Nothing was claimed. The loader starts sealed again later,
+			// when the attestor may declare the layered flow.
+			exitForRetry(cfg, "provisioning", errors.New("the attestor does not declare the layered flow"))
+			return
+		}
 		// A version the attestor no longer provisions (taken off the sealed
 		// list) still hands over to the newest listed one.
 		if prov.Layered {
@@ -302,11 +319,10 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	sealedProxy.SetAdapter(adapter)
 
 	// The layered runtime (layered.go): when the rule picks a sealed version
-	// other than this program (the owner's pick, the newest listed one once
-	// this one is delisted, or the one this program runs in place of), it is
-	// handed to the loader before the agent starts; when the loader does not
-	// switch, the boot carries on with this version. The harness starts on
-	// the package the rule picks.
+	// other than this program (the owner's pick, or the newest listed one
+	// once this one is delisted), it is handed to the loader before the agent
+	// starts; when the loader does not switch, the boot carries on with this
+	// version. The harness starts on the package the rule picks.
 	var lr *layeredRuntime
 	var picks settings.Versions
 	if prov.Layered {
@@ -320,22 +336,20 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		}
 		cancel()
 	}
-	if h, ok := any(adapter).(framework.LayeredRuntime); ok {
-		// LEGACY(pre-1.4.0): without the layered flow, base's package.
-		hash, dir := baseHarness()
-		if lr != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
-			hash, dir, err = lr.chooseHarness(ctx, picks.Harness, hash)
-			cancel()
-			if err != nil {
-				logger.Logf("FAIL harness: %v", err)
-				report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "harness: "+err.Error(), cfg.StatusBinding)
-				failTrial(cfg, "harness choice", err)
-				if isTransient(err) {
-					exitForRetry("harness choice", err)
-				}
-				return
+	// A package adapter outside the layered flow has no package to start on:
+	// its start fails and says so.
+	if h, ok := any(adapter).(framework.LayeredRuntime); ok && lr != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
+		hash, dir, err := lr.chooseHarness(ctx, picks.Harness)
+		cancel()
+		if err != nil {
+			logger.Logf("FAIL harness: %v", err)
+			report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "harness: "+err.Error(), cfg.StatusBinding)
+			failTrial(cfg, "harness choice", err)
+			if isTransient(err) {
+				exitForRetry(cfg, "harness choice", err)
 			}
+			return
 		}
 		h.UseHarness(hash, dir)
 	}
@@ -393,8 +407,14 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		currentStatus.SupervisorFailed(err.Error())
 		statusReports.Soon()
 		// A version on trial goes back to the previous one, which reports;
-		// or, failing for a reason outside it, starts again later.
+		// or, failing for a reason outside it, starts again later. So does a
+		// confirmed one whose start failed for such a reason (no harness
+		// package starts, a storage read), so that a package listed later,
+		// or the outside service back, is picked up.
 		failTrial(cfg, "agent start", err)
+		if isTransient(err) {
+			exitForRetry(cfg, "agent start", err)
+		}
 		return
 	}
 	logger.Logf("OK   agent ready (upstream listening, agentState armed, supervisor active)")
