@@ -1409,11 +1409,13 @@ pub struct LifecycleRequest {
 
 /// Request body for `POST /retry` — owner-triggered recovery.
 ///
-/// The optional `sandbox_envelope` (action="create") lets a single
-/// /retry call also recreate the sandbox when c is Failed/Stopped:
-/// after storage/mint retry runs, the worker reuses the envelope to
-/// spawn a fresh container, avoiding a second wallet popup. Pure
-/// storage/mint recovery (c healthy) ignores the envelope.
+/// `sandbox_envelope` (action="create", signed by the current owner) is
+/// required: the API answers `401` without it. It also lets a single
+/// /retry call recreate the sandbox when c is Failed/Stopped: after
+/// storage/mint retry runs, the worker reuses the envelope to spawn a
+/// fresh container, avoiding a second wallet popup. Pure storage/mint
+/// recovery (c healthy) ignores the envelope. `owner` is informational
+/// and never used for authorisation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryRequest {
     pub seal_id: SealId,

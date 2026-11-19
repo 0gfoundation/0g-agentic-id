@@ -1382,11 +1382,10 @@ export class AgentApi {
    * (storage upload, mint re-fetch, setAgentURI, …) against the same sealId,
    * where redeploying would orphan an already-minted agent.
    *
-   * Without a model key it does idempotent stages only. With one (`apiKey`
-   * or `sealedModelKey`, stored in the credential set as with
-   * {@link reset}, or a `provider` whose key the set holds already) it may
-   * continue past those into container creation, optionally on
-   * `sealedImage`: the owner signs a create envelope.
+   * The owner signs a create envelope, so when the container failed or was
+   * stopped it continues past those stages into container creation,
+   * optionally on `sealedImage`. A model key given (`apiKey` or
+   * `sealedModelKey`) is stored in the credential set as with {@link reset}.
    */
   async retry(sealId: Hash, opts?: ModelKeyLifecycleOpts): Promise<void> {
     const key = await this.modelKeyPlan(sealId, opts ?? {});
