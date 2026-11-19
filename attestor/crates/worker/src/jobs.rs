@@ -140,6 +140,24 @@ impl CreateBindError {
     }
 }
 
+/// The revocation fence: a stop, reset or grant change moved the boot
+/// generation while a create was in flight, so the new sandbox is retired
+/// instead of bound.
+const AUTHORIZATION_CHANGED_DURING_CREATE: &str = "sandbox authorization changed during create";
+
+/// Whether a failed job ended at the revocation fence — the expected outcome
+/// when the owner stops, resets or changes the grant during a create, not a
+/// fault.
+pub fn is_revoked_during_create(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<CreateBindError>(),
+            Some(CreateBindError::Denied(inner))
+                if inner.to_string() == AUTHORIZATION_CHANGED_DURING_CREATE
+        )
+    })
+}
+
 async fn try_bind_created_runtime(
     ctx: &Ctx,
     result: &PendingRuntimeCreate,
@@ -170,7 +188,7 @@ async fn try_bind_created_runtime(
         .is_some_and(|boot| boot.enabled && boot.generation == result.generation)
     {
         return Err(CreateBindError::Denied(anyhow::anyhow!(
-            "sandbox authorization changed during create"
+            AUTHORIZATION_CHANGED_DURING_CREATE
         )));
     }
     let principal = RuntimePrincipal {
@@ -209,7 +227,7 @@ async fn try_bind_created_runtime(
         .map_err(CreateBindError::dependency)?;
     if !bound {
         return Err(CreateBindError::Denied(anyhow::anyhow!(
-            "sandbox authorization changed during create"
+            AUTHORIZATION_CHANGED_DURING_CREATE
         )));
     }
     Ok(())
@@ -3428,6 +3446,27 @@ mod tests {
             .unwrap()
             .sandbox_id
             .is_none());
+    }
+
+    #[test]
+    fn only_the_revocation_fence_counts_as_revoked_during_create() {
+        let fence: anyhow::Error =
+            CreateBindError::Denied(anyhow::anyhow!(AUTHORIZATION_CHANGED_DURING_CREATE)).into();
+        assert!(is_revoked_during_create(
+            &fence.context("persist new sandbox ID")
+        ));
+        let other_denial: anyhow::Error =
+            CreateBindError::Denied(anyhow::anyhow!("operator authorization expired")).into();
+        assert!(!is_revoked_during_create(
+            &other_denial.context("persist new sandbox ID")
+        ));
+        let unavailable: anyhow::Error =
+            CreateBindError::Unavailable(anyhow::anyhow!(AUTHORIZATION_CHANGED_DURING_CREATE))
+                .into();
+        assert!(!is_revoked_during_create(&unavailable));
+        assert!(!is_revoked_during_create(&anyhow::anyhow!(
+            "sandbox authorization changed during create"
+        )));
     }
 
     #[tokio::test]

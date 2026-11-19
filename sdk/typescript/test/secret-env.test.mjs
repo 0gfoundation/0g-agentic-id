@@ -290,10 +290,13 @@ test('retry with the key in the set signs a create envelope without a key in it'
     assert.equal(message.action, 'create');
     assert.ok(!('env' in message.payload), 'no request copy');
     assert.ok(a.posts.at(-1).body.sandbox_envelope);
-    // No key anywhere: the soft retry, nothing signed.
+    // No key anywhere: still signed, since the attestor refuses an
+    // unsigned retry; the envelope carries no key.
     await c.retry({ sealId: SEAL_ID });
-    assert.equal(signed.length, 1);
-    assert.ok(!('sandbox_envelope' in a.posts.at(-1).body));
+    assert.equal(signed.length, 2);
+    assert.equal(JSON.parse(signed[1]).action, 'create');
+    assert.ok(!('env' in JSON.parse(signed[1]).payload));
+    assert.ok(a.posts.at(-1).body.sandbox_envelope);
   });
 });
 

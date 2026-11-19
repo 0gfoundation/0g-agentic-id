@@ -1447,14 +1447,12 @@ export class AttestorClient {
    * failed idempotent stage (storage upload from persisted ciphertext, mint
    * receipt re-fetch, setAgentURI, …) against the SAME seal_id.
    *
-   * Without a model key: posts `{ seal_id, owner }` — idempotent stages
-   * only, no container work (the cheap owner-field auth path). With one —
-   * the credential set holds the provider's key (`keyInCredentials`), or
-   * `apiKey` / `sealedSecretEnv` rides the request (LEGACY(model-key)) — it
-   * attaches the same owner-signed "create" envelope reset uses (optionally
-   * with `sealedImage`), so the worker may continue past the idempotent
-   * stages into container creation; the container takes the key from the
-   * set at its boot.
+   * Every retry carries the same owner-signed "create" envelope reset uses
+   * (optionally with `sealedImage`); the attestor refuses a retry without
+   * it. When the container failed or was stopped, the worker continues past
+   * the idempotent stages into container creation with that envelope; the
+   * container takes the model key from the credential set at its boot.
+   * LEGACY(model-key): `apiKey` / `sealedSecretEnv` also ride the request.
    */
   async retry(params: {
     sealId: `0x${string}`;
@@ -1472,7 +1470,7 @@ export class AttestorClient {
     /** LEGACY(model-key): how `apiKey` travels; see {@link SecretEnvMode}. Default `'auto'`. */
     secretEnv?: SecretEnvMode;
     /** As for {@link lifecycle}: the credential set holds the provider's
-     *  model key, so the retry may create a container. */
+     *  model key, so a provider other than 0g-compute needs no `apiKey`. */
     keyInCredentials?: boolean;
     /** As for {@link lifecycle}: run before the first write or signature. */
     beforeWrite?: () => Promise<void>;
@@ -1484,25 +1482,21 @@ export class AttestorClient {
     }
     const { account } = requireWallet(this.ctx);
     const body: Record<string, unknown> = { seal_id: params.sealId, owner: account.address };
-    if (requestKey || params.keyInCredentials) {
-      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
-      // LEGACY(model-key): the request copy; a key in the set reaches the
-      // container through /provision.
-      const env = requestKey
-        ? await this.sandboxEnv({
-            sealId: params.sealId,
-            provider: params.provider,
-            image: snapshot,
-            apiKey: params.apiKey,
-            sealedSecretEnv: params.sealedSecretEnv,
-            mode: params.secretEnv,
-          })
-        : undefined;
-      await params.beforeWrite?.();
-      body.sandbox_envelope = await this.signEnvelope('create', '', { snapshot, sealed: true, ...(env ? { env } : {}) }, params.envelopeTtlSec ?? 180);
-    } else {
-      await params.beforeWrite?.();
-    }
+    const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
+    // LEGACY(model-key): the request copy; a key in the set reaches the
+    // container through /provision.
+    const env = requestKey
+      ? await this.sandboxEnv({
+          sealId: params.sealId,
+          provider: params.provider,
+          image: snapshot,
+          apiKey: params.apiKey,
+          sealedSecretEnv: params.sealedSecretEnv,
+          mode: params.secretEnv,
+        })
+      : undefined;
+    await params.beforeWrite?.();
+    body.sandbox_envelope = await this.signEnvelope('create', '', { snapshot, sealed: true, ...(env ? { env } : {}) }, params.envelopeTtlSec ?? 180);
     const res = await fetch(`${this.baseUrl()}/retry`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
