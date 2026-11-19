@@ -6,7 +6,7 @@ English: [RELEASING.md](RELEASING.md).
 
 ## 1. dev 上准备好
 
-- 这个版本要带的东西都已合入 `dev`，并在 dev 的默认镜像上实测过：agent 是 reset 到 attestor 默认快照上测的，不是按 agent 指定的测试快照。
+- 这个版本要带的东西都已合入 `dev`，并在 dev 的默认镜像上实测过：agent 是 reset 到 attestor 默认快照上测的，不是按 agent 指定的测试快照。发版带的就是这些框架镜像（§3）。
 
 ## 2. 发版 PR（合入 `dev`）
 
@@ -27,17 +27,18 @@ English: [RELEASING.md](RELEASING.md).
   2. 在 `main` 上打 `v<版本>` 标签；
   3. 再把 `main` 合回 `dev`。
 
-## 3. 从标签构建
+## 3. 镜像和标签
 
-- **镜像**：从 `v<版本>` 的干净检出构建四个框架的镜像（`sealed/images/*`）和 attestor 镜像，推到镜像仓库。0g-harness 镜像带的是 `HARNESS_REF` 指定的那个 harness 提交（`sealed/images/harness/Dockerfile`）。
-- **包**：把 sealed 程序和 harness 包发布为 `artifacts` 发布（release）的附件，各以自己的 sha256 命名（见 [`sealed/LAYERS.zh.md`](sealed/LAYERS.zh.md) 的"下载"）。harness 包按 Dockerfile 开头的说明，从构建镜像时的 `harness-package` 阶段取出。
-- **记录**：把每个 digest 和哈希记进部署记录。
+- **框架镜像**：发版带的是在 dev 上作为默认镜像实测过的那些框架镜像（`sealed/images/*`，见 §1），不重新构建。标签 `v<版本>` 标记代码。
+- **attestor 镜像**：从 `v<版本>` 的干净检出构建，推到镜像仓库。它带着版本号：`/config` 里的 `attestor_version` 就是它。
+- **包**：这些框架镜像带的 sealed 程序和 harness 包是 `artifacts` 发布（release）的附件，各以自己的 sha256 命名（见 [`sealed/LAYERS.zh.md`](sealed/LAYERS.zh.md) 的"下载"）。它们在构建这些镜像时发布；harness 包按 Dockerfile 开头的说明，从构建镜像时的 `harness-package` 阶段取出。
+- **记录**：在部署记录里写明每个框架镜像的 digest 对应哪个构建提交，以及它的 sealed 和 harness 哈希；再记下从标签构建的 attestor 镜像的 digest。
 
 ## 4. 逐个环境（先测试网，再主网）
 
 1. **合约**（这个版本改了合约时）：通过该环境的 Timelock 排期并执行 beacon 升级（`contracts/UPGRADING.md` §2）。主网要等一天，要提前排期。新地址记进 `contracts/DEPLOYMENT.md` §6。
 2. **信任列表**：在新镜像成为默认之前，通过 Timelock 把新镜像、sealed 和 harness 的哈希加进 TrustRegistry（`contracts/script/TrustRegistryCalls.s.sol`；[`contracts/README.md`](contracts/README.md)）。已经在列表上的哈希会让 `list` 回滚，所以一批里只放新的。
-3. **快照**：把镜像导入为该环境的沙箱快照。
+3. **快照**：把发版的框架镜像（§3）导入为该环境的沙箱快照。
 4. **attestor**：
    - 部署新的 attestor 镜像。
    - 把 `ATTESTOR_FRAMEWORKS` / `ATTESTOR_SANDBOX_SNAPSHOT` 指向新快照。
