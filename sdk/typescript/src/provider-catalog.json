@@ -9,6 +9,7 @@
       "anthropic": "https://router-api.0g.ai"
     },
     "modelCatalog": "https://router-api.0g.ai/v1/models",
+    "webSearch": "0g-router",
     "compatibility": {
       "requiresStringContent": true,
       "supportsStore": false,
@@ -18,6 +19,6 @@
       "maxTokensField": "max_tokens"
     }
   },
-  { "id": "openai", "name": "OpenAI", "native": true, "formats": ["openai"] },
-  { "id": "anthropic", "name": "Anthropic", "native": true, "formats": ["anthropic"] }
+  { "id": "openai", "name": "OpenAI", "native": true, "formats": ["openai"], "webSearch": "openai" },
+  { "id": "anthropic", "name": "Anthropic", "native": true, "formats": ["anthropic"], "webSearch": "anthropic" }
 ]

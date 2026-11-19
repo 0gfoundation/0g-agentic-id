@@ -33,7 +33,7 @@ contract StandardCloneAuthorizerTest is AgenticIDTestBase {
         );
         gate = CloneGate(address(proxy));
         vm.prank(owner);
-        agenticId.addTrustedAttestor(address(gate));
+        trustRegistry.addTrustedAttestor(address(gate));
     }
 
     function _source() internal returns (uint256 sourceId, bytes32 dataHash) {

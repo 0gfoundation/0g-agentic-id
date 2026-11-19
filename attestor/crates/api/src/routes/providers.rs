@@ -218,6 +218,7 @@ mod tests {
 
             cli_latest: String::new(),
             cli_notes: String::new(),
+            releases_file: String::new(),
             frameworks: vec![attestor_shared::Framework {
                 name: "openclaw".into(),
                 image: None,
@@ -248,6 +249,8 @@ mod tests {
             chain: chain.clone(),
             sandbox: Arc::new(MockSandbox),
             deployments: Arc::new(InMemoryDeploymentRepo::new()),
+            credentials: attestor_shared::credentials_repo::in_memory(),
+            notify: None,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             jobs: Arc::new(InMemoryJobQueue::new()),
             events: Arc::new(InMemoryEventBus::new()),

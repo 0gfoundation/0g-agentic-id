@@ -3,9 +3,10 @@
 // Package privsep runs the framework subprocess as a dedicated low-privilege
 // user ("agent") so the agent process cannot read sealed's memory
 // (/proc/<pid>/mem, ptrace), sealed's bootstrap environment
-// (/proc/1/environ), or any file outside the subtrees explicitly handed to
-// it. sealed itself stays where it is (PID 1) — the split demotes the agent,
-// it does not elevate sealed.
+// (/proc/<pid>/environ, sealed's or PID 1's), or any file outside the
+// subtrees explicitly handed to it. sealed itself stays where it is (root, as
+// PID 1 or as the loader's child in the 0g-harness image) — the split
+// demotes the agent, it does not elevate sealed.
 //
 // Availability is probed once, lazily: the split engages only when sealed
 // runs as root AND the image ships an agent account with its own non-root

@@ -13,10 +13,11 @@ import { getAddress, hexToBytes, isAddress, keccak256 } from 'viem';
 import { requireWallet, type Ctx, type AttestorPublicConfig } from './context';
 import { listInferenceProviders, ProviderRegistryClient, routeHash, registrySigningMessage, acceptedRegistryDigest, validateProvider, type InferenceProvider, type ProviderRegistrySnapshot } from './Providers';
 import { SDK_VERSION } from './constants';
+import { OPERATOR_DOMAIN, OperatorConflictError, OperatorCheckpointSupersededError, assertOperatorComputeOptions, type OperatorOptions, type OperatorState, type RuntimeBinding } from './Operators';
 import { agenticIDAbi, cloneGateAbi, tappRegistryAbi } from './abi';
 import {
   canonicalSettings, modelAdvisory, settingsAuthMessage, SettingsConflictError, sha256Hex,
-  THINKING_LEVELS, type SettingsDoc,
+  THINKING_LEVELS, versionPicksProblem, type SettingsDoc,
 } from './Settings';
 import {
   SECRET_ENV_SCHEME,
@@ -29,6 +30,7 @@ import {
   sealSecretEnv,
   type SecretEnvMode,
 } from './secretEnv';
+import { carriesRequestKey, deployRequestKey } from './legacy/modelKey';
 
 export const CLONE_DOMAIN = 'AgenticID.Clone.v1';
 export const CLONE_CONTRACT_DOMAIN = 'AgenticID.CloneContract.v1';
@@ -228,13 +230,18 @@ export interface DeployParams {
      *  Omit (or pass '') to use the attestor /config's current image —
      *  the operator-maintained default. */
     sealedImage?: string;
-    /** Inference API key. On this one-shot path the create envelope is
-     *  signed before the agent (and its agentSeal key) exists, so the key
-     *  cannot be sealed and rides the envelope in clear: the wallet prompt
-     *  shows it. To keep it out of the prompt, deploy without `sandbox`,
-     *  wait for the mint, then `start(sealId, { apiKey })`. */
-    apiKey: string;
-    /** See {@link SecretEnvMode}. `'sealed'` makes this call throw before
+    /** Inference API key. `AgentApi.deploy` stores it in the agent's
+     *  credential set as the agent is created. LEGACY(model-key): it also
+     *  rides the create envelope, for older images. On this one-shot path the
+     *  envelope is signed before the agent (and its agentSeal key) exists, so
+     *  the key cannot be sealed and rides the envelope in clear: the wallet
+     *  prompt shows it. To keep it out of the prompt, deploy without `sandbox`,
+     *  wait for the mint, then `start(sealId, { apiKey })`. Omit it to
+     *  start without a model key (an agent that cannot call its model until
+     *  one is set with `credentials.setModelKey`). */
+    apiKey?: string;
+    /** LEGACY(model-key): how `apiKey` rides the create envelope; see
+     *  {@link SecretEnvMode}. `'sealed'` makes this call throw before
      *  anything is signed, because a one-shot deploy cannot seal the key. */
     secretEnv?: SecretEnvMode;
     sealed?: boolean;
@@ -242,6 +249,20 @@ export interface DeployParams {
   };
   /** Seconds the sandbox envelope stays valid. Default 180. */
   envelopeTtlSec?: number;
+  /** The caller stores the agent's credential set right after the attestor
+   *  accepts the deploy (`AgentApi.deploy` does with a model key): the
+   *  attestor creates the container once the set is stored, shortly after
+   *  the mint without one, or after a minute at the latest, so its first
+   *  boot gets the set. Signed with the deploy; an attestor from before
+   *  ignores it. Only with `sandbox`. */
+  awaitCredentials?: boolean;
+}
+
+/** The provider a deploy's model key is for: the persona's (the caller's own
+ *  `iData`), else the SDK-built persona's (`inference`), else 0g-compute. */
+export function deployProvider(params: Pick<DeployParams, 'iData' | 'inference'>): string {
+  const seed = params.iData?.find((entry) => entry.role === 'persona')?.plaintext as { inference?: { provider?: string } } | undefined;
+  return seed?.inference?.provider ?? params.inference?.provider ?? '0g-compute';
 }
 
 export interface DeployCloneResponse {
@@ -317,6 +338,16 @@ const SEALED_NEEDS_AGENT =
   '(and its agentSeal key) exists, so the key cannot be sealed. Deploy without `sandbox`, ' +
   'wait for the mint, then call start(sealId, { apiKey }).';
 
+/**
+ * An HTTP refusal from the attestor or the sandbox provider. The message is
+ * `<what>[ failed]: HTTP <status> <body>` as before; the answer is also kept
+ * apart (`httpStatus`, `httpWhat`, `httpBody`), so a caller that shows it to
+ * a person (the CLI) can say what the server said instead of its raw body.
+ */
+function httpRefusal(what: string, status: number, body: string, failed = true): Error & { httpStatus: number; httpWhat: string; httpBody: string } {
+  return Object.assign(new Error(`${what}${failed ? ' failed' : ''}: HTTP ${status} ${body}`), { httpStatus: status, httpWhat: what, httpBody: body });
+}
+
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -340,7 +371,7 @@ function schemeUnsupported(what: string): SecretEnvRefusedError {
 }
 
 export class AttestorClient {
-  /** In-memory half of the secret-env sticky pin (see secretEnvScheme). */
+  /** LEGACY(model-key): in-memory half of the secret-env sticky pin (see secretEnvScheme). */
   private schemeSeen = false;
 
   constructor(private readonly ctx: Ctx, initialConfig?: AttestorPublicConfig) {
@@ -378,7 +409,7 @@ export class AttestorClient {
       },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!r.ok) throw new Error(`provider /api/balance: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    if (!r.ok) throw httpRefusal('provider /api/balance', r.status, await r.text().catch(() => ''), false);
     const b = (await r.json()) as { balance?: string; reserved?: string; outstanding_debt?: string; pending_settlement?: string; available?: string };
     return {
       balanceWei: BigInt(b.balance ?? '0'),
@@ -428,6 +459,7 @@ export class AttestorClient {
     resourceId: string,
     payload: Record<string, unknown>,
     ttlSec: number,
+    agenticBinding?: RuntimeBinding,
   ) {
     const { walletClient, account } = requireWallet(this.ctx);
     // Provider binding (0g-sandbox#93, anti cross-provider replay): inserted
@@ -436,6 +468,7 @@ export class AttestorClient {
     const provider = await this.resolveProviderAddr();
     const canonical = JSON.stringify({
       action,
+      ...(agenticBinding ? { agentic_id: agenticBinding } : {}),
       expires_at: Math.floor(Date.now() / 1000) + ttlSec,
       nonce: randHex(16),
       payload,
@@ -448,6 +481,143 @@ export class AttestorClient {
       signed_message_b64: b64encode(canonical),
       wallet_signature: signature,
     };
+  }
+
+  /** Public routing metadata; runtime requests are independently authorized by the attestor. */
+  async getOperator(sealId: `0x${string}`): Promise<OperatorState> {
+    return this.fetchOperator(sealId);
+  }
+
+  private async fetchOperator(sealId: `0x${string}`, checkpoint = false): Promise<OperatorState> {
+    const res = await fetch(`${this.baseUrl()}/operator?seal_id=${encodeURIComponent(sealId)}${checkpoint ? '&checkpoint=true' : ''}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      const error = httpRefusal('/operator', res.status, await res.text().catch(() => ''));
+      Object.assign(error, { status: res.status });
+      throw error;
+    }
+    const body = await res.json() as {
+      owner: Address; operator: Address | null; version: number; allow_recreate: boolean;
+      expires_at: number;
+      checkpoint?: { number?: unknown; hash?: unknown } | null;
+    };
+    const anchor = body.checkpoint;
+    if (!isAddress(body.owner) || (body.operator !== null && !isAddress(body.operator)) ||
+        !Number.isSafeInteger(body.version) || body.version < 0 ||
+        !Number.isSafeInteger(body.expires_at) || body.expires_at < 0 ||
+        typeof body.allow_recreate !== 'boolean' ||
+        (anchor != null && (!Number.isSafeInteger(anchor.number) || Number(anchor.number) < 0 ||
+          typeof anchor.hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(anchor.hash)))) {
+      throw new Error('/operator returned an invalid authorization summary');
+    }
+    return {
+      sealId, owner: getAddress(body.owner), operator: body.operator === null ? null : getAddress(body.operator),
+      version: body.version, allowRecreate: body.allow_recreate, expiresAt: body.expires_at,
+      checkpoint: anchor == null ? null : {
+        number: anchor.number as number, hash: anchor.hash as `0x${string}`,
+      },
+    };
+  }
+
+  /** Owner-only. A successful grant update retires the current runtime; provision again with its controller wallet. */
+  async setOperator(sealId: `0x${string}`, operator: Address, opts: OperatorOptions = {}): Promise<OperatorState> {
+    if (!isAddress(operator) || /^0x0{40}$/i.test(operator)) throw new Error('setOperator: operator must be a nonzero wallet address');
+    return this.writeOperator(sealId, getAddress(operator), opts);
+  }
+
+  /** Owner-only. Revokes future operations and retires the current runtime. */
+  async revokeOperator(sealId: `0x${string}`, opts: { baseVersion?: number } = {}): Promise<OperatorState> {
+    return this.writeOperator(sealId, null, opts);
+  }
+
+  private async writeOperator(sealId: `0x${string}`, operator: Address | null, opts: OperatorOptions): Promise<OperatorState> {
+    const { account, walletClient } = requireWallet(this.ctx);
+    const current = await this.fetchOperator(sealId, operator !== null);
+    if (getAddress(account.address) !== current.owner) throw new Error('operator authorization requires the current NFT owner');
+    if (operator !== null && !current.checkpoint) {
+      throw new Error('operator authorization requires a minted agent and an ownership checkpoint from the attestor');
+    }
+    const base = opts.baseVersion ?? current.version;
+    const expiry = operator === null ? 0 : opts.expiresAt ?? 0;
+    if (!Number.isSafeInteger(base) || base < 0) throw new Error('operator baseVersion must be a nonnegative safe integer');
+    if (!Number.isSafeInteger(expiry) || expiry < 0 || (expiry !== 0 && expiry <= Math.floor(Date.now() / 1000))) {
+      throw new Error('operator expiresAt must be 0 or a future Unix timestamp');
+    }
+    if (opts.allowRecreate !== undefined && typeof opts.allowRecreate !== 'boolean') {
+      throw new Error('operator allowRecreate must be a boolean');
+    }
+    const contract = this.ctx.addresses?.agenticID;
+    const chainId = this.ctx.chain?.id;
+    if (!contract || !isAddress(contract) || !Number.isSafeInteger(chainId) || chainId <= 0) {
+      throw new Error('operator authorization requires an AgenticID contract and chain');
+    }
+    const canonical = JSON.stringify({
+      domain: OPERATOR_DOMAIN, chain_id: chainId, contract, seal_id: sealId,
+      owner: account.address, base_version: base, operator,
+      allow_recreate: operator === null ? false : opts.allowRecreate ?? false,
+      expires_at: expiry, issued_at: Math.floor(Date.now() / 1000),
+      checkpoint: operator === null ? null : current.checkpoint,
+    });
+    const signature = await walletClient.signMessage({ account, message: canonical });
+    const res = await fetch(`${this.baseUrl()}/operator`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ seal_id: sealId, signed_message_b64: b64encode(canonical), signature }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      if (res.status === 409) {
+        let body: { error?: { code?: unknown }; minimum_block?: unknown } | undefined;
+        try { body = JSON.parse(text); } catch { /* Preserve the ordinary conflict for non-JSON responses. */ }
+        if (body?.error?.code === 'operator_checkpoint_superseded') {
+          const minimum = body.minimum_block;
+          throw new OperatorCheckpointSupersededError(sealId, base, text,
+            Number.isSafeInteger(minimum) && Number(minimum) >= 0 ? minimum as number : undefined);
+        }
+        throw new OperatorConflictError(sealId, base, text);
+      }
+      throw httpRefusal('/operator', res.status, text);
+    }
+    // Re-read public routing metadata after the write.
+    return this.getOperator(sealId);
+  }
+
+  private async runtimeAuthority(sealId: `0x${string}`): Promise<{ owner: Address; binding?: RuntimeBinding }> {
+    const { account } = requireWallet(this.ctx);
+    let state: OperatorState;
+    try {
+      state = await this.getOperator(sealId);
+    } catch (e) {
+      // Older attestors have no operator route and remain owner-only. Other
+      // failures must not produce an unbound operator envelope.
+      if ((e as { status?: number }).status === 404) return { owner: account.address };
+      throw e;
+    }
+    if (state.owner === getAddress(account.address)) return { owner: state.owner };
+    if (state.operator !== getAddress(account.address) || (state.expiresAt !== 0 && state.expiresAt <= Math.floor(Date.now() / 1000))) {
+      throw new Error('connected wallet is neither the current NFT owner nor its active operator');
+    }
+    const contract = this.ctx.addresses?.agenticID;
+    const chainId = this.ctx.chain?.id;
+    if (!contract || !isAddress(contract) || !Number.isSafeInteger(chainId) || chainId <= 0) {
+      throw new Error('operator lifecycle requires an AgenticID contract and chain');
+    }
+    return { owner: state.owner, binding: {
+      chain_id: chainId, contract, seal_id: sealId, operator_version: state.version,
+    } };
+  }
+
+  /** Whether the connected wallet is this agent's effective, paying operator. */
+  async isRuntimeOperator(sealId: `0x${string}`): Promise<boolean> {
+    return !!(await this.runtimeAuthority(sealId)).binding;
+  }
+
+  /** Public deployment routing, for callers that only retain the agent's seal. */
+  async currentSandboxId(sealId: `0x${string}`): Promise<string | null> {
+    const res = await fetch(`${this.baseUrl()}/deployment/${sealId}`, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) throw new Error(`/deployment/${sealId} failed: HTTP ${res.status}`);
+    const row = await res.json() as { sandbox_id?: string | null };
+    return row.sandbox_id || null;
   }
 
   /**
@@ -598,6 +768,8 @@ export class AttestorClient {
     return this.publishSignedProviders({ document: prepared.document, signature });
   }
 
+  /** LEGACY(model-key): the route a request key is bound to (`keyEnv`,
+   *  `sealApiKey`); a key in the set is bound by {@link modelKeyBinding}. */
   private async credentialRoute(provider: string, image: string | undefined, sealId: `0x${string}` | undefined): Promise<{ hash: string; registry: import('./Providers').ProviderRegistryPin } | undefined> {
     const accepted = await this.getProviderRegistry();
     const definition = accepted.providers.find((p) => p.id === provider);
@@ -614,7 +786,26 @@ export class AttestorClient {
       ...(accepted.version > 0 ? { digest: acceptedRegistryDigest(accepted.document!, accepted.signature!) } : {}) } } : undefined;
   }
 
-  /** Verify support for an exact runtime image before signing an owner action. */
+  /**
+   * Where a model key set through the credential set may go
+   * (Credentials.setModelKey): the provider's route in the registry version
+   * the attestor serves now, which sealed reads back and checks before it uses
+   * the key; with no registry published, the image's built-in route (nothing
+   * to bind). The agent's image must support the provider.
+   */
+  async modelKeyBinding(provider: string, sealId: `0x${string}`): Promise<{ route_hash?: string; registry?: import('./Providers').ProviderRegistryPin }> {
+    await this.assertProviderSupported(provider, { sealId });
+    const accepted = await this.getProviderRegistry();
+    const definition = accepted.providers.find((p) => p.id === provider);
+    if (!definition) throw new Error(`UNSUPPORTED_INFERENCE_PROVIDER: ${provider}`);
+    if (accepted.version === 0) return {};
+    return { route_hash: routeHash(definition), registry: { version: accepted.version, digest: acceptedRegistryDigest(accepted.document!, accepted.signature!) } };
+  }
+
+  /** Verify support for an exact runtime image before signing an owner
+   *  action: the image's capabilities the attestor advertises. Whether the
+   *  request copy of a key can be sealed (`secret_env_scheme`) is not part of
+   *  it; {@link keyEnv} checks that for the copy it builds. */
   async assertProviderSupported(provider: string, options: { sealId?: `0x${string}`; framework?: string; sealedImage?: string } = {}): Promise<void> {
     const definition = await this.providerDefinition(provider);
     const builtin = listInferenceProviders().find((entry) => entry.id === provider);
@@ -623,7 +814,7 @@ export class AttestorClient {
     const cfg = await this.attestorConfig({ fresh: true });
     const image = await this.resolveSealedImage(options.sealedImage, options.framework, options.sealId);
     const capabilities = Array.isArray(cfg.inference_capabilities) ? cfg.inference_capabilities : [];
-    const supported = !!image && cfg.secret_env_scheme === SECRET_ENV_SCHEME && capabilities.some((entry) =>
+    const supported = !!image && capabilities.some((entry) =>
       entry.image === image && (
         (!changed && entry.providers.includes(provider) && entry.secret_env_versions.includes(2)) ||
         (entry.secret_env_versions.includes(3) && (definition.native ? entry.providers.includes(provider) : definition.formats.every((format) => entry.formats?.includes(format))))));
@@ -682,6 +873,8 @@ export class AttestorClient {
   }
 
   /**
+   * LEGACY(model-key): the request-only form of `credentials.sealModelKey`.
+   *
    * Seal an inference key for one agent without signing anything, for the
    * integrator whose server supplies the key while a user's wallet signs
    * (issue #166): the server calls this and hands the browser only the
@@ -706,7 +899,19 @@ export class AttestorClient {
     await this.assertProviderSupported(provider, params);
     const image = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
     const boundRoute = await this.credentialRoute(provider, image, params.sealId);
-    const { pubkey, onChain } = await this.verifiedAgentSeal(params.sealId);
+    const pubkey = await this.agentSealPubkeyFor(params.sealId, params.owner, 'sealApiKey');
+    return sealSecretEnv(pubkey, params.owner, { API_KEY: params.apiKey }, boundRoute || provider !== '0g-compute' ? provider : undefined, boundRoute?.hash, boundRoute?.registry);
+  }
+
+  /**
+   * The agent's agentSeal public key, verified as {@link agentSealPubkey}
+   * does, for a value sealed on behalf of `owner` without its wallet. The
+   * container takes such a value only while `owner` owns the agent, so once
+   * the agent is minted `owner` must be its on-chain owner. `what` names the
+   * caller in a refusal. Throws {@link SecretEnvRefusedError}.
+   */
+  async agentSealPubkeyFor(sealId: `0x${string}`, owner: Address, what: string): Promise<`0x${string}`> {
+    const { pubkey, onChain } = await this.verifiedAgentSeal(sealId);
     if (onChain) {
       let chainOwner: Address;
       try {
@@ -717,17 +922,17 @@ export class AttestorClient {
           args: [onChain.agentId],
         })) as Address;
       } catch (e) {
-        throw new SecretEnvRefusedError('chain_read_failed', `sealApiKey: ownerOf failed: ${errMsg(e)}`, { cause: e });
+        throw new SecretEnvRefusedError('chain_read_failed', `${what}: ownerOf failed: ${errMsg(e)}`, { cause: e });
       }
-      if (getAddress(chainOwner) !== getAddress(params.owner)) {
+      if (getAddress(chainOwner) !== getAddress(owner)) {
         throw new SecretEnvRefusedError(
           'owner_mismatch',
-          `sealApiKey: ${getAddress(params.owner)} is not the agent's on-chain owner (${getAddress(chainOwner)}); ` +
+          `${what}: ${getAddress(owner)} is not the agent's on-chain owner (${getAddress(chainOwner)}); ` +
             'its container would refuse the secret',
         );
       }
     }
-    return sealSecretEnv(pubkey, params.owner, { API_KEY: params.apiKey }, boundRoute || provider !== '0g-compute' ? provider : undefined, boundRoute?.hash, boundRoute?.registry);
+    return pubkey;
   }
 
   /** On-chain agentId + agentSeal of a minted agent; null before the mint
@@ -766,6 +971,8 @@ export class AttestorClient {
   }
 
   /**
+   * LEGACY(model-key): only the request copy of a key is sealed this way.
+   *
    * A FRESH read of `GET /config` for the seal-or-not decision, so turning
    * the flag ON reaches long-lived clients on their next call. The other
    * direction is deliberately NOT symmetric: after this client (or machine)
@@ -809,12 +1016,14 @@ export class AttestorClient {
     return '';
   }
 
+  /** LEGACY(model-key): the scheme the request copy of a key needs. */
   private async requireSecretEnvScheme(what: string): Promise<void> {
     if (!(await this.secretEnvScheme())) throw schemeUnsupported(what);
   }
 
-  /** env block for a sandbox create payload: the inference key (sealed or in
-   *  clear, see {@link keyEnv}), and nothing else. Reasoning depth used to
+  /** LEGACY(model-key): env block for a sandbox create payload: the
+   *  inference key (sealed or in clear, see {@link keyEnv}), and nothing
+   *  else; without the request copy a create carries no env. Reasoning depth used to
    *  ride here as `SEAL_OWNER_THINKING`; it does not any more — the container
    *  reads `thinking` from the owner's settings document, which reaches it on
    *  EVERY boot (including a resume, which a create-time variable misses) and
@@ -835,6 +1044,9 @@ export class AttestorClient {
   }
 
   /**
+   * LEGACY(model-key): the key sent with the request, for images that read
+   * only that (the credential set is the main path; legacy/modelKey.ts).
+   *
    * How the inference key rides the create payload (issue #166):
    *  - `sealedSecretEnv` (sealed elsewhere, e.g. by an integrator's server
    *    with {@link sealApiKey}): placed verbatim as `SEAL_SECRET_ENV`, only
@@ -908,7 +1120,7 @@ export class AttestorClient {
         snapshot,
         sealed: sandbox.sealed ?? true,
         // No sealId: the agent does not exist until /deploy answers.
-        env: await this.sandboxEnv({ apiKey: sandbox.apiKey, mode: sandbox.secretEnv }),
+        env: await this.sandboxEnv(deployRequestKey(sandbox)),
       },
       ttlSec,
     );
@@ -938,6 +1150,8 @@ export class AttestorClient {
     params: {
       sealId: `0x${string}`;
       sandboxId?: string;
+      /** Resolve the current mapping inside this request, without a second deployment read. */
+      resolveSandbox?: boolean;
       /** Framework name for `reset`/first `start` — the SDK resolves its
        *  sealed image from GET /config's frameworks[] (same as deploy), so a
        *  non-default framework doesn't need `sealedImage` passed. */
@@ -946,31 +1160,60 @@ export class AttestorClient {
        *  `snapshot`; only relevant for `reset`). Explicit wins over the
        *  framework-resolved image. */
       sealedImage?: string;
-      /** Inference API key for `reset` — the fresh container needs a fresh
-       *  env (the attestor doesn't cache the LLM key). Without it the agent
-       *  comes back alive but can't call its model. Sealed to the agent when
-       *  the attestor supports it (see `secretEnv`). */
+      /** LEGACY(model-key): the model key sent with the request, for images
+       *  that read only that (`AgentApi` stores it in the credential set).
+       *  Sealed to the agent when the attestor supports it (see `secretEnv`). */
       apiKey?: string;
       /** Credential provider; defaults to legacy compute. */
       provider?: string;
-      /** The key already sealed to this agent (the value {@link sealApiKey}
-       *  returned, e.g. on an integrator's server), in place of `apiKey`:
-       *  signed verbatim as `SEAL_SECRET_ENV`, so the key never has to reach
-       *  the signer. Requires the attestor to advertise `secret_env_scheme`. */
+      /** The agent's credential set holds a model key for `provider`: a
+       *  create without a key is not refused for it. */
+      keyInCredentials?: boolean;
+      /** Run once every check that can refuse has passed, before the first
+       *  write or signature (the model key going into the credential set). */
+      beforeWrite?: () => Promise<void>;
+      /** SDK owner-only model-key planning after runtime identity has been resolved. Never run for an operator. */
+      prepareModelKey?: () => Promise<{ keyInCredentials: boolean; beforeWrite?: () => Promise<void> }>;
+      /** Original facade options, checked without running owner callbacks for an operator. */
+      operatorOptions?: Parameters<typeof assertOperatorComputeOptions>[0];
+      /** LEGACY(model-key): the key already sealed to this agent (the value
+       *  {@link sealApiKey} returned, e.g. on an integrator's server), in place
+       *  of `apiKey`: signed verbatim as `SEAL_SECRET_ENV`, so the key never
+       *  has to reach the signer. Requires the attestor to advertise
+       *  `secret_env_scheme`. */
       sealedSecretEnv?: string;
-      /** How `apiKey` travels; see {@link SecretEnvMode}. Default `'auto'`. */
+      /** LEGACY(model-key): how `apiKey` travels; see {@link SecretEnvMode}. Default `'auto'`. */
       secretEnv?: SecretEnvMode;
       envelopeTtlSec?: number;
     },
   ): Promise<void> {
-    const { account } = requireWallet(this.ctx);
+    // Resolve identity and deployment once for this call. Never reuse a grant
+    // across calls; API and worker still revalidate at their own boundaries.
+    const deploymentPurpose = op === 'stop' ? 'resolve the sandbox'
+      : (op === 'reset' || !params.sandboxId) && !params.sealedImage && !params.framework
+        ? "pick the sealed image and check the agent's settings" : "check the agent's settings";
+    const [authority, row] = await Promise.all([
+      this.runtimeAuthority(params.sealId),
+      op !== 'stop' || (params.resolveSandbox && !params.sandboxId)
+        ? this.deploymentRow(params.sealId, deploymentPurpose)
+        : Promise.resolve(undefined),
+    ]);
+    const operator = !!authority.binding;
+    if (operator) {
+      assertOperatorComputeOptions(params);
+      assertOperatorComputeOptions(params.operatorOptions ?? {});
+    }
+    const keyPlan = operator ? undefined : await params.prepareModelKey?.();
+    const keyInCredentials = keyPlan?.keyInCredentials ?? params.keyInCredentials;
+    const sandboxId = params.sandboxId ?? (params.resolveSandbox ? row?.sandbox_id as string | undefined : undefined);
     const ttl = params.envelopeTtlSec ?? 180;
     // `reset`, OR a first-time `start` of a never-provisioned (mint-only)
     // agent: both spin a FRESH container via the `create` envelope. A `start`
     // WITH a sandboxId resumes an existing (stopped) container instead.
-    const create = op === 'reset' || (op === 'start' && !params.sandboxId);
-    if (!create && !params.sandboxId) throw new Error(`${op}: sandboxId is required`);
-    if (create && params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined) {
+    const create = op === 'reset' || (op === 'start' && !sandboxId);
+    if (!create && !sandboxId) throw new Error(`${op}: sandboxId is required`);
+    const requestKey = carriesRequestKey(params);
+    if (create && !operator && params.provider && params.provider !== '0g-compute' && !requestKey && !keyInCredentials) {
       throw new SecretEnvRefusedError('invalid_input', `reset/start for ${params.provider} requires its API key`);
     }
     // Every boot a start or reset brings about is served the agent's settings
@@ -978,15 +1221,8 @@ export class AttestorClient {
     // one stored first (see needsDefaultSettings). The row is read, and every
     // check below that can refuse runs, before anything is written or signed.
     let seed: { provider: string; model: string } | null = null;
-    let row: Record<string, unknown> | undefined;
     if (op !== 'stop') {
-      row = await this.deploymentRow(
-        params.sealId,
-        create && !params.sealedImage && !params.framework
-          ? "pick the sealed image and check the agent's settings"
-          : "check the agent's settings",
-      );
-      seed = this.defaultSettingsFor(row);
+      seed = operator ? null : this.defaultSettingsFor(row!);
       if (seed && params.provider && params.provider !== seed.provider) {
         throw new Error(
           `${op}: agent ${params.sealId} has no settings document and could boot with no model; ` +
@@ -995,7 +1231,7 @@ export class AttestorClient {
       }
     }
     let action: string = op;
-    let resourceId = params.sandboxId ?? '';
+    let resourceId = sandboxId ?? '';
     let payload: Record<string, unknown> = {};
     if (create) {
       const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId, row);
@@ -1004,7 +1240,9 @@ export class AttestorClient {
       payload = {
         snapshot,
         sealed: true,
-        ...(params.apiKey || params.sealedSecretEnv !== undefined
+        // LEGACY(model-key): the request copy; a key in the set reaches the
+        // container through /provision.
+        ...(requestKey
           ? {
               env: await this.sandboxEnv({
                 sealId: params.sealId,
@@ -1018,13 +1256,17 @@ export class AttestorClient {
           : {}),
       };
     }
+    if (!operator) {
+      await params.beforeWrite?.();
+      await keyPlan?.beforeWrite?.();
+    }
     if (seed) {
       await storeDefaultSettings(
         { setSettings: (sealId, settings, opts) => this.setSettings({ sealId, settings, baseVersion: opts.baseVersion }) },
         params.sealId,
       );
     }
-    const envelope = await this.signEnvelope(action, resourceId, payload, ttl);
+    const envelope = await this.signEnvelope(action, resourceId, payload, ttl, authority.binding);
     // A no-sandboxId `start` still POSTs /start; the attestor dispatches on the
     // envelope action (create → fresh provision, start → resume).
     const path = op === 'reset' ? '/reset' : `/${op}`;
@@ -1034,11 +1276,11 @@ export class AttestorClient {
       // `framework` rides along so the attestor can keep the row's recorded
       // framework in sync when a reset switches harness (review #154 F1) —
       // optional; old attestors ignore unknown fields.
-      body: JSON.stringify({ seal_id: params.sealId, owner: account.address, sandbox_envelope: envelope, ...(params.framework ? { framework: params.framework } : {}) }),
+      body: JSON.stringify({ seal_id: params.sealId, owner: authority.owner, sandbox_envelope: envelope, ...(params.framework ? { framework: params.framework } : {}) }),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`${path} failed: HTTP ${res.status} ${text}`);
+      throw httpRefusal(path, res.status, text);
     }
   }
 
@@ -1134,6 +1376,8 @@ export class AttestorClient {
       && !(THINKING_LEVELS as readonly string[]).includes(thinking.trim().toLowerCase())) {
       throw new Error(`setSettings: thinking must be one of ${THINKING_LEVELS.join('|')}, got "${thinking}"`);
     }
+    const versionsProblem = versionPicksProblem(params.settings.versions);
+    if (versionsProblem) throw new Error(`setSettings: ${versionsProblem}`);
     if (params.settings.provider) await this.assertProviderSupported(params.settings.provider, { sealId: params.sealId });
     if (params.onWarn) {
       for (const w of await modelAdvisory(params.settings, await this.providerDefinition(params.settings.provider ?? '0g-compute'))) params.onWarn(w);
@@ -1191,7 +1435,7 @@ export class AttestorClient {
           detail: live ? undefined : `could not re-read the current document: ${text.slice(0, 200)}`,
         });
       }
-      throw new Error(`/settings failed: HTTP ${res.status} ${text}`);
+      throw httpRefusal('/settings', res.status, text);
     }
     const body = (await res.json()) as { version?: number | string };
     return { version: Number(body.version ?? 0) };
@@ -1203,14 +1447,12 @@ export class AttestorClient {
    * failed idempotent stage (storage upload from persisted ciphertext, mint
    * receipt re-fetch, setAgentURI, …) against the SAME seal_id.
    *
-   * Without `apiKey`: posts `{ seal_id, owner }` — idempotent stages only, no
-   * container work (the cheap owner-field auth path). With `apiKey` or
-   * `sealedSecretEnv` (and optionally `sealedImage`): attaches the same
-   * owner-signed "create" envelope reset uses (the key sealed to the agent when the attestor
-   * supports it, see `secretEnv`), so the worker may continue past the
-   * idempotent stages into container creation. The attestor keeps no copy of
-   * the key outside that job, so — as with reset — continuing into a
-   * container needs it re-supplied.
+   * Every retry carries the same owner-signed "create" envelope reset uses
+   * (optionally with `sealedImage`); the attestor refuses a retry without
+   * it. When the container failed or was stopped, the worker continues past
+   * the idempotent stages into container creation with that envelope; the
+   * container takes the model key from the credential set at its boot.
+   * LEGACY(model-key): `apiKey` / `sealedSecretEnv` also ride the request.
    */
   async retry(params: {
     sealId: `0x${string}`;
@@ -1218,40 +1460,43 @@ export class AttestorClient {
      *  (same as deploy) when `sealedImage` isn't given. */
     framework?: string;
     sealedImage?: string;
+    /** LEGACY(model-key): the model key sent with the request; see
+     *  {@link lifecycle}'s `apiKey`. */
     apiKey?: string;
     provider?: string;
-    /** In place of `apiKey`: the key already sealed to this agent; see
-     *  {@link lifecycle}'s `sealedSecretEnv`. */
+    /** LEGACY(model-key): in place of `apiKey`, the key already sealed to
+     *  this agent; see {@link lifecycle}'s `sealedSecretEnv`. */
     sealedSecretEnv?: string;
-    /** How `apiKey` travels; see {@link SecretEnvMode}. Default `'auto'`. */
+    /** LEGACY(model-key): how `apiKey` travels; see {@link SecretEnvMode}. Default `'auto'`. */
     secretEnv?: SecretEnvMode;
+    /** As for {@link lifecycle}: the credential set holds the provider's
+     *  model key, so a provider other than 0g-compute needs no `apiKey`. */
+    keyInCredentials?: boolean;
+    /** As for {@link lifecycle}: run before the first write or signature. */
+    beforeWrite?: () => Promise<void>;
     envelopeTtlSec?: number;
   }): Promise<void> {
-    if (params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined) {
+    const requestKey = carriesRequestKey(params);
+    if (params.provider && params.provider !== '0g-compute' && !requestKey && !params.keyInCredentials) {
       throw new SecretEnvRefusedError('invalid_input', `retry for ${params.provider} requires its API key`);
     }
     const { account } = requireWallet(this.ctx);
     const body: Record<string, unknown> = { seal_id: params.sealId, owner: account.address };
-    if (params.apiKey || params.sealedSecretEnv !== undefined) {
-      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
-      body.sandbox_envelope = await this.signEnvelope(
-        'create',
-        '',
-        {
-          snapshot,
-          sealed: true,
-          env: await this.sandboxEnv({
-            sealId: params.sealId,
-            provider: params.provider,
-            image: snapshot,
-            apiKey: params.apiKey,
-            sealedSecretEnv: params.sealedSecretEnv,
-            mode: params.secretEnv,
-          }),
-        },
-        params.envelopeTtlSec ?? 180,
-      );
-    }
+    const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
+    // LEGACY(model-key): the request copy; a key in the set reaches the
+    // container through /provision.
+    const env = requestKey
+      ? await this.sandboxEnv({
+          sealId: params.sealId,
+          provider: params.provider,
+          image: snapshot,
+          apiKey: params.apiKey,
+          sealedSecretEnv: params.sealedSecretEnv,
+          mode: params.secretEnv,
+        })
+      : undefined;
+    await params.beforeWrite?.();
+    body.sandbox_envelope = await this.signEnvelope('create', '', { snapshot, sealed: true, ...(env ? { env } : {}) }, params.envelopeTtlSec ?? 180);
     const res = await fetch(`${this.baseUrl()}/retry`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1259,7 +1504,7 @@ export class AttestorClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`/retry failed: HTTP ${res.status} ${text}`);
+      throw httpRefusal('/retry', res.status, text);
     }
   }
 
@@ -1273,8 +1518,7 @@ export class AttestorClient {
     // Fail before the first signature: a one-shot deploy signs its create
     // envelope before the agent exists, so it can never seal the key.
     assertSecretEnvMode(params.sandbox?.secretEnv);
-    const seed = params.iData?.find((entry) => entry.role === 'persona')?.plaintext as { inference?: { provider?: string } } | undefined;
-    const provider = seed?.inference?.provider ?? params.inference?.provider ?? '0g-compute';
+    const provider = deployProvider(params);
     await this.providerDefinition(provider);
     if (params.sandbox && provider !== '0g-compute') throw new SecretEnvRefusedError('sealed_needs_agent', SEALED_NEEDS_AGENT);
     if (params.sandbox?.apiKey && params.sandbox.secretEnv === 'sealed') {
@@ -1306,6 +1550,7 @@ export class AttestorClient {
 
     // Owner canonical — must match CanonicalDeploy (order is irrelevant; the
     // attestor deserializes then re-checks each field).
+    const awaitCredentials = !!(params.awaitCredentials && params.sandbox);
     const canonical = JSON.stringify({
       domain: DEPLOY_DOMAIN,
       idempotency_key: idempotencyKey,
@@ -1314,6 +1559,7 @@ export class AttestorClient {
       description: params.description,
       image: params.image ?? null,
       i_data: iData,
+      ...(awaitCredentials ? { await_credentials: true } : {}),
     });
     const ownerSig = await walletClient.signMessage({ account, message: canonical });
     // Provision only when a sandbox is given; omit it → mint-only deploy
@@ -1332,6 +1578,7 @@ export class AttestorClient {
       image: params.image ?? null,
       i_data: iData,
       ...(sandbox_envelope ? { sandbox_envelope } : {}),
+      ...(awaitCredentials ? { await_credentials: true } : {}),
     });
   }
 
@@ -1453,7 +1700,7 @@ export class AttestorClient {
       }
       if (res.ok) return (await res.json()) as DeployCloneResponse;
       const text = await res.text().catch(() => '');
-      const err = new Error(`${path} failed: HTTP ${res.status} ${text}`);
+      const err = httpRefusal(path, res.status, text);
       if (res.status < 500) throw err; // 4xx — client/business error, retry won't help
       lastErr = err; // 5xx — server transient, retry
     }

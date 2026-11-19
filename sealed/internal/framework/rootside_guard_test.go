@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"seal-verify/internal/servicesandbox"
 )
 
 // sealed runs as root, and the agent process can change any tree handed to
@@ -90,10 +92,61 @@ var allowedDirectCalls = map[string]struct {
 	count  int
 	reason string
 }{
-	"internal/framework/state.go OpenLog os.OpenFile":         {1, "framework.StateDir/log is root-only and the file is opened O_NOFOLLOW (TestOpenLogRefusesALink)"},
-	"internal/logger/logger.go Flush os.MkdirAll":             {1, "the root-only state directory; logger cannot import privsep (privsep logs through it)"},
-	"internal/logger/logger.go Flush os.OpenFile":             {1, "LogPath in the root-only state directory, opened O_NOFOLLOW"},
-	"internal/proxy/sign.go Server.ListenInternal net.Listen": {1, "the sign socket is created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link"},
+	"internal/servicehost/model.go Manager.startModel net.Listen":                   {1, "binds a worker-private Unix model socket inside the task's fresh run directory, before any process of its identity exists, exposing only the pinned model route and hard per-job request limits"},
+	"internal/servicehost/model.go Manager.startModel os.Lchown":                    {1, "hands the model proxy socket sealed just bound to the task's identity before any process of it exists; Lchown never follows a link"},
+	"internal/servicehost/isolation.go imageSystem filepath.EvalSymlinks":           {2, "resolves fixed image system paths (/usr, /bin, /sbin, /lib, /lib64 and three /etc entries) that only root can change, so each Landlock rule names the real directory"},
+	"internal/servicehost/isolation.go imageSystem os.Stat":                         {1, "checks that a resolved fixed image system path is a directory"},
+	"internal/servicehost/isolation.go imageSystem unix.Lstat":                      {1, "checks that the fixed /dev nodes it grants are character devices"},
+	"internal/servicehost/manager.go Manager.command filepath.EvalSymlinks":         {1, "resolves the interpreter privsep.LookPath found on the trusted image PATH, then requires it inside the image's system directories"},
+	"internal/servicehost/manager.go privateDir os.Lchown":                          {1, "hands a directory sealed just created under a root-owned task, socket or coordinator parent to one service identity before its code starts"},
+	"internal/servicehost/runtime.go diskUsage unix.Open":                           {1, "opens O_DIRECTORY|O_NOFOLLOW a service identity's private work or temporary directory, whose path sealed made, only to list it"},
+	"internal/servicehost/runtime.go addBlocks unix.Fstatat":                        {1, "stats entries of that tree relative to an open directory without following links, to sum allocated blocks; nothing is read"},
+	"internal/servicehost/runtime.go addBlocks unix.Openat":                         {1, "opens O_DIRECTORY|O_NOFOLLOW a subdirectory relative to its open parent, so a swapped link cannot steer the walk outside the identity's tree"},
+	"internal/servicehost/runtime.go diskLow unix.Statfs":                           {1, "reads the free space of the filesystem holding sealed's own task directories; nothing is opened"},
+	"internal/servicesandbox/confine_linux.go ABI unix.Syscall":                     {1, "queries the kernel's Landlock ABI; no path"},
+	"internal/servicesandbox/confine_linux.go newRuleset unix.Syscall":              {1, "creates a Landlock ruleset; no path"},
+	"internal/servicesandbox/confine_linux.go newRuleset unsafe.Pointer":            {1, "passes the ruleset attributes to the kernel"},
+	"internal/servicesandbox/confine_linux.go newRuleset unsafe.Sizeof":             {1, "the size of those attributes"},
+	"internal/servicesandbox/confine_linux.go ruleset.allow unix.Open":              {1, "opens O_PATH|O_NOFOLLOW a path sealed put in the policy (image system directories, the release, the runtime, the identity's private directories) only to name it in a Landlock rule"},
+	"internal/servicesandbox/confine_linux.go ruleset.allow unix.Syscall6":          {1, "adds that Landlock rule"},
+	"internal/servicesandbox/confine_linux.go ruleset.allow unsafe.Pointer":         {1, "passes the rule to the kernel"},
+	"internal/servicesandbox/confine_linux.go ruleset.restrictSelf unix.Syscall":    {1, "enforces the ruleset on the launcher before it execs the service program"},
+	"internal/servicesandbox/confine_linux.go installServiceFilter unix.Syscall":    {1, "installs the seccomp filter: AF_UNIX sockets only, no io_uring, IPC, keyrings or x32"},
+	"internal/servicesandbox/confine_linux.go installServiceFilter unsafe.Pointer":  {1, "passes the filter program to the kernel"},
+	"internal/servicesandbox/confine_linux.go confine os.WriteFile":                 {1, "raises the launcher's own kernel-owned /proc/self/oom_score_adj to 1000 before it drops to the service identity"},
+	"internal/servicesandbox/confine_linux.go confine unix.Chdir":                   {1, "enters the release directory sealed named, after the identity drop and Landlock"},
+	"internal/servicesandbox/confine_linux.go Run syscall.Exec":                     {1, "execs the interpreter sealed resolved inside the image's system directories, only after the identity drop, no_new_privs, Landlock and seccomp; no service code runs as root"},
+	"internal/servicesandbox/probe_linux.go Probe os.ReadFile":                      {1, "after confining itself at a service identity, checks that Landlock refuses the kernel-owned /proc/self/status"},
+	"internal/servicesandbox/probe_linux.go existing os.Lstat":                      {1, "checks fixed image system directories for the probe's policy"},
+	"internal/servicesandbox/process_linux.go forEachProcess os.ReadDir":            {1, "lists kernel-owned /proc (a fixture root in tests)"},
+	"internal/servicesandbox/process_linux.go processUsage os.ReadFile":             {2, "reads kernel-owned /proc/<pid>/status and /proc/<pid>/task/<tid>/status to sum one identity's processes and memory"},
+	"internal/servicesandbox/process_linux.go processUsage os.ReadDir":              {1, "lists kernel-owned /proc/<pid>/task of a zombie thread-group leader"},
+	"internal/servicesandbox/probe_linux.go Probe unix.Syscall":                     {1, "after confining itself, checks that seccomp refuses shmget; no path"},
+	"internal/servicehost/isolation.go checkServiceIdentityMaps os.ReadFile":        {1, "reads only kernel-owned /proc/self/uid_map and gid_map to reject a provider that does not map the service identity range; no caller-supplied path"},
+	"internal/servicehost/manager.go Manager.Publish os.MkdirTemp":                  {1, "stages a release under the root-owned versions directory; service code only reads the final directory, which Landlock grants read and execute"},
+	"internal/servicehost/request.go taskTransport.RoundTrip os.MkdirTemp":          {1, "creates a task directory under sealed's root-owned programs/tasks parent; caller data is never written there"},
+	"internal/servicehost/execution.go Manager.prepareExecution os.MkdirTemp":       {1, "creates one execution directory under the root-owned task parent; no input or output is persisted there"},
+	"internal/servicehost/egress.go Manager.startEgress net.Listen":                 {1, "binds a Unix proxy socket in a newly prepared private run directory before the worker starts; it exposes only checked public destinations"},
+	"internal/servicehost/egress.go Manager.startEgress os.Lchown":                  {1, "hands the egress proxy socket sealed just bound to the task's identity before any process of it exists; Lchown never follows a link"},
+	"internal/servicehost/coordinator.go Manager.prepareCoordinatorWork os.Lchown":  {1, "hands only a root-parented private work inode to a stable service identity while its coordinator is stopped"},
+	"internal/servicehost/coordinator.go Manager.startCoordinatorLocked os.Lchown":  {1, "hands the process-control socket sealed just bound to the coordinator's identity before its code starts; Lchown never follows a link"},
+	"internal/servicehost/coordinator.go Manager.startCoordinatorLocked net.Listen": {1, "binds a control socket in a freshly prepared service-private run directory; the handler is pinned to this service and is never exposed publicly"},
+	"internal/framework/state.go OpenLog os.OpenFile":                               {1, "framework.StateDir/log is root-only and the file is opened O_NOFOLLOW (TestOpenLogRefusesALink)"},
+	"internal/logger/logger.go Flush os.MkdirAll":                                   {1, "the root-only state directory; logger cannot import privsep (privsep logs through it)"},
+	"internal/logger/logger.go Flush os.OpenFile":                                   {1, "LogPath in the root-only state directory, opened O_NOFOLLOW"},
+	"internal/proxy/sign.go Server.ListenInternal net.Listen":                       {1, "the sign socket is created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link"},
+	"internal/proxy/agentsock.go ServeAgentSocket net.Listen":                       {1, "the credential sockets are created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link (as for the sign socket)"},
+	"cmd/loader/supervise.go verifyFile os.Open":                                    {1, "hashes a sealed program in the loader's root-only state directory (/var/lib/loader, 0700), downloaded by the loader or staged by sealed, before it runs; the loader links only the standard library and x/sys (its TestLinkedPackages), so not privsep"},
+	"cmd/loader/supervise.go supervisor.runOnce exec.Command":                       {1, "starts the program verifyFile just matched against its hash, in the root-only state directory; between sealed runs the loader has ended every other process (killLeftovers)"},
+	"cmd/loader/fetch.go fetchSealed os.MkdirAll":                                   {1, "creates the sealed/ directory inside /var/lib/loader, which only root can enter"},
+	"cmd/loader/fetch.go fetchSealed os.Remove":                                     {1, "removes a download's temporary file inside /var/lib/loader, which only root can enter"},
+	"cmd/loader/fetch.go fetchSealed os.Rename":                                     {1, "moves a download that hashed to its name into place within /var/lib/loader, which only root can enter"},
+	"cmd/loader/fetch.go download os.OpenFile":                                      {1, "creates a download's temporary file (O_EXCL) inside /var/lib/loader, which only root can enter"},
+	"cmd/loader/state.go stateDir.prepare os.MkdirAll":                              {1, "creates /var/lib/loader, the loader's state directory, under the root-only /var/lib before any sealed runs"},
+	"cmd/loader/state.go stateDir.prepare os.Chmod":                                 {1, "makes /var/lib/loader 0700: only root (the loader and sealed) enters it"},
+	"cmd/loader/state.go stateDir.read os.ReadFile":                                 {1, "reads a file in /var/lib/loader, which only root can enter"},
+	"cmd/loader/state.go stateDir.write os.WriteFile":                               {1, "writes a file in /var/lib/loader, which only root can enter"},
+	"cmd/loader/state.go stateDir.write os.Rename":                                  {1, "renames a file within /var/lib/loader, which only root can enter"},
 }
 
 // rootCommands is everything root executes: the functions that may call
@@ -103,6 +156,15 @@ var rootCommands = map[string][]string{
 	"internal/framework/openclaw.installCommand": {"npm"},
 	"internal/framework/hermes.installHermes":    {"git", "uv"},
 	"internal/framework/prime.npmGlobalRoot":     {"npm"},
+}
+
+// rootSelfModes is everything root runs of sealed's own program: the
+// functions that may call privsep.RootSelf, and the modes (string literals)
+// each may name. The hosted-service launcher is the only one.
+var rootSelfModes = map[string][]string{
+	"internal/servicehost.Manager.command": {servicesandbox.LauncherMode},
+	"internal/servicehost.ProbeIsolation":  {servicesandbox.LauncherMode},
+	"internal/servicehost.reapIdentity":    {servicesandbox.LauncherMode},
 }
 
 // rootEnvHelpers are the functions whose result a rootCommands function may
@@ -702,8 +764,8 @@ func (s *moduleScan) inspectFile(rel, pkgDir string, f *ast.File, info *types.In
 					return true
 				}
 				if call == nil {
-					if name == "RootCommand" {
-						flag("privsep.RootCommand used as a value", n)
+					if name == "RootCommand" || name == "RootSelf" {
+						flag("privsep."+name+" used as a value", n)
 					}
 					return true
 				}
@@ -959,29 +1021,34 @@ func TestRootRunsOnlyPinnedToolchainCommands(t *testing.T) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	seen := map[string]bool{}
-	for _, fn := range keys {
-		for _, c := range s.calls[fn] {
-			if c.name != "RootCommand" {
-				continue
-			}
-			allowed, ok := rootCommands[fn]
-			switch {
-			case !ok:
-				t.Errorf("%s: %s runs a command as root (privsep.RootCommand); only the functions in rootCommands may", c.pos, fn)
-			case !c.lit:
-				t.Errorf("%s: %s passes RootCommand a non-literal command name; name the binary literally", c.pos, fn)
-			case !contains(allowed, c.arg):
-				t.Errorf("%s: %s runs %q as root; rootCommands allows it only %v", c.pos, fn, c.arg, allowed)
-			default:
-				seen[fn+" "+c.arg] = true
+	for _, rule := range []struct {
+		call, list string
+		allowed    map[string][]string
+	}{{"RootCommand", "rootCommands", rootCommands}, {"RootSelf", "rootSelfModes", rootSelfModes}} {
+		seen := map[string]bool{}
+		for _, fn := range keys {
+			for _, c := range s.calls[fn] {
+				if c.name != rule.call {
+					continue
+				}
+				allowed, ok := rule.allowed[fn]
+				switch {
+				case !ok:
+					t.Errorf("%s: %s runs a command as root (privsep.%s); only the functions in %s may", c.pos, fn, rule.call, rule.list)
+				case !c.lit:
+					t.Errorf("%s: %s passes %s a non-literal name; name it literally", c.pos, fn, rule.call)
+				case !contains(allowed, c.arg):
+					t.Errorf("%s: %s runs %q as root; %s allows it only %v", c.pos, fn, c.arg, rule.list, allowed)
+				default:
+					seen[fn+" "+c.arg] = true
+				}
 			}
 		}
-	}
-	for fn, names := range rootCommands {
-		for _, n := range names {
-			if !seen[fn+" "+n] {
-				t.Errorf("rootCommands lists %s running %q, but no such call exists; update the list", fn, n)
+		for fn, names := range rule.allowed {
+			for _, n := range names {
+				if !seen[fn+" "+n] {
+					t.Errorf("%s lists %s running %q, but no such call exists; update the list", rule.list, fn, n)
+				}
 			}
 		}
 	}
@@ -1064,17 +1131,79 @@ func TestMainWiresBootHardening(t *testing.T) {
 		t.Errorf("main() logs (line %d) before privsep.Harden (line %d), which settles the time zone that first log line reads", first.Line, harden.Line)
 	}
 	// The adapters register, and so declare their trees, before Harden
-	// reclaims root's home.
+	// reclaims root's home: main() calls registerAdapters first, which
+	// registers every adapter in the default build (adapters.go) and the
+	// 0g-harness adapter alone in the 0g-harness image's (harnessonly) build.
+	reg := findPlainCall(t, s, "registerAdapters")
+	switch {
+	case reg.Line == 0:
+		t.Fatal("main() does not call registerAdapters")
+	case reg.Line > harden.Line:
+		t.Errorf("registerAdapters (line %d) must run before privsep.Harden (line %d): the adapters declare the trees Harden leaves in root's home", reg.Line, harden.Line)
+	}
+	all := registeredIn(t, s, "adapters.go")
 	for _, pkg := range adapterPackages {
-		name := filepath.Base(pkg)
-		reg := findPackageCall(t, s, name, "New")
-		switch {
-		case reg.Line == 0:
-			t.Errorf("main() does not register %s (%s.New)", pkg, name)
-		case reg.Line > harden.Line:
-			t.Errorf("%s.New (line %d) must run before privsep.Harden (line %d): it declares the trees Harden leaves in root's home", name, reg.Line, harden.Line)
+		if name := filepath.Base(pkg); !all[name] {
+			t.Errorf("adapters.go does not register %s (%s.New)", pkg, name)
 		}
 	}
+	if only := registeredIn(t, s, "adapters_harnessonly.go"); len(only) != 1 || !only["harness"] {
+		t.Errorf("adapters_harnessonly.go registers %v, want the 0g-harness adapter alone", only)
+	}
+}
+
+// findPlainCall finds, in main(), the first call to the package-level
+// function fn of package main.
+func findPlainCall(t *testing.T, s *moduleScan, fn string) token.Position {
+	t.Helper()
+	f, err := parser.ParseFile(s.fset, filepath.Join(moduleRoot(t), "main.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pos token.Position
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "main" || fd.Recv != nil {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && pos.Line == 0 {
+				if id, ok := call.Fun.(*ast.Ident); ok && id.Name == fn {
+					pos = s.fset.Position(call.Pos())
+				}
+			}
+			return true
+		})
+	}
+	return pos
+}
+
+// registeredIn lists the packages whose New() the registerAdapters function
+// in file (of package main) calls.
+func registeredIn(t *testing.T, s *moduleScan, file string) map[string]bool {
+	t.Helper()
+	f, err := parser.ParseFile(s.fset, filepath.Join(moduleRoot(t), file), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]bool{}
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "registerAdapters" || fd.Recv != nil {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if se, ok := call.Fun.(*ast.SelectorExpr); ok && se.Sel.Name == "New" {
+					if x, ok := se.X.(*ast.Ident); ok {
+						out[x.Name] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	return out
 }
 
 // findPackageCall finds, in main(), the first call to pkg.fn (to any

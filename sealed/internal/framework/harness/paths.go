@@ -3,12 +3,14 @@ package harness
 // Filesystem paths the 0g-harness adapter manages.
 //
 // DSH keeps all user data under one root: $DSH_HOME, default ~/.dsh
-// (dsh-home-paths' resolveDshHome()). This adapter tracks two children of
+// (dsh-home-paths' resolveDshHome()). This adapter tracks three children of
 // that root as agent identity:
 //
 //	skills/          agent-installed skills — the "user-dsh" rank-400 root in
 //	                 the skill-discovery table (docs/subsystems/skills.md),
 //	                 <name>/SKILL.md or <name>.md per skill (skills.go)
+//	memory/          the agent's long-term memory, <name>.md per memory plus
+//	                 the MEMORY.md index (memory.go)
 //	APPEND_SYSTEM.md the owner persona (persona.go)
 //
 // Deliberately NOT managed (never on chain):
@@ -49,7 +51,8 @@ package harness
 //     names its own checkout path so its self-referential toolset can read
 //     and edit it), but doing so safely needs a promote/rollback primitive
 //     this codebase does not have yet (see the package doc). v1 tracks only
-//     the framework's DATA surface — the persona and the installed skills.
+//     the framework's DATA surface — the persona, the installed skills and
+//     the memory.
 //     The inference pin is NOT part of it: it is the owner's settings
 //     document, rendered into the harness's environment at every Start
 //     (settings.go), and no role carries it.
@@ -86,6 +89,10 @@ func ensureRoleDir(dir string) error {
 }
 
 func skillsDir() string { return dshHome + "/skills" }
+
+func memoryDir() string { return dshHome + "/memory" }
+
+func publicMemoryDir() string { return dshHome + "/memory-public" }
 
 // appendSystemPath holds the owner persona, injected by the harness into
 // ctx.systemPrompt at boot (see spawn.go) — DSH has no native

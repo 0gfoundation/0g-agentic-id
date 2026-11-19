@@ -267,6 +267,35 @@ ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS ticket_issued_at 
 -- sandbox created at the provider directly, even one carrying the ticket,
 -- has another key. Cleared with every new ticket.
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_container_pubkey BYTEA;
+
+-- Agent-scoped delegation keeps NFT authority separate from the wallet that
+-- owns and pays for its sandbox. Proof bytes are reverified before use.
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_operator BYTEA;
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS operator_version BIGINT;
+CREATE TABLE IF NOT EXISTS operator_grants (
+    seal_id BYTEA PRIMARY KEY REFERENCES deployments(seal_id) ON DELETE CASCADE,
+    version BIGINT NOT NULL CHECK (version > 0),
+    owner BYTEA NOT NULL CHECK (octet_length(owner) = 20),
+    signed_message_b64 TEXT NOT NULL,
+    signature BYTEA NOT NULL,
+    transfer_invalidated BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE operator_grants ADD COLUMN IF NOT EXISTS transfer_invalidated BOOLEAN NOT NULL DEFAULT FALSE;
+-- Admission cache bound to the original proof bytes, owner and revision.
+-- This is not an attestor signature or a substitute for the owner's proof.
+ALTER TABLE operator_grants ADD COLUMN IF NOT EXISTS checkpoint_acceptance BYTEA
+    CHECK (checkpoint_acceptance IS NULL OR octet_length(checkpoint_acceptance) = 32);
+
+
+-- Revocation and the exact cleanup targets commit together. No credentials
+-- or executable queue payloads live in this outbox.
+CREATE TABLE IF NOT EXISTS operator_teardowns (
+    seal_id BYTEA NOT NULL REFERENCES deployments(seal_id) ON DELETE CASCADE,
+    sandbox_id TEXT NOT NULL CHECK (sandbox_id <> ''),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (seal_id, sandbox_id)
+);
 -- The settings document the current boot was served. A running/warning
 -- report confirms the version only when its applied digest equals this one.
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS served_settings_version BIGINT;
@@ -289,3 +318,91 @@ ALTER TABLE inference_provider_registry ADD COLUMN IF NOT EXISTS publisher BYTEA
 -- No acceptance MAC: the table lives on the tapp FDE volume, and every read
 -- re-checks the row's environment and version.
 ALTER TABLE inference_provider_registry DROP COLUMN IF EXISTS acceptance_mac;
+
+-- ── Owner credential sets (sealed credential proxy) ──────────────────────
+-- One row per seal: the owner-signed set (auth::credentials) as posted
+-- and the values the container wrote back for that version. Deleted when
+-- the agent changes hands.
+CREATE TABLE IF NOT EXISTS credential_sets (
+    seal_id     BYTEA PRIMARY KEY,
+    owner       BYTEA  NOT NULL,
+    owner_epoch BIGINT NOT NULL DEFAULT 0,
+    version     BIGINT NOT NULL DEFAULT 0,
+    document    JSONB  NOT NULL,
+    writebacks  JSONB  NOT NULL DEFAULT '{}'::jsonb,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_credential_sets_owner ON credential_sets (owner);
+-- Ownership epoch per seal: the block of the agent's last transfer (0 =
+-- never transferred). A set signed for an earlier epoch is refused, so a set
+-- the agent's earlier owner signed can never be reinstated.
+CREATE TABLE IF NOT EXISTS credential_epochs (
+    seal_id BYTEA PRIMARY KEY,
+    epoch   BIGINT NOT NULL
+);
+-- The container's last reported count of requests waiting for the owner
+-- (signed status reports), and the count last notified, so the owner is
+-- told when it rises, not on every report.
+CREATE TABLE IF NOT EXISTS credential_pending (
+    seal_id          BYTEA PRIMARY KEY,
+    pending          INT NOT NULL DEFAULT 0,
+    notified_pending INT NOT NULL DEFAULT 0,
+    notified_at      TIMESTAMPTZ,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Expiry reminders already sent, one per entry, set version and expiry.
+CREATE TABLE IF NOT EXISTS credential_reminders (
+    seal_id    BYTEA  NOT NULL,
+    name       TEXT   NOT NULL,
+    version    BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    sent_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (seal_id, name, version, expires_at)
+);
+-- Release emails sent (releases.rs): one per owner, release and kind
+-- (`published`, `reminder:<until>`).
+CREATE TABLE IF NOT EXISTS release_notices (
+    owner   BYTEA NOT NULL,
+    version TEXT  NOT NULL,
+    kind    TEXT  NOT NULL,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner, version, kind)
+);
+-- Where an owner wants to be told about pending requests (owner-signed).
+CREATE TABLE IF NOT EXISTS credential_notify (
+    owner      BYTEA PRIMARY KEY,
+    email      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Recoverable public metadata failures must not hold up ownership revocations.
+-- Transfer/security failures never enter the skippable metadata path.
+CREATE TABLE IF NOT EXISTS indexer_deadletters (
+    chain_id BIGINT NOT NULL,
+    contract BYTEA NOT NULL CHECK (octet_length(contract) = 20),
+    block_hash BYTEA NOT NULL CHECK (octet_length(block_hash) = 32),
+    log_index BIGINT NOT NULL,
+    block_number BIGINT NOT NULL,
+    raw_log JSONB NOT NULL,
+    reason TEXT NOT NULL,
+    attempts BIGINT NOT NULL DEFAULT 1,
+    first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (chain_id, contract, block_hash, log_index)
+);
+
+-- Monotonic indexed ownership watermark fences grant admission against an
+-- outgoing Transfer observed while the API was still verifying its proof.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS operator_transfer_block BIGINT NOT NULL DEFAULT 0;
+
+-- Accepted provider responses awaiting authority/binding recovery. No secrets.
+CREATE TABLE IF NOT EXISTS runtime_create_results (
+    seal_id BYTEA NOT NULL REFERENCES deployments(seal_id) ON DELETE CASCADE,
+    generation BIGINT NOT NULL CHECK (generation > 0),
+    sandbox_id TEXT NOT NULL CHECK (sandbox_id <> ''),
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (seal_id,generation,sandbox_id)
+);
+
+ALTER TABLE runtime_create_results ADD COLUMN IF NOT EXISTS last_attempt TIMESTAMPTZ;

@@ -1,0 +1,378 @@
+[
+  {
+    "type": "constructor",
+    "inputs": [
+      {
+        "name": "canonicalReputation_",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "verifiedFeedback_",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "receive",
+    "stateMutability": "payable"
+  },
+  {
+    "type": "function",
+    "name": "canonicalReputation",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract ICanonicalReputationRegistry"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "giveFeedbackAndAttest",
+    "inputs": [
+      {
+        "name": "agentId",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "value",
+        "type": "int128",
+        "internalType": "int128"
+      },
+      {
+        "name": "valueDecimals",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "tag1",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "tag2",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "endpoint",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "feedbackURI",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "feedbackHash",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "proof",
+        "type": "tuple",
+        "internalType": "struct ServeProof",
+        "components": [
+          {
+            "name": "agentId",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "submitter",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "timestamp",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "deadline",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "taskHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "dataHashes",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "frameworkHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "signature",
+            "type": "bytes",
+            "internalType": "bytes"
+          }
+        ]
+      },
+      {
+        "name": "task",
+        "type": "tuple",
+        "internalType": "struct TaskReveal",
+        "components": [
+          {
+            "name": "method",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
+            "name": "uri",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
+            "name": "reqBodyHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "respBodyHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "statusCode",
+            "type": "uint16",
+            "internalType": "uint16"
+          }
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "feedbackIndex",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "giveFeedbackAndAttestVersioned",
+    "inputs": [
+      {
+        "name": "agentId",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "value",
+        "type": "int128",
+        "internalType": "int128"
+      },
+      {
+        "name": "valueDecimals",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "tag1",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "tag2",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "endpoint",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "feedbackURI",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "feedbackHash",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "proof",
+        "type": "tuple",
+        "internalType": "struct VersionedServeProof",
+        "components": [
+          {
+            "name": "version",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "agentId",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "submitter",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "timestamp",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "deadline",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "taskHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "dataHashes",
+            "type": "bytes32[]",
+            "internalType": "bytes32[]"
+          },
+          {
+            "name": "frameworkHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "sealedHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "harnessHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "inferenceURL",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
+            "name": "model",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
+            "name": "signature",
+            "type": "bytes",
+            "internalType": "bytes"
+          }
+        ]
+      },
+      {
+        "name": "task",
+        "type": "tuple",
+        "internalType": "struct TaskReveal",
+        "components": [
+          {
+            "name": "method",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
+            "name": "uri",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
+            "name": "reqBodyHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "respBodyHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "statusCode",
+            "type": "uint16",
+            "internalType": "uint16"
+          }
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "feedbackIndex",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "onERC721Received",
+    "inputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes4",
+        "internalType": "bytes4"
+      }
+    ],
+    "stateMutability": "pure"
+  },
+  {
+    "type": "function",
+    "name": "verifiedFeedback",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IVerifiedFeedbackRegistry"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "error",
+    "name": "BatcherNotSelf",
+    "inputs": []
+  }
+]

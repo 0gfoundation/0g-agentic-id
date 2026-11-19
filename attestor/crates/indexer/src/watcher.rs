@@ -9,6 +9,7 @@
 //! per-seal KMS derivation, it reconstructs the deployment
 //! row from on-chain view calls.
 
+use alloy::eips::{BlockId, BlockNumberOrTag, RpcBlockHash};
 use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::types::Filter;
@@ -18,8 +19,8 @@ use attestor_shared::{
     chain::AgenticID,
     repo::{load_checkpoint, save_checkpoint},
     types::{
-        derive_phase, AgentId, Deployment, DeploymentPhase, IDataArtifact, SealId, StageStatus,
-        StorageRoot,
+        derive_phase, AgentId, ChainIDataArtifact, Deployment, DeploymentPhase, IDataArtifact,
+        SealId, StageStatus, StorageRoot,
     },
     Config, CryptoModule, DeploymentRepo, EventBus, JobPayload, JobQueue, WsEvent,
 };
@@ -37,9 +38,73 @@ const LOOKBACK_BLOCKS: u64 = 128;
 
 type HttpProvider = RootProvider<Http<Client>>;
 
+/// Only fixed, non-authoritative metadata input failures are skippable.
+/// Dependency errors and every Transfer failure remain range-blocking.
+#[derive(Debug)]
+enum PermanentMetadata {
+    EntryIndexTooLarge,
+    EntryIndexNotCurrent,
+    MalformedEntryUpdated,
+    MalformedUpdated,
+}
+impl PermanentMetadata {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::EntryIndexTooLarge => "entry_index_too_large",
+            Self::EntryIndexNotCurrent => "entry_index_not_in_current_data",
+            Self::MalformedEntryUpdated => "malformed_entry_updated",
+            Self::MalformedUpdated => "malformed_updated",
+        }
+    }
+}
+impl std::fmt::Display for PermanentMetadata {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(self.reason())
+    }
+}
+impl std::error::Error for PermanentMetadata {}
+
+#[async_trait::async_trait]
+trait MetadataDeadletters: Send + Sync {
+    async fn record(
+        &self,
+        log: &alloy::rpc::types::Log,
+        reason: &'static str,
+    ) -> anyhow::Result<()>;
+}
+struct PostgresMetadataDeadletters {
+    pool: PgPool,
+    chain_id: u64,
+}
+#[async_trait::async_trait]
+impl MetadataDeadletters for PostgresMetadataDeadletters {
+    async fn record(
+        &self,
+        log: &alloy::rpc::types::Log,
+        reason: &'static str,
+    ) -> anyhow::Result<()> {
+        let hash = log
+            .block_hash
+            .ok_or_else(|| anyhow::anyhow!("deadletter requires a block hash"))?;
+        let index = i64::try_from(
+            log.log_index
+                .ok_or_else(|| anyhow::anyhow!("deadletter requires a log index"))?,
+        )?;
+        let block = i64::try_from(
+            log.block_number
+                .ok_or_else(|| anyhow::anyhow!("deadletter requires a block number"))?,
+        )?;
+        sqlx::query("INSERT INTO indexer_deadletters(chain_id,contract,block_hash,log_index,block_number,raw_log,reason) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(chain_id,contract,block_hash,log_index) DO UPDATE SET attempts=indexer_deadletters.attempts+1,last_seen=now(),reason=EXCLUDED.reason")
+            .bind(i64::try_from(self.chain_id)?).bind(log.inner.address.as_slice()).bind(hash.as_slice()).bind(index).bind(block)
+            .bind(serde_json::to_value(log)?).bind(reason).execute(&self.pool).await?;
+        Ok(())
+    }
+}
+
 pub struct Watcher {
     provider: HttpProvider,
     contract_addr: Address,
+    chain_id: u64,
     /// Canonical ERC-8004 registry the AgenticID contract is bound to. After
     /// binding, Registered / URIUpdated are emitted here, not on contract_addr.
     canonical_addr: Address,
@@ -49,7 +114,11 @@ pub struct Watcher {
     /// Used to enqueue SandboxTeardown on ownership transfer (Layer 2). The
     /// worker holds the admin signer; the indexer only detects + enqueues.
     jobs: Arc<dyn JobQueue>,
+    /// Owner credential sets: a transfer starts a new ownership epoch and
+    /// drops the previous owner's set.
+    credentials: Arc<dyn attestor_shared::credentials_repo::CredentialRepo>,
     pool: PgPool,
+    metadata_deadletters: Arc<dyn MetadataDeadletters>,
     http: reqwest::Client,
     start_block: Option<u64>,
 }
@@ -68,11 +137,19 @@ impl Watcher {
         Ok(Self {
             provider,
             contract_addr: cfg.agentic_id_addr,
+            chain_id: cfg.chain_id,
             canonical_addr: cfg.canonical_addr,
             crypto,
             deployments,
             events,
             jobs,
+            credentials: attestor_shared::credentials_repo::PostgresCredentialRepo::new(
+                pool.clone(),
+            ),
+            metadata_deadletters: Arc::new(PostgresMetadataDeadletters {
+                pool: pool.clone(),
+                chain_id: cfg.chain_id,
+            }),
             pool,
             http: reqwest::Client::new(),
             start_block: cfg.indexer_start_block,
@@ -124,14 +201,97 @@ impl Watcher {
             "fetched logs"
         );
 
-        for log in &logs {
-            if let Err(e) = self.handle_log(log).await {
-                tracing::warn!(error = %e, "log handler failed");
-            }
-        }
+        // Failed ownership/checkpoint reads must retry the range. Advancing
+        // past one would permanently miss the outgoing owner's ABA revocation.
+        self.process_logs(&logs).await?;
 
         save_checkpoint(&self.pool, CHECKPOINT_NAME, to_block as i64).await?;
         Ok(logs.len())
+    }
+
+    async fn process_logs(&self, logs: &[alloy::rpc::types::Log]) -> anyhow::Result<()> {
+        for log in logs {
+            if let Err(error) = self.handle_log(log).await {
+                let transfer = log.inner.address == self.contract_addr
+                    && log.inner.data.topics().first()
+                        == Some(&AgenticID::Transfer::SIGNATURE_HASH);
+                if !transfer {
+                    if let Some(permanent) = error.downcast_ref::<PermanentMetadata>() {
+                        // Durable provenance comes before skipping the log. A
+                        // failed write blocks checkpoint advancement as usual.
+                        self.metadata_deadletters
+                            .record(log, permanent.reason())
+                            .await?;
+                        tracing::warn!(reason=permanent.reason(), block=?log.block_number, "metadata log quarantined; ownership processing continues");
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn invalidate_transfer_grant(
+        &self,
+        agent: AgentId,
+        previous_owner: Address,
+        event_block: u64,
+    ) -> anyhow::Result<()> {
+        // Canonicality is checked before the mutation. A version CAS makes a
+        // concurrent new grant retry instead of inheriting the old decision.
+        for _ in 0..8 {
+            let Some(deployment) = self.deployments.get_by_agent_id(agent).await? else {
+                return Ok(());
+            };
+            let Some(grant) = self.deployments.operator_grant(deployment.seal_id).await? else {
+                return Ok(());
+            };
+            // Only an admitted appointment at/after this outgoing transfer
+            // can exempt the grant. Revocations have no checkpoint authority,
+            // including legacy records accepted with an unchecked checkpoint.
+            // Do not let that untrusted value trigger an RPC or block indexing.
+            // The repository only CASes this already checked revision.
+            let checkpoint = attestor_shared::auth::operator::verify_operator_grant_metadata(
+                &grant,
+                grant.owner,
+                self.chain_id,
+                self.contract_addr,
+                deployment.seal_id,
+                self.crypto.as_ref(),
+            )
+            .ok()
+            .and_then(|directive| directive.operator.and(directive.checkpoint))
+            .filter(|checkpoint| grant.owner == previous_owner && event_block <= checkpoint.number);
+            let canonical = if let Some(checkpoint) = checkpoint {
+                if attestor_shared::chain::operator_checkpoint_is_canonical(
+                    &self.provider,
+                    &checkpoint,
+                )
+                .await?
+                {
+                    Some(checkpoint)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if self
+                .deployments
+                .invalidate_operator_for_transfer_at(
+                    agent,
+                    previous_owner,
+                    event_block,
+                    grant.version,
+                    canonical,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("operator grant changed repeatedly during transfer processing")
     }
 
     async fn handle_log(&self, log: &alloy::rpc::types::Log) -> anyhow::Result<()> {
@@ -158,21 +318,34 @@ impl Watcher {
             return Ok(());
         }
 
+        if source != self.contract_addr {
+            return Ok(());
+        }
+        let topic = log.inner.data.topics().first();
+        // Identify ownership by its topic before decoding. A malformed
+        // Transfer is security-blocking, never an unknown/metadata skip.
+        if topic == Some(&AgenticID::Transfer::SIGNATURE_HASH) {
+            let event = AgenticID::Transfer::decode_log(&log.inner, true)
+                .map_err(|error| anyhow::anyhow!("invalid Transfer log: {error}"))?;
+            return self.on_transfer(event.data, block).await;
+        }
+        if topic == Some(&AgenticID::EntryUpdated::SIGNATURE_HASH) {
+            let event = AgenticID::EntryUpdated::decode_log(&log.inner, true)
+                .map_err(|_| PermanentMetadata::MalformedEntryUpdated)?;
+            return self.on_entry_updated(event.data, block).await;
+        }
+        if topic == Some(&AgenticID::Updated::SIGNATURE_HASH) {
+            let event = AgenticID::Updated::decode_log(&log.inner, true)
+                .map_err(|_| PermanentMetadata::MalformedUpdated)?;
+            return self.on_updated(event.data, block).await;
+        }
+
         // AgenticID-native events. First successful decode wins.
         if let Ok(ev) = AgenticID::AgentSealSet::decode_log(&log.inner, true) {
             return self.on_agent_seal_set(ev.data, block).await;
         }
-        if let Ok(ev) = AgenticID::Transfer::decode_log(&log.inner, true) {
-            return self.on_transfer(ev.data, block).await;
-        }
         if let Ok(ev) = AgenticID::ITransferred::decode_log(&log.inner, true) {
             return self.on_i_transferred(ev.data, block).await;
-        }
-        if let Ok(ev) = AgenticID::EntryUpdated::decode_log(&log.inner, true) {
-            return self.on_entry_updated(ev.data, block).await;
-        }
-        if let Ok(ev) = AgenticID::Updated::decode_log(&log.inner, true) {
-            return self.on_updated(ev.data, block).await;
         }
         if let Ok(ev) = AgenticID::Cloned::decode_log(&log.inner, true) {
             tracing::warn!(
@@ -197,16 +370,23 @@ impl Watcher {
             block,
             "Transfer"
         );
+        // Record every tracked native event before admission RPCs or grant
+        // lookup, including events observed while no grant existed yet.
+        self.deployments
+            .observe_operator_transfer(ev.tokenId, block)
+            .await?;
         // Skip mints — AgentSealSet handles row creation/backfill.
         if ev.from == Address::ZERO {
             return Ok(());
         }
         let managed = match self.deployments.get_by_agent_id(ev.tokenId).await? {
-            Some(d) => self
-                .deployments
-                .boot_authorization(d.seal_id)
-                .await?
-                .is_some_and(|a| a.enabled && a.owner.is_some()),
+            Some(d) => {
+                self.deployments
+                    .boot_authorization(d.seal_id)
+                    .await?
+                    .is_some_and(|a| a.enabled && a.owner.is_some())
+                    || self.deployments.operator_grant(d.seal_id).await?.is_some()
+            }
             None => false,
         };
         let live_owner = if managed {
@@ -219,6 +399,20 @@ impl Watcher {
             ev.to
         };
         self.deployments.set_owner(ev.tokenId, live_owner).await?;
+        // Revoke by the outgoing owner even when ownership has already
+        // returned to that address before the indexer observes the event.
+        self.invalidate_transfer_grant(ev.tokenId, ev.from, block)
+            .await?;
+        // Advancing the ownership epoch and dropping its old credentials are
+        // one operation. Retrying this range must not clear a fresh set that
+        // the owner stored for an epoch already processed successfully.
+        if let Some(d) = self.deployments.get_by_agent_id(ev.tokenId).await? {
+            let epoch = i64::try_from(block)
+                .map_err(|_| anyhow::anyhow!("ownership block exceeds epoch range"))?;
+            self.credentials
+                .advance_ownership_epoch(d.seal_id, epoch)
+                .await?;
+        }
         // Drop the container pubkey binding so the prior owner's resumed
         // container (reused SANDBOX_SEAL_KEY, stale attestation) can no longer
         // skip the freshness window — it now fails /provision instead of
@@ -379,20 +573,15 @@ impl Watcher {
             "EntryUpdated"
         );
         if index == usize::MAX {
-            tracing::warn!("EntryUpdated index too large");
-            return Ok(());
+            return Err(PermanentMetadata::EntryIndexTooLarge.into());
         }
-        self.deployments
-            .update_i_data_entry_at(
-                ev.tokenId,
-                index,
-                ev.newData.dataDescription.clone(),
-                ev.newData.dataHash,
-            )
-            .await?;
-        // V2: the new sealedKey is on chain. Refresh from view (full
-        // array) — simpler and DRY-er than a single-cell write path.
-        self.refresh_sealed_keys(ev.tokenId).await?;
+        // Full authoritative replacement handles new roles appended after the
+        // locally stored array. Patching the old local length could fail forever.
+        if let Some(count) = self.refresh_i_data(ev.tokenId, block).await? {
+            if index >= count {
+                return Err(PermanentMetadata::EntryIndexNotCurrent.into());
+            }
+        }
         if let Some(d) = self.deployments.get_by_agent_id(ev.tokenId).await? {
             let _ = self
                 .events
@@ -418,10 +607,7 @@ impl Watcher {
             block,
             "Updated"
         );
-        // TODO: refresh i_data descriptions/dataHashes from view too
-        //       once a `sealed.intelligentDatasOf(token_id)` call path
-        //       exists in repo. v0 only carries sealedKeys back.
-        self.refresh_sealed_keys(ev.tokenId).await?;
+        self.refresh_i_data(ev.tokenId, block).await?;
         if let Some(d) = self.deployments.get_by_agent_id(ev.tokenId).await? {
             let _ = self
                 .events
@@ -432,6 +618,60 @@ impl Watcher {
                 .await;
         }
         Ok(())
+    }
+
+    /// Synchronize the entire current iData array and keys at one block-end
+    /// snapshot. Both growth and replacement therefore update the local length.
+    async fn refresh_i_data(
+        &self,
+        token: AgentId,
+        min_event_block: u64,
+    ) -> anyhow::Result<Option<usize>> {
+        let Some(deployment) = self.deployments.get_by_agent_id(token).await? else {
+            return Ok(None);
+        };
+        let header = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Latest, false)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("iData snapshot header unavailable"))?;
+        anyhow::ensure!(
+            header.header.number >= min_event_block,
+            "iData snapshot is behind its event; retry on a current node"
+        );
+        let snapshot = BlockId::Hash(RpcBlockHash::from_hash(header.header.hash, Some(true)));
+        let contract = AgenticID::new(self.contract_addr, self.provider.clone());
+        let datas = contract
+            .intelligentDatasOf(token)
+            .block(snapshot)
+            .call()
+            .await?
+            ._0;
+        let keys = contract
+            .sealedKeysOf(token)
+            .block(snapshot)
+            .call()
+            .await?
+            ._0;
+        let artifacts: Vec<ChainIDataArtifact> = datas
+            .into_iter()
+            .enumerate()
+            .map(|(index, data)| {
+                let (role, storage_root) = parse_description(&data.dataDescription);
+                ChainIDataArtifact {
+                    role,
+                    description: data.dataDescription,
+                    storage_root,
+                    sealed_key: keys.get(index).cloned().unwrap_or_default(),
+                    data_hash: data.dataHash,
+                }
+            })
+            .collect();
+        let count = artifacts.len();
+        self.deployments
+            .sync_chain_i_data(deployment.seal_id, artifacts)
+            .await?;
+        Ok(Some(count))
     }
 
     /// Pull authoritative sealedKeys from the contract view and overwrite
@@ -654,6 +894,27 @@ mod tests {
     use attestor_shared::crypto::RealCrypto;
     use attestor_shared::mocks::{InMemoryDeploymentRepo, InMemoryEventBus, InMemoryJobQueue};
 
+    #[derive(Default)]
+    struct MemoryMetadataDeadletters {
+        rows: std::sync::Mutex<Vec<(alloy::rpc::types::Log, &'static str)>>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl MetadataDeadletters for MemoryMetadataDeadletters {
+        async fn record(
+            &self,
+            log: &alloy::rpc::types::Log,
+            reason: &'static str,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !self.fail.load(std::sync::atomic::Ordering::SeqCst),
+                "deadletter storage unavailable"
+            );
+            self.rows.lock().unwrap().push((log.clone(), reason));
+            Ok(())
+        }
+    }
+
     fn test_watcher(
         deployments: Arc<dyn DeploymentRepo>,
         events: Arc<dyn EventBus>,
@@ -666,11 +927,14 @@ mod tests {
         Watcher {
             provider,
             contract_addr: Address::ZERO,
+            chain_id: 16602,
             canonical_addr: Address::ZERO,
             crypto: Arc::new(RealCrypto::new_for_test([0u8; 32])),
             deployments,
             events,
             jobs,
+            credentials: attestor_shared::credentials_repo::in_memory(),
+            metadata_deadletters: Arc::new(MemoryMetadataDeadletters::default()),
             pool,
             http: reqwest::Client::new(),
             start_block: None,
@@ -742,6 +1006,25 @@ mod tests {
 
         let jobs = Arc::new(InMemoryJobQueue::new());
         let w = test_watcher(deployments.clone(), events.clone(), jobs.clone());
+        // The seller's credentials: a set with a writeback, a pending count
+        // and a reminder already sent.
+        let creds = w.credentials.clone();
+        creds
+            .put(
+                seal_id,
+                seller,
+                0,
+                0,
+                serde_json::json!({"set": {}}),
+                serde_json::json!({"rt": {}}),
+            )
+            .await
+            .unwrap();
+        creds.set_pending(seal_id, 2).await.unwrap();
+        assert!(creds
+            .claim_reminder(seal_id, "rt", 1, 1_900_000_000)
+            .await
+            .unwrap());
         w.on_transfer(
             AgenticID::Transfer {
                 from: seller,
@@ -753,6 +1036,26 @@ mod tests {
         .await
         .expect("transfer handled");
 
+        assert!(
+            creds.get(seal_id).await.unwrap().is_none(),
+            "the seller's set and writebacks are deleted"
+        );
+        assert!(
+            creds.pending_counts(&[seal_id]).await.unwrap().is_empty(),
+            "pending count deleted"
+        );
+        assert!(
+            creds
+                .claim_reminder(seal_id, "rt", 1, 1_900_000_000)
+                .await
+                .unwrap(),
+            "reminder records deleted, so the buyer's entries are reminded afresh"
+        );
+        assert_eq!(
+            creds.epoch(seal_id).await.unwrap(),
+            100,
+            "a new ownership epoch"
+        );
         let after = deployments.get(seal_id).await.unwrap().expect("seeded");
         assert_eq!(after.owner, buyer, "owner synced to new on-chain owner");
         assert!(
@@ -830,6 +1133,1150 @@ mod tests {
             ProviderBuilder::new().on_http(format!("http://{}", address).parse().unwrap()),
             task,
         )
+    }
+
+    async fn serve_checkpoint_rpc(
+        owner: Address,
+        checkpoint: attestor_shared::auth::operator::OperatorCheckpoint,
+        canonical: bool,
+        fail_block: bool,
+    ) -> (HttpProvider, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let request = loop {
+                    let mut b = [0; 4096];
+                    let n = stream.read(&mut b).await.unwrap();
+                    assert!(n > 0);
+                    raw.extend_from_slice(&b[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        if let Ok(value) =
+                            serde_json::from_slice::<serde_json::Value>(&raw[pos + 4..])
+                        {
+                            break value;
+                        }
+                    }
+                };
+                let id = request["id"].clone();
+                let response = match request["method"].as_str().unwrap() {
+                    "eth_call" => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":format!("0x{}{}","00".repeat(12),hex::encode(owner))})
+                    }
+                    "eth_getBlockByNumber" if fail_block => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":"checkpoint RPC unavailable"}})
+                    }
+                    "eth_getBlockByNumber" => {
+                        let mut block =
+                            alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+                        block.header.number = checkpoint.number;
+                        block.header.hash = if canonical {
+                            checkpoint.hash
+                        } else {
+                            B256::repeat_byte(0xff)
+                        };
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":block})
+                    }
+                    method => panic!("unexpected method {method}"),
+                };
+                let body = response.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+            }
+        });
+        (
+            ProviderBuilder::new().on_http(format!("http://{address}").parse().unwrap()),
+            task,
+        )
+    }
+
+    async fn checkpoint_runtime() -> (
+        Watcher,
+        Arc<InMemoryDeploymentRepo>,
+        Arc<InMemoryJobQueue>,
+        Address,
+        SealId,
+        AgentId,
+        attestor_shared::auth::status::BootAuthorization,
+    ) {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+        use attestor_shared::auth::operator::{OperatorCheckpoint, OperatorGrant};
+        use base64::Engine as _;
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let jobs = Arc::new(InMemoryJobQueue::new());
+        let owner_key = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x16)).unwrap();
+        let owner = owner_key.address();
+        let seal = B256::repeat_byte(0xa6);
+        let agent = U256::from(16);
+        let actor = Address::repeat_byte(0xb6);
+        seed_bound(&deployments, seal, agent, owner);
+        let record = deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .container_record
+            .unwrap();
+        let proof = serde_json::to_vec(&serde_json::json!({
+            "domain":"AgenticID.Operator.v1","chain_id":16602,"contract":Address::ZERO,
+            "seal_id":seal,"owner":owner,"base_version":0,"operator":actor,
+            "allow_recreate":false,"expires_at":0,"issued_at":Utc::now().timestamp(),
+            "checkpoint":OperatorCheckpoint {number:102,hash:B256::repeat_byte(0xa2)},
+        }))
+        .unwrap();
+        let signature: Vec<u8> = owner_key
+            .sign_hash_sync(&B256::from(attestor_shared::sandbox::eip191_digest(&proof)))
+            .unwrap()
+            .into();
+        deployments
+            .compare_and_swap_operator(seal, 0, {
+                let mut grant = OperatorGrant {
+                    version: 1,
+                    owner,
+                    signed_message_b64: base64::engine::general_purpose::STANDARD.encode(proof),
+                    signature: signature.into(),
+                    checkpoint_acceptance: None,
+                };
+                grant.checkpoint_acceptance = Some(
+                    attestor_shared::auth::operator::checkpoint_acceptance_digest(&grant).unwrap(),
+                );
+                grant
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        deployments
+            .complete_operator_teardown(seal, "sb-1")
+            .await
+            .unwrap();
+        let generation = deployments
+            .prepare_operator_boot(seal, Some([6; 32]), owner, actor, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        deployments
+            .bind_runtime_sandbox(
+                seal,
+                "new-after-aba".into(),
+                generation,
+                Some(record.pubkey.to_vec()),
+            )
+            .await
+            .unwrap();
+        let claim = attestor_shared::auth::status::BootClaim {
+            generation,
+            ticket_hash: [6; 32],
+            boot_id: B256::repeat_byte(6),
+            started_at: Utc::now().timestamp(),
+        };
+        assert!(deployments
+            .bind_status_boot(seal, &record, [6; 32], None, &claim)
+            .await
+            .unwrap());
+        let boot = deployments.boot_authorization(seal).await.unwrap().unwrap();
+        let watcher = test_watcher(
+            deployments.clone(),
+            Arc::new(InMemoryEventBus::new()),
+            jobs.clone(),
+        );
+        (watcher, deployments, jobs, owner, seal, agent, boot)
+    }
+
+    #[tokio::test]
+    async fn retried_transfer_preserves_credentials_written_for_the_current_epoch() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let events = Arc::new(InMemoryEventBus::new());
+        let jobs = Arc::new(InMemoryJobQueue::new());
+        let seal = B256::repeat_byte(0xae);
+        let agent = U256::from(17);
+        let seller = Address::repeat_byte(0x11);
+        let buyer = Address::repeat_byte(0x22);
+        seed_bound(&deployments, seal, agent, seller);
+        let watcher = test_watcher(deployments, events, jobs);
+        let event = || AgenticID::Transfer {
+            from: seller,
+            to: buyer,
+            tokenId: agent,
+        };
+        watcher.on_transfer(event(), 100).await.unwrap();
+        assert_eq!(watcher.credentials.epoch(seal).await.unwrap(), 100);
+        watcher
+            .credentials
+            .put(
+                seal,
+                buyer,
+                100,
+                0,
+                serde_json::json!({"current":"owner credentials"}),
+                serde_json::json!({"rt":{"value":"owner writeback"}}),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        watcher.credentials.set_pending(seal, 2).await.unwrap();
+        assert!(watcher
+            .credentials
+            .claim_reminder(seal, "rt", 1, 1_900_000_000)
+            .await
+            .unwrap());
+        let stored = watcher.credentials.get(seal).await.unwrap().unwrap();
+        // A later log in this range failed its RPC read. Replaying this
+        // already successful Transfer must leave current-epoch writes alone.
+        watcher.on_transfer(event(), 100).await.unwrap();
+        let replayed = watcher.credentials.get(seal).await.unwrap().unwrap();
+        assert_eq!(replayed.owner_epoch, 100);
+        assert_eq!(replayed.version, stored.version);
+        assert_eq!(replayed.document, stored.document);
+        assert_eq!(replayed.writebacks, stored.writebacks);
+        assert_eq!(
+            watcher.credentials.pending_counts(&[seal]).await.unwrap()[0].pending,
+            2
+        );
+        assert!(!watcher
+            .credentials
+            .claim_reminder(seal, "rt", 1, 1_900_000_000)
+            .await
+            .unwrap());
+        // The next genuine ownership epoch still clears all previous state.
+        watcher
+            .on_transfer(
+                AgenticID::Transfer {
+                    from: buyer,
+                    to: seller,
+                    tokenId: agent,
+                },
+                101,
+            )
+            .await
+            .unwrap();
+        assert_eq!(watcher.credentials.epoch(seal).await.unwrap(), 101);
+        assert!(watcher.credentials.get(seal).await.unwrap().is_none());
+        assert!(watcher
+            .credentials
+            .pending_counts(&[seal])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(watcher
+            .credentials
+            .claim_reminder(seal, "rt", 1, 1_900_000_000)
+            .await
+            .unwrap());
+    }
+
+    fn native_test_log(
+        data: alloy::primitives::LogData,
+        block: u64,
+        index: u64,
+    ) -> alloy::rpc::types::Log {
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data,
+            },
+            block_hash: Some(B256::repeat_byte(0x81)),
+            block_number: Some(block),
+            log_index: Some(index),
+            ..Default::default()
+        }
+    }
+
+    fn malformed_metadata() -> alloy::rpc::types::Log {
+        native_test_log(
+            alloy::primitives::LogData::new_unchecked(
+                vec![AgenticID::EntryUpdated::SIGNATURE_HASH],
+                Bytes::new(),
+            ),
+            100,
+            1,
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_metadata_deadletter_retries_keep_one_cursor_and_original_log() {
+        let url = std::env::var("AGENTDNA_TEST_DATABASE_URL").expect("isolated DB URL");
+        let pool = attestor_shared::repo::connect(&url).await.unwrap();
+        let chain_id = 16602u64;
+        let hash = alloy::primitives::keccak256(attestor_shared::JobId::new_v4().as_bytes());
+        let contract = Address::from_slice(&hash.as_slice()[..20]);
+        let mut log = malformed_metadata();
+        log.inner.address = contract;
+        log.block_hash = Some(hash);
+        log.log_index = Some(7);
+        let original = serde_json::to_value(&log).unwrap();
+        let sink = PostgresMetadataDeadletters {
+            pool: pool.clone(),
+            chain_id,
+        };
+        sink.record(&log, "malformed_entry_updated").await.unwrap();
+        let mut replay = log.clone();
+        replay.inner.data = alloy::primitives::LogData::new_unchecked(
+            vec![AgenticID::Updated::SIGNATURE_HASH],
+            Bytes::from_static(b"reprocessed input"),
+        );
+        sink.record(&replay, "entry_index_not_in_current_data")
+            .await
+            .unwrap();
+
+        let rows: Vec<(i64, serde_json::Value, i64, Vec<u8>, Vec<u8>, i64, String)> =
+            sqlx::query_as(
+                "SELECT attempts,raw_log,chain_id,contract,block_hash,log_index,reason
+                 FROM indexer_deadletters WHERE block_hash=$1",
+            )
+            .bind(hash.as_slice())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "replaying the same event cursor is an upsert"
+        );
+        let (attempts, raw_log, stored_chain, stored_contract, stored_hash, index, reason) =
+            &rows[0];
+        assert_eq!(*attempts, 2);
+        assert_eq!(raw_log, &original, "retain the first event's provenance");
+        assert_eq!(*stored_chain, chain_id as i64);
+        assert_eq!(stored_contract.as_slice(), contract.as_slice());
+        assert_eq!(stored_hash.as_slice(), hash.as_slice());
+        assert_eq!(*index, 7);
+        assert_eq!(reason, "entry_index_not_in_current_data");
+        let deleted = sqlx::query(
+            "DELETE FROM indexer_deadletters
+             WHERE chain_id=$1 AND contract=$2 AND block_hash=$3 AND log_index=$4",
+        )
+        .bind(chain_id as i64)
+        .bind(contract.as_slice())
+        .bind(hash.as_slice())
+        .bind(7i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+    }
+
+    fn entry_log(agent: AgentId, index: u64) -> alloy::rpc::types::Log {
+        use alloy::sol_types::SolValue;
+        let data = (
+            (String::new(), B256::ZERO),
+            (String::new(), B256::ZERO),
+            Bytes::new(),
+        )
+            .abi_encode_sequence();
+        let log = native_test_log(
+            alloy::primitives::LogData::new_unchecked(
+                vec![
+                    AgenticID::EntryUpdated::SIGNATURE_HASH,
+                    B256::from(agent.to_be_bytes::<32>()),
+                    B256::from(U256::from(index).to_be_bytes::<32>()),
+                ],
+                data.into(),
+            ),
+            100,
+            1,
+        );
+        AgenticID::EntryUpdated::decode_log(&log.inner, true).expect("valid EntryUpdated fixture");
+        log
+    }
+
+    #[tokio::test]
+    async fn bad_metadata_is_durable_before_following_transfer_can_proceed() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let jobs = Arc::new(InMemoryJobQueue::new());
+        let seal = B256::repeat_byte(0xb1);
+        let agent = U256::from(81);
+        let seller = Address::repeat_byte(0x11);
+        let buyer = Address::repeat_byte(0x22);
+        seed_bound(&deployments, seal, agent, seller);
+        let mut watcher =
+            test_watcher(deployments.clone(), Arc::new(InMemoryEventBus::new()), jobs);
+        watcher.canonical_addr = Address::repeat_byte(0x99);
+        let sink = Arc::new(MemoryMetadataDeadletters::default());
+        watcher.metadata_deadletters = sink.clone();
+        let transfer = AgenticID::Transfer {
+            from: seller,
+            to: buyer,
+            tokenId: agent,
+        };
+        watcher
+            .process_logs(&[
+                malformed_metadata(),
+                native_test_log(transfer.encode_log_data(), 100, 2),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(deployments.get(seal).await.unwrap().unwrap().owner, buyer);
+        let rows = sink.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "malformed_entry_updated");
+        assert_eq!(rows[0].0.block_hash, Some(B256::repeat_byte(0x81)));
+        assert_eq!(rows[0].0.log_index, Some(1));
+    }
+
+    #[tokio::test]
+    async fn deadletter_write_failure_blocks_range_and_following_transfer() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let seal = B256::repeat_byte(0xb2);
+        let agent = U256::from(82);
+        let seller = Address::repeat_byte(0x11);
+        let buyer = Address::repeat_byte(0x22);
+        seed_bound(&deployments, seal, agent, seller);
+        let mut watcher = test_watcher(
+            deployments.clone(),
+            Arc::new(InMemoryEventBus::new()),
+            Arc::new(InMemoryJobQueue::new()),
+        );
+        watcher.canonical_addr = Address::repeat_byte(0x99);
+        let sink = Arc::new(MemoryMetadataDeadletters::default());
+        sink.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        watcher.metadata_deadletters = sink.clone();
+        let transfer = AgenticID::Transfer {
+            from: seller,
+            to: buyer,
+            tokenId: agent,
+        };
+        assert!(watcher
+            .process_logs(&[
+                malformed_metadata(),
+                native_test_log(transfer.encode_log_data(), 100, 2)
+            ])
+            .await
+            .is_err());
+        assert_eq!(deployments.get(seal).await.unwrap().unwrap().owner, seller);
+        assert!(sink.rows.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_transfer_is_security_blocking_and_never_deadlettered() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let seal = B256::repeat_byte(0xb3);
+        let agent = U256::from(83);
+        let seller = Address::repeat_byte(0x11);
+        let buyer = Address::repeat_byte(0x22);
+        seed_bound(&deployments, seal, agent, seller);
+        let mut watcher = test_watcher(
+            deployments.clone(),
+            Arc::new(InMemoryEventBus::new()),
+            Arc::new(InMemoryJobQueue::new()),
+        );
+        watcher.canonical_addr = Address::repeat_byte(0x99);
+        let sink = Arc::new(MemoryMetadataDeadletters::default());
+        watcher.metadata_deadletters = sink.clone();
+        let bad = native_test_log(
+            alloy::primitives::LogData::new_unchecked(
+                vec![AgenticID::Transfer::SIGNATURE_HASH],
+                Bytes::new(),
+            ),
+            100,
+            1,
+        );
+        let good = native_test_log(
+            AgenticID::Transfer {
+                from: seller,
+                to: buyer,
+                tokenId: agent,
+            }
+            .encode_log_data(),
+            100,
+            2,
+        );
+        assert!(watcher.process_logs(&[bad, good]).await.is_err());
+        assert_eq!(deployments.get(seal).await.unwrap().unwrap().owner, seller);
+        assert!(sink.rows.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn metadata_rpc_errors_are_not_permanent_metadata_skips() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let seal = B256::repeat_byte(0xb4);
+        let agent = U256::from(84);
+        let seller = Address::repeat_byte(0x11);
+        seed_bound(&deployments, seal, agent, seller);
+        let mut watcher = test_watcher(
+            deployments,
+            Arc::new(InMemoryEventBus::new()),
+            Arc::new(InMemoryJobQueue::new()),
+        );
+        watcher.canonical_addr = Address::repeat_byte(0x99);
+        let sink = Arc::new(MemoryMetadataDeadletters::default());
+        watcher.metadata_deadletters = sink.clone();
+        // The default provider is an unavailable localhost endpoint.
+        assert!(watcher.process_logs(&[entry_log(agent, 0)]).await.is_err());
+        assert!(sink.rows.lock().unwrap().is_empty());
+    }
+
+    async fn serve_idata_snapshot(
+        datas: Vec<(String, B256)>,
+        keys: Vec<Bytes>,
+        height: u64,
+    ) -> (HttpProvider, tokio::task::JoinHandle<()>) {
+        use alloy::sol_types::{SolCall, SolValue};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            let mut block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+            block.header.number = height;
+            block.header.hash = B256::repeat_byte(0x88);
+            let data_return = (datas,).abi_encode_sequence();
+            let key_return = (keys,).abi_encode_sequence();
+            AgenticID::intelligentDatasOfCall::abi_decode_returns(&data_return,true).expect("valid iData return fixture");
+            AgenticID::sealedKeysOfCall::abi_decode_returns(&key_return,true).expect("valid sealed key return fixture");
+            let answers = [
+                serde_json::to_value(block).unwrap(),
+                serde_json::json!(format!("0x{}", hex::encode(data_return))),
+                serde_json::json!(format!("0x{}", hex::encode(key_return))),
+            ];
+            for (position, answer) in answers.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let request = loop {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(end) = raw.windows(4).position(|x| x == b"\r\n\r\n") {
+                        if let Ok(request) =
+                            serde_json::from_slice::<serde_json::Value>(&raw[end + 4..])
+                        {
+                            break request;
+                        }
+                    }
+                };
+                if position == 0 {
+                    assert_eq!(request["method"], "eth_getBlockByNumber");
+                } else {
+                    assert_eq!(request["method"], "eth_call");
+                    assert_eq!(
+                        request["params"][1],
+                        serde_json::json!({"blockHash":B256::repeat_byte(0x88),"requireCanonical":true})
+                    );
+                }
+                let body = serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":answer})
+                    .to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+            }
+            }).await.expect("metadata RPC fixture exceeded its 5 second deadline");
+        });
+        (
+            ProviderBuilder::new().on_http(format!("http://{address}").parse().unwrap()),
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn metadata_snapshot_behind_event_is_retried_without_deadletter() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let seal = B256::repeat_byte(0xb6);
+        let agent = U256::from(86);
+        seed_bound(&deployments, seal, agent, Address::repeat_byte(0x11));
+        let mut watcher = test_watcher(
+            deployments,
+            Arc::new(InMemoryEventBus::new()),
+            Arc::new(InMemoryJobQueue::new()),
+        );
+        watcher.canonical_addr = Address::repeat_byte(0x99);
+        let sink = Arc::new(MemoryMetadataDeadletters::default());
+        watcher.metadata_deadletters = sink.clone();
+        // Without the height fence, these valid old empty arrays would make
+        // index 1 look permanently invalid and the metadata log be skipped.
+        let (provider, rpc) = serve_idata_snapshot(vec![], vec![], 99).await;
+        watcher.provider = provider;
+        let result = watcher.process_logs(&[entry_log(agent, 1)]).await;
+        rpc.abort();
+        assert!(result.is_err());
+        assert!(sink.rows.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn entry_updated_new_role_and_full_updated_replace_authoritative_length() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let seal = B256::repeat_byte(0xb5);
+        let agent = U256::from(85);
+        seed_bound(&deployments, seal, agent, Address::repeat_byte(0x11));
+        // This is a retained, nonempty scratch snapshot. Completed deploys
+        // whose scratch was already cleared intentionally stay empty.
+        deployments
+            .by_seal
+            .lock()
+            .unwrap()
+            .get_mut(&seal)
+            .unwrap()
+            .i_data = vec![IDataArtifact {
+            role: "framework".into(),
+            description: serde_json::json!({"role":"framework"}).to_string(),
+            storage_root: StorageRoot {
+                root_hash: B256::repeat_byte(1),
+                indexer: "http://indexer.local".into(),
+                size: 5,
+            },
+            sealed_key: Bytes::new(),
+            data_hash: B256::repeat_byte(1),
+            ciphertext: Bytes::from_static(b"retry"),
+        }];
+        let mut watcher = test_watcher(
+            deployments.clone(),
+            Arc::new(InMemoryEventBus::new()),
+            Arc::new(InMemoryJobQueue::new()),
+        );
+        watcher.canonical_addr = Address::repeat_byte(0x99);
+        let roles = vec![
+            (
+                serde_json::json!({"role":"framework"}).to_string(),
+                B256::repeat_byte(1),
+            ),
+            (
+                serde_json::json!({"role":"new_role"}).to_string(),
+                B256::repeat_byte(2),
+            ),
+        ];
+        let (provider, rpc) = serve_idata_snapshot(
+            roles,
+            vec![Bytes::from_static(b"key-1"), Bytes::from_static(b"key-2")],
+            100,
+        )
+        .await;
+        watcher.provider = provider;
+        watcher.process_logs(&[entry_log(agent, 1)]).await.unwrap();
+        rpc.await.unwrap();
+        let d = deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.i_data.len(), 2);
+        assert_eq!(d.i_data[1].role, "new_role");
+        assert_eq!(d.i_data[1].sealed_key, Bytes::from_static(b"key-2"));
+        assert_eq!(d.i_data[0].ciphertext, Bytes::from_static(b"retry"));
+        let (provider, rpc) = serve_idata_snapshot(
+            vec![(
+                serde_json::json!({"role":"replacement"}).to_string(),
+                B256::repeat_byte(3),
+            )],
+            vec![Bytes::from_static(b"key-3")],
+            101,
+        )
+        .await;
+        watcher.provider = provider;
+        watcher
+            .on_updated(
+                AgenticID::Updated {
+                    tokenId: agent,
+                    oldDatas: vec![],
+                    newDatas: vec![],
+                    sealedKeys: vec![],
+                },
+                101,
+            )
+            .await
+            .unwrap();
+        rpc.await.unwrap();
+        let d = deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.i_data.len(), 1);
+        assert_eq!(d.i_data[0].role, "replacement");
+        assert_eq!(d.i_data[0].sealed_key, Bytes::from_static(b"key-3"));
+        assert!(d.i_data[0].ciphertext.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mint_and_entry_updates_do_not_refill_completed_deploy_scratch() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let seal = B256::repeat_byte(0xb6);
+        let agent = U256::from(86);
+        seed_bound(&deployments, seal, agent, Address::repeat_byte(0x11));
+        let mut watcher = test_watcher(
+            deployments.clone(),
+            Arc::new(InMemoryEventBus::new()),
+            Arc::new(InMemoryJobQueue::new()),
+        );
+        watcher.canonical_addr = Address::repeat_byte(0x99);
+        let sink = Arc::new(MemoryMetadataDeadletters::default());
+        watcher.metadata_deadletters = sink.clone();
+        let roles = vec![
+            (
+                serde_json::json!({"role":"framework"}).to_string(),
+                B256::repeat_byte(1),
+            ),
+            (
+                serde_json::json!({"role":"new_role"}).to_string(),
+                B256::repeat_byte(2),
+            ),
+        ];
+        let (provider, rpc) = serve_idata_snapshot(roles.clone(), vec![Bytes::new(); 2], 100).await;
+        watcher.provider = provider;
+        watcher
+            .on_updated(
+                AgenticID::Updated {
+                    tokenId: agent,
+                    oldDatas: vec![],
+                    newDatas: vec![],
+                    sealedKeys: vec![],
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        rpc.await.unwrap();
+        assert!(deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .i_data
+            .is_empty());
+        let (provider, rpc) = serve_idata_snapshot(roles, vec![Bytes::new(); 2], 100).await;
+        watcher.provider = provider;
+        watcher.process_logs(&[entry_log(agent, 1)]).await.unwrap();
+        rpc.await.unwrap();
+        assert!(deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .i_data
+            .is_empty());
+        assert!(
+            sink.rows.lock().unwrap().is_empty(),
+            "chain length validates the new role even when scratch stays empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_transfer_preserves_new_same_owner_checkpoint_runtime() {
+        use attestor_shared::auth::operator::OperatorCheckpoint;
+        let (mut watcher, deployments, jobs, owner, seal, agent, boot) = checkpoint_runtime().await;
+        let checkpoint = OperatorCheckpoint {
+            number: 102,
+            hash: B256::repeat_byte(0xa2),
+        };
+        for block in [101, 102] {
+            let (provider, rpc) = serve_checkpoint_rpc(owner, checkpoint, true, false).await;
+            watcher.provider = provider;
+            watcher
+                .on_transfer(
+                    AgenticID::Transfer {
+                        from: owner,
+                        to: Address::repeat_byte(0xb1),
+                        tokenId: agent,
+                    },
+                    block,
+                )
+                .await
+                .unwrap();
+            rpc.await.unwrap();
+            assert_eq!(
+                deployments
+                    .operator_grant(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version,
+                1
+            );
+            assert_eq!(
+                deployments.boot_authorization(seal).await.unwrap().unwrap(),
+                boot
+            );
+            assert_eq!(
+                deployments
+                    .get(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .sandbox_id
+                    .as_deref(),
+                Some("new-after-aba")
+            );
+            assert!(deployments
+                .pending_operator_teardowns()
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(jobs.submitted.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_revocation_checkpoint_cannot_block_later_transfers() {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+        use attestor_shared::auth::operator::{OperatorCheckpoint, OperatorGrant};
+        use base64::Engine as _;
+
+        // Reproduce records the previous API accepted. Neither an ordinary
+        // anchor nor a made-up future height gives a revocation authority to
+        // spare a grant or make the indexer query that header.
+        for number in [102, 1u64 << 62] {
+            let (mut watcher, deployments, jobs, owner, seal, agent, _) =
+                checkpoint_runtime().await;
+            watcher.canonical_addr = Address::repeat_byte(0x99);
+            let owner_key = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x16)).unwrap();
+            let proof = serde_json::to_vec(&serde_json::json!({
+                "domain":"AgenticID.Operator.v1","chain_id":16602,"contract":Address::ZERO,
+                "seal_id":seal,"owner":owner,"base_version":1,"operator":null,
+                "allow_recreate":false,"expires_at":0,"issued_at":Utc::now().timestamp(),
+                "checkpoint":OperatorCheckpoint {number,hash:B256::repeat_byte(0xee)},
+            }))
+            .unwrap();
+            let signature: Vec<u8> = owner_key
+                .sign_hash_sync(&B256::from(attestor_shared::sandbox::eip191_digest(&proof)))
+                .unwrap()
+                .into();
+            let grant = OperatorGrant {
+                version: 2,
+                owner,
+                signed_message_b64: base64::engine::general_purpose::STANDARD.encode(proof),
+                signature: signature.into(),
+                checkpoint_acceptance: None,
+            };
+            assert!(
+                attestor_shared::auth::operator::verify_operator_grant_metadata(
+                    &grant,
+                    owner,
+                    watcher.chain_id,
+                    watcher.contract_addr,
+                    seal,
+                    watcher.crypto.as_ref(),
+                )
+                .is_ok()
+            );
+            deployments
+                .compare_and_swap_operator(seal, 1, grant)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let next_seal = B256::repeat_byte(0xa7);
+            let next_agent = U256::from(17);
+            let buyer = Address::repeat_byte(0x28);
+            seed_bound(&deployments, next_seal, next_agent, owner);
+            let logs: Vec<_> = [agent, next_agent]
+                .into_iter()
+                .map(|token_id| alloy::rpc::types::Log {
+                    inner: alloy::primitives::Log {
+                        address: watcher.contract_addr,
+                        data: AgenticID::Transfer {
+                            from: owner,
+                            to: buyer,
+                            tokenId: token_id,
+                        }
+                        .encode_log_data(),
+                    },
+                    block_number: Some(101),
+                    ..Default::default()
+                })
+                .collect();
+            for _ in 0..3 {
+                // Only live ownerOf is served: a header request would fail.
+                let (provider, rpc) = serve_owner(buyer).await;
+                watcher.provider = provider;
+                tokio::time::timeout(Duration::from_secs(5), watcher.process_logs(&logs))
+                    .await
+                    .expect("revocation must not stall the range")
+                    .unwrap();
+                rpc.await.unwrap();
+            }
+            for id in [seal, next_seal] {
+                let after = deployments.get(id).await.unwrap().unwrap();
+                assert_eq!(after.owner, buyer);
+                assert!(after.container_record.is_none());
+                assert_eq!(watcher.credentials.epoch(id).await.unwrap(), 101);
+            }
+            assert!(deployments
+                .get(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .sandbox_id
+                .is_none());
+            assert_eq!(
+                deployments
+                    .operator_grant(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version,
+                3,
+                "the revoked record is invalidated once, even across replays"
+            );
+            assert!(
+                !deployments
+                    .boot_authorization(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .enabled
+            );
+            assert!(jobs.submitted.lock().unwrap().iter().any(|job| matches!(
+                job,
+                JobPayload::SandboxTeardown { seal_id, expected_sandbox_id }
+                    if *seal_id == next_seal && expected_sandbox_id.as_deref() == Some("sb-1")
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn unadmitted_appointment_checkpoint_cannot_block_transfer() {
+        let (mut watcher, deployments, _, owner, seal, agent, _) = checkpoint_runtime().await;
+        deployments
+            .operator_grants
+            .lock()
+            .unwrap()
+            .get_mut(&seal)
+            .unwrap()
+            .checkpoint_acceptance = None;
+        let (provider, rpc) = serve_owner(owner).await;
+        watcher.provider = provider;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            watcher.on_transfer(
+                AgenticID::Transfer {
+                    from: owner,
+                    to: Address::repeat_byte(0xb1),
+                    tokenId: agent,
+                },
+                101,
+            ),
+        )
+        .await
+        .expect("a grant without admission cannot require a header check")
+        .unwrap();
+        rpc.await.unwrap();
+        assert_eq!(
+            deployments
+                .operator_grant(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            2
+        );
+        assert!(
+            !deployments
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        assert!(deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .sandbox_id
+            .is_none());
+        assert!(deployments
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "new-after-aba".into())));
+    }
+
+    #[tokio::test]
+    async fn transfer_after_appointment_checkpoint_needs_no_header_read() {
+        let (mut watcher, deployments, _, owner, seal, agent, _) = checkpoint_runtime().await;
+        let (provider, rpc) = serve_owner(owner).await;
+        watcher.provider = provider;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            watcher.on_transfer(
+                AgenticID::Transfer {
+                    from: owner,
+                    to: Address::repeat_byte(0xb1),
+                    tokenId: agent,
+                },
+                103,
+            ),
+        )
+        .await
+        .expect("a checkpoint before the transfer cannot exempt the grant")
+        .unwrap();
+        rpc.await.unwrap();
+        assert_eq!(
+            deployments
+                .operator_grant(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            2
+        );
+        assert!(deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .sandbox_id
+            .is_none());
+        assert!(deployments
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "new-after-aba".into())));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rpc_failure_aborts_log_range_before_checkpoint_advance() {
+        use attestor_shared::auth::operator::OperatorCheckpoint;
+        let (mut watcher, deployments, _, owner, seal, agent, boot) = checkpoint_runtime().await;
+        watcher.canonical_addr = Address::repeat_byte(0x99);
+        let (provider, rpc) = serve_checkpoint_rpc(
+            owner,
+            OperatorCheckpoint {
+                number: 102,
+                hash: B256::repeat_byte(0xa2),
+            },
+            true,
+            true,
+        )
+        .await;
+        watcher.provider = provider;
+        let event = AgenticID::Transfer {
+            from: owner,
+            to: Address::repeat_byte(0xb1),
+            tokenId: agent,
+        };
+        let log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: event.encode_log_data(),
+            },
+            block_number: Some(101),
+            ..Default::default()
+        };
+        // tick awaits this range before save_checkpoint. Its error is propagated,
+        // not swallowed, so no database checkpoint write can be reached.
+        assert!(watcher.process_logs(&[log]).await.is_err());
+        rpc.await.unwrap();
+        assert_eq!(
+            deployments
+                .operator_grant(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+        assert_eq!(
+            deployments.boot_authorization(seal).await.unwrap().unwrap(),
+            boot
+        );
+        assert!(deployments
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn noncanonical_checkpoint_does_not_exempt_an_outgoing_grant() {
+        use attestor_shared::auth::operator::OperatorCheckpoint;
+        let (mut watcher, deployments, _, owner, seal, agent, _) = checkpoint_runtime().await;
+        let (provider, rpc) = serve_checkpoint_rpc(
+            owner,
+            OperatorCheckpoint {
+                number: 102,
+                hash: B256::repeat_byte(0xa2),
+            },
+            false,
+            false,
+        )
+        .await;
+        watcher.provider = provider;
+        watcher
+            .on_transfer(
+                AgenticID::Transfer {
+                    from: owner,
+                    to: Address::repeat_byte(0xb1),
+                    tokenId: agent,
+                },
+                101,
+            )
+            .await
+            .unwrap();
+        rpc.await.unwrap();
+        assert_eq!(
+            deployments
+                .operator_grant(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            2
+        );
+        assert!(deployments
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .sandbox_id
+            .is_none());
+        assert!(deployments
+            .pending_operator_teardowns()
+            .await
+            .unwrap()
+            .contains(&(seal, "new-after-aba".into())));
+    }
+
+    #[tokio::test]
+    async fn late_transfer_preserves_current_owner_operator_grant_without_a_boot() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let events = Arc::new(InMemoryEventBus::new());
+        let jobs = Arc::new(InMemoryJobQueue::new());
+        let seal = B256::repeat_byte(0xaa);
+        let agent = U256::from(7);
+        let seller = Address::repeat_byte(0x11);
+        let intermediate_buyer = Address::repeat_byte(0x22);
+        let current_owner = Address::repeat_byte(0x99);
+        seed_bound(&deployments, seal, agent, seller);
+        // The latest buyer has delegated before the indexer catches up, but
+        // has not provisioned a runtime yet. Grant history still requires a
+        // live owner lookup instead of trusting this older Transfer event.
+        deployments
+            .compare_and_swap_operator(
+                seal,
+                0,
+                attestor_shared::auth::operator::OperatorGrant {
+                    version: 1,
+                    owner: current_owner,
+                    signed_message_b64: String::new(),
+                    signature: Bytes::new(),
+                    checkpoint_acceptance: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deployments
+            .boot_authorization(seal)
+            .await
+            .unwrap()
+            .is_none());
+        let mut w = test_watcher(deployments.clone(), events, jobs.clone());
+        let (provider, rpc) = serve_owner(current_owner).await;
+        w.provider = provider;
+        w.on_transfer(
+            AgenticID::Transfer {
+                from: seller,
+                to: intermediate_buyer,
+                tokenId: agent,
+            },
+            100,
+        )
+        .await
+        .unwrap();
+        rpc.await.unwrap();
+        assert_eq!(
+            deployments.get(seal).await.unwrap().unwrap().owner,
+            current_owner
+        );
+        let grant = deployments.operator_grant(seal).await.unwrap().unwrap();
+        assert_eq!(grant.owner, current_owner);
+        assert_eq!(
+            grant.version, 1,
+            "a later owner's grant must remain effective"
+        );
+        assert!(jobs.submitted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

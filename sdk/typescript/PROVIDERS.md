@@ -98,6 +98,12 @@ a provider requiring another protocol or authentication scheme still needs a
 code release. Endpoints/catalogs must be HTTPS without embedded credentials,
 query strings, or fragments. Compatibility flags belong to their provider;
 additional managed providers do not inherit compute metadata or routing guesses.
+An optional `webSearch` names the web search service the provider's key pays
+for: `0g-router`, `openai` or `anthropic` (sealed's inference route calls each;
+a 0g-harness owner picks one with `others.webSearch`). It is not part of the
+route hash, so adding it does not re-authorize a sealed key. Without the
+field, sealed still gives `0g-compute` the router's search and native `openai`
+and `anthropic` their own (`providerWebSearch` returns the same).
 `0g-compute` must remain in the registry. The only native IDs are `openai` and
 `anthropic`; they have no custom endpoints and use framework-native wiring.
 

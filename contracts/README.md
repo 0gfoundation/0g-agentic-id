@@ -84,26 +84,43 @@ remappings = [
 `via_ir = true` is required because `giveFeedback`'s argument count causes
 stack too deep without it (details in [`../QUIRKS.md`](../QUIRKS.md)).
 CBOR remains enabled; `bytecode_hash = "none"` is not `--no-metadata`.
-With these settings, AgenticID's measured runtime is **24,543 bytes** and
-`AttestorAppBindingLib` is **1,730 bytes**. Both pass the 24,576-byte EIP-170 gate;
-rerun `forge build --sizes --skip test --skip script` and `forge test` after changes rather than relying on
+With these settings the measured runtimes are AgenticID **23,788 bytes**,
+TrustRegistry **5,905**, VerifiedFeedbackRegistry **12,902** and FeedbackBatcher
+**3,056**, all under the 24,576-byte EIP-170 gate; rerun
+`forge build --sizes --skip test --skip script` and `forge test` after changes rather than relying on
 the remaining margin. The size report excludes scripts and test-only upgrade mocks;
 `Eip170Size.t.sol` separately checks every production deployable in the full suite.
-The validation run passed 299 tests, with two fork cases skipped.
+The validation run passed 354 tests, with two fork cases skipped.
 
-### Linked attestor authorization library
+### The trust registry
 
-AgenticID links the stateless `AttestorAppBindingLib`. It has no owner or configuration;
-its public functions execute by `DELEGATECALL` against the proxy's existing storage.
-The AgenticID facade keeps the owner checks, ABI and migration switch.
+The deployer's trust decisions live in `TrustRegistry`, not in AgenticID: which
+attestors may act for the platform (and the Tapp app instances they are bound
+to), and which code may run an agent — code lists by kind (`IMAGE`, `SEALED`,
+`HARNESS`; any other `bytes32` kind works too), each in listing order with a
+`latest`. AgenticID's trust reads (`isTrustedAttestor`, `isValidFrameworkHash` —
+the image list — `trustedAttestorAppBinding`, `instanceBoundAttestorsRequired`)
+forward there, and its `registerWithSeal` / `setAgentURI` gates use them.
 
-`forge script` automatically deploys and links the library for scripts that create
-AgenticID. Standalone `forge create` requires deploying the library first and supplying
-`--libraries src/AttestorAppBindingLib.sol:AttestorAppBindingLib:<LIB_ADDRESS>` when
-creating the implementation. Retain the library address and the linked implementation's
-build metadata for verification. Changing library code requires a new library and linked
-implementation, activated through the existing beacon/timelock; proxy state stays put.
-See [`UPGRADING.md`](UPGRADING.md) for linking and verification constraints.
+Adding trust waits; removing it does not. The registry's owner is the
+environment's TimelockController (from TrustRegistry 1.1.0's owner move): a
+listing, an attestor trusted or bound, the instance-binding switch and the
+guardian are scheduled Timelock operations (`script/TrustRegistryCalls.s.sol`),
+run after `minDelay` — 1 day on mainnet, 0 on test / dev — and cancellable until
+then. The guardian, the environment's governance key, removes trust at once:
+`delist` and `removeTrustedAttestor`, alone or batched through `multicall`.
+The lists reach running agents: delist the sealed version they run and they
+move within one heartbeat to the owner's pick or the newest listed version,
+which then gets the agent key — so what can be listed waits for the delay
+([`DEPLOYMENT.md`](DEPLOYMENT.md) §1).
+
+The registry address is fixed in AgenticID's implementation (a constructor
+argument, read back by `trustRegistry()`), so a beacon upgrade switches every
+trust read at once and pointing at another registry is a new implementation
+behind the Timelock. `forge create` an implementation with
+`--constructor-args <TrustRegistry proxy>`. AgenticID 1.4.0 links no library;
+`AttestorAppBindingLib` is now internal code of the registry (the deployed 1.3.0
+implementations still link the old public library — [`UPGRADING.md`](UPGRADING.md)).
 
 ---
 
@@ -112,9 +129,12 @@ See [`UPGRADING.md`](UPGRADING.md) for linking and verification constraints.
 ```
 contracts/src/
 ├── AgenticID.sol                               main contract (identity + 7857 token + seal)
-├── AttestorAppBindingLib.sol                   stateless linked app-instance authorization code
+├── TrustRegistry.sol                           the deployer's trust decisions: trusted attestors
+│                                               and code lists by kind (image / sealed / harness)
+├── AttestorAppBindingLib.sol                   app-instance binding checks (internal to TrustRegistry)
 ├── VerifiedFeedbackRegistry.sol                TEE-verification layer over the canonical ERC-8004
-│                                               Reputation Registry (attestFeedback + ServeProof)
+│                                               Reputation Registry (attestFeedback + ServeProof,
+│                                               attestVersionedFeedback for versioned proofs)
 ├── FeedbackBatcher.sol                         EIP-7702 delegate: canonical feedback + attest in
 │                                               one atomic self-call (stateless, no beacon)
 ├── AgenticIDReputationRegistry.sol             DEPRECATED private reputation fork — replaced by
@@ -163,7 +183,7 @@ AgenticID
   ├── ERC7857IDataStorageUpgradeable             (IntelligentData[])
   ├── ERC7857AuthorizeUpgradeable                (authorizedUsers[])
   ├── ERC7857CloneableUpgradeable                (iCloneFrom)
-  └── Ownable2StepUpgradeable                     (two-step owner / attestor management)
+  └── Ownable2StepUpgradeable                     (two-step owner)
 ```
 
 ERC-721 arrives via both the 8004 and 7857 paths; C3 collapses it to a single
@@ -214,10 +234,11 @@ AgenticID.registerWithSeal(
 )
 ```
 
-Preconditions: `msg.sender` is in the `trustedAttestors` list (maintained by
-`onlyOwner`), and the sealed runtime's `image_hash` is in `validFrameworkHashes`
-(checked off-chain by the attestor before it provisions the seal). The call mints
-the canonical token to the AgenticID contract (custody) and the local token to `to`.
+Preconditions: `msg.sender` is a trusted attestor on the TrustRegistry
+(`isTrustedAttestor`, maintained by the registry owner), and the sealed runtime's
+`image_hash` is on the registry's image list (`isValidFrameworkHash`, checked
+off-chain by the attestor before it provisions the seal). The call mints the
+canonical token to the AgenticID contract (custody) and the local token to `to`.
 
 **Events** — split across the two contracts:
 - on the **canonical registry**: `Registered(agentId, agentURI, owner=AgenticID)`,
@@ -315,6 +336,36 @@ console's say-hi check and `attestor/scripts/verify-agent.sh` (the list is kept
 in the root [`AGENTS.md`](../AGENTS.md)) — and all pin one known-answer vector
 (`VerifiedFeedback.t.sol` `test_serveProofDigest_knownAnswerVector`).
 
+### Versioned ServeProofs (v2)
+
+The proof above is v1 and carries no version. From v2 on a proof names its
+version — `VersionedServeProof` adds `version` and, for v2, what ran when it was
+signed: `sealedHash` and `harnessHash` (each on the TrustRegistry's lists) and
+the `inferenceURL` / `model` sealed's inference proxy forwarded with (the
+0g-harness layered runtime, [`../sealed/LAYERS.md`](../sealed/LAYERS.md) §7).
+The v2 inner hash opens with a version tag, so a v1 and a v2 signature never
+verify as each other; the wrap is v1's:
+
+```
+innerV2 = keccak256(abi.encode(keccak256("AgentDNA.ServeProof.v2"),
+                               block.chainid, identityRegistry, submitter,
+                               agentId, timestamp, deadline, taskHash,
+                               keccak256(abi.encodePacked(dataHashes)), frameworkHash,
+                               sealedHash, harnessHash,
+                               keccak256(bytes(inferenceURL)), keccak256(bytes(model))))
+digest  = keccak256(0x19 ‖ 0x00 ‖ verifiedFeedbackRegistry ‖ innerV2)
+```
+
+`attestVersionedFeedback(agentId, feedbackIndex, proof, task)` takes it
+(VerifiedFeedbackRegistry ≥ 1.3.0): any version but 2 reverts
+`VerifiedFeedbackUnsupportedVersion`, then the v1 checks run in the v1 order, an
+empty `task.method` skips the receipt opening, and the mark emits
+`FeedbackVerified` followed by `VersionedFeedbackVerified` (the v2 fields).
+`getServeLayers` reads the sealed and harness hashes back (zero for a v1 mark).
+Known-answer vector: `VersionedFeedback.t.sol`
+`test_serveProofDigestV2_knownAnswerVector` (the one sealed pins). The v1 entry
+points are unchanged.
+
 ### On-chain submission — two calls by the client (SDK bundles them)
 
 On EIP-7702-enabled chains (0G Galileo is — verified live) the SDK executes
@@ -322,8 +373,8 @@ both calls in ONE atomic type-4 transaction: the client EOA delegates to
 `FeedbackBatcher` and self-calls `giveFeedbackAndAttest`, which runs in the
 EOA's account context (msg.sender = the client for both inner calls) and reads
 the assigned index inside the same transaction. A failed attest rolls back the
-canonical write. Without 7702 the SDK falls back to the sequential two-tx flow
-below.
+canonical write; `giveFeedbackAndAttestVersioned` is the same for a versioned
+proof. Without 7702 the SDK falls back to the sequential two-tx flow below.
 
 The delegation **persists** on the EOA (`getCode(you)` reads `0xef0100‖batcher`
 while delegated); undelegate by signing a delegation to the zero address. When
@@ -389,6 +440,7 @@ explicit list of trusted clients.
 - `getVerifiedSummary(agentId, clients[], tag1, tag2)` — aggregate the given clients' **verified** canonical entries (values read live from the canonical registry; revoked skipped, and so are pre-1.2.0 marks outside the value bound; sum + count, normalized to fixed 18 decimals; `clients` must be non-empty — the caller picks whom to trust). Off-chain `eth_call` only.
 - `attestFeedbackWithTask(…, TaskReveal)` — additionally opens the proof's taskHash commitment (method / uri / body **hashes** / status — bodies stay private): the contract recomputes the hash and records the URI as the entry's **TEE-verified endpoint**. `getVerifiedEndpoint` reads it back; `getVerifiedSummaryForEndpoint(agentId, clients[], uri)` aggregates per interface without trusting client-declared tags (`uri` must be non-empty — `VerifiedFeedbackEndpointRequired`, 1.2.0: unrevealed entries store "", so an empty filter matched exactly the unproven ones, FIND-09). The reveal is rejected (`VerifiedFeedbackInvalidTaskReveal`) unless the method is in the known HTTP set, the URI starts with `/`, and `statusCode` is in **100..999** (exactly three digits — the range Go's `net/http` emits). The packed preimage is otherwise ambiguous: a 1–2 digit status would let a reveal shift body-hash bytes into the URI and record an endpoint the call never hit (audit FIND-02, enforced since 1.2.0).
 - `getServeData(agentId, client, idx)` — the `dataHashes` and `frameworkHash` in effect at the time of that feedback. **This is the buyer's due-diligence entrypoint**: compare against `intelligentDatasOf(agentId)` to see whether the agent's data changed since the reputation was earned.
+- `getServeLayers(agentId, client, idx)` — the `sealedHash` and `harnessHash` a versioned proof recorded (zero for a v1 mark; a v2 proof may claim zero too, so the `VersionedFeedbackVerified` event, emitted only for versioned proofs, tells them apart); check them against the TrustRegistry's sealed and harness lists.
 - Every view above counts marks from before the environment's 1.2.0 upgrade block (`DEPLOYMENT.md` §6) as well, and those carry no FIND-01 / FIND-02 guarantee (audit data and verified endpoint not assured). The views take no block filter; a reader that needs only post-cut marks filters `FeedbackVerified` logs by block.
 
 > **Deprecated — paused:** the previous private fork
@@ -421,7 +473,7 @@ Transfer behaviour splits on whether the agent has a seal (`getAgentSeal(tokenId
   (marketplace fork) — the BUYER signs an `AgenticID.CloneContract.v1` intent
   binding `keccak256(auth_data)` and the authorizer, and the owner-configured
   `ICloneAuthorizer` decides via `CloneGate.cloneFrom` (atomic policy consult;
-  the gate is a SATELLITE contract — AgenticID itself sits at the EIP-170
+  the gate is a SATELLITE contract — AgenticID itself sits near the EIP-170
   bytecode ceiling and is unchanged).
 - **Non-seal agent** (data blob): plain transfers stay disabled; ownership moves
   only through the proof-gated `iTransferFrom` below, which atomically re-encrypts
@@ -430,10 +482,10 @@ Transfer behaviour splits on whether the agent has a seal (`getAgentSeal(tokenId
 ### Policy-mode cloning (issue #133): the `CloneGate` satellite
 
 A seal-bound agent's owner can delegate fork authorization to a policy
-contract. Everything lives in `CloneGate` — AgenticID is untouched (it sits at
+contract. Everything lives in `CloneGate` — AgenticID is untouched (it sits near
 the EIP-170 ceiling; new capabilities ship as companion contracts, like
-`VerifiedFeedbackRegistry`). The gate must be on AgenticID's trusted-attestor
-allowlist (it mints through `registerWithSeal`); pausing AgenticID pauses
+`VerifiedFeedbackRegistry`). The gate must be a trusted attestor on the
+TrustRegistry (it mints through `registerWithSeal`); pausing AgenticID pauses
 cloning; the marketplace-fork flow:
 
 1. **Publisher opts in once:** `CloneGate.setCloneAuthorizer(tokenId, authorizer)`
@@ -578,13 +630,15 @@ lowering it reopened still-valid consumed proofs to replay).
     canonical singleton. The canonical singleton is shared and cannot be changed to
     report otherwise.
 - **Governance: direct two-step owner, Timelocked upgrades.** AgenticID,
-  TEEDataVerifier and VerifiedFeedbackRegistry are `Ownable2Step` (1.2.0, audit
+  TrustRegistry, TEEDataVerifier and VerifiedFeedbackRegistry are `Ownable2Step` (1.2.0, audit
   FIND-16): `transferOwnership(x)` only sets `pendingOwner` (event
   `OwnershipTransferStarted`), and ownership moves when `x` calls
-  `acceptOwnership()`. Owner-only admin — attestor allowlist, framework-hash
-  whitelist, `setVerifier` / `setTeeOracleAddress`, `setPauser`,
-  `setMaxProofAge` (raise-only) — is a direct call, not timelocked; only beacon upgrades go
-  through the Timelock (1-day `minDelay` on mainnet, 0 on testnet / dev).
+  `acceptOwnership()`. Owner-only admin — `setVerifier` /
+  `setTeeOracleAddress`, `setPauser`, `setMaxProofAge` (raise-only) — is a
+  direct call, not timelocked; beacon upgrades go through the Timelock (1-day
+  `minDelay` on mainnet, 0 on testnet / dev), and so does every addition of
+  trust on the TrustRegistry, whose owner is the Timelock and whose guardian
+  removes trust at once (§1, "The trust registry").
   The swap setters refuse `address(0)` (`AgenticIDZeroAddress` /
   `TEEDataVerifierZeroAddress`) and emit `VerifierUpdated` / `TeeOracleUpdated`
   (old, new), like `PauserUpdated` (FIND-12). Who holds each role per
@@ -600,7 +654,7 @@ lowering it reopened still-valid consumed proofs to replay).
 
 ## 9. Tests
 
-290 Foundry tests across 28 suites (288 pass, 2 fork tests skip unless
+356 Foundry tests across 33 suites (354 pass, 2 fork tests skip unless
 `FORK_RPC` is set), all green under `forge test`. Coverage spans every
 `external` / `public` function and every documented error path.
 
@@ -612,25 +666,30 @@ lowering it reopened still-valid consumed proofs to replay).
 | `Clone.t.sol` | 11 | iCloneFrom + source preserved + new token has no seal + Cloned vs ITransferred + a look-alike can't redeem the source's proofs + transfer proofs don't clone |
 | `TransferHook.t.sol` | 4 | `_update` clears agentWallet / authorizedUsers, retains seal / data / URI / metadata |
 | `VerifiedFeedback.t.sol` | 47 | attestFeedback ServeProof verification / canonical-entry binding / self-feedback (owner, operator, payment wallet, agentSeal) / value bound ±1e9, ≤ 18 decimals (FIND-04) / proof timestamp (FIND-15) / raise-only maxProofAge incl. the cleanup-replay scenario (FIND-07) / verified summary against the canonical registry mock / task-receipt opening incl. the statusCode 100..999 bound, the status-0 shifted-split forgery and the empty-endpoint filter (FIND-09) / registry-bound digest: legacy personal_sign, EIP-712-wrapped and other-validator proofs rejected (and a registry-bound proof rejected by the deprecated fork), plus the cross-impl digest known-answer vector (inner + signed + legacy) and the sealed proxy's pinned taskHash vector redeemed via attestFeedbackWithTask |
-| `FeedbackBatcher.t.sol` | 8 | EIP-7702 delegated batch (7702 cheatcodes): atomic write+attest, bad-proof rollback, self-call guard vs direct/outsider calls, delegated EOA still receives ETH / safe-minted NFTs |
+| `VersionedFeedback.t.sol` | 13 | attestVersionedFeedback (ServeProof v2): the v2 digest known-answer vector sealed pins (and v1's from the same fields), and the same with a non-ASCII model (hashed as UTF-8) / sealed and harness hashes recorded, both events / task reveal and the endpoint summary / only version 2 accepted / v1 and v2 signatures never pass as each other / every layer field signed / the v1 checks (agent, submitter, replay, already verified, self-feedback, pause) / getServeLayers zero for a v1 mark |
+| `FeedbackBatcher.t.sol` | 11 | EIP-7702 delegated batch (7702 cheatcodes): atomic write+attest for v1 and versioned proofs, bad-proof rollback, self-call guard vs direct/outsider calls, delegated EOA still receives ETH / safe-minted NFTs |
 | `Reputation.t.sol` | 24 | deprecated fork: giveFeedback ServeProof verification (legacy personal_sign digest) + revoke / appendResponse, all paths (incl. the inner-hash known-answer vector) |
 | `DataStorage.t.sol` | 13 | update / updateAt + empty / out-of-range / non-owner |
 | `Authorize.t.sol` | 9 | add/remove/query/clear authorization + duplicate / zero address / non-owner |
 | `AgentWallet.t.sol` | 8 | setAgentWallet EIP-712 + expired / replay / non-owner / unset |
 | `AgentURIAndMetadata.t.sol` | 9 | setAgentURI / setMetadata + overwrite / nonexistent |
 | `VerifierAdmin.t.sol` | 11 | oracle rotation (zero rejected, `TeeOracleUpdated`) / pause (pauser role) / maxProofAge (raise-only, initialize range) / onlyOwner |
-| `AgenticIDAdmin.t.sol` | 11 | attestor add/remove / frameworkHash / setVerifier (zero rejected, `VerifierUpdated`) / onlyOwner / pause coverage — URI (owner and attestor), metadata, wallet and usage-grant writes blocked, revocations and wallet unset open (FIND-11) |
+| `AgenticIDAdmin.t.sol` | 14 | the trust registry fixed by the implementation (zero rejected) / attestor add/remove and image hashes through it / setVerifier (zero rejected, `VerifierUpdated`) / onlyOwner / pause coverage — URI (owner and attestor), metadata, wallet and usage-grant writes blocked, revocations and wallet unset open (FIND-11) |
+| `TrustRegistry.t.sol` | 21 | code lists: listing order and `latest` through middle / head / tail delists and re-lists, kinds kept apart, any kind works, zero / duplicate / unlisted rejected, events / owner-only adds / atomic `multicall` / initializers / two-step ownership / state across a beacon upgrade; the guardian (1.1.0): set by the owner only, removes trust alone or in a `multicall` and adds none, cleared by zero; 1.0.0 → 1.1.0 from the frozen 1.0.0 source (`test/mocks/TrustRegistryV1_0_0.sol`, its interface in `test/mocks/v1_0_0/`) keeps lists, attestors, bindings and owner with the guardian zero; the owner move to a 1-day Timelock, a listing through schedule / execute (not before the delay, cancellable) and the guardian's immediate delist; `HandOverTrustRegistry.s.sol`'s calls and refusals, `TrustRegistryCalls.s.sol`'s call check |
+| `AttestorAppBinding.t.sol` | 11 | attestor app-instance binding on the TrustRegistry: owner-only, recycled app / changed owner / failing or malformed registry deny, one-way instance mode, input checks; AgenticID's mint and URI gates and forwarded reads follow the registry, and its retired trust slots are never written |
 | `TwoStepOwnership.t.sol` | 6 | AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry: propose leaves the owner in place, only the pending owner accepts, rights move on accept; re-proposal replaces, `address(0)` cancels |
 | `Upgradeable.t.sol` | 9 | Timelock-upgraded beacon (non-Timelock rejected / before-delay rejected / after-delay succeeds + state retained) + pauser role (non-pauser rejected / pause blocks write paths / view still works / unpause / setPauser rotation) |
 | `CanonicalBinding.t.sol` | 10 | canonical custody (token held by contract, survives local transfer) / global agentId counter / URI + metadata canonical visibility / agentWallet cleared at mint / agentId-0 sealId sentinel / clone registers a new canonical id / metadata + wallet views revert for a third-party canonical agent (FIND-14) |
 | `UpgradeReputation.t.sol` | 2 | reputation beacon owned by Timelock + feedback storage survives beacon upgrade |
-| `UpgradeVerifiedFeedback.t.sol` | 5 | VerifiedFeedbackRegistry 1.1.0 → 1.2.0 through the Timelock (pre-upgrade impl = frozen 1.1.0 source in `test/mocks/`): marks / audit data / endpoints / config / nonces survive; legacy-format proofs rejected after the cut, registry-bound accepted; owner preserved and two-step afterwards; a pre-upgrade out-of-range mark is skipped by summaries instead of making them revert |
-| `UpgradeGovernance.t.sol` | 7 | AgenticID 1.1.0 → 1.3.0 and TEEDataVerifier 1.1.0 → 1.2.0 from frozen 1.1.0 sources (and their frozen bases in `test/mocks/v1_1_0/`) through a 1-day Timelock (mainnet's delay, owner-proposer, open execution): seal bindings / iData / URI / metadata / allowlists / verifier / oracle / nonces survive; two-step ownership, zero-address guards and seal-address uniqueness live after the upgrade; 1.1.0-format transfer proofs rejected, token-bound ones accepted; either impl upgraded alone breaks non-seal transfers; a pre-upgrade seal is refused by CloneGate as its own source's clone seal |
+| `UpgradeVerifiedFeedback.t.sol` | 5 | VerifiedFeedbackRegistry 1.1.0 → 1.3.0 through the Timelock (pre-upgrade impl = frozen 1.1.0 source in `test/mocks/`): marks / audit data / endpoints / config / nonces survive, and old marks read zero sealed / harness hashes; legacy-format proofs rejected after the cut, registry-bound accepted; owner preserved and two-step afterwards; a pre-upgrade out-of-range mark is skipped by summaries instead of making them revert |
+| `UpgradeVerifiedFeedbackFrom1_2_0.t.sol` | 3 | VerifiedFeedbackRegistry 1.2.0 → 1.3.0, the upgrade test and mainnet take (pre-upgrade impl = frozen 1.2.0 source, `test/mocks/VerifiedFeedbackRegistryV1_2_0.sol`): every stored word of the namespace's fixed fields, the owner slots and each mark's record is unchanged and the appended layer hashes read zero; a v1 proof signed before the upgrade still verifies after it, and v2 proofs verify from then on |
+| `UpgradeGovernance.t.sol` | 7 | AgenticID 1.1.0 → 1.4.0 and TEEDataVerifier 1.1.0 → 1.2.0 from frozen 1.1.0 sources (and their frozen bases in `test/mocks/v1_1_0/`) through a 1-day Timelock (mainnet's delay, owner-proposer, open execution), the allowlists copied into a TrustRegistry first: seal bindings / iData / URI / metadata / allowlists / verifier / oracle / nonces survive; two-step ownership, zero-address guards and seal-address uniqueness live after the upgrade; 1.1.0-format transfer proofs rejected, token-bound ones accepted; either impl upgraded alone breaks non-seal transfers; a pre-upgrade seal is refused by CloneGate as its own source's clone seal |
+| `UpgradeAgenticID.t.sol` | 12 | AgenticID 1.3.0 → 1.4.0 from the frozen 1.3.0 source (`test/mocks/AgenticIDV1_3_0.sol`, its linked library and interface in `test/mocks/v1_3_0/`) in test / dev / mainnet's shape: `script/TrustMigration.sol` fed 1.3.0's events copies only what is trusted now (bound attestor and CloneGate, the instance mode, listed image hashes in order; not a removed, an inert or a stale-bound attestor); its check catches a gap, an image hash beyond the kept set and — with the registry's own logs among the candidates — an attestor trusted only there; `IMAGES` keeps only the named hashes and refuses one AgenticID does not list; `ScheduleUpgrade.s.sol` refuses an implementation reading another registry, a registry without code or under another owner; the upgrade switches every trust read at once, keeps agents and seals, and new trust changes land in the registry only; after it the check proves the kept hashes; an empty registry trusts nothing; rolling back to 1.3.0 restores its own lists |
 | `CloneGate.t.sol` | 21 | policy-mode cloning satellite: setCloneAuthorizer gating / cloneFrom happy path + every revert (attestor, no/denying/reverting authorizer, arity, sealId, reused source seal, paused) / owner-at-set invalidation on transfer / lineage |
 | `StandardCloneAuthorizer.t.sol` | 10 | stock per-buyer clone policy: seller-only grant/revoke, per-agent scoping, grant dies on transfer and revives on re-acquire, clone through the gate |
 | `Eip170Size.t.sol` | 1 | every deployed impl fits the EIP-170 runtime-size limit |
 | `InitializerGuard.t.sol` | 3 | Neither proxy nor impl can re-init |
-| `StorageLayout.t.sol` | 3 | every ERC-7201 slot constant matches its namespace derivation (+ the intentional BaseDataVerifier literal); OZ's `Ownable2Step` slot pinned and disjoint from all of ours |
+| `StorageLayout.t.sol` | 3 | every ERC-7201 slot constant (TrustRegistry's included) matches its namespace derivation (+ the intentional BaseDataVerifier literal); OZ's `Ownable2Step` slot pinned and disjoint from all of ours |
 | `DeployScript.t.sol` | 8 | deploy-script governance (`script/MainnetGovernance.sol`), library-level and end to end. `Deploy.s.sol`: on chain 16661 Timelock `minDelay` defaults to / requires ≥ 86400, no external Timelock admin, and unusable or ambiguous PROPOSERS / EXECUTORS (empty, a `0x0` proposer, OWNER not a proposer, `0x0` mixed into named executors, named executors without OWNER) revert before broadcast; elsewhere delay 0, OWNER admin, role sets unchecked. `DeployVerifiedFeedback.s.sol` / `DeployCloneGate.s.sol`: on chain 16661 refuse a weak or code-less `TIMELOCK`, accept a ≥ 1-day one; any elsewhere |
 | `ERC165.t.sol` | 2 | 9 declared interfaces accepted, `0xffffffff` / unknown rejected |
 | `CanonicalForkIntegration.t.sol` | 2 | self-mint + verified-feedback attest against the live canonical registries (runs only with `FORK_RPC` set; skips otherwise) |
@@ -645,6 +704,6 @@ inherits this base and adds the business assertions.
 ## 10. Further reading
 
 - **[`DEPLOYMENT.md`](DEPLOYMENT.md)** — full deploy / upgrade / Etherscan-verify
-  runbook (15 contracts in a single deploy, Timelock two-stage upgrade, how
+  runbook (18 contracts in a single deploy, Timelock two-stage upgrade, how
   `verify.sh` works, 0g Galileo testnet and 0G mainnet reference addresses +
   per-environment governance).

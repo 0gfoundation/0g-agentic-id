@@ -9,10 +9,11 @@
 //!
 //! Canonical format:
 //!   "StatusReport.v2:0x<seal>:<status>:<detail>:<status token SHA-256>:<applied settings SHA-256>"
+//!   "StatusReport.v3:…same fields…:<credential requests pending>"
 //!
-//! The `"StatusReport.v2:"` prefix is the domain tag — signatures for this
+//! The `"StatusReport.v2:"` / `"StatusReport.v3:"` prefix is the domain tag — signatures for this
 //! action cannot be replayed as a `/provision` boot claim
-//! (`"ProvisionBoot.v1:"`) or any future action with a distinct prefix.
+//! (`"ProvisionBoot.v1:"` / `"ProvisionBoot.v2:"`) or any future action with a distinct prefix.
 
 use crate::traits::CryptoModule;
 use crate::types::{ContainerReportStatus, StatusReport};
@@ -44,7 +45,7 @@ pub fn settings_digest(document: &[u8]) -> B256 {
     B256::from(<[u8; 32]>::from(Sha256::digest(document)))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootAuthorization {
     pub generation: i64,
     pub ticket_hash: [u8; 32],
@@ -59,6 +60,10 @@ pub struct BootAuthorization {
     /// attestor's create under the current ticket. None until that sandbox
     /// is persisted, or when the response carried no certificate.
     pub container_pubkey: Option<Vec<u8>>,
+    /// Delegation does not change the NFT owner above: the sandbox payer
+    /// and the exact owner-signed authorization revision are separate.
+    pub operator: Option<Address>,
+    pub operator_version: Option<i64>,
 }
 
 /// Why a resume (`/start` with `start`) is refused: the deployment's sandbox
@@ -129,6 +134,7 @@ pub fn verify_boot_claim(
         &claim.ticket_hash,
         claim.boot_id,
         claim.started_at,
+        req.sealed_hash,
     );
     let signer = crypto.recover_signer(
         &keccak256(message.as_bytes()).0,
@@ -151,20 +157,37 @@ pub fn pubkey_address(pubkey: &[u8]) -> anyhow::Result<Address> {
     ))
 }
 
+/// What the container signs for a boot. Under the layered flow it names the
+/// sealed program the loader started:
+/// `ProvisionBoot.v2:0x<seal>:<generation>:<sha256(ticket)>:<boot id>:<started at>:<sealed hash>`
+/// (sealed/LAYERS.md §10); without a sealed hash it is the old images'
+/// ProvisionBoot.v1 (`legacy`).
 pub fn boot_signing_message(
     seal: B256,
     generation: i64,
     ticket_hash: &[u8; 32],
     boot_id: B256,
     started_at: i64,
+    // LEGACY(v1): None for an image without the loader.
+    sealed_hash: Option<B256>,
 ) -> String {
+    let Some(sealed) = sealed_hash else {
+        return crate::legacy::boot_signing_message_v1(
+            seal,
+            generation,
+            ticket_hash,
+            boot_id,
+            started_at,
+        );
+    };
     format!(
-        "ProvisionBoot.v1:0x{}:{}:{}:{}:{}",
+        "ProvisionBoot.v2:0x{}:{}:{}:{}:{}:{}",
         hex::encode(seal),
         generation,
         hex::encode(ticket_hash),
         hex::encode(boot_id),
-        started_at
+        started_at,
+        hex::encode(sealed)
     )
 }
 
@@ -175,8 +198,18 @@ pub fn binding_hash(token: &str) -> [u8; 32] {
 /// Reconstruct the exact bytes the container signed. The container side
 /// MUST produce the same format when signing.
 pub fn canonical_message(report: &StatusReport) -> String {
+    // v3 appends the pending credential-request count; a container that
+    // reports none still signs v2.
+    let tag = match report.credentials_pending {
+        Some(_) => "StatusReport.v3",
+        None => "StatusReport.v2",
+    };
+    let pending = report
+        .credentials_pending
+        .map(|n| format!(":{n}"))
+        .unwrap_or_default();
     format!(
-        "StatusReport.v2:0x{}:{}:{}:{}:{}",
+        "{tag}:0x{}:{}:{}:{}:{}{pending}",
         hex::encode(report.seal_id),
         status_slug(report.status),
         report.error_detail.as_deref().unwrap_or(""),
@@ -244,6 +277,7 @@ mod tests {
             error_detail,
             status_binding: "11".repeat(32),
             settings_digest: None,
+            credentials_pending: None,
             agent_seal_signature: Bytes::new(),
         };
         let canonical = canonical_message(&report);
@@ -262,6 +296,7 @@ mod tests {
             error_detail: None,
             status_binding: "token".into(),
             settings_digest: Some(B256::repeat_byte(0x12)),
+            credentials_pending: None,
             agent_seal_signature: Bytes::new(),
         };
         assert_eq!(
@@ -283,6 +318,7 @@ mod tests {
             error_detail: Some("oom".to_string()),
             status_binding: "token".into(),
             settings_digest: None,
+            credentials_pending: None,
             agent_seal_signature: Bytes::new(),
         };
         let msg = canonical_message(&report);
@@ -404,13 +440,15 @@ mod tests {
             .parse()
             .unwrap();
         let claim = claimed_boot(&req).unwrap();
+        assert!(req.sealed_hash.is_none());
         assert_eq!(
             boot_signing_message(
                 req.seal_id,
                 claim.generation,
                 &claim.ticket_hash,
                 claim.boot_id,
-                claim.started_at
+                claim.started_at,
+                None
             ),
             fixture["canonical"]
         );
@@ -476,7 +514,8 @@ mod tests {
                 claim.generation,
                 &claim.ticket_hash,
                 claim.boot_id,
-                claim.started_at
+                claim.started_at,
+                req.sealed_hash
             ),
             fixture["canonical"]
         );
@@ -489,5 +528,43 @@ mod tests {
                 .parse::<Address>()
                 .unwrap()
         );
+    }
+
+    /// The layered claim (sealed/LAYERS.md §10), from the fixture sealed's
+    /// own tests sign: v1's fields, then the sealed hash, under the v2 tag.
+    /// The hash is part of what is signed: another hash, or none, fails.
+    #[test]
+    fn layered_boot_fixture_signs_the_sealed_hash() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../sealed/internal/inference/testdata/boot-v2.json"
+        ))
+        .unwrap();
+        let req: crate::ProvisionRequest =
+            serde_json::from_value(fixture["request"].clone()).unwrap();
+        let pubkey: Bytes = fixture["recorded_container_pubkey"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let claim = claimed_boot(&req).unwrap();
+        assert_eq!(req.sealed_hash, Some(B256::repeat_byte(0x55)));
+        assert_eq!(
+            boot_signing_message(
+                req.seal_id,
+                claim.generation,
+                &claim.ticket_hash,
+                claim.boot_id,
+                claim.started_at,
+                req.sealed_hash
+            ),
+            fixture["canonical"]
+        );
+        verify_boot_claim(&req, &claim, &pubkey, crypto().as_ref()).unwrap();
+        let mut other = req.clone();
+        other.sealed_hash = Some(B256::repeat_byte(0x56));
+        assert!(verify_boot_claim(&other, &claim, &pubkey, crypto().as_ref()).is_err());
+        let mut stripped = req.clone();
+        stripped.sealed_hash = None;
+        assert!(verify_boot_claim(&stripped, &claim, &pubkey, crypto().as_ref()).is_err());
     }
 }

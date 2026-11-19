@@ -10,14 +10,12 @@
 //! `getAgentIdBySealId(seal_id)` view; if a non-zero id comes back, the
 //! prior tx actually landed and we just record it.
 //!
-//! Authorisation: two tiers, matching what the retry can do. When a
-//! create envelope is attached (the worker may escalate ResumeDeploy →
-//! SandboxRecreate, i.e. a fresh container), the envelope must be signed
-//! by the current on-chain owner (`authorize_lifecycle`). Without an
-//! envelope the worker only performs idempotent, attestor-authored
-//! on-chain writes (mint resubmit, setAgentURI) which require the
-//! attestor's own EOA — so the cheaper `req.owner == deployment.owner`
-//! field check suffices for that path.
+//! Authorisation: the request must carry a create envelope signed by the
+//! current on-chain owner (`authorize_lifecycle`); operators are refused.
+//! The worker may escalate ResumeDeploy → SandboxRecreate (a fresh
+//! container) with that envelope, and every retry spends attestor gas or
+//! work, so a request without one is a `401`. The body's `owner` field is
+//! not used for authorisation.
 
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
@@ -41,33 +39,25 @@ pub async fn handle(
         .get(req.seal_id)
         .await?
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
-    // When a create envelope is attached, the worker may escalate
-    // ResumeDeploy → SandboxRecreate (a fresh container), so that envelope
-    // must be signed by the current on-chain owner — see {lifecycle_auth}.
-    // Without an envelope the worker only performs idempotent,
-    // attestor-authored on-chain writes (mint resubmit, setAgentURI) — no
-    // container is created and no seal is handed out — so the cheaper owner
-    // field check is retained for that path.
-    match &req.sandbox_envelope {
-        Some(env) => {
-            authorize_lifecycle(&state, &d, env).await?;
-            // The worker may create a container from it: only the inference
-            // key may ride the owner's env, refused here rather than at the
-            // sandbox create.
-            let msg_bytes = base64::engine::general_purpose::STANDARD
-                .decode(env.signed_message_b64.as_bytes())
-                .map_err(|e| ApiError::bad_request(format!("envelope base64: {e}")))?;
-            let canonical: CanonicalSignedMessage = serde_json::from_slice(&msg_bytes)
-                .map_err(|e| ApiError::bad_request(format!("envelope JSON: {e}")))?;
-            check_owner_env(&canonical.payload)
-                .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
-        }
-        None => {
-            if d.owner != req.owner {
-                return Err(ApiError::unauthorized("owner mismatch"));
-            }
-        }
-    }
+    // The worker may escalate ResumeDeploy → SandboxRecreate (a fresh
+    // container) with this envelope, so it must be signed by the current
+    // on-chain owner — see {lifecycle_auth}. The unsigned `owner` field is
+    // never trusted.
+    let Some(env) = &req.sandbox_envelope else {
+        return Err(ApiError::unauthorized(
+            "retry needs a create envelope signed by the agent's owner",
+        ));
+    };
+    authorize_lifecycle(&state, &d, env).await?;
+    // The worker may create a container from it: only the inference key may
+    // ride the owner's env, refused here rather than at the sandbox create.
+    let msg_bytes = base64::engine::general_purpose::STANDARD
+        .decode(env.signed_message_b64.as_bytes())
+        .map_err(|e| ApiError::bad_request(format!("envelope base64: {e}")))?;
+    let canonical: CanonicalSignedMessage = serde_json::from_slice(&msg_bytes)
+        .map_err(|e| ApiError::bad_request(format!("envelope JSON: {e}")))?;
+    check_owner_env(&canonical.payload)
+        .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
 
     // Carry the resume context (ciphertext/root/sealed_key) in the job. It's
     // derived from a random dataKey and can't be recomputed, so any track that
@@ -168,6 +158,7 @@ mod tests {
 
             cli_latest: String::new(),
             cli_notes: String::new(),
+            releases_file: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             frameworks: vec![attestor_shared::Framework {
@@ -210,6 +201,8 @@ mod tests {
         // create envelope authorizes the escalation path). agent_id is None
         // here, so the gate falls back to this deployment owner.
         let owner = attestor_shared::mocks::signed_envelope(&OWNER_PRIV, "create").wallet_address;
+        // Once minted, the gate reads the live owner: the same wallet.
+        chain.set_owner_of(owner);
         let seal_id = B256::repeat_byte(0xbb);
         let now = Utc::now();
         let d = Deployment {
@@ -262,6 +255,8 @@ mod tests {
             chain,
             sandbox: Arc::new(attestor_shared::mocks::MockSandbox),
             deployments: deployments.clone(),
+            credentials: attestor_shared::credentials_repo::in_memory(),
+            notify: None,
             idempotency,
             jobs: jobs.clone(),
             events,
@@ -275,14 +270,22 @@ mod tests {
         }
     }
 
+    /// A retry carrying the owner's signed create envelope.
+    fn owner_retry(s: &Setup) -> RetryRequest {
+        RetryRequest {
+            seal_id: s.seal_id,
+            owner: s.owner,
+            sandbox_envelope: Some(attestor_shared::mocks::signed_envelope(
+                &OWNER_PRIV,
+                "create",
+            )),
+        }
+    }
+
     #[tokio::test]
     async fn happy_path_enqueues_resume_deploy() {
         let s = make_setup();
-        let req = RetryRequest {
-            seal_id: s.seal_id,
-            owner: s.owner,
-            sandbox_envelope: None,
-        };
+        let req = owner_retry(&s);
         let (status, _) = handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("must accept");
@@ -304,11 +307,7 @@ mod tests {
             let mut g = s.deployments.by_seal.lock().unwrap();
             g.get_mut(&s.seal_id).unwrap().i_data = vec![test_artifact()];
         }
-        let req = RetryRequest {
-            seal_id: s.seal_id,
-            owner: s.owner,
-            sandbox_envelope: None,
-        };
+        let req = owner_retry(&s);
         handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("must accept");
@@ -335,11 +334,7 @@ mod tests {
             d.i_data = vec![test_artifact()];
             d.agent_id = Some(U256::from(9u64)); // minted, but storage still Failed
         }
-        let req = RetryRequest {
-            seal_id: s.seal_id,
-            owner: s.owner,
-            sandbox_envelope: None,
-        };
+        let req = owner_retry(&s);
         handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("must accept");
@@ -369,11 +364,7 @@ mod tests {
             d.agent_id = Some(U256::from(9u64)); // minted
             d.storage_stage = StageStatus::Confirmed { at: Utc::now() };
         }
-        let req = RetryRequest {
-            seal_id: s.seal_id,
-            owner: s.owner,
-            sandbox_envelope: None,
-        };
+        let req = owner_retry(&s);
         handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("must accept");
@@ -463,26 +454,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_mismatch_is_401_and_no_job_enqueued() {
-        // Critical authorization test. A drive-by owner field on /retry
-        // would otherwise let any address poke "soft retry" against any
-        // other address's deployment. That's not catastrophic (idempotent
-        // mint resubmit, OSS overwrite), but it leaks "this seal_id
-        // exists" signal and burns attestor gas.
+    async fn unsigned_retry_is_401_and_no_job_enqueued() {
+        // Every retry spends attestor gas or work, so it needs the owner's
+        // signature. An unsigned body naming the real owner — or anyone
+        // else — is refused before any job is queued.
         let s = make_setup();
-        let req = RetryRequest {
-            seal_id: s.seal_id,
-            owner: Address::from([0xee; 20]),
-            sandbox_envelope: None,
-        };
-        let err = handle(axum::extract::State(s.state.clone()), Json(req))
-            .await
-            .err()
-            .expect("must reject");
-        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        for owner in [s.owner, Address::from([0xee; 20])] {
+            let req = RetryRequest {
+                seal_id: s.seal_id,
+                owner,
+                sandbox_envelope: None,
+            };
+            let err = handle(axum::extract::State(s.state.clone()), Json(req))
+                .await
+                .err()
+                .expect("unsigned retry must be refused");
+            assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+            assert!(
+                err.message.contains("signed by the agent's owner"),
+                "{}",
+                err.message
+            );
+        }
         assert!(
             s.jobs.submitted.lock().unwrap().is_empty(),
-            "owner-mismatch must not enqueue a job"
+            "an unsigned retry must not enqueue a job"
         );
     }
 
@@ -493,11 +489,7 @@ mod tests {
         // would race with whatever the worker is doing.
         let s = make_setup();
         let before = s.deployments.get(s.seal_id).await.unwrap().unwrap();
-        let req = RetryRequest {
-            seal_id: s.seal_id,
-            owner: s.owner,
-            sandbox_envelope: None,
-        };
+        let req = owner_retry(&s);
         let _ = handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("must accept");

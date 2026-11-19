@@ -277,8 +277,8 @@ func refuseSendsAfter(ctx context.Context, p *providers.MiddlewarableProvider) {
 // there included, which configureLogger turns into one) is recovered by
 // runBounded and returned as an error. A panic in a goroutine the SDK
 // starts itself, which the SDK does not recover, or memory exhausted
-// during an upload, ends sealed (PID 1) and with it the container and the
-// agent. That is the trade accepted to keep the key in this process
+// during an upload, ends sealed and with it the container and the agent
+// (in the 0g-harness image the loader exits with sealed). That is the trade accepted to keep the key in this process
 // (QUIRKS.md).
 //
 // Errors read "0g-storage upload: <cause>" on a single line, so the summary
@@ -410,7 +410,8 @@ func runBounded(ctx context.Context, f func(context.Context) ([]common.Hash, err
 // query failed -- the function fills that slot itself and returns, and the
 // goroutine blocks on its send for good (contract/contract.go:276 at the
 // pinned version), keeping what it references. The CLI exited after each
-// upload; sealed is PID 1 and keeps every such goroutine. A failed upload is
+// upload; sealed runs for the container's life and keeps every such
+// goroutine. A failed upload is
 // tried again on every drift tick, with up to three submissions each time
 // (indexer.Client.SplitableUpload), so nothing else bounds them.
 //

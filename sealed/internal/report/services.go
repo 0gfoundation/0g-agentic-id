@@ -37,7 +37,25 @@ type Service struct {
 	// signer attribution AND body binding. That is the trust a random MCP
 	// server cannot offer.
 	Transport string `json:"transport,omitempty"`
+	// Kind says who answers on the path, and so what a caller trusts:
+	// "runtime" (sealed itself, /hello), "agent" (the agent's own backend,
+	// which sealed fronts and signs: the agent itself answers, with its
+	// memory, tools and credentials) or "hosted" (a program the agent
+	// published, run by sealed in isolation from the agent: immutable,
+	// auditable code whose data the agent cannot read).
+	Kind string `json:"kind,omitempty"`
+	// Version and Release, for a hosted program only: the release hash
+	// callers pin, and the path that returns that release for audit.
+	Version string `json:"version,omitempty"`
+	Release string `json:"release,omitempty"`
 }
+
+// Kinds of Service (Service.Kind).
+const (
+	ServiceKindRuntime = "runtime"
+	ServiceKindAgent   = "agent"
+	ServiceKindHosted  = "hosted"
+)
 
 // Route is one framework-declared path prefix, as surfaced in the `routes`
 // array of the signed /hello self-introduction. Distinct from Service: a

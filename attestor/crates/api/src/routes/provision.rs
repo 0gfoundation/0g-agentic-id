@@ -11,6 +11,13 @@
 //! and are re-checked against the current provider instance and the image
 //! allowlist. Every request also carries a boot claim bound to the
 //! owner-authorized ticket and generation.
+//!
+//! Under the layered runtime (sealed/LAYERS.md §10) discovery answers
+//! `layered` once the chain has a trust registry; a container whose loader
+//! started sealed then names that program's hash in the claim
+//! (ProvisionBoot.v2), and gets the key only while the trust registry's
+//! sealed list holds it. A claim without a sealed hash is an image without
+//! the loader (`attestor_shared::legacy`).
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -47,10 +54,26 @@ pub async fn challenge(
         .get(query.seal_id)
         .await?
         .is_some_and(|d| d.container_record.is_some());
+    // An unreadable chain is a retry, not "no": a loader image told `false`
+    // would claim without its sealed hash. LEGACY(pre-1.4.0): `false` only
+    // for a chain whose AgenticID names no trust registry.
+    let layered = trust_registry(&state).await?.is_some();
     Ok(Json(serde_json::json!({
         "generation": auth.generation,
         "certificate_required": !recorded,
+        "layered": layered,
     })))
+}
+
+/// The chain's trust registry; None (LEGACY(pre-1.4.0)) only when AgenticID
+/// refuses the call, as one before 1.4.0 does. A chain read that fails for
+/// any other reason is a 503, which sealed retries.
+async fn trust_registry(state: &AppState) -> ApiResult<Option<alloy::primitives::Address>> {
+    state
+        .chain
+        .trust_registry()
+        .await
+        .map_err(|e| ApiError::unavailable(format!("trust registry lookup failed: {e}")))
 }
 
 /// Which container this request is for, decided before any key is handed out.
@@ -186,6 +209,19 @@ async fn provision(
             ));
         }
     }
+    if auth.operator.is_some() {
+        attestor_shared::auth::operator::validate_boot_operator(
+            state.chain.as_ref(),
+            state.crypto.as_ref(),
+            state.deployments.as_ref(),
+            state.cfg.chain_id,
+            state.cfg.agentic_id_addr,
+            &d,
+            &auth,
+        )
+        .await
+        .map_err(super::lifecycle_auth::boot_authorization_error)?;
+    }
     *authorized = Some(auth.generation);
 
     let boot = match (certificate, d.container_record.clone()) {
@@ -277,6 +313,50 @@ async fn provision(
     status::verify_boot_claim(&req, &claim, &record.pubkey, state.crypto.as_ref()).map_err(
         |_| ApiError::unauthorized("container signature does not match the container key"),
     )?;
+    // The layered flow: the sealed program the loader started, which the
+    // container signed into its claim, must be on the trust registry's sealed
+    // list. A claim without one comes from an image without the loader.
+    if let Some(sealed) = req.sealed_hash {
+        // LEGACY(pre-1.4.0): a chain without a trust registry runs no
+        // layered flow, so no claim on it names a sealed program.
+        let registry = trust_registry(state).await?.ok_or_else(|| {
+            ApiError::bad_request(
+                "sealed_hash reported, but the chain has no trust registry: this attestor runs no layered flow",
+            )
+        })?;
+        let listed = state
+            .chain
+            .is_listed(
+                registry,
+                attestor_shared::chain::trust_kind("sealed"),
+                sealed,
+            )
+            .await
+            .map_err(|e| ApiError::unavailable(format!("sealed list lookup failed: {e}")))?;
+        if !listed {
+            // Not a verdict on the agent: sealed takes the 403, switches to
+            // the newest listed version, and claims again under this
+            // generation. The reason goes on the row; the agent is not taken
+            // offline for it (handle() does that for refused boots it still
+            // sees as authorized).
+            let reason = format!(
+                "sealed 0x{} is not on the trust registry's sealed list; the container moves to the newest listed version",
+                hex::encode(sealed)
+            );
+            if let Err(e) = state
+                .deployments
+                .record_provision_error(req.seal_id, reason.clone(), false, Some(claim.generation))
+                .await
+            {
+                tracing::warn!(seal_id = ?req.seal_id, error = %e, "recording the sealed refusal failed");
+            }
+            *authorized = None;
+            return Err(ApiError::forbidden(reason));
+        }
+    } else {
+        // LEGACY(v1): such an image's sealed is the one its image hash covers.
+        attestor_shared::legacy::sealed_covered_by_image();
+    }
     // A recorded container stays trusted only while the provider instance
     // that certified it is the one discovery authenticates now, and its
     // image is still allowed.
@@ -288,7 +368,7 @@ async fn provision(
         }
         if !allowed_image(state, record.image_hash).await? {
             return Err(ApiError::unauthorized(
-                "recorded image_hash not in validFrameworkHashes; reset required",
+                "recorded image_hash not in validFrameworkHashes: the image was retired; reset required",
             ));
         }
     }
@@ -334,6 +414,23 @@ async fn provision(
         None => None,
     };
 
+    // The owner's credential set, sealed to the same key, with the values the
+    // container wrote back merged in. Only a set signed for the current
+    // ownership is served. Like settings, a failure here never stops a boot.
+    let encrypted_credentials = credentials_for_boot(state, req.seal_id)
+        .await
+        .and_then(|bytes| match state.crypto.ecies_encrypt(&bytes, &record.pubkey) {
+            Ok(ct) => Some(alloy::primitives::Bytes::from(ct)),
+            Err(e) => {
+                tracing::warn!(
+                    seal_id = ?req.seal_id,
+                    error = %e,
+                    "encrypt credentials failed; provisioning without them"
+                );
+                None
+            }
+        });
+
     // A fresh opaque status token per boot; only its hash is stored, beside
     // the settings actually served.
     let token = status::new_status_token();
@@ -371,8 +468,32 @@ async fn provision(
     Ok(ProvisionResponse {
         encrypted_agent_seal_priv: encrypted.into(),
         encrypted_settings,
+        encrypted_credentials,
         encrypted_status_binding: encrypted_status_binding.into(),
     })
+}
+
+/// The credential set to hand this boot: `{"document": …, "owner_epoch": n}`,
+/// or None when there is none for the current ownership.
+async fn credentials_for_boot(state: &AppState, seal_id: SealId) -> Option<Vec<u8>> {
+    let epoch = match state.credentials.epoch(seal_id).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(seal_id = ?seal_id, error = %e, "credential epoch lookup failed");
+            return None;
+        }
+    };
+    let stored = match state.credentials.get(seal_id).await {
+        Ok(Some(c)) if c.owner_epoch == epoch => c,
+        Ok(_) => return None,
+        Err(e) => {
+            tracing::warn!(seal_id = ?seal_id, error = %e, "credential lookup failed");
+            return None;
+        }
+    };
+    let mut document = stored.document;
+    document["writebacks"] = stored.writebacks;
+    serde_json::to_vec(&serde_json::json!({"document": document, "owner_epoch": epoch})).ok()
 }
 
 /// `validFrameworkHashes` membership. A chain error (wrong contract, RPC
@@ -528,6 +649,7 @@ pub(crate) mod tests {
 
             cli_latest: String::new(),
             cli_notes: String::new(),
+            releases_file: String::new(),
             frameworks: vec![attestor_shared::Framework {
                 name: "openclaw".into(),
                 image: None,
@@ -635,6 +757,7 @@ pub(crate) mod tests {
                 .started_at
                 .max(Utc::now().timestamp_nanos_opt().unwrap())
                 + 1,
+            sealed_hash: None,
             container_signature: Default::default(),
         };
         sign_claim(&mut req, private);
@@ -648,6 +771,7 @@ pub(crate) mod tests {
             &binding_hash(&req.boot_ticket),
             req.boot_id,
             req.boot_started_at,
+            req.sealed_hash,
         );
         req.container_signature = PrivateKeySigner::from_bytes(&private.into())
             .unwrap()
@@ -738,6 +862,8 @@ pub(crate) mod tests {
             chain: Arc::new(MockChain::new()),
             sandbox: Arc::new(ConfigurableSandbox::new()),
             deployments: repo.clone(),
+            credentials: attestor_shared::credentials_repo::in_memory(),
+            notify: None,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             jobs: Arc::new(InMemoryJobQueue::new()),
             events: Arc::new(InMemoryEventBus::new()),
@@ -780,6 +906,181 @@ pub(crate) mod tests {
     }
 
     // ── v3 certificate: first boot, later boots ───────────────────────────
+
+    async fn write_runtime_operator(
+        state: &AppState,
+        seal: B256,
+        owner: &PrivateKeySigner,
+        operator: Option<Address>,
+        base_version: i64,
+    ) {
+        use base64::Engine;
+        let checkpoint = if operator.is_some() {
+            Some(state.chain.operator_checkpoint().await.unwrap())
+        } else {
+            None
+        };
+        let canonical = serde_json::json!({
+            "domain": "AgenticID.Operator.v1",
+            "chain_id": state.cfg.chain_id,
+            "contract": state.cfg.agentic_id_addr,
+            "seal_id": seal,
+            "owner": owner.address(),
+            "operator": operator,
+            "base_version": base_version,
+            "allow_recreate": false,
+            "expires_at": 0,
+            "issued_at": Utc::now().timestamp(),
+            "checkpoint": checkpoint,
+        });
+        let bytes = serde_json::to_vec(&canonical).unwrap();
+        let signature = owner
+            .sign_hash_sync(&B256::from(attestor_shared::sandbox::eip191_digest(&bytes)))
+            .unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "seal_id": seal,
+            "signed_message_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            "signature": format!("0x{}", hex::encode(signature.as_bytes())),
+        }))
+        .unwrap();
+        super::super::operator::handle_set(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+    }
+
+    async fn operator_setup() -> (
+        AppState,
+        Arc<InMemoryDeploymentRepo>,
+        B256,
+        PrivateKeySigner,
+        Address,
+    ) {
+        let (mut state, repo, seal) = setup(None).await;
+        let owner = PrivateKeySigner::random();
+        let operator = PrivateKeySigner::random().address();
+        let chain = Arc::new(MockChain::new());
+        chain.set_owner_of(owner.address());
+        state.chain = chain;
+        let mut d = repo.get(seal).await.unwrap().unwrap();
+        d.owner = owner.address();
+        d.agent_id = Some(alloy::primitives::U256::from(7));
+        d.framework = Some("openclaw".into());
+        repo.seed(d);
+        write_runtime_operator(&state, seal, &owner, Some(operator), 0).await;
+        let generation = repo
+            .prepare_operator_boot(
+                seal,
+                Some(binding_hash(&ticket())),
+                owner.address(),
+                operator,
+                1,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(repo
+            .bind_runtime_sandbox(
+                seal,
+                "operator-runtime".into(),
+                generation,
+                Some(pubkey(CONTAINER_PRIV))
+            )
+            .await
+            .unwrap());
+        repo.set_container_stage(
+            seal,
+            StageStatus::Submitted {
+                tx_hash: None,
+                at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        (state, repo, seal, owner, operator)
+    }
+
+    #[tokio::test]
+    async fn delegated_v3_provision_keeps_nft_owner_and_container_proof() {
+        let (state, repo, seal, owner, operator) = operator_setup().await;
+        let auth = repo.boot_authorization(seal).await.unwrap().unwrap();
+        assert_eq!(auth.owner, Some(owner.address()));
+        assert_eq!(auth.operator, Some(operator));
+        assert_ne!(auth.owner, auth.operator);
+        let response = call(&state, first(&repo, seal).await).await.unwrap();
+        assert_eq!(
+            decrypt(&state, &response.encrypted_agent_seal_priv, CONTAINER_PRIV),
+            state.crypto.derive_agent_seal(seal).await.unwrap().priv_key,
+        );
+        assert!(repo
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .container_record
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn accepted_operator_boot_can_provision_after_historical_state_is_pruned() {
+        let (mut state, repo, seal, owner, _) = operator_setup().await;
+        let chain = Arc::new(MockChain::new());
+        chain.set_owner_of(owner.address());
+        chain.set_checkpoint_owner_failure(true);
+        chain.set_operator_checkpoint_failure(true);
+        state.chain = chain;
+        let response = call(&state, first(&repo, seal).await).await.unwrap();
+        assert_eq!(
+            decrypt(&state, &response.encrypted_agent_seal_priv, CONTAINER_PRIV),
+            state.crypto.derive_agent_seal(seal).await.unwrap().priv_key,
+        );
+        call(&state, later(&repo, seal).await).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoked_operator_cannot_renew_v3_provisioning() {
+        let (state, repo, seal, owner, _) = operator_setup().await;
+        call(&state, first(&repo, seal).await).await.unwrap();
+        let old_request = later(&repo, seal).await;
+        write_runtime_operator(&state, seal, &owner, None, 1).await;
+        assert_eq!(
+            call(&state, old_request).await.unwrap_err().status,
+            StatusCode::FORBIDDEN
+        );
+        assert!(repo.get(seal).await.unwrap().unwrap().sandbox_id.is_none());
+        assert!(
+            !repo
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_ticket_cannot_provision_a_different_v3_certified_container() {
+        let (state, repo, seal, _, _) = operator_setup().await;
+        let other_private = [0x59; 32]; // privacy-check: allow
+        let other = request(
+            &repo,
+            seal,
+            other_private,
+            Some(certificate(seal, other_private)),
+        )
+        .await;
+        let error = call(&state, other).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(error
+            .message
+            .contains("not for the sandbox this attestor created"));
+        assert!(repo
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .container_record
+            .is_none());
+    }
 
     #[tokio::test]
     async fn first_boot_records_the_certificate_and_later_boots_need_none() {
@@ -923,7 +1224,7 @@ pub(crate) mod tests {
         assert_eq!(error.status, StatusCode::UNAUTHORIZED);
         assert_eq!(
             error.message,
-            "recorded image_hash not in validFrameworkHashes; reset required"
+            "recorded image_hash not in validFrameworkHashes: the image was retired; reset required"
         );
     }
 
@@ -1458,6 +1759,181 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
         }
+    }
+
+    // ── Layered runtime: the sealed program in the claim ─────────────────
+
+    const TRUST: Address = Address::repeat_byte(0x77);
+    const SEALED: B256 = B256::repeat_byte(0x55);
+
+    /// A chain with a trust registry whose sealed list holds `listed`.
+    fn layered_chain(state: &mut AppState, listed: &[B256]) -> Arc<MockChain> {
+        let chain = Arc::new(MockChain::new());
+        chain.set_trust_registry(Some(TRUST));
+        for hash in listed {
+            chain.set_listed("sealed", *hash, true);
+        }
+        state.chain = chain.clone();
+        chain
+    }
+
+    async fn layered(state: &AppState, seal_id: B256) -> bool {
+        challenge(
+            State(state.clone()),
+            axum::extract::Query(BootQuery { seal_id }),
+        )
+        .await
+        .unwrap()
+        .0["layered"]
+            .as_bool()
+            .unwrap()
+    }
+
+    /// A first-boot request that names `sealed` and signs ProvisionBoot.v2.
+    async fn first_layered(
+        repo: &InMemoryDeploymentRepo,
+        seal: B256,
+        sealed: B256,
+    ) -> ProvisionRequest {
+        let mut req = first(repo, seal).await;
+        req.sealed_hash = Some(sealed);
+        sign_claim(&mut req, CONTAINER_PRIV);
+        req
+    }
+
+    #[tokio::test]
+    async fn discovery_declares_layered_once_the_chain_has_a_trust_registry() {
+        let (mut state, _, seal) = setup(None).await;
+        assert!(
+            !layered(&state, seal).await,
+            "AgenticID before 1.4.0: no trust registry"
+        );
+        layered_chain(&mut state, &[]);
+        assert!(layered(&state, seal).await);
+    }
+
+    #[tokio::test]
+    async fn a_listed_sealed_program_is_provisioned() {
+        let (mut state, repo, seal) = setup(None).await;
+        layered_chain(&mut state, &[SEALED]);
+        let resp = call(&state, first_layered(&repo, seal, SEALED).await)
+            .await
+            .unwrap();
+        let key = decrypt(&state, &resp.encrypted_agent_seal_priv, CONTAINER_PRIV);
+        assert_eq!(
+            key,
+            state.crypto.derive_agent_seal(seal).await.unwrap().priv_key
+        );
+    }
+
+    /// A version taken off the list gets no key; sealed then moves to the
+    /// newest listed one and claims again, so the agent is not taken offline.
+    #[tokio::test]
+    async fn an_unlisted_sealed_program_is_403_without_taking_the_agent_offline() {
+        let (mut state, repo, seal) = setup(None).await;
+        let events = Arc::new(InMemoryEventBus::new());
+        state.events = events.clone();
+        let chain = layered_chain(&mut state, &[]);
+        let before = repo.get(seal).await.unwrap().unwrap();
+        let error = call(&state, first_layered(&repo, seal, SEALED).await)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert!(
+            error
+                .message
+                .contains("not on the trust registry's sealed list"),
+            "{}",
+            error.message
+        );
+        let after = repo.get(seal).await.unwrap().unwrap();
+        assert_eq!(
+            after.last_provision_error.as_deref(),
+            Some(error.message.as_str())
+        );
+        assert_eq!(
+            serde_json::to_value(&after.container_stage).unwrap(),
+            serde_json::to_value(&before.container_stage).unwrap(),
+            "the agent stays where it was"
+        );
+        assert!(
+            events.events.lock().unwrap().is_empty(),
+            "no ContainerFailed"
+        );
+        // The newest listed version claims under the same generation and is served.
+        let newest = B256::repeat_byte(0x56);
+        chain.set_listed("sealed", newest, true);
+        call(&state, first_layered(&repo, seal, newest).await)
+            .await
+            .unwrap();
+        assert!(repo
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_provision_error
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn the_sealed_hash_is_part_of_the_signed_claim() {
+        let (mut state, repo, seal) = setup(None).await;
+        layered_chain(&mut state, &[SEALED, B256::repeat_byte(0x56)]);
+        // Signed for one hash, sent with another.
+        let mut req = first_layered(&repo, seal, SEALED).await;
+        req.sealed_hash = Some(B256::repeat_byte(0x56));
+        assert_eq!(
+            call(&state, req).await.unwrap_err().status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// An image without the loader claims with ProvisionBoot.v1 and no hash,
+    /// and is served on a layered attestor too (`attestor_shared::legacy`).
+    #[tokio::test]
+    async fn a_claim_without_a_sealed_hash_still_provisions_on_a_layered_attestor() {
+        let (mut state, repo, seal) = setup(None).await;
+        layered_chain(&mut state, &[]);
+        let req = first(&repo, seal).await;
+        assert!(req.sealed_hash.is_none());
+        call(&state, req).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sealed_hash_on_a_chain_without_a_trust_registry_is_400() {
+        let (state, repo, seal) = setup(None).await;
+        let error = call(&state, first_layered(&repo, seal, SEALED).await)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A trust-registry read the node answered with an error that is not a
+    /// revert says nothing about the chain: both sides are a 503, which
+    /// sealed retries — never `layered: false` (a loader image would claim
+    /// without its sealed hash) and never the final 400.
+    #[tokio::test]
+    async fn an_unreadable_trust_registry_is_503_at_discovery_and_at_the_claim() {
+        let (mut state, repo, seal) = setup(None).await;
+        let chain = layered_chain(&mut state, &[SEALED]);
+        chain.set_trust_registry_failure(true);
+        let error = challenge(
+            State(state.clone()),
+            axum::extract::Query(BootQuery { seal_id: seal }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        let error = call(&state, first_layered(&repo, seal, SEALED).await)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        // Readable again: the same claim is served.
+        chain.set_trust_registry_failure(false);
+        assert!(layered(&state, seal).await);
+        call(&state, first_layered(&repo, seal, SEALED).await)
+            .await
+            .unwrap();
     }
 
     // ── Settings delivery ─────────────────────────────────────────────────

@@ -12,7 +12,7 @@ import {VerifiedFeedbackRegistry} from "../src/VerifiedFeedbackRegistry.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 import {ServeProof} from "../src/interfaces/IAgenticIDReputationRegistry.sol";
-import {TaskReveal} from "../src/interfaces/IVerifiedFeedbackRegistry.sol";
+import {TaskReveal, VersionedServeProof} from "../src/interfaces/IVerifiedFeedbackRegistry.sol";
 
 /// @notice The batcher runs AS the client's EOA via an EIP-7702 delegation.
 ///         These tests exercise it with forge's 7702 cheatcodes
@@ -154,6 +154,81 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
         );
 
         assertEq(registry.getVerifiedEndpoint(agentId, clientWallet.addr, idx), "/hello", "endpoint recorded through the batch");
+    }
+
+    // ── Versioned proofs ──────────────────────────────────────────────────────
+
+    function _mkVersionedProof(uint256 agentId, bytes32 dataHash, uint256 signerPk)
+        internal view returns (VersionedServeProof memory p)
+    {
+        bytes32[] memory dataHashes = new bytes32[](1);
+        dataHashes[0] = dataHash;
+        p = VersionedServeProof({
+            version: 2,
+            agentId: agentId,
+            submitter: clientWallet.addr,
+            timestamp: block.timestamp,
+            deadline: block.timestamp + 1 hours,
+            taskHash: keccak256("task"),
+            dataHashes: dataHashes,
+            frameworkHash: FRAMEWORK_HASH,
+            sealedHash: keccak256("sealed"),
+            harnessHash: keccak256("harness"),
+            inferenceURL: "https://router.example/v1",
+            model: "model-x",
+            signature: ""
+        });
+        bytes32 inner = keccak256(abi.encode(
+            keccak256("AgentDNA.ServeProof.v2"),
+            block.chainid, address(agenticId), p.submitter, p.agentId, p.timestamp, p.deadline,
+            p.taskHash, keccak256(abi.encodePacked(p.dataHashes)), p.frameworkHash,
+            p.sealedHash, p.harnessHash, keccak256(bytes(p.inferenceURL)), keccak256(bytes(p.model))
+        ));
+        p.signature = _sign(signerPk, _eip191ValidatorHash(address(registry), inner));
+    }
+
+    function test_delegatedVersionedBatch_writesAndAttestsAtomically() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        VersionedServeProof memory proof = _mkVersionedProof(agentId, dataHash, sealWallet.privateKey);
+
+        vm.signAndAttachDelegation(address(batcher), clientWallet.privateKey);
+        vm.prank(clientWallet.addr);
+        uint64 idx = FeedbackBatcher(payable(clientWallet.addr)).giveFeedbackAndAttestVersioned(
+            agentId, 90, 0, "quality", "latency",
+            "https://api.example.com", "", bytes32(0), proof, _emptyTask()
+        );
+
+        assertEq(idx, 1, "entry landed at canonical index 1");
+        assertTrue(registry.isVerified(agentId, clientWallet.addr, 1), "verified mark set");
+        (bytes32 sealedHash, bytes32 harnessHash) = registry.getServeLayers(agentId, clientWallet.addr, 1);
+        assertEq(sealedHash, keccak256("sealed"), "sealed hash recorded through the batch");
+        assertEq(harnessHash, keccak256("harness"), "harness hash recorded through the batch");
+    }
+
+    function test_delegatedVersionedBatch_badProofRollsBackCanonicalWrite() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        (, uint256 fakePk) = makeAddrAndKey("not-the-seal");
+        VersionedServeProof memory proof = _mkVersionedProof(agentId, dataHash, fakePk);
+
+        vm.signAndAttachDelegation(address(batcher), clientWallet.privateKey);
+        vm.prank(clientWallet.addr);
+        vm.expectRevert();
+        FeedbackBatcher(payable(clientWallet.addr)).giveFeedbackAndAttestVersioned(
+            agentId, 90, 0, "quality", "latency",
+            "https://api.example.com", "", bytes32(0), proof, _emptyTask()
+        );
+        assertEq(canonicalRep.getLastIndex(agentId, clientWallet.addr), 0, "canonical write rolled back");
+    }
+
+    function test_versionedDirectCall_reverts() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        VersionedServeProof memory proof = _mkVersionedProof(agentId, dataHash, sealWallet.privateKey);
+        vm.prank(clientWallet.addr);
+        vm.expectRevert(BatcherNotSelf.selector);
+        batcher.giveFeedbackAndAttestVersioned(
+            agentId, 90, 0, "quality", "latency",
+            "https://api.example.com", "", bytes32(0), proof, _emptyTask()
+        );
     }
 
     // ── Atomicity: failed attest rolls back the canonical write ──────────────

@@ -101,6 +101,29 @@ the plain not-found path. If it still times out,
 the tx has most likely landed anyway — confirm by reading on-chain state
 (balance / index / etc.), don't trust the receipt alone.
 
+### Only a revert means "this contract has no such function"
+
+Code that tells an AgenticID before 1.4.0 (no `trustRegistry()`) from a
+failed read must look at the error itself. The node answers a call to a
+function the contract lacks with HTTP 200 and `{"code":3,"message":"execution
+reverted","data":"0x"}`, and other failures with HTTP 200 too ("header not
+found" is `-32000`), and the clients blur them:
+
+- alloy's `TransportError::as_error_resp()` is `Some` for every JSON-RPC
+  error object, not only a revert. The attestor (`chain.rs`
+  `is_execution_revert`) takes code 3, or a message saying "execution
+  reverted", as the revert; anything else is a 503, which sealed retries.
+- viem wraps a node's internal error (`-32603`) in a
+  `ContractFunctionRevertedError` as well. The SDK (`viemErrors.ts`
+  `isContractRevert`) takes only `ExecutionRevertedError` (code 3 /
+  "execution reverted") or `ContractFunctionZeroDataError` (no code at the
+  address) as the contract's answer; a `-32603` throws.
+
+Treating any node error as "no registry" would, on a passing RPC hiccup,
+send a loader image's sealed away without a claim (the earlier loader images,
+which carry a sealed of their own, would claim without its sealed hash), or
+refuse a claim that names one.
+
 ---
 
 ## Etherscan-compatible verifier (0G endpoint)
@@ -137,6 +160,29 @@ the compatibility package: installing the canonical package over its global
 command links instead can fail with npm `EEXIST`. Keep both release versions
 aligned while supporting this path. See the [migration release order](sdk/typescript/MIGRATION.md#release-order)
 ([中文](sdk/typescript/MIGRATION.zh.md#发布顺序)).
+
+### The CLI's Ink session view (`sdk/typescript/src/cli/inkView.ts`)
+
+- `ink` is an ES module with a top-level await (yoga-layout), and the SDK
+  compiles to CommonJS, where TypeScript turns `import()` into `require`.
+  `loadInk` imports it with `new Function('url', 'return import(url)')` on
+  `require.resolve('ink')`. Do not write `await import('ink')` there.
+- Ink draws a change at once only when its last render is more than 32 ms old,
+  and `useStdout().write` redraws Ink's last *rendered* frame under the text it
+  writes. Frames are `FRAME_MS` (40 ms) apart so that frame is always the
+  current one; closer frames showed a stale frame for a moment (a reply line
+  twice). `close()` hides the region before it waits out that gap, or
+  unmounting draws once more and leaves an empty row.
+- Transcript text goes through `useStdout().write`, not `<Text>` or `<Static>`:
+  Ink's text layout (`@alcalzone/ansi-tokenize` 0.1) cuts OSC 8 links apart.
+- Ink clears the whole terminal, scrollback included, when its output is as
+  tall as the screen. Every row of the region is cut to the width in
+  `inkView.ts`, and the region is kept below the screen's height.
+- While the view is up, `run()` hands every keypress to it alone
+  (`routeKeys`) and unhooks readline's resize redraw: readline would edit and
+  redraw a line nobody sees.
+- Ink 5.2.1 with React 18.3.1 is the last Ink that runs on Node 18, which the
+  package's `engines` allows (Ink 6 needs Node 20; Ink 7 and 8 need Node 22).
 
 ### 0g-storage Rust SDK dependency patch
 
@@ -228,7 +274,8 @@ deliberate:
   when the receipt wait failed before that (a reverted submission, a failed receipt
   query), the function has already filled that slot and returned, so the goroutine
   blocks for good (`contract/contract.go:276` at the pinned version), keeping some
-  tens of kilobytes. The CLI exited after every upload; sealed is PID 1, retries a
+  tens of kilobytes. The CLI exited after every upload; sealed runs for the
+  container's life (as PID 1, or under the loader in the 0g-harness image), retries a
   failed upload on every drift tick, and the SDK makes up to three submissions per
   upload. `dataplane.Upload` therefore caps the SDK's live submit goroutines at 64:
   it refuses an upload over 2 MiB that could take them past that (`admitUpload`),
@@ -246,8 +293,9 @@ deliberate:
   (`runBounded`; a fatal log there is turned into a panic first), and the SDK
   recovers none in the goroutines it starts (its non-test sources at the pinned
   version contain no `recover()`). A panic in one of those goroutines (a fatal log
-  there included), or memory exhausted during an upload, therefore ends sealed
-  (PID 1), and with it the container and the agent. This is the trade accepted to
+  there included), or memory exhausted during an upload, therefore ends sealed,
+  and with it the agent (as PID 1, the container too; in the 0g-harness image
+  the loader starts sealed again, at most 5 times in 10 minutes). This is the trade accepted to
   keep the key in one process.
 
 ### 0g-sandbox billing rejects random keys
@@ -470,6 +518,31 @@ every SSE response sealed relays or synthesizes carries
 0g-harness sets it on its own streams (`src/http.mjs` `openSSE`). Do not drop
 the header because a stream looks fine end to end: a finite stream hides the
 buffering, and only a live view (the CLI's notices, live typing) shows it.
+
+### 0g-harness's tools never see variables named like credentials
+
+dsh starts every tool process from its own environment minus the names
+matching `/KEY|PASSWORD|SECRET|TOKEN/i` (`SENSITIVE_ENV_PATTERN`,
+`@deepseek-ai/dsh-subprocess`). So git's credential helper reaches the
+agent's shell as `GIT_CONFIG_SYSTEM=/etc/seal/credential-gitconfig`, a file
+sealed writes, and not as `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/
+`GIT_CONFIG_VALUE_0`: dsh drops `GIT_CONFIG_KEY_0` and keeps the other two,
+and git then refuses every command (`missing config key GIT_CONFIG_KEY_0`;
+seen on dev, 2026-11-05). Any variable sealed adds to `CredentialEnv` must
+pass that pattern (`internal/framework/gitcred_test.go` applies it).
+
+### 0g-harness logs "platform doc ABSENT" while the doc rides sealed's inference route
+
+When sealed knows the model's endpoint (every registry provider, plus
+`openai` and `anthropic`), the agent doc is not a file: sealed's inference
+route appends it to the system prompt of every model request
+(`sealed/internal/inferproxy`, `sealed/LAYERS.md` §4.2) and leaves
+`SEAL_AGENT_DOC` unset. The harness (`src/composition.mjs`) then logs
+`WARN platform doc ABSENT — agent will not know its identity or doctrine`,
+and `platform doc: ABSENT` in its `agent ready` line. Both are expected: the
+doc is on every request. Do not "fix" it by setting `SEAL_AGENT_DOC` as well;
+the harness would add the doc as its own section and the model would read it
+twice.
 
 ---
 

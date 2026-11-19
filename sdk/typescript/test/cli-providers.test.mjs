@@ -8,7 +8,7 @@ import { loadCredentials, saveApiKey, loadApiKey, inferenceKeyFromEnv, configPat
 import { configuredInferenceKey, agentInferenceProvider, resetInferencePlan, applyResetInference, requireConfiguredInferenceKey, deployWithInference } from '../dist/cli/inference.js';
 import { listInferenceProviders } from '../dist/Providers.js';
 import { SettingsConflictError } from '../dist/index.js';
-import { completeLine } from '../dist/cli/commands/interactive.js';
+import { completeLine, configuredProvidersText } from '../dist/cli/commands/interactive.js';
 
 const KEY = `0x${'42'.repeat(32)}`;
 const fresh = () => ({ XDG_CONFIG_HOME: mkdtempSync(join(tmpdir(), 'agentdna-providers-')) });
@@ -31,12 +31,17 @@ test('deploy wizard binds changed compute routes after mint and keeps legacy com
       waitForMint:async()=>{calls.push(['mint']);return {agentId:42n};},
       setSettings:async(...args)=>{calls.push(['settings',...args]);return {version:1};},
       start:async(...args)=>{calls.push(['start',...args]);},
+    },credentials:{
+      setModelKey:async(...args)=>{calls.push(['cred',...args]);return {version:1};},
     }};
     const result=await deployWithInference(ag,{name:'test',framework:'openclaw',provider:selected.id,model:'model',provision,...(provision?{apiKey:'test-private-key'}:{})});
     assert.equal(result.agentId,'42');
     if (kind==='builtin') {
-      assert.deepEqual(calls.map(c=>c[0]),['deploy','mint']);
+      // The key rides the create request and, once minted, also goes into the
+      // agent's credential set (LEGACY(model-key) until every image reads it).
+      assert.deepEqual(calls.map(c=>c[0]),['deploy','mint','cred']);
       assert.equal(calls[0][1].sandbox.apiKey,'test-private-key');
+      assert.deepEqual(calls[2].slice(1),[seal,selected.id,'test-private-key',{push:false}]);
     } else if (kind==='builtin-mint-only') {
       // The chosen pin is kept as the settings document, so a later reset
       // boots on it.
@@ -146,12 +151,25 @@ test('login registers a provider key without exposing it or replacing the comput
     child.stderr.on('data',(data)=>stderr+=data);
     child.on('error',reject);
     child.on('close',(code)=>resolve({ code,stdout,stderr }));
-    child.stdin.end('login openai\n\n\nsk-private-openai\nwhoami\nquit\n');
+    child.stdin.end('login openai\nsk-private-openai\nwhoami\nquit\n');
   });
   assert.equal(result.code,0,result.stderr);
   assert.equal(loadApiKey('openai',env),'sk-private-openai');
   assert.equal(loadApiKey('0g-compute',env),'sk-old-compute');
   assert.ok(!result.stdout.includes('sk-private-openai') && !result.stderr.includes('sk-private-openai'));
   assert.ok(!result.stdout.includes(KEY) && !result.stderr.includes(KEY));
-  assert.match(result.stdout,/key openai: set/);
+  // whoami lists the providers configured here (a key login saved), the
+  // default for new agents first: not the platform's whole list (that is the
+  // `providers` command), and not an agent's own keys (`cred <agent>`).
+  assert.match(result.stdout,/providers {3}0g-compute \(new agents\), openai\n/);
+  assert.doesNotMatch(result.stdout,/sk-|key openai/);
+});
+
+test('whoami\'s providers: those with a key on this machine, the default for new agents first, never a value', () => {
+  const ids = ['0g-compute', 'openai', 'anthropic', 'zg-mock', 'ghast'];
+  const has = (...keyed) => (id) => keyed.includes(id);
+  assert.equal(configuredProvidersText('0g-compute', ids, has('0g-compute', 'anthropic', 'openai')), '0g-compute (new agents), openai, anthropic');
+  assert.equal(configuredProvidersText('0g-compute', ids, has('openai')), '0g-compute (new agents, no key), openai');
+  assert.equal(configuredProvidersText('anthropic', ids, has('openai', 'anthropic')), 'anthropic (new agents), openai');
+  assert.equal(configuredProvidersText('0g-compute', ids, has()), 'none — run login');
 });

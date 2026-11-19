@@ -305,6 +305,135 @@ func (c *Client) Update(
 	return signed.Hash(), nil
 }
 
+// The trust registry's code-list kinds sealed reads (TrustRegistry.SEALED and
+// TrustRegistry.HARNESS; sealed/LAYERS.md §10).
+var (
+	KindSealed  = crypto.Keccak256Hash([]byte("sealed"))
+	KindHarness = crypto.Keccak256Hash([]byte("harness"))
+)
+
+var (
+	trustRegistrySelector = crypto.Keccak256([]byte("trustRegistry()"))[:4]
+	isListedSelector      = crypto.Keccak256([]byte("isListed(bytes32,bytes32)"))[:4]
+	latestSelector        = crypto.Keccak256([]byte("latest(bytes32)"))[:4]
+	listedSelector        = crypto.Keccak256([]byte("listed(bytes32)"))[:4]
+)
+
+// maxListedVersions bounds the versions one listed(kind) answer may name.
+const maxListedVersions = 4096
+
+// BalanceAndGasPrice returns addr's balance and the gas price the chain
+// suggests now (what Update would pay), for telling a commit the seal wallet
+// cannot pay from another failure.
+func (c *Client) BalanceAndGasPrice(ctx context.Context, addr common.Address) (*big.Int, *big.Int, error) {
+	balance, err := c.eth.BalanceAt(ctx, addr, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("balance of %s: %w", addr.Hex(), err)
+	}
+	price, err := c.eth.SuggestGasPrice(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("suggest gas price: %w", err)
+	}
+	return balance, price, nil
+}
+
+// TrustRegistry reads AgenticID.trustRegistry(): the contract that holds the
+// deployer's trust decisions, the code lists among them. An AgenticID before
+// 1.4.0 has no such function; that, and the zero address, are errors.
+func (c *Client) TrustRegistry(ctx context.Context) (common.Address, error) {
+	out, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &c.contract, Data: trustRegistrySelector}, nil)
+	if err != nil {
+		return common.Address{}, fmt.Errorf("trustRegistry(): %w", err)
+	}
+	if len(out) != 32 || new(big.Int).SetBytes(out[:12]).Sign() != 0 {
+		return common.Address{}, fmt.Errorf("trustRegistry(): return is not an address (%d bytes)", len(out))
+	}
+	registry := common.BytesToAddress(out[12:])
+	if registry == (common.Address{}) {
+		return common.Address{}, fmt.Errorf("trustRegistry(): AgenticID names no trust registry")
+	}
+	return registry, nil
+}
+
+// Listed reads the trust registry's isListed(kind, hash): whether the
+// deployer lists this code hash under kind.
+func (c *Client) Listed(ctx context.Context, kind, hash [32]byte) (bool, error) {
+	out, err := c.callTrustRegistry(ctx, "isListed", isListedSelector, kind[:], hash[:])
+	if err != nil {
+		return false, err
+	}
+	if len(out) != 32 || new(big.Int).SetBytes(out[:31]).Sign() != 0 || out[31] > 1 {
+		return false, fmt.Errorf("isListed: return is not a bool (%d bytes)", len(out))
+	}
+	return out[31] == 1, nil
+}
+
+// Latest reads the trust registry's latest(kind): the last hash listed under
+// kind that is still listed, zero when none is.
+func (c *Client) Latest(ctx context.Context, kind [32]byte) ([32]byte, error) {
+	var h [32]byte
+	out, err := c.callTrustRegistry(ctx, "latest", latestSelector, kind[:])
+	if err != nil {
+		return h, err
+	}
+	if len(out) != 32 {
+		return h, fmt.Errorf("latest: return is not a bytes32 (%d bytes)", len(out))
+	}
+	copy(h[:], out)
+	return h, nil
+}
+
+// Versions reads the trust registry's listed(kind): every hash listed under
+// kind, oldest first.
+func (c *Client) Versions(ctx context.Context, kind [32]byte) ([][32]byte, error) {
+	out, err := c.callTrustRegistry(ctx, "listed", listedSelector, kind[:])
+	if err != nil {
+		return nil, err
+	}
+	return decodeBytes32Array(out)
+}
+
+// decodeBytes32Array decodes the ABI encoding of one bytes32[] return: the
+// offset of the array (32), its length, then the elements.
+func decodeBytes32Array(out []byte) ([][32]byte, error) {
+	if len(out) < 64 || len(out)%32 != 0 {
+		return nil, fmt.Errorf("listed: return of %d bytes is not a bytes32[]", len(out))
+	}
+	if offset := new(big.Int).SetBytes(out[:32]); offset.Cmp(big.NewInt(32)) != 0 {
+		return nil, fmt.Errorf("listed: return is not a bytes32[] (offset %s)", offset)
+	}
+	n := new(big.Int).SetBytes(out[32:64])
+	if !n.IsInt64() || n.Int64() > maxListedVersions || int64(len(out)) != 64+32*n.Int64() {
+		return nil, fmt.Errorf("listed: return of %d bytes does not hold %s bytes32", len(out), n)
+	}
+	hashes := make([][32]byte, 0, n.Int64())
+	for i := 64; i < len(out); i += 32 {
+		var h [32]byte
+		copy(h[:], out[i:i+32])
+		hashes = append(hashes, h)
+	}
+	return hashes, nil
+}
+
+// callTrustRegistry calls a view of the trust registry AgenticID names now.
+// The address is read on every call: a new AgenticID implementation may name
+// another one.
+func (c *Client) callTrustRegistry(ctx context.Context, method string, selector []byte, words ...[]byte) ([]byte, error) {
+	registry, err := c.TrustRegistry(ctx)
+	if err != nil {
+		return nil, err
+	}
+	data := append([]byte{}, selector...)
+	for _, w := range words {
+		data = append(data, w...)
+	}
+	out, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &registry, Data: data}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%s on %s: %w", method, registry.Hex(), err)
+	}
+	return out, nil
+}
+
 // getIdentityRegistrySelector is VerifiedFeedbackRegistry.getIdentityRegistry()
 // — the AgenticID (identity registry) the registry verifies serve-proofs
 // against.

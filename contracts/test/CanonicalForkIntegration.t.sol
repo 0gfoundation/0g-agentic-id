@@ -6,6 +6,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {AgenticID} from "../src/AgenticID.sol";
+import {TrustRegistry} from "../src/TrustRegistry.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 import {VerifiedFeedbackRegistry} from "../src/VerifiedFeedbackRegistry.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
@@ -39,6 +40,7 @@ contract CanonicalForkIntegrationTest is Test {
     address constant CANONICAL_8004_REPUTATION = 0x8004B663056A597Dffe9eCcC1965A193B7388713;
 
     AgenticID internal agenticId;
+    TrustRegistry internal trustRegistry;
     VerifiedFeedbackRegistry internal verifiedFeedback;
     bool internal active;
 
@@ -70,7 +72,10 @@ contract CanonicalForkIntegrationTest is Test {
             address(vImpl),
             abi.encodeCall(TEEDataVerifier.initialize, (deployer, deployer, deployer, 1 days))
         );
-        AgenticID impl = new AgenticID();
+        trustRegistry = TrustRegistry(address(new ERC1967Proxy(
+            address(new TrustRegistry()), abi.encodeCall(TrustRegistry.initialize, (deployer))
+        )));
+        AgenticID impl = new AgenticID(address(trustRegistry));
         ERC1967Proxy proxy = new ERC1967Proxy(
             address(impl),
             abi.encodeCall(
@@ -124,7 +129,7 @@ contract CanonicalForkIntegrationTest is Test {
 
         // Seal-mint through the trusted-attestor path.
         vm.prank(deployer);
-        agenticId.addTrustedAttestor(deployer);
+        trustRegistry.addTrustedAttestor(deployer);
         bytes32 dataHash = keccak256("fork-vf-data");
         IntelligentData[] memory datas = new IntelligentData[](1);
         datas[0] = IntelligentData({dataDescription: "persona", dataHash: dataHash});

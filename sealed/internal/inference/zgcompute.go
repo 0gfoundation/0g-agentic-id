@@ -75,6 +75,10 @@ type ModelFacts struct {
 	// False on the heuristic fallback (can't know, and sending the parameter
 	// to a model that rejects it is a hard 400).
 	SupportsReasoningEffort bool
+	// InputModalities are what the catalog says the model accepts
+	// (`architecture.input_modalities` on the 0G router: "text", "image",
+	// …). Nil means the catalog said nothing: unknown, not text-only.
+	InputModalities []string
 	// CatalogSourced reports that the limits above came from the live catalog
 	// rather than the name heuristic. Callers that PERSIST limits into
 	// config must gate on it: a heuristic guess written to disk during a
@@ -97,6 +101,9 @@ type Endpoint struct {
 	// for this wire format (ANTHROPIC_API_KEY / OPENAI_API_KEY). The 0g
 	// key itself is format-agnostic; only the variable name differs.
 	EnvKey string
+	// WebSearch is the web search service this endpoint's key pays for
+	// (SearchServices), "" for none (Provider.WebSearch).
+	WebSearch string
 }
 
 // Route is a resolved routing decision for one model on 0g-compute: both
@@ -190,6 +197,7 @@ func ResolveZG(ctx context.Context, model string) Route {
 				break
 			}
 		}
+		r.InputModalities = entry.inputModalities()
 		r.CatalogSourced = true
 		return r
 	}
@@ -256,6 +264,32 @@ type zgCatalogEntry struct {
 	ContextLength       int      `json:"context_length"`
 	MaxCompletionTokens int      `json:"max_completion_tokens"`
 	SupportedParameters []string `json:"supported_parameters"`
+	Architecture        *struct {
+		InputModalities []string `json:"input_modalities"`
+	} `json:"architecture"`
+}
+
+// inputModalities is what the entry says the model accepts; nil when it
+// carries no architecture.
+func (e zgCatalogEntry) inputModalities() []string {
+	if e.Architecture == nil || e.Architecture.InputModalities == nil {
+		return nil
+	}
+	return append([]string{}, e.Architecture.InputModalities...)
+}
+
+// TakesImages reports whether the catalog lists image input for the model,
+// and whether it said anything about the model's input at all.
+func (f ModelFacts) TakesImages() (takes, known bool) {
+	if f.InputModalities == nil {
+		return false, false
+	}
+	for _, m := range f.InputModalities {
+		if m == "image" {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 func fetchZGCatalogEntry(ctx context.Context, model string) (zgCatalogEntry, bool) {

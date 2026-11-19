@@ -22,11 +22,13 @@ const maxSettingsBody = 256 << 10
 
 // SettingsApplier is what the platform does with a document the owner pushed:
 // validate it, make it the one future renders use, render it now, and restart
-// the framework process so it takes effect.
+// the framework process so it takes effect. It reports whether it restarted
+// the framework: a push that changes only the layered runtime's version picks
+// does not (the version rule switches what it must).
 //
 // main.go owns that sequence because it owns both the document and the
 // manager; the proxy only authenticates the request.
-type SettingsApplier func(ctx context.Context, doc settings.Doc) error
+type SettingsApplier func(ctx context.Context, doc settings.Doc) (restarted bool, err error)
 
 // SettingsReader returns the document currently in force, so an owner can read
 // before writing without keeping an authoritative copy of their own.
@@ -99,6 +101,7 @@ func (s *Server) SetConversationHistory(fn func(ctx context.Context) ([]Conversa
 //
 //	GET   returns the document in force
 //	POST  replaces it, then re-renders and restarts the framework process
+//	      (not when only the layered runtime's version picks changed)
 //
 // Both are owner-signed. POST additionally binds the signature to a sha256 of
 // the request body: without that the signature attests only to who is calling,
@@ -161,7 +164,8 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := apply(r.Context(), doc); err != nil {
+		restarted, err := apply(r.Context(), doc)
+		if err != nil {
 			logger.Logf("settings: apply failed: %v", err)
 			for _, code := range []string{"CREDENTIAL_PROVIDER_MISMATCH", "CREDENTIAL_ROUTE_MISMATCH", "PROVIDER_BOUND_CREDENTIAL_REQUIRED"} {
 				if strings.HasPrefix(err.Error(), code+":") {
@@ -172,10 +176,11 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "apply failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":   true,
-			"note": "applied; the framework process was restarted, so any task in flight was interrupted",
-		})
+		note := "applied; the framework process was restarted, so any task in flight was interrupted"
+		if !restarted {
+			note = "applied; only the version picks changed, so nothing was restarted (a version switch restarts the layer it changes)"
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "note": note})
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

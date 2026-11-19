@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -257,6 +258,95 @@ type SettleDelayer interface {
 	SettleDelay() time.Duration
 }
 
+// UncommittedKeeper is implemented by adapters whose roles keep, at boot,
+// what the agent changed on disk after its last commit. A stop or a crash
+// can end the container before the watcher commits a change; on the next
+// boot of the same container bootstrap leaves such a role's disk content in
+// place instead of restoring the chain version over it, and the watcher
+// commits it. Bootstrap does that only while the chain still holds the
+// version the container last had in sync (main.go, synced.go); after any
+// other change on chain, the chain version is restored as usual.
+//
+// KeepsUncommitted names the roles this applies to: content the agent
+// writes, never platform-owned state such as the framework binding.
+type UncommittedKeeper interface {
+	KeepsUncommitted(role string) bool
+}
+
+// BearerTranslator is implemented by adapters whose framework's own bearer
+// token stays in sealed (sealed/LAYERS.md §4.3): /_seal/auth hands the owner
+// another token, and on a route whose Auth is "bearer" the proxy forwards
+// only a request that carries the owner's token, with the framework's in its
+// place. The framework process, and every command it runs, never sees the
+// owner's token.
+type BearerTranslator interface {
+	// TranslateBearer returns the framework's token for the owner's; ok is
+	// false when token is not the owner's.
+	TranslateBearer(token string) (frameworkToken string, ok bool)
+}
+
+// PlaintextCommitter is implemented by adapters whose roles carry a salted
+// commitment to their plaintext in every entry sealed uploads
+// (sealed/LAYERS.md §7.1; internal/uploader/commitments.go).
+type PlaintextCommitter interface {
+	CommitsPlaintext() bool
+}
+
+// ServiceFieldLimiter is implemented by adapters whose agents' service
+// registrations have bounded text (sealed/LAYERS.md §6.1): the proxy refuses
+// a registration whose description or input example is longer, in bytes.
+// The signed /hello lists every registered service, so unbounded fields
+// would make it a channel for whatever the agent writes into them.
+type ServiceFieldLimiter interface {
+	ServiceFieldLimits() (description, inputExample int)
+}
+
+// SigningRules is implemented by adapters whose agents the sign socket holds
+// to the runtime's signing rules (sealed/LAYERS.md §4.3): it refuses a
+// transaction to AgenticID update or updateAt, the drift watcher's channel,
+// and records every signature it makes and every request it refuses, for
+// the owner to read (GET /_seal/signatures). Without it the socket signs as
+// it always has, and keeps no record.
+type SigningRules interface {
+	AppliesSigningRules() bool
+}
+
+// RuntimeTools is implemented by adapters whose framework mounts the
+// runtime's tools: the agent sockets serve their endpoints as MCP tools on
+// POST /mcp (internal/sealmcp), and the framework registers them. Without it
+// /mcp is not served.
+type RuntimeTools interface {
+	ServesRuntimeTools() bool
+}
+
+// LayeredRuntime is implemented by adapters whose framework runs as a
+// harness official version package, picked by hash (sealed/LAYERS.md §5;
+// only 0g-harness). sealed tells the adapter which unpacked package to run;
+// under the layered flow it also switches packages as the attestor targets
+// them and signs serve-proofs v2, which name the package's hash.
+//
+// Start wraps ErrHarnessDidNotStart when the package's process exited or
+// never listened.
+type LayeredRuntime interface {
+	// UseHarness makes the package unpacked at dir, whose sha256 is hash
+	// (64 lowercase hex), the one the next Start runs. "" for both runs the
+	// framework the image installed without a package (LEGACY(v1)).
+	UseHarness(hash, dir string)
+	// HarnessHash is the hash of the package the running process started
+	// from, "" before the first Start or without a package.
+	HarnessHash() string
+	// InferenceTarget is the endpoint sealed's inference route forwards the
+	// framework's model calls to, and the model it names, as of the last
+	// Start; "" for the URL when the framework dials a provider itself.
+	InferenceTarget() (url, model string)
+}
+
+// ErrHarnessDidNotStart is wrapped by a LayeredRuntime adapter's Start error
+// when the package's process exited or never listened: the package is at
+// fault, not the settings, the key or sealed, so a boot records it as failed
+// and starts the next version.
+var ErrHarnessDidNotStart = fmt.Errorf("framework: the harness package did not start")
+
 // Route is one path prefix a framework exposes through the sealed proxy.
 //
 // The proxy forwards a request to the framework upstream ONLY if its path
@@ -295,8 +385,62 @@ type Route struct {
 	// route rather than to one upstream. Mirrors an agent service's
 	// per-backend routing, which the proxy already does.
 	Backend string
-	// Description is a one-line human summary for /hello.
+	// Description is what the route is for, in one plain sentence, as
+	// /hello shows it to anyone who asks: no request shapes, status codes or
+	// internal names (those belong in the framework's protocol document).
 	Description string
+	// Endpoints, when set, are the only requests the route forwards: a
+	// method and a path, where a segment written {id} stands for any one
+	// segment. Any other request under Prefix 404s, or 405s when only its
+	// method is not listed; a CORS preflight (OPTIONS) passes on any listed
+	// path. Empty forwards everything under Prefix.
+	Endpoints []Endpoint
+}
+
+// Endpoint is one request a route forwards (Route.Endpoints).
+type Endpoint struct {
+	Method string
+	Path   string
+}
+
+// Allows reports whether the route forwards method on path: pathListed is
+// whether any endpoint has this path, allowed whether one has this method
+// too. A route without Endpoints allows everything.
+func (rt Route) Allows(method, path string) (allowed, pathListed bool) {
+	if len(rt.Endpoints) == 0 {
+		return true, true
+	}
+	for _, e := range rt.Endpoints {
+		if !endpointPathMatches(e.Path, path) {
+			continue
+		}
+		pathListed = true
+		if strings.EqualFold(e.Method, method) || method == http.MethodOptions {
+			return true, true
+		}
+	}
+	return false, pathListed
+}
+
+// endpointPathMatches matches path against pattern segment by segment; a
+// pattern segment {id} matches any one non-empty segment.
+func endpointPathMatches(pattern, path string) bool {
+	ps, xs := strings.Split(pattern, "/"), strings.Split(path, "/")
+	if len(ps) != len(xs) {
+		return false
+	}
+	for i := range ps {
+		if ps[i] == "{id}" {
+			if xs[i] == "" {
+				return false
+			}
+			continue
+		}
+		if ps[i] != xs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // RouteProvider is implemented by adapters that declare their public HTTP
@@ -417,7 +561,7 @@ var ErrUnsupportedDim = fmt.Errorf("framework: dim not supported by this adapter
 // workspace context (e.g. platform.RuntimeSnapshot). They are not secrets
 // — they are public on-chain data that the agent benefits from knowing.
 type RuntimeContext struct {
-	APIKey       string // inference provider API key from env (e.g. ANTHROPIC_API_KEY)
+	APIKey       string // LEGACY(model-key): the key handed over at create/reset; adapters use settings.Resolved.APIKey
 	PublicURL    string // externally-reachable URL prefix for this sandbox; empty in local dev
 	SealSignSock string // unix socket path for agent-only sign endpoint (agentSeal identity)
 	AgentSeal    string // 0x-prefixed address derived from agent_seal_priv pubkey
@@ -452,6 +596,97 @@ type RuntimeContext struct {
 	// Sealed runtime metadata.
 	SealedVersion string // git short hash of sealed binary; empty if unavailable
 	FrameworkHash string // "0x"+sha256 sealed image hash; signed into serve-proofs as the AgenticID Framework code hash
+
+	// Credential proxy (internal/credproxy). All empty when it is off.
+	CredProxy      string // explicit form prefix: http://127.0.0.1:<port>/<token>
+	CredHTTPSProxy string // HTTPS_PROXY value: http://agent:<token>@127.0.0.1:<port>
+	CredCAFile     string // the proxy's per-boot root alone
+	CredCABundle   string // system roots followed by the proxy's root
+	CredSock       string // harness credential socket
+	CredRevealSock string // socket that hands out revealed values
+	CredGitConfig  string // git config file naming sealed's credential helper (GitConfig)
+	// CredHold, when the proxy is on, has sealed hold a value it supplies
+	// to the framework (its inference key) instead of handing it over: the
+	// value is filled in only in the given headers (name → template with
+	// one {v}) on baseURL's host. It returns the base URL to use instead
+	// (through the proxy) and the placeholder to give the framework. An
+	// error wrapping ErrCredHoldRefused means the framework must not get
+	// the value either; any other, that sealed could not hold it.
+	CredHold func(name, baseURL string, headers map[string]string, value []byte) (proxiedBaseURL, placeholder string, err error)
+}
+
+// ErrCredHoldRefused is CredHold refusing a value the framework may not
+// have at all: the agent's owner changed, and the value came with the
+// previous owner's deployment.
+var ErrCredHoldRefused = fmt.Errorf("framework: sealed refused the value; the agent's owner changed")
+
+// WithCredentials returns rt with every credential field (Cred*) taken from
+// c, the RuntimeContext startCredentials returned. One place copies them, so
+// a field added there reaches the adapters.
+func (rt RuntimeContext) WithCredentials(c RuntimeContext) RuntimeContext {
+	rt.CredProxy, rt.CredHTTPSProxy = c.CredProxy, c.CredHTTPSProxy
+	rt.CredCAFile, rt.CredCABundle = c.CredCAFile, c.CredCABundle
+	rt.CredSock, rt.CredRevealSock = c.CredSock, c.CredRevealSock
+	rt.CredGitConfig, rt.CredHold = c.CredGitConfig, c.CredHold
+	return rt
+}
+
+// credentialCAVars name the CA-location variables, read by the tools a
+// harness runs, that replace a tool's trust store. They get the bundle
+// (system roots + the proxy root) so ordinary hosts still verify.
+var credentialCAVars = []string{
+	"SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+	"GIT_SSL_CAINFO", "AWS_CA_BUNDLE", "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+}
+
+// CredentialEnv is the environment that sends a framework's tools through
+// sealed's credential proxy: HTTPS_PROXY for the intercepting form, the CA
+// variables pointing at the proxy's root, and the explicit prefix and
+// sockets for tools that call them directly. Every adapter appends it to
+// the framework's environment; it is empty when the proxy is off.
+// gitCredentialHelper answers git's "get" with the credential socket's
+// username and placeholder for the host git names.
+const gitCredentialHelper = `!f() { test "$1" = get || exit 0; h=$(sed -n 's/^host=//p'); test -n "$h" && curl -sf --unix-socket "$SEAL_CRED_SOCKET" "http://localhost/credentials/git?host=$h" || true; }; f`
+
+// GitConfig is the file sealed writes at CredGitConfig: the image's system
+// config, then the credential helper. git reads it as GIT_CONFIG_SYSTEM, a
+// name harnesses pass to their tools; GIT_CONFIG_KEY_<n> is not, where a
+// harness drops credential-shaped names (KEY, TOKEN, …) from its tools'
+// environment, and git then refuses every command.
+func GitConfig() []byte {
+	quoted := `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(gitCredentialHelper) + `"`
+	return []byte("[include]\n\tpath = /etc/gitconfig\n[credential]\n\thelper = " + quoted + "\n")
+}
+
+func (rt RuntimeContext) CredentialEnv() []string {
+	if rt.CredHTTPSProxy == "" {
+		return nil
+	}
+	env := []string{
+		"SEAL_CRED_PROXY=" + rt.CredProxy,
+		"HTTPS_PROXY=" + rt.CredHTTPSProxy,
+		"https_proxy=" + rt.CredHTTPSProxy,
+		"NO_PROXY=localhost,127.0.0.1,::1",
+		"no_proxy=localhost,127.0.0.1,::1",
+		"NODE_EXTRA_CA_CERTS=" + rt.CredCAFile,
+	}
+	for _, name := range credentialCAVars {
+		env = append(env, name+"="+rt.CredCABundle)
+	}
+	if rt.CredSock != "" {
+		env = append(env, "SEAL_CRED_SOCKET="+rt.CredSock)
+	}
+	if rt.CredGitConfig != "" {
+		// git over HTTPS asks the credential socket for the placeholder of
+		// an entry that allows Basic auth on that host; the proxy fills the
+		// real value in. Nothing comes back for other hosts, and git moves
+		// on to whatever helper it has.
+		env = append(env, "GIT_CONFIG_SYSTEM="+rt.CredGitConfig)
+	}
+	if rt.CredRevealSock != "" {
+		env = append(env, "SEAL_CRED_REVEAL_SOCKET="+rt.CredRevealSock)
+	}
+	return env
 }
 
 // StartResult is what an adapter returns when its agent process is up and

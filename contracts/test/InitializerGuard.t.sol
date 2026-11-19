@@ -22,7 +22,7 @@ contract InitializerGuardTest is AgenticIDTestBase {
 
     function test_implementation_initializeDisabled() public {
         // Deploy a fresh impl — constructor calls _disableInitializers.
-        AgenticID impl = new AgenticID();
+        AgenticID impl = new AgenticID(address(trustRegistry));
         vm.expectRevert(Initializable.InvalidInitialization.selector);
         impl.initialize("x", "x", address(verifier), owner, pauser, address(canonical));
 

@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {ICanonicalReputationRegistry} from "./interfaces/ICanonicalReputationRegistry.sol";
-import {IVerifiedFeedbackRegistry, TaskReveal} from "./interfaces/IVerifiedFeedbackRegistry.sol";
+import {IVerifiedFeedbackRegistry, TaskReveal, VersionedServeProof} from "./interfaces/IVerifiedFeedbackRegistry.sol";
 import {ServeProof} from "./interfaces/IAgenticIDReputationRegistry.sol";
 
 /// @dev The routine may only be self-called: it is designed to run AS the
@@ -69,6 +69,9 @@ contract FeedbackBatcher {
     ///         An empty `task.method` skips the receipt opening (plain
     ///         attest); a non-empty one routes to attestFeedbackWithTask,
     ///         recording `task.uri` as the entry's TEE-verified endpoint.
+    /// @dev LEGACY(v1): for v1 proofs (IVerifiedFeedbackRegistry.attestFeedback).
+    ///      The batcher is immutable: dropping this path takes a new batcher,
+    ///      advertised and re-delegated to, once every running image signs v2.
     /// @return feedbackIndex The 1-based canonical index the entry landed at.
     function giveFeedbackAndAttest(
         uint256 agentId,
@@ -95,5 +98,31 @@ contract FeedbackBatcher {
         } else {
             verifiedFeedback.attestFeedbackWithTask(agentId, feedbackIndex, proof, task);
         }
+    }
+
+    /// @notice {giveFeedbackAndAttest} for a proof that carries its version
+    ///         (VerifiedFeedbackRegistry >= 1.3.0). The registry's
+    ///         attestVersionedFeedback takes the optional receipt itself: an
+    ///         empty `task.method` skips the opening.
+    /// @return feedbackIndex The 1-based canonical index the entry landed at.
+    function giveFeedbackAndAttestVersioned(
+        uint256 agentId,
+        int128  value,
+        uint8   valueDecimals,
+        string calldata tag1,
+        string calldata tag2,
+        string calldata endpoint,
+        string calldata feedbackURI,
+        bytes32 feedbackHash,
+        VersionedServeProof calldata proof,
+        TaskReveal calldata task
+    ) external returns (uint64 feedbackIndex) {
+        if (msg.sender != address(this)) revert BatcherNotSelf();
+
+        canonicalReputation.giveFeedback(
+            agentId, value, valueDecimals, tag1, tag2, endpoint, feedbackURI, feedbackHash
+        );
+        feedbackIndex = canonicalReputation.getLastIndex(agentId, address(this));
+        verifiedFeedback.attestVersionedFeedback(agentId, feedbackIndex, proof, task);
     }
 }

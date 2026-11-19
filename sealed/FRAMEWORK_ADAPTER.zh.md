@@ -67,8 +67,9 @@ sealed 的五个组件各自通过一个窄切面消费它:
 `chain`、`platform`。
 
 - **adapter 选择由 binding 驱动**:adapter 在自己的 `New()` 里
-  `framework.Register` 自注册;`main.go` 注册所有随二进制打包的
-  adapter,Phase 2 解密完 iData 后按**链上 framework binding 的
+  `framework.Register` 自注册;`main.go` 注册这次编译打包的所有
+  adapter(`adapters.go`;0g-harness 镜像用 `harnessonly` 标签编译,只打包
+  它自己的,见 `adapters_harnessonly.go`),Phase 2 解密完 iData 后按**链上 framework binding 的
   `name`** 选出激活的那个——决定"哪个框架解释这份 iData"的是 agent
   被 mint 的身份,不是部署配置。`AGENT_FRAMEWORK` env 只是链上无
   binding 时的 fallback(本地 dev);两者都在且不一致时 binding 赢,
@@ -98,7 +99,9 @@ sealed 的五个组件各自通过一个窄切面消费它:
   `Roles()` 毫无关系。
 
   **跑哪个 adapter 仍然与镜像无关** —— 那是链上 binding 决定的(见上面
-  §2.1),每个镜像里的 sealed 二进制都注册了全部 adapter。但镜像必须真的
+  §2.1),除 0g-harness 外每个镜像里的 sealed 二进制都注册了全部 adapter
+  (0g-harness 镜像只注册它自己的,所以 binding 指向别的框架时,在选 adapter
+  那一步就会失败)。但镜像必须真的
   **带着**被选中 adapter 所需的运行时,而**这个配对没有任何校验**:binding
   指向一个运行时缺失的框架,容器会正常起来然后在 Start 阶段失败。所以部署
   非默认镜像时必须显式传 `sealedImage`。
@@ -141,6 +144,13 @@ sealed 的五个组件各自通过一个窄切面消费它:
 | `ConversationHistory` | `ConversationHistory(ctx)` | 有状态 responses 门丢掉客户端发的历史:先发这里返回的历史,再只发客户端的当前轮。网关自己会重放会话时返回空(openclaw)——再叠客户端的历史,模型会看到两遍 | 客户端历史继续原样转发 |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear`(owner 签名)+ CLI `/clear`,随后进程重启 | 该路由答 501——历史在客户端侧,服务端无可清 |
 | `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact`(owner 签名、同一时间只跑一个、拒绝重放、与 synth 门上的一轮永不重叠)+ CLI `/compact`:立刻运行框架**自己的**压缩,不重启;note 展示给 owner。框架暂时拒绝(忙、会话已变)时包装 `framework.ErrCompactRefused`——owner 收到可重试的 409,而不是失败;已安装的框架版本缺少你的 adapter 用来触发压缩的东西时(openclaw 2026.7.1 之前没有 `sessions compact` 这条 CLI 命令),包装 `framework.ErrCompactUnsupported`——答 501,和没实现这个接口一样 | 该路由答 501——无法从外部让该框架压缩 |
+| `UncommittedKeeper` | `KeepsUncommitted(role) bool` | bootstrap Phase A:同一容器再次启动时,对列出的 role,agent 在上次提交之后改过的盘上内容保留,前提是链上仍是这个容器上次同步时的版本(`synced.go`);随后 watcher 提交它。只列 agent 自己写的内容,不列 framework binding 这类平台状态 | 每次启动都用链上版本覆盖盘上内容 |
+| `BearerTranslator` | `TranslateBearer(token) (frameworkToken string, ok bool)` | proxy,在 `Auth` 为 `bearer` 的路由上:只转发带 owner token 的请求,并把它换成框架自己的 token,框架看不到 owner 的 token。`AuthResponse` 这时交给 owner 的是 owner 的 token,不是框架的 | `AuthResponse` 返回的 token 原样转发 |
+| `PlaintextCommitter` | `CommitsPlaintext() bool` | uploader:上传的每个条目都在 `dataDescription` 里带一个对明文的加盐 sha256 承诺(`LAYERS.zh.md` §7.1) | 没有承诺 |
+| `ServiceFieldLimiter` | `ServiceFieldLimits() (description, inputExample int)` | proxy,注册服务时:描述或输入示例超长(按字节)就拒绝 | 不限长度 |
+| `SigningRules` | `AppliesSigningRules() bool` | 签名 socket:拒签发往 AgenticID `update` / `updateAt` 的交易(drift watcher 的通道),并把每个签名和拒绝记下来给 owner(`GET /_seal/signatures`)。同时设置 `RuntimeSnapshot.SigningRules`,让 agent 文档写明。只有 0g-harness | socket 在三种格式内照签,不做记录;`/_seal/signatures` 返回 404 |
+| `RuntimeTools` | `ServesRuntimeTools() bool` | 签名 socket 和交出 socket:`POST /mcp` 把它们的端点(以及凭据 socket 的端点)作为 MCP 工具提供,由你的框架从 `tools/list` 注册、用 `tools/call` 回调。同时设置 `RuntimeSnapshot.SealTools`,让 agent 文档列出它们。只有 0g-harness(它的 `seal-tools` 插件) | `/mcp` 返回 404 |
+| `LayeredRuntime` | `UseHarness(hash, dir)`、`HarnessHash()`、`InferenceTarget()` | bootstrap 和 `layered.go`:`Start` 运行哪个 harness 包(镜像不带包,没设定时 `Start` 失败)、按版本规则换包,以及 serve-proof v2(`LAYERS.zh.md` §5、§7)。只有 0g-harness | 运行镜像安装的框架;serve-proof 仍是 v1 |
 
 实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
 悄悄没实现 = 功能悄悄关闭。
@@ -181,7 +191,7 @@ sealed 的五个组件各自通过一个窄切面消费它:
   | openclaw(`openclaw.go:164`) | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `~/.openclaw/openclaw.json`,每次 spawn 重新渲染 |
   | hermes(`hermes.go:143`) | `framework`、`SOUL.md`、`memories/`、`skills/` | `~/.hermes/config.yaml`,每次 spawn 重新渲染 |
   | prime-agent(`prime.go:162`) | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `~/.prime/agent/models.json`,每次 spawn 重新渲染 |
-  | 0g-harness(`harness.go:167`) | `framework`、`APPEND_SYSTEM.md`、`skills/` | 没有——harness 进程的环境变量 |
+  | 0g-harness(`harness.go:208`) | `framework`、`APPEND_SYSTEM.md`、`skills/`、`memory/`、`memory-public/` | 没有——harness 进程的环境变量 |
 
   `openclaw.json`、`config.yaml`、`models.json`、`settings.yaml` 曾经都是
   role,直到 owner 的 settings 文档成为推理 pin 的持久归宿。把一个派生产物
@@ -664,6 +674,8 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 | `VerifiedFeedbackAddr` | 来自 `VERIFIED_FEEDBACK_ADDR` 的 VerifiedFeedbackRegistry proxy 地址;未设置、格式错误或为零地址,或其 `getIdentityRegistry()` 不是 `AGENTIC_ID_ADDR` 时为空 | serve-proof 的 validator(EIP-191 version `0x00`)。由 sealed 自己拿它签名——adapter 无需处理;为空 ⇒ 任何路由都不带 `X-Agent-Proof` |
 | `SealedVersion` | sealed 二进制的 git hash | 用于 proof/元数据表面 |
 | `FrameworkHash` | sealed 镜像的 `"0x"+sha256` | 签进 serve-proof 的 AgenticID Framework code hash |
+| `CredProxy`、`CredHTTPSProxy`、`CredCAFile`、`CredCABundle`、`CredSock`、`CredRevealSock` | owner 凭据代理及其 socket([CREDENTIALS.zh.md](CREDENTIALS.zh.md));代理关闭时全部为空 | 把 `rt.CredentialEnv()` 追加到框架的环境变量,并把 `CredSock` / `CredRevealSock` 传进 `platform.RuntimeSnapshot`,让 agent 知道如何使用凭据 |
+| `CredHold` | 代理关闭时为 nil | `CredHold(name, baseURL, headers, value)` 让 sealed 保管原本要交给框架的值(推理 key):框架拿到占位符和经代理访问的 `baseURL`。0g-harness 对走平台路由的模型使用它(`holdInferenceKey`) |
 
 **这里刻意没有的东西:配置。** `RuntimeContext` 在首次 Start 时被捕获、之后
 每次重启原样重放,所以装在里面的东西就被冻在容器这一辈子里,运行期改的配置会被
@@ -700,8 +712,16 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
   时不发这个头。你的上游只需在
   localhost 上提供明文 HTTP。
 - **`GET /hello`** ——签名的自我介绍:agent 身份、当前 `data_hashes`、
-  `public_url`,以及(如果 agent 通过 `POST $SEAL_SIGN_SOCK/services`
-  注册过)agent 自声明的服务列表。
+  `public_url`,以及服务列表,每项带 `kind`:`runtime`(`/hello`)、`agent`
+  (agent 接口:agent 在 loopback 上自己运行、通过 `POST $SEAL_SIGN_SOCK/services`
+  注册的后端,不是各框架的 manifest 文件)或 `hosted`(托管程序,附它运行的
+  `version` 和审计用的 `release` 路径;见 MCP_SERVICES.zh.md)。sealed 在容器
+  重启后保留 agent 接口(绑定 owner 和 seal);注册时带 `start` 命令的,sealed 以
+  agent 用户身份自己运行它的后端,退出后再次启动:环境为 `PATH`、`HOME`、凭据代理
+  的设置、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK` 和 `AGENT_SEAL`(不含框架自己的
+  变量),运行在独立的进程组里,条目被删除或修改时 sealed 杀掉整个进程组。一个后端
+  地址只有一条启动命令;`GET /services` 报告每个这样的后端的状态、启动次数、上次
+  退出原因和最近的输出。
 - **`POST /_seal/auth`** ——§5.7 的 owner 鉴权流程。
 - **`unix:///run/seal-sign.sock`** ——`POST /sign/personal_sign`、
   `/sign/typed_data`、`/sign/transaction`;仅容器内可达。agent 就是
@@ -713,7 +733,7 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
   agent 的教义里*(见 [AGENT_DOCTRINE.zh.md](AGENT_DOCTRINE.zh.md));
   你的 adapter 应该装一套等价于 openclaw SOUL 规则的东西,让来自外部
   prompt 的签名请求被拒绝。如果你的 adapter 把 socket 桥接成 agent
-  工具(像 0g-harness 的 `seal_sign` 那样),它只能转发到这几个端点,**绝不**
+  工具(像 0g-harness 的 `seal-tools` 挂载运行时的 MCP 工具那样),它只能转发到这几个端点,**绝不**
   能加裸 hash 或 `0x00` 签名路径。任何一条都会让 agent 能伪造
   serve-proof。
 - **`/log`、`/log.html`、`/log/agent`(`.html`)** ——bootstrap 和
@@ -817,7 +837,7 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
 
 1. 在 `internal/framework/<yourfw>/` 实现 `framework.Framework` +
    `MonitorExit`,在你的 `New()` 里 `framework.Register` 自注册;在
-   `main.go` 加一行注册。CLI 型框架照 git 历史里已下线的
+   `adapters.go` 加一行注册。CLI 型框架照 git 历史里已下线的
    `claudecode/`(内嵌 bridge 模式,另见 §12 的下线原因),服务型框架
    照 `openclaw/`。
 2. 声明你的 role 集,包括保留的 `framework` leaf(含空版本 →
@@ -1003,7 +1023,10 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
     (ghostty `/pty` + `BrowserFiles`)和 hermes(`/api/pty` + 文件端点)
     都恰好带这套 UI;现在两者都只声明 chat。规则:**受限接口默认暴露;
     框架完整 UI 只有在逐端点审计证明其下无 shell/文件/exec 可达后才暴露。**
-    拿不准就别声明 route——未声明的前缀在 proxy 层 404。
+    拿不准就别声明 route——未声明的前缀在 proxy 层 404。route 还可以列出
+    确切的 endpoint(`Route.Endpoints`:方法和路径,`{id}` 匹配一段),proxy
+    就只转发这些:没列的路径 404,没列的方法 405。0g-harness 列的是它
+    protocol v1 的 endpoint。
 
 ## 12. 移植实录:接入 claude-code(2026-07)—— 已下线,保留为案例
 
@@ -1238,7 +1261,7 @@ postinstall 才是装 uv、Python 和 kernel 的地方,而且它照样导出同�
 版本序列跟 npm 的不必一致 —— 这里 release 0.7.2 就是 npm 0.84.1。
 
 **安装该放在镜像里,而且这有安全收益。**框架在镜像构建期装好,它的字节就被镜像
-哈希覆盖了 —— 也就是进链上 `validFrameworkHashes` 的那个度量。openclaw 和
+哈希覆盖了 —— 也就是登记在链上镜像名单（信任合约）里的那个度量。openclaw 和
 hermes 在首次 Start 时重新钉版本,所以那些 agent 实际跑的框架是启动那一刻
 registry 给什么就是什么,**在度量之外**。因此这个 adapter 运行时不装任何东西:
 Start 校验已安装版本与 binding 是否一致,不一致就明确失败;并且不实现
@@ -1256,7 +1279,7 @@ skill、会话、存储、乃至系统提示本身,每一样都是独立版本�
 (约 50 个)。跟 openclaw、hermes、prime-agent 不同,它没有"框架自己的那个配置
 文件"这种东西——组合本身(装哪些插件、什么顺序、什么配置)就是平台结构:它放在
 [0g-harness](https://github.com/0gfoundation/0g-harness)(`src/composition.mjs`)
-里,由 0g-harness 镜像在构建时安装。状态那一半
+里,从 sealed 按哈希装上的官方版本包运行(镜像不带包)。状态那一半
 ——`Roles`、`Defaults`、`Restore`/`EvolutionFor`、`HandleLegacy["persona"]`、
 `FrameworkFacts`——在 `conformance.Run` 之外还配了 persona 注入的专项测试;
 settings 通道落地后,渲染本身也有专项测试(`harness/settings_test.go`:幂等、
@@ -1296,6 +1319,21 @@ overlay 解析、以及从已下线 role 回收 pin)。
    是目录包(`<name>/SKILL.md`),要么是扁平文件(`<name>.md`)——这个角色两种
    entry 形状都追踪。provider 自己保留的子目录(`.system`)被排除,跟 hermes
    排除 `skills/.bundled_manifest` 是同一个套路。
+5. **`memory/`** —— `DirectoryManifest`,指向 `$DSH_HOME/memory/`,agent 的私有
+   长期记忆(只在 owner 自己的会话和任务里用):每条记忆一个 `<name>.md`,直接放在
+   这个目录里,再加上索引 `MEMORY.md`,每个文件一个 entry——和 hermes 的
+   `memories/` 同一种形状。子目录、点文件、链接和空文件不追踪(`harness/memory.go`)。
+   DSH 自己没有记忆;harness 用自己的系统提示段把记忆(超过一定大小时改为索引)放进
+   模型上下文,每个模型步骤都重新读取(0g-harness `src/memory.mjs`)。这个角色出现
+   之前铸造的 agent 链上没有这一项:bootstrap round B 落下空的默认值,它和空目录的
+   演化结果相同,所以 agent 写下第一条记忆之前什么都不会提交。和人设、skills 一样,
+   它是 agent 自己写的内容(`KeepsUncommitted`)。
+6. **`memory-public/`** —— 同样的形状,指向 `$DSH_HOME/memory-public/`:agent 的
+   公开长期记忆,在 owner 会话之外也可以用的知识。harness 只在 owner 明确要求时
+   才写这里。两个角色里的每条记忆都写明确认它的 owner(`trusted_by`);只有它是
+   当前 owner(sealed 作为 `SEAL_OWNER` 传入)时 harness 才信任它,所以转让后前任
+   owner 的记忆不用改写就成了参考。可信度是 harness 的事:对 sealed 来说两个角色
+   都只是文件。默认值、缺失条目的恢复和 `KeepsUncommitted` 都和 `memory/` 一样。
 
 **动手写代码之前,第五个样本教会的一件关于范围的事。**DSH 是这里第一个
 **设计者主动邀请** agent 自己改写 harness 源码的框架——它有一段系统提示专门
@@ -1323,10 +1361,10 @@ skill、推理 pin),跟 openclaw、hermes 追踪的是同一个面;DSH 自己的
 因为 harness 进程里那个 `Agent` 对象本来就长期存活,一句普通的后续消息就已经
 能接上同一个 turn 的上下文,不需要另开一条应答通道。
 
-**进程那一半。**0g-harness(连同平台插件 `seal-tools`、`seal-guard`、
-`subagent-guard`)在进程内组出整棵插件树——不走 loader、不走 profile、不吃
-`$DSH_HOME` 的任何 patch 层;0g-harness 镜像在构建时装一个确定版本的 harness,依赖树
-锁定,所以组合跟着镜像哈希走,agent 改自己家目录也改不动下次启动挂什么。harness
+**进程那一半。**0g-harness(连同平台插件 `seal-tools`、`subagent-guard`)
+在进程内组出整棵插件树——不走 loader、不走 profile、不吃
+`$DSH_HOME` 的任何 patch 层;官方版本包装着一个确定版本的 harness,依赖树
+锁定,所以组合跟着包哈希走(包登记在信任合约的 harness 名单里),agent 改自己家目录也改不动下次启动挂什么。harness
 常驻一个 `Agent` 对象,owner 的轮次一次跑一个,每一轮的输出交给开启这一轮的一方:
 owner 的请求,或者(agent 自己开启的轮次,比如后台任务结束、提醒到点)收件箱。
 它对外提供 `/v1/chat/completions`(靠 `session/event` 的 `text-delta` 块做流式)、

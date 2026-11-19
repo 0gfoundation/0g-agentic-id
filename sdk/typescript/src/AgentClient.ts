@@ -19,6 +19,25 @@
 import { proofFromResponse, requestBytesOf, normalizedMethod, type TaskExchange } from './ServeSession';
 import type { ServeProof } from './types';
 
+/** What a task id the agent returns must look like to be handed out. */
+const TASK_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+/**
+ * Text from the agent (an activity label, an error it sent) made one plain
+ * line for display: escape sequences, control characters and bidi controls
+ * removed, so a program that prints it cannot have its terminal restyled.
+ */
+export function plainText(s: string): string {
+  return s
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u009b[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007\u001b\u009c]*(?:\u0007|\u001b\\|\u009c)?/g, '')
+    .replace(/\u001b[PX^_][^\u001b\u009c]*(?:\u001b\\|\u009c)?/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')
+    .replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');
+}
+
 /**
  * One agent-registered service, as listed in `/hello`'s `services` array.
  * These are exact `/api/*` paths the agent's own code serves; they are not
@@ -121,6 +140,189 @@ export interface ChatMessage {
 }
 
 /**
+ * An image sent with a message (`images` on {@link AgentClient.chat} /
+ * {@link AgentClient.chatStream}): PNG, JPEG, WebP or GIF, its bytes in
+ * base64. 0g-harness takes at most 8 per message, 10 MiB each and 32 MiB
+ * together; other frameworks may ignore or refuse them.
+ */
+export interface ChatImage {
+  mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
+  data: string;
+  /** Its file name on the owner's side (`flag test.png`). Sent as the part's
+   *  `filename` only to an agent that says it reads one (0g-harness
+   *  `GET /v1/harness` → `features.image_names`): a model that cannot view
+   *  images gets the file under this name in `~/inbox`. */
+  name?: string;
+}
+
+/**
+ * What the agent's runtime says about a message it took (`onNotice`,
+ * 0g-harness): the owner's model cannot view images, so the images were saved
+ * as files in the agent's file inbox `~/inbox` instead; or the turn left files new or
+ * changed in the agent's `~/outbox`, for the owner to download
+ * ({@link AgentClient.downloadFile}).
+ */
+export interface ChatNotice {
+  imagesSavedAsFiles?: string[];
+  /** Names of files in the outbox (`downloadFile('outbox', name)`). */
+  outboxFiles?: string[];
+}
+
+/** A file the owner can download ({@link AgentClient.listFiles}). */
+export interface AgentFile {
+  name: string;
+  bytes: number;
+  /** ISO 8601. */
+  mtime: string;
+  /** Hex; given for files up to 4 MiB. */
+  sha256?: string;
+}
+
+/** Where a download comes from: what the agent handed over, or what the owner uploaded. */
+export type AgentFileDir = 'outbox' | 'inbox';
+
+/** A file the owner sent ({@link AgentClient.uploadFile}): where it landed. */
+export interface UploadedFile {
+  /** Absolute path in the agent's container (in its file inbox, `~/inbox`). */
+  path: string;
+  bytes: number;
+}
+
+/** What {@link AgentClient.steer} did with the owner's text. */
+export interface SteerResult {
+  /** true: read in the running owner turn `turn`, before its next model
+   *  call. false: no owner turn was running, so it is an ordinary turn,
+   *  `queued` (follow it like any response); `reason` says why. */
+  merged: boolean;
+  /** The steered message's id, for {@link AgentClient.steerState} (merged only). */
+  id?: string;
+  turn?: string;
+  queued?: string;
+  reason?: string;
+}
+
+/** One of the owner's sessions on 0g-harness (zgh-style; {@link AgentClient.sessions}). */
+export interface AgentSession {
+  id: string;
+  object?: 'session';
+  /** owner: the default `owner-chat`; session: one the owner opened; task: a task's session. */
+  kind: 'owner' | 'session' | 'task';
+  title: string;
+  /** running: a turn is open. idle: loaded. stored: unloaded, resumes on its next prompt. */
+  state: 'running' | 'idle' | 'stored';
+  created_at: number;
+  updated_at: number;
+  forked_from?: string;
+}
+
+/** What {@link AgentClient.promptSession} did with a message. */
+export interface SessionPromptResult {
+  /** false: the message is the session's next turn, record `id` (follow it
+   *  with {@link AgentClient.followTask}). true (mode steer): read in the
+   *  running turn `turn`, before its next model call; `id` is the steer's id. */
+  merged: boolean;
+  id: string;
+  session?: string;
+  turn?: string;
+  /** Why a steer was queued instead (no turn running). */
+  reason?: string;
+}
+
+/** A task's state on 0g-harness (zgh's task model; {@link AgentClient.getTask}). */
+export type HarnessTaskState = 'queued' | 'working' | 'idle' | 'needs-input' | 'done' | 'failed' | 'archived';
+
+/**
+ * One outcome record a task's agent made: `raise_question` and
+ * `request_action` end in `needs-input` and close when the owner answers;
+ * `report_complete` ends in `done` and closes when the next run starts.
+ * `arguments` is the agent's own text: clean it before printing it.
+ */
+export interface HarnessTaskRecord {
+  id: number;
+  run: number;
+  tool: string;
+  ends_in: 'needs-input' | 'done';
+  closes_on: 'answer' | 'next-run';
+  arguments: Record<string, unknown>;
+  at: number;
+  state: 'open' | 'closed';
+  closed?: { how: string; at: number };
+}
+
+/** What the task feed carries of a task ({@link AgentClient.taskFeed}). */
+export interface HarnessTaskSummary {
+  id: string;
+  state: HarnessTaskState;
+  /** For `failed`: `error` (the last turn failed, or the watchdog stopped the run) or `interrupted` (a restart). */
+  reason: string | null;
+  /** The latest run's records. */
+  outcome: HarnessTaskRecord[];
+  /** The done record that sealed a working run, else null. */
+  sealed: number | null;
+  /** The records still open. */
+  records: HarnessTaskRecord[];
+  runs: { count: number; last?: { started_at: number; ended_at?: number; end?: string; error?: string; records: number } };
+  updated_at: number;
+  /** In the feed: what changed (`created`, `run-started`, `recorded`, `input`, `run-ended`, `cancelled`, `archived`). */
+  change?: string;
+}
+
+/** A task on 0g-harness: a piece of work with its own session, workspace, state and outcome records. */
+export interface HarnessTask extends HarnessTaskSummary {
+  object?: 'task';
+  title: string;
+  prompt: string;
+  workspace: { path: string };
+  session_id: string;
+  /** Inputs waiting for the next run. */
+  pending: number;
+  outcome_tools: string[];
+  metadata: Record<string, unknown>;
+  created_at: number;
+  queued_at?: number;
+}
+
+/** What {@link AgentClient.createTask} takes. */
+export interface CreateTaskOptions {
+  prompt: string;
+  /** `task-` and 1 to 63 lowercase letters, digits or `-`: makes the create idempotent. */
+  id?: string;
+  title?: string;
+  /** An existing directory under the agent's home; default `~/tasks/<id>`. */
+  workspace?: { dir: string };
+  /** Added to the task agent's system prompt. */
+  instructions?: string;
+  /** true (all built-ins, the default), false (none), or built-in names. */
+  outcome_tools?: boolean | string[];
+  metadata?: Record<string, unknown>;
+}
+
+/** What {@link AgentClient.taskInput} did with the input. */
+export interface TaskInputResult extends HarnessTask {
+  /** current-run: steered into the running turn (`steer` is its id), or the run's next turn.
+   *  next-run: the run is sealed by a done record. queued: it starts or waits for a run. */
+  delivery: 'current-run' | 'next-run' | 'queued';
+  steer?: string;
+}
+
+/** One event of {@link AgentClient.taskFeed}: a task's state, or `ready` once every task was sent. */
+export type HarnessTaskFeedEvent = { type: 'task'; task: HarnessTaskSummary } | { type: 'ready' };
+
+/** What became of a steered text ({@link AgentClient.steerState}). */
+export interface SteerState {
+  id: string;
+  /** pending: not read yet. merged: read in `turn`. turn: the turn it was
+   *  meant for ended first, so it opened `turn`, an owner turn of its own.
+   *  dropped: an interrupt, or a cancel of its turn, came first (a cancel
+   *  drops them from 0g-harness #12 on; an older one leaves them pending and
+   *  gives them to the next turn). */
+  state: 'pending' | 'merged' | 'turn' | 'dropped';
+  turn: string;
+  /** The text as sent (0g-harness #12 on). */
+  text?: string;
+}
+
+/**
  * Snapshot of one long-running task (a "response" in OpenAI Responses API
  * terms) on the agent. Returned by {@link AgentClient.task} /
  * {@link AgentClient.cancelTask}.
@@ -131,6 +333,8 @@ export interface AgentTask {
   /** Assistant text produced so far (full text once completed). */
   output_text: string;
   error?: { message: string };
+  /** Runtime notices about the message that opened it (0g-harness). */
+  harness?: { images_saved_as_files?: string[]; outbox_files?: string[] };
 }
 
 export interface ChatCompletion {
@@ -139,15 +343,16 @@ export interface ChatCompletion {
 }
 
 /**
- * One unit of work on the agent, as its task list shows it
- * ({@link AgentClient.tasks}): a turn of its conversation, a background
+ * One thing that runs or ran on the agent, as its activity list shows it
+ * ({@link AgentClient.activities}): a turn of its conversation, a background
  * command, or a subagent. `actor` says who does the work, `trigger` who asked
- * for it.
+ * for it. ("Task" is kept for zgh-style tasks: a unit of work with its own
+ * session, state and outcome.)
  */
-export interface AgentTaskInfo {
+export interface AgentActivityInfo {
   /** A turn: `resp_…` (the id {@link AgentClient.task} and
-   *  {@link AgentClient.followTask} take). A command: `bash-N`. A subagent:
-   *  `subagent-N`. */
+   *  {@link AgentClient.followTask} take). A command: `bash-<hex>`. A
+   *  subagent: its session id (a UUID). */
   id: string;
   type: 'turn' | 'command' | 'subagent';
   status: AgentTask['status'];
@@ -156,7 +361,14 @@ export interface AgentTaskInfo {
   /** Who asked. A turn: `user` | `job` | `schedule` | `plugin`. A command or
    *  a subagent: `agent` (the main agent started it). */
   trigger: string;
-  /** What the task is: the prompt, the job notice, the reminder's text. */
+  /** A turn: the session it ran in (`owner-chat`, another of the owner's, a task's). */
+  session?: string;
+  /** A command or subagent (0g-harness #12 on): the turn that started it,
+   *  who asked for that turn (`user` for an owner turn) and its session. */
+  parent_turn?: string;
+  parent_trigger?: string;
+  parent_session?: string;
+  /** What the activity is: the prompt, the job notice, the reminder's text. */
   label: string;
   /** Unix seconds. */
   created_at: number;
@@ -166,16 +378,22 @@ export interface AgentTaskInfo {
   detail?: string;
   /** Notices that reached the agent while this turn ran, merged into it. */
   merged_notices?: string[];
-  /** {@link AgentClient.taskInfo} only: a turn's text, or a finished
+  /** {@link AgentClient.activity} only: a turn's text, or a finished
    *  subagent's final answer. A command's output is never returned. */
   output_text?: string;
 }
 
-/** What stopping one task did ({@link AgentClient.stopTask}). */
-export interface AgentTaskStop {
+/** @deprecated Renamed {@link AgentActivityInfo}. */
+export type AgentTaskInfo = AgentActivityInfo;
+
+/** What stopping one activity did ({@link AgentClient.stopActivity}). */
+export interface AgentActivityStop {
   id: string;
   outcome: 'cancelled' | 'already-finished' | 'not-running';
 }
+
+/** @deprecated Renamed {@link AgentActivityStop}. */
+export type AgentTaskStop = AgentActivityStop;
 
 /**
  * The words of a turn the agent opened itself (a background job finished, a
@@ -231,8 +449,8 @@ export interface AgentSchedule {
  *
  * | type | data |
  * |---|---|
- * | `turn.queued` / `turn.started` / `turn.completed` / `turn.failed` / `turn.cancelled` | an {@link AgentTaskInfo} (a turn) |
- * | `task.updated` | an {@link AgentTaskInfo} (a command or a subagent) |
+ * | `turn.queued` / `turn.started` / `turn.completed` / `turn.failed` / `turn.cancelled` | an {@link AgentActivityInfo} (a turn) |
+ * | `activity.updated` | an {@link AgentActivityInfo} (a command or a subagent); a runtime from before the rename sends it as `task.updated` |
  * | `inbox.message` | an {@link AgentInboxMessage} |
  * | `inbox.read` | `{ read_through }` |
  * | `schedule.changed` | `{ operation: "create" \| "delete" \| "dispatch", id }` |
@@ -240,7 +458,7 @@ export interface AgentSchedule {
  *
  * `reset` means the agent could not serve the position asked for (it is
  * older than the agent's in-memory window, or from before a `/clear`):
- * re-read the inbox, tasks and schedules; the feed carries on from `cursor`.
+ * re-read the inbox, activities and schedules; the feed carries on from `cursor`.
  * A type this list does not name is passed through as it came.
  */
 export interface AgentEvent {
@@ -301,7 +519,14 @@ export interface AgentClient {
    * the agent; the completion is reassembled before returning, so the shape is
    * a plain {@link ChatCompletion}.
    */
-  chat?(messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }): Promise<ChatCompletion>;
+  chat?(messages: ChatMessage[], opts?: {
+    model?: string;
+    signal?: AbortSignal;
+    /** Images sent with the last user message (see {@link ChatImage}). */
+    images?: ChatImage[];
+    /** The runtime's notices about this message (see {@link ChatNotice}). */
+    onNotice?: (notice: ChatNotice) => void;
+  }): Promise<ChatCompletion>;
   /**
    * Like {@link chat}, but yields each content delta as it is generated — for
    * a live-typing UI. Present under the same conditions as `chat`.
@@ -317,6 +542,10 @@ export interface AgentClient {
   chatStream?(messages: ChatMessage[], opts?: {
     model?: string;
     signal?: AbortSignal;
+    /** Images sent with the last user message (see {@link ChatImage}). */
+    images?: ChatImage[];
+    /** The runtime's notices about this message (see {@link ChatNotice}). */
+    onNotice?: (notice: ChatNotice) => void;
     /** Tool-activity progress, when the agent's bridge streams it (SSE
      *  ": activity tool/call <name>" comments — 0g-harness does). Labels like
      *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
@@ -406,29 +635,128 @@ export interface AgentClient {
    * Everything running or that has run on the agent, newest first: turns,
    * background commands and subagents, with who does each (`actor`) and who
    * asked (`trigger`). `status` filters: `"active"` (queued or running) or one
-   * status name. Present only when the agent declares a `kind: "tasks"` route
-   * and this handle holds the owner token.
+   * status name. Present only when the agent declares a `kind: "activities"`
+   * route (or, on a runtime from before the rename, `kind: "tasks"`) and this
+   * handle holds the owner token. Reads `/v1/activities`, and the deprecated
+   * `/v1/tasks` when an older harness answers 404 there.
    */
-  tasks?(opts?: { status?: string; limit?: number }): Promise<AgentTaskInfo[]>;
-  /** One task of {@link tasks}, by id, with its `output_text` where there
-   *  is one. Present under the same conditions as {@link tasks}. */
-  taskInfo?(id: string): Promise<AgentTaskInfo>;
+  activities?(opts?: { status?: string; limit?: number }): Promise<AgentActivityInfo[]>;
+  /** One activity of {@link activities}, by id, with its `output_text` where
+   *  there is one. Present under the same conditions as {@link activities}. */
+  activity?(id: string): Promise<AgentActivityInfo>;
   /**
-   * Stop one task of {@link tasks}: a turn is cancelled (a queued one never
-   * starts), a command or subagent is killed. Already-executed actions are
-   * not rolled back. Present under the same conditions as {@link tasks}.
+   * Stop one activity of {@link activities}: a turn is cancelled (a queued
+   * one never starts), a command or subagent is killed. Already-executed
+   * actions are not rolled back. Present under the same conditions as
+   * {@link activities}.
    */
-  stopTask?(id: string): Promise<AgentTaskStop>;
+  stopActivity?(id: string): Promise<AgentActivityStop>;
   /** Stop everything: queued turns first, then the running turn, then every
    *  running command and subagent. Present under the same conditions as
-   *  {@link tasks}. */
-  stopAllTasks?(): Promise<AgentTaskStop[]>;
+   *  {@link activities}. */
+  stopAllActivities?(): Promise<AgentActivityStop[]>;
+  /** @deprecated Renamed {@link activities}. */
+  tasks?(opts?: { status?: string; limit?: number }): Promise<AgentActivityInfo[]>;
+  /** @deprecated Renamed {@link activity}. */
+  taskInfo?(id: string): Promise<AgentActivityInfo>;
+  /** @deprecated Renamed {@link stopActivity}. */
+  stopTask?(id: string): Promise<AgentActivityStop>;
+  /** @deprecated Renamed {@link stopAllActivities}. */
+  stopAllTasks?(): Promise<AgentActivityStop[]>;
   /**
    * The reminders the agent set for itself. `enabled: false` means the
    * agent's reminders are switched off. Present only when the agent declares
    * a `kind: "schedules"` route and this handle holds the owner token.
    */
   schedules?(): Promise<{ enabled: boolean; data: AgentSchedule[] }>;
+  /**
+   * Send the agent a file: it lands in the agent's file inbox `~/inbox` (a new
+   * name, never over an existing file; container-local, lost on a reset),
+   * and the agent reads it with its own tools — tell it the returned path.
+   * At most 25 MiB. Present only when the agent declares a `kind: "files"`
+   * route (0g-harness) and this handle holds the owner token.
+   */
+  uploadFile?(name: string, data: Uint8Array): Promise<UploadedFile>;
+  /**
+   * The owner's word for the turn already running: the agent reads it before
+   * that turn's next model call — when the current model answer or tool call
+   * finishes, not in the middle of a long command. With no owner turn
+   * running it is queued as an ordinary turn (`merged: false`). Present only
+   * when the agent declares a `kind: "steer"` route (0g-harness) and this
+   * handle holds the owner token.
+   */
+  steer?(text: string): Promise<SteerResult>;
+  /**
+   * The owner's sessions, most recently used first (0g-harness, kind
+   * `sessions`): `owner-chat` (the default, behind chat/Responses) and the
+   * ones the owner opened. Each is its own conversation; all share the
+   * agent's persona, skills, memory and credentials.
+   */
+  sessions?(): Promise<AgentSession[]>;
+  /** One session. Present with {@link sessions}. */
+  session?(id: string): Promise<AgentSession>;
+  /**
+   * Open a session: fresh, or a `fork` of another session's history (its
+   * first `at` events when given). `resume` loads an existing one instead.
+   * Present with {@link sessions}.
+   */
+  createSession?(opts?: { title?: string; fork?: string; at?: number; resume?: string }): Promise<AgentSession>;
+  /**
+   * Send a session a message: its next turn (`mode: 'next'`, the default),
+   * or a steer into its running turn (`'steer'`). Present with {@link sessions}.
+   */
+  promptSession?(id: string, text: string, opts?: { mode?: 'next' | 'steer' }): Promise<SessionPromptResult>;
+  /** Stop a session's running turn. Present with {@link sessions}. */
+  cancelSession?(id: string): Promise<{ cancelled: string | null; session: string }>;
+  /**
+   * Hand the agent a task (0g-harness, zgh's task model): it runs in a
+   * session and workspace of its own and ends each run with an outcome
+   * record. With an `id` already taken, the existing task comes back with
+   * `created: false`. Present only when the agent declares the `tasks` and
+   * `task-feed` kinds and this handle holds the owner token.
+   */
+  createTask?(opts: CreateTaskOptions): Promise<{ task: HarnessTask; created: boolean }>;
+  /** Tasks, newest first; `state` and `metadata` filter. Present with {@link createTask}. */
+  listTasks?(opts?: { state?: HarnessTaskState | HarnessTaskState[]; metadata?: Record<string, string>; limit?: number }): Promise<HarnessTask[]>;
+  /** One task. Present with {@link createTask}. */
+  getTask?(id: string): Promise<HarnessTask>;
+  /**
+   * Input for a task: to a resting task it starts a run; to a working one
+   * `mode: 'steer'` (the default) reaches the running turn and `'next'` is
+   * the run's next turn (the next run's once a done record sealed it). It
+   * answers the task's open questions. Present with {@link createTask}.
+   */
+  taskInput?(id: string, text: string, opts?: { mode?: 'steer' | 'next' }): Promise<TaskInputResult>;
+  /** Stop a task's run (or take it out of the queue); input waiting is dropped. Present with {@link createTask}. */
+  cancelTaskRun?(id: string): Promise<HarnessTask>;
+  /** Archive a task: stopped, records closed, agent disposed; its workspace stays. Present with {@link createTask}. */
+  archiveTask?(id: string): Promise<HarnessTask>;
+  /**
+   * Every task's changes: one `task` event per task not archived, then
+   * `ready`, then one per change. One connection: it ends when the stream
+   * does (reconnect and re-read on `ready`). Present with {@link createTask}.
+   */
+  taskFeed?(opts?: { signal?: AbortSignal }): AsyncGenerator<HarnessTaskFeedEvent>;
+  /** What became of a text {@link steer} merged. Present with {@link steer}. */
+  steerState?(id: string): Promise<SteerState>;
+  /**
+   * The files the owner can download, newest first: what the agent put in its
+   * `~/outbox` (the default) or what the owner sent (`'inbox'`, the file inbox
+   * `~/inbox` — not the message inbox, {@link AgentClient.inbox}). Both are
+   * container-local and lost on a reset. Present only when the agent declares
+   * a `kind: "files"` route (0g-harness) and this handle holds the owner token;
+   * an agent whose runtime predates downloads answers with an error saying so.
+   */
+  listFiles?(dir?: AgentFileDir): Promise<AgentFile[]>;
+  /** One file's bytes (at most 50 MiB). See {@link AgentClient.listFiles}. */
+  downloadFile?(dir: AgentFileDir, name: string): Promise<Uint8Array>;
+  /**
+   * Remove one file from the agent's outbox or file inbox (0g-harness
+   * `DELETE /v1/files/{dir}/{name}`). `deleted`: it is gone; `missing`: there
+   * was no such file; `unsupported`: this agent's runtime has no delete
+   * route (an older image).
+   */
+  deleteFile?(dir: AgentFileDir, name: string): Promise<'deleted' | 'missing' | 'unsupported'>;
 }
 
 /** Longest-prefix match over declared routes, or undefined if none match. */
@@ -522,17 +850,73 @@ function chunkDelta(chunk: Record<string, unknown>): { role?: string; content: s
 }
 
 /** Fold an SSE chat stream into a single reassembled {@link ChatCompletion}. */
-async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<ChatCompletion> {
+async function collectChatStream(body: ReadableStream<Uint8Array>, onComment?: (c: string) => void): Promise<ChatCompletion> {
   let content = '';
   let role = 'assistant';
   let last: Record<string, unknown> = {};
-  for await (const chunk of iterSseChunks(body)) {
+  for await (const chunk of iterSseChunks(body, onComment)) {
     last = chunk;
     const d = chunkDelta(chunk);
     if (d.role) role = d.role;
     content += d.content;
   }
   return { ...last, choices: [{ message: { role, content } }] } as ChatCompletion;
+}
+
+// Base64 without Node's Buffer, so the module runs in browsers too.
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+const imageUrl = (im: ChatImage): string => `data:${im.mediaType};base64,${im.data}`;
+
+/**
+ * The messages with `images` on the last user message, in the request's own
+ * shape: chat/completions `image_url` parts, or Responses `input_text` /
+ * `input_image` parts. No images: the messages as they are.
+ */
+export function withImages(messages: ChatMessage[], images: ChatImage[] | undefined, shape: 'chat' | 'responses', names = false): unknown[] {
+  if (!images?.length) return messages;
+  let i = messages.length - 1;
+  while (i >= 0 && messages[i].role !== 'user') i--;
+  const text = i >= 0 ? messages[i].content : '';
+  // `filename` only where the agent reads it (`names`): another runtime may refuse a field it does not know.
+  const named = (im: ChatImage): { filename?: string } => (names && im.name ? { filename: im.name } : {});
+  const content = shape === 'chat'
+    ? [{ type: 'text', text }, ...images.map((im) => ({ type: 'image_url', image_url: { url: imageUrl(im) }, ...named(im) }))]
+    : [{ type: 'input_text', text }, ...images.map((im) => ({ type: 'input_image', image_url: imageUrl(im), ...named(im) }))];
+  const out: unknown[] = messages.slice();
+  if (i >= 0) out[i] = { role: 'user', content };
+  else out.push({ role: 'user', content });
+  return out;
+}
+
+/** The notice an SSE comment carries (`: notice images_saved_as_files [...]`, `: notice outbox_files [...]`), if any. */
+function noticeOf(comment: string): ChatNotice | undefined {
+  const m = /^notice (images_saved_as_files|outbox_files) (\[.*\])$/.exec(comment);
+  if (!m) return undefined;
+  try {
+    const items = JSON.parse(m[2]) as unknown;
+    if (!Array.isArray(items) || !items.every((p) => typeof p === 'string')) return undefined;
+    const clean = items.map((p) => plainText(p));
+    return m[1] === 'outbox_files' ? { outboxFiles: clean } : { imagesSavedAsFiles: clean };
+  } catch { /* not a notice */ }
+  return undefined;
+}
+
+/** The notice a buffered reply or a Responses record carries in `harness`, if any. */
+function harnessNotice(harness: AgentTask['harness'] | undefined): ChatNotice | undefined {
+  if (!harness) return undefined;
+  const n: ChatNotice = {};
+  const strings = (v: unknown): string[] | undefined =>
+    Array.isArray(v) && v.length && v.every((p) => typeof p === 'string') ? v.map((p) => plainText(p)) : undefined;
+  const images = strings(harness.images_saved_as_files);
+  const outbox = strings(harness.outbox_files);
+  if (images) n.imagesSavedAsFiles = images;
+  if (outbox) n.outboxFiles = outbox;
+  return images || outbox ? n : undefined;
 }
 
 /**
@@ -659,8 +1043,31 @@ export function makeAgentClient(params: {
   // deploy. There's no framework-agnostic default (/hello doesn't declare it),
   // so omit the field when the caller doesn't set one rather than sending a
   // bogus value the framework rejects.
-  const chatBody = (messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }) =>
-    JSON.stringify(opts?.model ? { model: opts.model, messages, stream: true } : { messages, stream: true });
+  const chatBody = async (messages: ChatMessage[], opts?: { model?: string; images?: ChatImage[] }) => {
+    const sent = withImages(messages, opts?.images, 'chat', await imageNames(opts?.images));
+    return JSON.stringify(opts?.model ? { model: opts.model, messages: sent, stream: true } : { messages: sent, stream: true });
+  };
+
+  // What the agent's runtime says it reads (0g-harness `GET /v1/harness`,
+  // `features`), asked once; null where there is no such route.
+  let featuresAsked: Promise<Record<string, unknown> | null> | null = null;
+  const harnessFeatures = (): Promise<Record<string, unknown> | null> => {
+    const r = routes.find((x) => x.kind === 'chat') ?? routes.find((x) => x.kind === 'responses');
+    if (!r || !canAuth) return Promise.resolve(null);
+    const path = r.kind === 'chat' ? `${r.prefix.replace(/\/?$/, '/')}harness` : r.prefix.replace(/responses\/?$/, 'harness');
+    featuresAsked ??= doFetch(path, { signal: AbortSignal.timeout(5000) })
+      .then(async (res) => {
+        if (res.status === 404) return null; // not a harness: it never will be
+        if (!res.ok) throw new Error(`harness: HTTP ${res.status}`);
+        const f = ((await res.json()) as { features?: unknown }).features;
+        return f && typeof f === 'object' ? f as Record<string, unknown> : null;
+      })
+      .catch(() => { featuresAsked = null; return null; }); // asked again next time
+    return featuresAsked;
+  };
+  /** Whether image parts carry their file name: only where the agent says it reads it. */
+  const imageNames = async (images?: ChatImage[]): Promise<boolean> =>
+    !!images?.some((im) => im.name) && (await harnessFeatures())?.image_names === true;
 
   const chat = routes.find((r) => r.kind === 'chat');
   if (chat && canAuth) {
@@ -683,7 +1090,7 @@ export function makeAgentClient(params: {
           return { aborted: !!j.aborted, note: j.note };
         }
         if (r.status === 404) return { aborted: false, note: 'no bridge endpoint — this framework stops its turn when the stream disconnects' };
-        throw new Error(`interrupt: HTTP ${r.status}: ${await r.text()}`);
+        throw new Error(`interrupt: HTTP ${r.status}: ${plainText(await r.text())}`);
       } catch (e) {
         if ((e as Error).message.startsWith('interrupt:')) throw e;
         return { aborted: false, note: 'interrupt transport failed — this framework stops its turn when the stream disconnects' };
@@ -694,25 +1101,28 @@ export function makeAgentClient(params: {
       const r = await doFetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: chatBody(messages, opts),
+        body: await chatBody(messages, opts),
         signal: opts?.signal,
       });
-      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const ct = r.headers.get('content-type') ?? '';
       if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
-        return (await r.json()) as ChatCompletion; // server didn't stream → plain JSON
+        const full = (await r.json()) as ChatCompletion & { harness?: AgentTask['harness'] };
+        const n = harnessNotice(full.harness);
+        if (n) opts?.onNotice?.(n);
+        return full; // server didn't stream → plain JSON
       }
-      return collectChatStream(r.body);
+      return collectChatStream(r.body, opts?.onNotice ? (c) => { const n = noticeOf(c); if (n) opts.onNotice!(n); } : undefined);
     };
 
     client.chatStream = async function* (messages, opts) {
       const r = await doFetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: chatBody(messages, opts),
+        body: await chatBody(messages, opts),
         signal: opts?.signal,
       });
-      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const ct = r.headers.get('content-type') ?? '';
       if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
         // Server didn't stream — yield the whole reply as one delta. An EMPTY
@@ -731,8 +1141,12 @@ export function makeAgentClient(params: {
       // (feedback.md F15)
       let sawContent = false;
       let streamErr: string | null = null;
-      const onComment = opts?.onActivity
-        ? (c: string): void => { if (c.startsWith('activity ')) opts.onActivity!(c.slice(9)); }
+      const onComment = opts?.onActivity || opts?.onNotice
+        ? (c: string): void => {
+          if (c.startsWith('activity ')) opts.onActivity?.(plainText(c.slice(9)));
+          const n = noticeOf(c);
+          if (n) opts.onNotice?.(n);
+        }
         : undefined;
       let lastThinkingAt = 0;
       const thinking = (): void => {
@@ -749,8 +1163,8 @@ export function makeAgentClient(params: {
           if (opts?.onActivity) {
             const tool = (chunk as { tool_name?: string }).tool_name ?? '';
             if (tool === '_thinking') thinking();
-            else if (ev === 'hermes.tool.progress') { if (tool) opts.onActivity(`tool/call ${tool}`); }
-            else opts.onActivity(tool ? `${ev.replace(/^hermes\./, '')} ${tool}` : ev.replace(/^hermes\./, ''));
+            else if (ev === 'hermes.tool.progress') { if (tool) opts.onActivity(plainText(`tool/call ${tool}`)); }
+            else opts.onActivity(plainText(tool ? `${ev.replace(/^hermes\./, '')} ${tool}` : ev.replace(/^hermes\./, '')));
           }
           continue;
         }
@@ -763,7 +1177,7 @@ export function makeAgentClient(params: {
           const delta = choice?.delta as { tool_calls?: Array<{ function?: { name?: string } }> } | undefined;
           for (const tc of delta?.tool_calls ?? []) {
             const fn = tc?.function?.name;
-            if (fn) opts.onActivity(`tool/call ${fn}`);
+            if (fn) opts.onActivity(plainText(`tool/call ${fn}`));
           }
         }
         const d = chunkDelta(chunk);
@@ -772,7 +1186,7 @@ export function makeAgentClient(params: {
       if (!sawContent) {
         throw new Error(
           streamErr
-            ? `chat: upstream error: ${streamErr}`
+            ? `chat: upstream error: ${plainText(String(streamErr))}`
             : 'chat: the stream ended without any output — the agent-side model call likely failed (see /agentlog)',
         );
       }
@@ -795,7 +1209,7 @@ export function makeAgentClient(params: {
 
     const taskSnapshot = async (id: string): Promise<AgentTask> => {
       const r = await doFetch(`${rPrefix}/${id}`);
-      if (!r.ok) throw new Error(`task: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`task: HTTP ${r.status}: ${plainText(await r.text())}`);
       return (await r.json()) as AgentTask;
     };
 
@@ -846,8 +1260,8 @@ export function makeAgentClient(params: {
 
     const lostAgent = (id: string | undefined, why: string): Error =>
       new Error(
-        `task ${id}: lost the agent while following (${why}) — ` +
-        `the task may still be running; re-attach with followTask("${id}")`,
+        `task ${plainText(String(id))}: lost the agent while following (${plainText(why)}) — ` +
+        `the task may still be running; re-attach with followTask("${plainText(String(id))}")`,
       );
 
     async function* followResponse(args: {
@@ -855,6 +1269,7 @@ export function makeAgentClient(params: {
       startingAfter?: number;
       signal?: AbortSignal;
       onActivity?: (label: string) => void;
+      onNotice?: (notice: ChatNotice) => void;
     }): AsyncGenerator<string> {
       const id = args.id;
       let seq = args.startingAfter ?? 0;
@@ -894,7 +1309,7 @@ export function makeAgentClient(params: {
           let res: Response;
           try {
             const r = await doFetch(`${rPrefix}/${id}?stream=true&starting_after=${seq}`, { signal: attempt.signal });
-            if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+            if (!r.ok) throw new Error(`HTTP ${r.status}: ${plainText(await r.text())}`);
             res = r;
             lastByteAt = Date.now();
           } catch (e) {
@@ -935,7 +1350,7 @@ export function makeAgentClient(params: {
                 }
                 case 'response.activity': {
                   const label = (chunk as { label?: string }).label;
-                  if (args.onActivity && typeof label === 'string') args.onActivity(label);
+                  if (args.onActivity && typeof label === 'string') args.onActivity(plainText(label));
                   break;
                 }
                 case 'response.completed':
@@ -976,8 +1391,13 @@ export function makeAgentClient(params: {
         }
       }
 
+      // Notices known only when the turn ends (files it left in the outbox).
+      {
+        const n = harnessNotice(terminal.harness);
+        if (n?.outboxFiles) args.onNotice?.({ outboxFiles: n.outboxFiles });
+      }
       if (terminal.status === 'failed') {
-        throw new Error(`chat: ${terminal.error?.message ?? 'task failed'}`);
+        throw new Error(`chat: ${plainText(terminal.error?.message ?? 'task failed')}`);
       }
       if (terminal.status === 'cancelled') return; // owner stopped it — partial text already yielded
       if (!sawText) {
@@ -996,7 +1416,7 @@ export function makeAgentClient(params: {
       // returns the id in milliseconds, so every long-lived byte after that
       // travels on a GET we can always resume by id. One extra round trip
       // buys the guarantee that a task is never lost to a dropped connection.
-      const payload: Record<string, unknown> = { input: messages };
+      const payload: Record<string, unknown> = { input: withImages(messages, opts?.images, 'responses', await imageNames(opts?.images)) };
       if (opts?.model) payload.model = opts.model;
       if (opts?.thinking) payload.reasoning = { effort: opts.thinking };
       const r = await doFetch(rPrefix, {
@@ -1005,15 +1425,20 @@ export function makeAgentClient(params: {
         body: JSON.stringify(payload),
         signal: opts?.signal,
       });
-      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${plainText(await r.text())}`);
       const submitted = (await r.json()) as AgentTask;
       if (!submitted?.id) throw new Error('chat: the agent accepted the task but returned no id');
-      opts?.onTask?.(submitted.id);
+      const saved = harnessNotice(submitted.harness)?.imagesSavedAsFiles;
+      if (saved) opts?.onNotice?.({ imagesSavedAsFiles: saved });
+      // A task id is a name to re-attach with: one that is not a plain
+      // identifier is not handed out to be printed.
+      if (TASK_ID.test(submitted.id)) opts?.onTask?.(submitted.id);
       yield* followResponse({
         id: submitted.id,
         startingAfter: 0,
         signal: opts?.signal,
         onActivity: wrapActivity(opts?.onActivity),
+        onNotice: opts?.onNotice,
       });
     };
 
@@ -1032,12 +1457,12 @@ export function makeAgentClient(params: {
     });
     client.cancelTask = async (id) => {
       const r = await doFetch(`${rPrefix}/${id}/cancel`, { method: 'POST' });
-      if (!r.ok) throw new Error(`cancelTask: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`cancelTask: HTTP ${r.status}: ${plainText(await r.text())}`);
       return (await r.json()) as AgentTask;
     };
   }
 
-  // ── The agent's own work: inbox, live feed, tasks, reminders ─────────────
+  // ── The agent's own work: inbox, live feed, activities, reminders ────────
   //
   // An agent that works in the background (commands, subagents, reminders)
   // also opens turns by itself, and their words belong to no chat request.
@@ -1056,7 +1481,7 @@ export function makeAgentClient(params: {
   };
   const getJSON = async <T>(what: string, path: string): Promise<T> => {
     const r = await doFetch(path);
-    if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json()) as T;
   };
   const postJSON = async <T>(what: string, path: string, body?: unknown): Promise<T> => {
@@ -1064,7 +1489,7 @@ export function makeAgentClient(params: {
       method: 'POST',
       ...(body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
     });
-    if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${plainText(await r.text())}`);
     return (await r.json()) as T;
   };
 
@@ -1074,18 +1499,40 @@ export function makeAgentClient(params: {
     client.ackInbox = (through) => postJSON('ackInbox', `${inboxBase}/ack`, { through });
   }
 
-  const tasksBase = ownerBase('tasks');
-  if (tasksBase) {
-    client.tasks = async (opts) =>
-      (await getJSON<{ data: AgentTaskInfo[] }>('tasks', `${tasksBase}${query({ status: opts?.status, limit: opts?.limit })}`)).data;
-    client.taskInfo = (id) => getJSON<AgentTaskInfo>('taskInfo', `${tasksBase}/${encodeURIComponent(id)}`);
-    client.stopTask = async (id) => {
-      // `all` is a different request with a different answer.
-      if (id === 'all') throw new Error('stopTask: "all" is stopAllTasks()');
-      return postJSON<AgentTaskStop>('stopTask', `${tasksBase}/${encodeURIComponent(id)}/cancel`);
+  // The activity list: /v1/activities, or /v1/tasks, its old name, on a
+  // runtime from before the rename. A newer sealed can run an older harness
+  // package, which answers 404 on /v1/activities: then the old name. A
+  // runtime that declares `task-feed` serves zgh-style tasks on /v1/tasks
+  // instead (below), so there is no old name to fall back to.
+  const taskFeedBase = ownerBase('task-feed');
+  const activitiesBase = ownerBase('activities');
+  const legacyTasksBase = taskFeedBase ? undefined : ownerBase('tasks');
+  if (activitiesBase || legacyTasksBase) {
+    let base = (activitiesBase ?? legacyTasksBase) as string;
+    const activityCall = async <T>(what: string, rest: string, post = false): Promise<T> => {
+      const send = (b: string) => doFetch(`${b}${rest}`, post ? { method: 'POST' } : undefined);
+      let r = await send(base);
+      if (r.status === 404 && base === activitiesBase && legacyTasksBase) {
+        const old = await send(legacyTasksBase);
+        if (old.status !== 404) { base = legacyTasksBase; r = old; }
+      }
+      if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${plainText(await r.text())}`);
+      return (await r.json()) as T;
     };
-    client.stopAllTasks = async () =>
-      (await postJSON<{ data: AgentTaskStop[] }>('stopAllTasks', `${tasksBase}/all/cancel`)).data;
+    client.activities = async (opts) =>
+      (await activityCall<{ data: AgentActivityInfo[] }>('activities', query({ status: opts?.status, limit: opts?.limit }))).data;
+    client.activity = (id) => activityCall<AgentActivityInfo>('activity', `/${encodeURIComponent(id)}`);
+    client.stopActivity = async (id) => {
+      // `all` is a different request with a different answer.
+      if (id === 'all') throw new Error('stopActivity: "all" is stopAllActivities()');
+      return activityCall<AgentActivityStop>('stopActivity', `/${encodeURIComponent(id)}/cancel`, true);
+    };
+    client.stopAllActivities = async () =>
+      (await activityCall<{ data: AgentActivityStop[] }>('stopAllActivities', '/all/cancel', true)).data;
+    client.tasks = client.activities;
+    client.taskInfo = client.activity;
+    client.stopTask = client.stopActivity;
+    client.stopAllTasks = client.stopAllActivities;
   }
 
   const schedulesBase = ownerBase('schedules');
@@ -1093,6 +1540,113 @@ export function makeAgentClient(params: {
     client.schedules = async () => {
       const j = await getJSON<{ enabled?: boolean; data?: AgentSchedule[] }>('schedules', schedulesBase);
       return { enabled: j.enabled !== false, data: j.data ?? [] };
+    };
+  }
+
+  const filesBase = ownerBase('files');
+  if (filesBase) {
+    client.uploadFile = (name, data) => postJSON<UploadedFile>('uploadFile', filesBase, { name, content_base64: bytesToBase64(data) });
+    // Downloads share the files route; an agent whose runtime predates them
+    // does not list the GET endpoints, and the proxy answers 404.
+    const noDownloads = (what: string, status: number, text: string): Error =>
+      status === 404 && /no route|not found|404/i.test(text) && !/no file /.test(text)
+        ? new Error(`${what}: this agent's runtime does not serve downloads (update the agent)`)
+        : new Error(`${what}: HTTP ${status}: ${plainText(text)}`);
+    client.listFiles = async (dir = 'outbox') => {
+      const r = await doFetch(`${filesBase}${query({ dir })}`);
+      if (!r.ok) throw noDownloads('listFiles', r.status, await r.text());
+      const j = (await r.json()) as { data?: AgentFile[] };
+      return (j.data ?? []).map((f) => ({ ...f, name: plainText(String(f.name)) }));
+    };
+    client.downloadFile = async (dir, name) => {
+      if (dir !== 'outbox' && dir !== 'inbox') throw new Error('downloadFile: dir is outbox or inbox');
+      if (!name || name.includes('/') || name.includes('\\') || name.startsWith('.')) throw new Error('downloadFile: a file name is one path segment, without a leading dot');
+      const r = await doFetch(`${filesBase}/${dir}/${encodeURIComponent(name)}`);
+      if (!r.ok) throw noDownloads('downloadFile', r.status, await r.text());
+      return new Uint8Array(await r.arrayBuffer());
+    };
+    client.deleteFile = async (dir, name) => {
+      if (dir !== 'outbox' && dir !== 'inbox') throw new Error('deleteFile: dir is outbox or inbox');
+      if (!name || name.includes('/') || name.includes('\\') || name.startsWith('.')) throw new Error('deleteFile: a file name is one path segment, without a leading dot');
+      const r = await doFetch(`${filesBase}/${dir}/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      if (r.ok) return 'deleted';
+      const text = await r.text();
+      // The harness answers a missing file with "no file …"; anything else
+      // that is not found (or a method the route does not take) is a runtime
+      // without the delete route.
+      if (r.status === 404 && /no file /i.test(text)) return 'missing';
+      if (r.status === 404 || r.status === 405) return 'unsupported';
+      throw new Error(`deleteFile: HTTP ${r.status}: ${plainText(text)}`);
+    };
+  }
+
+  const steerBase = ownerBase('steer');
+  if (steerBase) {
+    client.steer = (text) => postJSON<SteerResult>('steer', steerBase, { text });
+    client.steerState = (id) => getJSON<SteerState>('steerState', `${steerBase}/${encodeURIComponent(id)}`);
+  }
+
+  const sessionsBase = ownerBase('sessions');
+  if (sessionsBase) {
+    const sid = (id: string): string => {
+      // owner-chat, an owner session, a task, or a session a schedule opened (DSH's `session-…` ids).
+      if (!/^(owner-chat|(sess|task)-[a-z0-9][a-z0-9-]{0,62}|session-[a-z0-9][a-z0-9-]{0,90})$/.test(id)) throw new Error(`not a session id: ${plainText(id)}`);
+      return `${sessionsBase}/${id}`;
+    };
+    const clean = (s: AgentSession): AgentSession => ({ ...s, title: plainText(String(s.title ?? '')) });
+    client.sessions = async () => ((await getJSON<{ data?: AgentSession[] }>('sessions', sessionsBase)).data ?? []).map(clean);
+    client.session = async (id) => clean(await getJSON<AgentSession>('session', sid(id)));
+    client.createSession = async (opts = {}) => clean(await postJSON<AgentSession>('createSession', sessionsBase, opts));
+    client.promptSession = (id, text, opts = {}) => postJSON<SessionPromptResult>('promptSession', `${sid(id)}/prompt`, { text, ...(opts.mode ? { mode: opts.mode } : {}) });
+    client.cancelSession = (id) => postJSON<{ cancelled: string | null; session: string }>('cancelSession', `${sid(id)}/cancel`);
+  }
+
+  // zgh-style tasks: /v1/tasks with the `task-feed` kind beside it (an older
+  // runtime's `tasks` kind alone is the activity list's old name).
+  const tasksBase = taskFeedBase ? ownerBase('tasks') : undefined;
+  if (tasksBase && taskFeedBase) {
+    const tid = (id: string): string => {
+      // A task's id, or a scheduled task's (the session id a schedule gave it).
+      if (!/^(task-[a-z0-9][a-z0-9-]{0,62}|session-[a-z0-9][a-z0-9-]{0,90})$/.test(id)) throw new Error(`not a task id: ${plainText(id)}`);
+      return `${tasksBase}/${id}`;
+    };
+    const clean = <T extends { title?: string }>(t: T): T => (t && typeof t.title === 'string' ? { ...t, title: plainText(t.title) } : t);
+    client.createTask = async (opts) => {
+      const r = await doFetch(tasksBase, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(opts) });
+      const text = await r.text();
+      let body: { error?: { code?: string }; task?: HarnessTask } | HarnessTask | undefined;
+      try { body = JSON.parse(text); } catch { body = undefined; }
+      if (r.status === 201 && body) return { task: clean(body as HarnessTask), created: true };
+      const taken = body as { error?: { code?: string }; task?: HarnessTask } | undefined;
+      if (r.status === 409 && taken?.error?.code === 'id-taken' && taken.task) return { task: clean(taken.task), created: false };
+      throw new Error(`createTask: HTTP ${r.status}: ${plainText(text)}`);
+    };
+    client.listTasks = async (opts = {}) => {
+      const q = new URLSearchParams();
+      for (const st of opts.state === undefined ? [] : Array.isArray(opts.state) ? opts.state : [opts.state]) q.append('state', st);
+      for (const [k, v] of Object.entries(opts.metadata ?? {})) q.set(`metadata.${k}`, v);
+      if (opts.limit !== undefined) q.set('limit', String(opts.limit));
+      const qs = q.toString();
+      return ((await getJSON<{ data?: HarnessTask[] }>('listTasks', `${tasksBase}${qs ? `?${qs}` : ''}`)).data ?? []).map(clean);
+    };
+    client.getTask = async (id) => clean(await getJSON<HarnessTask>('getTask', tid(id)));
+    client.taskInput = async (id, text, opts = {}) => clean(await postJSON<TaskInputResult>('taskInput', `${tid(id)}/input`, { text, ...(opts.mode ? { mode: opts.mode } : {}) }));
+    client.cancelTaskRun = async (id) => clean(await postJSON<HarnessTask>('cancelTaskRun', `${tid(id)}/cancel`));
+    client.archiveTask = async (id) => clean(await postJSON<HarnessTask>('archiveTask', `${tid(id)}/archive`));
+    client.taskFeed = async function* (opts) {
+      const res = await doFetch(taskFeedBase, opts?.signal ? { signal: opts.signal } : undefined);
+      if (!res.ok) throw new Error(`taskFeed: HTTP ${res.status}: ${plainText(await res.text())}`);
+      if (!res.body) throw new Error('taskFeed: expected an SSE stream from the task-feed route');
+      try {
+        for await (const chunk of iterSseChunks(res.body)) {
+          const { __sseEvent, ...data } = chunk as Record<string, unknown> & { __sseEvent?: string };
+          if (__sseEvent === 'ready') yield { type: 'ready' };
+          else if (__sseEvent === 'task' && typeof data.id === 'string') yield { type: 'task', task: data as unknown as HarnessTaskSummary };
+        }
+      } catch (err) {
+        if (opts?.signal?.aborted) return;
+        throw err;
+      }
     };
   }
 
@@ -1142,7 +1696,7 @@ export function makeAgentClient(params: {
             // A 4xx is an answer (the route is gone, the handle is refused),
             // and asking again gets the same one.
             if (res.status < 500 && res.status !== 408 && res.status !== 429) {
-              throw new Error(`events: HTTP ${res.status}: ${text}`);
+              throw new Error(`events: HTTP ${res.status}: ${plainText(text)}`);
             }
             res = undefined;
           }
@@ -1201,7 +1755,7 @@ export function makeAgentClient(params: {
         headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
         signal: AbortSignal.timeout(30_000),
       });
-      if (!r.ok) throw new Error(`logs: HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw new Error(`logs: HTTP ${r.status}: ${plainText(await r.text())}`);
       const text = await r.text();
       if (opts?.tail && opts.tail > 0) {
         return text.split('\n').slice(-opts.tail).join('\n');

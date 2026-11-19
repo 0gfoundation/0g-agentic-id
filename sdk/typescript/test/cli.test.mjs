@@ -169,16 +169,20 @@ test('--version: exit 0, semver on stdout', async () => {
   assert.match(r.stdout.trim(), /^\d+\.\d+\.\d+/);
 });
 
-test('non-command token routes to interactive, which rejects --json (exit 2, envelope)', async () => {
-  // There is no UNKNOWN_COMMAND anymore by design: any non-command token is
-  // an agent ref for the interactive default, and interactive has no --json.
+test('a word that is neither a command nor an agent ref: UNKNOWN_COMMAND (exit 2, envelope)', async () => {
   const r = await run(['nope', '--json']);
   assert.equal(r.code, 2);
   const env = JSON.parse(r.stdout);
   assert.equal(env.ok, false);
-  assert.equal(env.error.code, 'BAD_FLAG');
+  assert.equal(env.error.code, 'UNKNOWN_COMMAND');
   assert.ok(env.error.remedy.length > 0);
   assert.equal(r.stderr, '');
+});
+
+test('an agent ref with --json still reaches the shell, which has no --json (BAD_FLAG)', async () => {
+  const r = await run(['286', '--json']);
+  assert.equal(r.code, 2);
+  assert.equal(JSON.parse(r.stdout).error.code, 'BAD_FLAG');
 });
 
 test('unknown flag --json: exit 2, BAD_FLAG', async () => {
@@ -606,8 +610,10 @@ test('REPL `settings <id> others={…}`: the unquoted document is written as typ
 
 
 test('CLI provider switch saves pending reset without pushing an old credential', async () => {
+  // The agent's image predates model keys in cred: its credential view has
+  // no `model`, so the switch waits for a reset. Reads are not pushes.
   let pushes = 0;
-  const agent = createServer((req, res) => { pushes++; res.end('{}'); });
+  const agent = createServer((req, res) => { if (req.method !== 'GET') pushes++; res.end('{}'); });
   await new Promise((resolve) => agent.listen(0, '127.0.0.1', resolve));
   const att = await replAttestor(`http://127.0.0.1:${agent.address().port}`,
     { provider: '0g-compute', model: 'old', thinking: 'low' }, {

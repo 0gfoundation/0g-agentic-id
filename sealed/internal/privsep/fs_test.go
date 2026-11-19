@@ -661,9 +661,13 @@ func TestReadRefusesSocketAndDevice(t *testing.T) {
 	if os.Geteuid() != 0 {
 		return
 	}
-	dev := filepath.Join(dir, "null.md")
-	if err := unix.Mknod(dev, unix.S_IFCHR|0o666, int(unix.Mkdev(1, 3))); err != nil {
-		skipOrFail(t, "cannot create a device node here: %v", err)
+	// Production deliberately lacks CAP_MKNOD. Use the image's existing
+	// character device so the mandatory refusal check still runs with the
+	// same six capabilities, rather than requiring a more privileged fixture.
+	dev := "/dev/null"
+	fi, err := os.Stat(dev)
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		t.Fatalf("expected the image's null character device: %v", err)
 	}
 	_, err = ReadFile(dev, 1<<10)
 	wantUnsafe(t, "ReadFile(device)", err)
@@ -740,6 +744,27 @@ func TestRemoveAllDeepTree(t *testing.T) {
 	}
 }
 
+// Symlink creates the link itself, refuses an existing entry, and never
+// creates it through a linked parent.
+func TestSymlinkCreatesTheLinkOnly(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "a", "f"), "one")
+	if err := Symlink("f", filepath.Join(dir, "a", "l")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.Readlink(filepath.Join(dir, "a", "l")); err != nil || got != "f" {
+		t.Fatalf("link holds %q (%v), want f", got, err)
+	}
+	if err := Symlink("f", filepath.Join(dir, "a", "l")); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("Symlink over an existing entry = %v, want fs.ErrExist", err)
+	}
+	mustSymlink(t, filepath.Join(dir, "a"), filepath.Join(dir, "link"))
+	wantUnsafe(t, "Symlink into a linked directory", Symlink("f", filepath.Join(dir, "link", "l2")))
+	if _, err := os.Lstat(filepath.Join(dir, "a", "l2")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a link was created through the linked directory: %v", err)
+	}
+}
+
 // Rename moves an entry between directories without following links;
 // RenameNoReplace refuses to replace an existing destination.
 func TestRenameAcrossDirectories(t *testing.T) {
@@ -784,6 +809,23 @@ func TestWriteFileFromStreams(t *testing.T) {
 	}
 	if fi2, _ := os.Lstat(p); fi2.Size() != 1<<20 {
 		t.Fatal("a failed write changed the destination")
+	}
+}
+
+func TestWriteFileSyncWritesAndReplaces(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "record.json")
+	for _, data := range []string{"first", "second"} {
+		if err := WriteFileSync(p, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(p)
+		if err != nil || string(b) != data {
+			t.Fatalf("read %q, %v; want %q", b, err, data)
+		}
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".*sealed-tmp-*")); len(left) != 0 {
+		t.Fatalf("temp files left: %v", left)
 	}
 }
 

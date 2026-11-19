@@ -7,7 +7,8 @@ pragma solidity ^0.8.20;
 // 2026-09-09), taken verbatim from git 5e9ab03:contracts/src/AgenticID.sol
 // (unchanged through a417c65). Only the import paths and the contract name
 // differ; the inherited bases are frozen 1.1.0 copies in ./v1_1_0/ (src/
-// changed them in 1.2.0).
+// changed them in 1.2.0), and IAgenticID is the frozen copy in ./v1_3_0/
+// (comment-only changes from 1.1.0 to 1.3.0; src/ changed it in 1.4.0).
 // Its runtime bytecode, CBOR metadata stripped, is identical to the mainnet
 // impl 0xAa63e6B6260402F9f0bFA9Fe4Df749d44C588817 (24,567 B; compared
 // 2026-10-19). UpgradeGovernance.t.sol uses it as the pre-upgrade beacon
@@ -16,7 +17,7 @@ pragma solidity ^0.8.20;
 
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 
-import {IAgenticID} from "../../src/interfaces/IAgenticID.sol";
+import {IAgenticIDV1_3_0 as IAgenticID} from "./v1_3_0/IAgenticIDV1_3_0.sol";
 import {IERC8004IdentityRegistry, MetadataEntry} from "../../src/interfaces/IERC8004IdentityRegistry.sol";
 import {IntelligentData} from "../../src/interfaces/IERC7857Metadata.sol";
 import {IERC7857, SealedKeyEntry} from "../../src/interfaces/IERC7857.sol";

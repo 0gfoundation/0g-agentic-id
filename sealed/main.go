@@ -5,7 +5,7 @@
 //	                         provider signer (the anchor of the attestor TLS
 //	                         statement, internal/attestorhttp)
 //	Phase 1  provision       GET + POST /provision, retried with backoff up to
-//	                         10 minutes after PID-1 start -> ECIES-decrypt
+//	                         10 minutes after sealed starts -> ECIES-decrypt
 //	                         agent_seal_priv
 //	Phase 2  chain bootstrap getAgentIdBySealId + intelligentDatasOf +
 //	                         loadSealedKeys + per-entry download + AES-GCM decrypt
@@ -15,6 +15,10 @@
 // Long-running:
 //   - HTTP server on :8080 (proxy package)
 //   - manager monitors agent process exit and clears shared state
+//
+// sealed is PID 1, except in the 0g-harness image, where the loader
+// (cmd/loader) checks it and runs it as its child; only there does sealed
+// handle a stop signal (shutdown.go).
 package main
 
 import (
@@ -25,22 +29,24 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 
+	"seal-verify/internal/agentdata"
 	"seal-verify/internal/attestorhttp"
 	"seal-verify/internal/chain"
 	"seal-verify/internal/config"
+	"seal-verify/internal/credentials"
+	"seal-verify/internal/credproxy"
 	"seal-verify/internal/dataplane"
 	"seal-verify/internal/framework"
-	"seal-verify/internal/framework/harness"
-	"seal-verify/internal/framework/hermes"
-	"seal-verify/internal/framework/openclaw"
-	"seal-verify/internal/framework/prime"
 	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manager"
@@ -49,7 +55,10 @@ import (
 	"seal-verify/internal/provision"
 	"seal-verify/internal/proxy"
 	"seal-verify/internal/report"
+	"seal-verify/internal/scrub"
 	"seal-verify/internal/secretenv"
+	"seal-verify/internal/servicehost"
+	"seal-verify/internal/servicesandbox"
 	"seal-verify/internal/settings"
 	"seal-verify/internal/state"
 	"seal-verify/internal/uploader"
@@ -99,26 +108,21 @@ type storageDescription struct {
 }
 
 func main() {
-	// Register every bundled adapter (side-effect of New()). Which one this
-	// deployment actually uses is resolved AFTER the chain bootstrap, from
-	// the on-chain framework binding (see resolveAdapter); registration is
-	// cheap and touches no disk.
-	//
-	// openclaw, hermes and prime-agent ship today. The adapter interface +
-	// platform seam are framework-agnostic (see FRAMEWORK_ADAPTER.md); a
-	// claude-code adapter was prototyped to validate the seam and retired — a
-	// per-request CLI couldn't host owner-built public services, the shape
-	// this platform is for. That port's lessons live on as a case study in
-	// the doc.
-	//
-	// prime-agent needs a node+python image (its runtime is TypeScript over a
-	// Python IPython kernel); registration is harmless on an image without
-	// them, since selection is per-agent and an unusable adapter simply never
-	// gets picked.
-	openclaw.New()
-	hermes.New()
-	prime.New()
-	harness.New()
+	// The sealed program is also the trusted launcher of hosted service
+	// processes: servicehost starts this executable as root with
+	// servicesandbox.LauncherMode first (privsep.RootSelf), so the launcher
+	// is always this build. That run is dispatched before anything else, so
+	// it registers no adapter, hardens nothing, logs nothing and touches none
+	// of sealed's state; the launcher refuses to run unless it is root.
+	if len(os.Args) > 1 && os.Args[1] == servicesandbox.LauncherMode {
+		os.Exit(servicesandbox.Launch(os.Args[2:]))
+	}
+
+	// Register the adapters this build bundles (adapters.go, or
+	// adapters_harnessonly.go for the 0g-harness image). Which one this
+	// deployment uses is resolved after the chain bootstrap, from the
+	// on-chain framework binding (resolveAdapter).
+	registerAdapters()
 
 	// agent_seal_priv lives only in this process's memory: make it
 	// non-dumpable before anything else runs, so no sibling process can
@@ -136,7 +140,16 @@ func main() {
 	// connection and before its first log line, which is what first reads
 	// the time zone: nothing may log before this call.
 	privsep.Harden()
-	// Provisioning gives up a fixed time after this PID-1 start.
+	// Under the loader (cmd/loader) sealed is not PID 1, and a stop signal
+	// gets a graceful stop: the agent is stopped before sealed exits
+	// (shutdown.go). As PID 1 nothing changes (LEGACY(v1): images without
+	// the loader).
+	if os.Getpid() != 1 {
+		stopSigs := make(chan os.Signal, 2)
+		signal.Notify(stopSigs, syscall.SIGTERM, syscall.SIGINT)
+		go handleStopSignals(stopSigs, &sealedStop, stopBudget, logger.Flush, os.Exit)
+	}
+	// Provisioning gives up a fixed time after this start.
 	started := time.Now()
 
 	// Shared agent state -- read by proxy, written by main + manager.
@@ -164,8 +177,15 @@ func main() {
 	//   before provision completes; handlers return 503 until agent_seal_priv
 	//   is loaded into state.Agent.
 	sealedProxy := proxy.New(agent, cfg.PublicURL)
+	// For an adapter that declares framework.SigningRules (0g-harness), what
+	// the sign socket signs is recorded for the owner and it does not sign
+	// AgenticID's iData writes (the watcher's); both are set up before it
+	// listens.
+	sealedProxy.EnableSignLog()
+	sealedProxy.SetAgenticID(cfg.ContractAddr)
 	sealedProxy.Listen()
 	sealedProxy.ListenInternal(sealSignSockPath)
+	// LEGACY(model-key): the key handed over at create/reset.
 	if cfg.APIKey != "" {
 		logger.Logf("API_KEY (from env): <set, %d chars>", len(cfg.APIKey))
 	} else {
@@ -228,9 +248,26 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		CertificateJSON: cfg.Certificate,
 		Ticket:          cfg.BootTicket,
 		Started:         started,
+		SealedHash:      cfg.SealedHash,
 	})
 	agentSealPriv := prov.AgentSealPriv
 	if agentSealPriv == nil {
+		if prov.LayeredRequired {
+			// Nothing was claimed. The loader starts sealed again later,
+			// when the attestor may declare the layered flow.
+			exitForRetry(cfg, "provisioning", errors.New("the attestor does not declare the layered flow"))
+			return
+		}
+		// A version the attestor no longer provisions (taken off the sealed
+		// list) still hands over to the newest listed one.
+		if prov.Layered {
+			switchAfterRefusal(cfg)
+		}
+		var cause error = errors.New("the attestor did not provision this boot")
+		if prov.Unanswered {
+			cause = transient(errors.New("the attestor gave no answer within the provision window"))
+		}
+		failTrial(cfg, "provisioning", cause)
 		return
 	}
 	cfg.StatusBinding = report.NewBinding(prov.StatusToken)
@@ -257,6 +294,8 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	if err != nil {
 		logger.Logf("FAIL bootstrap: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "bootstrap: "+err.Error(), cfg.StatusBinding)
+		// The chain and storage reads are outside this sealed version.
+		failTrial(cfg, "chain bootstrap", transient(err))
 		return
 	}
 
@@ -274,9 +313,46 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	if err != nil {
 		logger.Logf("FAIL framework resolve: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "framework resolve: "+err.Error(), cfg.StatusBinding)
+		failTrial(cfg, "framework resolve", err)
 		return
 	}
 	sealedProxy.SetAdapter(adapter)
+
+	// The layered runtime (layered.go): when the rule picks a sealed version
+	// other than this program (the owner's pick, or the newest listed one
+	// once this one is delisted), it is handed to the loader before the agent
+	// starts; when the loader does not switch, the boot carries on with this
+	// version. The harness starts on the package the rule picks.
+	var lr *layeredRuntime
+	var picks settings.Versions
+	if prov.Layered {
+		if doc, err := settings.Parse(prov.Settings); err == nil && doc.Versions != nil {
+			picks = *doc.Versions
+		}
+		lr = newLayeredRuntime(cfg, res.client)
+		ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
+		if target, ok := lr.sealedTarget(ctx, picks.Sealed); ok && lr.switchSealed(ctx, target) {
+			lr.awaitHandOver()
+		}
+		cancel()
+	}
+	// A package adapter outside the layered flow has no package to start on:
+	// its start fails and says so.
+	if h, ok := any(adapter).(framework.LayeredRuntime); ok && lr != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), applyTimeout)
+		hash, dir, err := lr.chooseHarness(ctx, picks.Harness)
+		cancel()
+		if err != nil {
+			logger.Logf("FAIL harness: %v", err)
+			report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "harness: "+err.Error(), cfg.StatusBinding)
+			failTrial(cfg, "harness choice", err)
+			if isTransient(err) {
+				exitForRetry(cfg, "harness choice", err)
+			}
+			return
+		}
+		h.UseHarness(hash, dir)
+	}
 
 	// Owner-gated endpoints now ask the chain on every call instead of
 	// trusting the address read once here — see proxy.verifyOwnerSig for the
@@ -293,21 +369,52 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 			}
 			return owner.Hex(), nil
 		})
+		// The container serves the owner it was started for; once the agent
+		// belongs to someone else it closes for good (proxy/ownerlock.go).
+		// Its status says so; after a transfer the attestor no longer takes
+		// this container's reports, so this is for the container's own log.
+		sealedProxy.SetBootOwner(res.owner)
+		go sealedProxy.WatchOwner(context.Background(), ownerWatchInterval, func() {
+			currentStatus.OwnerChanged("the agent now belongs to another owner: this container no longer serves it; reset the agent to run it")
+			level, m := currentStatus.Get()
+			report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, m, cfg.StatusBinding)
+		})
 	}
+
+	// The credential proxy and store come up before the framework, so the
+	// framework's first environment already points its tools at them.
+	credRT, credValues, credStore := startCredentials(cfg, res, agentSealPriv, prov, sealedProxy)
 
 	logger.Logf("")
 	logger.Logf("--- Starting agent ---")
 	// onFailed is invoked by the manager exactly once if the supervisor
 	// exhausts restart retries. Reports an "error" status to the attestor
 	// so the platform can decide whether to recreate the sandbox.
+	// Reports from the supervisor and the model key paths go through one
+	// sender, in order, each with the effective status when it leaves.
+	statusReports := newStatusReporter(func(level, msg string) {
+		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, msg, cfg.StatusBinding)
+	})
 	onFailed := func(err error) {
 		logger.Logf("FAIL supervisor: max retries exceeded: %v", err)
 		currentStatus.SupervisorFailed("supervisor exhausted retries: " + err.Error())
-		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "supervisor exhausted retries: "+err.Error(), cfg.StatusBinding)
+		statusReports.Soon()
 	}
-	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, sealedProxy, onFailed); err != nil {
+	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, credRT, credValues, credStore, sealedProxy, onFailed, statusReports, lr); err != nil {
 		logger.Logf("FAIL agent: %v", err)
-		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", err.Error(), cfg.StatusBinding)
+		// Recorded, so a later report (a recovery, a model key retry) does
+		// not read "running" past it.
+		currentStatus.SupervisorFailed(err.Error())
+		statusReports.Soon()
+		// A version on trial goes back to the previous one, which reports;
+		// or, failing for a reason outside it, starts again later. So does a
+		// confirmed one whose start failed for such a reason (no harness
+		// package starts, a storage read), so that a package listed later,
+		// or the outside service back, is picked up.
+		failTrial(cfg, "agent start", err)
+		if isTransient(err) {
+			exitForRetry(cfg, "agent start", err)
+		}
 		return
 	}
 	logger.Logf("OK   agent ready (upstream listening, agentState armed, supervisor active)")
@@ -316,6 +423,13 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	// secret_env_not_applied warning (applySecretEnv).
 	level, msg := currentStatus.Get()
 	report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, msg, cfg.StatusBinding)
+	confirmTrial(cfg)
+	sealedSettled.Store(true)
+	if lr != nil {
+		// Versions nothing here runs any more, and what a cut-off download
+		// left, go (layered.go).
+		lr.prune()
+	}
 }
 
 // applySecretEnv opens SEAL_SECRET_ENV (issue #166) and makes its inference
@@ -325,6 +439,8 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 // class (never a value), so the attestor and owner see why the agent
 // cannot call its model instead of a healthy "running". The ciphertext is
 // dropped from memory either way.
+//
+// LEGACY(model-key): the key handed over at create/reset (internal/secretenv).
 func applySecretEnv(cfg *config.Bootstrap, agentSealPriv []byte, res *chainBootstrapResult) {
 	if cfg.SecretEnv == "" {
 		return
@@ -629,10 +745,15 @@ func startAgent(
 	res *chainBootstrapResult,
 	agentSealPriv []byte,
 	settingsBlob []byte,
+	credRT framework.RuntimeContext,
+	credValues *credproxy.Registry,
+	credStore *credentials.Store,
 	sealedProxy *proxy.Server,
 	onFailed func(err error),
+	statusReports *statusReporter,
+	lr *layeredRuntime,
 ) error {
-	apiKey := cfg.APIKey
+	apiKey := cfg.APIKey // LEGACY(model-key): the key handed over at create/reset
 	publicURL := cfg.PublicURL
 	sealID := cfg.Attestation.SealID
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -676,19 +797,41 @@ func startAgent(
 		seen[role] = true
 	}
 
+	// What the watcher hashes and the uploader commits is scrubbed of the
+	// credential values sealed holds and of secrets of known formats
+	// (internal/scrub), for every framework, with or without credentials.
+	// Built before Phase A, which reads the disk the way the watcher does to
+	// find the agent's uncommitted edits. The drift handler keeps the
+	// adapter itself: it asks it for optional interfaces.
+	var heldValues scrub.Values
+	if credValues != nil {
+		heldValues = credValues
+	}
+	var idata framework.Framework = scrub.Wrap(adapter, heldValues)
+
+	// An adapter whose roles keep the agent's uncommitted edits
+	// (framework.UncommittedKeeper) reads what this container last had in
+	// sync with the chain (synced.go).
+	keeper, _ := any(adapter).(framework.UncommittedKeeper)
+	var (
+		prevSynced     syncedRecord
+		havePrevSynced bool
+	)
+	if keeper != nil {
+		prevSynced, havePrevSynced = loadSynced()
+	}
+
 	// Phase A
+	type restoreRole struct {
+		role                            framework.RoleSpec
+		entry                           *decryptedEntry
+		contentHashForSeed, dataHashHex string
+	}
+	var restores []restoreRole
 	for _, r := range roles {
 		entry := findEntry(res.entries, r.Name)
 		if entry == nil {
 			continue
-		}
-		if err := adapter.Restore(ctx, r.Name, entry.Plaintext); err != nil {
-			return fmt.Errorf("restore %s: %w", r.Name, err)
-		}
-		if r.Shape == framework.DirectoryManifest && len(entry.Plaintext) > 0 {
-			if err := restoreManifestEntries(ctx, adapter, r.Name, entry.Plaintext, entry.DataKey, entry.Indexer); err != nil {
-				return fmt.Errorf("restore manifest entries for %s: %w", r.Name, err)
-			}
 		}
 		dataHashHex := "0x" + hex.EncodeToString(entry.DataHash[:])
 		// Manifest-shape plaintext from 0g-storage carries filled StoragePtr
@@ -705,7 +848,38 @@ func startAgent(
 			}
 			contentHashForSeed = sha256Hex(stripped)
 		}
-		agent.SeedChainSnapshot(r.Name, contentHashForSeed, dataHashHex)
+		// The agent changed this role after its last commit, and the chain
+		// has not moved since: the disk stays, and the watcher's first tick
+		// commits it.
+		if keeper != nil && keeper.KeepsUncommitted(r.Name) {
+			if disk := diskContentHash(ctx, idata, r.Name); keepsUncommitted(prevSynced, havePrevSynced, sealID, res.owner, r.Name, contentHashForSeed, disk) {
+				logger.Logf("iData %s: keeping the agent's edits made after its last commit (disk %s, chain %s as last synced); the watcher commits them",
+					r.Name, shortHex(disk), shortHex(contentHashForSeed))
+				agent.SeedChainSnapshot(r.Name, contentHashForSeed, dataHashHex)
+				continue
+			}
+		}
+		restores = append(restores, restoreRole{role: r, entry: entry, contentHashForSeed: contentHashForSeed, dataHashHex: dataHashHex})
+	}
+	// What is restored from chain leaves the record first (synced.go).
+	if keeper != nil && havePrevSynced {
+		names := make([]string, len(restores))
+		for i, x := range restores {
+			names[i] = x.role.Name
+		}
+		forgetSynced(prevSynced, names)
+	}
+	for _, x := range restores {
+		r, entry := x.role, x.entry
+		if err := adapter.Restore(ctx, r.Name, entry.Plaintext); err != nil {
+			return fmt.Errorf("restore %s: %w", r.Name, err)
+		}
+		if r.Shape == framework.DirectoryManifest && len(entry.Plaintext) > 0 {
+			if err := restoreManifestEntries(ctx, adapter, r.Name, entry.Plaintext, entry.DataKey, entry.Indexer); err != nil {
+				return fmt.Errorf("restore manifest entries for %s: %w", r.Name, err)
+			}
+		}
+		agent.SeedChainSnapshot(r.Name, x.contentHashForSeed, x.dataHashHex)
 	}
 
 	// Phase B
@@ -765,34 +939,68 @@ func startAgent(
 	// Held behind a mutex because two goroutines reach it: the manager's
 	// PreStart hook on every spawn, and an owner push arriving on the proxy.
 	live := &liveSettings{doc: settingsDoc}
-	credential := inference.ProviderCredential{Provider: inference.ZGComputeProvider, APIKey: apiKey}
-	if cfg.InferenceCredential != nil {
-		credential = *cfg.InferenceCredential
+	// The model key: the owner's for the settings' provider from the
+	// credential set, else (LEGACY(model-key)) the one handed over at
+	// create/reset (modelkey.go).
+	keys := &modelKeys{boot: inference.ProviderCredential{Provider: inference.ZGComputeProvider, APIKey: apiKey}}
+	if credStore != nil {
+		keys.store = credStore
 	}
-	registry := inference.DefaultRegistry
-	if credential.RouteHash != "" {
-		if res.client == nil || res.client.ChainID() == nil || !res.client.ChainID().IsUint64() {
-			return fmt.Errorf("dynamic provider registry requires chain bootstrap")
-		}
-		var err error
-		registry, err = inference.LoadPinnedRegistry(ctx, cfg.AttestorURL, res.client.ChainID().Uint64(), cfg.ContractAddr, credential)
-		if err != nil {
-			return fmt.Errorf("load provider registry: %w", err)
+	if cfg.InferenceCredential != nil { // LEGACY(model-key)
+		keys.boot = *cfg.InferenceCredential
+	}
+	if res.client != nil && res.client.ChainID() != nil && res.client.ChainID().IsUint64() {
+		chainID := res.client.ChainID().Uint64()
+		keys.loadPinned = func(ctx context.Context, c inference.ProviderCredential) (*inference.Registry, error) {
+			return inference.LoadPinnedRegistry(ctx, cfg.AttestorURL, chainID, cfg.ContractAddr, c)
 		}
 	}
-	renderResolved := func(ctx context.Context, resolved settings.Resolved) error {
+	// applied is the choice the framework was last rendered with.
+	var appliedMu sync.Mutex
+	var applied modelChoice
+	reportStatus := statusReports.Soon
+	// markInUse tells the owner which key the framework runs on, once it
+	// runs: after a start, a restart or a reload, not when it renders.
+	markInUse := func() {
+		if credStore == nil {
+			return
+		}
+		appliedMu.Lock()
+		c := applied
+		appliedMu.Unlock()
+		if c.source != stoppedChoice.source {
+			credStore.SetModelInUse(c.inUse())
+		}
+	}
+	renderResolved := func(ctx context.Context, choice modelChoice, resolved settings.Resolved) error {
 		if err := adapter.RenderSettings(ctx, resolved); err != nil {
 			return err
 		}
-		live.applied(proxy.RuntimeSettingsFor(resolved, credential))
+		live.applied(proxy.RuntimeSettingsFor(resolved, choice.credential))
+		appliedMu.Lock()
+		applied = choice
+		appliedMu.Unlock()
+		// A key renders: whatever stopped the framework over its model key
+		// is over, whichever start path got here.
+		changed := currentStatus.ModelKeyIssue("")
+		// A key from the set: the boot's own key (secretenv) not applying no
+		// longer keeps the agent from its model. Falling back to that key
+		// fails to resolve, which the model key status reports instead.
+		if choice.source == "credentials" && currentStatus.Pin("") {
+			changed = true
+		}
+		if changed {
+			reportStatus()
+		}
 		return nil
 	}
 	renderSettings := func(ctx context.Context, doc settings.Doc) error {
-		resolved, err := settings.ResolveForRegistry(ctx, doc, credential, registry)
+		choice := keys.choose(doc)
+		resolved, err := keys.resolve(ctx, choice)
 		if err != nil {
 			return err
 		}
-		return renderResolved(ctx, resolved)
+		return renderResolved(ctx, choice, resolved)
 	}
 
 	if err := settingsDoc.Validate(); err != nil {
@@ -806,20 +1014,68 @@ func startAgent(
 		currentStatus.SettingsIssue(fmt.Sprintf("owner settings unusable (%v); write the agent's settings (provider and model)", err))
 	}
 
+	// The agent's committed data for hosted programs that ask for it
+	// (servicehost agent_data): kept per committed version, built after every
+	// confirmed commit and on boot (internal/agentdata).
+	var agentData *agentdata.Provider
+	if adapter.Name() == "0g-harness" || adapter.Name() == "dsh" {
+		agentData = agentdata.New(privsep.StateDir+"/agent-data", idata, func(role string) (string, string) {
+			e := agent.ChainEntry(role)
+			return e.ContentHash, e.DataHash
+		})
+	}
+	observeCommit := func(dim string) {
+		if agentData != nil {
+			go agentData.Observe(context.Background(), dim)
+		}
+	}
+
+	// The record of what this container has in sync with the chain starts
+	// from what Phase A and B seeded, and follows every confirmed commit.
+	if keeper != nil {
+		synced := newSyncedStore(sealID, res.owner)
+		inSync := make(map[string]string, len(roles))
+		for _, r := range roles {
+			inSync[r.Name] = agent.ChainEntry(r.Name).ContentHash
+		}
+		synced.setAll(inSync)
+		agent.SetChainUploadHook(func(dim, contentHash string) {
+			synced.set(dim, contentHash)
+			observeCommit(dim)
+		})
+	} else if agentData != nil {
+		agent.SetChainUploadHook(func(dim, _ string) { observeCommit(dim) })
+	}
+	if agentData != nil {
+		for _, role := range []string{agentdata.RolePersona, agentdata.RoleSkills, agentdata.RolePublicMemory} {
+			observeCommit(role)
+		}
+	}
+
 	// Build the uploader. The watcher tick handler reuses this single
 	// instance to call upload.Apply each cycle.
-	upload, err := uploader.New(adapter, agent, res.client, res.agentID,
+	upload, err := uploader.New(idata, agent, res.client, res.agentID,
 		agentSealPriv, cfg.ChainRPC, cfg.FallbackIndexer)
 	if err != nil {
 		return fmt.Errorf("init uploader: %w", err)
 	}
+	if pc, ok := any(adapter).(framework.PlaintextCommitter); ok && pc.CommitsPlaintext() {
+		upload.SetPlaintextCommitments(true)
+	}
+	// An upload under way when the agent changes owner is not committed.
+	upload.SetCommitGate(func() error {
+		if sealedProxy.OwnerLocked() {
+			return errors.New("the agent now belongs to another owner; not committed")
+		}
+		return nil
+	})
 
 	// Phase 1 seed: capture post-Restore + post-HandleLegacy disk state
 	// into currentSnapshot so /hello can report non-empty dataHashes
 	// immediately after mgr.Start arms phase=Running. chainSnapshot is
 	// untouched here — Phase A/B already seeded it with chain truth.
 	logger.Logf("--- iData seed phase 1: post-Restore (pre-Start) ---")
-	if err := seedCurrentSnapshots(ctx, adapter, agent); err != nil {
+	if err := seedCurrentSnapshots(ctx, idata, agent); err != nil {
 		return err
 	}
 
@@ -837,12 +1093,89 @@ func startAgent(
 		chainIDStr = res.client.ChainID().String()
 	}
 
+	harness, isLayeredRuntime := any(adapter).(framework.LayeredRuntime)
+	var hostedServices *servicehost.Manager
+	// Resume untrusted services only after the live owner and identity have
+	// been restored. Each service process runs at its own identity under
+	// Landlock and seccomp (internal/servicesandbox).
+	if adapter.Name() == "0g-harness" || adapter.Name() == "dsh" {
+		host, err := servicehost.NewWithOptions(privsep.StateDir+"/services", strings.ToLower(res.owner)+":"+sealID, servicehost.Options{
+			ModelRoute: func(ctx context.Context) (servicehost.ModelRoute, error) {
+				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				return serviceModelRoute(ctx, keys, live.get())
+			},
+			AcquireRuntime: func(ctx context.Context) (servicehost.RuntimeLease, error) {
+				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				return lr.acquireServiceRuntime(ctx, harness)
+			},
+			Owner: strings.ToLower(res.owner),
+			AgentData: func(ctx context.Context, g servicehost.AgentDataGrant) ([]servicehost.AgentDataPart, func(), error) {
+				if agentData == nil {
+					return nil, nil, fmt.Errorf("agent data is unavailable for this framework")
+				}
+				ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				return agentData.Parts(ctx, g)
+			},
+		})
+		if err != nil {
+			logger.Logf("service hosting unavailable: %v", err)
+		} else {
+			sealedProxy.SetServiceHost(host)
+			sealedStop.add(func(context.Context) { host.Close() })
+			hostedServices = host
+		}
+	}
+	// The agent's interfaces (backends it registers over the sign socket)
+	// come back after a restart, under the same owner and seal: the list is
+	// kept in sealed's state directory, and a backend registered with a
+	// start command runs again as the agent, with PATH, HOME, the credential
+	// proxy's settings and the agent's public facts below (not the
+	// framework's own variables).
+	agentEnv := credRT.CredentialEnv()
+	if publicURL != "" {
+		agentEnv = append(agentEnv, "AGENT_PUBLIC_URL="+publicURL)
+	}
+	agentEnv = append(agentEnv, "SEAL_SIGN_SOCK="+sealSignSockPath)
+	if agentSealAddr != "" {
+		agentEnv = append(agentEnv, "AGENT_SEAL="+agentSealAddr)
+	}
+	sealedProxy.RestoreAgentServices(proxy.AgentServiceRuntime{
+		StateFile: privsep.StateDir + "/agent-services.json",
+		Binding:   strings.ToLower(res.owner) + ":" + sealID,
+		Env:       agentEnv,
+	})
+	sealedStop.add(func(context.Context) { sealedProxy.StopAgentServices() })
 	mgr := manager.New(adapter, agent, manager.Config{
 		OnFailed: onFailed,
+		// A confirmed start, whoever brought it up, clears an earlier
+		// supervisor failure.
+		OnRecovered: func() {
+			markInUse()
+			if currentStatus.SupervisorRecovered() {
+				reportStatus()
+			}
+		},
 	})
-	if err := mgr.Start(context.Background(), manager.StartParams{
+	// Under the layered flow every serve-proof is v2 from the first one: its
+	// layers are set before the agent starts, and until the harness has
+	// started nothing is signed (proxy.SetProofLayers).
+	if isLayeredRuntime && lr != nil {
+		sealedHash := cfg.SealedHash
+		sealedProxy.SetProofLayers(func() (proxy.ProofLayers, bool) {
+			h := harness.HarnessHash()
+			if h == "" {
+				return proxy.ProofLayers{}, false
+			}
+			url, model := harness.InferenceTarget()
+			return proxy.ProofLayers{SealedHash: "0x" + sealedHash, HarnessHash: "0x" + h, InferenceURL: url, Model: model}, true
+		})
+	}
+	startParams := manager.StartParams{
 		Runtime: framework.RuntimeContext{
-			APIKey:       apiKey,
+			APIKey:       apiKey, // LEGACY(model-key)
 			PublicURL:    publicURL,
 			SealSignSock: sealSignSockPath,
 			AgentSeal:    agentSealAddr,
@@ -863,7 +1196,7 @@ func startAgent(
 			// AgenticID Framework code hash = the sealed image measurement
 			// the provider certified (image_hash), as the contract's bytes32.
 			FrameworkHash: cfg.Attestation.FrameworkHash(),
-		},
+		}.WithCredentials(credRT), // credential proxy, sockets, CredHold (startCredentials); empty when off
 		AgentSealPriv: agentSealPriv,
 		SealID:        sealID,
 		Owner:         res.owner,
@@ -882,17 +1215,60 @@ func startAgent(
 		// model accepts a reasoning bound come from the live router catalog,
 		// and a stored copy of those goes stale and then fights the computed
 		// one.
+		//
+		// The model key sealed held for the previous process goes first: the
+		// new one holds it again only if it still needs it, so a switch to a
+		// framework built-in provider or a removed key leaves nothing behind.
 		PreStart: func(ctx context.Context) error {
+			if credStore != nil {
+				credStore.ReleaseSystem("sealed:inference")
+			}
 			return renderSettings(ctx, live.get())
 		},
-	}); err != nil {
+	}
+	start := func() error { return mgr.Start(context.Background(), startParams) }
+	if isLayeredRuntime && lr != nil {
+		// A package chosen at boot that does not start gives way to the next
+		// version (layered.go).
+		fctx, fcancel := context.WithTimeout(context.Background(), applyTimeout)
+		err = lr.startFirst(fctx, harness, start, func(ctx context.Context) { _ = adapter.Stop(ctx, 10*time.Second) })
+		fcancel()
+	} else {
+		err = start()
+	}
+	if err != nil {
 		return err
+	}
+	markInUse()
+	if hostedServices != nil {
+		hostedServices.Resume()
 	}
 
 	// Confirm only the document used by the successful initial framework start,
 	// before registering runtime settings mutation callbacks.
 	if provisionedSettingsUsed {
 		cfg.StatusBinding.AdoptSettings(settingsBlob)
+	}
+
+	// A framework that runs from a package can ask to be restarted over the
+	// sign socket, and its owner over /_seal/restart (ownerrestart.go); under
+	// the layered flow the owner's version picks apply (layered.go).
+	if isLayeredRuntime {
+		sealedProxy.SetHarnessRestart(mgr.Reload)
+	}
+	if lr != nil {
+		lr.started(adapter, mgr, func() settings.Versions {
+			if v := live.get().Versions; v != nil {
+				return *v
+			}
+			return settings.Versions{}
+		})
+	}
+	if isLayeredRuntime {
+		// The requests used are kept on disk: the sealed a restart starts
+		// refuses them too.
+		sealedProxy.SetOwnerRestartRecord(framework.StatePath(ownerRestartsFile))
+		sealedProxy.SetOwnerRestart(ownerRestarter(mgr, lr))
 	}
 
 	// The owner's hot path: push a document, have it take effect without
@@ -904,26 +1280,40 @@ func startAgent(
 	// so a document that cannot be rendered never becomes the one the next
 	// crash-restart would pick up.
 	var settingsApply sync.Mutex
-	sealedProxy.SetSettings(live.get, func(ctx context.Context, doc settings.Doc) error {
+	sealedProxy.SetSettings(live.get, func(ctx context.Context, doc settings.Doc) (bool, error) {
 		settingsApply.Lock()
 		defer settingsApply.Unlock()
-		resolved, err := settings.ResolveForRegistry(ctx, doc, credential, registry)
+		// Under the layered flow a push that changes only the version picks
+		// restarts nothing here: the version rule switches what it must, and
+		// restarts only the layer it changes (layered.go).
+		if lr != nil && doc.OnlyVersionsChanged(live.get()) {
+			live.set(doc)
+			logger.Logf("settings: version picks applied (no framework restart)")
+			go lr.recheck()
+			return false, nil
+		}
+		choice := keys.choose(doc)
+		resolved, err := keys.resolve(ctx, choice)
 		if err != nil {
-			return err
+			return false, err
 		}
 		prev := live.get()
 		live.set(doc)
-		if err := renderResolved(ctx, resolved); err != nil {
+		if err := renderResolved(ctx, choice, resolved); err != nil {
 			live.set(prev)
-			return fmt.Errorf("render: %w", err)
+			return false, fmt.Errorf("render: %w", err)
 		}
 		if err := mgr.Reload(ctx); err != nil {
-			return fmt.Errorf("restart: %w", err)
+			return true, fmt.Errorf("restart: %w", err)
 		}
 		if agent.Phase() == state.PhaseRunning {
 			currentStatus.SupervisorRecovered()
 		}
 		logger.Logf("settings: applied (provider=%s model=%s thinking=%s)", doc.Provider, doc.Model, doc.Thinking)
+		// The owner's version picks take effect now (layered.go).
+		if lr != nil {
+			go lr.recheck()
+		}
 		// A document that applied clears a boot-time settings warning; say
 		// so now rather than at the next heartbeat.
 		if doc.Validate() == nil && currentStatus.SettingsIssue("") != "running" {
@@ -931,9 +1321,93 @@ func startAgent(
 				go report.Status(cfg.AttestorURL, agentSealPriv, sealID, level, msg, cfg.StatusBinding)
 			}
 		}
-		return nil
+		return true, nil
 	})
 	sealedProxy.SetRuntimeSettings(live.runtime)
+
+	// A model key the owner pushes (cred set model) takes effect now: where
+	// sealed holds the key for the framework and only the key changed, it
+	// is swapped in place; otherwise the framework is rendered with it and
+	// restarted, as a settings push is. A key for a provider the settings do
+	// not use is only kept.
+	if credStore != nil {
+		pushed := modelApply{
+			keys:    keys,
+			current: live.get,
+			applied: func() modelChoice {
+				appliedMu.Lock()
+				defer appliedMu.Unlock()
+				return applied
+			},
+			setApplied: func(c modelChoice) {
+				appliedMu.Lock()
+				defer appliedMu.Unlock()
+				applied = c
+			},
+			render:   renderResolved,
+			swap:     func(host string, v []byte) bool { return credStore.SwapSystemValue("sealed:inference", host, v) },
+			reload:   mgr.Reload,
+			busy:     mgr.Busy,
+			failed:   func() bool { return agent.Phase() == state.PhaseFailed },
+			setInUse: credStore.SetModelInUse,
+		}
+		var applyModelKeys func()
+		// One retry pending at a time, touched under settingsApply only: it
+		// backs off while a key cannot be used (an attestor that cannot serve
+		// its registry version, say); a (re)start under way is waited out
+		// briefly.
+		var retryTimer *time.Timer
+		retry := 30 * time.Second
+		again := func(d time.Duration) {
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
+			retryTimer = time.AfterFunc(d, applyModelKeys)
+		}
+		applyModelKeys = func() {
+			settingsApply.Lock()
+			defer settingsApply.Unlock()
+			if sealedProxy.OwnerLocked() {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			switch outcome := pushed.apply(ctx); outcome {
+			case "unchanged":
+				// Whatever recovered the framework (its own restart, a
+				// settings push), the next outage starts the backoff anew,
+				// and a running framework clears a failed restart.
+				retry = 30 * time.Second
+				if agent.Phase() == state.PhaseRunning && currentStatus.SupervisorRecovered() {
+					reportStatus()
+				}
+			case "deferred":
+				again(5 * time.Second)
+			case "stopped", "restart_failed":
+				if outcome == "stopped" {
+					logger.Logf("warn: model key: the key the settings choose cannot be used; the framework is stopped until it can (cred <agent> shows why); trying again in %s", retry)
+					currentStatus.ModelKeyIssue("the agent's model key cannot be used: the framework is stopped until it can (cred <agent> shows why)")
+				} else {
+					logger.Logf("warn: model key: the framework did not restart (cred <agent> shows why); trying again in %s", retry)
+					currentStatus.SupervisorFailed("the framework did not restart; sealed keeps trying (cred <agent> shows why)")
+				}
+				reportStatus()
+				again(retry)
+				if retry *= 2; retry > 10*time.Minute {
+					retry = 10 * time.Minute
+				}
+			default:
+				retry = 30 * time.Second
+				if agent.Phase() == state.PhaseRunning && currentStatus.SupervisorRecovered() {
+					reportStatus()
+				}
+				logger.Logf("OK   model key: applied (%s)", outcome)
+			}
+		}
+		credStore.OnModelKeys(applyModelKeys)
+		// A set loaded between the first render and now.
+		go applyModelKeys()
+	}
 
 	// The agent's own lever: same validation, same render, same restart —
 	// but nothing is persisted, so the owner's document is what comes back
@@ -945,17 +1419,26 @@ func startAgent(
 		// read and this callback must not be undone by a thinking-only change.
 		doc := live.get()
 		doc.Thinking = requested.Thinking
-		resolved, err := settings.ResolveForRegistry(ctx, doc, credential, registry)
+		choice := keys.choose(doc)
+		resolved, err := keys.resolve(ctx, choice)
 		if err != nil {
 			return err
 		}
 		prev := live.get()
+		appliedMu.Lock()
+		running := applied
+		appliedMu.Unlock()
 		live.set(doc)
-		if err := renderResolved(ctx, resolved); err != nil {
+		if err := renderResolved(ctx, choice, resolved); err != nil {
 			// Re-render the owner's document so a rejected agent attempt
 			// cannot leave the framework configured from a half-applied one.
 			live.set(prev)
 			_ = renderSettings(ctx, prev)
+			// Nothing restarted: the process still runs on what it ran on,
+			// so a model key change waiting behind this is still applied.
+			appliedMu.Lock()
+			applied = running
+			appliedMu.Unlock()
 			return fmt.Errorf("render: %w", err)
 		}
 		err = mgr.Reload(ctx)
@@ -1030,7 +1513,7 @@ func startAgent(
 	logger.Logf("--- iData seed phase 2: waiting %s for %s to settle ---", settle, adapter.Name())
 	time.Sleep(settle)
 	logger.Logf("--- iData seed phase 2: post-settle baseline capture ---")
-	if err := seedCurrentSnapshots(ctx, adapter, agent); err != nil {
+	if err := seedCurrentSnapshots(ctx, idata, agent); err != nil {
 		return fmt.Errorf("re-seed after settle: %w", err)
 	}
 	logger.Logf("OK   baseline captured: %d roles total", len(roles))
@@ -1041,19 +1524,37 @@ func startAgent(
 	// then asks the uploader to push the entire post-reconcile state in
 	// one wholesale chain.Update via upload.Apply.
 	watchCtx := context.Background()
-	go watcher.New(adapter, agent, watcher.Config{
+	w := watcher.New(idata, agent, watcher.Config{
 		OnDrift: func(plaintexts map[string][]byte, drifted []string) {
+			// An agent that belongs to another owner now is not written to
+			// from this container.
+			if sealedProxy.OwnerLocked() {
+				return
+			}
 			handleDrift(watchCtx, plaintexts, drifted, adapter, agent, mgr, upload,
 				cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, cfg.StatusBinding)
 		},
-	}).Run(watchCtx)
+	})
+	go w.Run(watchCtx)
+	// A stop (shutdown.go) stops the agent before sealed exits. What the
+	// agent changed since its last commit stays on disk for the next boot
+	// (synced.go).
+	sealedStop.add(func(ctx context.Context) {
+		stopAgent(ctx, w, mgr)
+	})
 
 	// Heartbeat: report.Status("running") on a slow ticker so the attestor
 	// can tell a healthy sandbox from one whose process is alive but stuck.
 	// 5 min keeps signed-tx volume low; first beat fires immediately after
 	// the initial "running" report from runMainPipeline so the cadence is
 	// regular regardless of when this goroutine starts.
-	go runHeartbeat(watchCtx, cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, cfg.StatusBinding)
+	// Under the layered flow every beat also applies the version rule, so a
+	// delisted version is left within one interval (layered.go).
+	var onBeat func()
+	if lr != nil {
+		onBeat = lr.recheck
+	}
+	go runHeartbeat(watchCtx, cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, cfg.StatusBinding, onBeat)
 
 	return nil
 }
@@ -1069,7 +1570,7 @@ func startAgent(
 // warning, or error) and never clobbers a real failure.
 const heartbeatInterval = 5 * time.Minute
 
-func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte, sealID string, binding *report.Binding) {
+func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte, sealID string, binding *report.Binding, onBeat func()) {
 	t := time.NewTicker(heartbeatInterval)
 	defer t.Stop()
 	for {
@@ -1079,6 +1580,9 @@ func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte,
 		case <-t.C:
 			level, msg := currentStatus.Get()
 			report.Status(attestorURL, agentSealPriv, sealID, level, msg, binding)
+			if onBeat != nil {
+				go onBeat()
+			}
 		}
 	}
 }
@@ -1101,13 +1605,12 @@ func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte,
 //     next watcher tick re-detects divergence (chainSnapshot stays
 //     stale, currentSnapshot still differs) and Apply re-runs naturally.
 //
-// All errors are logged. Error classification follows severityOf:
-//   - "warning" (owner-recoverable, e.g. insufficient funds): reported
-//     to the attestor immediately on first occurrence so the UI can
-//     surface the owner-action prompt without delay; the failure
-//     counter is NOT advanced (it's not a system failure).
-//   - "error" (genuine system failure): reported after failureEscalateAt
-//     consecutive Apply failures so transient blips don't false-alarm.
+// All errors are logged. A failed commit makes the status a "warning", never
+// an "error" (commitFailureStatus): the agent runs; only its data is not on
+// chain yet. An owner-recoverable cause (the seal wallet cannot pay) shows at
+// once; any other after failureEscalateAt consecutive failures, so a
+// transient blip does not show. Retries of the same content back off
+// (commitretry.go); new content is tried at once.
 const failureEscalateAt = 5
 
 var consecutiveApplyFailures int
@@ -1191,34 +1694,30 @@ func handleDrift(
 	// zero — a death loop of "10 OKs + 1 kill" with no progress to chain.
 	// Inheriting ctx (watchCtx) here is effectively unbounded, gated only
 	// by the per-blob timeout downstream.
-	if err := upload.Apply(ctx, plaintexts); err != nil {
-		sev := severityOf(err)
-		summary := summarizeError(err)
-		logger.Logf("drift: upload.Apply: %v (severity=%s)", err, sev)
-
-		if sev == "warning" {
-			// Owner-recoverable. Don't count it toward the system-failure
-			// threshold (a chronically-unfunded agent shouldn't ratchet
-			// up consecutiveApplyFailures forever). Push the status
-			// immediately on the first transition so the UI prompts the
-			// owner without waiting for the next heartbeat.
-			if prev := currentStatus.Set("warning", summary); prev != "warning" {
-				level, msg := currentStatus.Get()
-				report.Status(attestorURL, agentSealPriv, sealID, level, msg, binding)
-			}
-			return
-		}
-
-		// Real system error: keep the 5-failure threshold to ride out
-		// transient network / chain blips.
-		consecutiveApplyFailures++
-		if consecutiveApplyFailures == failureEscalateAt {
-			msg := fmt.Sprintf("upload.Apply failed %d times: %s", failureEscalateAt, summary)
-			currentStatus.Set("error", msg)
-			report.Status(attestorURL, agentSealPriv, sealID, "error", msg, binding)
+	key := driftKey(plaintexts)
+	if wait, first := commitRetry.Wait(time.Now(), key); wait > 0 {
+		if first {
+			logger.Logf("drift: the last commit of this content failed; the next attempt is in %s", wait.Round(time.Second))
 		}
 		return
 	}
+	if err := upload.Apply(ctx, plaintexts); err != nil {
+		consecutiveApplyFailures++
+		next := commitRetry.Failed(time.Now(), key)
+		level, msg := commitFailureStatus(err, consecutiveApplyFailures, fundsShortfall(ctx, upload.FundsFor, err))
+		logger.Logf("drift: upload.Apply: %v (failure %d; next attempt in %s unless the content changes)", err, consecutiveApplyFailures, next)
+		if level == "" {
+			return
+		}
+		// Push the status on the transition so the owner sees it without
+		// waiting for the next heartbeat; later failures only update it.
+		if prev := currentStatus.Set(level, msg); prev != level {
+			level, msg := currentStatus.Get()
+			report.Status(attestorURL, agentSealPriv, sealID, level, msg, binding)
+		}
+		return
+	}
+	commitRetry.Succeeded()
 	consecutiveApplyFailures = 0
 	// Success: if we were previously in warning / error, push a "running"
 	// status now so the UI clears without waiting for the next heartbeat.
@@ -1332,7 +1831,8 @@ func restoreManifestEntries(
 		}
 		ct, err := dataplane.Download(ctx, rootHex, indexer)
 		if err != nil {
-			return fmt.Errorf("download entry %q: %w", entry.Path, err)
+			// Storage is outside this sealed version (layered.go).
+			return transient(fmt.Errorf("download entry %q: %w", entry.Path, err))
 		}
 		pt, err := dataplane.Decrypt(ct, dataKey)
 		if err != nil {

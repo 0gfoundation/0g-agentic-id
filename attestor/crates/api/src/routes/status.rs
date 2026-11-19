@@ -60,14 +60,32 @@ pub async fn handle(
         ));
     }
 
-    if let (Some(agent), Some(auth)) = (
-        d.agent_id,
-        state.deployments.boot_authorization(report.seal_id).await?,
-    ) {
-        if auth.owner != Some(state.chain.owner_of(agent).await?) {
-            return Err(ApiError::forbidden(
-                "boot authorization belongs to a previous owner",
-            ));
+    if let Some(auth) = state.deployments.boot_authorization(report.seal_id).await? {
+        if let Some(agent) = d.agent_id {
+            if auth.owner != Some(state.chain.owner_of(agent).await?) {
+                return Err(ApiError::forbidden(
+                    "boot authorization belongs to a previous owner",
+                ));
+            }
+        }
+        if auth.operator.is_some() {
+            if !auth.enabled {
+                return Ok((
+                    StatusCode::OK,
+                    Json(json!({"ok": true, "ignored": "revoked boot"})),
+                ));
+            }
+            attestor_shared::auth::operator::validate_boot_operator(
+                state.chain.as_ref(),
+                state.crypto.as_ref(),
+                state.deployments.as_ref(),
+                state.cfg.chain_id,
+                state.cfg.agentic_id_addr,
+                &d,
+                &auth,
+            )
+            .await
+            .map_err(super::lifecycle_auth::boot_authorization_error)?;
         }
     }
 
@@ -159,6 +177,17 @@ pub async fn handle(
     };
     state.events.publish(event).await?;
 
+    if let Some(n) = report.credentials_pending {
+        // Signed in v3, so the count is the container's own.
+        let n = n.min(i32::MAX as u32) as i32;
+        match state.credentials.set_pending(report.seal_id, n).await {
+            Ok(()) if n > 0 => super::credentials::notify_pending(&state, report.seal_id),
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(seal_id = ?report.seal_id, error = %e, "credential pending count not stored")
+            }
+        }
+    }
     Ok((StatusCode::OK, Json(json!({"ok": true}))))
 }
 
@@ -220,6 +249,7 @@ mod tests {
 
             cli_latest: String::new(),
             cli_notes: String::new(),
+            releases_file: String::new(),
             frameworks: vec![attestor_shared::Framework {
                 name: "openclaw".into(),
                 image: None,
@@ -319,6 +349,8 @@ mod tests {
             chain: Arc::new(MockChain::new()),
             sandbox: Arc::new(MockSandbox),
             deployments: repo.clone(),
+            credentials: attestor_shared::credentials_repo::in_memory(),
+            notify: None,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             jobs: Arc::new(InMemoryJobQueue::new()),
             events: Arc::new(InMemoryEventBus::new()),
@@ -335,6 +367,8 @@ mod tests {
                 owner: Some(Address::ZERO),
                 sandbox_id: Some("sb-1".into()),
                 container_pubkey: None,
+                operator: None,
+                operator_version: None,
             },
         );
         repo.status_bindings
@@ -371,6 +405,7 @@ mod tests {
             error_detail,
             status_binding: s.token.clone(),
             settings_digest: s.digest,
+            credentials_pending: None,
             agent_seal_signature: Bytes::new(),
         };
         let sig: Vec<u8> = s
@@ -888,6 +923,8 @@ mod tests {
             deployments: s.repo.clone(),
             events: s.state.events.clone(),
             oss: attestor_shared::oss::OssClient::for_test(),
+            credentials: s.state.credentials.clone(),
+            runtime_creates: attestor_shared::runtime_creates::in_memory(),
         };
         // The owner's stop and start name the row's sandbox.
         let canonical = json!({

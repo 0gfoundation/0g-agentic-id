@@ -12,14 +12,17 @@ mod attestor_tls;
 mod avatar;
 mod clone;
 mod config;
+pub(crate) mod credentials;
 mod deploy;
 mod deployment;
 mod deployments;
 mod lifecycle_auth;
+mod operator;
 mod preflight;
 mod probe;
 mod providers;
 mod provision;
+pub(crate) mod releases;
 mod reset;
 mod retry;
 mod settings;
@@ -81,12 +84,14 @@ pub fn router(state: AppState) -> Router {
         .route("/avatar/:seed", get(avatar::keyed_avatar))
         .route("/health", get(health))
         .route("/config", get(config::handle))
+        .route("/releases", get(releases::handle))
         .route("/inference/providers", get(providers::read))
         .route(
             "/admin/inference/providers",
             axum::routing::put(providers::update),
         )
         .route("/deploy", post(deploy::handle))
+        .route("/operator", get(operator::handle_get).put(operator::handle_set))
         .route("/clone", post(clone::handle))
         .route(
             "/provision",
@@ -103,6 +108,22 @@ pub fn router(state: AppState) -> Router {
             get(settings::handle_get).post(settings::handle),
         )
         .route("/settings/seed", post(settings::handle_seed))
+        // Owner credential sets for sealed's credential proxy: owner-signed
+        // reads and writes, container writebacks signed by agentSeal, and
+        // the owner's cross-agent pending counts.
+        .route(
+            "/credentials",
+            get(credentials::handle_get).post(credentials::handle_post),
+        )
+        .route(
+            "/credentials/writeback",
+            post(credentials::handle_writeback),
+        )
+        .route("/credentials/pending", get(credentials::handle_pending))
+        .route(
+            "/credentials/notify",
+            get(credentials::handle_notify_get).post(credentials::handle_notify_post),
+        )
         .route("/start", post(start::handle))
         .route("/stop", post(stop::handle))
         .route("/retry", post(retry::handle))

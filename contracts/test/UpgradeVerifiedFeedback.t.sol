@@ -20,7 +20,7 @@ import {ServeProof} from "../src/interfaces/IAgenticIDReputationRegistry.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 
-/// @notice VerifiedFeedbackRegistry 1.1.0 → 1.2.0 across a real
+/// @notice VerifiedFeedbackRegistry 1.1.0 → 1.3.0 across a real
 ///         BeaconProxy + UpgradeableBeacon + Timelock upgrade (the generic
 ///         ScheduleUpgrade/ExecuteUpgrade path). The pre-upgrade impl is the
 ///         frozen 1.1.0 source (test/mocks/VerifiedFeedbackRegistryV1_1_0.sol).
@@ -177,10 +177,11 @@ contract UpgradeVerifiedFeedbackTest is AgenticIDTestBase {
 
         VerifiedFeedbackRegistry newImpl = new VerifiedFeedbackRegistry();
         _upgradeBeacon(address(newImpl));
-        assertEq(vfBeacon.implementation(), address(newImpl), "beacon points at 1.2.0");
-        assertEq(registry.VERSION(), "1.2.0", "post-upgrade VERSION");
+        assertEq(vfBeacon.implementation(), address(newImpl), "beacon points at the new impl");
+        assertEq(registry.VERSION(), "1.3.0", "post-upgrade VERSION");
 
-        // Marks + audit data + endpoints survived (no storage change in 1.2.0).
+        // Marks + audit data + endpoints survived (no storage change in 1.2.0;
+        // 1.3.0 only appends to the mapping-stored ServeData).
         assertTrue(registry.isVerified(agentId, client, 1), "plain mark survived");
         assertTrue(registry.isVerified(agentId, client, 2), "receipt mark survived");
         (bytes32[] memory hashes, bytes32 fw) = registry.getServeData(agentId, client, 1);
@@ -189,6 +190,9 @@ contract UpgradeVerifiedFeedbackTest is AgenticIDTestBase {
         assertEq(fw, FRAMEWORK_HASH, "serve data frameworkHash");
         assertEq(registry.getVerifiedEndpoint(agentId, client, 1), "", "plain mark has no endpoint");
         assertEq(registry.getVerifiedEndpoint(agentId, client, 2), "/hello", "endpoint survived");
+        (bytes32 sealedHash, bytes32 harnessHash) = registry.getServeLayers(agentId, client, 1);
+        assertEq(sealedHash, bytes32(0), "a pre-1.3.0 mark has no sealed hash");
+        assertEq(harnessHash, bytes32(0), "a pre-1.3.0 mark has no harness hash");
         assertEq(registry.getVerifiedIndexes(agentId, client).length, 2, "indexes survived");
         assertEq(registry.getVerifiedClients(agentId).length, 1, "clients survived");
 

@@ -1,0 +1,14 @@
+{
+  "releases": [
+    {
+      "version": "0.5.0",
+      "published_at": "2026-11-26T00:00:00Z",
+      "migrate": [
+        {"framework": "openclaw", "image_hash": "0x287c697ecc2ae86fa419b223df95aa2a6c3fb87d437e758abee92eafd926c1fa", "until": "2026-12-10T00:00:00Z"},
+        {"framework": "hermes", "image_hash": "0x84fbfa113e686bc2f2e112b5fcbae7346a35d6a162944b9618bd30904e4fdb88", "until": "2026-12-10T00:00:00Z"},
+        {"framework": "prime-agent", "image_hash": "0x871941eb0863def5ed89296694bf755d9bf0e05f5896adf86ca9144726cb8704", "until": "2026-12-10T00:00:00Z"},
+        {"framework": "0g-harness", "image_hash": "0xb7febbbe3d00c77995cc484d37aa569558dd546851694d8a7c97e9ea1f2a10cd", "until": "2026-12-10T00:00:00Z"}
+      ]
+    }
+  ]
+}

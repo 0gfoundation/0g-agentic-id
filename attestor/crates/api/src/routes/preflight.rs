@@ -45,6 +45,25 @@ pub async fn check_owner_ready(state: &AppState, owner: Address) -> Result<(), A
     .await
 }
 
+/// Minting an agent does not allocate compute. The NFT owner still
+/// acknowledges the configured trust roots, but need not fund a sandbox
+/// balance when a delegated operator will provision and pay for it later.
+pub async fn check_owner_trust_ready(state: &AppState, owner: Address) -> Result<(), ApiError> {
+    check_inner(
+        state.chain.as_ref(),
+        owner,
+        state.cfg.tapp_registry_addr,
+        &[
+            ("attestor", state.cfg.app_id.as_deref()),
+            ("kms", state.cfg.kms_app_id.as_deref()),
+            ("sandbox", state.cfg.sandbox_app_id.as_deref()),
+        ],
+        None,
+        None,
+    )
+    .await
+}
+
 async fn check_inner(
     chain: &dyn ChainClient,
     owner: Address,

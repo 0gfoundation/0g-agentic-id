@@ -37,6 +37,8 @@ contract StorageLayoutTest is Test {
             0xa91e4c2ef61514299267811101bdc16c30719384e3b85c6fa8328f091e37e100);
         assertEq(_erc7201("0g.storage.CloneGate"),
             0x70c420e34ba808fea9cb59170b4cd5f9b7bcf6408241b0008bcba5d7b854d100);
+        assertEq(_erc7201("0g.storage.TrustRegistry"),
+            0x955d528b0519d716790edec9a92352a4ea6b21e7ba2e05977e7147878d775100);
     }
 
     /// @dev The OZ namespaces behind the 1.2.0 Ownable → Ownable2Step swap
@@ -49,14 +51,14 @@ contract StorageLayoutTest is Test {
         bytes32 twoStep = _erc7201("openzeppelin.storage.Ownable2Step");
         assertEq(ownable, 0x9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300);
         assertEq(twoStep, 0x237e158222e3e6968b72b9db0d8043aacf074ad9f650f0d1606b4d82ee432c00);
-        string[13] memory ours = [
+        string[14] memory ours = [
             "0g.storage.AgenticID", "0g.storage.ERC8004CanonicalBound",
             "0g.storage.ERC7857Cloneable", "0g.storage.ERC7857Authorize",
             "0g.storage.ERC7857IDataStorage", "0g.storage.NonceRegistry",
             "0g.storage.TEEDataVerifier", "0g.storage.AgenticIDReputationRegistry",
             "0g.storage.ERC7857", "0g.storage.VerifiedFeedbackRegistry",
             "0g.storage.CloneGate", "openzeppelin.storage.Ownable",
-            "0g.storage.BaseDataVerifier"
+            "0g.storage.BaseDataVerifier", "0g.storage.TrustRegistry"
         ];
         for (uint256 i = 0; i < ours.length; i++) {
             assertTrue(_erc7201(ours[i]) != twoStep, ours[i]);

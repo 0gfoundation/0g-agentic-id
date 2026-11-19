@@ -51,6 +51,52 @@ pub struct IDataArtifact {
     pub ciphertext: Bytes,
 }
 
+/// Public chain metadata cannot carry the deployer's persisted retry bytes.
+/// Synchronization merges those bytes only from the currently locked DB row.
+#[derive(Debug, Clone)]
+pub struct ChainIDataArtifact {
+    pub role: String,
+    pub description: String,
+    pub storage_root: StorageRoot,
+    pub sealed_key: Bytes,
+    pub data_hash: DataHash,
+}
+
+pub(crate) fn merge_chain_i_data(
+    storage_stage: &StageStatus,
+    current: &[IDataArtifact],
+    incoming: Vec<ChainIDataArtifact>,
+) -> Option<Vec<IDataArtifact>> {
+    // A confirmed empty array is the phase-2 scratch cleanup. Chain events
+    // must not refill it, including events fetched before that cleanup.
+    if matches!(storage_stage, StageStatus::Confirmed { .. }) && current.is_empty() {
+        return None;
+    }
+    Some(
+        incoming
+            .into_iter()
+            .map(|metadata| {
+                let ciphertext = current
+                    .iter()
+                    .find(|stored| {
+                        stored.data_hash == metadata.data_hash
+                            && stored.description == metadata.description
+                    })
+                    .map(|stored| stored.ciphertext.clone())
+                    .unwrap_or_default();
+                IDataArtifact {
+                    role: metadata.role,
+                    description: metadata.description,
+                    storage_root: metadata.storage_root,
+                    sealed_key: metadata.sealed_key,
+                    data_hash: metadata.data_hash,
+                    ciphertext,
+                }
+            })
+            .collect(),
+    )
+}
+
 fn bytes_is_empty(b: &Bytes) -> bool {
     b.is_empty()
 }
@@ -180,6 +226,14 @@ pub struct DeployRequest {
     /// deploy (SDK `provision: false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_envelope: Option<SandboxEnvelope>,
+
+    /// The owner stores the agent's credential set right after this deploy
+    /// is accepted (the SDK puts the model key there), so its container is
+    /// created once the set is stored, or after `AWAIT_CREDENTIALS` in the
+    /// worker: a container that boots first gets no set until its next
+    /// boot. Signed with the rest (`CanonicalDeploy`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub await_credentials: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -671,6 +725,7 @@ mod tests {
             description: "d".into(),
             image: None,
             sandbox_envelope: Some(env),
+            await_credentials: false,
         };
         let out = format!("{job:?}");
         assert!(
@@ -691,6 +746,7 @@ mod tests {
                 description: String::new(),
                 image: None,
                 sandbox_envelope: None,
+                await_credentials: false,
             },
             JobPayload::SandboxStart { seal_id: seal, sandbox_envelope: envelope("x") },
             JobPayload::SandboxStop { seal_id: seal, sandbox_envelope: envelope("x") },
@@ -792,6 +848,7 @@ mod tests {
                     description: "d".into(),
                     image: None,
                     sandbox_envelope: Some(env.clone()),
+                    await_credentials: false,
                 },
                 None,
             ),
@@ -1212,6 +1269,13 @@ pub struct ProvisionRequest {
     pub boot_id: B256,
     /// Unix nanoseconds; strictly increasing across attempts of one boot.
     pub boot_started_at: i64,
+    /// The sealed program the loader verified and started (sealed/LAYERS.md
+    /// §10): sent only under the layered flow (`GET /provision` answered
+    /// `layered`), and then signed into the claim as ProvisionBoot.v2.
+    /// LEGACY(v1): optional for a container that sends none and claims with
+    /// ProvisionBoot.v1 (`legacy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_hash: Option<B256>,
     pub container_signature: Bytes,
 }
 
@@ -1226,6 +1290,12 @@ pub struct ProvisionResponse {
     /// up unconfigured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_settings: Option<Bytes>,
+    /// The owner's credential set for this agent (`auth::credentials`) with
+    /// the container's writebacks merged in and the ownership epoch it was
+    /// signed for, ECIES-encrypted to the same container key. Omitted when
+    /// there is no set for the current ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_credentials: Option<Bytes>,
     /// ECIES-encrypted `{"token":"<64 lowercase hex>"}`: the opaque per-boot
     /// status token. The attestor stores only its SHA-256.
     pub encrypted_status_binding: Bytes,
@@ -1259,6 +1329,10 @@ pub struct StatusReport {
     pub status_binding: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_digest: Option<B256>,
+    /// Credential requests waiting for the owner (sealed's credential
+    /// store). Present only in `StatusReport.v3`, which signs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_pending: Option<u32>,
     /// Raw ECDSA signature (65 bytes, V ∈ {27,28}) produced by the
     /// container's `agentSeal_priv` over `keccak256(canonical_message)`,
     /// where `canonical_message` is a colon-joined ASCII string
@@ -1335,11 +1409,13 @@ pub struct LifecycleRequest {
 
 /// Request body for `POST /retry` — owner-triggered recovery.
 ///
-/// The optional `sandbox_envelope` (action="create") lets a single
-/// /retry call also recreate the sandbox when c is Failed/Stopped:
-/// after storage/mint retry runs, the worker reuses the envelope to
-/// spawn a fresh container, avoiding a second wallet popup. Pure
-/// storage/mint recovery (c healthy) ignores the envelope.
+/// `sandbox_envelope` (action="create", signed by the current owner) is
+/// required: the API answers `401` without it. It also lets a single
+/// /retry call recreate the sandbox when c is Failed/Stopped: after
+/// storage/mint retry runs, the worker reuses the envelope to spawn a
+/// fresh container, avoiding a second wallet popup. Pure storage/mint
+/// recovery (c healthy) ignores the envelope. `owner` is informational
+/// and never used for authorisation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryRequest {
     pub seal_id: SealId,
@@ -1459,6 +1535,10 @@ pub enum JobPayload {
         /// brought online later via SandboxStart). `Some` provisions as usual.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sandbox_envelope: Option<SandboxEnvelope>,
+        /// The container waits for the owner's credential set before it is
+        /// created (`DeployRequest::await_credentials`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        await_credentials: bool,
     },
     /// Resume a previously stopped sandbox. Worker calls
     /// `SandboxClient::start(seal_id, envelope)` which relays to

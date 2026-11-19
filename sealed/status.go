@@ -21,13 +21,15 @@ import (
 //	          (e.g., agent wallet has insufficient funds for the
 //	          drift-publish transaction — only owner can fix by funding
 //	          the address)
-//	error     genuine system failure, owner can't act on it directly
-//	          (sealed / openclaw / 0G chain / attestor link broken)
+//	error     the agent itself cannot serve (its framework stopped, the
+//	          agent belongs to another owner); the attestor shows it
+//	          offline
 //
-// Heartbeat now reflects current state instead of hard-coding "running",
-// and handleDrift uses the severity classifier to decide whether to
-// escalate immediately (warning, first occurrence) or after the
-// 5-failure threshold (error, defended against transient blips).
+// A failed commit of the agent's data to chain is a warning, never an error:
+// the agent runs and answers, only its data is not on chain yet
+// (commitFailureStatus, commitretry.go). handleDrift shows it at once when
+// the seal wallet cannot pay (severityOf), after failureEscalateAt
+// consecutive failures otherwise. Heartbeat reflects the current state.
 
 // runtimeStatus is the single source of truth for what the next /status
 // report (drift, heartbeat, or recovery) should declare. Zero value is
@@ -36,9 +38,10 @@ type runtimeStatus struct {
 	mu      sync.Mutex
 	level   string // "running" | "warning" | "error"
 	message string
-	// pinned is an owner-recoverable condition that no runtime event
-	// clears for the life of this boot (today: an owner-supplied sealed
-	// key that did not apply, so the agent cannot call its model). While
+	// pinned is an owner-recoverable condition for the life of this boot
+	// (today: an owner-supplied sealed key that did not apply, so the agent
+	// cannot call its model), cleared only once a model key from the
+	// credential set is in use. While
 	// the runtime itself is "running", it shows as a "warning" with this
 	// message, so a later drift success or heartbeat cannot report the
 	// agent healthy. A real warning or error still takes precedence.
@@ -48,12 +51,27 @@ type runtimeStatus struct {
 	// It shows like pinned, after it, until a settings push applies.
 	settingsIssue     string
 	supervisorFailure string
+	// modelKeyIssue is why the framework is stopped: the model key the
+	// settings choose cannot be used (modelkey.go). Cleared once a key
+	// renders, whichever start path rendered it.
+	modelKeyIssue string
+	// ownerChanged is set while the agent belongs to an owner other than the
+	// one this container was started for: the container no longer serves it.
+	ownerChanged string
 }
 
 var currentStatus = &runtimeStatus{level: "running"}
 
 // effective is what a /status report should declare. Caller holds mu.
 func (s *runtimeStatus) effective() (string, string) {
+	if s.ownerChanged != "" {
+		return "error", s.ownerChanged
+	}
+	// Before a supervisor failure: the restarts it gave up on failed over
+	// the model key, and this says so.
+	if s.modelKeyIssue != "" {
+		return "error", s.modelKeyIssue
+	}
 	if s.supervisorFailure != "" {
 		return "error", s.supervisorFailure
 	}
@@ -87,11 +105,57 @@ func (s *runtimeStatus) Set(level, message string) string {
 }
 
 // Pin sets (or, with "", clears) the pinned warning described on
-// runtimeStatus. The message must carry no secret values.
-func (s *runtimeStatus) Pin(message string) {
+// runtimeStatus and reports whether it changed. The message must carry no
+// secret values.
+func (s *runtimeStatus) Pin(message string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	changed := s.pinned != message
 	s.pinned = message
+	return changed
+}
+
+// OwnerChanged sets (or, with "", clears) the owner-change error described
+// on runtimeStatus and returns the previous effective level.
+func (s *runtimeStatus) OwnerChanged(message string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, _ := s.effective()
+	s.ownerChanged = message
+	return prev
+}
+
+// ModelKeyIssue sets (or, with "", clears) the model key error described on
+// runtimeStatus and reports whether it changed. The message must carry no
+// secret values.
+func (s *runtimeStatus) ModelKeyIssue(message string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := s.modelKeyIssue != message
+	s.modelKeyIssue = message
+	return changed
+}
+
+// statusReporter sends the effective status from one goroutine, reading it
+// when it sends: reports leave in order and the last one is current.
+type statusReporter struct{ nudge chan struct{} }
+
+func newStatusReporter(send func(level, message string)) *statusReporter {
+	r := &statusReporter{nudge: make(chan struct{}, 1)}
+	go func() {
+		for range r.nudge {
+			send(currentStatus.Get())
+		}
+	}()
+	return r
+}
+
+// Soon asks for a report; asks while one is pending fold into it.
+func (r *statusReporter) Soon() {
+	select {
+	case r.nudge <- struct{}{}:
+	default:
+	}
 }
 
 // SettingsIssue sets (or, with "", clears) the settings warning described
@@ -105,11 +169,10 @@ func (s *runtimeStatus) SettingsIssue(message string) string {
 	return prev
 }
 
-// severityOf classifies a runtime error into one of the 3 severity
-// levels. Owner-recoverable conditions (insufficient funds, etc.) are
-// "warning" so the UI can prompt the owner to act without escalating
-// the alarm; everything else is "error" by default (defensive — we'd
-// rather false-alarm than silently miss a real failure).
+// severityOf tells an owner-recoverable commit failure ("warning":
+// insufficient funds, etc., shown to the owner at once) from any other
+// ("error": possibly transient, shown after failureEscalateAt failures).
+// Either way the agent's status is a warning (commitFailureStatus).
 //
 // nil error → "running" (caller's success path).
 func severityOf(err error) string {
@@ -180,8 +243,10 @@ func (s *runtimeStatus) SupervisorFailed(message string) {
 	defer s.mu.Unlock()
 	s.supervisorFailure = message
 }
-func (s *runtimeStatus) SupervisorRecovered() {
+func (s *runtimeStatus) SupervisorRecovered() (changed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	changed = s.supervisorFailure != ""
 	s.supervisorFailure = ""
+	return changed
 }

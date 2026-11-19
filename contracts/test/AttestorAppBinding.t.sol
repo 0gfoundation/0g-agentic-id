@@ -2,10 +2,10 @@
 pragma solidity ^0.8.24;
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
+import {AgenticID, AgenticIDNotTrustedAttestor, AgenticIDAgentSealTaken} from "../src/AgenticID.sol";
 import {
-    AgenticID, IAttestorAppRegistry, AgenticIDNotTrustedAttestor, AgenticIDAgentSealTaken,
-    AgenticIDInvalidAttestorBinding, AgenticIDAppInstanceMismatch
-} from "../src/AgenticID.sol";
+    IAttestorAppRegistry, AgenticIDInvalidAttestorBinding, AgenticIDAppInstanceMismatch
+} from "../src/AttestorAppBindingLib.sol";
 import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
@@ -51,6 +51,9 @@ contract AttestorRawRegistryMock {
     }
 }
 
+/// @notice Attestor trust and Tapp app bindings. The TrustRegistry holds them
+///         (1.4.0); AgenticID's mint and URI gates and its trust reads follow
+///         the registry.
 contract AttestorAppBindingTest is AgenticIDTestBase {
     AttestorRegistryMock internal registry;
 
@@ -66,36 +69,36 @@ contract AttestorAppBindingTest is AgenticIDTestBase {
 
     function bind() internal {
         vm.prank(owner);
-        agenticId.bindTrustedAttestorApp(attestor, address(registry), "attestor", 100);
+        trustRegistry.bindTrustedAttestorApp(attestor, address(registry), "attestor", 100);
     }
 
     function test_bindingAdministrationRemainsOwnerOnly() public {
         vm.startPrank(attestor);
         vm.expectRevert();
-        agenticId.bindTrustedAttestorApp(attestor, address(registry), "attestor", 100);
+        trustRegistry.bindTrustedAttestorApp(attestor, address(registry), "attestor", 100);
         vm.expectRevert();
-        agenticId.removeTrustedAttestor(attestor);
+        trustRegistry.removeTrustedAttestor(attestor);
         vm.expectRevert();
-        agenticId.requireInstanceBoundAttestors();
+        trustRegistry.requireInstanceBoundAttestors();
         vm.stopPrank();
         assertFalse(agenticId.isTrustedAttestor(attestor));
         assertFalse(agenticId.instanceBoundAttestorsRequired());
     }
 
-    function test_linkedBindingEmitsFromProxyAndClearsLongAppId() public {
+    function test_bindingEmitsFromRegistryAndClearsLongAppId() public {
         string memory appId = "attestor-app-id-longer-than-one-solidity-storage-word";
-        vm.expectEmit(true, true, false, true, address(agenticId));
+        vm.expectEmit(true, true, false, true, address(trustRegistry));
         emit TrustedAttestorAppBound(attestor, address(registry), appId, 100);
         vm.prank(owner);
-        agenticId.bindTrustedAttestorApp(attestor, address(registry), appId, 100);
+        trustRegistry.bindTrustedAttestorApp(attestor, address(registry), appId, 100);
         (, string memory stored,,) = agenticId.trustedAttestorAppBinding(attestor);
-        assertEq(stored, appId);
-        vm.expectEmit(true, false, false, true, address(agenticId));
+        assertEq(stored, appId, "AgenticID forwards the binding read");
+        vm.expectEmit(true, false, false, true, address(trustRegistry));
         emit TrustedAttestorRemoved(attestor);
         vm.prank(owner);
-        agenticId.removeTrustedAttestor(attestor);
+        trustRegistry.removeTrustedAttestor(attestor);
         (address boundRegistry, string memory cleared, uint256 epoch, address boundOwner) =
-            agenticId.trustedAttestorAppBinding(attestor);
+            trustRegistry.trustedAttestorAppBinding(attestor);
         assertEq(boundRegistry, address(0));
         assertEq(cleared, "");
         assertEq(epoch, 0);
@@ -135,7 +138,8 @@ contract AttestorAppBindingTest is AgenticIDTestBase {
         _whitelistAttestor();
         assertTrue(agenticId.isTrustedAttestor(attestor));
         vm.prank(owner);
-        agenticId.requireInstanceBoundAttestors();
+        trustRegistry.requireInstanceBoundAttestors();
+        assertTrue(agenticId.instanceBoundAttestorsRequired(), "AgenticID forwards the mode");
         assertFalse(agenticId.isTrustedAttestor(attestor));
         _whitelistAttestor();
         assertFalse(agenticId.isTrustedAttestor(attestor));
@@ -146,11 +150,11 @@ contract AttestorAppBindingTest is AgenticIDTestBase {
     function test_removeClearsBindingAndWrongEpochCannotBind() public {
         vm.prank(owner);
         vm.expectRevert(AgenticIDAppInstanceMismatch.selector);
-        agenticId.bindTrustedAttestorApp(attestor, address(registry), "attestor", 99);
+        trustRegistry.bindTrustedAttestorApp(attestor, address(registry), "attestor", 99);
         bind();
         vm.prank(owner);
-        agenticId.removeTrustedAttestor(attestor);
-        (address addr,, uint256 epoch,) = agenticId.trustedAttestorAppBinding(attestor);
+        trustRegistry.removeTrustedAttestor(attestor);
+        (address addr,, uint256 epoch,) = trustRegistry.trustedAttestorAppBinding(attestor);
         assertEq(addr, address(0));
         assertEq(epoch, 0);
         assertFalse(agenticId.isTrustedAttestor(attestor));
@@ -166,8 +170,8 @@ contract AttestorAppBindingTest is AgenticIDTestBase {
         }));
         raw.setResponse(valid, false);
         vm.prank(owner);
-        agenticId.bindTrustedAttestorApp(attestor, address(raw), "attestor", 100);
-        assertTrue(agenticId.isTrustedAttestor(attestor));
+        trustRegistry.bindTrustedAttestorApp(attestor, address(raw), "attestor", 100);
+        assertTrue(trustRegistry.isTrustedAttestor(attestor));
 
         bytes[] memory malformed = new bytes[](6);
         malformed[0] = new bytes(0);
@@ -184,33 +188,33 @@ contract AttestorAppBindingTest is AgenticIDTestBase {
         }
         for (uint256 i = 0; i < malformed.length; i++) {
             raw.setResponse(malformed[i], false);
-            assertFalse(agenticId.isTrustedAttestor(attestor), "malformed live response must deny");
+            assertFalse(trustRegistry.isTrustedAttestor(attestor), "malformed live response must deny");
             vm.prank(owner);
             vm.expectRevert(AgenticIDAppInstanceMismatch.selector);
-            agenticId.bindTrustedAttestorApp(attestor, address(raw), "attestor", 100);
+            trustRegistry.bindTrustedAttestorApp(attestor, address(raw), "attestor", 100);
         }
         raw.setResponse(valid, true);
-        assertFalse(agenticId.isTrustedAttestor(attestor), "reverting registry must deny");
+        assertFalse(trustRegistry.isTrustedAttestor(attestor), "reverting registry must deny");
         vm.prank(owner);
         vm.expectRevert(AgenticIDAppInstanceMismatch.selector);
-        agenticId.bindTrustedAttestorApp(attestor, address(raw), "attestor", 100);
+        trustRegistry.bindTrustedAttestorApp(attestor, address(raw), "attestor", 100);
         raw.setResponse(valid, false);
-        assertTrue(agenticId.isTrustedAttestor(attestor));
+        assertTrue(trustRegistry.isTrustedAttestor(attestor));
     }
 
     function test_invalidBindingInputsRevertWithCustomError() public {
         vm.startPrank(owner);
         vm.expectRevert(AgenticIDInvalidAttestorBinding.selector);
-        agenticId.bindTrustedAttestorApp(address(0), address(registry), "attestor", 100);
+        trustRegistry.bindTrustedAttestorApp(address(0), address(registry), "attestor", 100);
         vm.expectRevert(AgenticIDInvalidAttestorBinding.selector);
-        agenticId.bindTrustedAttestorApp(attestor, address(0), "attestor", 100);
+        trustRegistry.bindTrustedAttestorApp(attestor, address(0), "attestor", 100);
         vm.expectRevert(AgenticIDInvalidAttestorBinding.selector);
-        agenticId.bindTrustedAttestorApp(attestor, address(registry), "", 100);
+        trustRegistry.bindTrustedAttestorApp(attestor, address(registry), "", 100);
         vm.stopPrank();
     }
 
     function test_beaconProxySelfChecksPreserveTheOriginalAttestor() public {
-        AgenticID implementation = new AgenticID();
+        AgenticID implementation = new AgenticID(address(trustRegistry));
         UpgradeableBeacon beacon = new UpgradeableBeacon(address(implementation), address(this));
         BeaconProxy proxy = new BeaconProxy(address(beacon), abi.encodeCall(
             AgenticID.initialize, ("AgenticID", "AID", address(verifier), owner, pauser, address(canonical))
@@ -218,7 +222,7 @@ contract AttestorAppBindingTest is AgenticIDTestBase {
         agenticId = AgenticID(address(proxy));
         bind();
         vm.prank(owner);
-        agenticId.requireInstanceBoundAttestors();
+        trustRegistry.requireInstanceBoundAttestors();
         IntelligentData[] memory datas = new IntelligentData[](1);
         datas[0] = IntelligentData({dataDescription: "d", dataHash: keccak256("data")});
         bytes[] memory keys = new bytes[](1);
@@ -240,18 +244,23 @@ contract AttestorAppBindingTest is AgenticIDTestBase {
         assertEq(agenticId.tokenURI(id), "https://example/card.json");
     }
 
-    function test_appBindingsAppendAfterTheV1_2SealAddressMap() public {
+    /// @dev 1.4.0 keeps AgenticID's storage struct as 1.3.0 left it: the seal
+    ///      map stays at base+7 and still binds, while the retired trust fields
+    ///      (trustedAttestors base+3, attestorAppBindings base+8,
+    ///      instanceBoundAttestorsRequired base+9) are never written — trust
+    ///      changes land in the registry only.
+    function test_trustStateLivesInTheRegistryNotInAgenticIDStorage() public {
         uint256 base = uint256(0xaa0e3d57ddf5d2f322a098202cb27f2804b292978acf041b4edd6beb821d4000);
         bytes32 sealSlot = keccak256(abi.encode(SEAL_ADDR, base + 7));
-        // This entry already exists on a 1.2.0 proxy before a beacon upgrade.
+        // This entry already exists on a pre-1.4.0 proxy before a beacon upgrade.
         vm.store(address(agenticId), sealSlot, bytes32(uint256(1)));
         bind();
         vm.prank(owner);
-        agenticId.requireInstanceBoundAttestors();
-        assertEq(vm.load(address(agenticId), sealSlot), bytes32(uint256(1)));
-        bytes32 bindingSlot = keccak256(abi.encode(attestor, base + 8));
-        assertEq(address(uint160(uint256(vm.load(address(agenticId), bindingSlot)))), address(registry));
-        assertEq(vm.load(address(agenticId), bytes32(base + 9)), bytes32(uint256(1)));
+        trustRegistry.requireInstanceBoundAttestors();
+        assertTrue(agenticId.isTrustedAttestor(attestor));
+        assertEq(vm.load(address(agenticId), keccak256(abi.encode(attestor, base + 3))), bytes32(0));
+        assertEq(vm.load(address(agenticId), keccak256(abi.encode(attestor, base + 8))), bytes32(0));
+        assertEq(vm.load(address(agenticId), bytes32(base + 9)), bytes32(0));
 
         IntelligentData[] memory datas = new IntelligentData[](1);
         datas[0] = IntelligentData({dataDescription: "d", dataHash: keccak256("data")});

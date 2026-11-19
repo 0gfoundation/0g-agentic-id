@@ -5,6 +5,7 @@ import {Script, console2} from "forge-std/Script.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {AgenticID} from "../src/AgenticID.sol";
+import {TrustRegistry} from "../src/TrustRegistry.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
@@ -29,7 +30,11 @@ contract DeployAndMint is Script {
             abi.encodeCall(TEEDataVerifier.initialize, (me, me, me, 1 days))
         );
 
-        AgenticID impl = new AgenticID();
+        ERC1967Proxy trustProxy = new ERC1967Proxy(
+            address(new TrustRegistry()), abi.encodeCall(TrustRegistry.initialize, (me))
+        );
+
+        AgenticID impl = new AgenticID(address(trustProxy));
         ERC1967Proxy proxy = new ERC1967Proxy(
             address(impl),
             abi.encodeCall(
@@ -53,6 +58,7 @@ contract DeployAndMint is Script {
 
         console2.log("deployer      :", me);
         console2.log("verifier proxy:", address(vProxy));
+        console2.log("TrustRegistry :", address(trustProxy));
         console2.log("AgenticID     :", address(agenticId));
         console2.log("minted agentId:", agentId);
     }

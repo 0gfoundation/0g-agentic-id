@@ -72,3 +72,26 @@ func TestResolveZG_ListedModelWithoutFormatsUsesHeuristic(t *testing.T) {
 		t.Errorf("formats-less glm model = %+v; want openai heuristic", r)
 	}
 }
+
+// The catalog's architecture.input_modalities says whether a model takes
+// images (the 0G router's shape); an entry without it says nothing.
+func TestResolveZG_InputModalities(t *testing.T) {
+	withCatalog(t, `{"data":[
+		{"id":"glm-5.3","supported_formats":["openai"],"architecture":{"input_modalities":["text"],"output_modalities":["text"]}},
+		{"id":"glm-5.3-flash","supported_formats":["openai"],"architecture":{"input_modalities":["text","image"]}},
+		{"id":"plain","supported_formats":["openai"]}]}`)
+	for _, c := range []struct {
+		model        string
+		takes, known bool
+	}{{"glm-5.3", false, true}, {"glm-5.3-flash", true, true}, {"plain", false, false}} {
+		takes, known := ResolveZG(context.Background(), c.model).TakesImages()
+		if takes != c.takes || known != c.known {
+			t.Errorf("%s: TakesImages = %v, %v; want %v, %v", c.model, takes, known, c.takes, c.known)
+		}
+	}
+	// A catalog outage is not "text-only": nothing is known.
+	zgModelsURL = "http://127.0.0.1:1/nope"
+	if _, known := ResolveZG(context.Background(), "glm-5.3").TakesImages(); known {
+		t.Error("the heuristic claims to know the model's input")
+	}
+}

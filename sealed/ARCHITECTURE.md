@@ -17,7 +17,7 @@ External components it integrates with:
 | attestor | After the sandbox comes up, it initiates RA against attestor to receive `agent_seal_priv`. See [`attestor/`](../attestor/README.md) for details |
 | AgenticID contract | Reads `intelligentDatasOf` / `sealedKeysOf`, signs `update` txs that push evolution on chain |
 | 0G storage | The actual carrier for each iData's encrypted plaintext; sealed downloads via the `0g-storage-client` CLI and uploads in-process via the same client's Go SDK (`internal/dataplane/upload.go`), so the signing key never leaves sealed |
-| the agent framework | Four adapters are compiled in and self-register at startup — openclaw, hermes, prime-agent, 0g-harness (`main.go:118-121`); the on-chain binding's `name` selects one, `AGENT_FRAMEWORK` is only the no-binding fallback. openclaw is the reference implementation: an npm package sealed installs and spawns as a subprocess on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); another framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
+| the agent framework | Four adapters are compiled in and self-register at startup — openclaw, hermes, prime-agent, 0g-harness (`adapters.go`); the 0g-harness image builds sealed with the `harnessonly` tag and carries only its own adapter (`adapters_harnessonly.go`). The on-chain binding's `name` selects one, `AGENT_FRAMEWORK` is only the no-binding fallback. openclaw is the reference implementation: an npm package sealed installs and spawns as a subprocess on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); another framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
 
 This document describes **the form actually running in current code** and **why it's organized that way**.
 
@@ -80,7 +80,7 @@ gate     privsep          privsep.Required: framework will run as the `agent` us
 Phase 1  provision        GET /provision (generation, certificate_required) →
                           POST /provision: the boot claim signed with the container key,
                           plus the certificate only when required; retried with backoff
-                          (1 s doubling to 30 s) until 10 min after PID-1 start →
+                          (1 s doubling to 30 s) until 10 min after sealed starts →
                           ECIES-decrypt, with the one container key, the payloads the
                           response carries:
                             · agent_seal_priv                (fatal if absent)
@@ -145,6 +145,86 @@ version promotion share one database transaction (`routes/status.rs`,
 sealed never sends one. This sealed requires the matching provider and
 attestor (v3 certificate, attestor TLS statement, the `/provision` shape
 above); every agent is recreated onto it.
+
+### The loader (0g-harness image), stopping, and the layered runtime
+
+In the 0g-harness image PID 1 is not sealed but the loader (`cmd/loader`);
+the image carries no sealed program (`images/harness/Dockerfile`). At every
+start the loader reads the trust registry's sealed list with `eth_call`s to
+`CHAIN_RPC_URL` (AgenticID's `trustRegistry()`, then the registry's
+`listed(SEALED)` and `isListed(SEALED, hash)`, `allowlist.go`) and picks the
+version it ran last while listed and not failed here, else the one that
+replaced, else the listed versions newest first (`supervise.go` `choose`). A
+version it does not have it downloads by hash from the artifacts release
+(`fetch.go`; at most 64 MiB, kept only if it hashes to its name; a mismatch is
+not fetched again in this container). It checks the program's hash right
+before it runs it; a version runs only when the chain says it is listed, and
+when the list cannot be read, or lists nothing that can run here, nothing
+runs and it reads the list again after 30 s, doubling up to 5 min. It starts
+sealed as its child with the environment unchanged plus `SEALED_HASH` (the
+hash it checked) and `SEALED_TRIAL` (on trial), forwards SIGTERM, SIGINT,
+SIGQUIT and SIGHUP, kills sealed if it has not exited 2 min after a stop
+signal, and reaps every orphan. Every version that has not come up in this
+container runs on trial, a new container's first one too: one that exits
+before confirming it came up, or has not confirmed within 20 minutes, is
+recorded as failed here and the next version starts. It also switches sealed
+versions when sealed asks (SIGUSR1) and the chain lists the new one, ending
+what the old sealed left behind before the switch (`LAYERS.md` §3, §3.1). It
+restarts a sealed that exits on its own at most 5 times in 10 minutes; exit
+code 76 (an owner restart of sealed) restarts at once and is not counted, and
+exit code 69 (a boot that failed for a reason outside the version) restarts
+the same version after 30 s, doubling up to 5 min, without counting it
+against the version. Its state directory is `/var/lib/loader`, which only
+root can enter. Like sealed it is root, non-dumpable and sets `no_new_privs`,
+and it links only the standard library and `golang.org/x/sys`
+(`TestLinkedPackages`). The other images keep sealed as PID 1.
+
+A sealed the loader started (`SEALED_HASH` set) claims at `/provision` only
+when the attestor declares the layered flow; otherwise it claims nothing and
+exits 69 (`internal/provision` `LayeredRequired`).
+
+A sealed that is not PID 1 handles SIGTERM and SIGINT (`shutdown.go`): it
+stops the watcher, stops the framework (which nothing restarts afterwards),
+waits for the watcher's tick in progress, and exits 0, all within 90 s. It
+starts no commit of its own: the platform kills the container about 10 s
+after the stop signal, and one 0G storage upload can take most of that.
+Changes made after the last commit stay on disk instead: sealed keeps, in
+`/var/lib/sealed/synced.json` (root-only), the version of each role this
+container last had in sync with the chain, and when on the next boot the
+chain has not moved but the disk has, it keeps the disk and lets the watcher
+commit it, instead of restoring the chain version over it (`synced.go`; for
+adapters that declare `framework.UncommittedKeeper`, i.e. 0g-harness). A
+recreate keeps only the iData on chain. As PID 1 sealed does not handle these
+signals, as before.
+
+The 0g-harness harness runs only from an official version package, which
+sealed downloads by hash from the artifacts release and unpacks into
+`/opt/0g-harness/<sha256>/`, root's, readable and runnable by the agent but
+not writable (`internal/layers`); the image ships none. Its model calls go through sealed's inference proxy
+(`internal/inferproxy`) for every provider sealed knows the endpoint of, the
+native `openai` and `anthropic` included, at official URLs fixed in sealed
+(`inference.NativeEndpoint`): sealed sets the address and the model name, puts the
+platform doc at the end of every request's system prompt, and the credential
+proxy fills the key, so the harness holds a placeholder. The token the owner
+gets from `/_seal/auth` is not the one the harness checks; the proxy checks it
+at the entry and swaps it. The harness's routes are listed one by one
+(`framework.Route.Endpoints`), and it can ask over the sign socket to be
+restarted (`POST /harness/restart`); the owner restarts the harness or sealed
+with `POST /_seal/restart` (`ownerrestart.go`). The sign socket refuses a transaction to
+AgenticID `update` or `updateAt` and records every signature and refusal for
+the owner (`/_seal/signatures`), and the sockets serve their endpoints as MCP
+tools (`POST /mcp`, `internal/sealmcp`), which the harness registers as native
+tools; both are adapter-declared (`framework.SigningRules`,
+`framework.RuntimeTools`), and only 0g-harness declares them. Every iData entry it uploads carries a
+salted plaintext commitment (`internal/uploader/commitments.go`). Once the
+attestor declares the layered flow, sealed reports its own hash, signs
+ServeProof v2, and at boot, after every settings push and at every heartbeat
+picks the harness and sealed versions by one rule: the owner's pick in the
+settings document's `versions` while the trust registry lists it, else the
+version running, else — that one delisted — the newest listed (`layered.go`).
+At boot the harness falls back to the package this container ran last, then
+to the listed packages newest first; with none it can run, sealed exits 69
+for the loader to start it again later. The full design is in `LAYERS.md`.
 
 ### Why the settings document comes down `/provision`
 
@@ -232,6 +312,7 @@ sealed/
 │   ├── manager/                  agent process lifecycle + supervision
 │   ├── uploader/                 drift → 0g-storage upload + signed chain.Update
 │   ├── watcher/                  30s tick running EvolutionFor, triggers uploader.Apply
+│   ├── sealmcp/                  an agent socket's endpoints as MCP tools (POST /mcp on the socket)
 │   └── proxy/                    :8080 reverse proxy + signing + log pages
 ├── Dockerfile                    the openclaw sealed image that ships (0g-sealed): the bootstrap binary on the images/openclaw/ base
 ├── images/openclaw/              openclaw base-image build scripts (independent artifact, layered separately from the sealed bootstrap image)
@@ -532,7 +613,7 @@ the reason in §5 ("What is iData, and what is a deployment parameter"):
 | openclaw (`openclaw.go:164`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `openclaw.json` |
 | hermes (`hermes.go:143`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `config.yaml` |
 | prime-agent (`prime.go:162`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `models.json` |
-| 0g-harness (`harness.go:167`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | `settings.yaml` |
+| 0g-harness (`harness.go:208`) | `framework`, `APPEND_SYSTEM.md`, `skills/`, `memory/`, `memory-public/` | `settings.yaml` |
 
 All four reduce to the same shape — *binding + persona + memory + skills* —
 which the per-framework config files were obscuring.
@@ -573,14 +654,17 @@ container's `:8080`.
 | `/_seal/settings` | **owner's wallet** | `GET` returns the document in force; `POST` replaces it, re-renders and restarts the framework process. Both owner-signed against the **live** on-chain owner; the `POST` signature is additionally bound to a sha256 of the request body, so anything able to alter the request in flight can't keep a valid signature while substituting a different document. The hot path — it exists so changing a model or a thinking level stops needing a container rebuild. Not durable: attestor still holds the owner's document, and the next boot restores it (`internal/proxy/settings.go:40-53`) |
 | `/_seal/claim` | **owner's wallet** | take the single-driver seat (tag `0GSealClaim`, body-digest-bound like the settings push); the displaced client instance gets 409 on its next driving request. Proxy memory only — a restart clears the seat (`internal/proxy/occupancy.go`) |
 | `/_seal/clear` | **owner's wallet** | wipe the agent's ONE persisted conversation and restart the framework process (tag `0GSealClear`, seat-gated); 501 when the framework keeps no server-side history (`CONVERSATION.md`) |
+| `/_seal/credentials*`, `/_seal/oauth/callback` | **owner's wallet**; the callback is the owner's browser | the owner's credentials for the agent: load a signed set, list it, decide requests, read the audit log, start an MCP login; the callback completes one. Served with the credential proxy, its sockets and its CA ([CREDENTIALS.md](CREDENTIALS.md)) |
+| `/_seal/signatures` | **owner's wallet** | 0g-harness only (`framework.SigningRules`; 404 for the other frameworks): what the sign socket signed and refused (tag `0GSealSignatures`, `?after=<seq>`), one record per signature or refusal with what identifies it (a message's hash and start, a typed-data digest and domain, a transaction's hash, chain, target, value, nonce and selector), the last 1000, kept across restarts of sealed (`internal/proxy/signlog.go`) |
 | `/_seal/compact` | **owner's wallet** | run the framework's own compaction on that conversation now, no restart (tag `0GSealCompact`, seat-gated): one at a time, a signed message accepted once, never overlapping a synthesized-door turn — each refusal a 409; 501 when the adapter cannot trigger the framework's compaction — no `SessionCompactor`, or an installed version without what it drives (openclaw before 2026.7.1 has no `sessions compact` CLI command) (`internal/proxy/compact.go`, `CONVERSATION.md`) |
+| `/_seal/restart` | **owner's wallet** | restart the harness (`{"layer":"harness"}`) or sealed itself (`{"layer":"sealed"}`; the loader starts it again) — tag `0GSealRestart`, seat-gated, a signed message accepted once, 202 before the restart. Only for adapters that run a harness package (0g-harness); a sealed restart also needs the layered flow and this boot confirmed as up (503 while starting); 501 elsewhere (`internal/proxy/ownerrestart.go`, `ownerrestart.go`) |
 | `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth; responses never proof-signed — the owner↔agent steering channel); every undeclared path 404s — there is no catch-all relay |
 | `/api/*` | external callers | agent-registered services (exact path, registered over the sign socket's `/services`), reverse-proxied to the agent's loopback backend; responses buffered and proof-signed (`X-Agent-Proof`), even when the backend emits SSE |
 | `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, 0g-harness), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |
-| `/v1/inbox`, `/v1/events`, `/v1/tasks`, `/v1/schedules` | owner | 0g-harness only (declared as the kinds `inbox` / `events` / `tasks` / `schedules`): the words of turns the agent opened itself (a background job finished, a reminder came due), a resumable live feed of turn, task, inbox and reminder changes, every turn, background command and subagent with who did it, and the agent's reminders. The other frameworks declare none of them, and the SDK offers them only where they are declared (`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
+| `/v1/inbox`, `/v1/events`, `/v1/activities`, `/v1/tasks`, `/v1/task-feed`, `/v1/schedules`, `/v1/files`, `/v1/memory`, `/v1/steer`, `/v1/sessions` | owner | 0g-harness only (declared as the kinds `inbox` / `events` / `activities` / `tasks` / `task-feed` / `schedules` / `files` / `memory` / `steer` / `sessions`): the words of turns the agent opened itself (a background job finished, a reminder came due), a resumable live feed of turn, activity, inbox and reminder changes, every turn, background command and subagent with who did it (`/v1/activities`), the owner's tasks (zgh's task model: a piece of work in a session and workspace of its own, ended by an outcome record) and the feed of their changes, the owner's other sessions, the agent's reminders, and file upload into the agent's file inbox `~/inbox` (not the message inbox `/v1/inbox`) plus download and deletion of what the agent put in `~/outbox` (or of the owner's own files in `~/inbox`), a long-term memory consolidation pass on request (`POST /v1/memory/tidy`), and the owner's word for the turn already running (`POST /v1/steer`, read before that turn's next model call; queued as an ordinary turn when no owner turn runs). The other frameworks declare none of them, and the SDK offers them only where they are declared (`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
 | `/log/agent` + `/log/agent.html` | ops | agent subprocess stdout/stderr (live); path resolved via the adapter's `SubprocessLogPath()`. `/log/openclaw`(`.html`) survives as a legacy alias |
-| `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`; never a raw hash and never EIP-191 version `0x00`, the serve-proof's domain — see below) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) |
+| `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`; never a raw hash and never EIP-191 version `0x00`, the serve-proof's domain — see below) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) + `/harness/restart` and `/mcp` (0g-harness only: a restart of the harness, and the same endpoints and the credential socket's as MCP tools; the reveal socket serves its own) |
 
 Exactly three surfaces are proof-signed: `/hello`, `/_seal/auth` and the
 agent-registered `/api/*` services — and only when `VERIFIED_FEEDBACK_ADDR`
@@ -620,7 +704,12 @@ EIP-191 version `0x00` data. Serve-proofs are signed in that `0x00`
 domain, bound to the VerifiedFeedbackRegistry, so nothing the agent
 signs through the socket verifies as one (audit FIND-01;
 `internal/proxy/sign.go` header, pinned by `sign_test.go`). Within
-those shapes the socket is just transport. **Refusal logic lives on
+those shapes the socket is just transport, except under 0g-harness
+(`framework.SigningRules`): there it refuses a transaction to AgenticID
+`update` or `updateAt`, the drift watcher's channel
+(`internal/proxy/signrules.go`), and records every signature it makes and
+every request it refuses, for the owner (`internal/proxy/signlog.go`,
+`/_seal/signatures`). **Refusal logic lives on
 the agent side, constrained by SOUL.md's refusal rules**: any sign
 request originating from external prompts must be refused, without
 relying on "describe what to sign in plain language" heuristics,
@@ -738,18 +827,41 @@ includes things like agentSeal wallet running out of gas
 (insufficient gas → `chain.Update` tx won't go in → Apply fails), so
 wallet balance falls under its scope too.
 
-Apply's three outcomes correspond to three severities:
+A failed commit is never an `error`: the agent runs and answers, only its
+latest data is not on chain yet, and an `error` report would make the
+attestor show it offline (its container stage failed) and the CLI refuse to
+chat. Apply's outcomes:
 
-| Apply outcome | severity | When reported | Failure counter |
+| Apply outcome | status | When reported | Failure counter |
 |---|---|---|---|
-| **success** (drift on chain, or no drift) | `running` | not reported immediately; runHeartbeat will replay it | accumulated errors cleared |
-| **failure, owner-recoverable** — typical: agentSeal wallet out of gas, wrong API key, provider rate limit | `warning` | reported **immediately** on first occurrence, doesn't wait for heartbeat | **does not** accumulate (not a system failure, the owner has to handle it) |
-| **failure, system-level** — typical: 0g-storage upload timeout, RPC anomaly, indexer unreachable | `error` | escalates to error only after **5 consecutive** Apply failures, to avoid single-network-jitter misjudgments | accumulates; clears on recovery |
+| **success** (drift on chain, or no drift) | `running` | reported on the transition back | cleared; the retry backoff starts over |
+| **failure, owner-recoverable** — typical: agentSeal wallet out of gas | `warning`, "agent data not committed to chain: …" | **immediately** | counted |
+| **failure, other** — typical: 0g-storage upload timeout, RPC anomaly, indexer unreachable | `warning`, "agent data not committed to chain (N attempts): …" | after **5 consecutive** failures, so a single network blip does not show | counted |
 
-`status.go::severityOf` is the classifier that maps a specific error
-string to one of these three severities — recognizing "insufficient
-funds" → `warning`, "connection refused" → `error`, and so on. The
-classification fallback is `error`.
+`status.go::severityOf` tells the owner-recoverable causes ("insufficient
+funds", a data-less revert of the seal wallet's own transaction) from the
+rest; `commitretry.go::commitFailureStatus` turns either into the warning.
+Every failure is also checked against the seal wallet (`fundsShortfall`):
+when its balance is under the failed step's gas (a storage submit 450k, an
+update 350k, the largest measured on Galileo, rounded up) at the current gas
+price, it is the funds case at once, and the warning names the wallet and
+both amounts ("the agent's wallet 0x… has 0.10 OG, about 0.90 OG is needed
+for its next transaction"). That covers a failure whose error names no
+cause, and replaces an "insufficient funds" error's own amount, which is the
+blob's storage fee (a few wei), not what a commit needs. If the balance
+cannot be read, the error's own grading stands.
+
+Retries back off (`commitretry.go`): after n consecutive failures of the same
+content the next attempt waits 30 s·2^(n-1), at most 30 min; new content to
+commit is tried on the next tick, and a success starts over. A retry uploads
+only what the failed attempt did not (`internal/uploader/pending.go`): the
+blobs an attempt uploaded before a later upload or the update failed are
+reused, with the data key minted for a role not yet on chain, so each blob
+is paid for once. Content that comes back to what an earlier commit of the
+boot held (a memory added and removed again, a change undone) is committed by
+reference to the blobs uploaded then, under the same data key, whatever path
+an entry is at (`internal/uploader/uploaded.go`): only the update is sent.
+Both are kept in memory for the boot.
 
 ### `runHeartbeat`'s 5-min ticker
 

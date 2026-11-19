@@ -14,14 +14,19 @@
 //! `NonceFiller`, `ChainIdFiller` and `WalletFiller`. Gas limit is
 //! estimated explicitly before each tx.
 
-use crate::traits::ChainClient;
+use crate::auth::operator::OperatorCheckpoint;
+use crate::traits::{
+    ChainClient, OperatorContinuity, OperatorContinuityRejection, MAX_OPERATOR_CHECKPOINT_SPAN,
+    OPERATOR_TRANSFER_LOG_CHUNK,
+};
 use crate::types::*;
+use alloy::eips::{BlockId, BlockNumberOrTag, RpcBlockHash};
 use alloy::network::{Ethereum, EthereumWallet, Network, TransactionBuilder};
 use alloy::primitives::B256;
 use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::fillers::{ChainIdFiller, NonceFiller, NonceManager};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{Filter, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolEvent};
@@ -88,6 +93,22 @@ sol!(
         event ClonedFrom(uint256 indexed sourceAgentId, uint256 indexed newAgentId, address indexed to, address caller);
     }
 );
+
+// TrustRegistry (contracts/src/TrustRegistry.sol), found through AgenticID's
+// `trustRegistry()` — only the list read: the attestor checks the sealed
+// program a layered boot names against the sealed list.
+sol!(
+    #[sol(rpc)]
+    interface ITrustRegistry {
+        function isListed(bytes32 kind, bytes32 hash) external view returns (bool);
+    }
+);
+
+/// A trust-registry list kind: keccak256 of its name ("image", "sealed",
+/// "harness").
+pub fn trust_kind(name: &str) -> B256 {
+    alloy::primitives::keccak256(name.as_bytes())
+}
 
 // VerifiedFeedbackRegistry — only the anchor read the startup check makes
 // (`check_verified_feedback_anchor`). The attestor never writes to it.
@@ -164,7 +185,8 @@ pub async fn check_verified_feedback_anchor(
                 reason = format!("{e:#}");
                 if attempt < ANCHOR_READ_ATTEMPTS {
                     tracing::warn!(attempt, error = %reason, "getIdentityRegistry() read failed; retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                        .await;
                 }
             }
         }
@@ -238,6 +260,29 @@ impl NonceManager for PendingNonceManager {
     }
 }
 
+/// A checkpoint is a complete, already-existing block-end view. Hash checks
+/// distinguish reorged/absent anchors from RPC failures without trusting clocks.
+pub async fn operator_checkpoint_is_canonical<T, P>(
+    provider: &P,
+    checkpoint: &OperatorCheckpoint,
+) -> anyhow::Result<bool>
+where
+    T: Transport + Clone,
+    P: Provider<T>,
+{
+    let block = provider
+        .get_block_by_number(BlockNumberOrTag::Number(checkpoint.number), false)
+        .await?;
+    let block = block.ok_or_else(|| {
+        anyhow::anyhow!("operator checkpoint header unavailable; node may be behind")
+    })?;
+    anyhow::ensure!(
+        block.header.number == checkpoint.number,
+        "RPC returned a different checkpoint height"
+    );
+    Ok(block.header.hash == checkpoint.hash)
+}
+
 /// Real chain client backed by alloy. Generic over Transport and Provider.
 pub struct AlloyChain<T, P>
 where
@@ -261,7 +306,59 @@ where
     // tokio Mutex (not std) because the guard is held across an `.await`.
     submit_lock: tokio::sync::Mutex<()>,
     submit_pool: sqlx::PgPool,
+    /// AgenticID's `trustRegistry()` answer (`TRUST_REGISTRY_TTL`).
+    trust_registry_answer: AnswerCache<Option<Address>>,
     _t: PhantomData<T>,
+}
+
+/// How long `trust_registry` keeps the chain's answer. The address is fixed
+/// in the AgenticID implementation and changes only with a beacon upgrade,
+/// so `GET /provision`, which every boot calls, reads it from the chain at
+/// most once a minute.
+const TRUST_REGISTRY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One chain answer, kept for `ttl` after it was read. A read that failed is
+/// never kept, so the next caller asks the chain again.
+struct AnswerCache<V> {
+    ttl: std::time::Duration,
+    slot: std::sync::Mutex<Option<(std::time::Instant, V)>>,
+}
+
+impl<V: Clone> AnswerCache<V> {
+    fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The answer read less than `ttl` before `now`, if any.
+    fn get(&self, now: std::time::Instant) -> Option<V> {
+        match &*self.slot.lock().unwrap() {
+            Some((at, answer)) if now.saturating_duration_since(*at) < self.ttl => {
+                Some(answer.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn put(&self, now: std::time::Instant, answer: V) {
+        *self.slot.lock().unwrap() = Some((now, answer));
+    }
+}
+
+/// Whether the node answered that the call reverted: JSON-RPC error code 3,
+/// or an error whose message says "execution reverted" (nodes that use
+/// another code for it). Any other error object the node returns — a missing
+/// header, an internal error, a rate limit — says nothing about the contract.
+fn is_execution_revert(e: &alloy::transports::TransportError) -> bool {
+    e.as_error_resp().is_some_and(|resp| {
+        resp.code == 3
+            || resp
+                .message
+                .to_ascii_lowercase()
+                .contains("execution reverted")
+    })
 }
 
 impl<T, P> AlloyChain<T, P>
@@ -287,6 +384,7 @@ where
             max_fee_wei: max_fee_gwei as u128 * GWEI_TO_WEI,
             submit_lock: tokio::sync::Mutex::new(()),
             submit_pool,
+            trust_registry_answer: AnswerCache::new(TRUST_REGISTRY_TTL),
             _t: PhantomData,
         })
     }
@@ -482,6 +580,161 @@ where
         Ok(c.ownerOf(agent_id).call().await?._0)
     }
 
+    async fn operator_checkpoint(&self) -> anyhow::Result<OperatorCheckpoint> {
+        let block = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Latest, false)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("latest operator checkpoint is unavailable"))?;
+        Ok(OperatorCheckpoint {
+            number: block.header.number,
+            hash: block.header.hash,
+        })
+    }
+
+    async fn is_checkpoint_canonical(
+        &self,
+        checkpoint: &OperatorCheckpoint,
+    ) -> anyhow::Result<bool> {
+        operator_checkpoint_is_canonical(&self.provider, checkpoint).await
+    }
+
+    async fn verify_operator_continuity(
+        &self,
+        agent: AgentId,
+        checkpoint: &OperatorCheckpoint,
+        owner: Address,
+    ) -> anyhow::Result<OperatorContinuity> {
+        use OperatorContinuityRejection as Rejection;
+        let reject = |reason| OperatorContinuity::RefreshRequired { reason };
+        let snapshot = self.operator_checkpoint().await?;
+        anyhow::ensure!(
+            snapshot.number >= checkpoint.number,
+            "operator checkpoint is ahead of this RPC node; retry on a current node"
+        );
+        let span = snapshot.number - checkpoint.number;
+        if span > MAX_OPERATOR_CHECKPOINT_SPAN {
+            return Ok(reject(Rejection::CheckpointTooOld {
+                maximum_span: MAX_OPERATOR_CHECKPOINT_SPAN,
+            }));
+        }
+        if (snapshot.number == checkpoint.number && snapshot.hash != checkpoint.hash)
+            || (snapshot.number != checkpoint.number
+                && !self.is_checkpoint_canonical(checkpoint).await?)
+        {
+            return Ok(reject(Rejection::NonCanonical));
+        }
+
+        // Only this fresh snapshot's state is read. An old H may be past the
+        // node's historical-state retention window while its headers/logs remain.
+        let contract = AgenticID::new(self.contract_addr, self.provider.clone());
+        let observed_owner = match contract
+            .ownerOf(agent)
+            .block(BlockId::Hash(RpcBlockHash::from_hash(
+                snapshot.hash,
+                Some(true),
+            )))
+            .call()
+            .await
+        {
+            Ok(result) => Some(result._0),
+            Err(alloy::contract::Error::TransportError(error)) if is_execution_revert(&error) => {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut reason = (observed_owner != Some(owner)).then_some(Rejection::OwnerChanged);
+        if reason.is_none() && span != 0 {
+            let token_topic = B256::from(agent.to_be_bytes::<32>());
+            let mut from = checkpoint.number + 1;
+            loop {
+                let to = snapshot
+                    .number
+                    .min(from.saturating_add(OPERATOR_TRANSFER_LOG_CHUNK - 1));
+                let logs = self
+                    .provider
+                    .get_logs(
+                        &Filter::new()
+                            .address(self.contract_addr)
+                            .event_signature(AgenticID::Transfer::SIGNATURE_HASH)
+                            .topic3(token_topic)
+                            .from_block(from)
+                            .to_block(to),
+                    )
+                    .await?;
+                for log in &logs {
+                    let block = log.block_number.ok_or_else(|| {
+                        anyhow::anyhow!("Transfer history returned a log without a block number")
+                    })?;
+                    anyhow::ensure!(
+                        !log.removed
+                            && log.inner.address == self.contract_addr
+                            && block >= from
+                            && block <= to,
+                        "Transfer history returned an inconsistent log"
+                    );
+                    let transfer =
+                        AgenticID::Transfer::decode_log(&log.inner, true).map_err(|error| {
+                            anyhow::anyhow!("Transfer history returned an invalid event: {error}")
+                        })?;
+                    anyhow::ensure!(
+                        transfer.data.tokenId == agent,
+                        "Transfer history returned another token"
+                    );
+                }
+                if !logs.is_empty() {
+                    reason = Some(Rejection::TransferObserved);
+                    break;
+                }
+                if to == snapshot.number {
+                    break;
+                }
+                from = to + 1;
+            }
+        }
+        // A reorg while reading history makes this attempt unavailable rather
+        // than proving either continuity or a definitive ownership rejection.
+        anyhow::ensure!(
+            self.is_checkpoint_canonical(&snapshot).await?,
+            "operator ownership snapshot changed while checking history; retry"
+        );
+        Ok(match reason {
+            Some(reason) => reject(reason),
+            None => OperatorContinuity::Continuous { snapshot },
+        })
+    }
+
+    async fn owner_at_checkpoint(
+        &self,
+        agent: AgentId,
+        checkpoint: &OperatorCheckpoint,
+    ) -> anyhow::Result<Option<Address>> {
+        if !operator_checkpoint_is_canonical(&self.provider, checkpoint).await? {
+            return Ok(None);
+        }
+        let contract = AgenticID::new(self.contract_addr, self.provider.clone());
+        // Bind eth_call to the same block hash, including a canonicality
+        // requirement, so a reorg between reads cannot substitute another state.
+        match contract
+            .ownerOf(agent)
+            .block(BlockId::Hash(RpcBlockHash::from_hash(
+                checkpoint.hash,
+                Some(true),
+            )))
+            .call()
+            .await
+        {
+            Ok(owner) => Ok(Some(owner._0)),
+            // A canonical block can precede this token's mint. A definite
+            // contract revert makes that checkpoint invalid; unavailable
+            // historical state or other RPC failures remain dependency errors.
+            Err(alloy::contract::Error::TransportError(error)) if is_execution_revert(&error) => {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn clone_authorizer_of(&self, agent_id: AgentId) -> anyhow::Result<Address> {
         let gate = self.clone_gate.ok_or_else(|| {
             anyhow::anyhow!("clone gate not configured (ATTESTOR_CLONE_GATE_ADDR unset)")
@@ -577,6 +830,30 @@ where
     async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool> {
         let c = AgenticID::new(self.contract_addr, self.provider.clone());
         Ok(c.isTrustedAttestor(addr).call().await?._0)
+    }
+
+    async fn trust_registry(&self) -> anyhow::Result<Option<Address>> {
+        if let Some(answer) = self.trust_registry_answer.get(std::time::Instant::now()) {
+            return Ok(answer);
+        }
+        let c = AgenticID::new(self.contract_addr, self.provider.clone());
+        let answer = match c.trustRegistry().call().await {
+            Ok(r) => (r._0 != Address::ZERO).then_some(r._0),
+            // LEGACY(pre-1.4.0): the contract refused the call, as an
+            // AgenticID without the function does (0G answers JSON-RPC code
+            // 3, "execution reverted"). Every other error, one the node
+            // answered included, stays an error, never "no registry".
+            Err(alloy::contract::Error::TransportError(e)) if is_execution_revert(&e) => None,
+            Err(e) => return Err(e.into()),
+        };
+        self.trust_registry_answer
+            .put(std::time::Instant::now(), answer);
+        Ok(answer)
+    }
+
+    async fn is_listed(&self, registry: Address, kind: B256, hash: B256) -> anyhow::Result<bool> {
+        let r = ITrustRegistry::new(registry, self.provider.clone());
+        Ok(r.isListed(kind, hash).call().await?._0)
     }
 
     async fn identity_registry_of(&self, registry: Address) -> anyhow::Result<Address> {
@@ -794,6 +1071,546 @@ mod tests {
     fn decode_returns_none_for_unknown_selector() {
         let err = r#"execution reverted, data: "0xdeadbeef""#;
         assert!(decode_revert_data_in_error(err).is_none());
+    }
+
+    // ── trust_registry ─────────────────────────────────────────────────
+
+    #[test]
+    fn an_answer_is_kept_for_its_ttl() {
+        use std::time::Duration;
+        let cache = AnswerCache::new(Duration::from_secs(60));
+        let read_at = std::time::Instant::now();
+        assert_eq!(cache.get(read_at), None::<u8>);
+        cache.put(read_at, 7);
+        assert_eq!(cache.get(read_at + Duration::from_secs(59)), Some(7));
+        assert_eq!(cache.get(read_at + Duration::from_secs(60)), None);
+    }
+
+    /// A JSON-RPC endpoint that answers request n with `answers[n]` (its
+    /// `result` or `error` member) under the request's id; the URL, and how
+    /// many requests it served.
+    async fn jsonrpc_peer(
+        answers: Vec<serde_json::Value>,
+    ) -> (
+        reqwest::Url,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (url, served, _, server) = jsonrpc_peer_with_requests(answers).await;
+        (url, served, server)
+    }
+
+    async fn jsonrpc_peer_with_requests(
+        answers: Vec<serde_json::Value>,
+    ) -> (
+        reqwest::Url,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = served.clone();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            for answer in answers {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let (body_at, body_len) = loop {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map_or(0, |v| v.trim().parse().unwrap());
+                        break (end + 4, len);
+                    }
+                };
+                while bytes.len() < body_at + body_len {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[body_at..body_at + body_len]).unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                recorded.lock().unwrap().push(request.clone());
+                let mut reply = serde_json::json!({"jsonrpc": "2.0", "id": request["id"]});
+                reply
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(answer.as_object().unwrap().clone());
+                let reply = reply.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            }).await.expect("JSON-RPC fixture exceeded its 5 second deadline");
+        });
+        (url, served, requests, server)
+    }
+
+    fn chain_at(url: reqwest::Url) -> Arc<impl ChainClient> {
+        let transport = rpc_http_transport(url, std::time::Duration::from_secs(5)).unwrap();
+        let provider = alloy::providers::RootProvider::<_, Ethereum>::new(
+            alloy::rpc::client::RpcClient::new(transport, true),
+        );
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
+        AlloyChain::new(provider, AGENTIC_ID, Address::ZERO, 1, 2, None, pool)
+    }
+
+    fn checkpoint_block(checkpoint: OperatorCheckpoint) -> serde_json::Value {
+        let mut block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+        block.header.number = checkpoint.number;
+        block.header.hash = checkpoint.hash;
+        serde_json::json!({"result":block})
+    }
+
+    #[tokio::test]
+    async fn operator_checkpoint_binds_historical_owner_to_canonical_block_hash() {
+        let checkpoint = OperatorCheckpoint {
+            number: 123,
+            hash: B256::repeat_byte(0x71),
+        };
+        let owner = Address::repeat_byte(0x72);
+        let (url, served, requests, server) = jsonrpc_peer_with_requests(vec![
+            checkpoint_block(checkpoint),
+            checkpoint_block(checkpoint),
+            serde_json::json!({"result":format!("0x{}",hex::encode(owner.into_word()))}),
+        ])
+        .await;
+        let chain = chain_at(url);
+        assert_eq!(chain.operator_checkpoint().await.unwrap(), checkpoint);
+        assert_eq!(
+            chain
+                .owner_at_checkpoint(U256::from(7), &checkpoint)
+                .await
+                .unwrap(),
+            Some(owner)
+        );
+        server.await.unwrap();
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0]["method"], "eth_getBlockByNumber");
+        assert_eq!(requests[0]["params"], serde_json::json!(["latest", false]));
+        assert_eq!(requests[1]["method"], "eth_getBlockByNumber");
+        assert_eq!(requests[1]["params"], serde_json::json!(["0x7b", false]));
+        assert_eq!(requests[2]["method"], "eth_call");
+        assert_eq!(
+            requests[2]["params"][0]["to"],
+            serde_json::json!(AGENTIC_ID)
+        );
+        assert_eq!(
+            requests[2]["params"][1],
+            serde_json::json!({"blockHash":checkpoint.hash,"requireCanonical":true})
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_owner_revert_is_invalid_but_rpc_failures_remain_errors() {
+        let checkpoint = OperatorCheckpoint {
+            number: 123,
+            hash: B256::repeat_byte(0x73),
+        };
+        for (code, message, revert) in [
+            (3, "execution reverted", true),
+            (-32000, "execution reverted: ERC721NonexistentToken", true),
+            (-32603, "internal error", false),
+            (
+                -32000,
+                "missing trie node: historical state unavailable",
+                false,
+            ),
+        ] {
+            let (url, served, requests, server) = jsonrpc_peer_with_requests(vec![
+                checkpoint_block(checkpoint),
+                serde_json::json!({"error":{"code":code,"message":message,"data":"0x"}}),
+            ])
+            .await;
+            let result = chain_at(url)
+                .owner_at_checkpoint(U256::from(7), &checkpoint)
+                .await;
+            if revert {
+                assert_eq!(result.unwrap(), None, "{message}");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{message} must not become an authorization rejection"
+                );
+            }
+            server.await.unwrap();
+            assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests[0]["method"], "eth_getBlockByNumber");
+            assert_eq!(requests[1]["method"], "eth_call");
+            assert_eq!(
+                requests[1]["params"][1],
+                serde_json::json!({"blockHash":checkpoint.hash,"requireCanonical":true})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn noncanonical_or_missing_checkpoint_never_calls_historical_owner() {
+        let checkpoint = OperatorCheckpoint {
+            number: 123,
+            hash: B256::repeat_byte(0x74),
+        };
+        for (answer, unavailable) in [
+            (
+                checkpoint_block(OperatorCheckpoint {
+                    number: checkpoint.number,
+                    hash: B256::repeat_byte(0x75),
+                }),
+                false,
+            ),
+            (
+                checkpoint_block(OperatorCheckpoint {
+                    number: 124,
+                    hash: checkpoint.hash,
+                }),
+                true,
+            ),
+            (serde_json::json!({"result":null}), true),
+        ] {
+            let (url, served, requests, server) = jsonrpc_peer_with_requests(vec![answer]).await;
+            let result = chain_at(url)
+                .owner_at_checkpoint(U256::from(7), &checkpoint)
+                .await;
+            if unavailable {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), None);
+            }
+            server.await.unwrap();
+            assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                requests.lock().unwrap()[0]["method"],
+                "eth_getBlockByNumber"
+            );
+        }
+        let (url, served, requests, server) = jsonrpc_peer_with_requests(vec![
+            serde_json::json!({"error":{"code":-32603,"message":"internal error"}}),
+        ])
+        .await;
+        assert!(chain_at(url)
+            .owner_at_checkpoint(U256::from(7), &checkpoint)
+            .await
+            .is_err());
+        server.await.unwrap();
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            requests.lock().unwrap()[0]["method"],
+            "eth_getBlockByNumber"
+        );
+    }
+
+    /// AgenticID before 1.4.0 has no `trustRegistry()`: 0G answers the call
+    /// with code 3 (measured on Galileo). A revert, and only a revert, is "no
+    /// registry"; an error the node answered for another reason, or no
+    /// answer at all, is an error, and is not kept.
+    #[tokio::test]
+    async fn trust_registry_is_none_only_when_the_call_reverts() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (url, served, server) = jsonrpc_peer(vec![serde_json::json!({
+            "error": {"code": 3, "message": "execution reverted", "data": "0x"}
+        })])
+        .await;
+        let chain = chain_at(url);
+        assert_eq!(chain.trust_registry().await.unwrap(), None);
+        assert_eq!(chain.trust_registry().await.unwrap(), None);
+        assert_eq!(served.load(SeqCst), 1, "the answer is kept");
+        server.await.unwrap();
+
+        // A node that reports the revert under another code.
+        let (url, _, server) = jsonrpc_peer(vec![serde_json::json!({
+            "error": {"code": -32000, "message": "execution reverted"}
+        })])
+        .await;
+        assert_eq!(chain_at(url).trust_registry().await.unwrap(), None);
+        server.await.unwrap();
+
+        // No answer: nothing listens there.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        drop(closed);
+        assert!(chain_at(url).trust_registry().await.is_err());
+
+        let registry = Address::repeat_byte(0x77);
+        let (url, served, server) = jsonrpc_peer(vec![
+            serde_json::json!({"error": {"code": -32000, "message": "header not found"}}),
+            serde_json::json!({"error": {"code": -32603, "message": "internal error"}}),
+            serde_json::json!({"result": format!("0x{}", hex::encode(registry.into_word()))}),
+        ])
+        .await;
+        let chain = chain_at(url);
+        assert!(chain.trust_registry().await.is_err());
+        assert!(chain.trust_registry().await.is_err());
+        assert_eq!(chain.trust_registry().await.unwrap(), Some(registry));
+        assert_eq!(chain.trust_registry().await.unwrap(), Some(registry));
+        assert_eq!(served.load(SeqCst), 3, "errors are not kept; the answer is");
+        server.await.unwrap();
+    }
+
+    fn continuity_answers(
+        h: OperatorCheckpoint,
+        t: OperatorCheckpoint,
+        owner: Address,
+    ) -> Vec<serde_json::Value> {
+        let mut answers = vec![checkpoint_block(t)];
+        if h.number != t.number {
+            answers.push(checkpoint_block(h));
+        }
+        answers.push(serde_json::json!({"result":format!("0x{}",hex::encode(owner.into_word()))}));
+        let span = t.number - h.number;
+        for _ in 0..span.div_ceil(OPERATOR_TRANSFER_LOG_CHUNK) {
+            answers.push(serde_json::json!({"result":[]}));
+        }
+        answers.push(checkpoint_block(t));
+        answers
+    }
+
+    #[tokio::test]
+    async fn operator_continuity_uses_current_state_and_bounded_transfer_history() {
+        let h = OperatorCheckpoint {
+            number: 10,
+            hash: B256::repeat_byte(0x81),
+        };
+        let t = OperatorCheckpoint {
+            number: 1035,
+            hash: B256::repeat_byte(0x82),
+        };
+        let owner = Address::repeat_byte(0x83);
+        let agent = U256::from(7);
+        let (url, _, requests, server) =
+            jsonrpc_peer_with_requests(continuity_answers(h, t, owner)).await;
+        assert_eq!(
+            chain_at(url)
+                .verify_operator_continuity(agent, &h, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::Continuous { snapshot: t }
+        );
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert_eq!(requests[0]["params"], serde_json::json!(["latest", false]));
+        assert_eq!(requests[1]["params"], serde_json::json!(["0xa", false]));
+        assert_eq!(requests[2]["method"], "eth_call");
+        assert_eq!(
+            requests[2]["params"][1],
+            serde_json::json!({"blockHash":t.hash,"requireCanonical":true})
+        );
+        for (position, (from, to)) in [(11, 522), (523, 1034), (1035, 1035)]
+            .into_iter()
+            .enumerate()
+        {
+            let request = &requests[position + 3];
+            assert_eq!(request["method"], "eth_getLogs");
+            let filter = &request["params"][0];
+            assert_eq!(filter["address"], serde_json::json!(AGENTIC_ID));
+            assert_eq!(filter["fromBlock"], format!("0x{from:x}"));
+            assert_eq!(filter["toBlock"], format!("0x{to:x}"));
+            assert_eq!(
+                filter["topics"],
+                serde_json::json!([
+                    AgenticID::Transfer::SIGNATURE_HASH,
+                    null,
+                    null,
+                    B256::from(agent.to_be_bytes::<32>())
+                ])
+            );
+        }
+        assert_eq!(requests[6]["method"], "eth_getBlockByNumber");
+        assert_eq!(requests[6]["params"], serde_json::json!(["0x40b", false]));
+    }
+
+    #[tokio::test]
+    async fn operator_continuity_rejects_aba_but_accepts_the_post_block_challenge() {
+        let h = OperatorCheckpoint {
+            number: 100,
+            hash: B256::repeat_byte(0x84),
+        };
+        let t = OperatorCheckpoint {
+            number: 102,
+            hash: B256::repeat_byte(0x85),
+        };
+        let owner = Address::repeat_byte(0x86);
+        let buyer = Address::repeat_byte(0x87);
+        let agent = U256::from(8);
+        let mut answers = continuity_answers(h, t, owner);
+        let log = |from, to, block| alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: AGENTIC_ID,
+                data: AgenticID::Transfer {
+                    from,
+                    to,
+                    tokenId: agent,
+                }
+                .encode_log_data(),
+            },
+            block_number: Some(block),
+            block_hash: Some(B256::repeat_byte(block as u8)),
+            ..Default::default()
+        };
+        answers[3] = serde_json::json!({"result":[log(owner,buyer,101),log(buyer,owner,102)]});
+        let (url, _, _, server) = jsonrpc_peer_with_requests(answers).await;
+        assert_eq!(
+            chain_at(url)
+                .verify_operator_continuity(agent, &h, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::RefreshRequired {
+                reason: OperatorContinuityRejection::TransferObserved
+            }
+        );
+        server.await.unwrap();
+        // T's block-end checkpoint includes both transfers, even if they were
+        // in this one block. No earlier logs are scanned for a new signature.
+        let (url, _, requests, server) =
+            jsonrpc_peer_with_requests(continuity_answers(t, t, owner)).await;
+        assert_eq!(
+            chain_at(url)
+                .verify_operator_continuity(agent, &t, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::Continuous { snapshot: t }
+        );
+        server.await.unwrap();
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request["method"] != "eth_getLogs"));
+    }
+
+    #[tokio::test]
+    async fn operator_continuity_distinguishes_refresh_inputs_from_unavailable_rpc() {
+        let h = OperatorCheckpoint {
+            number: 100,
+            hash: B256::repeat_byte(0x88),
+        };
+        let t = OperatorCheckpoint {
+            number: 102,
+            hash: B256::repeat_byte(0x89),
+        };
+        let owner = Address::repeat_byte(0x8a);
+        let agent = U256::from(9);
+        let (url, _, _, server) =
+            jsonrpc_peer_with_requests(vec![checkpoint_block(OperatorCheckpoint {
+                number: 99,
+                ..t
+            })])
+            .await;
+        assert!(chain_at(url)
+            .verify_operator_continuity(agent, &h, owner)
+            .await
+            .is_err());
+        server.await.unwrap();
+        let old = OperatorCheckpoint { number: 0, ..h };
+        let far = OperatorCheckpoint {
+            number: MAX_OPERATOR_CHECKPOINT_SPAN + 1,
+            ..t
+        };
+        let (url, _, requests, server) =
+            jsonrpc_peer_with_requests(vec![checkpoint_block(far)]).await;
+        assert_eq!(
+            chain_at(url)
+                .verify_operator_continuity(agent, &old, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::RefreshRequired {
+                reason: OperatorContinuityRejection::CheckpointTooOld {
+                    maximum_span: MAX_OPERATOR_CHECKPOINT_SPAN
+                }
+            }
+        );
+        server.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let (url, _, _, server) = jsonrpc_peer_with_requests(vec![
+            checkpoint_block(t),
+            checkpoint_block(OperatorCheckpoint {
+                hash: B256::repeat_byte(0xff),
+                ..h
+            }),
+        ])
+        .await;
+        assert_eq!(
+            chain_at(url)
+                .verify_operator_continuity(agent, &h, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::RefreshRequired {
+                reason: OperatorContinuityRejection::NonCanonical
+            }
+        );
+        server.await.unwrap();
+        for failure in [1, 2, 3, 4] {
+            let mut answers = continuity_answers(h, t, owner);
+            answers[failure] = if failure == 4 {
+                checkpoint_block(OperatorCheckpoint {
+                    hash: B256::repeat_byte(0xff),
+                    ..t
+                })
+            } else if failure == 1 {
+                serde_json::json!({"result":null})
+            } else {
+                serde_json::json!({"error":{"code":-32603,"message":"RPC unavailable"}})
+            };
+            answers.truncate(failure + 1);
+            let (url, _, _, server) = jsonrpc_peer_with_requests(answers).await;
+            assert!(
+                chain_at(url)
+                    .verify_operator_continuity(agent, &h, owner)
+                    .await
+                    .is_err(),
+                "failure at RPC {failure} must not become an invalid-checkpoint rejection"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_operator_continuity_never_needs_pruned_historical_state() {
+        let chain = crate::mocks::MockChain::new();
+        let owner = Address::repeat_byte(0x8b);
+        chain.set_owner_of(owner);
+        let h = chain.operator_checkpoint().await.unwrap();
+        let t = OperatorCheckpoint {
+            number: 1000,
+            hash: B256::repeat_byte(0x8c),
+        };
+        chain.set_operator_checkpoint(t);
+        chain.set_checkpoint_owner_failure(true);
+        assert_eq!(
+            chain
+                .verify_operator_continuity(U256::from(1), &h, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::Continuous { snapshot: t }
+        );
+        chain.set_operator_transfers(U256::from(1), vec![2, 3]);
+        assert_eq!(
+            chain
+                .verify_operator_continuity(U256::from(1), &h, owner)
+                .await
+                .unwrap(),
+            OperatorContinuity::RefreshRequired {
+                reason: OperatorContinuityRejection::TransferObserved
+            }
+        );
     }
 
     // ── check_verified_feedback_anchor ─────────────────────────────────

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Post-deploy verification for a LIVE agent — the checks that prove the
-# identity chain end-to-end, runnable with curl+jq+cast only (no node).
+# identity chain end-to-end.
 #
 #   1. identity tri-check: attestor row addr == on-chain getAgentSeal
 #      == the addr the container says it was provisioned with
@@ -16,7 +16,9 @@
 #      VerifiedFeedbackRegistry makes, gas-free, so a validator / image skew
 #      shows up here first. Both addresses come from the same /config, so
 #      the anchoring assertion is what ties the recovery to a registry that
-#      redeems for this AgenticID
+#      redeems for this AgenticID. A v2 proof (0g-harness on the layered
+#      runtime) is also checked against the trust registry: the image, sealed
+#      and harness hashes it names must be on its lists
 #
 # Owner-run: the deployment row's sandbox_id / agent_seal_addr are
 # owner-tier fields, so this needs THAT agent's owner key.
@@ -24,10 +26,17 @@
 # Usage:
 #   API=http://sandbox.example:8080 AGENT_ID=61 OWNER_PRIV=0x<owner key> scripts/verify-agent.sh
 #   scripts/verify-agent.sh --kat   # offline: pin check 3b's digest to the
-#                                   # cross-impl known-answer vector (cast + jq)
+#                                   # cross-impl known-answer vectors (cast + jq)
+#   scripts/verify-agent.sh --digest CHAIN_ID IDENTITY_REGISTRY VALIDATOR ENVELOPE_JSON
+#                                   # offline: check 3b's digest for one envelope;
+#                                   # exit 1 when it cannot be rebuilt
 #
-# Requires: curl, jq, and cast (foundry) — cast signs the owner-scoped
-# request and does the chain read and the signature recovery.
+# Requires: curl, jq, od, and cast (foundry) — cast signs the owner-scoped
+# request and does the chain read and the signature recovery — and, for
+# check 2, node >= 18 with the SDK built (sdk/typescript: npm run build):
+# the owner-gated startup log is read through
+# sdk/typescript/scripts/owner-log.cjs. --kat and --digest need only cast,
+# jq and od.
 #
 # Env:
 #   API         attestor base URL            (default http://localhost:8080)
@@ -43,31 +52,105 @@ command -v jq >/dev/null 2>&1 || { echo "verify-agent: jq is required"; exit 1; 
 
 # serveproof_digest CHAIN_ID IDENTITY_REGISTRY VALIDATOR ENVELOPE_JSON prints
 # the ServeProof signed digest for an X-Agent-Proof envelope — what agent_seal
-# signs RAW (no further wrap): keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash),
-# proofHash = keccak256(abi.encode(chainId, identityRegistry, submitter,
-# agentId, timestamp, deadline, taskHash, keccak256(packed dataHashes),
-# frameworkHash)). One of the five consensus-critical copies listed in
-# AGENTS.md; `--kat` pins it (run by sdk/typescript/test/serveproof-copies).
+# signs RAW (no further wrap): keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash).
+# The envelope's `version` picks proofHash (sealed/LAYERS.md §7):
+#   none (LEGACY(v1): every image before the layered runtime) —
+#     keccak256(abi.encode(chainId, identityRegistry, submitter, agentId,
+#     timestamp, deadline, taskHash, keccak256(packed dataHashes),
+#     frameworkHash));
+#   the JSON number 2 — keccak256(abi.encode(keccak256("AgentDNA.ServeProof.v2"),
+#     the same nine, sealedHash, harnessHash, keccak256(inferenceURL),
+#     keccak256(model))), each string's UTF-8 bytes exactly as sent.
+# An envelope the SDK refuses is refused here (return 1, nothing printed):
+# any other version, a hash that is not "0x" + 64 hex, a missing or
+# non-string inference_url / model.
+# One of the five consensus-critical copies listed in AGENTS.md; `--kat` pins
+# the vectors and the refusals (run by sdk/typescript/test/serveproof-copies).
 serveproof_digest() {
-  local env_json=$4 dh inner
-  _env() { printf '%s' "$env_json" | jq -r "$1"; }
-  dh=$(cast keccak "0x$(_env '(.data_hashes // []) | map(ltrimstr("0x")) | join("")')") &&
-  inner=$(cast keccak "$(cast abi-encode \
-    'f(uint256,address,address,uint256,uint256,uint256,bytes32,bytes32,bytes32)' \
-    "$1" "$2" "$(_env '.submitter // "0x0000000000000000000000000000000000000000"')" \
-    "$(_env '.agent_id // empty')" "$(_env .timestamp)" "$(_env .deadline)" \
-    "$(_env .task_hash)" "$dh" "$(_env .framework_hash)")") &&
+  local env_json=$4 word='^0x[0-9a-fA-F]{64}$' version submitter agent ts dl task framework dh
+  local tag sealed harness url model enc inner common
+  # A bytes32 field ("0x" + 64 hex); fails on anything else.
+  _word() { printf '%s' "$env_json" | jq -er --arg k "$1" --arg re "$word" '.[$k] | strings | select(test($re))'; }
+  # A uint field — a JSON number or a decimal string — in decimal.
+  _uint() {
+    printf '%s' "$env_json" | jq -er --arg k "$1" \
+      '.[$k] | if type == "number" then tostring elif type == "string" and test("^[0-9]+$") then . else empty end'
+  }
+  # keccak256 of a string field's UTF-8 bytes, refused unless it is a string.
+  # The bytes go from jq to od through a pipe, never through a shell
+  # variable, so a trailing newline or a NUL is hashed as sent.
+  _strhash() {
+    local hex
+    hex=$(printf '%s' "$env_json" | jq -ej --arg k "$1" '.[$k] | strings' | od -An -v -tx1 | tr -d ' \n') || return 1
+    cast keccak "0x$hex"
+  }
+  version=$(printf '%s' "$env_json" \
+    | jq -er 'if has("version") then (.version | numbers | tostring) else "none" end') || return 1
+  submitter=$(printf '%s' "$env_json" \
+    | jq -er '.submitter // "0x0000000000000000000000000000000000000000" | strings | select(test("^0x[0-9a-fA-F]{40}$"))') || return 1
+  agent=$(_uint agent_id) && ts=$(_uint timestamp) && dl=$(_uint deadline) || return 1
+  task=$(_word task_hash) && framework=$(_word framework_hash) || return 1
+  dh=$(printf '%s' "$env_json" | jq -er --arg re "$word" \
+    '(.data_hashes // []) | arrays | select(all(.[]; type == "string" and test($re))) | map(ltrimstr("0x")) | join("")') || return 1
+  dh=$(cast keccak "0x$dh") || return 1
+  common=("$1" "$2" "$submitter" "$agent" "$ts" "$dl" "$task" "$dh" "$framework")
+  case "$version" in
+    none) # LEGACY(v1): delete this branch once those images are gone; an
+          # envelope without a version is then refused.
+      enc=$(cast abi-encode 'f(uint256,address,address,uint256,uint256,uint256,bytes32,bytes32,bytes32)' \
+        "${common[@]}") || return 1 ;;
+    2)
+      sealed=$(_word sealed_hash) && harness=$(_word harness_hash) || return 1
+      url=$(_strhash inference_url) && model=$(_strhash model) || return 1
+      tag=$(cast keccak 'AgentDNA.ServeProof.v2') || return 1
+      enc=$(cast abi-encode \
+        'f(bytes32,uint256,address,address,uint256,uint256,uint256,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32)' \
+        "$tag" "${common[@]}" "$sealed" "$harness" "$url" "$model") || return 1 ;;
+    *) return 1 ;;
+  esac
+  inner=$(cast keccak "$enc") || return 1
   cast keccak "0x1900${3#0x}${inner#0x}"
 }
 
+if [ "${1:-}" = "--digest" ]; then
+  [ $# -eq 5 ] || { echo "usage: verify-agent.sh --digest CHAIN_ID IDENTITY_REGISTRY VALIDATOR ENVELOPE_JSON" >&2; exit 2; }
+  serveproof_digest "$2" "$3" "$4" "$5" || exit 1
+  exit 0
+fi
+
 if [ "${1:-}" = "--kat" ]; then
-  # Same fixed inputs and expected digest as contracts / sealed / the SDK.
+  # Same fixed inputs and expected digests as contracts / sealed / the SDK.
   KAT_ENV='{"agent_id":"42","submitter":"0x00000000000000000000000000000000000000C1","timestamp":1700000000,"deadline":1700003600,"task_hash":"0x1111111111111111111111111111111111111111111111111111111111111111","data_hashes":["0x2222222222222222222222222222222222222222222222222222222222222222","0x3333333333333333333333333333333333333333333333333333333333333333"],"framework_hash":"0x4444444444444444444444444444444444444444444444444444444444444444"}'
-  KAT_WANT=0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b
-  KAT_GOT=$(serveproof_digest 16602 0x00000000000000000000000000000000000000A9 \
-    0x00000000000000000000000000000000000000B7 "$KAT_ENV") || KAT_GOT=""
-  if [ "$KAT_GOT" = "$KAT_WANT" ]; then echo "OK   serveproof_digest KAT ($KAT_GOT)"; exit 0; fi
-  echo "FAIL serveproof_digest KAT: got '$KAT_GOT', want $KAT_WANT"; exit 1
+  KAT_ENV2=$(printf '%s' "$KAT_ENV" | jq -c '. + {version: 2,
+    sealed_hash: "0x5555555555555555555555555555555555555555555555555555555555555555",
+    harness_hash: "0x6666666666666666666666666666666666666666666666666666666666666666",
+    inference_url: "https://router.example/v1", model: "model-x"}')
+  # The same v2 tuple with a non-ASCII model ("模型-é"): its
+  # UTF-8 bytes are what is hashed.
+  KAT_ENV2U=$(printf '%s' "$KAT_ENV2" | jq -c '.model = "模型-é"')
+  kat_fail=0
+  # LEGACY(v1): the v1 vector goes with the v1 branch.
+  for kat in "v1 $KAT_ENV 0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b" \
+             "v2 $KAT_ENV2 0x50f91a86a4e744dddd29bc16e936ab717a8c54074458e4332c5f43661538df4e" \
+             "v2-utf8 $KAT_ENV2U 0xcab300c137d0d07deb4e73c3e027db4ff63df5045e0a95767519cce28ffbd963"; do
+    read -r KAT_NAME KAT_JSON KAT_WANT <<<"$kat"
+    KAT_GOT=$(serveproof_digest 16602 0x00000000000000000000000000000000000000A9 \
+      0x00000000000000000000000000000000000000B7 "$KAT_JSON") || KAT_GOT=""
+    if [ "$KAT_GOT" = "$KAT_WANT" ]; then echo "OK   serveproof_digest $KAT_NAME KAT ($KAT_GOT)"
+    else echo "FAIL serveproof_digest $KAT_NAME KAT: got '$KAT_GOT', want $KAT_WANT"; kat_fail=1; fi
+  done
+  # Envelopes the SDK refuses are refused here too, never hashed into
+  # another digest.
+  for change in '.version = "2"' '.version = null' '.version = 3' 'del(.model)' '.model = 5' \
+                'del(.inference_url)' '.sealed_hash = "0x55"' 'del(.harness_hash)' \
+                '.framework_hash = "0x44"' '.data_hashes = ["0x22"]' '.agent_id = "4x2"'; do
+    KAT_JSON=$(printf '%s' "$KAT_ENV2" | jq -c "$change")
+    if KAT_GOT=$(serveproof_digest 16602 0x00000000000000000000000000000000000000A9 \
+      0x00000000000000000000000000000000000000B7 "$KAT_JSON"); then
+      echo "FAIL serveproof_digest hashed a malformed envelope ($change): $KAT_GOT"; kat_fail=1
+    else echo "OK   serveproof_digest refuses $change"; fi
+  done
+  exit "$kat_fail"
 fi
 
 API="${API:-http://localhost:8080}"
@@ -187,6 +270,8 @@ if [ -n "$PROOF" ]; then
     | jq -Rr 'gsub("-";"+") | gsub("_";"/") | . + ("=" * ((4 - length % 4) % 4)) | @base64d' 2>/dev/null || true)
   E_AGENT=$(printf '%s' "$ENV_JSON" | jq -r '.agent_id // empty' 2>/dev/null || true)
   E_VAL=$(printf '%s' "$ENV_JSON" | jq -r '.validator // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+  # The version as serveproof_digest reads it: a JSON number, else none.
+  E_VER=$(printf '%s' "$ENV_JSON" | jq -r '.version | numbers | tostring' 2>/dev/null || true)
   if [ "$E_AGENT" = "$AGENT_ID" ]; then ok "proof envelope agent_id == $AGENT_ID"
   else bad "proof envelope agent_id='$E_AGENT' != $AGENT_ID"; fi
   if [ -z "$VF" ]; then
@@ -198,14 +283,37 @@ if [ -n "$PROOF" ]; then
     if [ -z "$DIGEST" ]; then
       bad "ServeProof digest: could not rebuild from envelope ($ENV_JSON)"
     elif VERIFY_ERR=$(cast wallet verify --no-hash --address "$DB_ADDR" "$DIGEST" "$SIG" 2>&1 >/dev/null); then
-      ok "ServeProof signature recovers to seal addr (validator $VF)"
+      ok "ServeProof ${E_VER:+v$E_VER }signature recovers to seal addr (validator $VF)"
     elif printf '%s' "$VERIFY_ERR" | grep -q "did not sign this message"; then
+      # LEGACY(v1): the hint for an image from before the validator.
       hint=""; [ -n "$E_VAL" ] || hint=" (envelope has no validator — legacy sealed image? owner must /reset)"
       bad "ServeProof signature does not recover to seal addr $DB_ADDR$hint"
     else
       # Not a plain mismatch (malformed signature, cast usage error, …).
       bad "ServeProof signature check errored: $VERIFY_ERR"
     fi
+  fi
+fi
+
+# ── 3c. a v2 proof's layers on the trust registry's lists ───────────────
+if [ -n "$PROOF" ] && [ "${E_VER:-}" = "2" ]; then
+  if ! TRUST=$(cast call --rpc-url "$RPC" "$CONTRACT" 'trustRegistry()(address)' 2>&1); then
+    if printf '%s' "$TRUST" | grep -qi 'execution reverted'; then
+      # LEGACY(pre-1.4.0): an AgenticID before 1.4.0 has no trustRegistry().
+      bad "v2 proof, but AgenticID $CONTRACT names no trust registry to check its layers against"
+    else
+      bad "v2 proof: trustRegistry() on AgenticID $CONTRACT could not be read ($TRUST)"
+    fi
+  elif [ "$TRUST" = "0x0000000000000000000000000000000000000000" ]; then
+    bad "v2 proof, but AgenticID $CONTRACT names no trust registry to check its layers against"
+  else
+    for layer in "image .framework_hash" "sealed .sealed_hash" "harness .harness_hash"; do
+      read -r KIND FIELD <<<"$layer"
+      HASH=$(printf '%s' "$ENV_JSON" | jq -r "$FIELD // empty")
+      LISTED=$(cast call --rpc-url "$RPC" "$TRUST" 'isListed(bytes32,bytes32)(bool)' "$(cast keccak "$KIND")" "$HASH" 2>/dev/null || true)
+      if [ "$LISTED" = "true" ]; then ok "$KIND $HASH is on the trust registry's $KIND list"
+      else bad "$KIND ${HASH:-<missing>} is not on the trust registry's $KIND list"; fi
+    done
   fi
 fi
 

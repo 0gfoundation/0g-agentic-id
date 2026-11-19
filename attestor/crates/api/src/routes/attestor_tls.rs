@@ -99,6 +99,8 @@ mod tests {
             chain: Arc::new(MockChain::new()),
             sandbox,
             deployments: Arc::new(InMemoryDeploymentRepo::new()),
+            credentials: attestor_shared::credentials_repo::in_memory(),
+            notify: None,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             jobs: Arc::new(InMemoryJobQueue::new()),
             events: Arc::new(InMemoryEventBus::new()),

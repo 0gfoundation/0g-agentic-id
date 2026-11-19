@@ -97,6 +97,10 @@ type Agent struct {
 	// Two snapshots; see package doc.
 	chainSnapshot   Snapshot
 	currentSnapshot Snapshot
+
+	// onChainUpload, when set, hears every RecordChainUpload, after the lock
+	// is released.
+	onChainUpload func(dim, contentHash string)
 }
 
 // New constructs an Agent in PhaseBootstrapping.
@@ -174,8 +178,7 @@ func (a *Agent) ProofDomain() (chainID, identityAddr, validator string) {
 	return a.chainID, a.identityAddr, a.validator
 }
 
-// Clear resets identity fields and snapshots. Used when the agent process
-// exits and the proxy must stop accepting requests. Phase -> Bootstrapping.
+// Clear resets identity fields and snapshots. Phase -> Bootstrapping.
 func (a *Agent) Clear() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -312,14 +315,27 @@ func (a *Agent) CurrentEntry(dim string) DimEntry {
 // already matches what was uploaded; we just attach the new storage root).
 func (a *Agent) RecordChainUpload(dim, contentHash, dataHash string) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	prev := a.chainSnapshot.PerDim[dim]
 	a.chainSnapshot.PerDim[dim] = DimEntry{ContentHash: contentHash, DataHash: dataHash}
 	if cur, ok := a.currentSnapshot.PerDim[dim]; ok && cur.ContentHash == contentHash {
 		a.currentSnapshot.PerDim[dim] = DimEntry{ContentHash: contentHash, DataHash: dataHash}
 	}
+	hook := a.onChainUpload
+	a.mu.Unlock()
 	logger.Logf("iData chain uploaded: dim=%s content=%s chain_root=%s -> %s",
 		dim, shortHash(contentHash), shortHash(prev.DataHash), shortHash(dataHash))
+	if hook != nil {
+		hook(dim, contentHash)
+	}
+}
+
+// SetChainUploadHook sets the function RecordChainUpload calls with each
+// role's newly committed content hash. bootstrap uses it to keep the
+// container's record of what it last had in sync with the chain (synced.go).
+func (a *Agent) SetChainUploadHook(f func(dim, contentHash string)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.onChainUpload = f
 }
 
 // CurrentDataHashes returns the sorted hex content-hashes of the current

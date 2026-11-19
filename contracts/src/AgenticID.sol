@@ -16,14 +16,8 @@ import {ERC8004CanonicalBoundUpgradeable} from "./ERC8004CanonicalBoundUpgradeab
 import {ERC7857IDataStorageUpgradeable} from "./extensions/ERC7857IDataStorageUpgradeable.sol";
 import {ERC7857AuthorizeUpgradeable} from "./extensions/ERC7857AuthorizeUpgradeable.sol";
 import {ERC7857CloneableUpgradeable} from "./extensions/ERC7857CloneableUpgradeable.sol";
-import {
-    AttestorAppBinding,
-    AttestorAppBindingLib,
-    IAttestorAppBindingErrors,
-    IAttestorAppRegistry,
-    AgenticIDInvalidAttestorBinding,
-    AgenticIDAppInstanceMismatch
-} from "./AttestorAppBindingLib.sol";
+import {ITrustRegistry} from "./interfaces/ITrustRegistry.sol";
+import {AttestorAppBinding} from "./AttestorAppBindingLib.sol";
 
 /// @notice Caller is not a trusted attestor.
 error AgenticIDNotTrustedAttestor();
@@ -50,7 +44,8 @@ error AgenticIDUseRegisterWithData();
 /// @notice Caller is not the pauser.
 error AgenticIDNotPauser();
 
-/// @notice An owner setter was given the zero address (setVerifier).
+/// @notice An owner setter (setVerifier) or the constructor (the trust
+///         registry) was given the zero address.
 error AgenticIDZeroAddress();
 
 /// @notice update / updateAt was called by an address that is not
@@ -84,9 +79,11 @@ error AgenticIDCannotCloneSealedAgent(uint256 agentId);
 ///             required on every transfer to atomically deliver the data key.
 ///
 ///         agentSeal is a TEE-derived address whose private key never leaves TEE memory.
-///         Only trusted attestors (whitelisted by the owner) can register an agentSeal.
-///         Attestors read the validFrameworkHashes whitelist off-chain to decide whether
-///         to provision the agentSeal private key to the agent runtime.
+///         Only trusted attestors can register an agentSeal. Which attestors are
+///         trusted, and which images may run an agent (read off-chain by attestors
+///         before they provision the agentSeal private key), are the deployer's
+///         trust decisions and live in the TrustRegistry ({trustRegistry}); this
+///         contract's trust reads forward there.
 ///         sealId provides a stable cross-hardware identity for the TEE instance.
 ///
 /// @dev Inheritance (C3 MRO, most-derived first):
@@ -106,8 +103,10 @@ error AgenticIDCannotCloneSealedAgent(uint256 agentId);
 ///      owner proposes with transferOwnership and the new owner must
 ///      acceptOwnership, so a mistyped address can't strand the admin
 ///      surface. Owner calls are direct (not timelocked); only beacon
-///      upgrades go through the Timelock. The linked 1.3.0 build sits 33 B
-///      under EIP-170 (test/Eip170Size.t.sol) — measure
+///      upgrades go through the Timelock. The trust registry is fixed in the
+///      implementation (constructor), so pointing at another one is a new
+///      implementation behind the Timelock. Runtime size is gated by
+///      test/Eip170Size.t.sol — measure
 ///      `forge build --sizes --skip test --skip script` on any change.
 ///
 ///      agentSeal / sealId are one-time bindings per agentId and persist across
@@ -122,18 +121,23 @@ contract AgenticID is
     ERC7857IDataStorageUpgradeable,
     ERC7857AuthorizeUpgradeable,
     ERC7857CloneableUpgradeable,
-    Ownable2StepUpgradeable,
-    IAttestorAppBindingErrors
+    Ownable2StepUpgradeable
 {
     // ── Storage ───────────────────────────────────────────────────────────────
 
+    /// @dev The trust fields (trustedAttestors, validFrameworkHashes,
+    ///      attestorAppBindings, instanceBoundAttestorsRequired) are retired
+    ///      since 1.4.0: the TrustRegistry holds that state and nothing here
+    ///      reads or writes them. Never remove, reorder or reuse them: every
+    ///      later field keeps its slot through them, and a rollback to 1.3.0
+    ///      reads 1.3.0's lists from them.
     /// @custom:storage-location erc7201:0g.storage.AgenticID
     struct AgenticIDStorage {
         mapping(uint256 => address) agentSeals;
         mapping(uint256 => bytes32) agentIdToSealId;
         mapping(bytes32 => uint256) sealIdToAgentId;
-        mapping(address => bool) trustedAttestors;
-        mapping(bytes32 => bool) validFrameworkHashes;
+        mapping(address => bool) trustedAttestors;          // retired (1.4.0)
+        mapping(bytes32 => bool) validFrameworkHashes;      // retired (1.4.0)
         address pauser;
         // Explicit existence bit for sealId bindings. Required because the
         // canonical registry numbers agentIds from 0 (and the live registry
@@ -148,12 +152,31 @@ contract AgenticID is
         mapping(address => bool)    agentSealBound;
         // 1.3.0: append after every 1.2.0 field so an upgraded proxy retains
         // the lifetime agentSeal binding map at its existing slot.
-        mapping(address => AttestorAppBinding) attestorAppBindings;
-        bool instanceBoundAttestorsRequired;
+        mapping(address => AttestorAppBinding) attestorAppBindings;   // retired (1.4.0)
+        bool instanceBoundAttestorsRequired;                          // retired (1.4.0)
     }
 
+    /// @notice The deployer's trust decisions, fixed per implementation.
+    ITrustRegistry private immutable _trustRegistry;
+
+    bytes32 private constant IMAGE = keccak256("image");
+
     /// @notice Current implementation version. Bump on every upgrade.
-    /// @dev 1.3.0 — instance-bound stable attestors with one-way legacy migration.
+    /// @dev 1.4.0 — trust moves to the TrustRegistry (beacon upgrade; storage
+    ///      unchanged, the trust fields retired in place). The implementation
+    ///      takes the registry in its constructor, so the upgrade itself
+    ///      switches every trust read, with no setter call and no window in
+    ///      between; the registry must hold the migrated lists before the
+    ///      upgrade executes (UPGRADING.md). ABI: the list-management functions
+    ///      (addTrustedAttestor, removeTrustedAttestor, bindTrustedAttestorApp,
+    ///      requireInstanceBoundAttestors, addValidFrameworkHash,
+    ///      removeValidFrameworkHash) and their events move to the registry;
+    ///      the reads stay and forward (isTrustedAttestor, isValidFrameworkHash
+    ///      = the registry's image list, trustedAttestorAppBinding,
+    ///      instanceBoundAttestorsRequired); trustRegistry() is new. The
+    ///      IAgenticID ERC-165 id changes with the interface. The linked
+    ///      AttestorAppBindingLib is no longer used here.
+    ///      1.3.0 — instance-bound stable attestors with one-way legacy migration.
     ///      Append-only storage after the 1.2.0 lifetime agentSeal binding map.
     ///      1.2.0 — governance hardening (beacon upgrade; audit FIND-12 /
     ///      FIND-16): ownership becomes two-step (Ownable2StepUpgradeable —
@@ -188,12 +211,7 @@ contract AgenticID is
     ///      function) + new reentrancy-guard storage (ERC-7201 namespaced, no
     ///      collision); no existing storage layout change.
     ///      1.0.0 — initial.
-    string public constant VERSION = "1.3.0";
-
-    event TrustedAttestorAppBound(
-        address indexed attestor, address indexed registry, string appId, uint256 registeredAt
-    );
-    event InstanceBoundAttestorsRequired();
+    string public constant VERSION = "1.4.0";
 
     event PauserUpdated(address indexed previousPauser, address indexed newPauser);
     event VerifierUpdated(address indexed previousVerifier, address indexed newVerifier);
@@ -208,8 +226,10 @@ contract AgenticID is
         }
     }
 
-    /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
+    /// @custom:oz-upgrades-unsafe-allow constructor state-variable-immutable
+    constructor(address trustRegistry_) {
+        if (trustRegistry_ == address(0)) revert AgenticIDZeroAddress();
+        _trustRegistry = ITrustRegistry(trustRegistry_);
         _disableInitializers();
     }
 
@@ -622,68 +642,40 @@ contract AgenticID is
         return _getAgenticIDStorage().sealIdBound[sealId];
     }
 
-    // ── Trusted attestors ─────────────────────────────────────────────────────
+    // ── Trust (held by the TrustRegistry; reads forward there) ───────────────
 
-    function addTrustedAttestor(address attestor) external onlyOwner {
-        _getAgenticIDStorage().trustedAttestors[attestor] = true;
-        emit TrustedAttestorAdded(attestor);
+    function trustRegistry() external view returns (address) {
+        return address(_trustRegistry);
     }
 
-    function removeTrustedAttestor(address attestor) external onlyOwner {
-        AgenticIDStorage storage s = _getAgenticIDStorage();
-        AttestorAppBindingLib.remove(s.attestorAppBindings, s.trustedAttestors, attestor);
+    function isTrustedAttestor(address attestor) public view returns (bool) {
+        return _trustRegistry.isTrustedAttestor(attestor);
     }
 
-    /// Bind the stable service key to one live registration, never just a reusable appId.
-    function bindTrustedAttestorApp(address attestor, address registry, string memory appId, uint256 registeredAt)
-        external
-        onlyOwner
-    {
-        AgenticIDStorage storage s = _getAgenticIDStorage();
-        AttestorAppBindingLib.bind(
-            s.attestorAppBindings, s.trustedAttestors, attestor, registry, appId, registeredAt
-        );
+    /// @notice Whether the image hash is on the TrustRegistry's image list.
+    /// @dev LEGACY(pre-1.4.0), with trustedAttestorAppBinding and
+    ///      instanceBoundAttestorsRequired below: forwards kept for readers
+    ///      written against 1.3.0's ABI (the attestor's provision check, the
+    ///      SDK). Removable once they read the TrustRegistry directly — an ABI
+    ///      change that also changes IAgenticID's ERC-165 id; no storage
+    ///      change. isTrustedAttestor is not legacy: it is the mint and URI
+    ///      gate, and CloneGate calls it.
+    function isValidFrameworkHash(bytes32 frameworkHash) external view returns (bool) {
+        return _trustRegistry.isListed(IMAGE, frameworkHash);
     }
 
-    /// One-way migration. Bind every production attestor before enabling this mode.
-    function requireInstanceBoundAttestors() external onlyOwner {
-        _getAgenticIDStorage().instanceBoundAttestorsRequired = true;
-        emit InstanceBoundAttestorsRequired();
-    }
-
-    function instanceBoundAttestorsRequired() external view returns (bool) {
-        return _getAgenticIDStorage().instanceBoundAttestorsRequired;
-    }
-
+    /// @dev LEGACY(pre-1.4.0): see isValidFrameworkHash.
     function trustedAttestorAppBinding(address attestor)
         external
         view
         returns (address registry, string memory appId, uint256 registeredAt, address appOwner)
     {
-        AttestorAppBinding storage b = _getAgenticIDStorage().attestorAppBindings[attestor];
-        return (b.registry, b.appId, b.registeredAt, b.appOwner);
+        return _trustRegistry.trustedAttestorAppBinding(attestor);
     }
 
-    function isTrustedAttestor(address attestor) public view returns (bool) {
-        AgenticIDStorage storage s = _getAgenticIDStorage();
-        if (!s.trustedAttestors[attestor]) return false;
-        return AttestorAppBindingLib.isCurrent(s.attestorAppBindings[attestor], s.instanceBoundAttestorsRequired);
-    }
-
-    // ── Valid framework hashes ────────────────────────────────────────────────
-
-    function addValidFrameworkHash(bytes32 frameworkHash) external onlyOwner {
-        _getAgenticIDStorage().validFrameworkHashes[frameworkHash] = true;
-        emit ValidFrameworkHashAdded(frameworkHash);
-    }
-
-    function removeValidFrameworkHash(bytes32 frameworkHash) external onlyOwner {
-        delete _getAgenticIDStorage().validFrameworkHashes[frameworkHash];
-        emit ValidFrameworkHashRemoved(frameworkHash);
-    }
-
-    function isValidFrameworkHash(bytes32 frameworkHash) external view returns (bool) {
-        return _getAgenticIDStorage().validFrameworkHashes[frameworkHash];
+    /// @dev LEGACY(pre-1.4.0): see isValidFrameworkHash.
+    function instanceBoundAttestorsRequired() external view returns (bool) {
+        return _trustRegistry.instanceBoundAttestorsRequired();
     }
 
     // ── Pauser ────────────────────────────────────────────────────────────────

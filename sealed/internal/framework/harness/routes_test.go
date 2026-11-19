@@ -1,6 +1,11 @@
 package harness
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	"seal-verify/internal/framework"
+)
 
 // The routes /hello advertises: the chat and responses surfaces, and one kind
 // per harness capability. A client enables a feature only on the kinds an
@@ -8,12 +13,18 @@ import "testing"
 // token, and none may be signed (the owner's steering channel never is).
 func TestFrameworkRoutesAdvertiseTheHarnessSurface(t *testing.T) {
 	want := map[string]string{
-		"/v1/":          "chat",
-		"/v1/responses": "responses",
-		"/v1/inbox":     "inbox",
-		"/v1/events":    "events",
-		"/v1/tasks":     "tasks",
-		"/v1/schedules": "schedules",
+		"/v1/":           "chat",
+		"/v1/responses":  "responses",
+		"/v1/inbox":      "inbox",
+		"/v1/events":     "events",
+		"/v1/activities": "activities",
+		"/v1/tasks":      "tasks",
+		"/v1/task-feed":  "task-feed",
+		"/v1/schedules":  "schedules",
+		"/v1/files":      "files",
+		"/v1/memory":     "memory",
+		"/v1/steer":      "steer",
+		"/v1/sessions":   "sessions",
 	}
 	routes := New().FrameworkRoutes()
 	if len(routes) != len(want) {
@@ -33,6 +44,113 @@ func TestFrameworkRoutesAdvertiseTheHarnessSurface(t *testing.T) {
 		}
 		if r.Description == "" {
 			t.Errorf("%s has no description", r.Prefix)
+		}
+	}
+}
+
+// Each route forwards the requests docs/PROTOCOL.md (protocol 1) lists and
+// nothing else under its prefix.
+func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
+	routes := map[string]framework.Route{}
+	for _, r := range New().FrameworkRoutes() {
+		routes[r.Prefix] = r
+	}
+	forwarded := []struct{ prefix, method, path string }{
+		{"/v1/", "GET", "/v1/harness"},
+		{"/v1/", "POST", "/v1/chat/completions"},
+		{"/v1/", "POST", "/v1/interrupt"},
+		{"/v1/", "POST", "/v1/compact"},
+		{"/v1/responses", "POST", "/v1/responses"},
+		{"/v1/responses", "GET", "/v1/responses/resp_1"},
+		{"/v1/responses", "POST", "/v1/responses/resp_1/cancel"},
+		{"/v1/inbox", "GET", "/v1/inbox"},
+		{"/v1/inbox", "POST", "/v1/inbox/ack"},
+		{"/v1/events", "GET", "/v1/events"},
+		{"/v1/activities", "GET", "/v1/activities"},
+		{"/v1/activities", "GET", "/v1/activities/bash-1"},
+		{"/v1/activities", "POST", "/v1/activities/all/cancel"},
+		{"/v1/tasks", "GET", "/v1/tasks"},
+		{"/v1/tasks", "POST", "/v1/tasks"},
+		{"/v1/tasks", "GET", "/v1/tasks/task-1"},
+		{"/v1/tasks", "POST", "/v1/tasks/task-1/input"},
+		{"/v1/tasks", "POST", "/v1/tasks/task-1/cancel"},
+		{"/v1/tasks", "POST", "/v1/tasks/task-1/archive"},
+		{"/v1/tasks", "GET", "/v1/tasks/task-1/events"},
+		{"/v1/tasks", "GET", "/v1/tasks/session-0b6e2c1a-5f3d-4b8e-9c21-7a4d0e9f1b23"},
+		{"/v1/task-feed", "GET", "/v1/task-feed"},
+		{"/v1/schedules", "GET", "/v1/schedules"},
+		{"/v1/schedules", "DELETE", "/v1/schedules/s1"},
+		{"/v1/files", "POST", "/v1/files"},
+		{"/v1/memory", "POST", "/v1/memory/tidy"},
+		{"/v1/steer", "POST", "/v1/steer"},
+		{"/v1/steer", "GET", "/v1/steer/4d2c0e3a-0b7e-4c1f-9a51-3f0b2a7c9e10"},
+		{"/v1/files", "GET", "/v1/files"},
+		{"/v1/files", "GET", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "GET", "/v1/files/inbox/notes.txt"},
+		{"/v1/files", "DELETE", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "DELETE", "/v1/files/inbox/notes.txt"},
+		{"/v1/sessions", "GET", "/v1/sessions"},
+		{"/v1/sessions", "POST", "/v1/sessions"},
+		{"/v1/sessions", "GET", "/v1/sessions/sess-1"},
+		{"/v1/sessions", "POST", "/v1/sessions/owner-chat/prompt"},
+		{"/v1/sessions", "GET", "/v1/sessions/sess-1/events"},
+		{"/v1/sessions", "POST", "/v1/sessions/session-0b6e2c1a-5f3d-4b8e-9c21-7a4d0e9f1b23/prompt"},
+		{"/v1/sessions", "POST", "/v1/sessions/sess-1/cancel"},
+		{"/v1/", "OPTIONS", "/v1/chat/completions"},
+	}
+	for _, f := range forwarded {
+		if ok, _ := routes[f.prefix].Allows(f.method, f.path); !ok {
+			t.Errorf("%s %s is not forwarded", f.method, f.path)
+		}
+	}
+	refused := []struct{ prefix, method, path string }{
+		{"/v1/", "GET", "/v1/models"},
+		{"/v1/", "POST", "/v1/export"},
+		{"/v1/", "GET", "/v1/chat/completions"},
+		{"/v1/responses", "DELETE", "/v1/responses/resp_1"},
+		{"/v1/activities", "POST", "/v1/activities/a/b/cancel"},
+		{"/v1/activities", "GET", "/v1/activities/"},
+		{"/v1/tasks", "POST", "/v1/tasks/a/b/cancel"},
+		{"/v1/tasks", "GET", "/v1/tasks/"},
+		{"/v1/tasks", "DELETE", "/v1/tasks/task-1"},
+		{"/v1/tasks", "POST", "/v1/tasks/task-1/answer"},
+		{"/v1/task-feed", "POST", "/v1/task-feed"},
+		{"/v1/inbox", "GET", "/v1/inbox/all"},
+		{"/v1/files", "POST", "/v1/files/x"},
+		{"/v1/files", "GET", "/v1/files/outbox"},
+		{"/v1/files", "GET", "/v1/files/outbox/a/b"},
+		{"/v1/files", "POST", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "PATCH", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "PUT", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "DELETE", "/v1/files"},
+		{"/v1/files", "DELETE", "/v1/files/outbox"},
+		{"/v1/files", "DELETE", "/v1/files/outbox/a/b"},
+	}
+	for _, f := range refused {
+		if ok, _ := routes[f.prefix].Allows(f.method, f.path); ok {
+			t.Errorf("%s %s is forwarded", f.method, f.path)
+		}
+	}
+}
+
+// The owner's token is not the harness's: the owner gets one, the proxy
+// swaps it for the other, and nothing else is swapped.
+func TestOwnerTokenIsNotTheHarnessToken(t *testing.T) {
+	a := New()
+	a.bridgeToken, a.ownerToken = "harness-token", "owner-token"
+	resp, err := a.AuthResponse(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.(map[string]any)["token"]; got != "owner-token" {
+		t.Fatalf("AuthResponse handed out %v", got)
+	}
+	if got, ok := a.TranslateBearer("owner-token"); !ok || got != "harness-token" {
+		t.Fatalf("TranslateBearer(owner) = %q, %v", got, ok)
+	}
+	for _, bad := range []string{"harness-token", "", "owner-toke", "owner-token "} {
+		if _, ok := a.TranslateBearer(bad); ok {
+			t.Errorf("TranslateBearer(%q) accepted", bad)
 		}
 	}
 }

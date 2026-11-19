@@ -313,6 +313,110 @@ func TestStop_HaltsLivenessLoop(t *testing.T) {
 	}
 }
 
+// After Stop nothing starts the agent again: not a reload (the drift
+// handler's), not a crash-restart.
+func TestStop_NothingStartsAfterward(t *testing.T) {
+	a := &fakeAdapter{}
+	m := New(a, state.New(), Config{
+		LivenessProbeInterval: time.Hour,
+		BackoffSeq:            []time.Duration{time.Millisecond},
+		MaxRetries:            3,
+	})
+	if err := m.Start(context.Background(), StartParams{}); err != nil {
+		t.Fatal(err)
+	}
+	m.Stop(context.Background())
+	_ = m.Reload(context.Background())
+	a.triggerExit(errors.New("killed"))
+	time.Sleep(30 * time.Millisecond)
+	if n := atomic.LoadInt32(&a.startCalls); n != 1 {
+		t.Fatalf("Start called %d times, want only the first", n)
+	}
+}
+
+// A reload under way when Stop is called finishes first; Stop then stops
+// the process the reload started, so none is left running.
+func TestStop_WaitsForAReloadUnderWay(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	note := func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, s)
+	}
+	inReload := make(chan struct{})
+	release := make(chan struct{})
+	var reloading atomic.Bool
+	a := &fakeAdapter{
+		stopFn: func() error {
+			if reloading.CompareAndSwap(true, false) {
+				close(inReload)
+				<-release
+			}
+			note("stop")
+			return nil
+		},
+		startFn: func(framework.RuntimeContext) (framework.StartResult, error) {
+			note("start")
+			return framework.StartResult{Upstream: "http://127.0.0.1:0"}, nil
+		},
+	}
+	m := New(a, state.New(), Config{LivenessProbeInterval: time.Hour, MaxRetries: 1})
+	if err := m.Start(context.Background(), StartParams{}); err != nil {
+		t.Fatal(err)
+	}
+	reloading.Store(true)
+	go func() { _ = m.Reload(context.Background()) }()
+	<-inReload
+
+	stopped := make(chan struct{})
+	go func() {
+		m.Stop(context.Background())
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned while the reload was under way")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after the reload finished")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"start", "stop", "start", "stop"}
+	if len(order) != len(want) {
+		t.Fatalf("order %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("order %v, want %v", order, want)
+		}
+	}
+}
+
+// Stop leaves the shared agent state alone: sealed's stop lets a commit the
+// watcher has under way finish with it.
+func TestStop_KeepsAgentState(t *testing.T) {
+	const seal = "0x5ea1"
+	agent := state.New()
+	agent.SeedChainSnapshot("config", "abc", "0xroot")
+	m := New(&fakeAdapter{}, agent, Config{LivenessProbeInterval: time.Hour})
+	if err := m.Start(context.Background(), StartParams{SealID: seal}); err != nil {
+		t.Fatal(err)
+	}
+	m.Stop(context.Background())
+	if got := agent.ChainEntry("config"); got.ContentHash != "abc" || got.DataHash != "0xroot" {
+		t.Fatalf("chain snapshot after Stop = %+v, want it kept", got)
+	}
+	if _, _, gotSeal, _, _ := agent.Snapshot(); gotSeal != seal {
+		t.Fatalf("sealID after Stop = %q, want %q", gotSeal, seal)
+	}
+}
+
 // PreStart must run before EVERY spawn, not just the first. Anything that
 // only runs on the initial Start is frozen at container boot — which is how
 // the owner's thinking level used to get reverted by the next harness
@@ -434,4 +538,183 @@ func TestArmState_ProofFieldsFromRuntime(t *testing.T) {
 		t.Fatalf("Reload: %v", err)
 	}
 	check("after Reload")
+}
+
+// A reload whose caller's context ends with the call (a settings push, a
+// model key) still leaves the new process supervised, by one liveness loop
+// however many reloads ran: a later crash is restarted, once.
+func TestReloadSupervisesBeyondTheCallersContext(t *testing.T) {
+	startCh := make(chan struct{}, 32)
+	a := &fakeAdapter{
+		startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+			startCh <- struct{}{}
+			return framework.StartResult{Upstream: "http://x"}, nil
+		},
+	}
+	m := New(a, state.New(), Config{
+		LivenessProbeInterval: 5 * time.Millisecond,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+	})
+	defer m.Stop(context.Background())
+	if err := m.Start(context.Background(), StartParams{}); err != nil {
+		t.Fatal(err)
+	}
+	<-startCh
+	for i := 0; i < 5; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		if err := m.Reload(ctx); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		<-startCh
+	}
+	time.Sleep(30 * time.Millisecond)
+	if n := m.liveLoops.Load(); n != 1 {
+		t.Fatalf("%d liveness loops after five reloads", n)
+	}
+	a.triggerExit(errors.New("crashed"))
+	select {
+	case <-startCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("a crash after a reload under an ended context was not restarted")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if n := len(startCh); n != 0 {
+		t.Fatalf("one crash restarted %d extra times", n)
+	}
+	if n := m.liveLoops.Load(); n != 1 {
+		t.Fatalf("%d liveness loops after the restart", n)
+	}
+}
+
+// A crash restarted reports the recovery.
+func TestRestartReportsRecovery(t *testing.T) {
+	startCh := make(chan struct{}, 4)
+	a := &fakeAdapter{startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+		startCh <- struct{}{}
+		return framework.StartResult{Upstream: "http://x"}, nil
+	}}
+	var recovered atomic.Int32
+	m := New(a, state.New(), Config{
+		LivenessProbeInterval: 1 * time.Hour,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+		OnRecovered:           func() { recovered.Add(1) },
+	})
+	defer m.Stop(context.Background())
+	if err := m.Start(context.Background(), StartParams{}); err != nil {
+		t.Fatal(err)
+	}
+	<-startCh
+	if recovered.Load() != 0 {
+		t.Fatal("the first start is not a recovery")
+	}
+	a.triggerExit(errors.New("crashed"))
+	<-startCh
+	time.Sleep(20 * time.Millisecond)
+	if recovered.Load() != 1 {
+		t.Fatalf("a restarted crash reported %d recoveries", recovered.Load())
+	}
+}
+
+// A reload asked for while the last restart attempt runs is not lost: the
+// restart tries once more, on what the reload asked for.
+func TestReloadDuringTheLastAttemptIsTried(t *testing.T) {
+	var fixed atomic.Bool
+	inLast := make(chan struct{})
+	release := make(chan struct{})
+	var starts atomic.Int32
+	a := &fakeAdapter{startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+		n := starts.Add(1)
+		switch {
+		case n == 1:
+			return framework.StartResult{Upstream: "http://x"}, nil
+		case n == 4: // the last of three attempts: the owner fixes it meanwhile
+			close(inLast)
+			<-release
+			return framework.StartResult{}, errors.New("still broken")
+		case fixed.Load():
+			return framework.StartResult{Upstream: "http://x"}, nil
+		default:
+			return framework.StartResult{}, errors.New("broken")
+		}
+	}}
+	var failed atomic.Int32
+	ag := state.New()
+	m := New(a, ag, Config{
+		LivenessProbeInterval: 1 * time.Hour,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+		OnFailed:              func(error) { failed.Add(1) },
+	})
+	defer m.Stop(context.Background())
+	var rendered atomic.Int32
+	if err := m.Start(context.Background(), StartParams{PreStart: func(context.Context) error {
+		rendered.Add(1)
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	a.triggerExit(errors.New("crashed"))
+	<-inLast
+	fixed.Store(true)
+	if err := m.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for ag.Phase() != state.PhaseRunning && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if ag.Phase() != state.PhaseRunning || failed.Load() != 0 || starts.Load() != 5 {
+		t.Fatalf("phase %v, failed %d, starts %d", ag.Phase(), failed.Load(), starts.Load())
+	}
+}
+
+// A reload asked for while a restart attempt starts, and that attempt
+// succeeds: the framework is started again on what the reload asked for.
+func TestReloadDuringASuccessfulAttemptIsApplied(t *testing.T) {
+	inAttempt := make(chan struct{})
+	release := make(chan struct{})
+	var starts atomic.Int32
+	a := &fakeAdapter{startFn: func(rt framework.RuntimeContext) (framework.StartResult, error) {
+		if starts.Add(1) == 2 { // the restart's first attempt
+			close(inAttempt)
+			<-release
+		}
+		return framework.StartResult{Upstream: "http://x"}, nil
+	}}
+	var version, rendered atomic.Int32
+	ag := state.New()
+	m := New(a, ag, Config{
+		LivenessProbeInterval: 1 * time.Hour,
+		BackoffSeq:            []time.Duration{1 * time.Millisecond},
+		MaxRetries:            3,
+		GracefulStopTimeout:   1 * time.Millisecond,
+	})
+	defer m.Stop(context.Background())
+	if err := m.Start(context.Background(), StartParams{PreStart: func(context.Context) error {
+		rendered.Store(version.Load())
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	a.triggerExit(errors.New("crashed"))
+	<-inAttempt
+	version.Store(1)
+	if err := m.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for (ag.Phase() != state.PhaseRunning || starts.Load() < 3) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if ag.Phase() != state.PhaseRunning || rendered.Load() != 1 || starts.Load() != 3 {
+		t.Fatalf("phase %v, rendered version %d, starts %d", ag.Phase(), rendered.Load(), starts.Load())
+	}
 }

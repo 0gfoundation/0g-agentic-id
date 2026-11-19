@@ -111,8 +111,20 @@ is one-way and the first live provision is step 5, so a change that has not run
 on dev would first meet the live provider with every agent already offline.
 
 1. **Images.** Build each framework's sealed image, register it as a provider
-   snapshot and add its image hash with `addValidFrameworkHash`. Check:
-   `isValidFrameworkHash(<hash>)` returns `true` for every image.
+   snapshot and list its image hash on the trust registry
+   (`list(keccak256("image"), <hash>)` on the TrustRegistry from AgenticID
+   1.4.0, scheduled through the environment's Timelock, which owns the
+   registry — mainnet waits 1 day; `addValidFrameworkHash` on AgenticID
+   before it). The 0g-harness image carries no sealed and no harness package:
+   build both from its Dockerfile (the export commands are at the top of
+   `sealed/images/harness/Dockerfile`), attach both files to the `artifacts`
+   release of `0gfoundation/0g-agentic-id`, each named by its sha256, and
+   list their hashes (`keccak256("sealed")`, `keccak256("harness")`) before
+   any container of the image boots: until then it runs nothing. Check:
+   `isValidFrameworkHash(<hash>)` returns `true` for every image,
+   `isListed` returns `true` for the sealed and harness hashes, and
+   `https://github.com/0gfoundation/0g-agentic-id/releases/download/artifacts/<sha256>`
+   serves both files.
 2. **Configuration.** Before the attestor is rolled in step 4, point
    `ATTESTOR_SANDBOX_SNAPSHOT` and `ATTESTOR_FRAMEWORKS` at the new snapshots,
    under the framework names the release ships. The harness framework is now
@@ -202,6 +214,85 @@ to `0g-harness`; it also cannot verify the v3 certificates of the containers
 check fails, fix forward with that step's remedy rather than redeploying the
 AgenticID 1.3 image.
 
+### Announcing a release
+
+Every release that ships new images gets an entry in each environment's
+release file (`ATTESTOR_RELEASES_FILE`; `docker-compose.yml` mounts `./releases`
+at `/etc/attestor/releases`). The file is generated, never written by hand:
+
+- **What changed and what owners should do** is the version's section of
+  [`CHANGELOG.md`](../CHANGELOG.md), in English, written in the pull request
+  that sets the version number. Its first line is the one-line summary the CLI
+  shows.
+- **When and which images** differ per environment and live in that
+  environment's parameters file, [`releases/<env>.json`](../releases)
+  (`testnet`, `mainnet`): per version, `published_at` and `migrate`. A dev
+  test release uses a parameters file kept with the dev deployment.
+  Image hashes and dates are public (the hashes are on the trust registry), so
+  they are reviewed in pull requests like the notes.
+- `node attestor/scripts/release-entry.mjs --changelog CHANGELOG.md --params
+  releases/mainnet.json --min-days 30 --out <host dir>/releases/releases.json`
+  joins the two (`--min-days 14` on testnet; `node --test
+  attestor/scripts/release-entry.test.mjs` tests the script). It refuses a version still headed
+  `(unreleased)`, notes over 4000 bytes, and a transition period shorter than
+  the minimum unless the entry is urgent. With `--out` it writes a temporary
+  file in the same directory and renames it over the target: the attestor
+  reads the file again when its modification time, size or inode changes, and
+  a mounted directory, unlike a mounted single file, shows the renamed file.
+  A test release with no changelog section may carry its own `notes` in the
+  parameters file.
+
+The generated file:
+
+```json
+{"releases": [
+  {"version": "0.5.0", "published_at": "2026-11-20T00:00:00Z",
+   "notes": "Layered runtime (…), owner credentials, …\n\n- Runtime: …",
+   "migrate": [
+     {"framework": "0g-harness", "image_hash": "0x…", "until": "2026-12-20T00:00:00Z"}
+   ]}
+]}
+```
+
+- `migrate` lists the images the release replaces, one per framework, and
+  `until`, the end of each one's transition period. Agents on an old image keep
+  running until then; owners are told to reset them onto the new image (their
+  persona, skills, settings and memory stay; the conversation starts fresh).
+- `published_at` is at or after the moment the new images become the default
+  (`ATTESTOR_FRAMEWORKS` / `ATTESTOR_SANDBOX_SNAPSHOT`, read at the attestor's
+  start): an owner who resets on the notice must land on the new image. An
+  entry with a future `published_at` stays hidden until then, so the entry can
+  be written ahead.
+- `version` is 1-64 of `A-Z a-z 0-9 . _ + -`, and a published one is never
+  renamed: emails are sent once per owner, version and kind, so a renamed
+  version is emailed again.
+- The transition period is at least 30 days on mainnet and 14 on testnet; the
+  deployer sets `until` accordingly (the attestor does not check it). The old
+  image is delisted no earlier than `until`. `urgent: true` marks an image with
+  a security problem, which may be delisted earlier; send a separate notice
+  when that happens. For an image listed by several releases, an urgent entry
+  counts first, then the earliest `until`.
+- A file that does not parse, or is removed, is logged and its last good
+  content is kept; to withdraw every notice, write `{"releases": []}`.
+- Owners hear about it in three places: the CLI (once a week, every day in the
+  last 7 days, with the agents to reset), the owner tier of `GET /deployments`
+  (`migrate`), and, where the attestor sends email, an email when the release
+  is out and one in the last 7 days of each transition period. Emails go to
+  the agent's live on-chain owner; one that fails is sent again by the next
+  hourly sweep.
+- A CLI from before release notices shows none of this; it shows only the
+  update hint (`ATTESTOR_CLI_LATEST`, `ATTESTOR_CLI_NOTES`, once a day). So the
+  same release sets both, and the `ATTESTOR_CLI_NOTES` line names the end of
+  the transition period and the reset, for example: `AgentDNA 0.5.0: run
+  0g-agentdna update; agents on 0.4 images keep running until 2026-12-20,
+  reset them before then`. Email reaches owners whatever their CLI version.
+- The sealed program and the official harness package need no entry: agents
+  switch to the newest listed version by themselves when the old one is
+  delisted.
+- After the image is delisted, an agent still on it keeps running until its
+  container next boots; that boot's provision is refused with `recorded image_hash not in validFrameworkHashes: the image
+  was retired; reset required`, which the owner sees as its failure reason.
+
 ## Workspace
 
 ```
@@ -274,35 +365,44 @@ stay up.
 |---|---|---|
 | `GET /health` | Process-level liveness probe | — |
 | `GET /config` | Public config the frontend needs (chain RPC, contract addresses, appId, snapshot, etc.) | — |
+| `GET /releases` | The published release notices, newest first: `version`, `published_at`, `notes` (and `notes_zh`), and `migrate`, the images each release replaces with the end of their transition period (`until`, `urgent`). See [Announcing a release](#announcing-a-release) | — |
 | `GET /inference/providers` | Versioned provider registry; `?version=N` reads verified accepted history for stop/start route continuity. Built-in seed is version 0 | public |
 | `PUT /admin/inference/providers` | Publish the full registry through HTTP; Postgres history + compare-and-swap, no SSH/restart. See [operator workflow](../sdk/typescript/PROVIDERS.md) | current attestor Tapp owner signature (EOA/EIP-1271) |
 
-### Lifecycle (owner-driven)
+### Lifecycle
+
+The NFT owner can appoint an operator to create, fund, start and stop its own sandbox. Settings and credentials remain owner-controlled. See the [runtime operator API](./OPERATORS.md) and [SDK workflow](../sdk/typescript/OPERATORS.md).
 
 | Path | Purpose | Auth |
 |---|---|---|
-| `POST /deploy` | User deploys an agent. A sandbox envelope whose `env` carries any key but `API_KEY` / `SEAL_SECRET_ENV` is a `400` naming the key | owner EIP-191 + sandbox envelope EIP-191 |
+| `POST /deploy` | User deploys an agent. A sandbox envelope whose `env` carries any key but `API_KEY` / `SEAL_SECRET_ENV` is a `400` naming the key. With `await_credentials: true` (signed with the rest) the container is created once the agent's credential set is stored, 10 seconds after the mint without one, at once when the mint fails (no container then), and after 60 seconds at the latest: the SDK stores the model key there right after the deploy is accepted, and a container created at once would boot before it | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | Source owner mints a brand-new agent for another owner, reusing the source's on-chain iData (dataKey re-sealed to a fresh agentSeal); lands Offline for the new owner to bring online | owner EIP-191, verified against the **live on-chain `ownerOf(source)`** (not a self-declared owner) |
-| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent. A `start` (resume) is `409` unless the agent's current boot ticket was issued for the deployment's sandbox: a sandbox created before AgentDNA 0.4 (no boot ticket, or one without an issue time), or the previous sandbox a reset leaves on the row when its create fails, cannot provision, so the agent needs a reset. A `start` or `stop` whose envelope `resource_id` is not the deployment's current sandbox is `409` too (the API and the worker both check), so a sandbox id kept from before a reset is never started or stopped in the agent's name. A create envelope (a reset, a first-provision `start`, a `retry` with an envelope) whose `env` carries any key but `API_KEY` / `SEAL_SECRET_ENV` is a `400` naming the key, before any job is queued | owner envelope, signature verified against the on-chain owner (`/retry` without an envelope is limited to idempotent attestor-side re-runs, gated by an owner-field match) |
+| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent. A `start` (resume) is `409` unless the agent's current boot ticket was issued for the deployment's sandbox: a sandbox created before AgentDNA 0.4 (no boot ticket, or one without an issue time), or the previous sandbox a reset leaves on the row when its create fails, cannot provision, so the agent needs a reset. A `start` or `stop` whose envelope `resource_id` is not the deployment's current sandbox is `409` too (the API and the worker both check), so a sandbox id kept from before a reset is never started or stopped in the agent's name. A create envelope (a reset, a first-provision `start`, a `retry`) whose `env` carries any key but `API_KEY` / `SEAL_SECRET_ENV` is a `400` naming the key, before any job is queued | owner or appointed operator envelope; `/retry` takes only a create envelope signed by the current owner (`401` without one, whatever the body's `owner` field says; operators are refused). Operator recreation requires `allow_recreate`; each wallet controls its own sandbox |
+| `GET /operator` / `PUT /operator` | Read public grant metadata; appoint, update or revoke the runtime operator with a versioned owner signature. A grant update retires the current boot and queues old-sandbox cleanup | public GET; PUT requires the live NFT owner’s EIP-191 signature; see [operator API](./OPERATORS.md) |
 | `GET /settings?seal_id=0x…` | Owner reads the agent's configuration document and its current `version` (the base for the next write). The document is the owner's, so it is in no public tier — this is the only way to read it. The response also carries `confirmed_version` / `attempts` / `fallback_active`, so a client can tell the owner their last push did not boot, the agent is running the previous document, and pushing again is the retry | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` in `X-Auth-Message`, verified against the **live on-chain owner** |
 | `POST /settings` | Owner writes the agent's ONE configuration document. attestor stores it as an OPAQUE blob — it never parses, validates or logs the contents, so widening the settings vocabulary never touches attestor. Not on chain: configuration is re-suppliable, memory is not. Compare-and-swap: a stale base version is 409 with `current_version`, so a captured request cannot reinstate a superseded document and two clients cannot silently overwrite each other | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<sha256 of the document>` in `X-Auth-Message`, verified against the **live on-chain owner** |
+| `GET /credentials?seal_id=0x…` | Owner reads the agent's credential set (definitions; values only as ciphertext sealed to the agent), its writebacks, and the ownership epoch the next set must be signed for. See `sealed/CREDENTIALS.md` | owner EIP-191 over `AgenticID.Credentials.v1:0x<sealId>:<ts>:0`, verified against the **live on-chain owner**; before the mint, against the owner the deployment row records (the address the mint goes to) |
+| `POST /credentials` | Owner stores a new credential set (EIP-712 `CredentialSet` signed by the owner, checked here: agent, epoch, version, every definition and value hash). Compare-and-swap on the version (409 with `version`, `owner_epoch`); writebacks of entries the new set keeps with `writeback: true` carry over (sealed takes one at boot only while it is bound to the same value or login) | owner EIP-191 over `AgenticID.Credentials.v1:0x<sealId>:<ts>:<base version>:<sha256 of the body>`, verified against the **live on-chain owner**; before the mint, against the owner the deployment row records (the address the mint goes to) |
+| `GET /credentials/pending` | Pending credential-request counts of every agent the signer owns (each checked against its live owner) | owner EIP-191 over `AgenticID.CredentialsPending.v1:<owner>:<ts>` |
+| `GET` / `POST /credentials/notify` | Owner reads or sets (`{"email": … \| null}`) the address it is emailed at when an agent's pending count rises or a credential is about to expire; the response says whether this attestor sends email | owner EIP-191 over `AgenticID.CredentialsNotify.v1:<owner>:<ts>[:<sha256 of the body>]` |
 | `POST /probe` | Synchronous liveness probe; flips unreachable containers to `Failed` and preserved-but-not-running sandboxes to `Stopped` (resumable) | none |
 
 ### Container handshake (agent runtime → attestor)
 
 | Path | Purpose | Auth |
 |---|---|---|
-| `GET /provision?seal_id=…` | Returns `{"generation", "certificate_required"}`: the enabled boot generation (never its ticket), and whether no container key is recorded yet so the next boot must send its certificate. `403 no authorized boot; reset required` without an enabled authorization | public metadata |
+| `GET /provision?seal_id=…` | Returns `{"generation", "certificate_required", "layered"}`: the enabled boot generation (never its ticket), whether no container key is recorded yet so the next boot must send its certificate, and whether this attestor runs the layered flow (`sealed/LAYERS.md` §10) — true once the chain has a trust registry (AgenticID's `trustRegistry()` is not zero). It is false only when AgenticID refuses that call, as one before 1.4.0 does (a revert: JSON-RPC code 3 or "execution reverted"); any other failed read, an error the node answers included, is a 503. The answer is kept for 60 s. `403 no authorized boot; reset required` without an enabled authorization | public metadata |
 | `GET /attestor-tls?provider=0x…` | Relays, byte-identical, the latest statement in which the sandbox provider signs this attestor's TLS SPKI pins (EIP-712 `AttestorTLS`, fetched from the discovered provider's `/api/attestor-tls`). Before serving, the attestor checks the provider signature, the lease (at most 300 s) and that its own TLS key is pinned; it refreshes 60 s before expiry, serves a statement until 15 s before it expires (sealed needs more than 5 s left), and consults sandbox discovery only for that refresh, so a discovery renewal or outage does not hold or fail a request the cache can answer. Each new statement is logged; the api fetches one at startup and logs the result. Unknown provider → 404; no valid statement → 503 with `Retry-After: 5`. Always `Cache-Control: no-store`. sealed pins every later attestor connection to these pins | public |
-| `POST /provision` | Container receives ECIES-encrypted `agentSeal_priv`, owner settings and an opaque per-boot status token (`encrypted_status_binding`, plaintext `{"token":"<64 hex>"}`; only its SHA-256 is stored, beside the settings version and digest actually served). **First boot** sends its v3 certificate (`certificate`: the `SANDBOX_SEAL_ATTESTATION` object, EIP-712 `ImageAttestation` signed by the provider key). The attestor requires the discovered provider instance as signer and scope, an issue time from 300 s before the boot ticket up to now + 300 s, an image in `validFrameworkHashes`, and the key the provider reported for the sandbox this attestor created under the current ticket (`401 certificate is not for the sandbox this attestor created; reset required`), then records container key, image and provider instance. **Later boots** send no certificate: the recorded key must sign the boot claim, the recorded provider instance must still be the discovered one (`403 provider instance no longer trusted; reset required`) and the recorded image still allowed (`401 recorded image_hash not in validFrameworkHashes; reset required`). No record and no certificate → `409 certificate_required`; a certificate for another key → `403 container key differs from record; reset required`. Every request carries the owner-authorized ticket, generation and a container-key boot claim with a strictly newer `boot_started_at`; 409 until create bookkeeping is persisted. Rejected requests never delete containers; a 401/403 for the authorized boot is logged (`provision rejected`), recorded as `last_provision_error` and takes the container stage to `failed` at once (published as `container_failed`), while that generation is current; the next accepted boot or a new container's ticket clears it. Repeated unconfirmed boots fall back to last-known-good (a retry by the same boot is the same attempt) | provider-signed certificate (first boot) or recorded container key + owner-authorized ticket, generation and container-key boot claim |
-| `POST /status` | sealed heartbeat/status (`StatusReport.v2` canonical). Signature covers the status token hash and applied settings digest; one transaction checks the token is the current boot's and updates stage, liveness and exact-version confirmation. Only a `running` / `warning` report whose applied digest equals the digest that boot was served promotes settings. Stale instances are ignored; errors leave settings unchanged. The report's level and reason (`error_detail`) are kept on the row as `container_status` | agentSeal raw-keccak signature + current status token |
+| `POST /provision` | Container receives ECIES-encrypted `agentSeal_priv`, owner settings, the owner's credential set (`encrypted_credentials`: `{document, owner_epoch}` with its writebacks, only for the current ownership) and an opaque per-boot status token (`encrypted_status_binding`, plaintext `{"token":"<64 hex>"}`; only its SHA-256 is stored, beside the settings version and digest actually served). **First boot** sends its v3 certificate (`certificate`: the `SANDBOX_SEAL_ATTESTATION` object, EIP-712 `ImageAttestation` signed by the provider key). The attestor requires the discovered provider instance as signer and scope, an issue time from 300 s before the boot ticket up to now + 300 s, an image in `validFrameworkHashes`, and the key the provider reported for the sandbox this attestor created under the current ticket (`401 certificate is not for the sandbox this attestor created; reset required`), then records container key, image and provider instance. **Later boots** send no certificate: the recorded key must sign the boot claim, the recorded provider instance must still be the discovered one (`403 provider instance no longer trusted; reset required`) and the recorded image still allowed (`401 recorded image_hash not in validFrameworkHashes: the image was retired; reset required`). No record and no certificate → `409 certificate_required`; a certificate for another key → `403 container key differs from record; reset required`. Every request carries the owner-authorized ticket, generation and a container-key boot claim with a strictly newer `boot_started_at`; 409 until create bookkeeping is persisted. Rejected requests never delete containers; a 401/403 for the authorized boot is logged (`provision rejected`), recorded as `last_provision_error` and takes the container stage to `failed` at once (published as `container_failed`), while that generation is current; the next accepted boot or a new container's ticket clears it. Repeated unconfirmed boots fall back to last-known-good (a retry by the same boot is the same attempt). **Layered flow**: a container whose loader started sealed adds `sealed_hash` (`0x` + 64 hex) and signs it into its claim (`ProvisionBoot.v2:…:<sealed hash>`); the trust registry's sealed list must hold it. One it does not hold is a `403` that is noted as `last_provision_error` but does not take the agent offline: sealed moves to the newest listed version and claims again under the same generation. `sealed_hash` on a chain without a trust registry is a `400`. A claim without one (`ProvisionBoot.v1`) is an image without the loader and is served as before (`crates/shared/src/legacy.rs`) | provider-signed certificate (first boot) or recorded container key + owner-authorized ticket, generation and container-key boot claim |
+| `POST /status` | sealed heartbeat/status (`StatusReport.v2` canonical; `StatusReport.v3` appends the count of credential requests waiting for the owner, stored per seal: a rise emails the owner when notifications are configured). Signature covers the status token hash and applied settings digest; one transaction checks the token is the current boot's and updates stage, liveness and exact-version confirmation. Only a `running` / `warning` report whose applied digest equals the digest that boot was served promotes settings. Stale instances are ignored; errors leave settings unchanged. The report's level and reason (`error_detail`) are kept on the row as `container_status` | agentSeal raw-keccak signature + current status token |
+| `POST /credentials/writeback` | Container stores a value it obtained (a rotated refresh token, an MCP login), sealed to its agentSeal key, for the next boot. Accepted only from the current boot, for an entry in the set with `writeback: true` | agentSeal raw-keccak signature over `CredentialWriteback.v2:0x<sealId>:<name>:<binding>:<boot_id>:<keccak256 of the ciphertext>`, `binding` being `value:0x<64 hex>` or `mcp:0x<64 hex>` (`sealed/CREDENTIALS.md`) |
 | `POST /settings/seed` | Container hands back a configuration document recovered from a pre-settings chain role, so it survives a recreate. Seed only, and single-use: it lands only while `settings_version = 0`, and is ignored outright when no sandbox is on record (ghost container — every container this agent ever had holds the agentSeal key) | agentSeal signature over `SettingsSeed:0x<sealId>:<sha256>` |
 
 ### Read / real-time
 
 | Path | Purpose |
 |---|---|
-| `GET /deployments` | List current deployments. With `?owner=` and the owner's signature, your own rows also carry the stages, `sandbox_id`, `last_provision_error` and `container_status` |
+| `GET /deployments` | List current deployments. With `?owner=` and the owner's signature, your own rows also carry the stages, `sandbox_id`, `last_provision_error`, `container_status`, and `migrate` when a published release replaces the agent's image (`version`, `framework`, `until`, `urgent`, `state`: `recommended`, `soon` within 7 days, `overdue`) |
 | `GET /deployment/:seal_id` | Single deployment detail (unauthenticated; never carries the settings document, the container record, or iData retry material). `container_status` (`{level, reason, at}`) is the current container's last `/status` report: `phase` shows a `warning` as `running`, so this is where a running agent that cannot answer (for example, its settings give it no model) shows. It is cleared when a new boot is authorized or accepted, and absent until that boot reports |
 | `GET /agent-seal-pubkey?seal_id=` | The agent's agentSeal public key. The SDK (and this console's Restore/Reset) seal the inference key to it (`SEAL_SECRET_ENV`) so the owner's wallet prompt never shows the key (issue #166). Known seal_ids only; cached per seal, with a small bound on concurrent KMS derivations |
 | `GET /ws/subscribe` | WebSocket event stream (indexer and worker push through the EventBus) |
@@ -317,7 +417,8 @@ known-answer vectors shared with the provider and sealed in
 
 | Contract | Purpose |
 |---|---|
-| **AgenticID** | NFT mint, iData registration, `validFrameworkHashes` allowlist |
+| **AgenticID** | NFT mint, iData registration, the image allowlist `isValidFrameworkHash` (read through the trust registry from 1.4.0), and `trustRegistry()` |
+| **TrustRegistry** | The deployer's trust decisions (AgenticID 1.4.0+, found through its `trustRegistry()`): trusted attestors and code lists by kind — `image`, `sealed`, `harness`. Owned by the environment's Timelock (listing and trusting are scheduled, cancellable operations; mainnet delay 1 day, dev/test 0); a guardian key delists and untrusts at once. `/provision` checks a layered boot's sealed program against the sealed list. The attestor only reads it |
 | **VerifiedFeedbackRegistry** | Verifies ServeProofs — the agentSeal's EIP-191 version-0x00 signature `keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)`, validator = this proxy — and records TEE marks over the canonical ERC-8004 reputation registry. The attestor never writes to it: it serves the address on `GET /config` and injects it into every new container as `VERIFIED_FEEDBACK_ADDR` (`ATTESTOR_VERIFIED_FEEDBACK_ADDR`); its one read is at worker / api startup, where `getIdentityRegistry()` must equal `ATTESTOR_AGENTIC_ID_ADDR` or startup fails |
 | **TappRegistry** | Code-identity and node-signature registry for the three Tapp apps (attestor, 0g-kms, 0g-sandbox-provider), and the EIP-712 `verifyingContract` of the provider's certificate and TLS statement. `/provision` checks the certificate signer and registration scope against authenticated sandbox discovery |
 | **SandboxServing** | Sandbox prepaid balance and voucher settlement. The frontend deploy gate requires owner balance ≥ 0.1 OG |
@@ -387,6 +488,19 @@ Attestor and configured sealed images are released together. `/config.inference_
 | `ATTESTOR_JOB_RETENTION_SECONDS` | Retention for completed and failed jobs, cleaned periodically by the sweep. Default 3600 |
 | `ATTESTOR_INDEXER_START_BLOCK` | Indexer's first-scan start block. Empty falls back to `latest-128` |
 | `RUST_LOG` | Log filter |
+
+### Owner notifications
+
+| env | Meaning |
+|---|---|
+| `ATTESTOR_NOTIFY_RESEND_API_KEY` / `ATTESTOR_NOTIFY_FROM` | Email through Resend's HTTP API. Both set: an owner who registered an address (`POST /credentials/notify`) is emailed when an agent's count of credential requests rises, a week before a credential's `expires_at`, and about agents a release asks to move: once when the release is out and once in the last 7 days of each transition period (hourly sweep). A credential email names the agent and the count, never what the agent wrote. Either blank: no email |
+| `ATTESTOR_NOTIFY_COOLDOWN_SECONDS` | Minimum seconds between two messages about the same agent. Default 600 |
+
+### Releases
+
+| env | Meaning |
+|---|---|
+| `ATTESTOR_RELEASES_FILE` | Path of the release file ([Announcing a release](#announcing-a-release)). Read again when it changes; a file that does not parse is logged and its last good content kept. Blank: no releases |
 
 ### Agent runtime URL composition
 

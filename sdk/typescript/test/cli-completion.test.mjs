@@ -22,9 +22,10 @@ test('L2 /settings model=glm-5.3 narrows to the match', () => {
   assert.deepEqual(hits, ['model=glm-5.3']);
 });
 
-test('L2 /settings bare offers the keys', () => {
+test('L2 /settings bare offers the keys, and versions (the list to pin from)', () => {
   const [hits] = completeLine('/settings ', L2);
-  assert.deepEqual(hits.sort(), ['model=', 'others=', 'provider=', 'thinking='].sort());
+  assert.deepEqual(hits.sort(), ['harness=', 'model=', 'others=', 'provider=', 'sealed=', 'thinking=', 'versions'].sort());
+  assert.deepEqual(completeLine('/settings ve', L2)[0], ['versions']);
 });
 
 test('L2 /settings thinking= offers the trio', () => {
@@ -85,4 +86,14 @@ test('hostOf: hostname out of a URL, graceful on garbage', () => {
   assert.equal(hostOf('https://agentdna.0g.ai/'), 'agentdna.0g.ai');
   assert.equal(hostOf(undefined), 'unset');
   assert.equal(hostOf('not a url'), 'not a url'.slice(0, 24));
+});
+
+test('L1: after `cred <agent>` the second word completes the subcommand, not another agent', () => {
+  const L1c = { completions: ['cred '], args: { cred: () => ['532', '531', 'pending', 'notify ', 'presets'] }, models: MODELS };
+  assert.deepEqual(completeLine('cred 5', L1c)[0], ['532', '531']);
+  const [hits, word] = completeLine('cred 532 app', L1c);
+  assert.deepEqual([hits, word], [['approve '], 'app']);
+  assert.ok(completeLine('cred 532 ', L1c)[0].includes('presets'));
+  // Past the subcommand nothing is offered (names, ids, k=v are free-form).
+  assert.deepEqual(completeLine('cred 532 approve 0x', L1c)[0], []);
 });

@@ -97,7 +97,7 @@ contract CloneGateTest is AgenticIDTestBase {
         gate = CloneGate(address(proxy));
         // The gate mints through registerWithSeal, so it must be allowlisted.
         vm.prank(owner);
-        agenticId.addTrustedAttestor(address(gate));
+        trustRegistry.addTrustedAttestor(address(gate));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

@@ -18,8 +18,9 @@ import {MainnetGovernance} from "./MainnetGovernance.sol";
 ///         Env vars: AGENTIC_ID (existing proxy), TIMELOCK (beacon owner; on 0G
 ///         mainnet (16661) it must have minDelay >= 86400).
 ///
-///         Post-deploy (AgenticID owner, one tx): addTrustedAttestor(proxy) —
-///         the gate mints through registerWithSeal.
+///         Post-deploy (TrustRegistry owner, one tx): trust the proxy —
+///         addTrustedAttestor(proxy), or bindTrustedAttestorApp once instance
+///         binding is required; the gate mints through registerWithSeal.
 contract DeployCloneGate is Script {
     function run() external returns (address impl, address beacon, address proxy) {
         address agenticId = vm.envAddress("AGENTIC_ID");
@@ -44,6 +45,6 @@ contract DeployCloneGate is Script {
         console2.log("CloneGate beacon:", beacon);
         console2.log("CloneGate proxy: ", proxy);
         console2.log("StandardCloneAuthorizer:", address(std));
-        console2.log("REMINDER: AgenticID owner must addTrustedAttestor(proxy)");
+        console2.log("REMINDER: the TrustRegistry owner must trust the proxy (addTrustedAttestor / bindTrustedAttestorApp)");
     }
 }

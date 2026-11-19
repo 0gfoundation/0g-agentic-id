@@ -27,17 +27,20 @@ if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
 
 // ── Facade + namespaces ──
 export { AgenticID as AgentDNA, AgenticID, AgentApi, AdminApi, ReputationApi } from './AgenticID';
-export type { ContainerStatus, DeployAccepted, WaitLevel } from './AgenticID';
+export type { ContainerStatus, DeployAccepted, WaitLevel, ModelKeyLifecycleOpts } from './AgenticID';
+export { fetchReleases, releaseNoticeOf, agentMigrationOf } from './Releases';
+export type { ReleaseNotice, ReleaseMigration, AgentMigration, MigrationState } from './Releases';
 export { makeAgentClient } from './AgentClient';
 export type {
   AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask,
-  AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
+  AgentActivityInfo, AgentActivityStop, AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
+  ChatImage, ChatNotice, UploadedFile, SteerResult, AgentSession, SessionPromptResult, HarnessTask, HarnessTaskState, HarnessTaskRecord, HarnessTaskSummary, HarnessTaskFeedEvent, CreateTaskOptions, TaskInputResult, SteerState, AgentFile, AgentFileDir,
 } from './AgentClient';
-export { mcpServices } from './AgentClient';
+export { mcpServices, withImages } from './AgentClient';
 export { defaultIData, DEFAULT_PERSONA_INFERENCE, deploymentFactsOf, needsDefaultSettings, storeDefaultSettings } from './AttestorClient';
 export type { DeploymentFacts } from './AttestorClient';
 export type { DefaultIDataParams } from './AttestorClient';
-export type { AgenticIDConfig as AgentDNAConfig, AgenticIDConfig } from './context';
+export type { AgenticIDConfig as AgentDNAConfig, AgenticIDConfig, CredentialMarkRecord } from './context';
 
 // ── Namespace implementation classes (advanced / typing) ──
 export { SandboxClient } from './SandboxClient';
@@ -46,6 +49,8 @@ export type { IntelligentDataResult } from './AgenticIDClient';
 export { ReputationClient, MAX_ABS_FEEDBACK_VALUE } from './ReputationClient';
 export { AttestorClient, CLONE_DOMAIN, CLONE_CONTRACT_DOMAIN, DEPLOY_DOMAIN, b64encode } from './AttestorClient';
 export type { CloneParams, DeployParams, IDataInput, DeployCloneResponse } from './AttestorClient';
+export { OPERATOR_DOMAIN, OperatorConflictError, OperatorCheckpointSupersededError } from './Operators';
+export type { OperatorState, OperatorOptions, OperatorCheckpoint, RuntimeBinding } from './Operators';
 // Sealed secret env (issue #166): the inference key sealed to the agent's
 // agentSeal key instead of riding the signed envelope in clear.
 export { SECRET_ENV_SCHEME, SECRET_ENV_VAR, SecretEnvRefusedError, sealSecretEnv } from './secretEnv';
@@ -64,8 +69,38 @@ export {
   sha256Hex,
   modelAdvisory,
   fetchRouterModelIds,
+  versionPicksProblem,
 } from './Settings';
-export type { SettingsDoc, ThinkingLevel } from './Settings';
+export type { SettingsDoc, ThinkingLevel, VersionPicks } from './Settings';
+export {
+  CredentialsApi,
+  CredentialsConflictError,
+  CredentialsUnverifiedError,
+  credentialSetTypes,
+  approvalTypes,
+  definitionOf,
+  inputOf,
+  credentialPlaintext,
+  modelKeyName,
+  MODEL_KEY_PREFIX,
+  CREDENTIALS_DOMAIN_NAME,
+  CREDENTIALS_DOMAIN_VERSION,
+} from './Credentials';
+export type {
+  CredentialSigner,
+  CredentialMCP,
+  CredentialInput,
+  CredentialDefinition,
+  CredentialDocument,
+  CredentialPosition,
+  TokenRequestTemplate,
+  PendingCredentialRequest,
+  CredentialInference,
+  ModelKeyInUse,
+  ModelKeysView,
+  LoadedCredentials,
+  SealedModelKey,
+} from './Credentials';
 
 // ── Reputation: serve-proof transport + verification ──
 export {
@@ -86,8 +121,13 @@ export {
   buildServeProof,
   signServeProof,
   verifyServeProofSignature,
+  serveProofLayers,
+  SERVE_PROOF_VERSION,
+  SERVE_PROOF_V2_TAG,
 } from './ServeProof';
-export type { BuildServeProofHashParams, BuildServeProofSigningHashParams } from './ServeProof';
+export type { BuildServeProofHashParams, BuildServeProofSigningHashParams, ServeProofLayers } from './ServeProof';
+export { TRUST_KINDS, trustRegistryOf, isListed, listedHashes } from './TrustRegistry';
+export type { TrustKind } from './TrustRegistry';
 export { taskHashOf, requestUriOf, requestUriCandidates } from './taskHash';
 
 // ── Types ──
@@ -97,12 +137,14 @@ export type {
   Feedback,
   FeedbackSummary,
   ServeData,
+  ServeLayers,
   GiveFeedbackParams,
   GiveFeedbackResult,
   TaskReveal,
   AppendResponseParams,
   ReadAllFeedbackParams,
   GetSummaryParams,
+  SignatureRecord,
 } from './types';
 
 // ── Constants ──
@@ -120,6 +162,7 @@ export type { ContractAddresses } from './constants';
 // ── ABIs (advanced usage) ──
 export {
   agenticIDAbi,
+  trustRegistryAbi,
   cloneGateAbi,
   standardCloneAuthorizerAbi,
   canonicalReputationAbi,
@@ -129,5 +172,5 @@ export {
   sandboxServingAbi,
 } from './abi';
 
-export { listInferenceProviders, inferenceProvider, routeHash } from './Providers';
+export { listInferenceProviders, inferenceProvider, providerWebSearch, routeHash } from './Providers';
 export type { InferenceProvider, InferenceFormat, InferenceModel, ProviderRegistrySnapshot, ProviderRegistryPin } from './Providers';

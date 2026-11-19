@@ -97,6 +97,8 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		AttestorURL:         rt.AttestorURL,
 		PublicURL:           rt.PublicURL,
 		SealSignSock:        rt.SealSignSock,
+		CredSock:            rt.CredSock,
+		CredRevealSock:      rt.CredRevealSock,
 		Provider:            provider,
 		Model:               model,
 		ZGComputeRouted:     rs.Endpoint != nil && provider == "0g-compute",
@@ -591,7 +593,7 @@ func gatewayEnv(apiKeyEnv, inferenceKey, apiServerKey string, rt framework.Runti
 	if rt.AgentSeal != "" {
 		envWhitelist = append(envWhitelist, "AGENT_SEAL="+rt.AgentSeal)
 	}
-	return envWhitelist
+	return append(envWhitelist, rt.CredentialEnv()...)
 }
 
 // waitForListen polls TCP-connect to addr until success or timeout.

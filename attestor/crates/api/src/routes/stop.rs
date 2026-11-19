@@ -3,9 +3,10 @@
 //! 0g-sandbox at `POST /api/sandbox/:id/stop`. A stop signed for a sandbox
 //! other than the deployment's is refused with 409.
 
-use super::lifecycle_auth::authorize_lifecycle;
+use super::lifecycle_auth::authorize_runtime_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use attestor_shared::auth::operator::LifecyclePermission;
 use attestor_shared::sandbox::{
     envelope_names_sandbox, CanonicalSignedMessage, NOT_CURRENT_SANDBOX,
 };
@@ -42,13 +43,6 @@ pub async fn handle(
         )));
     }
 
-    // Real owner authorization — same gate as /start, /reset and
-    // /retry-with-envelope: the envelope must be signed by the current
-    // on-chain owner. The previous `req.owner == d.owner` check trusted an
-    // unsigned, attacker-supplied field and was forgeable — see
-    // {lifecycle_auth}.
-    authorize_lifecycle(&state, &d, &req.sandbox_envelope).await?;
-
     // The provider stops the sandbox the owner signed for (`resource_id`),
     // while the worker records the deployment's sandbox as stopped and
     // disables its status binding. A stop signed for another sandbox would
@@ -57,6 +51,9 @@ pub async fn handle(
     if !envelope_names_sandbox(&req.sandbox_envelope, d.sandbox_id.as_deref()) {
         return Err(ApiError::conflict(NOT_CURRENT_SANDBOX));
     }
+
+    authorize_runtime_lifecycle(&state, &d, &req.sandbox_envelope, LifecyclePermission::Stop)
+        .await?;
 
     state
         .jobs
@@ -79,7 +76,7 @@ mod tests {
         MockChain,
     };
     use attestor_shared::{
-        derive_phase, Config, Deployment, DeploymentRepo, JobPayload, SealId, StageStatus,
+        derive_phase, Config, Deployment, JobPayload, SealId, StageStatus,
     };
     use chrono::Utc;
     use std::sync::Arc;
@@ -122,6 +119,7 @@ mod tests {
 
             cli_latest: String::new(),
             cli_notes: String::new(),
+            releases_file: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             frameworks: vec![attestor_shared::Framework {
@@ -232,6 +230,8 @@ mod tests {
             chain,
             sandbox: Arc::new(attestor_shared::mocks::MockSandbox),
             deployments,
+            credentials: attestor_shared::credentials_repo::in_memory(),
+            notify: None,
             idempotency,
             jobs: jobs.clone(),
             events,

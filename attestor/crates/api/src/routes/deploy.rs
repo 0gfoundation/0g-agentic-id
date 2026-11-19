@@ -51,7 +51,13 @@ pub async fn handle(
     // Preflight the owner's two prerequisites (trust-roots ack + prepaid
     // sandbox balance) HERE, with request context — otherwise the failure
     // surfaces minutes later as an async worker 402 nobody can attribute.
-    super::preflight::check_owner_ready(&state, req.owner).await?;
+    if req.sandbox_envelope.is_some() {
+        super::preflight::check_owner_ready(&state, req.owner).await?;
+    } else {
+        // Mint-only owners may delegate compute to an operator later. They
+        // acknowledge trust roots without funding a sandbox account.
+        super::preflight::check_owner_trust_ready(&state, req.owner).await?;
+    }
 
     tracing::info!(owner = %req.owner, key = %req.idempotency_key, n_idata = req.i_data.len(), framework = %framework, "deploy request");
 
@@ -144,6 +150,8 @@ pub async fn handle(
             description: req.description.clone(),
             image: req.image.clone(),
             sandbox_envelope: req.sandbox_envelope.clone(),
+            // Waiting for a set only matters to a container about to boot.
+            await_credentials: req.await_credentials && req.sandbox_envelope.is_some(),
         })
         .await?;
     tracing::info!(?seal_id, "DeployJob enqueued");

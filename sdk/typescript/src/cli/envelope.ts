@@ -15,6 +15,7 @@
  */
 
 import type { CliError } from './errors';
+import { fitLines, termWidth } from './textfit';
 
 /** JSON.stringify replacer: bigint → decimal string. */
 export function bigintReplacer(_key: string, value: unknown): unknown {
@@ -40,18 +41,21 @@ export function emitError(err: CliError, json: boolean): number {
     if (err.details !== undefined) error.details = err.details;
     process.stdout.write(JSON.stringify({ ok: false, error }, bigintReplacer) + '\n');
   } else {
-    process.stderr.write(`error (${err.code}): ${err.message}\n`);
-    if (err.remedy) process.stderr.write(`  fix: ${err.remedy}\n`);
+    const w = termWidth(process.stderr);
+    process.stderr.write(`${fitLines(`error (${err.code}): ${err.message}`, w)}\n`);
+    if (err.remedy) process.stderr.write(`${fitLines(`  fix: ${err.remedy}`, w)}\n`);
   }
   return err.exitCode;
 }
 
-/** Human-facing note/progress line — always stderr, never stdout. */
+/** Human-facing note/progress line — always stderr, never stdout; on a
+ *  terminal, wrapped between words at its width (textfit.fitLines). */
 export function note(message: string): void {
-  process.stderr.write(message + '\n');
+  process.stderr.write(fitLines(message, termWidth(process.stderr)) + '\n');
 }
 
-/** Human-mode data line (tables, check lists …) — stdout, non-JSON mode only. */
+/** Human-mode data line (tables, check lists …) — stdout, non-JSON mode
+ *  only; on a terminal, wrapped between words at its width. */
 export function print(line: string): void {
-  process.stdout.write(line + '\n');
+  process.stdout.write(fitLines(line, termWidth()) + '\n');
 }

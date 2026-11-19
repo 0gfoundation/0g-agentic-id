@@ -14,7 +14,7 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 | attestor | sandbox 起来后向 attestor 发起 RA，换 `agent_seal_priv`。详见 [`attestor/`](../attestor/README.zh.md) |
 | AgenticID 合约 | 读 `intelligentDatasOf` / `sealedKeysOf`、签 `update` tx 把演化推上链 |
 | 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 下载，通过同一 client 的 Go SDK 在进程内上传（`internal/dataplane/upload.go`），签名密钥从不离开 sealed |
-| agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、0g-harness（`main.go:118-121`）；链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
+| agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、0g-harness（`adapters.go`）；0g-harness 镜像用 `harnessonly` 标签编译 sealed，只带它自己的 adapter（`adapters_harnessonly.go`）。链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
 
 本文档讲**当前代码里实际跑的形态**和**为什么这么分**。
 
@@ -68,7 +68,7 @@ gate     privsep          privsep.Required：框架将以 `agent` 用户运行�
                           ↓
 Phase 1  provision        GET /provision（generation、certificate_required）→
                           POST /provision：用容器密钥签名的 boot claim，仅在需要时
-                          附带证书；以退避（1 秒起翻倍到 30 秒）重试，直到 PID 1
+                          附带证书；以退避（1 秒起翻倍到 30 秒）重试，直到 sealed
                           启动后 10 分钟 → 用同一把容器密钥 ECIES 解出响应里的载荷：
                             · agent_seal_priv            （缺了是致命的）
                             · 本次启动的 status 凭据      （缺了是致命的）
@@ -122,6 +122,59 @@ ECIES 加密给容器，状态、心跳和版本确认在同一数据库事务�
 `repo.rs::apply_status_report`）。不带凭据的报告会被拒绝，sealed 也从不发送。本版
 sealed 要求配套的 provider 和 attestor（v3 证书、attestor TLS 声明、上面的
 `/provision` 形状）；所有 agent 都要重建到它上面。
+
+### 加载器（0g-harness 镜像）、停机和分层运行
+
+0g-harness 镜像里的 PID 1 不是 sealed，而是加载器（`cmd/loader`）；镜像不带 sealed 程序
+（`images/harness/Dockerfile`）。每次启动，加载器向 `CHAIN_RPC_URL` 发 `eth_call` 读信任合约的
+sealed 名单（先读 AgenticID 的 `trustRegistry()`，再读信任合约的 `listed(SEALED)` 和
+`isListed(SEALED, 哈希)`，`allowlist.go`），选上次跑的版本（还在名单里、在这里没失败过），
+否则选它换下来的版本，再否则按名单从新到旧选（`supervise.go` 的 `choose`）。没有的版本按哈希
+从制品发布处下载（`fetch.go`；不超过 64 MiB，哈希对上名字才留下；对不上的，这个容器里不再
+下载）。执行前一刻核对程序哈希；链上明确答"在"的版本才执行；名单读不到，或者名单里没有能在
+这里跑的版本时，什么都不执行，过 30 秒起、加倍到 5 分钟后再读名单。它把 sealed 作为子进程启动，
+环境变量原样传下去，另加 `SEALED_HASH`（它核对过的哈希）和 `SEALED_TRIAL`（试运行）；转发
+SIGTERM、SIGINT、SIGQUIT 和 SIGHUP；收到停止信号后 sealed 2 分钟内没退出就杀掉；回收所有孤儿
+进程。这个容器里还没起来过的版本都以试运行方式启动，新容器的第一个版本也是：没确认起来就退出、
+或者 20 分钟内没确认的，记下它在这里失败，启动下一个版本。它还按 sealed 的请求（SIGUSR1）换
+sealed 版本，前提是链上列着新版本，换之前清掉旧 sealed 留下的进程（`LAYERS.zh.md` 第 3 节、
+3.1）。sealed 自己退出时重启它，10 分钟内最多 5 次；退出码 76（owner 重启 sealed）立即重启、
+不计次数，退出码 69（因为版本以外的原因起不来）过 30 秒起、加倍到 5 分钟后再启动同一个版本，
+不算在这个版本头上。它的状态目录是 `/var/lib/loader`（只有 root 能进）。它和 sealed 一样是
+root、不可 dump、设置 `no_new_privs`，只链接标准库和 `golang.org/x/sys`
+（`TestLinkedPackages`）。其他镜像里 sealed 仍是 PID 1。
+
+加载器启动的 sealed（设了 `SEALED_HASH`）只在 attestor 声明分层流程时才在 `/provision`
+申请；否则什么都不申请，以 69 退出（`internal/provision` 的 `LayeredRequired`）。
+
+不是 PID 1 的 sealed 会处理 SIGTERM 和 SIGINT（`shutdown.go`）：停下监视器，停掉框架
+（之后不再重启它），等监视器手上那一轮跑完，然后以 0 退出，总共不超过 90 秒。它不另起
+提交：平台发出停止信号约 10 秒后就杀掉容器，一次 0G 存储上传就可能用掉大半。最后一次提交
+之后的改动留在磁盘上：sealed 在 `/var/lib/sealed/synced.json`（只有 root 能读写）记着
+这个容器每个角色最后和链上一致的版本，下次启动时链上没变而磁盘变了，就保留磁盘上的，由
+监视器提交，不拿链上版本覆盖（`synced.go`；只对声明了 `framework.UncommittedKeeper` 的
+adapter，即 0g-harness）。重建容器只留下链上的 iData。作为 PID 1 时 sealed 不处理这些
+信号，行为和以前一样。
+
+0g-harness 的 harness 只从官方版本包运行：sealed 按哈希从制品发布处下载，解开到
+`/opt/0g-harness/<sha256>/`，root 所有，agent 只能读和执行（`internal/layers`）；镜像不带包。只要
+sealed 知道 provider 的 endpoint，它的模型调用就经 sealed 的推理代理（`internal/inferproxy`），
+native 的 `openai` 和 `anthropic` 也一样，用 sealed 固定的官方地址
+（`inference.NativeEndpoint`）：sealed 定地址和模型名，把平台
+说明放进每个请求的系统提示末尾，key 由凭证代理代填，harness 拿到的是占位值。owner 经
+`/_seal/auth` 拿到的令牌不是 harness 校验的那个，proxy 在入口核对后换掉；harness 的路由
+逐条列出（`framework.Route.Endpoints`）；它可以经签名 socket 请求重启
+（`POST /harness/restart`），owner 可以经 `POST /_seal/restart` 重启 harness 或 sealed
+（`ownerrestart.go`）。签名 socket 拒签发往 AgenticID `update` 或 `updateAt` 的交易，
+并把每个签名和拒绝记下来给 owner（`/_seal/signatures`）；各 socket 把端点作为 MCP 工具提供
+（`POST /mcp`，`internal/sealmcp`），由 harness 注册成原生工具。这两项都由 adapter 声明
+（`framework.SigningRules`、`framework.RuntimeTools`），只有 0g-harness 声明。它上传的每个 iData 条目都带加盐的明文承诺
+（`internal/uploader/commitments.go`）。attestor 声明分层流程后，sealed 上报自己的哈希、
+签 ServeProof v2，并在开机、每次设置推送和每次心跳时按规则换 harness 和 sealed：owner 在
+设置文档 `versions` 里选的版本（信任合约列着时），否则保持正在跑的版本，它被下架时换到最新
+登记的版本（`layered.go`）。开机时 harness 依次退到这个容器上次跑的包、名单里从新到旧的包；
+一个能跑的都没有时，sealed 以 69 退出，由加载器过一阵再启动它。
+完整设计见 `LAYERS.zh.md`。
 
 ### settings document 为什么走 `/provision`
 
@@ -199,6 +252,7 @@ sealed/
 │   ├── manager/                  agent 进程生命周期 + 监工
 │   ├── uploader/                 drift → 0g-storage upload + 签名 chain.Update
 │   ├── watcher/                  30s tick 跑 EvolutionFor、触发 uploader.Apply
+│   ├── sealmcp/                  把 agent socket 的端点作为 MCP 工具提供（socket 上的 POST /mcp）
 │   └── proxy/                    :8080 反向代理 + 签名 + 日志页
 ├── Dockerfile                    实际发布的 openclaw sealed 镜像（0g-sealed）：images/openclaw/ base 上加 bootstrap 二进制
 ├── images/openclaw/              openclaw base 镜像构建脚本（独立产物，跟 sealed bootstrap 镜像分层）
@@ -481,7 +535,7 @@ adapter 同时把自家那份摘掉了，理由见 §5（"什么是 iData，什�
 | openclaw（`openclaw.go:164`） | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `openclaw.json` |
 | hermes（`hermes.go:143`） | `framework`、`SOUL.md`、`memories/`、`skills/` | `config.yaml` |
 | prime-agent（`prime.go:162`） | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `models.json` |
-| 0g-harness（`harness.go:167`） | `framework`、`APPEND_SYSTEM.md`、`skills/` | `settings.yaml` |
+| 0g-harness（`harness.go:208`） | `framework`、`APPEND_SYSTEM.md`、`skills/`、`memory/`、`memory-public/` | `settings.yaml` |
 
 四个都收敛成同一个形状 —— *binding + persona + memory + skills* —— 这个形状以前被
 各框架的配置文件挡住了。
@@ -516,14 +570,17 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 | `/_seal/settings` | **owner 钱包** | `GET` 返回当前生效的 document；`POST` 换掉它、重渲染、重启 framework 进程。两者都要 owner 签名，且比对的是**链上实时** owner；`POST` 的签名还额外绑定 body 的 sha256 —— 否则签名只证明"谁在调用"，中途能改请求的人就能保着有效签名替换掉 document。这是热路径：换 model、换 thinking level 不用再重建容器。不持久：owner 的 document 仍在 attestor 手里，下次开机恢复回去（`internal/proxy/settings.go:40-53`）|
 | `/_seal/claim` | **owner 钱包** | 占单驾驶座（tag `0GSealClaim`，与设置推送一样绑定 body 摘要）；被挤下的客户端实例下一次驾驶请求得到 409。只在 proxy 内存里——重启即清空座位（`internal/proxy/occupancy.go`） |
 | `/_seal/clear` | **owner 钱包** | 清掉 agent 唯一的持久化对话并重启框架进程（tag `0GSealClear`，占座门控）；框架不在服务端保留历史时答 501（`CONVERSATION.zh.md`） |
+| `/_seal/credentials*`、`/_seal/oauth/callback` | **owner 钱包**；回调来自 owner 的浏览器 | owner 给 agent 的凭据：加载签名凭据集、列出、处理待办、读取使用记录、发起 MCP 登录；回调完成登录。与凭据代理、凭据 socket 和根证书一起提供（[CREDENTIALS.zh.md](CREDENTIALS.zh.md)） |
+| `/_seal/signatures` | **owner 钱包** | 只有 0g-harness（`framework.SigningRules`；其他框架返回 404）：签名 socket 签过和拒绝过什么（tag `0GSealSignatures`，`?after=<seq>`），每个签名或拒绝一条记录，带能认出它的信息（消息的哈希和开头、typed data 的 digest 和 domain、交易的哈希、链、目标、金额、nonce 和方法选择器），保留最近 1000 条，sealed 重启后仍在（`internal/proxy/signlog.go`） |
 | `/_seal/compact` | **owner 钱包** | 立刻对这份对话运行框架自己的压缩，不重启（tag `0GSealCompact`，占座门控）：同一时间只跑一个、一条签名消息只接受一次、与 synth 门上的一轮永不重叠——每种拒绝都答 409；adapter 无法触发框架的压缩时答 501——没实现 `SessionCompactor`，或已安装的版本缺少它要调用的东西（openclaw 2026.7.1 之前没有 `sessions compact` 这条 CLI 命令）（`internal/proxy/compact.go`、`CONVERSATION.zh.md`） |
+| `/_seal/restart` | **owner 钱包** | 重启 harness（`{"layer":"harness"}`）或 sealed 本身（`{"layer":"sealed"}`，由加载器重新启动）——tag `0GSealRestart`，占座门控，一条签名消息只接受一次，先答 202 再重启。只对运行 harness 包的 adapter（0g-harness）；重启 sealed 还要求分层流程，并且这次启动已经确认起来（启动中答 503）；其他情况答 501（`internal/proxy/ownerrestart.go`、`ownerrestart.go`） |
 | `/v1/*` | 用户、owner | framework chat API，反代到 gateway(bearer 鉴权;响应一律不带 proof 签名——这是 owner↔agent 的操控通道);未声明的路径一律 404——没有 catch-all 转发 |
 | `/api/*` | 外部调用方 | agent 注册的服务(精确路径,经 sign socket 的 `/services` 注册),反代到 agent 的 loopback backend;响应先缓冲再带 proof 签名(`X-Agent-Proof`),backend 发 SSE 也一样 |
 | `/v1/responses*` | owner | 长任务面(OpenAI Responses 子集):turn 归属服务端 id、断线不死、`starting_after` 续播、`POST /{id}/cancel` 停止。框架声明了 `kind:"responses"` 路由时由其 bridge 原生提供(prime、0g-harness),否则由 sealed proxy 在框架自身 chat API 之前**合成**(openclaw、hermes)——见 `internal/proxy/responses.go` |
-| `/v1/inbox`、`/v1/events`、`/v1/tasks`、`/v1/schedules` | owner | 仅 0g-harness(声明为 kind `inbox` / `events` / `tasks` / `schedules`):agent 自己开的 turn 说的话(后台任务结束、提醒到点)、可续接的实时事件流(turn、任务、inbox、提醒的变化)、每个 turn / 后台命令 / subagent 及其执行者,以及 agent 设的提醒。其他框架都不声明,SDK 只在声明了的 agent 上提供这些方法(`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
+| `/v1/inbox`、`/v1/events`、`/v1/activities`、`/v1/tasks`、`/v1/task-feed`、`/v1/schedules`、`/v1/files`、`/v1/memory`、`/v1/steer`、`/v1/sessions` | owner | 仅 0g-harness(声明为 kind `inbox` / `events` / `activities` / `tasks` / `task-feed` / `schedules` / `files` / `memory` / `steer` / `sessions`):agent 自己开的 turn 说的话(后台任务结束、提醒到点)、可续接的实时事件流(turn、活动、inbox、提醒的变化)、每个 turn / 后台命令 / subagent 及其执行者(`/v1/activities`)、owner 的任务(照 zgh 的任务模型:一件有自己会话和工作区、以结果记录收尾的工作)及其变化的事件流、owner 的其他会话、agent 设的提醒,以及把文件上传到 agent 的文件收件箱 `~/inbox`(不是消息收件箱 `/v1/inbox`)、下载或删除 agent 放进 `~/outbox` 的文件(或 `~/inbox` 里 owner 自己的文件),按需整理一次长期记忆(`POST /v1/memory/tidy`),以及 owner 给正在运行的那一轮的话(`POST /v1/steer`,在这一轮下一次调用模型之前读到;没有 owner 的轮次在运行时作为普通轮次排队)。其他框架都不声明,SDK 只在声明了的 agent 上提供这些方法(`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
 | `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
 | `/log/agent` + `/log/agent.html` | 运维 | agent 子进程的 stdout/stderr（实时）;路径经 adapter 的 `SubprocessLogPath()` 解析。`/log/openclaw`（`.html`）作为 legacy 别名保留 |
-| `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名；永不签裸 hash，也永不签 EIP-191 version `0x00` —— serve-proof 所在的域，见下）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）+ `/settings`（agent 自己提配置变更 —— 见下）|
+| `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名；永不签裸 hash，也永不签 EIP-191 version `0x00` —— serve-proof 所在的域，见下）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）+ `/settings`（agent 自己提配置变更 —— 见下）+ `/harness/restart` 和 `/mcp`（只有 0g-harness：重启 harness，以及把上面这些端点和凭据 socket 的端点作为 MCP 工具提供；取值 socket 自己提供它的工具）|
 
 带 proof 签名的只有三处:`/hello`、`/_seal/auth` 和 agent 注册的 `/api/*`
 服务——而且只在 `VERIFIED_FEEDBACK_ADDR` 可用且锚定(它的 `getIdentityRegistry()`
@@ -554,7 +611,10 @@ sign socket 是 sealed 跟外界（其实是同容器的 agent 进程）的关�
 serve-proof 正是签在这个 `0x00` 域里、绑定 VerifiedFeedbackRegistry，
 所以 agent 经 socket 签出的任何东西都验不成 serve-proof（审计
 FIND-01；见 `internal/proxy/sign.go` 文件头，由 `sign_test.go` 钉死）。
-在这几种形状之内，socket 只是传输层 —— **拒绝逻辑在 agent 侧由
+在这几种形状之内，socket 只是传输层；0g-harness（`framework.SigningRules`）例外：
+socket 拒签发往 AgenticID `update` 或 `updateAt` 的交易，这是 drift watcher 的通道
+（`internal/proxy/signrules.go`），并把签出的每个签名和拒绝的每个请求记下来给 owner
+（`internal/proxy/signlog.go`、`/_seal/signatures`）—— **拒绝逻辑在 agent 侧由
 SOUL.md 的拒绝规则约束**（任何来自外部 prompt 的 sign 请求都要拒，
 不靠"用人话描述待签内容" 这种容易被身份钓鱼骗过的启发式）。详见
 `internal/framework/openclaw/soulmd.go`。
@@ -656,17 +716,31 @@ sandbox 对账（见 attestor README）：sandbox 处于 started 但 `/healthz` 
 包括 agentSeal 钱包没 gas（gas 不足 → `chain.Update` tx 进不去 → Apply
 失败），所以钱包余额这种事也归它管。
 
-Apply 的三种结果对应三种 severity：
+提交失败从不报 `error`：agent 本身在运行、能应答，只是最新的数据还没上链；报
+`error` 会让 attestor 把它显示为离线（容器阶段失败），CLI 也就不让聊天。Apply 的结果：
 
-| Apply 结果 | severity | 上报时机 | 失败计数 |
+| Apply 结果 | 状态 | 上报时机 | 失败计数 |
 |---|---|---|---|
-| **成功**（drift 上链了，或无 drift）| `running` | 不立刻上报，等 runHeartbeat 复读 | 累计错误清零 |
-| **失败，owner-recoverable** —— 典型：agentSeal 钱包没 gas、API key 配错、provider rate limit | `warning` | 第一次出现**立刻**上报，不等心跳 | **不**累加（这不是系统故障，是 owner 自己得处理的事）|
-| **失败，系统级** —— 典型：0g-storage 上传超时、RPC 异常、indexer 不可达 | `error` | 累计 **5 次连续** Apply 失败才升级到 error 上报，避免单次网络抖动误判 | 累加，恢复后清零 |
+| **成功**（drift 上链了，或无 drift）| `running` | 状态变回时上报 | 清零；重试退避重新开始 |
+| **失败，owner 能处理** —— 典型：agentSeal 钱包没 gas | `warning`，"agent data not committed to chain: …" | **立刻** | 计数 |
+| **失败，其他** —— 典型：0g-storage 上传超时、RPC 异常、indexer 不可达 | `warning`，"agent data not committed to chain (N attempts): …" | **连续 5 次**失败后，避免单次网络抖动显示出来 | 计数 |
 
-`status.go::severityOf` 是把具体 error 字符串翻译到这三种 severity 的分类器
-（认 "insufficient funds" → `warning`、"connection refused" → `error`、etc.）。
-分类失败兜底 `error`。
+`status.go::severityOf` 把 owner 能处理的原因（"insufficient funds"、seal 钱包自己
+那笔交易不带数据的回滚）和其他原因分开；`commitretry.go::commitFailureStatus`
+把两者都变成 warning。每次失败都会拿 seal 钱包核对（`fundsShortfall`）：余额不够
+失败那一步按当前 gas 价格要付的 gas（存储上传按 45 万、update 按 35 万，取 Galileo
+上测到的最大值再往上取整），就立刻按钱不够处理，warning 里写出钱包地址和两个金额
+（"the agent's wallet 0x… has 0.10 OG, about 0.90 OG is needed for its next
+transaction"）。这既覆盖错误里没说原因的失败，也替换掉 "insufficient funds" 错误自带
+的金额——那是存储费（几个 wei），不是一次提交要花的钱。读不到余额时仍按错误本身分级。
+
+重试会退避（`commitretry.go`）：同一份内容连续失败 n 次后，下次尝试等 30 秒·2^(n-1)，
+最多 30 分钟；有新内容要提交时下一个 tick 就试，成功后重新开始。重试只上传失败的那次
+还没传的部分（`internal/uploader/pending.go`）：后面的上传或 update 失败之前已经传上去
+的 blob 会被复用，链上还没有的角色沿用当时生成的 data key，所以每个 blob 只付一次钱。
+内容回到本次启动中较早一次提交时的样子（加了一条记忆又删掉、改动被撤回）时，提交引用
+当时上传的 blob（同一个 data key，条目换了路径也一样，`internal/uploader/uploaded.go`），
+只发 update。两者都只记在本次启动的内存里。
 
 ### `runHeartbeat` 的 5min ticker
 

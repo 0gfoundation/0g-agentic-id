@@ -12,6 +12,14 @@
 //                Reputation.t.sol pins the inner hash only — deprecated fork)
 //   - sealed:    TestServeProofDigest_KnownAnswerVector (serveproof_test.go)
 // and test/serveproof.test.mjs repeats them under `npm test`.
+// v2 (sealed/LAYERS.md §7) adds sealedHash 0x55…55, harnessHash 0x66…66,
+// inferenceURL "https://router.example/v1" and model "model-x" to the same
+// inputs: contracts test_serveProofDigestV2_knownAnswerVector
+// (VersionedFeedback.t.sol), sealed TestServeProofDigestV2_KnownAnswerVector
+// (serveproof_v2_test.go), test/serveproof-v2.test.mjs. The same v2 inputs
+// with model "模型-é" pin that a string's UTF-8 bytes are hashed
+// (test/serveproof-v2.test.mjs, and the console and verify-agent.sh through
+// test/serveproof-copies.test.mjs).
 //
 // Run with:  npm run build && node scripts/serveproof-kav.cjs
 // (no test runner needed). Fails the process if an SDK hash drifts.
@@ -19,6 +27,8 @@ const assert = require('node:assert');
 const { hashMessage } = require('viem');
 const { buildServeProofMessageHash, buildServeProofSigningHash } = require('../dist/ServeProof.js');
 
+// LEGACY(v1): the v1 vectors (a proof without a version) go with
+// src/legacy/serveProofV1.ts; the v2 ones below build on the same inputs.
 const WANT_PROOF_HASH = '0xabfe2e6d0cc940ac398826e607b3d4d9bce2002bda0281c1b9e2efc7aaef3d5b';
 const VALIDATOR = '0x00000000000000000000000000000000000000B7';
 const WANT_SIGNED_DIGEST = '0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b';
@@ -56,4 +66,43 @@ assert.strictEqual(
 assert.strictEqual(hashMessage({ raw: got }).toLowerCase(), LEGACY_DIGEST, 'legacy digest vector drifted');
 assert.notStrictEqual(signed.toLowerCase(), LEGACY_DIGEST, 'signed digest must not be the personal_sign wrap');
 
-console.log('serveproof-kav: OK — SDK proofHash + v0 signed digest match the cross-impl vectors');
+const WANT_PROOF_HASH_V2 = '0xdac99843c8993224fa49be6989ea6cb8fc3c5190e2d2e8be132e9d073ba73a73';
+const WANT_SIGNED_DIGEST_V2 = '0x50f91a86a4e744dddd29bc16e936ab717a8c54074458e4332c5f43661538df4e';
+const v2 = {
+  ...params,
+  version: 2,
+  sealedHash: '0x' + '55'.repeat(32),
+  harnessHash: '0x' + '66'.repeat(32),
+  inferenceURL: 'https://router.example/v1',
+  model: 'model-x',
+};
+const gotV2 = buildServeProofMessageHash(v2);
+assert.strictEqual(
+  gotV2.toLowerCase(),
+  WANT_PROOF_HASH_V2,
+  `ServeProof v2 digest drifted from the cross-impl known-answer vector:\n got  ${gotV2}\n want ${WANT_PROOF_HASH_V2}`,
+);
+const signedV2 = buildServeProofSigningHash({ ...v2, validator: VALIDATOR });
+assert.strictEqual(
+  signedV2.toLowerCase(),
+  WANT_SIGNED_DIGEST_V2,
+  `ServeProof v2 signed digest drifted from the cross-impl known-answer vector:\n got  ${signedV2}\n want ${WANT_SIGNED_DIGEST_V2}`,
+);
+
+const WANT_PROOF_HASH_V2_UTF8 = '0x00dc0a9ba85191968c4bdcb00d11b4003216306420d80a6e68432fe01f24a977';
+const WANT_SIGNED_DIGEST_V2_UTF8 = '0xcab300c137d0d07deb4e73c3e027db4ff63df5045e0a95767519cce28ffbd963';
+const v2Utf8 = { ...v2, model: '模型-é' };
+const gotV2Utf8 = buildServeProofMessageHash(v2Utf8);
+assert.strictEqual(
+  gotV2Utf8.toLowerCase(),
+  WANT_PROOF_HASH_V2_UTF8,
+  `ServeProof v2 digest (non-ASCII model) drifted:\n got  ${gotV2Utf8}\n want ${WANT_PROOF_HASH_V2_UTF8}`,
+);
+const signedV2Utf8 = buildServeProofSigningHash({ ...v2Utf8, validator: VALIDATOR });
+assert.strictEqual(
+  signedV2Utf8.toLowerCase(),
+  WANT_SIGNED_DIGEST_V2_UTF8,
+  `ServeProof v2 signed digest (non-ASCII model) drifted:\n got  ${signedV2Utf8}\n want ${WANT_SIGNED_DIGEST_V2_UTF8}`,
+);
+
+console.log('serveproof-kav: OK — SDK proofHash + v0 signed digest match the cross-impl vectors (v1, v2, v2 with a non-ASCII model)');

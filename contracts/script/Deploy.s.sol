@@ -9,6 +9,7 @@ import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/Upgradeabl
 import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 
 import {AgenticID} from "../src/AgenticID.sol";
+import {TrustRegistry} from "../src/TrustRegistry.sol";
 import {VerifiedFeedbackRegistry} from "../src/VerifiedFeedbackRegistry.sol";
 import {CloneGate} from "../src/CloneGate.sol";
 import {StandardCloneAuthorizer} from "../src/StandardCloneAuthorizer.sol";
@@ -19,8 +20,9 @@ import {MainnetGovernance} from "./MainnetGovernance.sol";
 /// @notice Deploy AgenticID stack behind BeaconProxy + TimelockController.
 ///
 ///         Environment variables:
-///           OWNER             — owner of TEEDataVerifier / AgenticID / VerifiedFeedbackRegistry
-///                               (two-step Ownable; admin calls are direct, NOT timelocked).
+///           OWNER             — owner of TEEDataVerifier / TrustRegistry / AgenticID /
+///                               VerifiedFeedbackRegistry (two-step Ownable; admin calls are
+///                               direct, NOT timelocked).
 ///                               Also the default Timelock proposer (on 0G mainnet it must be
 ///                               one of PROPOSERS, and one of EXECUTORS unless execution is
 ///                               open), and the Timelock admin everywhere except 0G mainnet
@@ -78,6 +80,9 @@ contract Deploy is Script {
         address verifierImpl;
         address verifierBeacon;
         address verifier;
+        address trustRegistryImpl;
+        address trustRegistryBeacon;
+        address trustRegistry;
         address agenticIdImpl;
         address agenticIdBeacon;
         address agenticId;
@@ -134,8 +139,24 @@ contract Deploy is Script {
         d.verifierBeacon = address(verifierBeacon);
         d.verifier = address(verifierProxy);
 
-        // 3. AgenticID.
-        AgenticID agenticIdImpl = new AgenticID();
+        // 3. TrustRegistry — the deployer's trust decisions (attestors, code
+        //    lists). AgenticID's implementation fixes its address. NOTE:
+        //    post-deploy, its owner trusts the attestor(s) and the CloneGate
+        //    below (addTrustedAttestor / bindTrustedAttestorApp) and lists the
+        //    image hashes (list(IMAGE, …)), then hands the registry to the
+        //    Timelock with itself as guardian (HandOverTrustRegistry.s.sol;
+        //    the Timelock accepts through TrustRegistryCalls.s.sol).
+        TrustRegistry trustImpl = new TrustRegistry();
+        UpgradeableBeacon trustBeacon = new UpgradeableBeacon(address(trustImpl), address(timelock));
+        BeaconProxy trustProxy = new BeaconProxy(
+            address(trustBeacon), abi.encodeCall(TrustRegistry.initialize, (c.owner))
+        );
+        d.trustRegistryImpl = address(trustImpl);
+        d.trustRegistryBeacon = address(trustBeacon);
+        d.trustRegistry = address(trustProxy);
+
+        // 4. AgenticID.
+        AgenticID agenticIdImpl = new AgenticID(address(trustProxy));
         UpgradeableBeacon agenticIdBeacon = new UpgradeableBeacon(address(agenticIdImpl), address(timelock));
         BeaconProxy agenticIdProxy = new BeaconProxy(
             address(agenticIdBeacon),
@@ -148,7 +169,7 @@ contract Deploy is Script {
         d.agenticIdBeacon = address(agenticIdBeacon);
         d.agenticId = address(agenticIdProxy);
 
-        // 4. Verified-feedback registry (companion to the canonical ERC-8004
+        // 5. Verified-feedback registry (companion to the canonical ERC-8004
         //    Reputation Registry — feedback lives there, verification marks here).
         VerifiedFeedbackRegistry vfImpl = new VerifiedFeedbackRegistry();
         UpgradeableBeacon vfBeacon = new UpgradeableBeacon(address(vfImpl), address(timelock));
@@ -163,14 +184,15 @@ contract Deploy is Script {
         d.verifiedFeedbackBeacon = address(vfBeacon);
         d.verifiedFeedback = address(vfProxy);
 
-        // 5. Feedback batcher (EIP-7702 delegate; stateless, no beacon —
+        // 6. Feedback batcher (EIP-7702 delegate; stateless, no beacon —
         //    replace by deploying a new one and re-delegating).
         d.feedbackBatcher = address(new FeedbackBatcher(c.canonicalReputation, address(vfProxy)));
 
-        // 6. Clone gate (policy-mode cloning satellite). NOTE: post-deploy, the
-        //    AgenticID owner must `addTrustedAttestor(cloneGate)` — the gate
-        //    mints through registerWithSeal (same manual step as trusting the
-        //    real attestor).
+        // 7. Clone gate (policy-mode cloning satellite). NOTE: post-deploy, the
+        //    TrustRegistry owner must trust the gate (`addTrustedAttestor`, or
+        //    `bindTrustedAttestorApp` once instance binding is required) — the
+        //    gate mints through registerWithSeal (same manual step as trusting
+        //    the real attestor).
         CloneGate cgImpl = new CloneGate();
         UpgradeableBeacon cgBeacon = new UpgradeableBeacon(address(cgImpl), address(timelock));
         BeaconProxy cgProxy = new BeaconProxy(
@@ -239,6 +261,9 @@ contract Deploy is Script {
         console2.log("TEEDataVerifier impl:       ", d.verifierImpl);
         console2.log("TEEDataVerifier beacon:     ", d.verifierBeacon);
         console2.log("TEEDataVerifier proxy:      ", d.verifier);
+        console2.log("TrustRegistry impl:         ", d.trustRegistryImpl);
+        console2.log("TrustRegistry beacon:       ", d.trustRegistryBeacon);
+        console2.log("TrustRegistry proxy:        ", d.trustRegistry);
         console2.log("AgenticID impl:             ", d.agenticIdImpl);
         console2.log("AgenticID beacon:           ", d.agenticIdBeacon);
         console2.log("AgenticID proxy:            ", d.agenticId);

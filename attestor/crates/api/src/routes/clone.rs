@@ -367,6 +367,7 @@ mod tests {
 
             cli_latest: String::new(),
             cli_notes: String::new(),
+            releases_file: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             frameworks: vec![attestor_shared::Framework {
@@ -468,6 +469,8 @@ mod tests {
             chain: chain.clone(),
             sandbox: Arc::new(MockSandbox),
             deployments,
+            credentials: attestor_shared::credentials_repo::in_memory(),
+            notify: None,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             jobs: jobs.clone(),
             events: Arc::new(InMemoryEventBus::new()),

@@ -126,7 +126,7 @@ const params = {
     // image (the operator-maintained default; same fallback reset() uses).
     // Pass a name only to pin/rollback (0g-sandbox calls this field `snapshot` on the wire):
     sealedImage: process.env.SEALED_IMAGE,
-    apiKey:      process.env.AGENT_API_KEY,        // injected into the container as an env secret
+    apiKey:      process.env.AGENT_API_KEY,        // the model key: stored in the agent's credential set
   },
 };
 
@@ -214,25 +214,26 @@ await ag.agent.balanceOf(owner);            // → 5n       agents owned by `own
 const agentSeal = await ag.agent.getAgentSeal(agentId);
 await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → tx hash "0x…"
 
-// runtime start / stop / reset (owner-signed; on-chain identity preserved):
+// runtime start / stop / reset (owner or appointed operator; identity preserved):
 await ag.agent.stop(sealId, sandboxId);     // stop a running container
 await ag.agent.start(sealId, sandboxId);    // resume a STOPPED container
-await ag.agent.start(sealId, { apiKey });   // FIRST provision: bring a mint-only /
-                                            // never-provisioned agent online with a fresh
-                                            // container (apiKey required in practice). The
-                                            // semantic counterpart to a sandbox-less deploy;
-                                            // distinct from reset ("recreate an EXISTING one").
+await ag.agent.start(sealId, { apiKey });   // owner: resume the mapped sandbox, or first
+                                            // provision when there is no mapping.
+                                            // A failed resume never implicitly creates
+                                            // another paid sandbox; use reset explicitly.
+                                            // apiKey: see "The model key" below.
 await ag.agent.reset(sealId, { apiKey });   // recreate an EXISTING container: re-read iData
                                             // from chain, reselect the framework adapter.
-                                            // apiKey required in practice (attestor doesn't
-                                            // cache the model key); sealedImage optional.
+                                            // sealedImage optional.
 // A booting agent with no settings document uses the model pinned in its minted
-// persona, which leaves the chain at its first commit. So start and reset of an
+// persona, which leaves the chain at its first commit. So OWNER start and reset of an
 // agent that has no document and is a clone or has provisioned before first
 // store DEFAULT_PERSONA_INFERENCE (0g-compute) as its settings: one more owner
 // signature, after every check that can refuse the call; an existing document is
 // never replaced. To start such an agent on another provider, write its settings
 // (setSettings) first. The CLI's reset applies the same rule (needsDefaultSettings).
+// Operators call start(sealId)/stop(sealId) after owner configuration; they cannot
+// supply model-key options or write settings/credentials. See OPERATORS.md.
 await ag.agent.listDeployments();
 // → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError,
 //      containerStatus }, …]
@@ -247,7 +248,8 @@ One document per agent says which model it thinks with and how hard. It is **not
 
 ```ts
 const { settings, version } = await ag.agent.getSettings(sealId);
-// settings → { provider?, model?, thinking?: 'low'|'high'|'max', framework?: <any JSON> } | null
+// settings → { provider?, model?, thinking?: 'low'|'high'|'max', others?: <any JSON>,
+//              versions?: { sealed?, harness? } } | null
 //            null = never configured (not an error)
 // version  → what to write back against; 0 when there is no document yet
 
@@ -258,6 +260,8 @@ await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3
 ```
 
 **Whole-document write.** `setSettings` replaces the document — read it first and spread it to change one field. A `thinking` outside `low|high|max` (case-insensitive, as the container compares it) is refused before signing.
+
+**Version picks (0g-harness).** `versions: { sealed, harness }` pins the layered runtime to a sealed program and an official harness version, each by its sha256 (`"0x"` + 64 hex; anything else is refused before signing). A pick for a layer this SDK does not know is written back as it is, as an unknown top-level field is. `ag.agent.listedVersions()` reads what the trust registry lists — `{ registry, sealed: [...], harness: [...] }` in listing order, the last the newest; `null` on a chain without a trust registry (AgenticID before 1.4.0, whose `trustRegistry()` reverts); any other failed read throws. The agent runs a pick while it is listed; a layer with no pick keeps its running version while that stays listed and otherwise moves to the newest. The container applies a pushed document at once (`pushSettingsToContainer`), every boot, and every five minutes; the other frameworks ignore `versions`.
 
 **Who may read or write it.** Owner-signed, both directions, against the **live on-chain owner** read at request time — so a seller cannot keep configuring (or reading) an agent they already sold. The SDK signs `AgenticID.Settings.v1:<sealId>:<ts>:<base_version>:<sha256 of the document>` (EIP-191) for a write, and the same message minus the digest for a read (`GET /settings`, no body, base version 0). A rejected call is a clearly-worded HTTP 401. The document is on **no** listing tier and on no public deployment row: `getSettings` is the only way to read it.
 
@@ -318,6 +322,11 @@ const data = await response.json();                   // your normal response bo
 //           validator: "0x…" } | null
 //   (validator = the VerifiedFeedbackRegistry the proof was signed for; diagnostics
 //    only — it is not part of the on-chain proof)
+// A 0g-harness agent on the layered runtime signs a v2 proof, which adds what
+// each layer ran: { …, version: 2, sealedHash: "0x…", harnessHash: "0x…",
+//   inferenceURL: "https://…" (or "" when the framework dials its provider itself),
+//   model: "…" }. Without `version` it is v1 (every other image). The version picks
+// the digest and the registry entry point; the SDK handles both.
 // low-level escape hatch (you build the whole request): ag.reputation.capture(() => fetch(…))
 
 // 2. verify before spending gas (signer == on-chain agentSeal, deadline, dataHashes ⊆ iData).
@@ -329,7 +338,15 @@ const data = await response.json();                   // your normal response bo
 //    the CLI's `rate` does.
 await ag.reputation.verifyProof(proof);
 // → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true,
-//     taskMatches: null, reasons: [] }
+//     layersListed: null, taskMatches: null, reasons: [] }
+// layersListed: null for a v1 proof. For v2, whether the image (frameworkHash),
+// the sealed program and the official harness version it names are all on the
+// trust registry's lists now (AgenticID.trustRegistry(), 1.4.0+) — `ok` needs it;
+// a version delisted since the proof was signed fails, with the layer named in
+// reasons. The registry does not check the lists, so such a proof still redeems.
+// A chain whose AgenticID has no trustRegistry() (it reverts) gives false with a
+// reason; a list read that fails for any other reason throws. The envelope is
+// read as UTF-8, so a model or URL with non-ASCII text verifies.
 // signer attribution only. Pass { task } (the TaskExchange fetchWithProof
 // recorded) to also get taskMatches — the proof bound to THIS exchange's
 // bytes; ok requires the match, and task: null fails closed. Hand-rolled
@@ -368,6 +385,10 @@ await ag.reputation.verifyProof(proof);
 // beyond the registry's nonce retention, state changing between the check and
 // the attest, and non-proof tx failures (gas, RPC) — the proof stays
 // unconsumed, so retry with attestFeedback where that can help.
+// A v2 proof goes to attestVersionedFeedback (VerifiedFeedbackRegistry 1.3.0+;
+// on an older registry it is refused before anything is broadcast), atomically
+// through a batcher that has giveFeedbackAndAttestVersioned (the SDK asks it
+// gas-free once), else on the sequential path with the same preflight.
 // NOTE: an agent's OWNER cannot attest feedback on their own agent — the
 // verified registry rejects it (VerifiedFeedbackSelfFeedback). Feedback must
 // come from a different wallet than the one that owns `agentId`. Neither can
@@ -434,6 +455,7 @@ await ag.reputation.getVerifiedSummary({ agentId });            // unscoped → 
 await ag.reputation.getVerifiedClients(agentId);                // → [ "0x…", … ]  clients with ≥1 verified entry
 await ag.reputation.getVerifiedIndexes(agentId, buyer);         // → [ 1n, 2n ]
 await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHashes: ["0x…"], frameworkHash: "0x…" }  (verified entries only)
+await ag.reputation.getServeLayers(agentId, buyer, idx);        // → { sealedHash: "0x…", harnessHash: "0x…" }  (v2 entries; zero for v1; registry 1.3.0+)
 
 // owner responds to a feedback entry; the client who left it can revoke
 await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackIndex: idx, responseURI: 'ipfs://Qm…', responseHash: keccak256(toBytes('thanks')) });
@@ -566,10 +588,33 @@ For the router's live model catalog:
 await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …]
 ```
 
-`sandbox.apiKey` is required in practice — without it the agent boots but
-cannot reach its model. It travels inside the owner-signed "create"
-envelope into the TEE container's environment, and the attestor keeps no
-reusable copy (which is why `reset()` needs it again).
+**The model key.** `sandbox.apiKey` (and `apiKey` of `start` / `reset` /
+`retry`) is stored in the agent's credential set as `model.<provider>`,
+sealed to the agent ([credentials](../../docs/credentials.md#the-model-key)):
+`deploy` checks the key before it signs anything and stores it as soon as
+the attestor accepts the agent, without waiting for the mint
+(`modelKeyStored` in the result); the attestor creates the container once
+it is stored, ten seconds after the mint without one, or after a minute at
+the latest, so the first boot has it (`awaitCredentials`, signed with the
+deploy). `start` / `reset` / `retry` store it after their own checks pass,
+before the request is signed. A store asks the owner's wallet for three
+signatures (reading the stored set, the new set, the write); `deploy`'s for
+two, as the new agent has no set to read. A container whose image reads
+model keys from the set takes the key from there at boot, so with one
+stored, a `reset` on that image needs none, and a `retry` with the
+provider's key in the set can create a container. A key given without
+`provider` is the 0g-compute key (`model.0g-compute`): pass `provider` for
+any other provider's key. `ag.credentials.setModelKey(sealId, provider,
+apiKey)` sets or replaces it at any time (three signatures, a fourth to
+push it to the running agent). Without a key, 0g-harness on 0g-compute
+boots and its model calls fail until one is set; with no key for the
+provider in the set, the CLI asks for one for every other framework and
+provider, and the SDK refuses a create without one for a provider other
+than 0g-compute.
+
+While older images are in use, the key also travels with the request:
+inside the owner-signed "create" envelope into the TEE container's
+environment, of which the attestor keeps no copy.
 
 The owner's wallet shows that envelope verbatim when it signs. When the
 attestor's `GET /config` advertises `secret_env_scheme`, `start` / `reset` /
@@ -590,22 +635,29 @@ without `sandbox`, persist the provider/model settings, then
 
 **When your app supplies the key and the user signs.** Sealing in the
 browser still means the key reaches the user's browser. Seal it on your
-server instead, and hand the browser only the ciphertext:
+server instead, and hand the browser only the sealed key:
 
 ```ts
 // server: a read-only client is enough (no wallet)
 const ag = new AgentDNA({ attestorUrl, addresses, rpcUrl, chain });
-const sealed = await ag.agent.sealApiKey(sealId, { owner, apiKey });
+const sealed = await ag.credentials.sealModelKey(sealId, { owner, provider, apiKey });
 
-// browser: signs ciphertext only; the key never reaches it
-await ag.agent.start(sealId, { sealedSecretEnv: sealed });
+// browser: stores it in the agent's credential set, signing only its hash
+await ag.credentials.setModelKey(sealId, provider, sealed);
+// or with a new container, in place of apiKey
+await ag.agent.start(sealId, { sealedModelKey: sealed });
 ```
 
-`owner` must be the wallet that signs: the container applies the secret only
-while that address owns the agent on chain, so `sealApiKey` checks `ownerOf`
-once the agent is minted. `sealedSecretEnv` is accepted by `start` / `reset`
-/ `retry`, requires the attestor to advertise `secret_env_scheme`, and never
-falls back to `API_KEY`.
+`owner` must be the wallet that signs: the value is bound to it (and to the
+agent, the chain and `model.<provider>`), so `sealModelKey` checks `ownerOf`
+once the agent is minted, and `setModelKey` refuses a key sealed for another
+agent, provider or wallet. From the set the key reaches every boot of the
+agent, like the owner's own key. While older images are in use,
+`sealed.secretEnv` holds the same key as they read it with the request;
+`start` / `reset` / `retry` send it (it is present when the attestor
+advertises `secret_env_scheme`). The request-only form, `agent.sealApiKey`
+passed as `sealedSecretEnv`, still works for the request it rides and goes
+away with the request path.
 
 Every refusal on these paths throws `SecretEnvRefusedError` (exported) before
 anything is signed or sent: `signed` is always `false`, and `code` names the
@@ -685,6 +737,22 @@ const agentUrl = me?.url;               // null until the container is provision
 if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 ```
 
+When a release replaces an image, your agents on the old one keep running
+through a transition period, and the owner listing marks them: `migrate` is
+`{ version, framework, until, urgent, state }` (`state`: `recommended`, `soon`
+in the last 7 days, `overdue` after `until`). Reset such an agent before
+`until`: after it the old image may be retired, and the agent's next boot is
+then refused until it is reset. `urgent` means the image may be retired sooner
+(a security fix).
+`ag.agent.releases()` reads the attestor's release notices (`GET /releases`):
+each release's `notes` (and `notesZh`) and the images it replaces.
+
+```ts
+const toMove = (await ag.agent.listMyDeployments()).filter((d) => d.migrate);
+for (const d of toMove) console.log(d.agentId, d.migrate!.until, d.migrate!.state);
+const [latest] = await ag.agent.releases();   // newest first
+```
+
 - **`GET {agentUrl}/hello`** — public identity card: who I am, my owner, and
   the surface I expose. Buffered responses carry a signed `X-Agent-Proof`
   (a framework route's SSE stream doesn't — a signature needs a complete
@@ -710,9 +778,12 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   - `routes` — the framework's declared prefixes:
     `{ prefix, kind?, auth?, signed, description? }`, e.g. a `kind:"chat"` API
     at `/v1/` (auth `bearer`). `auth` tells you how to present the owner token;
-    `signed` says whether responses on that route carry an `X-Agent-Proof`.
-    Shipped frameworks are chat-only; a framework could declare a UI route,
-    but none currently do.
+    `signed` says whether responses on that route carry an `X-Agent-Proof`;
+    `description` is one plain sentence on what the route is for. Every
+    shipped framework declares a `chat` route, and `/hello` lists a
+    `responses` route next to it (the runtime serves one where the framework
+    does not); prime adds `activity`, 0g-harness `tasks`, `inbox`, `files`
+    and more. A framework could declare a UI route, but none currently do.
 
 - **`ag.agent.client(agentId)`** — one handle (`AgentClient`) for every caller.
   Whether it can do owner ops is inherited from `ag`, exactly like `ag`'s
@@ -764,6 +835,22 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   // compaction finishes anyway, and the runtime log has the outcome. HTTP 409
   // is "not now", nothing changed (a compaction or a turn already running, the
   // framework busy, or a reused signature: retry later).
+
+  // `ag.agent.restartRuntime(base, agentId, 'harness' | 'sealed', instanceId?)`
+  // (CLI `/restart`) restarts one layer of a 0g-harness runtime in place: the
+  // harness process (conversation and disk stay), or sealed itself — the loader
+  // starts it again and the agent is away for about one start. Either applies
+  // the owner's version picks and the trust registry's lists. 202 once under
+  // way; 501 where there is no such restart (other frameworks, an image without
+  // the loader), 503 while sealed is still starting, 409 for a reused signature
+  // or a displaced window.
+
+  // `ag.agent.signatures(base, agentId, { after })` (CLI `/signatures`) reads
+  // what the agent signed as itself and what the runtime refused, oldest
+  // first, whichever way the agent reached its sign socket: a message's hash
+  // and start, a typed-data digest and domain, a transaction's hash, chain,
+  // target, value, nonce and selector. The runtime keeps the last 1000.
+  // 0g-harness agents only; the other frameworks keep no record (HTTP 404).
 
   // Chat — present ONLY if the agent declares a chat route AND this ag has a
   // key. Streams under the hood (`stream: true`), so a long reasoning turn
@@ -860,14 +947,65 @@ for await (const e of agent.events!({ after: box.cursor, signal })) {
   if (e.type === 'reset') { /* the agent could not serve the position: re-read the inbox */ }
 }
 
-const tasks = await agent.tasks!({ status: 'active' });
-// every turn (yours and the agent's), command (bash-N) and subagent (subagent-N):
+const running = await agent.activities!({ status: 'active' });
+// every turn (yours and the agent's), command (bash-<hex>) and subagent (its session id, a UUID):
 // actor = who does the work (agent | subagent), trigger = who asked
-await agent.taskInfo!('subagent-1');   // includes a finished subagent's answer
-await agent.stopTask!('bash-2');       // a turn is cancelled, a command or subagent is killed
-await agent.stopAllTasks!();           // everything running
+await agent.activity!(running[0].id);     // a finished subagent's entry includes its answer
+await agent.stopActivity!('bash-2');      // a turn is cancelled, a command or subagent is killed
+await agent.stopAllActivities!();         // everything running
+// tasks/taskInfo/stopTask/stopAllTasks are the deprecated names of these; "task"
+// is kept for zgh-style tasks (a unit of work with its own session and outcome)
 await agent.schedules!();              // { enabled, data }: the reminders the agent set for itself
 ```
+
+A 0g-harness owner's `others` section also picks the agent's web search service
+(`webSearch`: the 0G router by default, or OpenAI or Anthropic) and the further
+models its subagents may run on (`subagentModels`, `subagentDefault`); each is
+paid with the model key or a named owner credential, never a key the agent
+holds. sealed's harness adapter README lists the fields; the CLI checks their
+shape before signing.
+
+A 0g-harness agent also takes **images and files** from its owner. Images ride
+a message: `chat` / `chatStream` take `images: [{ mediaType, data }]` (PNG, JPEG,
+WebP or GIF, base64; at most 8 per message, 10 MiB each, 32 MiB together),
+sent on the last user message in the transport's own shape. Whether the model
+sees them is what the provider's model list says (the 0G router's
+`architecture.input_modalities`: glm-5.3 takes text only, glm-5.3-flash images
+too); the owner's `others.modelImages` overrides it. A model that cannot view
+images gets each one saved as a file in the agent's file inbox `~/inbox` instead; the
+`onNotice` callback receives `{ imagesSavedAsFiles: [paths] }`. An image may
+carry its file name (`{ mediaType, data, name: 'flag test.png' }`): the SDK
+sends it as the part's `filename` when the agent's `GET /v1/harness` lists
+`features.image_names` (asked once per client), so the saved file keeps that
+name instead of `image-<ms>-<n>.png`; elsewhere the name is left out. Any other file
+goes through `uploadFile(name, bytes)` (present when `/hello` declares kind
+`files`; at most 25 MiB): it lands in `~/inbox` under a new name, never over
+an existing file, and returns `{ path, bytes }` — name the path in your
+message. Both live in the container only: a reset loses them.
+
+**Steering a running turn** (0g-harness, present when `/hello` declares kind
+`steer`): `agent.steer(text)` puts the owner's word into the turn that is
+running now; the agent reads it before that turn's next model call — when the
+current model answer or tool call finishes, not in the middle of a long
+command. It returns `{ merged: true, id, turn }`; with no owner turn running
+it is queued as an ordinary turn instead, `{ merged: false, queued, reason }`.
+`agent.steerState(id)` tells what became of it: `pending`, `merged` (read in
+`turn`), `turn` (the turn ended first, so it opened `turn`, an owner turn of
+its own) or `dropped` (an interrupt came first).
+
+The way back: the agent puts files for its owner in its `~/outbox`.
+`listFiles(dir?)` lists them (`'outbox'`, the default, or `'inbox'` for the
+owner's own files), newest first, as `{ name, bytes, mtime, sha256? }`;
+`downloadFile(dir, name)` returns one file's bytes (at most 50 MiB; one flat
+name, no leading dot). A turn that leaves files new or changed in the outbox
+says so: `onNotice` receives `{ outboxFiles: [names] }` when the turn ends.
+`deleteFile(dir, name)` removes one (`'deleted'`, `'missing'`, or
+`'unsupported'` from a runtime without the delete route). The methods share
+the `files` route; an agent whose runtime predates downloads answers with an
+error saying so. The outbox lives in the container only, like the file
+inbox, and the runtime removes files older than 30 days from both and keeps
+the file inbox under 1 GiB. The file inbox `~/inbox` is not the message inbox
+(`inbox()`, what the agent said in turns it opened itself).
 
 ## Agents as owners (nested agents)
 
@@ -929,7 +1067,7 @@ The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G
 
 ## Advanced
 
-Raw ABIs (`agenticIDAbi`, `canonicalReputationAbi`, `verifiedFeedbackAbi`, `feedbackBatcherAbi`, `cloneGateAbi`, `standardCloneAuthorizerAbi`, `tappRegistryAbi`, `sandboxServingAbi`) and serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`, and for the `taskHash` commitment `taskHashOf`, `requestUriOf`, `requestUriCandidates`) are exported.
+Raw ABIs (`agenticIDAbi`, `trustRegistryAbi`, `canonicalReputationAbi`, `verifiedFeedbackAbi`, `feedbackBatcherAbi`, `cloneGateAbi`, `standardCloneAuthorizerAbi`, `tappRegistryAbi`, `sandboxServingAbi`), serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`, `serveProofLayers`, `SERVE_PROOF_VERSION`, `SERVE_PROOF_V2_TAG`, and for the `taskHash` commitment `taskHashOf`, `requestUriOf`, `requestUriCandidates`) and trust-registry reads (`trustRegistryOf`, `isListed`, `listedHashes`, `TRUST_KINDS`) are exported.
 
 **Serve-proof canonical digest** (for independent verifiers): two hashes.
 The inner `proofHash` is
@@ -948,7 +1086,19 @@ It is **not** personal_sign: a personal_sign (`0x19 0x45`) signature over
 `proofHash` is rejected, and nothing falls back to it. `buildServeProofMessageHash` /
 `buildServeProofSigningHash` are the TS implementation; the Go side lives in
 `sealed/internal/proxy/`. `npm run test:kav` pins both hashes to the
-known-answer vectors the contracts and sealed also assert. The sealed proxy
+known-answer vectors the contracts and sealed also assert.
+
+That is v1, the proof without a `version`. A v2 proof (`version: 2`, signed by
+0g-harness agents on the layered runtime) opens its preimage with a tag and
+adds what each layer ran, under the same 0x00 wrap:
+`keccak256(abi.encode(keccak256("AgentDNA.ServeProof.v2"), chainId,
+identityRegistry, submitter, agentId, timestamp, deadline, taskHash,
+keccak256(abi.encodePacked(dataHashes)), frameworkHash, sealedHash, harnessHash,
+keccak256(bytes(inferenceURL)), keccak256(bytes(model))))` — 14 words against
+v1's 9, so neither signature verifies as the other. The builders, `signServeProof`
+and `verifyServeProofSignature` pick the digest by the `version` field (pass
+`version: 2` and the four layer fields for v2); the registry redeems v2 through
+`attestVersionedFeedback` (1.3.0+). `npm run test:kav` pins the v2 vector too. The sealed proxy
 learns the validator from `VERIFIED_FEEDBACK_ADDR` (injected by the attestor)
 and echoes it as the envelope's `validator` field (diagnostics only, not part
 of the on-chain tuple); when that variable is unset, malformed or zero — or
@@ -984,7 +1134,7 @@ The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`
 
 ## CLI: `0g-agentdna`
 
-The package ships a CLI — no separate install, zero extra dependencies. Bare `0g-agentdna` opens an **interactive shell** (Claude-Code style); `doctor`/`status`/`list`/`settings` remain scriptable diagnostics subcommands.
+The package ships a CLI — no separate install, zero extra dependencies. Bare `0g-agentdna` opens an **interactive shell** (Claude-Code style) at its manager prompt; `doctor`/`status`/`list`/`settings`/`cred`/`providers`/`releases`/`update` are scriptable one-shot commands. A word of the shell's own (`0g-agentdna login`, `whoami`, `deploy`, …) is refused with where to type it (run `0g-agentdna`, then type it there); any other word is an unknown command, with the nearest command named when it looks like a typo.
 
 ```bash
 npm install @0gfoundation/0g-agentdna
@@ -998,9 +1148,9 @@ For the old CLI update path and automatic local-config migration, see
 
 ### Interactive shell
 
-Two levels. The **manager** (`0g-agentdna>`): `list` (public listing with sealIds and the same FRAMEWORK/AGENTSEAL/OWNER columns as `0g-agentdna list`, `⇄ #<agentId>` on agent-owned agents, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `settings <id> [key=value …]` (show or change the agent's configuration document), `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login [provider]` (guided setup: attestor URL → owner key → provider → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
+Two levels. The **manager** (`0g-agentdna>`): `list` (the same columns as `0g-agentdna list`, fitted to the terminal, `⇄ #<agentId>` on agent-owned agents, an agent without an agentId yet shown by its sealId prefix, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase; an agent still being minted is entered once it has its agentId), `hello <id> [full]` (any agent's public /hello: identity, proof check, services one per line and owner routes on one line by kind; `full` prints every field — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework → provider → model wizard: a listed number or name, anything else asked again), `start`/`stop`/`reset <id>` (not on an agent still deploying), `settings <id> [key=value …]` (show or change the agent's configuration document), `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account; an amount is checked before any transaction, a bare `deposit`/`withdraw` asks for it with no default — Enter cancels — and `withdraw <og>` asks before restarting a pending refund's time lock), `ack`, `status <id>` / `doctor` / `providers` / `releases` (the one-shot commands), `login [provider]` (guided setup: attestor URL → owner key → each provider's model key → the default provider for new agents; each answer is checked before it is saved and asked again when wrong, Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`. Errors are one or two plain lines with a remedy typed at that prompt.
 
-The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/compact` (keep the conversation but have the framework summarize its older part now — 0g-harness, and openclaw 2026.7.1 or later; one or more model calls, can take minutes) `/tasks` `/result [id]` `/cancel [id|all]` `/inbox [all]` `/schedules` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed. On a 0g-harness agent, what the agent says on its own (a background job finished, a reminder came due) prints above the prompt as it arrives, and what came while you were away prints when you enter; `/tasks` lists every turn, background command and subagent with who did it, `/cancel <id>` stops any of them and `/cancel all` everything running. On the other frameworks `/inbox` and `/schedules` say the agent has none.
+The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. A message can span lines: a paste stays one message (shown as pasted, sent with the next Enter, never run as a command, whatever its first line starts with), and a line ending in `\` or Option/Alt+Enter goes on to a new line; Backspace at the start of a line joins it to the line before, and Ctrl-C or Esc with text in the box clears it, all its lines. On a terminal the session is drawn with Ink like Claude Code's input area: the `❯ ` input line between two rules at the bottom, a footer under it (it also says when the agent is not running, and the way out: `stopped — /start`; a bare Enter re-reads the phase and prints nothing), a status line above it during a turn (`⠹ running a command… (14s · Esc to stop)`, with `2 notices · 1 new file` at its right), the messages sent during the turn waiting above that, and the transcript scrolling above all of it — your messages as `❯ text`, replies, command output, notices, and one line per run of the agent's tool calls (`· ran 3 commands, read a file`); what you type stays in the box and can be edited while the agent replies. `AGENTDNA_INK=off`, a terminal under 30 columns or 12 rows, CI, or an `ink` package that does not load keep readline's prompt line, which stays on screen during a turn (`agent 286 (replying, Esc stops) › `) with the reply printing above it. On a 0g-harness agent a message you finish while the agent is working goes into the running turn of owner-chat (`agent.steer(text)` over `POST /v1/steer`): the agent reads it before the turn's next model call — shown as waiting for the agent until then (in the framed view it then moves into the transcript as your message; at readline's prompt `waiting for the agent: …`, then `↳ read by the agent: …`) — not in the middle of a long command; if the turn ends first, the agent answers it in the turn after (several such messages may be answered together) and the CLI follows it; an empty Enter waits for the next turn, and Esc stops the turn, the turns that would answer what was inserted and not read with it; those messages, and the ones queued, come back to be edited as one (a command that waited runs next, on its own). Which inserted messages come back is what the agent says after the stop: the ones it dropped (0g-harness drops them with the turn); one it read just before the stop prints as read; one an older 0g-harness still holds — it gives those to its next turn — is listed under `(not put back — …)` and stays out of the box, so it is not sent twice. A command alone on its line during a turn never goes to the agent: one that only reads (`/files`, `/tasks`, `/inbox`, `/hello`, …) runs at once, any other when the turn ends; Tab completes it. A turn that ends with no text because the model's output budget ran out says so (`no answer: …`); a failed turn says in one line whether the model service failed, the model is overloaded (try again for both), or what the error says (with `/agentlog`). Tab queues what you typed instead (shown as next turn, sent as your next message when the turn ends; Esc puts it back to edit, without blank lines), and ↑ on an empty prompt takes the newest queued entry back to edit. Option+Enter needs the Option key to send Meta: in macOS Terminal, Settings → Profiles → Keyboard → "Use Option as Meta key"; in iTerm2, Profiles → Keys → Left Option key: Esc+. Other questions take one line: several pasted lines are not their answer, and a paste does not answer a yes/no question or one that signs. Piped input stays one line per command. Slash commands: `/hello [full]` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …|versions]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/compact` (keep the conversation but have the framework summarize its older part now — 0g-harness, and openclaw 2026.7.1 or later; one or more model calls, can take minutes) `/restart harness|sealed` (0g-harness: restart one layer of the runtime in place) `/activities` `/tasks` `/result [id]` `/cancel [id|all]` `/inbox [all]` `/schedules` `/attach [path …|clear]` (0g-harness: files and images for your next message — an image goes with it, any other file is uploaded to the agent's file inbox `~/inbox` first and the message names its path) `/files [inbox]` (0g-harness: the files the agent left for you in its `~/outbox`; with `inbox`, the ones you sent) `/download <name> [path]` (0g-harness: save one locally, never over an existing file) `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed. On a 0g-harness agent, what the agent says on its own (a notice: a background job finished, a reminder came due) prints above the prompt as it arrives, and what came while you were away prints when you enter (`/inbox` or `/notices` lists them); files it leaves in its `~/outbox` are saved by themselves to `~/agentdna/<agentId>/outbox` on a terminal and, once verified, removed from the agent's outbox (`/files auto off` stops that), and the status line (or, at readline's prompt, the prompt) counts what waits (`2 notices · 1 new file`); `/activities` lists every turn, background command and subagent with who did it, `/cancel <id>` stops any of them and `/cancel all` everything running. On the other frameworks `/inbox` and `/schedules` say the agent has none.
 
 Configuration persists under `~/.config/0g-agentdna/` — `config.json` (attestor URL), `credentials` (owner key + provider-scoped inference keys, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. `rate` checks a ticket on what the registry checks — expiry and the signature — and discards one that fails on its own merits (bad signature — e.g. one banked from a pre-1.2.0 sealed image — or expiry), but keeps one that fails only because no VerifiedFeedbackRegistry, or a different one, is configured on this side. A ticket whose data hashes the agent has since replaced (it commits state drift every 30 s) still redeems — the registry records the version that served you without comparing it to current chain state — so `rate` only notes it and goes ahead. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 
@@ -1009,9 +1159,9 @@ Configuration persists under `~/.config/0g-agentdna/` — `config.json` (attesto
 | Command | What |
 |---|---|
 | `doctor` | Checks every deploy prerequisite — attestor reachable, RPC, wallet, gas, trust-root ack, sandbox balance ≥ 0.1 OG — and prints a remedy per failing item. Exit 0 when all green, 3 otherwise. |
-| `status <agent>` | One agent's full picture: phase, all three coordinates (agentId / sealId / agentSeal), url, failure reason. `<agent>` is a decimal agentId **or** a `0x…` sealId — the CLI converts between them. When a failed deployment's reason is withheld from the public listing (#64), a configured key makes the CLI fetch it via the owner-signed listing automatically. |
+| `status <agent>` | One agent's full picture: phase, all three coordinates (agentId / sealId / agentSeal), failure reason (`--json` also carries the container `url`). `<agent>` is a decimal agentId **or** a `0x…` sealId — the CLI converts between them. When a failed deployment's reason is withheld from the public listing (#64), a configured key makes the CLI fetch it via the owner-signed listing automatically. |
 | `list [--mine] [--phase p]` | Deployment listing; `--mine` (owner-signed, needs the key) adds the owner-only fields. Empty result is `[]` + exit 0. |
-| `settings <agent> [k=v …]` | Show the agent's configuration document; with `key=value` assignments, change it. Keys: `provider`, `model`, `thinking` (`low\|high\|max`), `framework` (opaque JSON — quote it: `framework='{"a": 1}'`, in the REPL too). Assignments **merge** onto the stored document; an empty value (`thinking=`) clears a field. **Both** directions are owner-signed (needs the key). A write is a compare-and-swap against the version just read: a concurrent edit by another client is refused with `SETTINGS_CONFLICT` (exit 3), never overwritten. A merged document with no `model` is refused before signing — that is the one state the container hard-fails on. The chosen model is checked against its provider's configured catalog before signing — an absence is a warning on stderr. Native providers without a catalog accept a manual model ID. A provider change requires a registered matching key and image support, then reports pending reset; execute `reset` with that provider's key. |
+| `settings <agent> [k=v …]` | Show the agent's configuration document; with `key=value` assignments, change it. Keys: `provider`, `model`, `thinking` (`low\|high\|max`), `others` (opaque JSON — quote it: `others='{"a": 1}'`, in the REPL too), and on a 0g-harness agent `sealed` / `harness` (a version's sha256 from the trust registry's lists, which `settings <agent> versions` prints — a bare show says on one line which versions run; refused for an agent of another framework). Assignments **merge** onto the stored document; an empty value (`thinking=`) clears a field. **Both** directions are owner-signed (needs the key). A write is a compare-and-swap against the version just read: a concurrent edit by another client is refused with `SETTINGS_CONFLICT` (exit 3), never overwritten. A merged document with no `model` is refused before signing — that is the one state the container hard-fails on. The chosen model is checked against its provider's configured catalog before signing — an absence is a warning on stderr. Native providers without a catalog accept a manual model ID. A provider change requires a registered matching key and image support, then reports pending reset; execute `reset` with that provider's key. |
 
 Environment variables (override the config files):
 

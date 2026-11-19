@@ -75,7 +75,9 @@ components hold only the interface (or a narrow subset of it) and need
 
 - **Adapter selection is binding-driven**: adapters self-register in
   their `New()` (`framework.Register`); `main.go` registers every
-  bundled adapter and, once Phase 2 has decrypted the iData, selects the
+  adapter the build bundles (`adapters.go`; the 0g-harness image's build,
+  tag `harnessonly`, bundles only its own, `adapters_harnessonly.go`) and,
+  once Phase 2 has decrypted the iData, selects the
   active one by the **on-chain framework binding's `name`** — the
   agent's minted identity decides which framework interprets its iData,
   not deploy config. The `AGENT_FRAMEWORK` env is only the fallback for
@@ -118,7 +120,9 @@ components hold only the interface (or a narrow subset of it) and need
 
   **Which adapter runs is still never decided by the image** — that is the
   on-chain binding's job (§2.1 above), and the sealed binary in every image
-  registers every adapter. But the image must actually *carry* the runtime
+  but 0g-harness's registers every adapter (the 0g-harness image's registers
+  only its own, so a binding naming another framework fails there at adapter
+  selection). But the image must actually *carry* the runtime
   the selected adapter needs, and **nothing validates that pairing**: a
   binding naming a framework whose runtime is absent yields a container that
   boots and then fails at Start. Deploys of anything but the default image
@@ -166,6 +170,13 @@ and degrades gracefully when absent):
 | `ConversationHistory` | `ConversationHistory(ctx)` | the stateful responses door drops client-sent history: it sends the prior turns this returns, then only the client's current turn. Return none when your gateway replays its own session (openclaw) — a client's history on top would reach the model twice | client-sent history keeps being forwarded verbatim |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear` (owner-signed) + CLI `/clear`, followed by a process restart | the route answers 501 — history is client-held, nothing server-side to clear |
 | `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact` (owner-signed, single-flight, replay-refused, never overlapping a synthesized-door turn) + CLI `/compact`: run the framework's OWN compaction now, no restart; the note is shown to the owner. Wrap `framework.ErrCompactRefused` when the framework declines for now (busy, changed) — the owner gets a 409 to retry, not a failure; wrap `framework.ErrCompactUnsupported` when the installed framework version lacks what your adapter uses to trigger compaction (openclaw before 2026.7.1 has no `sessions compact` CLI command) — a 501, as without the interface | the route answers 501 — the framework cannot be asked to compact from outside |
+| `UncommittedKeeper` | `KeepsUncommitted(role) bool` | bootstrap Phase A: a boot of the same container keeps the disk content of a named role that the agent changed after its last commit, as long as the chain still holds what this container last had in sync (`synced.go`); the watcher then commits it. Name only content the agent writes, never platform state such as the framework binding | every boot restores the chain version over the disk |
+| `BearerTranslator` | `TranslateBearer(token) (frameworkToken string, ok bool)` | proxy, on routes whose `Auth` is `bearer`: only a request carrying the owner's token is forwarded, with the framework's token in its place, so the framework never sees the owner's. `AuthResponse` then hands out the owner's token, not the framework's | the token `AuthResponse` returns is forwarded as-is |
+| `PlaintextCommitter` | `CommitsPlaintext() bool` | uploader: every entry it uploads carries a salted sha256 commitment to its plaintext in `dataDescription` (`LAYERS.md` §7.1) | no commitments |
+| `ServiceFieldLimiter` | `ServiceFieldLimits() (description, inputExample int)` | proxy, on service registration: a longer description or input example (bytes) is refused | no length caps |
+| `SigningRules` | `AppliesSigningRules() bool` | sign socket: refuses a transaction to AgenticID `update` / `updateAt` (the drift watcher's channel), and records every signature and refusal for the owner (`GET /_seal/signatures`). Set `RuntimeSnapshot.SigningRules` too, so the agent doc says so. Only 0g-harness | the socket signs within its three shapes and keeps no record; `/_seal/signatures` is 404 |
+| `RuntimeTools` | `ServesRuntimeTools() bool` | sign and reveal sockets: `POST /mcp` serves their endpoints (and the credential socket's) as MCP tools, which your framework registers from `tools/list` and calls back with `tools/call`. Set `RuntimeSnapshot.SealTools` too, so the agent doc names them. Only 0g-harness (its `seal-tools` plugin) | `/mcp` is 404 |
+| `LayeredRuntime` | `UseHarness(hash, dir)`, `HarnessHash()`, `InferenceTarget()` | bootstrap and `layered.go`: which harness package `Start` runs (the image ships none, so `Start` fails until one is set), switching packages by the version rule, and serve-proof v2 (`LAYERS.md` §5, §7). Only 0g-harness | the framework the image installed runs; serve-proofs stay v1 |
 
 Declare compile-time assertions for everything you implement
 (`var _ framework.VersionReconciler = (*Adapter)(nil)`) — silent non-implementation of an optional
@@ -210,7 +221,7 @@ Conventions and rules:
   | openclaw (`openclaw.go:164`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `~/.openclaw/openclaw.json`, re-rendered every spawn |
   | hermes (`hermes.go:143`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `~/.hermes/config.yaml`, re-rendered every spawn |
   | prime-agent (`prime.go:162`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `~/.prime/agent/models.json`, re-rendered every spawn |
-  | 0g-harness (`harness.go:167`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | none — the harness's process environment |
+  | 0g-harness (`harness.go:208`) | `framework`, `APPEND_SYSTEM.md`, `skills/`, `memory/`, `memory-public/` | none — the harness's process environment |
 
   `openclaw.json`, `config.yaml`, `models.json` and `settings.yaml` were all
   roles until the owner's settings document became the pin's durable home.
@@ -779,6 +790,8 @@ fallback.
 | `VerifiedFeedbackAddr` | VerifiedFeedbackRegistry proxy from `VERIFIED_FEEDBACK_ADDR`; empty when that is unset, malformed or zero, or its `getIdentityRegistry()` is not `AGENTIC_ID_ADDR` | the serve-proof validator (EIP-191 version `0x00`). sealed signs with it itself — the adapter need not act on it; empty ⇒ no `X-Agent-Proof` on any route |
 | `SealedVersion` | sealed binary git hash | for proof/metadata surfaces |
 | `FrameworkHash` | `"0x"+sha256` of the sealed image | the AgenticID Framework code hash signed into serve-proofs |
+| `CredProxy`, `CredHTTPSProxy`, `CredCAFile`, `CredCABundle`, `CredSock`, `CredRevealSock` | the owner-credential proxy and its sockets ([CREDENTIALS.md](CREDENTIALS.md)); all empty when it is off | append `rt.CredentialEnv()` to the framework's environment, and pass `CredSock` / `CredRevealSock` into the `platform.RuntimeSnapshot` so the agent is told how to use its credentials |
+| `CredHold` | nil when the proxy is off | `CredHold(name, baseURL, headers, value)` has sealed hold a value the framework would otherwise receive (its inference key): the framework gets a placeholder and `baseURL` through the proxy. 0g-harness uses it for a platform-routed model (`holdInferenceKey`) |
 
 **What is deliberately NOT here: configuration.** `RuntimeContext` is captured
 at the initial Start and replayed verbatim on every restart, so anything
@@ -821,9 +834,19 @@ You get these for free; design your framework's surface assuming them:
   `AGENTIC_ID_ADDR` on chain) no header is emitted. Your
   upstream serves plain HTTP on localhost.
 - **`GET /hello`** — signed self-introduction: agent identity, current
-  `data_hashes`, `public_url`, and the agent-declared service list (built
-  from sealed's service registry — agents register via
-  `POST $SEAL_SIGN_SOCK/services`, not a per-framework manifest file).
+  `data_hashes`, `public_url`, and the service list, each entry with its
+  `kind`: `runtime` (`/hello`), `agent` (an agent interface: a backend the
+  agent runs on loopback and registers via `POST $SEAL_SIGN_SOCK/services`,
+  not a per-framework manifest file) or `hosted` (a hosted program, with the
+  `version` it runs and its `release` audit path; MCP_SERVICES.md). sealed
+  keeps the agent interfaces across restarts of the container, bound to the
+  owner and the seal, and runs the backend of one registered with a `start`
+  command itself, as the agent user, starting it again whenever it exits:
+  with `PATH`, `HOME`, the credential proxy's settings, `AGENT_PUBLIC_URL`,
+  `SEAL_SIGN_SOCK` and `AGENT_SEAL` (not the framework's own variables), in a
+  process group of its own that sealed kills when the entry is removed or
+  changed. One backend address has one start command; `GET /services`
+  reports each such backend's state, starts, last exit and last output.
 - **`POST /_seal/auth`** — the owner-auth flow of §5.7.
 - **`unix:///run/seal-sign.sock`** — `POST /sign/personal_sign`,
   `/sign/typed_data`, `/sign/transaction`; container-local only. This is
@@ -836,8 +859,8 @@ You get these for free; design your framework's surface assuming them:
   in the agent's doctrine* (see [AGENT_DOCTRINE.md](AGENT_DOCTRINE.md));
   your adapter should install an equivalent of openclaw's SOUL rules so
   externally-prompted sign requests get refused. If your adapter
-  bridges the socket into an agent tool (as 0g-harness's `seal_sign` does), it
-  must forward only to these endpoints and must **never** add a
+  bridges the socket into an agent tool (as 0g-harness's `seal-tools` does with
+  the runtime's MCP tools), it must forward only to these endpoints and must **never** add a
   raw-hash or `0x00` signing path. Either one would let the agent forge
   serve-proofs.
 - **`/log`, `/log.html`, `/log/agent`(`.html`)** — live bootstrap and
@@ -954,7 +977,7 @@ The one obligation that replaced all four is step 4.
 1. Implement `framework.Framework` + `MonitorExit` in
    `internal/framework/<yourfw>/`, self-registering via
    `framework.Register` in your `New()`; add the one registration line
-   in `main.go`. Use `openclaw/` as the template for server-shaped
+   in `adapters.go`. Use `openclaw/` as the template for server-shaped
    frameworks. For CLI-shaped frameworks (embedded-bridge pattern), the
    retired `claudecode/` adapter in git history + §12 are the reference —
    but note §12's caveat: a per-request CLI can't host public services.
@@ -1199,7 +1222,11 @@ The one obligation that replaced all four is step 4.
     chat only. Rule: **constrained interfaces exposed by default; a full
     framework UI only after a per-endpoint audit proves no shell / file /
     exec is reachable through it.** When in doubt, don't declare the route
-    — an undeclared prefix 404s at the proxy.
+    — an undeclared prefix 404s at the proxy. A route can also list its
+    exact endpoints (`Route.Endpoints`: method and path, `{id}` matching one
+    segment); the proxy then forwards only those, 404 for an unlisted path
+    and 405 for an unlisted method. 0g-harness lists the endpoints of its
+    protocol v1.
 
 ## 12. Port report: integrating claude-code (2026-07) — retired, kept as case study
 
@@ -1497,7 +1524,7 @@ here release 0.7.2 *is* npm 0.84.1.
 
 **The install belongs in the image, and that has a security payoff.** Because
 the framework is provisioned at image build time, its bytes are covered by the
-image hash that goes into on-chain `validFrameworkHashes`. openclaw and hermes
+image hash that is listed on chain (the trust registry's image list). openclaw and hermes
 re-pin their version at first Start, so the framework those agents actually run
 is whatever the registry served at boot — outside the measurement. This adapter
 therefore installs nothing at runtime: Start verifies the installed version
@@ -1521,7 +1548,8 @@ package (~50 of them). Unlike openclaw, hermes and prime-agent, there is no
 single "the framework's config file"; the composition itself (which plugins,
 in what order, with what config) is platform structure: it lives in
 [0g-harness](https://github.com/0gfoundation/0g-harness) (`src/composition.mjs`),
-which the 0g-harness image installs at build time. The state half — `Roles`, `Defaults`, `Restore`/`EvolutionFor`,
+which runs from an official version package sealed installs by hash (the image
+ships none). The state half — `Roles`, `Defaults`, `Restore`/`EvolutionFor`,
 `HandleLegacy["persona"]`, `FrameworkFacts` — is green under
 `conformance.Run` plus adapter-specific tests for persona ingestion and, since
 the settings channel landed, for the render itself
@@ -1572,6 +1600,28 @@ retired role's pin).
    (`<name>.md`) — this role tracks both entry shapes. The provider's own
    reserved child (`.system`) is excluded, the same pattern hermes uses for
    `skills/.bundled_manifest`.
+5. **`memory/`** — `DirectoryManifest` over `$DSH_HOME/memory/`, the agent's
+   private long-term memory (used only in the owner's own sessions and
+   tasks): one `<name>.md` per memory directly in the directory, plus the
+   `MEMORY.md` index, one file entry each — hermes's `memories/` shape.
+   Subdirectories, dotfiles, links and empty files are not tracked
+   (`harness/memory.go`). DSH has no memory of its own; the harness keeps the
+   memories, or above a size their index, in the model's context through its
+   own system-prompt section, read at every model step (0g-harness
+   `src/memory.mjs`). An agent minted before the role existed has no such
+   chain entry: bootstrap round B lands the empty default, which equals the
+   empty directory's evolution, so nothing is committed until the agent
+   writes a memory. Like the persona and skills it is the agent's own writing
+   (`KeepsUncommitted`).
+6. **`memory-public/`** — the same shape over `$DSH_HOME/memory-public/`: the
+   agent's public long-term memory, knowledge that may also be used outside
+   the owner's sessions. The harness writes it only on the owner's explicit
+   request. Each memory in either role names the owner who confirmed it
+   (`trusted_by`); the harness trusts it only while that is the current owner,
+   which sealed passes as `SEAL_OWNER`, so a transfer turns the previous
+   owner's memories into reference without rewriting them. That trust is the
+   harness's business: to sealed both roles are files. Defaults, restore of an
+   absent entry and `KeepsUncommitted` are as for `memory/`.
 
 **What a fifth data point taught about scope, before any code was written.**
 DSH is the first framework here whose own designers explicitly *invite*
@@ -1608,12 +1658,12 @@ free, because the underlying `Agent` object is long-lived in the harness
 process and a plain follow-up message already continues the same turn
 context, no separate answer channel required.
 
-**The process half.** 0g-harness (with its platform plugins `seal-tools`,
-`seal-guard` and `subagent-guard`) composes the plugin tree in-process — no
-loader, no profile, no `$DSH_HOME` patch layer — and the 0g-harness image installs
-one exact build of it at build time, its dependency tree locked, so the
-composition rides the image hash and an agent editing its home cannot change
-what mounts next boot. It keeps one long-lived `Agent`, runs owner turns one
+**The process half.** 0g-harness (with its platform plugins `seal-tools` and
+`subagent-guard`) composes the plugin tree in-process — no
+loader, no profile, no `$DSH_HOME` patch layer — and an official version
+package holds one exact build of it, its dependency tree locked, so the
+composition rides the package hash (on the trust registry's harness list) and
+an agent editing its home cannot change what mounts next boot. It keeps one long-lived `Agent`, runs owner turns one
 at a time, and routes each turn's output to whoever opened the turn: the
 owner request, or the inbox for a turn the agent opened itself (a background
 job finishing, a reminder coming due). It serves `/v1/chat/completions`

@@ -2,7 +2,8 @@
  * @file status.ts
  * @description `0g-agentdna status <agent>` — one agent's full picture
  * (spec v0.03 §3.2): all three coordinates (agentId / sealId / agentSeal),
- * phase, url, and the FOLDED failure reason. `<agent>` is a decimal agentId
+ * phase, and the FOLDED failure reason (`--json` also carries the container
+ * url, which the human output leaves out). `<agent>` is a decimal agentId
  * or a 0x… sealId; the command resolves the other coordinates from chain +
  * the attestor listing.
  *
@@ -15,7 +16,9 @@
 import type { Address, Hash } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import { buildClient } from '../sdk';
-import { CliError } from '../errors';
+import { CliError, cmdStep, shellTo } from '../errors';
+import { explainError } from '../plain';
+import { cleanCell } from './cells';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef } from '../ref';
 import type { CommandContext } from '../types';
@@ -55,8 +58,8 @@ export async function run(ctx: CommandContext): Promise<void> {
         hits.length ? 'BAD_AGENT_REF' : 'AGENT_NOT_FOUND',
         hits.length
           ? `"${ctx.positionals[0]}" matches ${hits.length} agents — add more hex chars`
-          : `no agent matching ${ctx.positionals[0]} on this attestor`,
-        { remedy: '0g-agentdna list   # to discover existing agents' },
+          : `agent ${cleanCell(ctx.positionals[0])} does not exist on this attestor`,
+        { remedy: `${cmdStep('list')} shows the agents here` },
       );
     }
     ref = { kind: 'sealId', sealId: hits[0].sealId as Hash };
@@ -71,8 +74,8 @@ export async function run(ctx: CommandContext): Promise<void> {
     try {
       await ag.agent.ownerOf(agentId);
     } catch {
-      throw new CliError('AGENT_NOT_FOUND', `agent ${agentId} not found on chain`, {
-        remedy: '0g-agentdna list   # to discover existing agents',
+      throw new CliError('AGENT_NOT_FOUND', `agent ${agentId} does not exist on this attestor's chain`, {
+        remedy: `${cmdStep('list')} shows the agents here`,
       });
     }
     try {
@@ -99,13 +102,13 @@ export async function run(ctx: CommandContext): Promise<void> {
     try {
       row = bySeal(await ag.agent.listDeployments());
     } catch (e) {
-      note(`attestor listing unavailable (${(e as Error).message}) — chain-only view`);
+      note(`attestor listing unavailable (${explainError(e).message}) — chain-only view`);
     }
 
     // Not minted AND no deployment row → the sealId leads nowhere.
     if (!row && agentId === null) {
       throw new CliError('AGENT_NOT_FOUND', `seal ${sealId} has no deployment and no minted agent`, {
-        remedy: '0g-agentdna list   # to discover existing agents',
+        remedy: `${cmdStep('list')} shows the agents here`,
       });
     }
 
@@ -115,10 +118,10 @@ export async function run(ctx: CommandContext): Promise<void> {
         try {
           row = bySeal(await ag.agent.listMyDeployments()) ?? row;
         } catch (e) {
-          note(`could not fetch the owner-tier failure reason (${(e as Error).message})`);
+          note(`could not fetch the owner-tier failure reason (${explainError(e).message})`);
         }
       } else {
-        note('failure reason is owner-only — set AGENTIC_PRIVATE_KEY to see it');
+        note(`the failure reason is owner-only: ${shellTo('login', 'save your owner key')} (or set AGENTIC_PRIVATE_KEY), then look again`);
       }
     }
   }
@@ -149,22 +152,22 @@ export async function run(ctx: CommandContext): Promise<void> {
   };
   if (data.phase === 'failed') {
     // retry preserves the minted identity; a redeploy would orphan it.
-    data.hint = 'recover with retry (keeps the on-chain identity) — SDK: await ag.agent.retry(sealId); do NOT redeploy';
+    data.hint = `${shellTo(`retry ${agentId ?? data.agentId ?? `0x${(sealId ?? '').slice(2, 12)}`}`, 'recover it under the same on-chain identity')} — do not redeploy`;
   }
 
   if (ctx.json) {
     emitOk(data);
     return;
   }
+  // An 11-column label: the 66-character sealId line fits 80 columns.
   const show = (v: unknown): string => (v === null || v === undefined ? '—' : String(v));
-  print(`agentId:        ${show(data.agentId)}`);
-  print(`sealId:         ${show(data.sealId)}`);
-  print(`agentSeal:      ${show(data.agentSeal)}`);
-  print(`owner:          ${show(data.owner)}`);
-  print(`phase:          ${show(data.phase)}`);
-  print(`url:            ${show(data.url)}`);
-  print(`name:           ${show(data.name)}`);
-  print(`createdAt:      ${show(data.createdAt)}`);
-  print(`failureReason:  ${show(data.failureReason)}`);
-  if (data.hint) print(`hint:           ${data.hint}`);
+  print(`agentId:   ${show(data.agentId)}`);
+  print(`sealId:    ${show(data.sealId)}`);
+  print(`agentSeal: ${show(data.agentSeal)}`);
+  print(`owner:     ${show(data.owner)}`);
+  print(`phase:     ${show(data.phase)}`);
+  print(`name:      ${show(data.name)}`);
+  print(`createdAt: ${show(data.createdAt)}`);
+  print(`failure:   ${show(data.failureReason)}`);
+  if (data.hint) print(`hint:      ${data.hint}`);
 }

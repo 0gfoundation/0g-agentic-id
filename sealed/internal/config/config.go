@@ -31,6 +31,12 @@
 //	                            framework binding (local dev); the binding is authoritative
 //	SANDBOX_PROXY_DOMAIN,       (optional) compose the public URL (composePublicURL)
 //	DAYTONA_SANDBOX_ID
+//	SEALED_HASH                 set by the loader (cmd/loader) for the sealed it starts:
+//	                            the sha256 it verified, 64 lowercase hex. Unset when
+//	                            sealed is PID 1. Reported at /provision under the
+//	                            layered runtime (sealed/LAYERS.md)
+//	SEALED_TRIAL                set by the loader ("1") when it starts a sealed version
+//	                            that has not come up in this container yet
 //
 // CHAIN_RPC_URL and INDEXER_URL are public and must not embed credentials
 // (an API token in the URL's userinfo, path or query). sealed prints both in
@@ -82,6 +88,9 @@ type Bootstrap struct {
 	ProviderSigner common.Address
 
 	// Optional pipeline knobs
+	// APIKey is the create/reset model key, in clear (API_KEY) or opened from
+	// SecretEnv, and InferenceCredential its binding. LEGACY(model-key): see
+	// internal/secretenv.
 	APIKey              string
 	InferenceCredential *inference.ProviderCredential
 	StatusBinding       *report.Binding
@@ -103,6 +112,7 @@ type Bootstrap struct {
 	// be opened only after Phase 1 (it is sealed to agentSeal_priv) and is
 	// bound to the on-chain owner, so main opens it after Phase 2 and
 	// overwrites APIKey with the result (internal/secretenv).
+	// LEGACY(model-key).
 	SecretEnv string
 
 	// Framework is the raw AGENT_FRAMEWORK env value (may be empty). The
@@ -118,6 +128,15 @@ type Bootstrap struct {
 	// proxy infrastructure). See ARCHITECTURE.zh.md §8
 	// (AGENT_PUBLIC_URL 怎么暴露给 agent).
 	PublicURL string
+
+	// SealedHash is SEALED_HASH: this program's sha256 as the loader
+	// verified it, 64 lowercase hex, or "" when sealed is PID 1 (no loader).
+	// A malformed value is passed on as is, and provisioning refuses it.
+	SealedHash string
+	// Trial is SEALED_TRIAL=1: this version has not come up in this
+	// container yet, and the loader moves to another one if it exits before
+	// it has (layers.go).
+	Trial bool
 }
 
 // Load reads env vars and runs the certificate self-check (Phase 0). Returns
@@ -170,6 +189,8 @@ func Load() (*Bootstrap, error) {
 		FallbackIndexer:      os.Getenv("INDEXER_URL"),
 		Framework:            strings.TrimSpace(os.Getenv("AGENT_FRAMEWORK")),
 		PublicURL:            composePublicURL(),
+		SealedHash:           os.Getenv("SEALED_HASH"),
+		Trial:                os.Getenv("SEALED_TRIAL") == "1",
 	}, nil
 }
 

@@ -93,6 +93,8 @@ impl std::error::Error for SandboxError {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalSignedMessage {
     pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentic_id: Option<crate::auth::operator::RuntimeBinding>,
     pub expires_at: i64,
     pub nonce: String,
     pub payload: serde_json::Value,
@@ -284,6 +286,17 @@ where
 /// locations, proxy endpoints, the Go runtime's settings), and gives each
 /// framework only variables it names itself, so no other owner variable has
 /// a consumer.
+///
+/// LEGACY(model-key): model keys go into the agent's credential set, which
+/// reaches every boot through `/provision`. This is the copy sent with the
+/// create, for images that read only that. It goes in two steps: once every
+/// image reads model keys from the set, clients stop sending it; once no
+/// client sends it any more (SDK and CLI releases until then, this one
+/// included; this attestor's console until it stores keys in the set;
+/// integrators on `sealedSecretEnv`), empty this list, and
+/// `secret_env_scheme` in `GET /config` goes with it. Until then every
+/// create that carries it is logged ([`check_owner_env`]), which shows when
+/// none does.
 const OWNER_ENV_KEYS: [&str; 2] = ["API_KEY", "SEAL_SECRET_ENV"];
 
 /// Why an owner-signed create `env` is refused: it names a variable other
@@ -306,8 +319,29 @@ fn owner_env_refusal(env: &serde_json::Map<String, serde_json::Value>) -> Option
 pub fn check_owner_env(payload: &serde_json::Value) -> Result<(), String> {
     match payload.get("env") {
         None => Ok(()),
-        Some(serde_json::Value::Object(env)) => owner_env_refusal(env).map_or(Ok(()), Err),
+        Some(serde_json::Value::Object(env)) => {
+            owner_env_refusal(env).map_or(Ok(()), Err)?;
+            note_request_key(env);
+            Ok(())
+        }
         Some(_) => Err("canonical.payload.env must be a JSON object".into()),
+    }
+}
+
+/// LEGACY(model-key): log a create that carries the model key with the
+/// request, by variable name only, so the operator sees when no client sends
+/// it any more ([`OWNER_ENV_KEYS`]).
+fn note_request_key(env: &serde_json::Map<String, serde_json::Value>) {
+    let carried: Vec<&str> = OWNER_ENV_KEYS
+        .iter()
+        .copied()
+        .filter(|key| env.contains_key(*key))
+        .collect();
+    if !carried.is_empty() {
+        tracing::info!(
+            variables = ?carried,
+            "LEGACY(model-key): an owner's create carries the model key with the request"
+        );
     }
 }
 
@@ -493,7 +527,10 @@ fn check_envelope_provider(
 /// the container this create made.
 fn created_container_pubkey(body: &str, seal_id: SealId) -> Option<Vec<u8>> {
     let response: serde_json::Value = serde_json::from_str(body).ok()?;
-    let raw = response.get("env")?.get("SANDBOX_SEAL_ATTESTATION")?.as_str()?;
+    let raw = response
+        .get("env")?
+        .get("SANDBOX_SEAL_ATTESTATION")?
+        .as_str()?;
     let certificate: crate::image_attestation::Certificate = serde_json::from_str(raw).ok()?;
     let parsed = certificate.parse().ok()?;
     (parsed.seal_id == seal_id).then(|| parsed.pubkey.to_vec())
@@ -508,10 +545,12 @@ fn apply_boot_ticket(env: &mut serde_json::Map<String, serde_json::Value>, ticke
 
 #[async_trait]
 impl SandboxClient for HttpSandbox {
-    async fn authenticated_service_identity(&self) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
-        let discovery = self.discovery.as_ref().ok_or_else(|| anyhow::anyhow!(
-            "workload attestation requires authenticated sandbox discovery"
-        ))?;
+    async fn authenticated_service_identity(
+        &self,
+    ) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
+        let discovery = self.discovery.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("workload attestation requires authenticated sandbox discovery")
+        })?;
         Ok(Some(discovery.service_identity().await?))
     }
 
@@ -655,9 +694,9 @@ impl SandboxClient for HttpSandbox {
         let Some(signer) = &self.admin_signer else {
             tracing::warn!(
                 %sandbox_id,
-                "sandbox admin_delete: no admin signer configured, skipping cleanup"
+                "sandbox admin_delete: no admin signer configured; cleanup remains pending"
             );
-            return Ok(());
+            anyhow::bail!("sandbox admin_delete requires an admin signer; cleanup must be retried");
         };
         if sandbox_id.is_empty() {
             anyhow::bail!("sandbox admin_delete: empty sandbox_id");
@@ -675,6 +714,7 @@ impl SandboxClient for HttpSandbox {
             hex::encode(buf)
         };
         let canonical = CanonicalSignedMessage {
+            agentic_id: None,
             action: "stop".into(),
             expires_at: chrono::Utc::now().timestamp() + 240,
             nonce,
@@ -737,7 +777,7 @@ impl SandboxClient for HttpSandbox {
             }
         }
         let (status, body) = res?;
-        if !status.is_success() {
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
             return Err(SandboxError::new("admin_delete", status.as_u16(), body).into());
         }
         tracing::info!(%sandbox_id, signer = %addr_hex, "sandbox: admin force-delete ok");
@@ -764,6 +804,7 @@ impl SandboxClient for HttpSandbox {
             hex::encode(buf)
         };
         let canonical = CanonicalSignedMessage {
+            agentic_id: None,
             action: "get_sandbox".into(),
             expires_at: chrono::Utc::now().timestamp() + 240,
             nonce,
@@ -974,8 +1015,14 @@ mod tests {
             Some(&key[..])
         );
         // Another seal's certificate, none, or a malformed one: no key.
-        assert_eq!(created_container_pubkey(&attested, SealId::repeat_byte(0xbb)), None);
-        assert_eq!(created_container_pubkey(&body(serde_json::json!({})), seal), None);
+        assert_eq!(
+            created_container_pubkey(&attested, SealId::repeat_byte(0xbb)),
+            None
+        );
+        assert_eq!(
+            created_container_pubkey(&body(serde_json::json!({})), seal),
+            None
+        );
         assert_eq!(
             created_container_pubkey(
                 &body(serde_json::json!({"SANDBOX_SEAL_ATTESTATION": "{}"})),
@@ -1083,7 +1130,10 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let expires_at = chrono::Utc::now().timestamp() + 1;
+        // At least a second ahead, so the create is sent before the lease
+        // ends even with other tests running alongside; the server answers
+        // only after it.
+        let expires_at = chrono::Utc::now().timestamp() + 2;
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = vec![0u8; 4096];
@@ -1200,6 +1250,7 @@ mod tests {
         );
         sandbox.http = reqwest::Client::builder().no_proxy().build().unwrap();
         let canonical = CanonicalSignedMessage {
+            agentic_id: None,
             action: "start".into(),
             expires_at: 9_999_999_999,
             nonce: "0123456789abcdef0123456789abcdef".into(),
@@ -1299,6 +1350,7 @@ mod tests {
 
     fn make_envelope(sk: &SigningKey, addr: Address) -> (SandboxEnvelope, CanonicalSignedMessage) {
         let canonical = CanonicalSignedMessage {
+            agentic_id: None,
             action: "create".to_string(),
             expires_at: 9_999_999_999,
             nonce: "0123456789abcdef0123456789abcdef".to_string(),
@@ -1588,6 +1640,7 @@ mod tests {
         let signer = AdminSigner::from_priv(priv_bytes).unwrap();
 
         let canonical = CanonicalSignedMessage {
+            agentic_id: None,
             action: "stop".into(),
             expires_at: 9_999_999_999,
             nonce: "deadbeefcafebabedeadbeefcafebabe".into(),

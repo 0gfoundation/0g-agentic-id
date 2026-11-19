@@ -53,6 +53,9 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - ./.env:/app/.env:ro
+      # The release file's directory (ATTESTOR_RELEASES_FILE, README "Announcing
+      # a release"): a directory, so a file replaced by rename is seen.
+      - ./releases:/etc/attestor/releases:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

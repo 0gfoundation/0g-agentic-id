@@ -1,38 +1,88 @@
 # Sealed sandbox runtime image — 0g-harness flavour.
 #
-# Per-framework image, node-only: 0g-harness
-# (github.com/0gfoundation/0g-harness), installed below, composes the DeepSeek
-# Harness (DSH) plugin tree in-process and serves the owner's /v1/ surface. No
-# Python runtime, unlike images/prime/.
+# Per-framework image: 0g-harness (github.com/0gfoundation/0g-harness)
+# composes the DeepSeek Harness (DSH) plugin tree in-process and serves the
+# owner's /v1/ surface. The harness itself runs on node.
 #
-# Contents beyond debian-slim: node, ca-certificates (chain RPC + 0G storage +
-# router TLS), git and procps (the adapter's orphan sweep), 0g-harness with its
-# locked DSH dependency tree, the sealed bootstrap binary, and
-# 0g-storage-client.
+# The image is base and the loader (cmd/loader) only: debian-slim, node,
+# python3 (an interpreter hosted MCP services may name; sealed's network
+# adapter for it is built into sealed), a browser for the owner's agent
+# (Chromium, the Playwright MCP server and sealed-browser-mcp, which the owner
+# turns on in the agent's settings), ca-certificates (chain RPC + 0G storage +
+# router TLS), git and procps (the adapter's orphan sweep), poppler-utils
+# (pdftotext, for uploaded PDFs), 0g-storage-client, and /loader. It carries no sealed program and no harness package
+# (sealed/LAYERS.md §2): the loader reads the trust registry's sealed list on
+# chain, downloads the version to run from the official `artifacts` release,
+# checks that it hashes to its listed name and runs it; that sealed installs
+# the harness package the harness list names the same way, into
+# /opt/0g-harness/<sha256>/ (root's, read-only to the agent). The sealed
+# program is also the launcher that confines each hosted service process (it
+# runs its own executable in launcher mode, internal/servicesandbox), so a
+# sealed version always runs with its own launcher. The image hash covers base
+# and the loader; what runs on top is what the chain lists.
 #
-# The composition is authored in the harness's code, installed here at build
-# time — NOT in a cordis.yml / profile / bundle the agent can reach — so it
-# rides the image hash and an agent editing $DSH_HOME cannot change what mounts
-# next boot.
+# This file builds both of them too. The sealed program (stage 2) and the
+# harness package (stage 3) are exported, put on the `artifacts` release
+# (each asset named by its sha256) and listed on the trust registry's sealed
+# and harness lists:
 #
-# Build context = sealed/ (for the bootstrap COPY):
+#   cd sealed && docker buildx build --pull --target bootstrap-builder --output type=tar,dest=- -f images/harness/Dockerfile . | tar -xOf - app/bootstrap > sealed
+#   cd sealed && docker buildx build --pull --target harness-package --build-arg HARNESS_REF=… --output type=tar,dest=- -f images/harness/Dockerfile . | tar -xOf - out/0g-harness.tgz > 0g-harness.tgz
+#
+# The builds print the sha256 of each ("sealed program sha256", "0g-harness
+# package sha256"); check that the exported file hashes to it. A new sealed
+# or harness version needs no new image: build it with the same command
+# (HARNESS_REF naming the harness commit, whose version must pass the
+# whitelist check below), publish it and list its hash. Agents take it by
+# the version rule (sealed/LAYERS.md §3.1, §5.3): the owner's pick, or the
+# newest listed one for a new container or once the running version is
+# delisted. HARNESS_REF in this file names the version built by default.
+#
+# The composition is authored in the harness's code — NOT in a cordis.yml /
+# profile / bundle the agent can reach — so it rides the package hash and an
+# agent editing $DSH_HOME cannot change what mounts next boot.
+#
+# Build context = sealed/ (for the loader's COPY):
 #
 #   cd sealed && docker build -t 0g-sealed-harness:0.1.0 -f images/harness/Dockerfile .
 #
-# Release checklist: a new image hash must be added to on-chain
-# validFrameworkHashes or the attestor destroys the container right after
-# provision. The container does not check that the agent's framework matches
-# the image: an 0g-harness agent booted on an image without the harness fails
-# at framework start. The SDK picks the image by the agent's framework from
-# the attestor's GET /config frameworks[] (ATTESTOR_FRAMEWORKS).
+# Release checklist:
+#   1. Before any container of a new image boots, a sealed program and a
+#      harness package that run on it are on the `artifacts` release and on
+#      the trust registry's sealed and harness lists. A container whose loader
+#      finds no listed sealed it can run, or whose sealed finds no listed
+#      harness package, runs nothing and waits for a listing.
+#   2. The image hash is on the trust registry's image list, or the attestor
+#      destroys the container right after provision.
+#   3. A base on another node version (NODE_VERSION, both stages) needs
+#      harness packages built on it (stage 3): the package's native modules
+#      run only on the node they were built for. List them before its image
+#      boots; a listed package that does not start on a base is recorded as
+#      failed in that container, and the next listed one starts.
+#   4. The listed sealed carries the hosted-service launcher (it runs itself
+#      in launcher mode; this image has no separate launcher). A sealed built
+#      before that runs here without hosted programs, which report isolation
+#      unavailable: delist those versions once one with the launcher is
+#      listed.
+# Hashes are listed through the registry's owner, the environment's Timelock:
+# a scheduled operation that takes effect after its delay (one day on
+# mainnet, none on testnet and dev); delisting is immediate, by the owner or
+# the guardian. The image runs only on a chain whose AgenticID (1.4.0 or
+# later) names its trust registry. The container does not check that the
+# agent's framework matches the image: an 0g-harness agent booted on an image
+# without the harness fails at framework start. The SDK picks the image by
+# the agent's framework from the attestor's GET /config frameworks[]
+# (ATTESTOR_FRAMEWORKS).
 
-# Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data;
-# uploads run inside the bootstrap binary, through the same client's Go SDK).
+# Stage 1 — 0g-storage-client (used by sealed to download intelligent data;
+# uploads run inside the sealed program, through the same client's Go SDK).
 # The CLI is `go install`ed at the SDK version pinned in go.mod (module
-# checksums verified against the Go checksum database), so the two always
-# move together. A `replace` of the module in go.mod would split them (this
-# would install upstream's CLI while sealed links the replacement), so the
-# stage refuses to build with one.
+# checksums verified against the Go checksum database), so the image's CLI
+# and the sealed built from the same tree agree. The image keeps its CLI
+# while sealed versions change on top of it: a sealed version that needs
+# another CLI needs a new image. A `replace` of the module in go.mod would
+# split them (this would install upstream's CLI while sealed links the
+# replacement), so the stage refuses to build with one.
 FROM golang:1.24-alpine AS storage-builder
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -41,24 +91,86 @@ RUN V=$(go list -m -f '{{.Version}}' github.com/0gfoundation/0g-storage-client) 
  && test -z "$(go list -m -f '{{if .Replace}}replaced{{end}}' github.com/0gfoundation/0g-storage-client)" \
  && CGO_ENABLED=0 GOBIN=/out go install -ldflags="-s -w" "github.com/0gfoundation/0g-storage-client@$V"
 
-# Stage 2 — sealed bootstrap binary.
+# Stage 2 — the sealed program and the loader. Only the loader goes into the
+# image; the sealed program is exported and published (see the top of this
+# file), and the loader downloads it by hash. sealed is built with the
+# harnessonly tag: the 0g-harness adapter is the only one in it
+# (adapters_harnessonly.go); the other frameworks' images build it without
+# the tag, and run it as PID 1.
 FROM golang:1.24-alpine AS bootstrap-builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
 COPY internal/ ./internal/
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap .
+COPY cmd/ ./cmd/
+RUN CGO_ENABLED=0 GOOS=linux go build -tags harnessonly -ldflags="-s -w" -o bootstrap . \
+ && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o loader ./cmd/loader \
+ && echo "sealed program sha256 $(sha256sum bootstrap | cut -d' ' -f1)"
 
-# Stage 3 — runtime.
+# Stage 3 — the 0g-harness official version package, built on the runtime's
+# own base and node: node-pty (pulled in by bash-local → subprocess-local) is
+# a native module, so the package runs only on the node it was built for
+# (NODE_VERSION here and in the runtime stage must match). The image does not
+# carry it: it is exported and published (see the top of this file), and
+# sealed installs it by hash.
+#
+# 0g-harness is installed globally, with the whole DSH plugin tree as its own
+# dependencies, locked exactly, with integrity hashes, by its
+# npm-shrinkwrap.json; it resolves its @deepseek-ai/* imports from its own
+# node_modules. HARNESS_REF names one exact build: the source archive of one
+# repository commit, over https — npm installs it as a package archive, with
+# no git and no install-time scripts of its own (a git URL to GitHub makes npm
+# reach for ssh, which the image does not have) — or a published version
+# (@0gfoundation/0g-harness@<version>).
+#
+# The build then checks the one thing the package must agree on with the
+# sealed binary: its 0g-harness version is the version whitelist.go records in
+# every 0g-harness agent's chain-tracked framework role (its last entry,
+# whitelistMax). A mismatch fails the build, not a boot.
+#
+# The package is the installed directory as a deterministic tar (names
+# sorted, owner 0, mtime 0, hard links stored as files, gzip without a
+# timestamp). It may hold only directories, regular files and links that stay
+# inside it, which is all sealed unpacks (internal/layers); anything else
+# fails the build.
+FROM debian:13-slim AS harness-package
+ARG NODE_VERSION=24.22.3
+ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/4de3655d24fc573180931171c17f2275e6278d7f
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl xz-utils python3 make g++ \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+      -o /tmp/node.tar.xz \
+ && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
+ && rm /tmp/node.tar.xz
+COPY internal/framework/harness/whitelist.go /tmp/harness-whitelist.go
+RUN npm install -g --no-fund --no-audit "${HARNESS_REF}" \
+ && H=/usr/local/lib/node_modules/@0gfoundation/0g-harness \
+ && test -f "$H/bin/0g-harness.mjs" \
+ && GOT="$(node -p "require('$H/package.json').version")" \
+ && WANT="$(sed -n '/supportedVersions = \[\]string{/,/^}/p' /tmp/harness-whitelist.go | grep -oE '"[^"]+"' | tail -1 | tr -d '"')" \
+ && if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "installed 0g-harness $GOT but whitelist.go records $WANT in the framework role" >&2; exit 1; fi \
+ && echo "packaging 0g-harness $GOT with DSH $(node -p "require('$H/node_modules/@deepseek-ai/dsh-agent/package.json').version")" \
+ && if [ -n "$(find "$H" ! -type d ! -type f ! -type l)" ]; then echo "the package holds an entry that is not a directory, file or link" >&2; exit 1; fi \
+ && if [ -n "$(find "$H" -type l -lname '/*')" ]; then echo "the package holds a link with an absolute target" >&2; exit 1; fi \
+ && (cd "$H" && find . -type l | while read -r l; do r="$(realpath -m --relative-to=. "$(dirname "$l")/$(readlink "$l")")"; case "$r" in ..|../*) echo "link $l leaves the package" >&2; exit 1;; esac; done) \
+ && mkdir -p /out \
+ && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --hard-dereference --format=gnu -C "$H" -cf - . | gzip -n -9 > /out/0g-harness.tgz \
+ && echo "0g-harness package sha256 $(sha256sum /out/0g-harness.tgz | cut -d' ' -f1)"
+
+# Stage 4 — runtime.
 FROM debian:13-slim
 
+# poppler-utils: pdftotext and pdfinfo, so the agent reads the PDFs its
+# owner uploads (POST /v1/files lands them in the file inbox ~/inbox).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils \
+ && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils python3 poppler-utils \
+ && command -v pdftotext \
  && rm -rf /var/lib/apt/lists/*
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):
-# sealed (root, PID 1) drops the agent process to it so the agent cannot
+# sealed (root, the loader's child) drops the agent process to it so the agent cannot
 # read sealed's memory or bootstrap env. Its home is /home/agent, which
 # sealed creates at boot (agent:agent 0700, privsep.PrepareAgentHome) and
 # which is HOME for everything the agent runs, so its tools' caches and
@@ -79,7 +191,7 @@ RUN useradd --system --no-create-home --home-dir /home/agent --shell /usr/sbin/n
 ENV HOME=/root
 
 # Node from the official tarball (debian's node is too old for the SDK).
-ARG NODE_VERSION=24.22.1
+ARG NODE_VERSION=24.22.3
 #
 # --no-same-owner: the release tarball records its build user's uid/gid
 # (1001), and GNU tar run as root restores it by default — onto
@@ -94,41 +206,32 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
  && rm /tmp/node.tar.xz \
  && node --version && npm --version
 
-# Install 0g-harness globally, at /usr/local/lib/node_modules/@0gfoundation/0g-harness
-# — the entry spawn.go runs (harnessEntry). It brings the whole DSH plugin tree
-# as its own dependencies, locked exactly, with integrity hashes, by its
-# npm-shrinkwrap.json, and resolves its @deepseek-ai/* imports from its own
-# node_modules. HARNESS_REF names one exact build: the source archive of one
-# repository commit, over https — npm installs it as a package archive, with no
-# git and no install-time scripts of its own (a git URL to GitHub makes npm
-# reach for ssh, which the image does not have) — or a published version
-# (@0gfoundation/0g-harness@<version>).
-#
-# node-pty (pulled in by bash-local → subprocess-local) is a native module, so
-# a build toolchain is present during install, then purged to keep the image
-# slim.
-#
-# The build then checks the one thing the image must agree on with the sealed
-# binary: the installed 0g-harness version is the version whitelist.go records
-# in every 0g-harness agent's chain-tracked framework role (its last entry,
-# whitelistMax). A mismatch fails the build, not a boot.
-ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/2a5ffb38ccac7e5590463cf98fa3e6fb52a526bd
-COPY internal/framework/harness/whitelist.go /tmp/harness-whitelist.go
+# The owner's agent's browser, off until the owner lists it in the agent's
+# settings (others.mcpServers, see images/harness/browser-mcp.mjs): Debian's
+# Chromium with Latin and CJK fonts, the Playwright MCP server at a pinned
+# version (its playwright and playwright-core are pinned exactly by it; no
+# browser download, it drives /usr/bin/chromium), and sealed-browser-mcp,
+# which starts it headless behind sealed's credential proxy. Root's, like the
+# rest of /usr: the agent can run them, not change them.
+ARG PLAYWRIGHT_MCP_VERSION=0.0.84
 RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 make g++ \
- && npm install -g --no-fund --no-audit "${HARNESS_REF}" \
- && H=/usr/local/lib/node_modules/@0gfoundation/0g-harness \
- && test -f "$H/bin/0g-harness.mjs" \
- && GOT="$(node -p "require('$H/package.json').version")" \
- && WANT="$(sed -n '/supportedVersions = \[\]string{/,/^}/p' /tmp/harness-whitelist.go | grep -oE '"[^"]+"' | tail -1 | tr -d '"')" \
- && if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "installed 0g-harness $GOT but whitelist.go records $WANT in the framework role" >&2; exit 1; fi \
- && echo "baked 0g-harness $GOT with DSH $(node -p "require('$H/node_modules/@deepseek-ai/dsh-agent-spine-demo/package.json').version")" \
- && rm /tmp/harness-whitelist.go \
- && apt-get purge -y python3 make g++ && apt-get autoremove -y \
- && rm -rf /var/lib/apt/lists/* /root/.npm
+ && apt-get install -y --no-install-recommends chromium fonts-liberation fonts-noto-cjk \
+ && rm -rf /var/lib/apt/lists/* \
+ && chromium --version \
+ && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install -g --no-fund --no-audit "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" \
+ && test "$(node -p "require('/usr/local/lib/node_modules/@playwright/mcp/package.json').version")" = "${PLAYWRIGHT_MCP_VERSION}" \
+ && command -v playwright-mcp
+COPY images/harness/browser-mcp.mjs /usr/local/bin/sealed-browser-mcp
+RUN chown root:root /usr/local/bin/sealed-browser-mcp && chmod 0755 /usr/local/bin/sealed-browser-mcp
+
+# Where sealed installs the harness packages it runs:
+# /opt/0g-harness/<sha256 of the package>/, root's, directories 0755 and
+# files 0644 (0755 when executable). The agent user can read and run them,
+# not change them. Empty in the image.
+RUN install -d -o root -g root -m 0755 /opt/0g-harness
 
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
-COPY --from=bootstrap-builder /app/bootstrap /bootstrap
+COPY --from=bootstrap-builder /app/loader /loader
 
 # sealed resolves every command it runs by name — as root (RootCommand) and
 # as the agent (AgentCommand, Sweep) alike — only through PATH directories
@@ -136,7 +239,7 @@ COPY --from=bootstrap-builder /app/bootstrap /bootstrap
 # and the resolved binary must be root-owned too (privsep.LookPath; the boot
 # log lists PATH entries it rejected). Fail the build, rather than the first
 # boot, when that does not hold for a command sealed needs here.
-RUN for c in npm node pkill 0g-storage-client; do \
+RUN for c in npm node python3 pkill 0g-storage-client; do \
       w="$(command -v "$c")" || { echo "$c: not on PATH" >&2; exit 1; }; \
       for p in "$(readlink -f "$w")" "$(readlink -f "$(dirname "$w")")"; do \
         while :; do \
@@ -149,9 +252,13 @@ RUN for c in npm node pkill 0g-storage-client; do \
       done; \
     done
 
-# Bootstrap runs as PID 1 and spawns the harness once it has restored the
-# agent's iData. ENTRYPOINT is REQUIRED on a standalone (non-0g-sandbox-base)
-# image — without it the container boots a shell, never runs sealed, and fails
-# as a provision timeout.
-ENTRYPOINT ["/bootstrap"]
+# The loader runs as PID 1: it picks the sealed version the chain lists,
+# downloads it, checks it against its hash right before it runs it as its
+# child, forwards stop signals, reaps orphans, switches to the versions sealed
+# stages for it, and restarts a sealed that exits (cmd/loader). sealed
+# installs the harness package and spawns the harness once it has restored
+# the agent's iData. ENTRYPOINT is REQUIRED on a standalone
+# (non-0g-sandbox-base) image — without it the container boots a shell, never
+# runs sealed, and fails as a provision timeout.
+ENTRYPOINT ["/loader"]
 EXPOSE 8080

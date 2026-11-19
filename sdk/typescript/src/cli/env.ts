@@ -6,7 +6,7 @@
  * CI logs), env is not.
  */
 
-import { CliError } from './errors';
+import { CliError, currentSurface, shellStep, shellTo } from './errors';
 import { loadConfig, loadKey, normalizeKey } from './config';
 
 /** Resolved CLI environment. All values come from `process.env`. */
@@ -14,6 +14,9 @@ export interface CliEnv {
   /** `AGENTIC_ATTESTOR_URL` — one URL selects the whole environment
    *  (contracts, chain RPC, appIds via the attestor's GET /config). */
   attestorUrl?: string;
+  /** Where `attestorUrl` came from — a remedy names the place to fix it
+   *  (the env var, or `login`). */
+  attestorUrlSource?: 'env' | 'file';
   /** `AGENTIC_PRIVATE_KEY` — optional owner key. Enables `--mine`,
    *  owner-tier failure reasons, and doctor's owner checks. */
   privateKey?: `0x${string}`;
@@ -38,8 +41,10 @@ export function readEnv(env: NodeJS.ProcessEnv = process.env): CliEnv {
   };
   const file = loadConfig(env);
   const fileKey = loadKey(env);
+  const envUrl = pick('AGENTIC_ATTESTOR_URL');
   return {
-    attestorUrl: (pick('AGENTIC_ATTESTOR_URL') ?? file.attestorUrl)?.replace(/\/$/, ''),
+    attestorUrl: (envUrl ?? file.attestorUrl)?.replace(/\/$/, ''),
+    ...(envUrl ? { attestorUrlSource: 'env' as const } : file.attestorUrl ? { attestorUrlSource: 'file' as const } : {}),
     // env keys are normalized like login input (0x prefix optional); a
     // malformed value passes through so requirePrivateKey can name the problem.
     ...((): Pick<CliEnv, 'privateKey' | 'privateKeySource'> => {
@@ -52,11 +57,19 @@ export function readEnv(env: NodeJS.ProcessEnv = process.env): CliEnv {
   };
 }
 
+/** How to set the attestor URL, from where the owner is: `login` saves it;
+ *  a one-shot command also takes the env var. */
+export function attestorUrlRemedy(): string {
+  return currentSurface() === 'shell'
+    ? `${shellStep('login')} sets it`
+    : `${shellStep('login')}, or export AGENTIC_ATTESTOR_URL=https://agentdna.0g.ai`;
+}
+
 /** Attestor URL or a remediable failure (exit 3) naming the exact fix. */
 export function requireAttestorUrl(env: CliEnv): string {
   if (!env.attestorUrl) {
-    throw new CliError('MISSING_ATTESTOR_URL', 'AGENTIC_ATTESTOR_URL is not set — the CLI cannot reach an environment without it', {
-      remedy: 'export AGENTIC_ATTESTOR_URL=https://agentdna.0g.ai   # or your own attestor',
+    throw new CliError('MISSING_ATTESTOR_URL', 'no attestor URL is set — the CLI cannot reach an environment without it', {
+      remedy: attestorUrlRemedy(),
     });
   }
   return env.attestorUrl;
@@ -67,8 +80,10 @@ export function requireAttestorUrl(env: CliEnv): string {
  *  remedy instead of a deep viem stack trace later. */
 export function requirePrivateKey(env: CliEnv): `0x${string}` {
   if (!env.privateKey) {
-    throw new CliError('WALLET_REQUIRED', 'this operation needs the owner wallet, and AGENTIC_PRIVATE_KEY is not set', {
-      remedy: 'export AGENTIC_PRIVATE_KEY=0x…   # env only — there is no flag for this, by design',
+    throw new CliError('WALLET_REQUIRED', 'this needs your owner key, and none is set', {
+      remedy: currentSurface() === 'shell'
+        ? `${shellStep('login')} saves it`
+        : `${shellStep('login')}, or export AGENTIC_PRIVATE_KEY=0x…   # env only — there is no flag for this, by design`,
     });
   }
   if (!/^0x[0-9a-fA-F]{64}$/.test(env.privateKey)) {
@@ -81,7 +96,7 @@ export function requirePrivateKey(env: CliEnv): `0x${string}` {
         : 'AGENTIC_PRIVATE_KEY is set but malformed (expected 64 hex chars, 0x prefix optional)',
       {
         remedy: env.privateKeySource === 'file'
-          ? 'run `login` and re-enter the key'
+          ? shellTo('login', 'enter the key again')
           : 'export AGENTIC_PRIVATE_KEY=0x<64 hex chars>   # or unset it to use the login-saved key',
       },
     );

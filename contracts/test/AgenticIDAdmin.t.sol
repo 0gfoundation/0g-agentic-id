@@ -13,7 +13,16 @@ contract AgenticIDAdminTest is AgenticIDTestBase {
     address internal alice = address(0xA1);
     address internal stranger = address(0xB0B);
 
-    // ── Trusted attestor lifecycle ────────────────────────────────────────────
+    // ── Trusted attestor lifecycle (held by the TrustRegistry) ────────────────
+
+    function test_trustRegistry_isFixedByTheImplementation() public view {
+        assertEq(agenticId.trustRegistry(), address(trustRegistry));
+    }
+
+    function test_constructor_rejectsZeroTrustRegistry() public {
+        vm.expectRevert(AgenticIDZeroAddress.selector);
+        new AgenticID(address(0));
+    }
 
     function test_addTrustedAttestor_enablesRegisterWithSeal() public {
         assertTrue(!agenticId.isTrustedAttestor(attestor), "not whitelisted initially");
@@ -25,7 +34,7 @@ contract AgenticIDAdminTest is AgenticIDTestBase {
         _whitelistAttestor();
 
         vm.prank(owner);
-        agenticId.removeTrustedAttestor(attestor);
+        trustRegistry.removeTrustedAttestor(attestor);
         assertTrue(!agenticId.isTrustedAttestor(attestor), "attestor removed");
 
         // Subsequent registerWithSeal from (now-former) attestor must revert.
@@ -47,39 +56,49 @@ contract AgenticIDAdminTest is AgenticIDTestBase {
                 OwnableUpgradeable.OwnableUnauthorizedAccount.selector, stranger
             )
         );
-        agenticId.addTrustedAttestor(attestor);
+        trustRegistry.addTrustedAttestor(attestor);
     }
 
-    // ── validFrameworkHashes lifecycle ────────────────────────────────────────
+    // ── Image hashes (the TrustRegistry's image list) ─────────────────────────
 
-    function test_frameworkHashes_addRemoveAndQuery() public {
+    function test_frameworkHashes_followTheImageList() public {
         bytes32 frameworkHashA = keccak256("framework-A");
         bytes32 frameworkHashB = keccak256("framework-B");
+        bytes32 image = trustRegistry.IMAGE();
 
         assertTrue(!agenticId.isValidFrameworkHash(frameworkHashA), "initially unknown");
 
         vm.startPrank(owner);
-        agenticId.addValidFrameworkHash(frameworkHashA);
-        agenticId.addValidFrameworkHash(frameworkHashB);
+        trustRegistry.list(image, frameworkHashA);
+        trustRegistry.list(image, frameworkHashB);
         vm.stopPrank();
 
         assertTrue(agenticId.isValidFrameworkHash(frameworkHashA), "A added");
         assertTrue(agenticId.isValidFrameworkHash(frameworkHashB), "B added");
 
         vm.prank(owner);
-        agenticId.removeValidFrameworkHash(frameworkHashA);
+        trustRegistry.delist(image, frameworkHashA);
         assertTrue(!agenticId.isValidFrameworkHash(frameworkHashA), "A removed");
         assertTrue(agenticId.isValidFrameworkHash(frameworkHashB), "B still there");
     }
 
-    function test_addValidFrameworkHash_revertsWhenNotOwner() public {
+    function test_frameworkHashes_otherKindsDoNotCount() public {
+        bytes32 h = keccak256("sealed-program");
+        bytes32 sealedKind = trustRegistry.SEALED();
+        vm.prank(owner);
+        trustRegistry.list(sealedKind, h);
+        assertTrue(!agenticId.isValidFrameworkHash(h), "a sealed hash is not an image hash");
+    }
+
+    function test_listImage_revertsWhenNotOwner() public {
+        bytes32 image = trustRegistry.IMAGE();
         vm.prank(stranger);
         vm.expectRevert(
             abi.encodeWithSelector(
                 OwnableUpgradeable.OwnableUnauthorizedAccount.selector, stranger
             )
         );
-        agenticId.addValidFrameworkHash(keccak256("fw"));
+        trustRegistry.list(image, keccak256("fw"));
     }
 
     // ── setVerifier ───────────────────────────────────────────────────────────

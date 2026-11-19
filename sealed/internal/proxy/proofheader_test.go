@@ -131,7 +131,7 @@ func TestHandleProxy_ServiceSignedCarriesOnlyGenuineProof(t *testing.T) {
 func TestWSReverseProxy_DropsUpstreamProof(t *testing.T) {
 	resp := &http.Response{StatusCode: http.StatusSwitchingProtocols,
 		Header: http.Header{"X-Agent-Proof": {upstreamProof}, "x-agent-proof": {upstreamProof}}}
-	if err := wsReverseProxy("http://127.0.0.1:1").ModifyResponse(resp); err != nil {
+	if err := (&Server{}).wsReverseProxy("http://127.0.0.1:1").ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse: %v", err)
 	}
 	if h := proofHeaders(&httptest.ResponseRecorder{HeaderMap: resp.Header}); len(h) != 0 {

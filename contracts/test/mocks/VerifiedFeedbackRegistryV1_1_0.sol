@@ -8,7 +8,9 @@ pragma solidity ^0.8.20;
 // and the contract name differ. UpgradeVerifiedFeedback.t.sol uses it as the
 // pre-upgrade beacon impl. Never edit — it stands in for the deployed 1.1.0.
 // NonceRegistryUpgradeable comes from the frozen 1.1.0 copy in ./v1_1_0/ (src
-// changed it in 1.2.0); the interfaces above are still imported live from src,
+// changed it in 1.2.0) and IVerifiedFeedbackRegistry from the frozen copy in
+// ./v1_2_0/ (src changed it in 1.3.0); the other interfaces above are still
+// imported live from src,
 // so if any of those change the fixture may no longer behave like (or share
 // storage layout with) the deployed 1.1.0 — re-check it then.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -20,7 +22,8 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
-import {IVerifiedFeedbackRegistry, TaskReveal} from "../../src/interfaces/IVerifiedFeedbackRegistry.sol";
+import {IVerifiedFeedbackRegistryV1_2_0 as IVerifiedFeedbackRegistry} from "./v1_2_0/IVerifiedFeedbackRegistryV1_2_0.sol";
+import {TaskReveal} from "../../src/interfaces/IVerifiedFeedbackRegistry.sol";
 import {ServeProof} from "../../src/interfaces/IAgenticIDReputationRegistry.sol";
 import {ICanonicalReputationRegistry} from "../../src/interfaces/ICanonicalReputationRegistry.sol";
 import {IAgenticID} from "../../src/interfaces/IAgenticID.sol";

@@ -196,7 +196,9 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_ID=<id> SEAL_ADDR=0x… \
   node scripts/evolution-probe.cjs
 ```
 
-`verify-agent.sh` (needs `curl`, `jq` and `cast`) checks:
+`verify-agent.sh` (needs `curl`, `jq`, `od` and `cast`, and for check 2 node
+≥ 18 with the SDK built: it reads the owner-gated log through
+`sdk/typescript/scripts/owner-log.cjs`) checks:
 1. **identity tri-check** — attestor row == on-chain `getAgentSeal` ==
    the address the container was provisioned with;
 2. **decrypt health** — the sealed bootstrap log has one `decrypted` per
@@ -211,13 +213,20 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_ID=<id> SEAL_ADDR=0x… \
    other than that address fails as
    "proof signed for a different registry"; no `validator` plus a failed
    recovery means a sealed image from before the VerifiedFeedbackRegistry
-   1.2.0 cut (the owner must `/reset`). The console's say-hi verifier and
-   SDK `sayHi()` (0.2.0+) run the same recovery.
+   1.2.0 cut (the owner must `/reset`). A v2 envelope is rebuilt only when it
+   is well-formed, as the SDK requires (`version` the JSON number 2, every
+   hash `0x` + 64 hex, `inference_url` and `model` strings, hashed as their
+   UTF-8 bytes); anything else is "could not rebuild". The image, sealed and
+   harness hashes of a v2 proof must be on the trust registry's lists. The
+   console's say-hi verifier and SDK `sayHi()` (0.2.0+) run the same
+   recovery, and the console the same list check.
 
 `bash scripts/verify-agent.sh --kat` checks step 3's digest offline against
-the cross-implementation known-answer vector (`cast` + `jq` only, no attestor
-or agent); the SDK's `npm test` runs it, and the console's copy, from
-`test/serveproof-copies.test.mjs`.
+the cross-implementation known-answer vectors — v1, v2, and v2 with a
+non-ASCII model — and that malformed v2 envelopes are refused (`cast`, `jq`
+and `od` only, no attestor or agent); `--digest CHAIN_ID IDENTITY_REGISTRY
+VALIDATOR ENVELOPE_JSON` prints the digest for one envelope. The SDK's `npm
+test` runs both, and the console's copy, from `test/serveproof-copies.test.mjs`.
 
 **4. recreate determinism** (the check that guards KMS key stability):
 reset the agent (console button, or SDK `reset({snapshot, apiKey})`),
@@ -315,16 +324,25 @@ sandbox provider and sealed: `crates/shared/testdata/image-attestation-v3.json`
 `AttestorTLS`). The Rust tests recompute each type hash, domain separator,
 struct hash, digest and recovered signer, and read sealed's
 `sealed/internal/inference/testdata/boot-v1-first.json` (first provision,
-carrying the certificate) and `boot-v1.json` (later boot, recorded key). API
+carrying the certificate), `boot-v1.json` (later boot, recorded key) and
+`boot-v2.json` (the layered claim, which signs the sealed hash). API
 tests cover a first boot and later boots, another container key, a changed
 provider instance, an image removed from the allowlist, `409
 certificate_required`, the certificate's issue window, and the
 `/attestor-tls` relay's 200/404/503 answers; the relay tests also check that
 a cached statement is served without consulting sandbox discovery, and still
-while discovery fails during a refresh:
+while discovery fails during a refresh. The layered flow's tests cover
+`layered` in discovery, a listed and an unlisted sealed program (`403`, the
+agent not taken offline, the newest listed version accepted under the same
+generation), a sealed hash outside the signature, a claim without one on a
+layered attestor, a sealed hash on a chain without a trust registry, and an
+unreadable trust registry (`503` at discovery and at the claim). The chain
+client's tests run `trustRegistry()` against a local JSON-RPC endpoint: only
+a revert is "no registry"; an error the node answers for another reason
+(`header not found`, an internal error) or no answer is an error, never kept:
 
 ```bash
-cargo test -p attestor-shared -- image_attestation:: attestor_tls::
+cargo test -p attestor-shared -- image_attestation:: attestor_tls:: auth::status:: chain::
 cargo test -p attestor-api -- provision:: attestor_tls::
 ```
 

@@ -4,8 +4,8 @@ pragma solidity ^0.8.20;
 error AgenticIDInvalidAttestorBinding();
 error AgenticIDAppInstanceMismatch();
 
-/// @dev Inherit this on the facade so its ABI keeps the errors whose reverts
-/// are now produced by linked library code.
+/// @dev Inherited by TrustRegistry so its ABI carries the errors the binding
+///      code reverts with.
 interface IAttestorAppBindingErrors {
     error AgenticIDInvalidAttestorBinding();
     error AgenticIDAppInstanceMismatch();
@@ -23,9 +23,8 @@ interface IAttestorAppRegistry {
     function getAppInfo(string calldata appId) external view returns (AppInfo memory);
 }
 
-/// @dev Keep this field order: bindings already occupy the AgenticID proxy's
-/// namespaced storage. Public library calls receive a storage slot and execute
-/// through DELEGATECALL; the library has no owner, configuration or own state.
+/// @dev Keep this field order: AgenticID 1.3.0 stored bindings in this shape in
+///      its namespaced storage, and TrustRegistry stores them the same way.
 struct AttestorAppBinding {
     address registry;
     string appId;
@@ -33,20 +32,19 @@ struct AttestorAppBinding {
     address appOwner;
 }
 
+/// @notice Binding an attestor to one live Tapp app instance, and checking
+///         that the instance is still the one it was bound to. Internal
+///         helpers for TrustRegistry; the caller emits the events.
 library AttestorAppBindingLib {
-    event TrustedAttestorAppBound(
-        address indexed attestor, address indexed registry, string appId, uint256 registeredAt
-    );
-    event TrustedAttestorRemoved(address indexed attestor);
-
+    /// @dev Records the binding after checking that the registry's current
+    ///      instance of `appId` is the one registered at `registeredAt`.
     function bind(
-        mapping(address => AttestorAppBinding) storage bindings,
-        mapping(address => bool) storage trustedAttestors,
+        AttestorAppBinding storage binding,
         address attestor,
         address registry,
         string memory appId,
         uint256 registeredAt
-    ) public {
+    ) internal {
         if (attestor == address(0) || registry == address(0) || bytes(appId).length == 0) {
             revert AgenticIDInvalidAttestorBinding();
         }
@@ -54,27 +52,17 @@ library AttestorAppBindingLib {
         if (registeredAt == 0 || epoch != registeredAt || appOwner == address(0)) {
             revert AgenticIDAppInstanceMismatch();
         }
-        AttestorAppBinding storage binding = bindings[attestor];
         binding.registry = registry;
         binding.appId = appId;
         binding.registeredAt = registeredAt;
         binding.appOwner = appOwner;
-        trustedAttestors[attestor] = true;
-        emit TrustedAttestorAppBound(attestor, registry, appId, registeredAt);
     }
 
-    function remove(
-        mapping(address => AttestorAppBinding) storage bindings,
-        mapping(address => bool) storage trustedAttestors,
-        address attestor
-    ) public {
-        delete trustedAttestors[attestor];
-        delete bindings[attestor];
-        emit TrustedAttestorRemoved(attestor);
-    }
-
+    /// @dev An unbound attestor is current only while instance binding is not
+    ///      required; a bound one only while its app instance (registeredAt
+    ///      and owner) is unchanged.
     function isCurrent(AttestorAppBinding storage binding, bool instanceRequired)
-        public
+        internal
         view
         returns (bool)
     {

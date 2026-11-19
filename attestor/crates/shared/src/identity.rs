@@ -809,8 +809,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut bytes = [0; 4096];
-            assert!(socket.read(&mut bytes).await.unwrap() > 0);
-            sent.send(()).unwrap();
+            // Under load the client's 50 ms deadline can pass before its
+            // request is written; it then hangs up and this reads nothing,
+            // which bounds the request just the same.
+            let _ = socket.read(&mut bytes).await;
+            let _ = sent.send(());
             std::future::pending::<()>().await;
             drop(socket);
         });

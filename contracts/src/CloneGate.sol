@@ -43,9 +43,10 @@ error CloneGateSourceSealReused(address agentSeal);
 ///         Authorization surfaces reused, none added:
 ///           - `cloneFrom` callers must pass AgenticID's `isTrustedAttestor`
 ///             (the same allowlist the attestor already lives on);
-///           - the gate itself must be on that allowlist too (it is the
+///           - the gate itself must be a trusted attestor too (it is the
 ///             `msg.sender` of the inner `registerWithSeal`) — one
-///             `addTrustedAttestor(gate)` by the AgenticID owner at setup;
+///             `addTrustedAttestor(gate)` / `bindTrustedAttestorApp` by the
+///             TrustRegistry owner at setup (on AgenticID before 1.4.0);
 ///           - pausing AgenticID pauses cloning (registerWithSeal is
 ///             `whenNotPaused`); the gate carries no pause of its own.
 ///

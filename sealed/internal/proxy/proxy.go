@@ -29,10 +29,11 @@
 // streamed (SSE) responses are never signed, nor is anything else. The
 // header is runtime-owned: an X-Agent-Proof set by an upstream backend is
 // dropped on every relay path, so the only one a client ever sees is the one
-// writeServeProof attached. The signature is EIP-191 version 0x00 bound to the
-// VerifiedFeedbackRegistry (see writeServeProof) — not a personal_sign, so
-// there is no verifyMessage-style check: verifiers rebuild the ServeProof hash
-// from the envelope plus their configured deployment and recover the digest.
+// writeServeProofLayered attached. The signature is EIP-191 version 0x00
+// bound to the VerifiedFeedbackRegistry (see writeServeProofLayered) — not a
+// personal_sign, so there is no verifyMessage-style check: verifiers rebuild
+// the ServeProof hash from the envelope plus their configured deployment and
+// recover the digest.
 package proxy
 
 import (
@@ -60,6 +61,7 @@ import (
 	"seal-verify/internal/logger"
 	"seal-verify/internal/privsep"
 	"seal-verify/internal/report"
+	"seal-verify/internal/servicehost"
 	"seal-verify/internal/state"
 )
 
@@ -77,17 +79,23 @@ type Server struct {
 	// chain scan is in flight). Until SetAdapter runs, adapter-backed
 	// endpoints degrade: /_seal/auth 503s, /hello omits services,
 	// /log/agent reports unavailable.
-	mu           sync.RWMutex
-	adapter      framework.Framework
-	agentLogPath string            // adapter's subprocess log file; empty renders "not available"
-	services     []ServiceEntry    // agent-registered external services (see services.go); nil until first POST /services
-	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ every framework path 404s
+	mu             sync.RWMutex
+	adapter        framework.Framework
+	agentLogPath   string         // adapter's subprocess log file; empty renders "not available"
+	services       []ServiceEntry // agent-registered external services (see services.go); nil until first POST /services
+	serviceHost    *servicehost.Manager
+	keeper         agentServiceKeeper // keeps the agent's interfaces across restarts (agentservices.go)
+	strictServices bool
+	fwRoutes       []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ every framework path 404s
 
 	// synth backs the synthesized /v1/responses surface (responses.go) for
 	// adapters that don't serve one natively.
 	synth *synthHub
 
 	readSettings        SettingsReader
+	credentials         CredentialService
+	credUsed            usedMessages // owner-signed credential requests already taken
+	scrubber            Scrubber
 	readRuntimeSettings func() RuntimeSettings
 	applySettings       SettingsApplier
 	applyClear          ClearApplier
@@ -95,6 +103,8 @@ type Server struct {
 	// compact backs POST /_seal/compact (compact.go): its applier plus the
 	// single-flight and replay guards, under their own lock.
 	compact compactState
+	// restart is /_seal/restart (ownerrestart.go).
+	restart ownerRestart
 
 	// Stateful-door conversation binding (framework.ConversationSession),
 	// wired by main.go only for adapters that hold the conversation
@@ -112,6 +122,10 @@ type Server struct {
 	// seat is the single active owner client (see occupancy.go).
 	seat occupantSeat
 
+	// lock closes the container once the agent belongs to another owner
+	// (ownerlock.go).
+	lock ownerLock
+
 	// liveOwner reads the CURRENT on-chain owner. Late-bound like adapter:
 	// the chain client only exists after Phase 2. See verifyOwnerSig for why
 	// the cached owner is not good enough.
@@ -120,11 +134,64 @@ type Server struct {
 	// chainID is the chain the bootstrap client dialled (decimal), late-bound
 	// via SetChainID; it picks the explorer the HTML log pages link to.
 	chainID string
+
+	// proofLayers, when set and ok, makes serve-proofs v2 and names what
+	// they sign beyond v1 (SetProofLayers, sealed/LAYERS.md §7).
+	proofLayers func() (ProofLayers, bool)
+
+	// restartHarness backs POST /harness/restart on the sign socket
+	// (restart.go); nil answers 501.
+	restartHarness func(ctx context.Context) error
+
+	// signLog records what the sign socket signs and refuses (signlog.go).
+	signLog signLog
+	// agenticID is the contract whose iData writes the sign socket does not
+	// sign (signrules.go); zero turns the rule off.
+	agenticID common.Address
 }
 
 // OwnerResolver returns the agent's owner as of right now, by reading the
 // chain. main.go supplies one backed by the bootstrap chain client.
 type OwnerResolver func(ctx context.Context) (string, error)
+
+// SetProofLayers makes every serve-proof a v2 proof (sealed/LAYERS.md §7),
+// signing what f names at that moment; while f does not report ok, nothing
+// is signed. main.go sets it under the layered runtime only, before the agent
+// starts; otherwise proofs stay v1.
+func (s *Server) SetProofLayers(f func() (ProofLayers, bool)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.proofLayers = f
+}
+
+// layersForProof is what the next serve-proof signs beyond v1: nil for a v1
+// proof (no SetProofLayers: LEGACY(v1)). ok is false while the layered runtime
+// cannot name its layers: then no proof is signed, never a v1 one.
+func (s *Server) layersForProof() (*ProofLayers, bool) {
+	s.mu.RLock()
+	f := s.proofLayers
+	s.mu.RUnlock()
+	if f == nil {
+		return nil, true
+	}
+	l, ok := f()
+	if !ok {
+		return nil, false
+	}
+	return &l, true
+}
+
+// serveWithProof writes body with the serve-proof this server signs now: v2
+// under the layered runtime, none while its layers are not known, v1 without
+// it (layersForProof).
+func (s *Server) serveWithProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr, validator string) error {
+	layers, ok := s.layersForProof()
+	if !ok {
+		writeWithoutProof(w, body, statusCode)
+		return nil
+	}
+	return writeServeProofLayered(w, r, priv, reqBody, body, dataHashes, statusCode, agentID, frameworkHash, chainID, identityAddr, validator, layers)
+}
 
 // SetLiveOwner installs the resolver. Safe to call before or after Listen.
 func (s *Server) SetLiveOwner(r OwnerResolver) {
@@ -170,6 +237,7 @@ func (s *Server) SetAdapter(fw framework.Framework) {
 	s.adapter = fw
 	s.agentLogPath = agentLogPath
 	s.fwRoutes = fwRoutes
+	s.strictServices = fw.Name() == "0g-harness" || fw.Name() == "dsh"
 	s.mu.Unlock()
 	if len(fwRoutes) == 0 {
 		logger.Logf("proxy: adapter %q declares no routes; only agent /api/* services are reachable (all other paths 404)", fw.Name())
@@ -193,6 +261,27 @@ func (s *Server) matchFrameworkRoute(path string) (framework.Route, bool) {
 		}
 	}
 	return bestRoute, best >= 0
+}
+
+// translateBearer swaps the owner's bearer token on r for the framework's
+// own, for adapters that keep the framework's token in sealed
+// (framework.BearerTranslator). It reports false when r does not carry the
+// owner's token; other adapters' requests pass unchanged.
+func (s *Server) translateBearer(r *http.Request) bool {
+	bt, ok := s.getAdapter().(framework.BearerTranslator)
+	if !ok {
+		return true
+	}
+	token, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !found {
+		return false
+	}
+	own, ok := bt.TranslateBearer(strings.TrimSpace(token))
+	if !ok {
+		return false
+	}
+	r.Header.Set("Authorization", "Bearer "+own)
+	return true
 }
 
 // frameworkRoutesForHello maps the declared routes to the public /hello wire
@@ -232,10 +321,10 @@ func (s *Server) frameworkRoutesForHello() []report.Route {
 			Kind:   "responses",
 			Auth:   "bearer",
 			Signed: false,
-			Description: "OpenAI Responses API subset (synthesized by the sealed proxy in front of the framework's chat API): " +
-				"POST /v1/responses {input, stream} → events with sequence_number; GET /{id} polls; " +
-				"GET /{id}?stream=true&starting_after=N resumes; POST /{id}/cancel stops the turn. " +
-				"The turn survives client disconnects; same stateful session as the chat route.",
+			// The same sentence as the native ones (prime, 0g-harness): /hello
+			// is public and says what the route is for; how it works is
+			// responses.go and ARCHITECTURE.md's route table.
+			Description: "The same chat, with replies that keep running when the connection drops.",
 		})
 	}
 	return out
@@ -282,11 +371,20 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/claim", s.handleClaim)
 	mux.HandleFunc("/_seal/clear", s.handleClear)
 	mux.HandleFunc("/_seal/compact", s.handleCompact)
+	mux.HandleFunc("/_seal/restart", s.handleOwnerRestart)
+	mux.HandleFunc("/_seal/credentials", s.handleCredentials)
+	mux.HandleFunc("/_seal/credentials/pending", s.handleCredentialPending)
+	mux.HandleFunc("/_seal/credentials/decide", s.handleCredentialDecide)
+	mux.HandleFunc("/_seal/credentials/audit", s.handleCredentialAudit)
+	mux.HandleFunc("/_seal/credentials/login", s.handleCredentialLogin)
+	mux.HandleFunc("/_seal/credentials/disconnect", s.handleCredentialDisconnect)
+	mux.HandleFunc("/_seal/oauth/callback", s.handleOAuthCallback)
+	mux.HandleFunc("/_seal/signatures", s.handleSignatures)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {
 		fmt.Println("Listening on :8080  GET /healthz | /log | /log/agent (owner-only) | /hello (signed) | /_seal/auth (owner-only) | /* (agent proxy)")
-		_ = http.ListenAndServe(":8080", corsMiddleware(mux))
+		_ = http.ListenAndServe(":8080", corsMiddleware(s.ownerGate(mux)))
 	}()
 }
 
@@ -408,8 +506,11 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "marshal: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// The services' descriptions and examples are the agent's text: scrubbed
+	// like a service's own response, before the proof covers them.
+	body = s.scrubBytes(body)
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
+	if err := s.serveWithProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -446,11 +547,18 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 // On success returns the server's current unix time; on any failure it writes
 // the HTTP error response and returns ok=false, so callers just `return`.
 func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sealID, cachedOwner, wantDigest string) (int64, bool) {
+	ts, _, ok := s.verifyOwnerSigAs(w, r, tag, sealID, cachedOwner, wantDigest)
+	return ts, ok
+}
+
+// verifyOwnerSigAs is verifyOwnerSig, also returning the owner the
+// signature was checked against.
+func (s *Server) verifyOwnerSigAs(w http.ResponseWriter, r *http.Request, tag, sealID, cachedOwner, wantDigest string) (int64, string, bool) {
 	msg := r.Header.Get("X-Auth-Message")
 	sigHex := r.Header.Get("X-Auth-Signature")
 	if msg == "" || sigHex == "" {
 		http.Error(w, "missing X-Auth-Message or X-Auth-Signature", http.StatusBadRequest)
-		return 0, false
+		return 0, "", false
 	}
 
 	// Grammar:
@@ -482,12 +590,12 @@ func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sea
 			grammar = fmt.Sprintf("%q:0x<sealID>:<ts>:<sha256(body)>:<audience>", tag)
 		}
 		http.Error(w, "X-Auth-Message must be "+grammar, http.StatusBadRequest)
-		return 0, false
+		return 0, "", false
 	}
 	if wantDigest != "" {
 		if !strings.EqualFold(strings.TrimPrefix(parts[3], "0x"), wantDigest) {
 			http.Error(w, "signed body digest does not match the request body", http.StatusUnauthorized)
-			return 0, false
+			return 0, "", false
 		}
 		// Shift so the audience check below stays one expression for both
 		// grammars: audience is the last field either way.
@@ -495,31 +603,31 @@ func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sea
 	}
 	if !strings.EqualFold(parts[1], "0x"+sealID) {
 		http.Error(w, "seal_id mismatch", http.StatusUnauthorized)
-		return 0, false
+		return 0, "", false
 	}
 	ts, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil {
 		http.Error(w, "bad timestamp in X-Auth-Message", http.StatusBadRequest)
-		return 0, false
+		return 0, "", false
 	}
 	now := time.Now().Unix()
 	if ts > now+authWindowSec || ts < now-authWindowSec {
 		http.Error(w, "stale or future X-Auth-Message timestamp", http.StatusUnauthorized)
-		return 0, false
+		return 0, "", false
 	}
 	if s.publicURL != "" {
 		want := strings.TrimRight(s.publicURL, "/")
 		got := strings.TrimRight(parts[3], "/")
 		if !strings.EqualFold(got, want) {
 			http.Error(w, "audience mismatch: signature not bound to this agent's URL", http.StatusUnauthorized)
-			return 0, false
+			return 0, "", false
 		}
 	}
 
 	sigBytes, err := hex.DecodeString(strings.TrimPrefix(sigHex, "0x"))
 	if err != nil || len(sigBytes) != 65 {
 		http.Error(w, "X-Auth-Signature must be 65-byte hex", http.StatusBadRequest)
-		return 0, false
+		return 0, "", false
 	}
 	if sigBytes[64] >= 27 {
 		sigBytes[64] -= 27
@@ -529,20 +637,28 @@ func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sea
 	pub, err := crypto.SigToPub(hash, sigBytes)
 	if err != nil {
 		http.Error(w, "signature recover: "+err.Error(), http.StatusBadRequest)
-		return 0, false
+		return 0, "", false
 	}
 	owner, ok := s.resolveOwner(r.Context(), cachedOwner)
 	if !ok {
 		http.Error(w, "owner lookup unavailable, retry", http.StatusServiceUnavailable)
-		return 0, false
+		return 0, "", false
+	}
+	// The agent belongs to someone else now: this container serves neither
+	// owner (ownerlock.go). The owner cached at bootstrap is the one it was
+	// started for.
+	s.SetBootOwner(cachedOwner)
+	if locked, _ := s.ObserveOwner(owner); locked {
+		writeOwnerLocked(w)
+		return 0, "", false
 	}
 
 	recovered := crypto.PubkeyToAddress(*pub).Hex()
 	if !strings.EqualFold(recovered, owner) {
 		http.Error(w, "signer is not the agent owner", http.StatusUnauthorized)
-		return 0, false
+		return 0, "", false
 	}
-	return now, true
+	return now, owner, true
 }
 
 // resolveOwner returns the owner to check a signature against. With a
@@ -563,8 +679,10 @@ func (s *Server) resolveOwner(ctx context.Context, cached string) (string, bool)
 		logger.Logf("proxy: live owner lookup failed: %v", err)
 		return "", false
 	}
-	if owner == "" {
-		logger.Logf("proxy: live owner lookup returned empty")
+	// No owner (or the zero address, which no minted agent has) is a lookup
+	// that failed, not an answer.
+	if owner == "" || common.HexToAddress(owner) == (common.Address{}) {
+		logger.Logf("proxy: live owner lookup returned no owner")
 		return "", false
 	}
 	return owner, true
@@ -615,7 +733,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
+	if err := s.serveWithProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -623,6 +741,21 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 // ── Catch-all reverse proxy ─────────────────────────────────────────────────
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
+	if managedServicePath(r.URL.Path) && s.isolatedServicePolicy() {
+		if _, audit := r.URL.Query()["sealed-release"]; audit {
+			s.handleServiceRelease(w, r)
+			return
+		}
+		host := s.getServiceHost()
+		if host == nil {
+			http.Error(w, "isolated service hosting unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if _, ok := host.Match(r.URL.Path); !ok {
+			http.NotFound(w, r)
+			return
+		}
+	}
 	priv, upstream, _, _, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
 	chainID, identityAddr, validator := s.agent.ProofDomain()
@@ -675,18 +808,54 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	//   - neither → 404 (fail-closed); no forward-all fallback.
 	signed := false
 	frameworkRoute := false
+	mcpService := false
+	managedEndpoint := false
+	client := http.DefaultClient
 	if svc, ok := s.matchService(r.URL.Path); ok {
-		if !strings.EqualFold(svc.Method, r.Method) {
+		mcpService = svc.Transport == "mcp"
+		allowed := strings.EqualFold(svc.Method, r.Method)
+		if mcpService {
+			allowed = r.Method == http.MethodPost || r.Method == http.MethodGet || r.Method == http.MethodDelete
+		}
+		if !allowed {
 			// RFC 9110: a 405 should carry Allow naming the one method
 			// this pinned path accepts (the proxy pins exactly one).
 			w.Header().Set("Allow", svc.Method)
+			if mcpService {
+				w.Header().Set("Allow", "POST, GET, DELETE")
+			}
 			http.Error(w, "method not allowed for "+svc.Path, http.StatusMethodNotAllowed)
 			return
 		}
 		signed = true
 		upstream = svc.Backend
+		if host := s.getServiceHost(); host != nil {
+			if status, ok := host.Match(r.URL.Path); ok {
+				managedEndpoint = true
+				if status.State != "running" {
+					http.Error(w, "service is not ready", 503)
+					return
+				}
+				client = host.HTTPClient(status.ID)
+			}
+		}
 	} else if rt, ok := s.matchFrameworkRoute(r.URL.Path); ok {
 		frameworkRoute = true
+		// A route that lists its endpoints forwards those requests only:
+		// what the framework serves beyond them is not reachable from
+		// outside, whatever its code adds.
+		if allowed, listed := rt.Allows(r.Method, r.URL.Path); !allowed {
+			if listed {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			} else {
+				http.NotFound(w, r)
+			}
+			return
+		}
+		if rt.Auth == "bearer" && r.Method != http.MethodOptions && !s.translateBearer(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		// A route may pin its own loopback backend (a framework whose
 		// surfaces are separate processes/ports); empty keeps the single
 		// StartResult upstream. Same mechanism as svc.Backend above.
@@ -703,9 +872,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Runtime input must never fall through to the owner harness or a shared
+	// user-registered backend. Only isolated managed workers may receive it.
+	if _, supplied := r.Header[servicehost.RuntimeInputHeader]; supplied && !managedEndpoint {
+		http.Error(w, "runtime input requires a managed request service", http.StatusBadRequest)
+		return
+	}
+	// MCP uses HTTP, not WebSocket upgrades. In particular, managed Unix
+	// endpoints must not fall through to a TCP reverse proxy for localhost.
+	if mcpService && isWebSocketUpgrade(r) {
+		http.Error(w, "MCP WebSocket upgrade unsupported", http.StatusBadRequest)
+		return
+	}
 	// WS upgrades cannot be buffered + signed; hand off to httputil.
 	if isWebSocketUpgrade(r) {
-		wsReverseProxy(upstream).ServeHTTP(w, r)
+		s.wsReverseProxy(upstream).ServeHTTP(w, r)
 		return
 	}
 
@@ -726,6 +907,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if u, perr := url.Parse(upstream); perr == nil {
 		upHost = u.Host
 	}
+	s.mu.RLock()
+	scrubbing := s.scrubber != nil
+	s.mu.RUnlock()
 	for k, vs := range r.Header {
 		switch k {
 		case "Connection", "Keep-Alive", "Te", "Trailer", "Transfer-Encoding", "Upgrade", "Proxy-Authorization", "Proxy-Authenticate":
@@ -733,17 +917,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		case "Origin", "X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host", "X-Real-Ip":
 			continue
 		case "Accept-Encoding":
-			// Signed service path only. Forwarding the client's
-			// Accept-Encoding explicitly pins it: Go's Transport then skips
-			// its own negotiation AND does not decompress, so the serve-proof
-			// taskHash would cover the gzip bytes while the client (undici,
-			// browsers) hashes the plain body it transparently decompressed —
-			// every compressing backend would fail per-exchange verification.
-			// Dropping the header lets the Transport negotiate + decompress,
-			// so the hashed bytes equal the delivered bytes. Framework routes
-			// keep the client's header: their responses are never hashed, and
-			// dropping it would cost br/zstd on framework UI assets.
-			if signed {
+			// Forwarding the client's Accept-Encoding explicitly pins it:
+			// Go's Transport then skips its own negotiation AND does not
+			// decompress. On the signed service path the serve-proof taskHash
+			// would cover the gzip bytes while the client (undici, browsers)
+			// hashes the plain body it transparently decompressed — every
+			// compressing backend would fail per-exchange verification. With
+			// credentials on, the scrubber would see compressed bytes and
+			// miss a value in them. Dropping the header lets the Transport
+			// negotiate + decompress, so what is hashed and scrubbed is what
+			// is delivered. Framework routes otherwise keep the client's
+			// header: their responses are never hashed, and dropping it costs
+			// br/zstd on framework UI assets.
+			if signed || scrubbing {
 				continue
 			}
 		}
@@ -755,12 +941,28 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		upReq.Header.Set("Origin", "http://"+upHost)
 	}
 
-	resp, err := http.DefaultClient.Do(upReq)
+	resp, err := client.Do(upReq)
 	if err != nil {
 		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+	// No credential value leaves through here, whatever the backend put in
+	// its response: headers and body are scrubbed before they are relayed,
+	// and before a serve-proof is computed, so the proof covers the bytes
+	// the caller receives.
+	s.scrubResponse(resp)
+	// MCP SSE may contain server-to-client requests during a tool call.
+	// Buffering would deadlock sampling/elicitation. A stream has no complete
+	// body to sign in an initial header: explicitly label it unsigned; /hello
+	// remains the signed identity/discovery surface. Finite JSON stays signed.
+	if mcpService && isEventStream(resp) {
+		w.Header().Set("X-Agent-Proof-Mode", "stream-unsigned")
+		resp.Header.Set("X-Accel-Buffering", "no")
+		resp.Header.Set("Cache-Control", "no-cache")
+		streamRelay(w, resp)
+		return
+	}
 
 	// An SSE stream can't be buffered + signed: the serve-proof signs a complete
 	// body, which a stream doesn't have until it ends. Relay it verbatim with
@@ -793,7 +995,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(k, "Access-Control-") {
 			continue
 		}
-		// X-Agent-Proof is runtime-owned: only writeServeProof attaches it.
+		// X-Agent-Proof is runtime-owned: only writeServeProofLayered attaches it.
 		if isAgentProofHeader(k) {
 			continue
 		}
@@ -810,7 +1012,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(respBody)
 		return
 	}
-	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
+	if err := s.serveWithProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -828,9 +1030,9 @@ func isEventStream(resp *http.Response) bool {
 // shouldStreamRelay decides whether a response is relayed as an unsigned stream
 // rather than buffered + signed. Only a framework-declared route (the
 // owner↔agent steering channel: chat/UI) may stream: it has no attribution
-// consumer, so an unsigned stream is fine. Agent-registered /api/* services
-// never stream here — they stay buffered + signed so the attributable surface
-// keeps its X-Agent-Proof even when it emits SSE.
+// consumer, so an unsigned stream is fine. Plain agent-registered /api/* services
+// stay buffered and signed here. MCP SSE takes its explicit unsigned streaming
+// branch in handleProxy before this framework-only helper.
 func shouldStreamRelay(frameworkRoute bool, resp *http.Response) bool {
 	return frameworkRoute && isEventStream(resp)
 }
@@ -914,7 +1116,7 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return false
 }
 
-func wsReverseProxy(upstream string) *httputil.ReverseProxy {
+func (s *Server) wsReverseProxy(upstream string) *httputil.ReverseProxy {
 	target, err := url.Parse(upstream)
 	if err != nil {
 		return &httputil.ReverseProxy{
@@ -951,7 +1153,26 @@ func wsReverseProxy(upstream string) *httputil.ReverseProxy {
 			// no trailers.
 			if resp.StatusCode != http.StatusSwitchingProtocols {
 				dropAgentProof(resp.Trailer)
-				resp.Body = &trailerProofStripper{ReadCloser: resp.Body, resp: resp}
+				resp.Body = &trailerProofStripper{ReadCloser: resp.Body, resp: resp, scrub: s.scrubBytes, nameHolds: s.nameHoldsValue}
+				// Not an upgrade after all: an ordinary response, scrubbed
+				// like any other (headers set by the caller choose the path,
+				// not what comes back), trailers too. Scrubbing can change
+				// the body's length.
+				s.mu.RLock()
+				scrubbing := s.scrubber != nil
+				s.mu.RUnlock()
+				if scrubbing {
+					s.scrubResponse(resp)
+					resp.Header.Del("Content-Length")
+					resp.ContentLength = -1
+					// The Trailer announcement is built from these names
+					// after this returns.
+					for k := range resp.Trailer {
+						if s.nameHoldsValue(k) {
+							delete(resp.Trailer, k)
+						}
+					}
+				}
 			}
 			return nil
 		},
@@ -971,21 +1192,39 @@ func dropAgentProof(h http.Header) {
 // has been read to EOF (when the transport populates trailers) and on Close.
 type trailerProofStripper struct {
 	io.ReadCloser
-	resp *http.Response
+	resp      *http.Response
+	scrub     func([]byte) []byte // credential values out of trailer values; nil: none
+	nameHolds func(string) bool   // whether a trailer name holds a value
 }
 
 func (b *trailerProofStripper) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil {
-		dropAgentProof(b.resp.Trailer)
+		b.clean()
 	}
 	return n, err
 }
 
 func (b *trailerProofStripper) Close() error {
 	err := b.ReadCloser.Close()
-	dropAgentProof(b.resp.Trailer)
+	b.clean()
 	return err
+}
+
+func (b *trailerProofStripper) clean() {
+	dropAgentProof(b.resp.Trailer)
+	if b.scrub == nil {
+		return
+	}
+	for k, vs := range b.resp.Trailer {
+		if b.nameHolds != nil && b.nameHolds(k) {
+			delete(b.resp.Trailer, k)
+			continue
+		}
+		for i, v := range vs {
+			vs[i] = string(b.scrub([]byte(v)))
+		}
+	}
 }
 
 // ── Serve-proof signing ─────────────────────────────────────────────────────
@@ -1033,57 +1272,93 @@ type serveProof struct {
 	Validator     string   `json:"validator"`
 }
 
+// ProofLayers are the fields a v2 serve-proof signs beyond v1
+// (sealed/LAYERS.md §7):
+//
+//	SealedHash   : sha256 of the sealed program the loader verified and ran
+//	               ("0x" + 64 hex)
+//	HarnessHash  : sha256 of the harness official version package running
+//	               ("0x" + 64 hex)
+//	InferenceURL : the endpoint sealed's inference route forwards model calls
+//	               to ("" when the framework dials a provider itself)
+//	Model        : the model name the route sends, the owner's setting
+//
+// framework_hash keeps its v1 meaning: the image, i.e. base.
+type ProofLayers struct {
+	SealedHash   string
+	HarnessHash  string
+	InferenceURL string
+	Model        string
+}
+
+// serveProofV2 is the v2 envelope: the v1 fields, then version (2) and the
+// ProofLayers fields. A verifier picks the digest by version; a v1 envelope
+// has none.
+type serveProofV2 struct {
+	serveProof
+	Version      int    `json:"version"`
+	SealedHash   string `json:"sealed_hash"`
+	HarnessHash  string `json:"harness_hash"`
+	InferenceURL string `json:"inference_url"`
+	Model        string `json:"model"`
+}
+
 // clientAddressHeader is the request header a client sets to declare the
 // address that will redeem the serve-proof (bound into the signature).
 const clientAddressHeader = "X-Client-Address"
 
-// agentProofHeader carries the serve-proof. It is runtime-owned: writeServeProof
-// is the only place that sets it, and every path relaying an upstream response
-// (buffered, streamed, WebSocket upgrade — header and trailer) drops an
-// upstream-supplied copy, so a backend cannot put a header of its own choosing
-// under the runtime's name.
+// agentProofHeader carries the serve-proof. It is runtime-owned:
+// writeServeProofLayered is the only place that sets it, and every path
+// relaying an upstream response (buffered, streamed, WebSocket upgrade —
+// header and trailer) drops an upstream-supplied copy, so a backend cannot put
+// a header of its own choosing under the runtime's name.
 const agentProofHeader = "X-Agent-Proof"
 
 // isAgentProofHeader reports whether a response header key names
 // X-Agent-Proof. Keys from net/http are canonical already; the comparison is
 // case-insensitive anyway so a non-canonical map key cannot slip past.
 func isAgentProofHeader(k string) bool {
-	return strings.EqualFold(k, agentProofHeader)
+	return strings.EqualFold(k, agentProofHeader) || strings.EqualFold(k, "X-Agent-Proof-Mode")
 }
 
-// writeServeProof signs the contract-shaped envelope with agent_seal_priv and
-// emits a single header packing the signature and base64-url envelope JSON:
+// writeServeProofLayered signs the contract-shaped envelope with
+// agent_seal_priv and emits a single header packing the signature and
+// base64-url envelope JSON:
 //
 //	X-Agent-Proof: 0x<65-byte sig hex>.<base64-url-encoded envelope JSON>
 //
-// The signed digest is serveProofDigest(validator, serveProofHash(...)) —
-// exactly what VerifiedFeedbackRegistry._verifyServeProof checks. chainId +
-// identityRegistry give cross-chain / cross-deployment separation; submitter
-// (declared by the client in X-Client-Address) binds the proof to one
-// redeemer; validator (the registry proxy) binds the signature to the one
-// contract that redeems it, in a signing domain the sign socket never
-// produces (see sign.go).
+// The signed digest is serveProofDigest(validator, serveProofHashV2(...)) —
+// exactly what VerifiedFeedbackRegistry checks — for a v2 proof (layers not
+// nil), and the v1 hash (legacy_v1.go) otherwise. chainId + identityRegistry
+// give cross-chain / cross-deployment separation; submitter (declared by the
+// client in X-Client-Address) binds the proof to one redeemer; validator (the
+// registry proxy) binds the signature to the one contract that redeems it, in
+// a signing domain the sign socket never produces (see sign.go).
 //
 // When the agent has no on-chain identity yet (agentID/frameworkHash/chainID
 // empty, e.g. local dev without a chain), or no usable validator
 // (VERIFIED_FEEDBACK_ADDR unset, malformed, zero, or not anchored to
-// AGENTIC_ID_ADDR — see main.anchorValidator), the body is written
-// without a proof header — a reputation proof would be meaningless, and there
-// is deliberately no fallback to the legacy personal_sign wrap.
-func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr, validator string) error {
+// AGENTIC_ID_ADDR — see main.anchorValidator), the body is written without a
+// proof header — a reputation proof would be meaningless, and there is
+// deliberately no fallback to the legacy personal_sign wrap. A v2 proof whose
+// sealed or harness hash is not a 32-byte hex value is not signed at all
+// either.
+func writeServeProofLayered(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr, validator string, layers *ProofLayers) error {
 	agentIDBig, ok := new(big.Int).SetString(agentID, 10)
 	chainIDBig, chainOK := new(big.Int).SetString(chainID, 10)
 	fwBytes, fwErr := hexToBytes32(frameworkHash)
 	validatorAddr, validatorOK := parseValidator(validator)
-	if !ok || !chainOK || fwErr != nil || agentIDBig.Sign() == 0 || !validatorOK {
-		// No on-chain identity (or nothing to bind the proof to) — serve the
-		// body without a serve-proof, and without any X-Agent-Proof a caller
-		// may have left on w.
-		w.Header().Del(agentProofHeader)
-		w.Header().Del("Content-Length")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
-		w.WriteHeader(statusCode)
-		_, _ = w.Write(body)
+	var sealedBytes, harnessBytes []byte
+	layersOK := true
+	if layers != nil {
+		var sErr, hErr error
+		sealedBytes, sErr = hexToBytes32(layers.SealedHash)
+		harnessBytes, hErr = hexToBytes32(layers.HarnessHash)
+		layersOK = sErr == nil && hErr == nil
+	}
+	if !ok || !chainOK || fwErr != nil || agentIDBig.Sign() == 0 || !validatorOK || !layersOK {
+		// No on-chain identity (or nothing to bind the proof to).
+		writeWithoutProof(w, body, statusCode)
 		return nil
 	}
 
@@ -1136,13 +1411,32 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 		FrameworkHash: frameworkHash,
 		Validator:     "0x" + hex.EncodeToString(validatorAddr.Bytes()),
 	}
-	proofJSON, err := json.Marshal(env)
+	var (
+		proofJSON []byte
+		proofHash []byte
+		err       error
+	)
+	if layers == nil {
+		// LEGACY(v1)
+		proofJSON, err = json.Marshal(env)
+		proofHash = serveProofHash(chainIDBig, addrWord(identityAddr), submitterWord,
+			agentIDBig, now, deadline, taskHash, packed, fwBytes)
+	} else {
+		proofJSON, err = json.Marshal(serveProofV2{
+			serveProof:   env,
+			Version:      2,
+			SealedHash:   "0x" + hex.EncodeToString(sealedBytes),
+			HarnessHash:  "0x" + hex.EncodeToString(harnessBytes),
+			InferenceURL: layers.InferenceURL,
+			Model:        layers.Model,
+		})
+		proofHash = serveProofHashV2(chainIDBig, addrWord(identityAddr), submitterWord,
+			agentIDBig, now, deadline, taskHash, packed, fwBytes,
+			sealedBytes, harnessBytes, layers.InferenceURL, layers.Model)
+	}
 	if err != nil {
 		return fmt.Errorf("marshal serve-proof: %w", err)
 	}
-
-	proofHash := serveProofHash(chainIDBig, addrWord(identityAddr), submitterWord,
-		agentIDBig, now, deadline, taskHash, packed, fwBytes)
 	digest := serveProofDigest(validatorAddr, proofHash)
 
 	privKey, err := crypto.ToECDSA(priv)
@@ -1165,18 +1459,39 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 	return nil
 }
 
-// serveProofHash is the inner ServeProof hash, keccak256(abi.encode(chainId,
-// identityRegistry, submitter, agentId, timestamp, deadline, taskHash,
-// keccak256(abi.encodePacked(dataHashes)), frameworkHash)). Every field is a
-// static 32-byte word, so abi.encode is a plain concatenation. identityRegistry
-// and submitter are abi address words (addrWord); dataHashesPacked is
-// abi.encodePacked(bytes32[]) — the on-chain roots back to back.
+// writeWithoutProof writes body with no serve-proof, and without any
+// X-Agent-Proof a caller may have left on w.
+func writeWithoutProof(w http.ResponseWriter, body []byte, statusCode int) {
+	w.Header().Del(agentProofHeader)
+	w.Header().Del("Content-Length")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	w.WriteHeader(statusCode)
+	_, _ = w.Write(body)
+}
+
+// serveProofV2Tag opens the v2 ServeProof preimage:
+// keccak256("AgentDNA.ServeProof.v2"). The v1 preimage opens with the chain
+// id and is 9 words long against v2's 14, so a signature over either never
+// verifies as the other.
+var serveProofV2Tag = crypto.Keccak256([]byte("AgentDNA.ServeProof.v2"))
+
+// serveProofHashV2 is the inner v2 ServeProof hash (sealed/LAYERS.md §7):
 //
-// Consensus-critical: byte-identical to VerifiedFeedbackRegistry, the SDK
-// (sdk/typescript/src/ServeProof.ts), the attestor console's say-hi check and
-// attestor/scripts/verify-agent.sh check 3b (the five copies in AGENTS.md).
-func serveProofHash(chainID *big.Int, identityRegistry, submitter []byte, agentID *big.Int, timestamp, deadline int64, taskHash, dataHashesPacked, frameworkHash []byte) []byte {
+//	keccak256(abi.encode(
+//	    keccak256("AgentDNA.ServeProof.v2"),
+//	    chainId, identityRegistry, submitter, agentId, timestamp, deadline,
+//	    taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash,
+//	    sealedHash, harnessHash,
+//	    keccak256(bytes(inferenceURL)), keccak256(bytes(model))))
+//
+// Every field is a static 32-byte word, so abi.encode is a plain
+// concatenation, as for v1. Signed through serveProofDigest like v1.
+//
+// Consensus-critical, like serveProofHash: the contracts, the SDK, the
+// attestor console and verify-agent.sh carry the same function.
+func serveProofHashV2(chainID *big.Int, identityRegistry, submitter []byte, agentID *big.Int, timestamp, deadline int64, taskHash, dataHashesPacked, frameworkHash, sealedHash, harnessHash []byte, inferenceURL, model string) []byte {
 	return crypto.Keccak256(bytes.Join([][]byte{
+		serveProofV2Tag,
 		word256(chainID),
 		identityRegistry,
 		submitter,
@@ -1186,6 +1501,10 @@ func serveProofHash(chainID *big.Int, identityRegistry, submitter []byte, agentI
 		taskHash,
 		crypto.Keccak256(dataHashesPacked),
 		frameworkHash,
+		sealedHash,
+		harnessHash,
+		crypto.Keccak256([]byte(inferenceURL)),
+		crypto.Keccak256([]byte(model)),
 	}, nil))
 }
 

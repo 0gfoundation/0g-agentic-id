@@ -143,6 +143,10 @@ Simple is the default; per-tag / per-role weighting is opt-in.
   or the `FeedbackVerified(…, dataHashes, frameworkHash, taskHash, uri)` event. (The
   deprecated `AgenticIDReputationRegistry`'s `FeedbackWithProof` is not a source: it
   still accepts the legacy, agent-forgeable ServeProof digest.)
+- **Serving code per review** (v2 proofs — 0g-harness on the layered runtime, registry
+  1.3.0+): `getServeLayers(agentId, client, idx)` gives the sealed program and official
+  harness version that served; the `VersionedFeedbackVerified` event adds the inference
+  address and model name. Entries attested with a v1 proof read zero there.
 
 ## Attribution limits (important)
 

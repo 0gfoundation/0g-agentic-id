@@ -1,0 +1,154 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+// TEST FIXTURE — FROZEN copy of IVerifiedFeedbackRegistry as
+// VerifiedFeedbackRegistry 1.1.0 and 1.2.0 implement it (git
+// bdfd1c6:contracts/src/interfaces/IVerifiedFeedbackRegistry.sol). Only the
+// import path and the interface name differ; TaskReveal is src's (unchanged).
+// Never edit.
+
+import {ServeProof} from "../../../src/interfaces/IAgenticIDReputationRegistry.sol";
+import {TaskReveal} from "../../../src/interfaces/IVerifiedFeedbackRegistry.sol";
+
+/// @title Verified Feedback Registry
+/// @notice TEE-verification layer over the **official** ERC-8004 Reputation
+///         Registry. Feedback itself lives in the canonical registry (clients
+///         call its `giveFeedback` directly, so per-client attribution is
+///         native and every ERC-8004 reader sees it); this contract only
+///         records which of those canonical entries were backed by a real
+///         service interaction — a TEE-signed ServeProof.
+///
+///         Flow (two calls by the same client, SDK-bundled):
+///           1. client → canonicalReputation.giveFeedback(agentId, …)
+///           2. client → attestFeedback(agentId, lastIndex, proof)
+///
+///         Readers that care about authenticity intersect the canonical
+///         entries with this contract's verified set (events, `isVerified`,
+///         or the `getVerifiedSummary` eth_call helper). Entries without a
+///         verification mark are unauthenticated noise — the canonical
+///         registry is permissionless and accepts feedback from anyone.
+interface IVerifiedFeedbackRegistryV1_2_0 {
+
+    // ── Events ────────────────────────────────────────────────────────────────
+
+    /// @notice A canonical feedback entry passed ServeProof verification.
+    /// @dev (agentId, clientAddress, feedbackIndex) identifies the entry in the
+    ///      canonical ERC-8004 Reputation Registry. dataHashes/frameworkHash
+    ///      are the audit data carried by the proof: CLAIMED by the agent's
+    ///      runtime and signed by agentSeal, not checked on chain against the
+    ///      agent's iData or the framework allowlist (see {getServeData});
+    ///      taskHash is the TEE-signed interaction receipt (see {TaskReveal}).
+    ///      `uri` is non-empty only when the receipt was opened and verified
+    ///      on-chain (attestFeedbackWithTask) — the TEE-verified endpoint.
+    event FeedbackVerified(
+        uint256 indexed agentId,
+        address indexed clientAddress,
+        uint64  indexed feedbackIndex,
+        bytes32[]       dataHashes,
+        bytes32         frameworkHash,
+        bytes32         taskHash,
+        string          uri
+    );
+
+    // ── Write ─────────────────────────────────────────────────────────────────
+
+    /// @notice Mark the caller's canonical feedback entry `feedbackIndex` for
+    ///         `agentId` as backed by a TEE-signed ServeProof.
+    /// @dev Verifies (in order): agentId matches proof.agentId;
+    ///      proof.submitter == msg.sender (before signature recovery, so a
+    ///      mismatched caller reverts cheaply); 0 < proof.timestamp ≤
+    ///      proof.deadline; the ServeProof signature
+    ///      against the agentSeal registered in the identity registry (inner
+    ///      hash bound to this chain + identity registry + submitter, signed
+    ///      as EIP-191 version 0x00 with THIS registry as the intended
+    ///      validator — keccak256(0x19 ‖ 0x00 ‖ registry ‖ proofHash); legacy
+    ///      personal_sign-wrapped proofs are rejected); the proof's nonce
+    ///      (consumed — one proof attests at most one entry); the caller is
+    ///      not the agent owner, an approved operator, the agent's payment
+    ///      wallet, or the agent's agentSeal; the canonical entry exists for
+    ///      msg.sender and its value is in range (|value| ≤ 1e9, ≤ 18
+    ///      decimals); the entry is not already verified.
+    function attestFeedback(uint256 agentId, uint64 feedbackIndex, ServeProof calldata proof) external;
+
+    /// @notice Like {attestFeedback}, additionally opening the proof's
+    ///         taskHash commitment: the contract recomputes the hash from the
+    ///         revealed receipt materials and, on match, records `task.uri`
+    ///         as the TEE-verified endpoint of this entry — enabling
+    ///         trustless per-endpoint aggregation (getVerifiedSummaryForEndpoint).
+    /// @dev Reverts VerifiedFeedbackInvalidTaskReveal when the method is
+    ///      outside the known set, the uri lacks a leading '/', or statusCode
+    ///      is outside 100..999; VerifiedFeedbackTaskMismatch when the
+    ///      recomputed hash differs from proof.taskHash.
+    function attestFeedbackWithTask(
+        uint256 agentId,
+        uint64 feedbackIndex,
+        ServeProof calldata proof,
+        TaskReveal calldata task
+    ) external;
+
+    // ── Read ──────────────────────────────────────────────────────────────────
+
+    /// @notice True if the canonical entry (agentId, clientAddress, feedbackIndex)
+    ///         has been attested with a valid ServeProof.
+    function isVerified(uint256 agentId, address clientAddress, uint64 feedbackIndex)
+        external view returns (bool);
+
+    /// @notice Serve-proof audit data stored for a verified entry.
+    /// @dev Both fields are as CLAIMED in the seal-signed ServeProof — the
+    ///      registry checks the signature, not the content: dataHashes is not
+    ///      compared with the agent's on-chain iData and frameworkHash is not
+    ///      checked against AgenticID's framework allowlist (audit FIND-15).
+    ///      Their weight is that only the agent's TEE runtime holds agentSeal.
+    ///      Buyer due-diligence: compare dataHashes against
+    ///      intelligentDatasOf(agentId) to see whether the agent's data changed
+    ///      since this reputation was earned. Reverts if the entry is unverified.
+    function getServeData(uint256 agentId, address clientAddress, uint64 feedbackIndex)
+        external view returns (bytes32[] memory dataHashes, bytes32 frameworkHash);
+
+    /// @notice All verified canonical feedback indexes of `clientAddress` for `agentId`.
+    function getVerifiedIndexes(uint256 agentId, address clientAddress)
+        external view returns (uint64[] memory);
+
+    /// @notice All clients with at least one verified entry for `agentId`.
+    function getVerifiedClients(uint256 agentId) external view returns (address[] memory);
+
+    /// @notice The TEE-verified endpoint of a verified entry — empty string
+    ///         when the entry was attested without opening its task receipt.
+    function getVerifiedEndpoint(uint256 agentId, address clientAddress, uint64 feedbackIndex)
+        external view returns (string memory);
+
+    /// @notice Aggregate the given clients' verified entries whose TEE-verified
+    ///         endpoint equals `uri` (values read live from the canonical
+    ///         registry; revoked and out-of-range entries skipped; sum +
+    ///         count, 18 decimals). `clientAddresses` and `uri` must be
+    ///         non-empty — same trust stance as getVerifiedSummary. Off-chain
+    ///         eth_call only.
+    function getVerifiedSummaryForEndpoint(
+        uint256 agentId,
+        address[] calldata clientAddresses,
+        string calldata uri
+    ) external view returns (uint64 count, int128 summaryValue, uint8 summaryValueDecimals);
+
+    /// @notice Aggregate the given clients' VERIFIED canonical feedback,
+    ///         reading values live from the canonical registry (revoked entries
+    ///         and entries outside |value| ≤ 1e9 / ≤ 18 decimals skipped — the
+    ///         latter can only be marks from before 1.2.0; empty tag = wildcard). `clientAddresses` must be
+    ///         non-empty — the caller picks whom to trust, mirroring ERC-8004
+    ///         getSummary (verification proves a service call happened, not
+    ///         that the client is unrelated to the owner).
+    /// @dev O(verified entries × canonical reads) — off-chain eth_call only.
+    ///      A client listed twice in `clientAddresses` is aggregated twice —
+    ///      dedup is the caller's responsibility (matches the fork registry).
+    function getVerifiedSummary(
+        uint256 agentId,
+        address[] calldata clientAddresses,
+        string calldata tag1,
+        string calldata tag2
+    ) external view returns (uint64 count, int128 summaryValue, uint8 summaryValueDecimals);
+
+    /// @notice The AgenticID identity registry proofs are verified against.
+    function getIdentityRegistry() external view returns (address);
+
+    /// @notice The official ERC-8004 Reputation Registry entries are anchored to.
+    function getCanonicalReputation() external view returns (address);
+}

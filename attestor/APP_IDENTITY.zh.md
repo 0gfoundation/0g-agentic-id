@@ -74,6 +74,8 @@ AgenticID 链接无状态的 `AttestorAppBindingLib`；库没有 owner 或独立
 4. 调用单向开启的 `requireInstanceBoundAttestors()`。
 5. 移除废弃的旧地址白名单项。
 
+AgenticID 1.4.0 起，这些 owner 调用改在 TrustRegistry 上进行：attestor 名单、绑定和实例绑定模式都由它保存；AgenticID 保留只读函数，从它读取后回答。
+
 AgenticID 1.3.0 保留 1.2.0 的治理与 proof 规则。新字段追加在原 ERC-7201 namespace
 已有的 `agentSealBound` mapping 之后，保留它的槽位和终身 seal 地址绑定。
 步骤 4 之前保留旧白名单兼容，但生产 API/worker
@@ -166,7 +168,7 @@ appId、registeredAt、signer）。
 同一容器之后的启动不带证书。必须由已记录的公钥签 boot claim，已记录的 provider 实例
 必须仍是当前发现的实例（否则 `403 provider instance no longer trusted; reset required`；
 discovery 不可用时 503），已记录的镜像必须仍在白名单中（否则 `401 recorded image_hash
-not in validFrameworkHashes; reset required`）。证书对应已记录的公钥时按之后的启动处理，
+not in validFrameworkHashes: the image was retired; reset required`）。证书对应已记录的公钥时按之后的启动处理，
 覆盖首次响应丢失的情况；对应另一把公钥则返回 `403 container key differs from record;
 reset required`；没有记录也没有证书返回 `409 certificate_required`。新的启动票据
 （create 或 recreate）、reset 与所有权撤销都会清除记录，因此每个新容器都要出示自己的

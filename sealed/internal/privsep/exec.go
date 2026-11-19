@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -214,6 +215,25 @@ func RootCommand(ctx context.Context, name string, args ...string) (*exec.Cmd, e
 	return cmd, nil
 }
 
+// RootSelf is RootCommand for this program's own executable (os.Executable)
+// with mode as its first argument: sealed runs the code it carries for
+// another role this way (the hosted-service launcher,
+// servicesandbox.LauncherMode), so that code is always the build of the
+// sealed that runs it. The executable is checked like an absolute
+// RootCommand path: a root-owned regular file in root-only directories (the
+// loader's state directory, or /bootstrap). Which modes may be run, and from
+// where, is fixed by the root-side guard test (rootSelfModes).
+func RootSelf(ctx context.Context, mode string, args ...string) (*exec.Cmd, error) {
+	if mode == "" || strings.ContainsAny(mode, "/\x00") {
+		return nil, fmt.Errorf("privsep: RootSelf takes a bare mode, got %q", mode)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("privsep: this program's executable: %w", err)
+	}
+	return RootCommand(ctx, self, append([]string{mode}, args...)...)
+}
+
 // RootDir sets the working directory of cmd, a RootCommand, to dir after
 // checking that dir resolves to a directory which, with every directory
 // above it, is owned by root and writable by nobody else.
@@ -252,6 +272,24 @@ func TempDir(pattern string) (string, error) {
 		return "", err
 	}
 	return os.MkdirTemp(base, pattern)
+}
+
+// RemoveTempDirs removes what TempDir made with names starting with prefix
+// and a process that ended mid-way left behind. Only for a prefix whose
+// directories nothing is using now.
+func RemoveTempDirs(prefix string) {
+	entries, err := ReadDir(rootTmpDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		if err := RemoveAll(filepath.Join(rootTmpDir, e.Name())); err != nil {
+			logger.Logf("privsep: remove %s: %v", filepath.Join(rootTmpDir, e.Name()), err)
+		}
+	}
 }
 
 func resolveRoot(name string) (string, error) {
@@ -310,6 +348,41 @@ func AgentCommand(ctx context.Context, name string, args ...string) (*exec.Cmd, 
 	if Drop(cmd) && agentHomeReady() {
 		cmd.Dir = agentHomeDir
 	}
+	return cmd, nil
+}
+
+// BelowAgentHome reports whether dir, an absolute and clean path, is the
+// agent's home or lies below it.
+func BelowAgentHome(dir string) bool {
+	home := AgentHome()
+	return filepath.IsAbs(dir) && filepath.Clean(dir) == dir && (dir == home || strings.HasPrefix(dir, home+"/"))
+}
+
+// AgentBackground is AgentCommand for a long-running process sealed keeps for
+// the agent (a backend it registered with a start command): it starts in dir,
+// which must lie below the agent's home (the home when empty), gets env on
+// top of AgentCommand's PATH and HOME, and runs in a process group of its
+// own, which cancelling ctx kills whole. With the split the child enters the
+// working directory after it has become the agent user, so dir is resolved
+// with the agent's rights, never root's; without it the child, like the
+// agent, runs as sealed.
+func AgentBackground(ctx context.Context, dir string, env []string, name string, args ...string) (*exec.Cmd, error) {
+	cmd, err := AgentCommand(ctx, name, args...)
+	if err != nil {
+		return nil, err
+	}
+	if dir != "" {
+		if !BelowAgentHome(dir) {
+			return nil, fmt.Errorf("directory %s is not below the agent's home", dir)
+		}
+		cmd.Dir = dir
+	}
+	cmd.Env = append(cmd.Env, env...)
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+	cmd.Cancel = func() error { return unix.Kill(-cmd.Process.Pid, unix.SIGKILL) }
 	return cmd, nil
 }
 
