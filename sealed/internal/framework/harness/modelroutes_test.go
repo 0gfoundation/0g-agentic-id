@@ -102,7 +102,7 @@ func TestPlanWebSearch(t *testing.T) {
 	}
 	for others, wantWhy := range map[string]string{
 		`{"webTools":false}`:                 "webTools",
-		`{"webSearch":{"service":"off"}}`:    "webSearch",
+		`{"webSearch":{"service":"off"}}`:    "your owner turned it off (settings: webSearch.service = off)",
 		`{"webSearch":{"service":"openai"}}`: "credential",
 	} {
 		if ws, why := planWebSearch(knobs(t, others), held, routerEp, routerBase, "glm-5.3"); ws != nil || !strings.Contains(why, wantWhy) {

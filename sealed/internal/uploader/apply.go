@@ -138,21 +138,30 @@ func (u *Uploader) Apply(ctx context.Context, plaintexts map[string][]byte) erro
 				return err
 			}
 			basis := basisOf(chainEntry)
+			kid := keyID(dataKey)
+			leaf := u.shapeOf(r.Name) != framework.DirectoryManifest
 			newEntry, reused := u.pending.leaf(r.Name, basis, contentHashHex)
 			if reused {
 				logger.Logf("uploader.Apply: %s reuses the blob an earlier attempt uploaded (0x%x)", r.Name, newEntry.DataHash)
-			} else {
-				switch u.shapeOf(r.Name) {
-				case framework.DirectoryManifest:
-					newEntry, err = u.pushManifest(ctx, r.Name, plaintext, dataKey, chainEntry, basis)
-				default:
+			} else if e, ok := u.uploaded.whole(r.Name, kid, contentHashHex); ok && leaf {
+				// This content was uploaded before in this boot (uploaded.go).
+				newEntry, reused = e, true
+				logger.Logf("uploader.Apply: %s reuses the blob uploaded earlier for this content (0x%x)", r.Name, newEntry.DataHash)
+			}
+			if !reused {
+				if leaf {
 					newEntry, err = u.pushLeaf(ctx, r.Name, plaintext, dataKey)
+				} else {
+					newEntry, err = u.pushManifest(ctx, r.Name, plaintext, dataKey, chainEntry, basis)
 				}
 				if err != nil {
 					return err
 				}
 				if chainEntry == nil || newEntry.DataHash != chainEntry.DataHash {
 					u.pending.keepLeaf(r.Name, basis, contentHashHex, newEntry)
+				}
+				if leaf {
+					u.uploaded.keepWhole(r.Name, kid, contentHashHex, newEntry)
 				}
 			}
 			newEntries = append(newEntries, newEntry)
@@ -192,6 +201,7 @@ func (u *Uploader) Apply(ctx context.Context, plaintexts map[string][]byte) erro
 			// Commits stop here (the agent belongs to another owner, say):
 			// nothing uploaded for them is to be reused.
 			u.pending.reset()
+			u.uploaded.reset()
 			return fmt.Errorf("uploader.Apply: %w", err)
 		}
 	}

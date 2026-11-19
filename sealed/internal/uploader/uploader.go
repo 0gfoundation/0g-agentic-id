@@ -25,6 +25,8 @@
 // without mutating the agent's state. The next watcher tick re-detects
 // divergence (chainSnapshot stays stale, current still differs) and Apply
 // re-runs, reusing what the failed attempt already uploaded (pending.go).
+// Content that comes back to what an earlier commit of this boot held is
+// committed by reference to the blobs uploaded then (uploaded.go).
 package uploader
 
 import (
@@ -129,6 +131,9 @@ type Uploader struct {
 	// pending keeps what an attempt that did not reach the chain already
 	// uploaded, for the next attempt to reuse (pending.go).
 	pending pendingUploads
+	// uploaded keeps every blob this boot uploaded, by key and content, for
+	// content that comes back (uploaded.go).
+	uploaded uploadedBlobs
 }
 
 // SetCommitGate installs commitGate. Call it before the first Apply.
