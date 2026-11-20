@@ -242,7 +242,7 @@ func firstLine(b []byte) string {
 // the cost does not grow with the number of tasks times the number of
 // processes. A separate 2 s loop walks private directories and checks the free
 // space of the filesystem that holds the task directories: below
-// diskReserveBytes it stops every service process, whatever space they hold
+// DiskReserveBytes it stops every service process, whatever space they hold
 // that no walk can see (files deleted while open), since sealed and the owner
 // need that space. A slow walk never delays the memory check.
 type resourceWatcher struct {
@@ -260,9 +260,10 @@ type resourceWatcher struct {
 	dskTick time.Duration
 }
 
-// diskReserveBytes is the free space service processes must leave on the
+// DiskReserveBytes is the free space service processes must leave on the
 // filesystem of their task directories; new tasks are refused below it.
-const diskReserveBytes = 1 << 30
+// sealed warns the owner from the same point (diskwatch.go).
+const DiskReserveBytes = 1 << 30
 
 func newResourceWatcher(stop chan struct{}, disk string) *resourceWatcher {
 	return &resourceWatcher{active: map[uint32]*isolatedCommand{}, stop: stop, disk: disk,
@@ -351,22 +352,40 @@ func (w *resourceWatcher) diskLoop() {
 	}
 }
 
-// diskReserveInodes is the floor of free inodes, for filesystems that
+// DiskReserveInodes is the floor of free inodes, for filesystems that
 // report a fixed inode count.
-const diskReserveInodes = 65536
+const DiskReserveInodes = 65536
+
+// FreeSpace is what the filesystem holding a path has left: the bytes
+// available to unprivileged writers and, where the filesystem counts them,
+// the free inodes (-1 where it does not).
+type FreeSpace struct {
+	Bytes  int64
+	Inodes int64
+}
+
+// ReadFreeSpace reads FreeSpace for the filesystem holding path.
+func ReadFreeSpace(path string) (FreeSpace, error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return FreeSpace{}, err
+	}
+	free := FreeSpace{Bytes: int64(st.Bavail) * int64(st.Bsize), Inodes: -1}
+	if st.Files > 0 {
+		free.Inodes = int64(st.Ffree)
+	}
+	return free, nil
+}
 
 // diskLowCheck is diskLow, replaceable in tests.
 var diskLowCheck = diskLow
 
 // diskLow reports whether the filesystem holding path has less than
-// diskReserveBytes available or, where it counts inodes, fewer than
-// diskReserveInodes free. An unreadable filesystem counts as low.
+// DiskReserveBytes available or, where it counts inodes, fewer than
+// DiskReserveInodes free. An unreadable filesystem counts as low.
 func diskLow(path string) bool {
-	var st unix.Statfs_t
-	if err := unix.Statfs(path, &st); err != nil {
-		return true
-	}
-	return int64(st.Bavail)*int64(st.Bsize) < diskReserveBytes || (st.Files > 0 && st.Ffree < diskReserveInodes)
+	free, err := ReadFreeSpace(path)
+	return err != nil || free.Bytes < DiskReserveBytes || (free.Inodes >= 0 && free.Inodes < DiskReserveInodes)
 }
 
 // maxWalkDepth bounds how deep diskUsage descends (each level holds one open

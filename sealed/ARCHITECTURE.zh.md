@@ -748,6 +748,25 @@ transaction"）。这既覆盖错误里没说原因的失败，也替换掉 "ins
 `currentStatus.Get()`，POST `/status`。上报失败只打日志，不影响进程 ——
 attestor 那侧靠 15min 阈值兜底。
 
+### sandbox 磁盘
+
+sealed、agent 和它托管的程序共用一块 sandbox 磁盘，里面没有配额。`diskwatch.go`
+读取 agent 家目录（`privsep.AgentHome()`）所在文件系统的剩余空间：本次启动的第一次
+上报之前读一次，之后每分钟一次。低于 servicehost 的保留线，即 1 GiB
+（`DiskReserveBytes`），或在计数 inode 的文件系统上 65536 个 inode
+（`DiskReserveInodes`），状态为 `warning`：
+"sandbox disk nearly full: 412 MiB free; ask the agent to delete files it no
+longer needs, or reset it"（inode 不够时为 "room for N more files"）。用
+servicehost 的保留线，是因为低于它时 sealed 会停掉所有托管服务进程并拒绝新的
+（[MCP_SERVICES.zh.md](MCP_SERVICES.zh.md)），owner 在 agent 开始失去它运行的东西
+时就会知道磁盘的情况。剩余空间回到保留线之上 512 MiB（以及 32768 个 inode）后
+警告才清除，所以在线附近写入又删除的文件不会让它每分钟出现又消失。出现和清除会
+立即上报；其间剩余空间的数字随心跳送到 attestor。和配置警告一样，它只在没有别的
+问题时显示，排在配置警告之后；文件系统读不出时保持原样。owner 在所有警告出现的
+地方看到它：deployment 行的 `container_status`
+（[attestor README](../attestor/README.zh.md)）和 CLI 会话卡片上的 `warning` 行
+（[docs/cli-reference.md](../docs/cli-reference.md)）。
+
 ### serve-proof 的 `data_hash` 来源
 
 serve-proof envelope 的 `data_hashes` 是一个 **`data_hash` root 的扁平列表**（TEE 当下
