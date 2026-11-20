@@ -492,9 +492,16 @@ export class CredentialsApi {
    * resolves it. The public row carries only the AgentCard's.
    */
   async agentUrl(sealId: Hash): Promise<string> {
+    return this.deploymentUrl(await this.deploymentRow(sealId));
+  }
+
+  private async deploymentRow(sealId: Hash): Promise<{ phase?: string; url?: string; agent_card?: { url?: string } }> {
     const r = await fetch(`${this.attestorUrl()}/deployment/${sealId}`, { signal: AbortSignal.timeout(10_000) });
     if (!r.ok) throw new Error(`credentials: cannot read /deployment/${sealId}: HTTP ${r.status}`);
-    const row = (await r.json()) as { url?: string; agent_card?: { url?: string } };
+    return await r.json() as { phase?: string; url?: string; agent_card?: { url?: string } };
+  }
+
+  private deploymentUrl(row: { url?: string; agent_card?: { url?: string } }): string {
     const url = row.url ?? row.agent_card?.url?.replace(/\/hello$/, '');
     if (!url) throw new Error('credentials: the agent has no public URL yet (not running?)');
     return url.replace(/\/$/, '');
@@ -866,7 +873,11 @@ export class CredentialsApi {
   }
 
   private async push(sealId: Hash, doc: CredentialDocument, agentUrl?: string): Promise<void> {
-    const base = agentUrl ?? (await this.agentUrl(sealId));
+    const row = agentUrl ? undefined : await this.deploymentRow(sealId);
+    // A stopped/deploying container's recorded URL can still exist, but
+    // has no process to receive this set. It takes the stored set at boot.
+    if (row?.phase && row.phase !== 'running') return;
+    const base = agentUrl ?? this.deploymentUrl(row!);
     const r = await this.sealRequest(sealId, base, '0GSealCredentials', '/_seal/credentials', JSON.stringify(doc));
     if (!r.ok) throw new Error(`push to the running agent failed: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
   }

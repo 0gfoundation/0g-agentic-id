@@ -96,6 +96,13 @@ const BEARER: CredentialPosition = { kind: 'header', name: 'Authorization', temp
  * goes with a token as the password.
  */
 export const CRED_PRESETS: Record<string, CredPreset> = {
+  '0g-compute': {
+    hosts: ['router-api.0g.ai'],
+    positions: [BEARER],
+    description: '0G Compute router API key',
+    create: 'https://pc.0g.ai/dashboard/api-keys',
+    tip: 'for tool calls to the router; use set model provider=0g-compute for the agent\'s inference key',
+  },
   github: {
     hosts: ['api.github.com', 'uploads.github.com', 'github.com'],
     // GitHub does not use the Basic username to authenticate a token, but it must not be empty.
@@ -705,7 +712,7 @@ export async function ensureModelKey(ag: AgenticID, sealId: Hash, provider: stri
   const { markKey, keyMark } = modelKeyMarkOf(sealId, provider, value);
   recordModelKeyMark(markKey, { valueHash: out.valueHash, keyMark });
   io.out(`added ${name}${out.pushWarning ? `; not applied to the running agent: ${out.pushWarning}` : ''}`);
-  if (state === null) io.out(`the agent is not running: on an image from before model keys in cred, the switch takes a reset with the ${provider} key`);
+  if (state === null) io.out('saved; the agent takes this model key when it next starts');
   return 'added';
 }
 

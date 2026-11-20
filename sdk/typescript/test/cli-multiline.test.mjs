@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import * as readline from 'node:readline';
-import { lineQueue } from '../dist/cli/commands/interactive.js';
+import { lineQueue, commandEntry, steerable } from '../dist/cli/commands/interactive.js';
 
 const PASTE = (s) => `\x1b[200~${s}\x1b[201~`;
 const later = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -61,7 +61,7 @@ test('multiline: a paste that ends in a newline, then Enter', async () => {
   assert.equal(e.multi, true);
 });
 
-test('multiline: a pasted single line is a message too (never a command)', async () => {
+test('multiline: a pasted single line retains paste metadata for command classification', async () => {
   const { input, rl, ask } = session();
   const msg = ask.message('agent 1 › ');
   input.write(PASTE('/stop'));
@@ -70,7 +70,36 @@ test('multiline: a pasted single line is a message too (never a command)', async
   const e = await msg;
   rl.close();
   assert.deepEqual(e, { text: '/stop', multi: false, pasted: true });
+  assert.equal(commandEntry(e), true);
+  assert.equal(steerable(e), false);
 });
+
+test('command classification: pasted arguments and a trailing newline keep a single slash command local', () => {
+  for (const text of ['/help', '/result "resp_123"', '/help\n', ' /cred set token preset=github\r\n']) {
+    const e = { text, multi: /[\r\n]/.test(text), pasted: true };
+    assert.equal(commandEntry(e), true, text);
+    assert.equal(steerable(e), false, text);
+  }
+  for (const text of ['/help\nexplain this document', 'hello', 'paragraph\n/stop']) {
+    const e = { text, multi: text.includes('\n'), pasted: true };
+    assert.equal(commandEntry(e), false, text);
+    assert.equal(steerable(e), true, text);
+  }
+});
+
+for (const text of ['/help', '/help\n', 'paragraph\n/help\nend']) {
+  test(`bracketed paste followed by Enter in the same read submits exactly once: ${JSON.stringify(text)}`, async (t) => {
+    const { input, rl, ask } = session();
+    t.after(() => rl.close());
+    const msg = ask.message('agent 1 › ');
+    input.write(PASTE(text) + '\r');
+    let timer;
+    const e = await Promise.race([msg, new Promise((_, reject) => { timer = setTimeout(() => reject(Error('paste waited for another Enter')), 300); })]).finally(() => clearTimeout(timer));
+    assert.equal(e.text.trim(), text.trim());
+    assert.equal(e.pasted, true);
+    assert.equal(commandEntry(e), !text.trim().includes('\n'));
+  });
+}
 
 test('multiline: a typed line is sent with Enter as before', async () => {
   const { input, rl, ask } = session();

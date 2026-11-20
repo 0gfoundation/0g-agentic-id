@@ -34,7 +34,7 @@ async function storedSet() {
     signature: '0x', defs: { github: defB.toString('base64') }, values: { github: ct.toString('base64') } }) };
 }
 
-async function stub() {
+async function stub(phase) {
   const seen = [];
   const stored = await storedSet();
   const server = createServer((req, res) => {
@@ -46,7 +46,7 @@ async function stub() {
       const json = (status, b) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
       if (req.method === 'GET' && url.pathname === '/credentials') return json(200, stored);
       if (req.method === 'POST' && url.pathname === '/credentials') return json(200, { ok: true, version: 4 });
-      if (req.method === 'GET' && url.pathname.startsWith('/deployment/')) return json(200, { agent_card: { url: `http://127.0.0.1:${server.address().port}/hello` } });
+      if (req.method === 'GET' && url.pathname.startsWith('/deployment/')) return json(200, { phase, agent_card: { url: `http://127.0.0.1:${server.address().port}/hello` } });
       // The running agent does not take the set (e.g. its owner lookup failed).
       if (req.method === 'POST' && url.pathname === '/_seal/credentials') { res.writeHead(503); return res.end('owner lookup unavailable, retry'); }
       json(404, {});
@@ -61,6 +61,17 @@ function ag(port) {
     walletClient: { signMessage: ({ message }) => owner.signMessage({ message }), signTypedData: (a) => owner.signTypedData(a) } };
   return { credentials: new CredentialsApi(ctx, { agentSealPubkey: async () => SEAL_PUB }) };
 }
+
+test('credentials saved while stopped are kept for the next boot without pushing a stale URL', async () => {
+  const s = await stub('stopped');
+  try {
+    const result = await ag(s.port).credentials.remove(SEAL_ID, 'github');
+    assert.equal(result.version, 4);
+    assert.equal(result.pushWarning, undefined);
+    assert.ok(s.seen.includes('POST /credentials'));
+    assert.ok(!s.seen.includes('POST /_seal/credentials'));
+  } finally { s.server.close(); }
+});
 
 for (const args of [['reveal', 'github', 'off'], ['rm', 'github']]) {
   test(`cli: cred ${args.join(' ')} says whether the running agent took it`, async () => {

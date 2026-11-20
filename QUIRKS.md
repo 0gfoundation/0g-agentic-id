@@ -589,3 +589,15 @@ that migration. `repo.rs::deployment_tx` obtains RowExclusive first (compatible
 with other runtime writers), then takes per-deployment row locks. Bootstrap
 orders deployments before its status child. Keep both orders: the Postgres
 regression deliberately pauses a migration behind an active runtime transaction.
+
+### Service cleanup handles OverlayFS directory rename failures
+
+Container snapshots can place sealed's old service scratch directories in an
+OverlayFS lower layer. Renaming such a directory can return `EXDEV` even when
+the destination is in the same parent ([kernel documentation](https://docs.kernel.org/filesystems/overlayfs.html#renaming-directories)).
+`servicehost.discardDir` normally renames scratch trees aside for background
+removal. On `EXDEV` only, it instead finishes `privsep.RemoveAll`'s no-follow
+walk before returning, so the caller may safely recreate the original path.
+Do not queue deletion of that original path: it could remove the new tree.
+Other rename failures remain errors. This exceptional cleanup may take longer,
+but an inherited scratch directory no longer disables all hosted services at boot.

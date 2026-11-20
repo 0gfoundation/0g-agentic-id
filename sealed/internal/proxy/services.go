@@ -231,7 +231,7 @@ func (s *Server) helloServiceList() []report.Service {
 	for _, svc := range hosted {
 		out = append(out, report.Service{
 			Path: svc.Path, Method: "POST", Description: svc.Description, Transport: "mcp",
-			Kind: report.ServiceKindHosted, Version: svc.Version, Release: svc.Path + "?sealed-release=1",
+			Kind: report.ServiceKindHosted, Version: svc.Version, Release: svc.Path + "?sealed-release=1", State: svc.State,
 		})
 	}
 	return out

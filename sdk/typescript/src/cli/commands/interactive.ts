@@ -1095,14 +1095,25 @@ type Ask = ((q: string) => Promise<string>) & {
 };
 
 /** What the owner entered: its text (newlines kept), whether it spans lines,
- *  and whether any of it was pasted. An agent message that spans lines or was
- *  pasted is never a command. */
+ *  and whether any of it was pasted. Multiline documents stay messages;
+ *  pasting a single command or its arguments does not change its meaning. */
 export type Entry = {
   text: string; multi: boolean; pasted: boolean;
   /** Entered while a turn ran (queued, put back, or a command that waits for
    *  its end): never the answer to a question asked after it. */
   during?: boolean;
 };
+
+/** Trailing paste newlines do not turn a single slash command into a document. */
+export function commandEntry(e: Entry): boolean {
+  const text = e.text.trim();
+  return text.startsWith('/') && !/[\r\n]/.test(text);
+}
+
+/** Shell quotes, plus Markdown's inline-code wrapper when copying an id. */
+function commandId(line: string): string | undefined {
+  return tokenize(line)[1]?.replace(/^`([^`]+)`$/, '$1');
+}
 
 /** Whether an entry finished during a turn goes into that turn (steer): any
  *  message, but not an empty line or a command typed alone on its line —
@@ -1111,7 +1122,7 @@ export function steerable(e: Entry): boolean {
   const t = e.text.trim();
   if (!t) return false;
   // A dragged file's path first is a message, not a command.
-  return e.multi || e.pasted || !t.startsWith('/') || findDroppedFiles(t).some((p) => typeof p !== 'string');
+  return !commandEntry(e) || findDroppedFiles(t).some((p) => typeof p !== 'string');
 }
 
 /** An answer to a signing question this soon after it is shown was typed before it. */
@@ -1314,12 +1325,15 @@ export function lineQueue(
     // Ctrl-U on a message of several lines clears all of it, not only the
     // line the cursor is on (its earlier lines would go with the next one).
     if (key?.name === 'u' && key.ctrl && !key.meta && draft.length && !boxed && messageHere()) { ask.clearBox?.(); return; }
-    if (key?.name === 'paste-start') { pasting = true; pasteLines = []; return; }
+    if (key?.name === 'paste-start') { endChunk(); pasting = true; pasteLines = []; return; }
     if (key?.name === 'paste-end') {
       pasting = false;
       const lines = pasteLines;
       pasteLines = [];
-      lastPasteAt = Date.now();
+      // This terminal marked the exact end: a following Enter is a user
+      // submission even when both arrived in the same read. The gap
+      // heuristic is only for terminals without bracketed paste markers.
+      lastPasteAt = 0;
       pasted(lines);
       return;
     }
@@ -2741,6 +2755,9 @@ export async function run(ctx: CommandContext): Promise<void> {
     // can't suppress, and its line editor raced the async banner for early
     // input. (feedback.md F11/F6/F5)
     terminal: process.stdin.isTTY === true && process.stdout.isTTY === true,
+    // A standalone Esc must clear/cancel before the owner starts typing
+    // again. Node's 500 ms default otherwise swallows the next key as Alt.
+    escapeCodeTimeout: 25,
     // Tab completion on the command word. One readline serves both levels,
     // so the candidate set is swapped by whichever REPL loop is active
     // (activeCompletions); empty line + Tab lists everything.
@@ -4145,13 +4162,13 @@ function pickRow<T extends { agentId?: unknown; sealId?: string }>(
 }
 
 /** The agent's registered service table (from its /hello; empty on failure). */
-async function servicesOf(url: string): Promise<Array<{ path: string; method: string; description?: string; skill?: string; transport?: string }>> {
+async function servicesOf(url: string): Promise<Array<{ path: string; method: string; description?: string; skill?: string; transport?: string; state?: string }>> {
   try {
     const b = (await (await fetch(`${url}/hello`)).json()) as {
-      services?: Array<{ path: string; method: string; description?: string; skill?: string; transport?: string }>;
+      services?: Array<{ path: string; method: string; description?: string; skill?: string; transport?: string; state?: string }>;
     };
     // entry #0 is /hello itself — callable but not a business service; keep it out of the picker
-    return (b.services ?? []).filter((sv) => sv.path !== '/hello');
+    return (b.services ?? []).filter((sv) => sv.path !== '/hello' && (!sv.state || sv.state === 'running'));
   } catch {
     return [];
   }
@@ -4161,7 +4178,7 @@ async function servicesOf(url: string): Promise<Array<{ path: string; method: st
  *  endpoints, entry #0 is /hello itself) and routes (framework-declared
  *  prefixes, the owner's API). */
 export interface HelloSurface {
-  services?: { path: string; method: string; description?: string; skill?: string; transport?: string }[];
+  services?: { path: string; method: string; description?: string; skill?: string; transport?: string; state?: string }[];
   routes?: { prefix: string; kind?: string; auth?: string; signed: boolean; description?: string }[];
 }
 
@@ -4201,7 +4218,7 @@ export function renderHelloSurface(body: HelloSurface, opts: { full: boolean; wi
     if (services.length) {
       lines.push('services:');
       for (const sv of services) {
-        lines.push(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}`);
+        lines.push(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.state ? `[${sv.state}] ` : ''}${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}`);
       }
     }
     if (routes.length) {
@@ -4219,7 +4236,7 @@ export function renderHelloSurface(body: HelloSurface, opts: { full: boolean; wi
     lines.push('services:');
     for (const sv of services) {
       const mcp = sv?.transport === 'mcp' ? '[mcp] ' : '';
-      const line = `  ${cleanCell(sv?.method).padEnd(4)} ${cleanCell(sv?.path).padEnd(24)} ${mcp}${cleanCell(sv?.description)}`.trimEnd();
+      const line = `  ${cleanCell(sv?.method).padEnd(4)} ${cleanCell(sv?.path).padEnd(24)} ${sv?.state ? `[${cleanCell(sv.state)}] ` : ''}${mcp}${cleanCell(sv?.description)}`.trimEnd();
       const shown = fitLine(line, width);
       if (shown !== line || sv?.skill) hidden = true;
       lines.push(shown);
@@ -4550,12 +4567,12 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
     .then((r) => r.json())
     .catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
-  let framework = 'openclaw';
+  let framework = '0g-harness';
   say('\n');
   if (fws.length) {
-    framework = await askChoice(ask, 'frameworks', 'framework', fws.map((id) => ({ id })), Math.max(0, fws.indexOf('openclaw')));
+    framework = await askChoice(ask, 'frameworks', 'framework', fws.map((id) => ({ id })), Math.max(0, fws.indexOf('0g-harness')));
   } else {
-    say('framework: openclaw (this attestor lists no others)\n');
+    say('framework: 0g-harness (this attestor lists no others)\n');
   }
 
   // Only offer models the chosen framework can actually run: chatbots only
@@ -5047,7 +5064,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         list: () => s.client!.listFiles!('outbox'),
         download: (name) => s.client!.downloadFile!('outbox', name),
         auto: () => filesAuto,
-        ...(s.client?.deleteFile ? { remove: (name: string) => s.client!.deleteFile!('outbox', name) } : {}),
+        // The session may have been entered while stopped: resolve the
+        // connected client's capability at each call, not only at entry.
+        remove: (name: string) => s.client?.deleteFile
+          ? s.client.deleteFile('outbox', name)
+          : Promise.resolve('unsupported' as const),
       })
     : null;
   const counts = (): PromptCounts => ({
@@ -5158,13 +5179,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   const links = supportsHyperlinks();
   // The files saved by themselves in this session, for /files.
   const savedHere: string[] = [];
+  let outboxChecking = false;
   const checkOutbox = (): void => {
-    if (!outbox || !s.client?.listFiles || !s.client.downloadFile) return;
+    if (!outbox || outboxChecking || !s.client?.listFiles || !s.client.downloadFile) return;
+    outboxChecking = true;
     outbox.check().then((events) => {
       for (const e of events) if (e.kind === 'saved') savedHere.push(cleanCell(e.name));
       for (const e of events) show(renderOutboxEvent(e, links), () => undefined, { files: e.kind === 'saved' ? 1 : 0, raw: true });
       recount();
-    }, () => undefined /* an agent without downloads, or unreachable: the next check */);
+    }, () => undefined /* an agent without downloads, or unreachable: the next check */)
+      .finally(() => { outboxChecking = false; });
   };
   const outboxTimer = outbox ? setInterval(checkOutbox, OUTBOX_POLL_MS) : null;
   outboxTimer?.unref();
@@ -5186,8 +5210,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   const queued: string[] = [];
   /**
    * One entry as the session's command: 'next' once a command ran, 'back'
-   * for /back, 'chat' when it goes to the agent (`message`: several lines or
-   * a paste, never a command). Run from the prompt, and while a turn runs for
+   * for /back, 'chat' when it goes to the agent (`message`: a multiline document or ordinary
+   * pasted text). Run from the prompt, and while a turn runs for
    * a command that only reads (busyEntries).
    */
   const runCommand = async (line: string, message: boolean): Promise<'next' | 'back' | 'chat'> => {
@@ -5466,9 +5490,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/sessions' || line.startsWith('/sessions ')) {
-        if (!s.client?.sessions) { out('(this agent has no sessions — only 0g-harness does)\n'); continue; }
-        const [, sub = '', ...rest] = line.split(/\s+/);
-        const arg = rest.join(' ').trim();
+        if (!s.client?.sessions) {
+          out(s.phase !== 'running'
+            ? `agent is ${s.phase} — /start or /reset to connect\n`
+            : s.framework === '0g-harness' || s.framework === 'dsh'
+              ? '(this runtime does not expose sessions — update the agent runtime)\n'
+              : '(sessions are available on 0g-harness)\n');
+          continue;
+        }
+        const { head, rest } = splitHead(line, 2);
+        const sub = head[1] ?? '';
+        // Titles are free text (Bob's notes is not shell quoting). Decode
+        // an explicit outer quote while preserving ordinary title text.
+        const arg = /^(['"])[\s\S]*\1$/.test(rest) ? tokenize(rest).join(' ') : rest.trim();
         if (!sub || sub === 'list') {
           const list = await s.client.sessions();
           sessionsSeen = list;
@@ -5614,14 +5648,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (line === '/result' || line.startsWith('/result ')) {
         // A background command or a subagent is not a turn: its record is
         // the activity list's, and it has no stream to follow.
-        let named = line.split(/\s+/)[1];
+        let named = commandId(line);
         // An id, or a unique start of one, from the agent's activity list.
         if (named && s.client?.activity && s.client.activities) {
           const known = await s.client.activity(named).then(() => true, () => false);
           if (!known) {
-            const hits = (await s.client.activities({ limit: 200 }).catch(() => [])).filter((a) => a.id.startsWith(named!));
+            const hits = (await s.client.activities({ limit: 500 }).catch(() => [])).filter((a) => a.id.startsWith(named!));
             if (hits.length !== 1) {
-              out(hits.length ? `${hits.length} start with ${cleanCell(named)} — give more of the id\n` : `nothing with the id ${cleanCell(named)} — /activities lists them\n`);
+              out(hits.length ? `${hits.length} start with ${cleanCell(named)} — give more of the id\n` : `no match in the latest 500 activities for ${cleanCell(named)} — use the full id for an older activity\n`);
               continue;
             }
             named = hits[0].id;
@@ -5645,7 +5679,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // id may come from another window, a /tasks listing before a restart,
         // or a dropped-connection message — once /result shows it, /cancel
         // (bare form) can stop it without re-typing the id.
-        if (line.split(/\s+/)[1] && !s.tasks?.some((t) => t.id === id)) {
+        if (named && !s.tasks?.some((t) => t.id === id)) {
           (s.tasks ??= []).push({ id, prompt: '(adopted by /result)', at: Date.now() });
         }
         const snap = await s.client.task(id).catch(async (e: Error) => {
@@ -5708,7 +5742,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // turn keeps running server-side (on the responses transport that
         // survival is the feature). /cancel is the explicit brake: by id, or
         // everything in flight this session knows.
-        let id = line.split(/\s+/)[1];
+        let id = commandId(line);
         // An agent with an activity list (0g-harness) stops any activity by id
         // (a turn, a background command, a subagent), and all of them at once.
         if (id && s.client.stopActivity && s.client.stopAllActivities) {
@@ -5716,7 +5750,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             try {
               // An id as /activities lists it: a unique start of one.
               if (id !== 'all' && s.client.activities) {
-                const list = await s.client.activities({ limit: 200 }).catch(() => null);
+                const list = await s.client.activities({ limit: 500 }).catch(() => null);
                 const hits = list?.filter((a) => a.id.startsWith(id!)) ?? [];
                 if (list && !list.some((a) => a.id === id) && hits.length === 1) id = hits[0].id;
                 else if (list && hits.length > 1 && !list.some((a) => a.id === id)) { out(`${hits.length} activities start with ${cleanCell(id)} — give more of the id\n`); break; }
@@ -5977,7 +6011,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // A file dragged in goes with the message, which is not inserted into
     // the turn: it waits for the next one (its path is no command either).
     if (findDroppedFiles(t).some((p) => typeof p !== 'string')) return false;
-    if (!e.multi && !e.pasted && t.startsWith('/')) {
+    if (commandEntry(e)) {
       if (readOnlyCommand(t)) { runNow(t, view); return true; }
       // A switch by number with no list shown yet: the list now, so the
       // number counts in it when the switch runs (no question then).
@@ -6227,8 +6261,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
     }
     let line: string;
-    // A message of several lines, or a pasted one, goes to the agent as it
-    // is: never a command, whatever its first line starts with.
+    // A multiline document stays a message. A single slash command keeps
+    // its meaning even when its text or arguments came from the clipboard.
     let asMessage = false;
     if (queued.length) {
       line = queued.shift()!;
@@ -6242,7 +6276,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const q = activeInk ? INK_PROMPT : `\n${screen.prompt(false)}`;
         const entry = (ask as Ask).message ? await (ask as Ask).message!(q) : { text: await ((ask as Ask).main ?? ask)(q), multi: false, pasted: false };
         line = entry.text.trim();
-        asMessage = entry.multi || entry.pasted;
+        asMessage = (entry.multi || entry.pasted) && !commandEntry(entry);
       } finally {
         atPrompt = false;
       }

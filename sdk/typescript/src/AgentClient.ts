@@ -48,6 +48,8 @@ export interface AgentServiceEntry {
   method: string;
   description?: string;
   input_example?: string;
+  /** Hosted program lifecycle state; stopped entries remain available for release audit. */
+  state?: string;
   /**
    * Protocol the consumer should speak. `"mcp"` = an MCP server endpoint:
    * the backend implements the MCP streamable-HTTP protocol (JSON-RPC over
@@ -115,7 +117,7 @@ export interface AgentServiceEntry {
  * use a non-browser client for verified MCP.
  */
 export function mcpServices(client: Pick<AgentClient, 'services'>): AgentServiceEntry[] {
-  return client.services.filter((s) => s.transport === 'mcp');
+  return client.services.filter((s) => s.transport === 'mcp' && (!s.state || s.state === 'running'));
 }
 
 /**

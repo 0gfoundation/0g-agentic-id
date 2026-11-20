@@ -178,6 +178,10 @@ var removeInBackground = func(path string) { go privsep.RemoveAll(path) }
 // that filled it cannot hold callers (some under the manager lock) for the
 // time a removal takes. Earlier discards left by a crash go the same way.
 func discardDir(dir string) error {
+	return discardDirWithRename(dir, privsep.Rename)
+}
+
+func discardDirWithRename(dir string, rename func(string, string) error) error {
 	parent, name := filepath.Dir(dir), filepath.Base(dir)
 	if entries, err := privsep.ReadDir(parent); err == nil {
 		for _, e := range entries {
@@ -191,9 +195,17 @@ func discardDir(dir string) error {
 		return err
 	}
 	aside := filepath.Join(parent, fmt.Sprintf("%s.discard-%x", name, b))
-	if err := privsep.Rename(dir, aside); err != nil {
+	if err := rename(dir, aside); err != nil {
 		if os.IsNotExist(err) {
 			return nil
+		}
+		if errors.Is(err, unix.EXDEV) {
+			// OverlayFS may refuse to rename a directory inherited from the
+			// image's lower layer, even within one parent. Remove it through
+			// the no-follow walker before reusing its name. This exceptional
+			// cleanup must finish here: a background removal of the old name
+			// could delete the fresh directory a caller creates next.
+			return privsep.RemoveAll(dir)
 		}
 		return err
 	}

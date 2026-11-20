@@ -48,6 +48,9 @@ type Service struct {
 	// callers pin, and the path that returns that release for audit.
 	Version string `json:"version,omitempty"`
 	Release string `json:"release,omitempty"`
+	// Hosted service lifecycle state, kept visible for release auditing even
+	// when the program has stopped and its endpoint accepts no work.
+	State string `json:"state,omitempty"`
 }
 
 // Kinds of Service (Service.Kind).

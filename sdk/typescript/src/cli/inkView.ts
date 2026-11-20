@@ -872,8 +872,7 @@ export class InkScreen<A extends InkAsk = InkAsk> {
 /**
  * A chat turn under the Ink view: the reply goes to the transcript (its
  * unfinished line drawn just above the region), the status row says what
- * the agent does, and each run of tool calls becomes one dim line when the
- * reply goes on or the turn ends.
+ * the agent does, and all tool calls become one dim line when the turn ends.
  */
 export class InkTurn implements TurnView {
   readonly live = true;
@@ -881,8 +880,6 @@ export class InkTurn implements TurnView {
   readonly stopHint = ' · Esc to stop';
   private statusText: string | null = null;
   private labels: string[] = [];
-  /** A run's line was just written: the reply's next text starts it own line. */
-  private gap = false;
   private ended = false;
   private spin = 0;
   private readonly t0 = Date.now();
@@ -895,14 +892,8 @@ export class InkTurn implements TurnView {
 
   write(s: string): void {
     if (this.ended) return;
-    let t = cleanStream(s);
+    const t = cleanStream(s);
     if (!t) return;
-    this.closeRun();
-    if (this.gap) {
-      t = t.replace(/^\n+/, '');
-      if (!t) return;
-      this.gap = false;
-    }
     this.screen.write(t);
   }
 
@@ -915,7 +906,6 @@ export class InkTurn implements TurnView {
   /** A line after what the reply has written so far: its line ends there. */
   after(text: string): void {
     if (this.ended) { this.screen.write(cleanStream(text)); return; }
-    this.closeRun();
     const t = cleanStream(text).replace(/^\n+/, '').replace(/\n+$/, '');
     if (t) this.screen.after(t);
   }
@@ -932,7 +922,7 @@ export class InkTurn implements TurnView {
 
   /** An activity label as the stream reports it ("tool/call bash", "thinking"). */
   activity(label: string): void {
-    if (!this.ended) this.labels.push(label);
+    if (!this.ended) { this.labels.push(label); this.screen.refresh(); }
   }
 
   refresh(): void { this.screen.refresh(); }
@@ -948,7 +938,8 @@ export class InkTurn implements TurnView {
   /** The status row's text: the turn's own status, or how long it has been replying. */
   statusLine(): string {
     if (this.statusText) return this.statusText;
-    return `${SPIN[this.spin % SPIN.length]} replying… (${Math.floor((Date.now() - this.t0) / 1000)}s${this.stopHint})`;
+    const summary = this.screen.summarize(this.labels);
+    return `${SPIN[this.spin % SPIN.length]} ${summary ? `${summary} · ` : ''}replying… (${Math.floor((Date.now() - this.t0) / 1000)}s${this.stopHint})`;
   }
 
   private closeRun(): void {
@@ -957,7 +948,6 @@ export class InkTurn implements TurnView {
     this.labels = [];
     if (!sum) return;
     this.screen.dim(`· ${sum}`);
-    this.gap = true;
   }
 }
 
