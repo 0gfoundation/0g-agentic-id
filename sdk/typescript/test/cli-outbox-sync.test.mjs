@@ -124,18 +124,71 @@ test('with saving off new files are counted, and /files listing them clears the 
   rmSync(t.home, { recursive: true, force: true });
 });
 
-test('a failed download is said once and left for /download', async () => {
+test('a failed download is said once and retries after backoff', async () => {
   const t = setup();
+  let now = 1;
+  let attempts = 0;
   const s = makeOutboxSync({
     agentId: '625', home: t.home, auto: () => true,
+    now: () => now,
     list: async () => [{ name: 'x.txt', bytes: 3, mtime: '2026-11-18T00:00:00Z' }],
-    download: async () => { throw new Error('downloadFile: HTTP 502: bad gateway'); },
+    download: async () => { if (++attempts === 1) throw new Error('downloadFile: HTTP 502: bad gateway'); return enc('ok!'); },
   });
   const ev = await s.check();
-  assert.equal(renderOutboxEvent(ev[0], false), 'could not save x.txt: downloadFile: HTTP 502: bad gateway — /download x.txt tries again\n');
+  assert.equal(renderOutboxEvent(ev[0], false), 'could not save x.txt: downloadFile: HTTP 502: bad gateway — will retry; /download x.txt tries now\n');
   assert.deepEqual(await s.check(), []);
+  assert.equal(attempts, 1);
+  now += 30_000;
+  assert.equal((await s.check())[0].kind, 'saved');
+  assert.equal(readFileSync(join(t.dir, 'x.txt'), 'utf8'), 'ok!');
+  assert.equal(attempts, 2);
   rmSync(t.home, { recursive: true, force: true });
 });
+
+test('a failed file can retry when the same version reappears after an empty listing', async () => {
+  const t = setup();
+  t.box.put('a.txt', 'alpha');
+  let listed = true, attempts = 0;
+  const s = makeOutboxSync({
+    agentId: '625', home: t.home, auto: () => true,
+    list: async () => listed ? t.box.list() : [],
+    download: async (name) => { if (++attempts === 1) throw new Error('HTTP 502'); return t.box.download(name); },
+  });
+  try {
+    assert.equal((await s.check())[0].kind, 'failed');
+    listed = false;
+    await s.check();
+    listed = true;
+    assert.equal((await s.check())[0].kind, 'saved');
+    assert.equal(attempts, 2);
+  } finally { rmSync(t.home, { recursive: true, force: true }); }
+});
+
+for (const change of ['unchanged', 'edited', 'missing']) {
+  test(`remote cleanup retries without downloading twice; local copy ${change}`, async () => {
+    const t = setup();
+    t.box.put('a.txt', 'alpha');
+    let now = 1, deletes = 0;
+    const s = makeOutboxSync({
+      agentId: '625', home: t.home, auto: () => true, now: () => now,
+      list: t.box.list, download: t.box.download,
+      remove: async () => { if (++deletes === 1) throw new Error('HTTP 503'); return 'deleted'; },
+    });
+    try {
+      assert.equal((await s.check())[0].kind, 'saved');
+      assert.equal(deletes, 1);
+      await s.check();
+      assert.equal(deletes, 1, 'backoff avoids a tight retry loop');
+      const file = join(t.dir, 'a.txt');
+      if (change === 'edited') writeFileSync(file, 'other');
+      if (change === 'missing') rmSync(file);
+      now += 30_000;
+      assert.deepEqual(await s.check(), []);
+      assert.deepEqual(t.box.downloads, ['a.txt']);
+      assert.equal(deletes, change === 'unchanged' ? 2 : 1, 'only delete when the verified local copy still exists');
+    } finally { rmSync(t.home, { recursive: true, force: true }); }
+  });
+}
 
 test('a saved file is announced with its path, a link where the terminal shows one', () => {
   const home = join(tmpdir(), 'owner');

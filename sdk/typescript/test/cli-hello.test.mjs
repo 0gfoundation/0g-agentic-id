@@ -48,6 +48,13 @@ function harnessHello() {
 
 const MORE = '/hello full';
 
+test('hosted service state is visible in both compact and full discovery', () => {
+  const body = { services: [{ method: 'POST', path: '/api/mcp/stopped', state: 'stopped', description: 'A hosted program' }] };
+  for (const full of [false, true]) {
+    assert.match(renderHelloSurface(body, { full, width: 120, more: MORE }).join('\n'), /\[stopped\]/);
+  }
+});
+
 // ── 1. the renderer ──
 
 test('compact: services one line each within the width, routes folded by kind', () => {

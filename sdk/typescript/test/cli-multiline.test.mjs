@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import * as readline from 'node:readline';
-import { lineQueue } from '../dist/cli/commands/interactive.js';
+import { lineQueue, commandEntry, steerable } from '../dist/cli/commands/interactive.js';
 
 const PASTE = (s) => `\x1b[200~${s}\x1b[201~`;
 const later = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -61,7 +61,7 @@ test('multiline: a paste that ends in a newline, then Enter', async () => {
   assert.equal(e.multi, true);
 });
 
-test('multiline: a pasted single line is a message too (never a command)', async () => {
+test('multiline: a pasted single line retains paste metadata for command classification', async () => {
   const { input, rl, ask } = session();
   const msg = ask.message('agent 1 › ');
   input.write(PASTE('/stop'));
@@ -70,6 +70,21 @@ test('multiline: a pasted single line is a message too (never a command)', async
   const e = await msg;
   rl.close();
   assert.deepEqual(e, { text: '/stop', multi: false, pasted: true });
+  assert.equal(commandEntry(e), true);
+  assert.equal(steerable(e), false);
+});
+
+test('command classification: pasted arguments and a trailing newline keep a single slash command local', () => {
+  for (const text of ['/help', '/result "resp_123"', '/help\n', ' /cred set token preset=github\r\n']) {
+    const e = { text, multi: /[\r\n]/.test(text), pasted: true };
+    assert.equal(commandEntry(e), true, text);
+    assert.equal(steerable(e), false, text);
+  }
+  for (const text of ['/help\nexplain this document', 'hello', 'paragraph\n/stop']) {
+    const e = { text, multi: text.includes('\n'), pasted: true };
+    assert.equal(commandEntry(e), false, text);
+    assert.equal(steerable(e), true, text);
+  }
 });
 
 test('multiline: a typed line is sent with Enter as before', async () => {

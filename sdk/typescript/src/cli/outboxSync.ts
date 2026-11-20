@@ -14,7 +14,9 @@
  *
  * Which versions of which files were saved is kept next to that folder
  * (`outbox-saved.json`: name → size, time, hash, local path), so a check
- * downloads only what changed. Without it (lost, unreadable) a check downloads
+ * downloads only what changed. Failed transfers and remote cleanup retry
+ * with backoff; cleanup rechecks the saved local copy before deleting.
+ * Without the index (lost, unreadable) a check downloads
  * the outbox again and the content comparison keeps it from saving copies.
  */
 import { createHash } from 'node:crypto';
@@ -69,6 +71,8 @@ export function makeOutboxSync(o: {
   auto(): boolean;
   /** Remove a saved file from the outbox; see {@link AgentClient.deleteFile}. */
   remove?(name: string): Promise<'deleted' | 'missing' | 'unsupported'>;
+  /** Clock for retry scheduling. */
+  now?: () => number;
 }): OutboxSync {
   const base = agentFilesDir(o.agentId, o.home);
   const dir = join(base, 'outbox');
@@ -80,6 +84,13 @@ export function makeOutboxSync(o: {
   let unseen: AgentFile[] = [];
   let running: Promise<OutboxEvent[]> | null = null;
   let canRemove = !!o.remove;
+  const now = o.now ?? Date.now;
+  const retries = new Map<string, { attempts: number; at: number }>();
+  const ready = (key: string): boolean => (retries.get(key)?.at ?? 0) <= now();
+  const failed = (key: string): void => {
+    const attempts = (retries.get(key)?.attempts ?? 0) + 1;
+    retries.set(key, { attempts, at: now() + Math.min(300_000, OUTBOX_POLL_MS * 2 ** Math.min(attempts - 1, 4)) });
+  };
 
   const version = (f: AgentFile): string => `${f.name}\u0000${f.bytes}\u0000${f.mtime}`;
   const isNew = (f: AgentFile): boolean => {
@@ -87,15 +98,40 @@ export function makeOutboxSync(o: {
     return !s || s.bytes !== f.bytes || s.mtime !== f.mtime || (!!f.sha256 && !!s.sha256 && f.sha256 !== s.sha256);
   };
 
+  async function removeSaved(f: AgentFile): Promise<void> {
+    const key = `delete:${version(f)}`;
+    if (!canRemove || !ready(key)) return;
+    const saved = index[f.name];
+    if (!saved?.path || saved.bytes !== f.bytes || saved.mtime !== f.mtime || !saved.sha256 || (f.sha256 && saved.sha256 !== f.sha256)) return;
+    // The owner may have moved, removed or edited the local file since a
+    // failed DELETE. An index entry alone is not a delivered copy.
+    try {
+      const bytes = readFileSync(saved.path);
+      if (bytes.length !== saved.bytes || createHash('sha256').update(bytes).digest('hex') !== saved.sha256) return;
+    } catch { return; }
+    try {
+      if ((await o.remove!(f.name)) === 'unsupported') canRemove = false;
+      retries.delete(key);
+    } catch { failed(key); }
+  }
+
   async function run(): Promise<OutboxEvent[]> {
-    const files = (await o.list()).filter((f) => isNew(f) && !reported.has(version(f))).reverse(); // oldest first
+    const files = (await o.list()).reverse(); // oldest first
+    const present = new Set(files.map(version));
+    for (const key of reported) if (!present.has(key)) reported.delete(key);
+    for (const key of shown) if (!present.has(key)) shown.delete(key);
+    const versions = new Set(files.flatMap((f) => [`download:${version(f)}`, `delete:${version(f)}`]));
+    for (const key of retries.keys()) if (!versions.has(key)) retries.delete(key);
     const events: OutboxEvent[] = [];
     if (!o.auto()) {
-      unseen = files.filter((f) => !shown.has(version(f)));
+      unseen = files.filter((f) => isNew(f) && !reported.has(version(f)) && !shown.has(version(f)));
       return events;
     }
     unseen = [];
     for (const f of files) {
+      if (!isNew(f)) { await removeSaved(f); continue; }
+      const key = `download:${version(f)}`;
+      if (!ready(key) || (reported.has(version(f)) && !retries.has(key))) continue;
       if (f.bytes > DOWNLOAD_MAX_BYTES) {
         reported.add(version(f));
         events.push({ kind: 'skipped', name: f.name, bytes: f.bytes });
@@ -107,19 +143,17 @@ export function makeOutboxSync(o: {
         mkdirSync(dir, { recursive: true });
         const have = sameFile(dir, f.name, bytes.length, sha256);
         const path = have ?? saveDownload(bytes, f.name, dir);
-        index[f.name] = { bytes: f.bytes, mtime: f.mtime, sha256: f.sha256 ?? sha256, path };
+        index[f.name] = { bytes: bytes.length, mtime: f.mtime, sha256, path };
         writeIndex(indexFile, index);
+        retries.delete(key);
         if (!have) events.push({ kind: 'saved', name: f.name, bytes: bytes.length, path });
         // The owner has it: take it off the agent's disk, unless what came
         // down is not what the listing described (it changed meanwhile).
-        if (canRemove && bytes.length === f.bytes && (!f.sha256 || f.sha256 === sha256)) {
-          try {
-            if ((await o.remove!(f.name)) === 'unsupported') canRemove = false;
-          } catch { /* kept in the outbox; its age clears it later */ }
-        }
+        if (bytes.length === f.bytes && (!f.sha256 || f.sha256 === sha256)) await removeSaved(f);
       } catch (e) {
+        failed(key);
+        if (!reported.has(version(f))) events.push({ kind: 'failed', name: f.name, bytes: f.bytes, error: (e as Error).message });
         reported.add(version(f));
-        events.push({ kind: 'failed', name: f.name, bytes: f.bytes, error: (e as Error).message });
       }
     }
     return events;
@@ -223,7 +257,7 @@ export function renderOutboxEvent(e: OutboxEvent, links: boolean, home: string =
     return `${name} (${size(e.bytes)}) is over the ${size(DOWNLOAD_MAX_BYTES)} download limit: not saved\n`;
   }
   if (e.kind === 'failed') {
-    return `could not save ${name}: ${cleanCell(e.error ?? 'no reason given')} — /download ${name} tries again\n`;
+    return `could not save ${name}: ${cleanCell(e.error ?? 'no reason given')} — will retry; /download ${name} tries now\n`;
   }
   const path = e.path ?? '';
   const renamed = localName(e.name) !== path.slice(path.lastIndexOf(sep) + 1);

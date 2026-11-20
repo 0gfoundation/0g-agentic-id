@@ -47,7 +47,7 @@ export interface TurnView {
   refresh(): void;
   /** Said after the status line's time (` · Esc to stop`) by a view whose prompt does not say it. */
   readonly stopHint?: string;
-  /** An activity label of the turn ("tool/call bash"), for a view that sums up each run of tool calls. */
+  /** An activity label of the turn ("tool/call bash"), for a view that sums up the turn's tool calls. */
   activity?(label: string): void;
   /** The turn is over: the region and its prompt go, the reply's unfinished
    *  line is left as written (no line break). */

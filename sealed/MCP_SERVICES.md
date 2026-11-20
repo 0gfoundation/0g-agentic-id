@@ -21,6 +21,8 @@ Programs listen on `$MCP_SOCKET` (in their private run directory); the public en
 the `version` it runs and its `release` path (`?sealed-release=1`). The original path is kept.
 Publication uses the existing public 8080 and adds no port or management entry.
 
+Hosted entries also carry their current `state`. Stopped or unsupported programs remain visible for release audit; they do not accept work. Clients should display this state and only mount or offer entries whose state is `running` (an absent state is an older runtime).
+
 Omit `worker` for a small stateless server: each POST starts a temporary sandbox.
 For async jobs, declare `worker:{command,args}`: sealed starts an **isolated
 coordinator** for MCP, with a service-private persistent `$HOME` and a private,
