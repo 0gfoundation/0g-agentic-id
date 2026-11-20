@@ -12,6 +12,17 @@ loses `(unreleased)` when the version ships.
   (`attestor/scripts/release-entry.mjs`; attestor README, "Announcing a
   release").
 
+## 0.5.1
+
+Pasted slash commands execute in the CLI, file deliveries retry automatically, and 0g-harness reports when a hosted service has stopped.
+
+- The CLI accepts quoted activity IDs and session titles, looks up short IDs in the latest 500 activities, and groups a turn’s tool calls on one line. The deploy wizard selects 0g-harness by default when it is offered.
+- A session opened while its agent is stopped can save files and clean up remote copies after the agent starts. Failed transfers retry, and each successful save prints the local path once.
+- The CLI includes a 0g-compute credential preset. Owners can store a model key while the agent is stopped and use it on the next start.
+- On the updated 0g-harness runtime, hosted services start on OverlayFS snapshots and report their lifecycle state in `/hello`. The SDK and CLI omit stopped services from the list of callable services.
+
+On testnet, install the CLI with `npm install -g @0gfoundation/0g-agentdna@next`.
+
 ## 0.5.0
 
 Layered runtime (the sealed program and the 0g-harness package update themselves), owner credentials, operators, sessions and tasks, configurable web search, a new CLI agent session.
