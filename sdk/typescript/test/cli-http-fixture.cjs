@@ -14,6 +14,7 @@ if (!output) throw Error("AGENTDNA_CLI_E2E_DIR is required");
 let oldRuntime = false;
 let deploymentPhase = 'running';
 let deploymentDelay = 0;
+let fileDelay = 0;
 let base;
 const calls = [];
 const responses = new Map();
@@ -57,6 +58,7 @@ const server = http.createServer(async(req,res) => {
     if('old' in (body||{})) oldRuntime=body.old===true;
     if(body?.phase) deploymentPhase=body.phase;
     if('deploymentDelay' in (body||{})) deploymentDelay=Number(body.deploymentDelay)||0;
+    if('fileDelay' in (body||{})) fileDelay=Number(body.fileDelay)||0;
     if(body?.clearFiles) files.clear();
     if(body?.file) files.set(body.file.name,Buffer.from(body.file.text));
     return json({oldRuntime,deploymentDelay});
@@ -86,7 +88,10 @@ const server = http.createServer(async(req,res) => {
     if(parts[4]==='cancel')return json({cancelled:null,session:session.id});
     return json(session);
   }
-  if(u.pathname==='/v1/files')return json({data:[...files].map(([name,content])=>({name,bytes:content.length,mtime:'2026-11-20T00:00:00Z'}))});
+  if(u.pathname==='/v1/files'){
+    if(fileDelay)await new Promise(r=>setTimeout(r,fileDelay));
+    return json({data:[...files].map(([name,content])=>({name,bytes:content.length,mtime:'2026-11-20T00:00:00Z'}))});
+  }
   if(u.pathname.startsWith('/v1/files/')){
     const name=decodeURIComponent(u.pathname.split('/').pop());
     if(!files.has(name))return json({error:'no file '+name},404);

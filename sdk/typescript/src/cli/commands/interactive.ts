@@ -1325,12 +1325,15 @@ export function lineQueue(
     // Ctrl-U on a message of several lines clears all of it, not only the
     // line the cursor is on (its earlier lines would go with the next one).
     if (key?.name === 'u' && key.ctrl && !key.meta && draft.length && !boxed && messageHere()) { ask.clearBox?.(); return; }
-    if (key?.name === 'paste-start') { pasting = true; pasteLines = []; return; }
+    if (key?.name === 'paste-start') { endChunk(); pasting = true; pasteLines = []; return; }
     if (key?.name === 'paste-end') {
       pasting = false;
       const lines = pasteLines;
       pasteLines = [];
-      lastPasteAt = Date.now();
+      // This terminal marked the exact end: a following Enter is a user
+      // submission even when both arrived in the same read. The gap
+      // heuristic is only for terminals without bracketed paste markers.
+      lastPasteAt = 0;
       pasted(lines);
       return;
     }
@@ -5176,13 +5179,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   const links = supportsHyperlinks();
   // The files saved by themselves in this session, for /files.
   const savedHere: string[] = [];
+  let outboxChecking = false;
   const checkOutbox = (): void => {
-    if (!outbox || !s.client?.listFiles || !s.client.downloadFile) return;
+    if (!outbox || outboxChecking || !s.client?.listFiles || !s.client.downloadFile) return;
+    outboxChecking = true;
     outbox.check().then((events) => {
       for (const e of events) if (e.kind === 'saved') savedHere.push(cleanCell(e.name));
       for (const e of events) show(renderOutboxEvent(e, links), () => undefined, { files: e.kind === 'saved' ? 1 : 0, raw: true });
       recount();
-    }, () => undefined /* an agent without downloads, or unreachable: the next check */);
+    }, () => undefined /* an agent without downloads, or unreachable: the next check */)
+      .finally(() => { outboxChecking = false; });
   };
   const outboxTimer = outbox ? setInterval(checkOutbox, OUTBOX_POLL_MS) : null;
   outboxTimer?.unref();

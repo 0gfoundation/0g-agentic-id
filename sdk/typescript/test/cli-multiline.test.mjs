@@ -87,6 +87,20 @@ test('command classification: pasted arguments and a trailing newline keep a sin
   }
 });
 
+for (const text of ['/help', '/help\n', 'paragraph\n/help\nend']) {
+  test(`bracketed paste followed by Enter in the same read submits exactly once: ${JSON.stringify(text)}`, async (t) => {
+    const { input, rl, ask } = session();
+    t.after(() => rl.close());
+    const msg = ask.message('agent 1 › ');
+    input.write(PASTE(text) + '\r');
+    let timer;
+    const e = await Promise.race([msg, new Promise((_, reject) => { timer = setTimeout(() => reject(Error('paste waited for another Enter')), 300); })]).finally(() => clearTimeout(timer));
+    assert.equal(e.text.trim(), text.trim());
+    assert.equal(e.pasted, true);
+    assert.equal(commandEntry(e), !text.trim().includes('\n'));
+  });
+}
+
 test('multiline: a typed line is sent with Enter as before', async () => {
   const { input, rl, ask } = session();
   const msg = ask.message('agent 1 › ');

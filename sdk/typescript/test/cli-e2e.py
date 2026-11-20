@@ -127,6 +127,9 @@ def main():
             run_case(t,'pasted /help stays a command',lambda _:test_command(t,'','session commands',['\x1b[200~/help\x1b[201~']))
             run_case(t,'typed slash with pasted argument stays a command',lambda _:test_command(t,'','QA_RECENT_1',['/result ','\x1b[200~job-recent-000001\x1b[201~']))
             run_case(t,'pasted command plus trailing newline stays a command',lambda _:test_command(t,'','session commands',['\x1b[200~/help\n\x1b[201~']))
+            run_case(t,'paste end and Enter in the same read submits the command',lambda _:test_command(t,'\x1b[200~/help\x1b[201~','session commands'))
+            run_case(t,'pasted argument and Enter in the same read stays a command',lambda _:test_command(t,'/result \x1b[200~job-recent-000001\x1b[201~','QA_RECENT_1'))
+            run_case(t,'paste trailing newline and Enter in the same read submits',lambda _:test_command(t,'\x1b[200~/help\n\x1b[201~','session commands'))
             run_case(t,'multiline pasted document stays one chat message',lambda _:test_message(t,['\x1b[200~/help\nthis is quoted document text\x1b[201~',''],'/help\nthis is quoted document text'))
             for quote,label in [('"','double'),("'",'single'),('`','backtick')]:
                 run_case(t,label+'-quoted activity ID',lambda _,q=quote:test_command(t,'/result '+q+'job-recent-000001'+q,'QA_RECENT_1'))
@@ -253,12 +256,13 @@ def main():
                 t.read(11)  # the actual session's 10 s phase poll connects
             def automatic_file(before):
                 name='qa-lifecycle-'+phase+'.txt'
-                api('/fixture-mode',{'file':{'name':name,'text':'QA_LIFECYCLE_OK'}})
-                t.send('/files auto on\r',2)
+                api('/fixture-mode',{'fileDelay':250,'file':{'name':name,'text':'QA_LIFECYCLE_OK'}})
+                output=t.send('/files auto on\r',2)
                 local=ROOT/'home'/'agentdna'/'42'/'outbox'/name
                 require(local.exists() and local.read_text()=='QA_LIFECYCLE_OK','automatic download did not save the exact bytes')
                 require(any(c['method']=='DELETE' and c['path'].endswith(name) for c in calls()[before:]),'remote file was not deleted')
                 require(not api('/v1/files')['data'],'outbox still has the downloaded file')
+                require(output.count('saved '+name)==1,'overlapping checks announced the same save more than once')
             run_case(t,'automatic download and cleanup after entering '+phase,automatic_file)
         finally:t.close()
 
