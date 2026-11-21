@@ -971,12 +971,13 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       }
       const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
       const out = await cred.put(sealId, [...others, entry], { baseVersion: cur.version, ...at }).catch(conflict);
-      if (io.json) return emitOk({ sealId, version: out.version, name, pushWarning: out.pushWarning ?? null });
+      if (io.json) return emitOk({ sealId, version: out.version, name, applied: out.applied, pushWarning: out.pushWarning ?? null });
       const gives = (entry.tokenRequest?.take ?? []).map((t) => `[[credential:${derivedName(name, t)}]]`);
       io.out(gives.length && entry.use === 'token_only'
         ? `${stored ? 'changed' : 'added'} ${name}; the agent asks for a token request on ${name} and then uses ${gives.join(', ')}`
         : `${stored ? 'changed' : 'added'} ${name}; the agent writes [[credential:${name}]] where the key goes`);
-      io.out(out.pushWarning ? `stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot` : 'applied to the running agent');
+      if (out.pushWarning) io.out(`stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot`);
+      else io.out(out.applied ? 'applied to the running agent' : 'saved for the next start');
       return;
     }
     case 'rm': {

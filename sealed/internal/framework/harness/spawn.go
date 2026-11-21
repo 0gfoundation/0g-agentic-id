@@ -707,7 +707,7 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 		// message inbox above. Images ride the chat and Responses messages
 		// themselves.
 		route("/v1/files", "files", "Files the owner sends the agent, and files the agent leaves for the owner.",
-			post("/v1/files"), get("/v1/files"), get("/v1/files/{id}/{id}"), del("/v1/files/{id}/{id}")),
+			post("/v1/files"), get("/v1/files"), get("/v1/files/{id}/{id}"), del("/v1/files/{id}/{id}"), post("/v1/files/outbox/{id}/ack")),
 		// The owner's word for the turn already running: read before that
 		// turn's next model call (DSH next-step input); queued as an
 		// ordinary turn when no owner turn is running.

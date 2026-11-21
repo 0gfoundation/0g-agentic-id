@@ -63,6 +63,9 @@ test('a new file is saved once; a changed one never over the first', async () =>
   assert.deepEqual(ev.map((e) => [e.kind, e.path]), [['saved', join(t.dir, 'report-1.pdf')]]);
   assert.equal(readFileSync(join(t.dir, 'report.pdf'), 'utf8'), 'v1', 'the first is untouched');
   assert.equal(readFileSync(join(t.dir, 'report-1.pdf'), 'utf8'), 'v2 longer');
+  assert.equal(t.sync().savedPath('report.pdf'), join(t.dir, 'report-1.pdf'));
+  writeFileSync(join(t.dir, 'report-1.pdf'), 'different');
+  assert.equal(t.sync().savedPath('report.pdf'), undefined, 'never reports the surviving older file');
 
   // Written again with the same content as a saved one: no copy.
   t.box.put('report.pdf', 'v1');
@@ -256,11 +259,11 @@ test('a saved outbox file is removed from the agent, once it matches; an older r
     list: async () => files,
     download: async () => body,
     auto: () => true,
-    remove: async (name) => { removed.push(name); return 'deleted'; },
+    remove: async (name, digest) => { removed.push([name, digest]); return 'deleted'; },
   });
   const ev = await sync.check();
   assert.equal(ev[0].kind, 'saved');
-  assert.deepEqual(removed, ['report.txt']);
+  assert.deepEqual(removed, [['report.txt', sha]]);
 
   // What came down differs from the listing (changed meanwhile): kept.
   const home2 = mkdtempSync(join(tmpdir(), 'outbox-remove-'));

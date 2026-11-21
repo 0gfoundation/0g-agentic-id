@@ -1,5 +1,6 @@
 // Full CLI backend fixture. Only HTTP/JSON-RPC is simulated; CLI code is unmodified.
 const http = require('node:http');
+const {createHash} = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -21,6 +22,7 @@ const responses = new Map();
 const steers = new Map();
 const sessions = new Map([['owner-chat',{id:'owner-chat',title:'owner chat',kind:'owner',state:'idle',created_at:Date.now()/1000,updated_at:Date.now()/1000}]]);
 const files = new Map();
+let replaceOnAck;
 let sessionNumber = 0;
 const oldJob = {id:'job-oldest-000001',type:'command',status:'completed',actor:'agent',initiator:'owner',label:'old fixture command',started_at:1,ended_at:2,output_text:'QA_OLDER_THAN_200_OK'};
 const recent = Array.from({length:200},(_,i) => ({...oldJob,id:`job-recent-${String(i).padStart(6,'0')}`,output_text:`QA_RECENT_${i}`}));
@@ -44,7 +46,7 @@ const rpc = body => {
   }
   return {jsonrpc:'2.0',id,result};
 };
-const routeKinds = ['chat','responses','activities','inbox','events','files','sessions','steer'];
+const routeKinds = ['chat','responses','activities','inbox','events','files','schedules','sessions','steer'];
 const server = http.createServer(async(req,res) => {
   const chunks=[]; for await(const c of req) chunks.push(c);
   let body;try{body=JSON.parse(Buffer.concat(chunks).toString())}catch{}
@@ -59,8 +61,9 @@ const server = http.createServer(async(req,res) => {
     if(body?.phase) deploymentPhase=body.phase;
     if('deploymentDelay' in (body||{})) deploymentDelay=Number(body.deploymentDelay)||0;
     if('fileDelay' in (body||{})) fileDelay=Number(body.fileDelay)||0;
-    if(body?.clearFiles) files.clear();
+    if(body?.clearFiles) { files.clear(); replaceOnAck=undefined; }
     if(body?.file) files.set(body.file.name,Buffer.from(body.file.text));
+    if(body?.replaceOnAck) replaceOnAck=body.replaceOnAck;
     return json({oldRuntime,deploymentDelay});
   }
   if(u.pathname==='/fixture-calls')return json(calls);
@@ -92,13 +95,27 @@ const server = http.createServer(async(req,res) => {
     if(fileDelay)await new Promise(r=>setTimeout(r,fileDelay));
     return json({data:[...files].map(([name,content])=>({name,bytes:content.length,mtime:'2026-11-20T00:00:00Z'}))});
   }
-  if(u.pathname.startsWith('/v1/files/')){
+  const ack=/^\/v1\/files\/outbox\/([^/]+)\/ack$/.exec(u.pathname);
+  if(ack && req.method==='POST' && !oldRuntime){
+    const name=decodeURIComponent(ack[1]);
+    if(replaceOnAck?.name===name){files.set(name,Buffer.from(replaceOnAck.text));replaceOnAck=undefined;}
+    if(!files.has(name))return json({error:{code:'file_missing'}},404);
+    const digest=createHash('sha256').update(files.get(name)).digest('hex');
+    if(req.headers['if-match']!=='"'+digest+'"') return json({error:{code:'file_changed'}},412);
+    files.delete(name);res.writeHead(204);return res.end();
+  }
+  if(/^\/v1\/files\/(?:outbox|inbox)\/[^/]+$/.test(u.pathname)){
     const name=decodeURIComponent(u.pathname.split('/').pop());
     if(!files.has(name))return json({error:'no file '+name},404);
     if(req.method==='DELETE'){files.delete(name);return json({ok:true});}
+    if(req.method!=='GET')return json({error:'method not allowed'},405);
     res.writeHead(200,{'content-type':'application/octet-stream'});return res.end(files.get(name));
   }
   if(u.pathname==='/v1/inbox')return json({data:[],last_id:0});
+  if(u.pathname==='/v1/schedules')return json({enabled:true,data:[{
+    id:'sched-repeat',kind:'rrule',status:'active',prompt:'recurring fixture',
+    rrule:'DTSTART:20300101T010000Z\nRRULE:FREQ=MINUTELY;INTERVAL=5;COUNT=2',scheduledAt:'2030-01-01T01:00:00Z',
+  }]});
   if(u.pathname==='/v1/activities')return json({data:[...recent,oldJob].slice(0,Math.min(500,Number(u.searchParams.get('limit')||50)))});
   if(u.pathname.startsWith('/v1/activities/')) {
     const id=decodeURIComponent(u.pathname.split('/')[3]);

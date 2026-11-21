@@ -34,7 +34,7 @@ async function storedSet() {
     signature: '0x', defs: { github: defB.toString('base64') }, values: { github: ct.toString('base64') } }) };
 }
 
-async function stub(phase) {
+async function stub(phase, pushStatus = 503) {
   const seen = [];
   const stored = await storedSet();
   const server = createServer((req, res) => {
@@ -48,7 +48,7 @@ async function stub(phase) {
       if (req.method === 'POST' && url.pathname === '/credentials') return json(200, { ok: true, version: 4 });
       if (req.method === 'GET' && url.pathname.startsWith('/deployment/')) return json(200, { phase, agent_card: { url: `http://127.0.0.1:${server.address().port}/hello` } });
       // The running agent does not take the set (e.g. its owner lookup failed).
-      if (req.method === 'POST' && url.pathname === '/_seal/credentials') { res.writeHead(503); return res.end('owner lookup unavailable, retry'); }
+      if (req.method === 'POST' && url.pathname === '/_seal/credentials') { res.writeHead(pushStatus); return res.end(pushStatus === 200 ? 'ok' : 'owner lookup unavailable, retry'); }
       json(404, {});
     });
   });
@@ -72,6 +72,25 @@ test('credentials saved while stopped are kept for the next boot without pushing
     assert.ok(!s.seen.includes('POST /_seal/credentials'));
   } finally { s.server.close(); }
 });
+
+for (const [phase, code, text, pushed] of [
+  ['stopped', 200, 'saved for the next start', false],
+  ['deploying', 200, 'saved for the next start', false],
+  ['running', 200, 'applied to the running agent', true],
+  ['running', 503, 'it applies on the next boot', true],
+]) {
+  test(`cred set reports the actual delivery outcome (${phase}, ${code})`, async () => {
+    const s = await stub(phase, code);
+    try {
+      const lines = [];
+      await credOp(ag(s.port), SEAL_ID, ['set', 'github', 'reveal=off'], {
+        json: false, out: (l) => lines.push(l), secret: async () => '',
+      });
+      assert.ok(lines.at(-1).includes(text), JSON.stringify(lines));
+      assert.equal(s.seen.includes('POST /_seal/credentials'), pushed);
+    } finally { s.server.close(); }
+  });
+}
 
 for (const args of [['reveal', 'github', 'off'], ['rm', 'github']]) {
   test(`cli: cred ${args.join(' ')} says whether the running agent took it`, async () => {

@@ -788,16 +788,15 @@ pub trait DeploymentRepo: Send + Sync {
     /// counted. `/provision` uses the count to decide whether this boot gets
     /// the new document (first attempt) or the last one that worked.
     ///
-    /// `boot` is the claiming container's boot ID. A request from the boot
-    /// that made the last counted attempt (a retried `/provision`) is not
-    /// counted again: it gets the current count back, so it is served the
-    /// same document. `None` always counts.
+    /// A retry by the same boot receives the same document. The initial
+    /// handoff to the owner's selected sealed in the same generation also
+    /// belongs to that attempt. A request without a boot ID always counts.
     async fn note_settings_attempt(
         &self,
         seal_id: SealId,
         version: i64,
         generation: Option<i64>,
-        boot: Option<B256>,
+        boot: Option<SettingsBoot>,
     ) -> anyhow::Result<Option<i32>>;
 
     /// Settle the stages an abandoned job (`ReapCause::Abandoned`) left in
