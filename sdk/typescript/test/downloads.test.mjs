@@ -130,6 +130,26 @@ test('/download: never overwrites; inbox/ names the owner\'s own files; a local 
   assert.match(lines[0], /report\.pdf\s+2\.0 KiB\s+2026-11-17 06:00:00Z/);
 });
 
+test('acknowledgeFile sends a conditional receipt and never falls back to DELETE', async () => {
+  const digest = 'a'.repeat(64);
+  const calls = [];
+  const agent = await mockAgent((req, res) => {
+    calls.push([req.method, req.url, req.headers['if-match']]);
+    const status = Number(req.url.split('/')[4]);
+    if (status === 204) { res.writeHead(204); return res.end(); }
+    return json(res, status === 410 ? 404 : status, { error: { code: status === 410 ? 'file_missing' : 'other' } });
+  });
+  try {
+    const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS, token: 't' });
+    const expected = [[204, 'deleted'], [410, 'missing'], [412, 'changed'], [404, 'unsupported'], [405, 'unsupported'], [501, 'unsupported']];
+    for (const [status, result] of expected) assert.equal(await c.acknowledgeFile(String(status), digest), result);
+    for (const status of [401, 409, 503]) await assert.rejects(c.acknowledgeFile(String(status), digest), new RegExp('HTTP ' + status));
+    await assert.rejects(c.acknowledgeFile('../x', digest), /invalid outbox/);
+    await assert.rejects(c.acknowledgeFile('x', '*'), /invalid SHA/);
+    assert.deepEqual(calls, [...expected.map(([s]) => s), 401, 409, 503].map((s) => ['POST', '/v1/files/outbox/' + s + '/ack', '"' + digest + '"']));
+  } finally { agent.stop(); }
+});
+
 test('deleteFile: deleted, missing, or a runtime without the route', async () => {
   const agent = await mockAgent((req, res) => {
     if (req.method !== 'DELETE') return json(res, 405, { error: { message: 'method not allowed' } });

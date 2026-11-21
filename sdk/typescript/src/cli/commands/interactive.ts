@@ -14,7 +14,7 @@
  */
 
 import * as readline from 'node:readline';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, type Address } from 'viem';
@@ -544,9 +544,13 @@ export function renderSessionList(list: readonly AgentSession[], current: string
  * else an id, id prefix or words of a title. `number` without `shown`: no
  * list was shown yet; `gone`: the one shown under that number is no more.
  */
-export function pickSession(list: readonly AgentSession[], arg: string, shown?: readonly ShownSession[] | null): { hit?: AgentSession; number?: number; gone?: ShownSession } {
-  const num = /^(\d+)(?:\s|$)/.exec(arg);
-  if (num) {
+export function pickSession(list: readonly AgentSession[], arg: string, shown?: readonly ShownSession[] | null, quoted = false): { hit?: AgentSession; number?: number; gone?: ShownSession } {
+  const rows = orderSessions(list);
+  const title = arg.toLowerCase();
+  const num = quoted ? null : /^(\d+)(?:\s+(.*))?$/.exec(arg);
+  // A bare number or its actual Tab completion refers to the displayed row.
+  // The first word of an ordinary title is allowed to be a number.
+  if (num && (!num[2] || shown?.[Number(num[1]) - 1]?.title === num[2])) {
     const number = Number(num[1]);
     if (!shown) return { number };
     const row = shown[number - 1];
@@ -554,8 +558,9 @@ export function pickSession(list: readonly AgentSession[], arg: string, shown?: 
     const hit = list.find((x) => x.id === row.id);
     return hit ? { hit, number } : { number, gone: row };
   }
-  const rows = orderSessions(list);
-  const hit = rows.find((x) => x.id === arg) ?? rows.find((x) => x.id.startsWith(arg)) ?? rows.find((x) => (x.title || '').toLowerCase().includes(arg.toLowerCase()));
+  const exact = rows.find((x) => x.title?.toLowerCase() === title);
+  const byId = rows.find((x) => x.id === arg) ?? rows.find((x) => x.id.startsWith(arg));
+  const hit = (quoted ? exact ?? byId : byId ?? exact) ?? rows.find((x) => (x.title || '').toLowerCase().includes(title));
   return hit ? { hit } : {};
 }
 
@@ -5089,8 +5094,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         auto: () => filesAuto,
         // The session may have been entered while stopped: resolve the
         // connected client's capability at each call, not only at entry.
-        remove: (name: string) => s.client?.deleteFile
-          ? s.client.deleteFile('outbox', name)
+        remove: (name, sha256) => s.client?.acknowledgeFile
+          ? s.client.acknowledgeFile(name, sha256)
           : Promise.resolve('unsupported' as const),
       })
     : null;
@@ -5525,7 +5530,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const sub = head[1] ?? '';
         // Titles are free text (Bob's notes is not shell quoting). Decode
         // an explicit outer quote while preserving ordinary title text.
-        const arg = /^(['"])[\s\S]*\1$/.test(rest) ? tokenize(rest).join(' ') : rest.trim();
+        const quoted = /^(['"])[\s\S]*\1$/.test(rest);
+        const arg = quoted ? tokenize(rest).join(' ') : rest.trim();
         if (!sub || sub === 'list') {
           const list = await s.client.sessions();
           sessionsSeen = list;
@@ -5547,7 +5553,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (!arg) { out('usage: /sessions switch <#|id|title>\n'); continue; }
           const list = await s.client.sessions();
           sessionsSeen = list;
-          const picked = pickSession(list, arg, sessionsShown);
+          const picked = pickSession(list, arg, sessionsShown, quoted);
           let hit = picked.hit;
           if (picked.gone) { out(`#${picked.number} in the list you saw (${cleanCell(picked.gone.title)}) is gone — /sessions lists them again\n`); continue; }
           if (!hit && picked.number !== undefined && !sessionsShown) {
@@ -5968,14 +5974,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const args = tokenize(line.slice('/download'.length).trim());
         if (!args.length || args.length > 2) { out('usage: /download <name> [local path]\n'); continue; }
         const { dir, name } = parseDownloadName(args[0]);
-        const bytes = await s.client.downloadFile(dir, name).catch((e: Error) => {
+        let bytes: Uint8Array;
+        try {
+          bytes = await s.client.downloadFile(dir, name);
+        } catch (e) {
+          if (!(e instanceof Error)) throw e;
           if (!/HTTP 404/.test(e.message)) throw e;
-          // Saved here by itself, and gone from the agent's outbox since.
-          const local = dir === 'outbox' && outbox ? join(outbox.dir, name) : '';
-          if (local && existsSync(local)) return null;
+          const local = dir === 'outbox' ? outbox?.savedPath(name) : undefined;
+          if (local) { out(`already saved to ${cleanCell(tildePath(local))}\n`); continue; }
           throw new CliError('UNKNOWN', `no file ${name} in the agent's ${dir === 'inbox' ? 'inbox' : 'outbox'} — /files${dir === 'inbox' ? ' inbox' : ''} lists them`);
-        });
-        if (!bytes) { out(`already saved to ${cleanCell(tildePath(join(outbox!.dir, name)))}\n`); continue; }
+        }
         const saved = saveDownload(bytes, name, args[1]);
         out(`saved ${cleanCell(name)} (${bytes.length} bytes) → ${cleanCell(tildePath(saved))}\n`);
         continue;

@@ -169,6 +169,13 @@ def main():
                 test_command(t,'/sessions switch "'+title+'"','→ '+title)
             run_case(t,'switch session by unquoted title',switch_unquoted)
             run_case(t,'switch session by quoted title',switch_quoted)
+            def numeric_title(before):
+                title='2026 预算 '+mode
+                t.send('/sessions new "'+title+'"\r',.6)
+                for arg in ['"'+title+'"',title]:
+                    t.send('/sessions default\r',.4)
+                    test_command(t,'/sessions switch '+arg,'→ '+title)
+            run_case(t,'switch session by a title starting with a number',numeric_title)
             run_case(t,'return to owner-chat',lambda _:test_command(t,'/sessions default','owner-chat'))
             def busy_readonly(before):
                 t.send('QA_SLOW_READONLY\r',.5);t.send('/activities\r',.5)
@@ -212,6 +219,25 @@ def main():
                 p=dest.with_name(dest.stem+'-1'+dest.suffix)
                 require(p.exists() and p.read_text()=='QA_MATRIX_FILE_OK','collision copy missing')
             run_case(t,'download preserves existing local file',no_overwrite)
+            def revisions(before):
+                name='revisions-'+mode+'.txt'
+                local=ROOT/'home'/'agentdna'/'42'/'outbox'/name
+                latest=local.with_name(local.stem+'-1.txt')
+                api('/fixture-mode',{'clearFiles':True,'file':{'name':name,'text':'one'},'replaceOnAck':{'name':name,'text':'two'}})
+                try:
+                    t.send('/files auto on\r',1)
+                    require(local.read_text()=='one','first revision missing')
+                    require(any(f['name']==name for f in api('/v1/files')['data']),'acknowledging version one removed version two')
+                    t.send('/files auto on\r',1)
+                    require(latest.read_text()=='two','second revision missing')
+                    require(not api('/v1/files')['data'],'delivered second revision still remote')
+                    test_command(t,'/download '+name,'already saved to ~/agentdna/42/outbox/'+latest.name)
+                    latest.write_text('edited locally')
+                    test_command(t,'/download '+name,'no file '+name)
+                    require(local.read_text()=='one','original local file was overwritten')
+                    require(not any(c['method']=='DELETE' for c in calls()[before:]),'automatic save issued an unconditional delete')
+                finally:t.send('/files auto off\r',.4)
+            run_case(t,'same name changes during delivery and download finds the latest copy',revisions)
             api('/fixture-mode',{'clearFiles':True})
             t.send('/back\r',.6)
             for command in ['deposit -1','deposit abc','withdraw 0']:
@@ -262,7 +288,7 @@ def main():
                 output=t.send('/files auto on\r',2)
                 local=ROOT/'home'/'agentdna'/'42'/'outbox'/name
                 require(local.exists() and local.read_text()=='QA_LIFECYCLE_OK','automatic download did not save the exact bytes')
-                require(any(c['method']=='DELETE' and c['path'].endswith(name) for c in calls()[before:]),'remote file was not deleted')
+                require(any(c['method']=='POST' and c['path'].endswith('/'+name+'/ack') for c in calls()[before:]),'remote revision was not acknowledged')
                 require(not api('/v1/files')['data'],'outbox still has the downloaded file')
                 require(output.count('saved '+name)==1,'overlapping checks announced the same save more than once')
             run_case(t,'automatic download and cleanup after entering '+phase,automatic_file)

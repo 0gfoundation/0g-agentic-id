@@ -88,6 +88,7 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/files", "GET", "/v1/files/outbox/report.pdf"},
 		{"/v1/files", "GET", "/v1/files/inbox/notes.txt"},
 		{"/v1/files", "DELETE", "/v1/files/outbox/report.pdf"},
+		{"/v1/files", "POST", "/v1/files/outbox/report.pdf/ack"},
 		{"/v1/files", "DELETE", "/v1/files/inbox/notes.txt"},
 		{"/v1/sessions", "GET", "/v1/sessions"},
 		{"/v1/sessions", "POST", "/v1/sessions"},
@@ -125,6 +126,8 @@ func TestFrameworkRoutesListTheProtocolEndpoints(t *testing.T) {
 		{"/v1/files", "DELETE", "/v1/files"},
 		{"/v1/files", "DELETE", "/v1/files/outbox"},
 		{"/v1/files", "DELETE", "/v1/files/outbox/a/b"},
+		{"/v1/files", "POST", "/v1/files/inbox/report.pdf/ack"},
+		{"/v1/files", "DELETE", "/v1/files/outbox/report.pdf/ack"},
 	}
 	for _, f := range refused {
 		if ok, _ := routes[f.prefix].Allows(f.method, f.path); ok {

@@ -756,6 +756,8 @@ export interface AgentClient {
   listFiles?(dir?: AgentFileDir): Promise<AgentFile[]>;
   /** One file's bytes (at most 50 MiB). See {@link AgentClient.listFiles}. */
   downloadFile?(dir: AgentFileDir, name: string): Promise<Uint8Array>;
+  /** Acknowledge the exact outbox bytes saved locally. Older runtimes retain the file. */
+  acknowledgeFile?(name: string, sha256: string): Promise<'deleted' | 'missing' | 'changed' | 'unsupported'>;
   /**
    * Remove one file from the agent's outbox or file inbox (0g-harness
    * `DELETE /v1/files/{dir}/{name}`). `deleted`: it is gone; `missing`: there
@@ -1570,6 +1572,19 @@ export function makeAgentClient(params: {
       const r = await doFetch(`${filesBase}/${dir}/${encodeURIComponent(name)}`);
       if (!r.ok) throw noDownloads('downloadFile', r.status, await r.text());
       return new Uint8Array(await r.arrayBuffer());
+    };
+    client.acknowledgeFile = async (name, sha256) => {
+      if (!name || name.includes('/') || name.includes('\\') || name.startsWith('.')) throw new Error('acknowledgeFile: invalid outbox file name');
+      if (!/^[a-f0-9]{64}$/.test(sha256)) throw new Error('acknowledgeFile: invalid SHA-256');
+      const r = await doFetch(`${filesBase}/outbox/${encodeURIComponent(name)}/ack`, {
+        method: 'POST', headers: { 'If-Match': `"${sha256}"` },
+      });
+      if (r.status === 204) return 'deleted';
+      if (r.status === 412) return 'changed';
+      if (r.status === 405 || r.status === 501) return 'unsupported';
+      const text = await r.text();
+      if (r.status === 404) return /"code"\s*:\s*"file_missing"/.test(text) ? 'missing' : 'unsupported';
+      throw new Error(`acknowledgeFile: HTTP ${r.status}: ${plainText(text)}`);
     };
     client.deleteFile = async (dir, name) => {
       if (dir !== 'outbox' && dir !== 'inbox') throw new Error('deleteFile: dir is outbox or inbox');
