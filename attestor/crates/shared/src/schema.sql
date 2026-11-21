@@ -236,6 +236,10 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_attempts INT NOT NULL 
 -- served the same document; only a container that comes back as a new boot
 -- moves the count past the first attempt.
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_attempt_boot BYTEA;
+-- Only the first attempt can continue in the sealed binary selected by
+-- that settings version. A new generation cannot consume the old handoff.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_attempt_generation BIGINT;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_handover_to BYTEA;
 
 
 -- Global provider revisions, scoped to the deployment environment. Exact signed

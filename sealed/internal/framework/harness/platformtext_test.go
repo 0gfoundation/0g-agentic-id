@@ -20,3 +20,22 @@ func TestFrameworkFactsNameTheWebSwitches(t *testing.T) {
 		}
 	}
 }
+
+func TestFileDeliveryDistinguishesCopiesFromAutomaticCleanup(t *testing.T) {
+	facts := New().FrameworkFacts()
+	notes := strings.Join(facts.Notes, "\n")
+	for _, want := range []string{
+		"Manual `/download` keeps the remote original",
+		"acknowledges the saved revision so a supported runtime can remove it",
+	} {
+		if !strings.Contains(notes, want) {
+			t.Errorf("missing file delivery guidance %q", want)
+		}
+	}
+	for _, entry := range facts.Untracked {
+		if entry.Path == "~/outbox/" && strings.Contains(entry.Note, "automatic saver acknowledges the saved revision on supported runtimes") {
+			return
+		}
+	}
+	t.Error("the outbox guidance should identify when the remote copy is removed")
+}

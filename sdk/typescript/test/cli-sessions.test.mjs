@@ -49,6 +49,20 @@ test('switch by number in the list last shown, id, id prefix or title words', ()
   assert.deepEqual(pickSession(list, '3'), { number: 3 });
 });
 
+test('numeric titles coexist with row numbers and their Tab completions', () => {
+  const titles = ['2026 预算', '2', '2 ?', 'owner-chat'];
+  const extra = titles.map((title, i) => ({ ...list[2], title, id: 'named-' + i }));
+  const all = [...list, ...extra], shown = shownSessions(list);
+  assert.equal(pickSession(all, '2026 预算', null, true).hit.id, 'named-0');
+  assert.equal(pickSession(all, '2026 预算', shown).hit.id, 'named-0');
+  assert.equal(pickSession(all, '2', shown, true).hit.id, 'named-1');
+  assert.equal(pickSession(all, '2 ?', shown, true).hit.id, 'named-2');
+  assert.equal(pickSession(all, '2 ?', shown).hit.id, shown[1].id);
+  assert.equal(pickSession(all, 'owner-chat', shown).hit.id, 'owner-chat');
+  assert.equal(pickSession(all, 'owner-chat', shown, true).hit.id, 'named-3');
+  assert.deepEqual(pickSession(all, '2 missing', shown), {});
+});
+
 test('a number counts in the list the owner saw, not the order now', () => {
   // The owner saw this list: #3 was 我最喜欢的颜色.
   const before = [

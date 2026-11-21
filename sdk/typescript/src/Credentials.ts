@@ -492,9 +492,16 @@ export class CredentialsApi {
    * resolves it. The public row carries only the AgentCard's.
    */
   async agentUrl(sealId: Hash): Promise<string> {
+    return this.deploymentUrl(await this.deploymentRow(sealId));
+  }
+
+  private async deploymentRow(sealId: Hash): Promise<{ phase?: string; url?: string; agent_card?: { url?: string } }> {
     const r = await fetch(`${this.attestorUrl()}/deployment/${sealId}`, { signal: AbortSignal.timeout(10_000) });
     if (!r.ok) throw new Error(`credentials: cannot read /deployment/${sealId}: HTTP ${r.status}`);
-    const row = (await r.json()) as { url?: string; agent_card?: { url?: string } };
+    return await r.json() as { phase?: string; url?: string; agent_card?: { url?: string } };
+  }
+
+  private deploymentUrl(row: { url?: string; agent_card?: { url?: string } }): string {
     const url = row.url ?? row.agent_card?.url?.replace(/\/hello$/, '');
     if (!url) throw new Error('credentials: the agent has no public URL yet (not running?)');
     return url.replace(/\/$/, '');
@@ -575,14 +582,19 @@ export class CredentialsApi {
   /**
    * Replace the agent's whole credential set (compare-and-swap on the version
    * {@link get} returned). Entries without `value` keep their stored value.
-   * Stores the set at the attestor, then pushes it to the running container;
-   * a push failure is returned as a warning (the next boot applies it).
+   * Stores the set at the attestor. `applied` is true when the running
+   * container accepts it. A stopped container loads it at the next boot.
+   * If a live push fails, `pushWarning` contains the reason.
    */
-  async put(sealId: Hash, entries: CredentialInput[], opts: { baseVersion: number; agentUrl?: string }): Promise<{ version: number; pushWarning?: string }> {
+  async put(sealId: Hash, entries: CredentialInput[], opts: { baseVersion: number; agentUrl?: string }): Promise<{ version: number; applied: boolean; pushWarning?: string }> {
     const doc = await this.buildDocument(sealId, entries, opts.baseVersion);
     const version = await this.store(sealId, doc, opts.baseVersion);
-    const pushWarning = await this.push(sealId, doc, opts.agentUrl).then(() => undefined, (e: unknown) => String(e instanceof Error ? e.message : e));
-    return { version, pushWarning };
+    try {
+      const applied = await this.push(sealId, doc, opts.agentUrl);
+      return { version, applied };
+    } catch (e) {
+      return { version, applied: false, pushWarning: String(e instanceof Error ? e.message : e) };
+    }
   }
 
   /**
@@ -752,8 +764,8 @@ export class CredentialsApi {
     if (!provider || !view.stored.some((k) => k.provider === provider) || view.inUse.source === 'credentials') return 'in_sync';
     const cur = await this.get(sealId);
     if (!cur.document) return 'in_sync';
-    await this.push(sealId.toLowerCase() as Hash, cur.document, opts?.agentUrl);
-    return 'pushed';
+    const applied = await this.push(sealId.toLowerCase() as Hash, cur.document, opts?.agentUrl);
+    return applied ? 'pushed' : 'not_running';
   }
 
   /** The agent's agentSeal key values are sealed to, checked as
@@ -865,10 +877,15 @@ export class CredentialsApi {
     });
   }
 
-  private async push(sealId: Hash, doc: CredentialDocument, agentUrl?: string): Promise<void> {
-    const base = agentUrl ?? (await this.agentUrl(sealId));
+  private async push(sealId: Hash, doc: CredentialDocument, agentUrl?: string): Promise<boolean> {
+    const row = agentUrl ? undefined : await this.deploymentRow(sealId);
+    // A stopped/deploying container's recorded URL can still exist, but
+    // has no process to receive this set. It takes the stored set at boot.
+    if (row?.phase && row.phase !== 'running') return false;
+    const base = agentUrl ?? this.deploymentUrl(row!);
     const r = await this.sealRequest(sealId, base, '0GSealCredentials', '/_seal/credentials', JSON.stringify(doc));
     if (!r.ok) throw new Error(`push to the running agent failed: HTTP ${r.status} ${plainText(await r.text().catch(() => ''))}`);
+    return true;
   }
 
   /**

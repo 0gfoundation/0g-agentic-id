@@ -1,6 +1,6 @@
 {
   "name": "@0gfoundation/0g-agentdna",
-  "version": "0.5.0",
+  "version": "0.5.2",
   "description": "0G AgentDNA TypeScript SDK and CLI for on-chain AI agent identities",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -35,6 +35,7 @@
   "scripts": {
     "build": "node scripts/sync-providers.cjs && tsc",
     "test": "npm run build && node --test test/*.test.mjs",
+    "test:cli-e2e": "npm run build && python3 test/cli-e2e.py",
     "typecheck": "tsc --noEmit",
     "test:kav": "npm run build && node scripts/serveproof-kav.cjs",
     "clean": "rm -rf dist",

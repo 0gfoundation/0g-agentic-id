@@ -389,7 +389,7 @@ async fn provision(
     // container with no document still comes up (the sealed side treats an
     // absent blob as "never configured").
     let mut served = None;
-    let encrypted_settings = match settings_for_boot(state, &d, claim.generation, claim.boot_id).await {
+    let encrypted_settings = match settings_for_boot(state, &d, &claim, req.sealed_hash).await {
         Some((doc, version)) => match serde_json::to_vec(doc)
             .map_err(|e| anyhow::anyhow!("serialize settings: {e}"))
             .and_then(|bytes| {
@@ -521,7 +521,8 @@ async fn allowed_image(state: &AppState, image_hash: alloy::primitives::B256) ->
 /// without ever reporting `running` is, by that fact, not booting on it.
 /// Attempts are counted per boot: sealed retries a failed or lost
 /// `/provision` under the same boot ID, and such a retry is the same
-/// attempt, so it is served the same document.
+/// attempt, so it is served the same document. A transfer from the bootstrap
+/// sealed to the binary pinned by that document also counts as one attempt.
 /// Keying the fallback on repeated attempts rather than on an error report
 /// is deliberate — an error report arrives on every failing heartbeat, so
 /// reverting there made it impossible to land a configuration change while
@@ -532,8 +533,8 @@ async fn allowed_image(state: &AppState, image_hash: alloy::primitives::B256) ->
 async fn settings_for_boot<'a>(
     state: &AppState,
     d: &'a attestor_shared::Deployment,
-    generation: i64,
-    boot_id: alloy::primitives::B256,
+    claim: &status::BootClaim,
+    sealed: Option<alloy::primitives::B256>,
 ) -> Option<(&'a serde_json::Value, i64)> {
     let current = if let Some(doc) = d.settings.as_ref() {
         (doc, d.settings_version)
@@ -550,9 +551,20 @@ async fn settings_for_boot<'a>(
     // boot is not counted again). A failure to record it must not fail the
     // boot: treat the attempt as the first, i.e. serve what the owner asked
     // for.
+    let pin = current
+        .0
+        .pointer("/versions/sealed")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.trim().parse().ok());
+    let boot = attestor_shared::SettingsBoot::new(claim.boot_id, sealed, pin);
     let attempts = match state
         .deployments
-        .note_settings_attempt(d.seal_id, d.settings_version, Some(generation), Some(boot_id))
+        .note_settings_attempt(
+            d.seal_id,
+            d.settings_version,
+            Some(claim.generation),
+            Some(boot),
+        )
         .await
     {
         Ok(Some(n)) => n,
@@ -2040,6 +2052,58 @@ pub(crate) mod tests {
         let d = repo.get(seal).await.unwrap().unwrap();
         assert_eq!(d.settings.as_ref(), Some(&bad));
         assert_eq!(d.settings_attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn pinned_sealed_handover_keeps_the_new_model_on_its_first_real_boot() {
+        let old_binary = B256::repeat_byte(0x54);
+        let new_binary = B256::repeat_byte(0x55);
+        let old =
+            serde_json::json!({"provider":"fixture","model":"a","versions":{"sealed":old_binary}});
+        let new =
+            serde_json::json!({"provider":"fixture","model":"b","versions":{"sealed":new_binary}});
+        let (mut state, repo, seal) = setup(Some(old.clone())).await;
+        layered_chain(&mut state, &[old_binary, new_binary]);
+        let boot = first_layered(&repo, seal, old_binary).await;
+        assert_eq!(opened(&state, &call(&state, boot).await.unwrap()), old);
+        assert_eq!(
+            repo.promote_settings_last_good(seal).await.unwrap(),
+            Some(1)
+        );
+
+        for (version, from, to, doc) in [
+            (1, old_binary, new_binary, &new),
+            (2, new_binary, old_binary, &old),
+        ] {
+            repo.set_settings(seal, doc.clone(), version).await.unwrap();
+            for binary in [from, to] {
+                let mut req = later(&repo, seal).await;
+                req.sealed_hash = Some(binary);
+                sign_claim(&mut req, CONTAINER_PRIV);
+                let response = call(&state, req.clone()).await.unwrap();
+                assert_eq!(&opened(&state, &response), doc, "wrong model on {binary}");
+                let retry = retried(&repo, req, CONTAINER_PRIV).await;
+                assert_eq!(&opened(&state, &call(&state, retry).await.unwrap()), doc);
+            }
+            assert_eq!(repo.get(seal).await.unwrap().unwrap().settings_attempts, 1);
+            if version == 1 {
+                assert_eq!(
+                    repo.promote_settings_last_good(seal).await.unwrap(),
+                    Some(2)
+                );
+            }
+        }
+        // A crash of the selected binary really is another attempt.
+        let mut crash = later(&repo, seal).await;
+        crash.sealed_hash = Some(old_binary);
+        sign_claim(&mut crash, CONTAINER_PRIV);
+        assert_eq!(opened(&state, &call(&state, crash).await.unwrap()), new);
+        assert!(repo
+            .get(seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .settings_fallback_active());
     }
 
     #[tokio::test]

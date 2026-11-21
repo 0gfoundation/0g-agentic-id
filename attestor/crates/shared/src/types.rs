@@ -618,6 +618,25 @@ impl Deployment {
     }
 }
 
+/// Identity of the process claiming the owner's unconfirmed settings. A
+/// layered process may first read them only to hand off to the selected sealed.
+#[derive(Clone, Copy, Debug)]
+pub struct SettingsBoot {
+    pub(crate) id: B256,
+    pub(crate) sealed: Option<B256>,
+    pub(crate) handover_to: Option<B256>,
+}
+
+impl SettingsBoot {
+    pub fn new(id: B256, sealed: Option<B256>, pin: Option<B256>) -> Self {
+        Self {
+            id,
+            sealed,
+            handover_to: sealed.and_then(|running| pin.filter(|target| *target != running)),
+        }
+    }
+}
+
 /// Does the boot counted as attempt number `attempts` get
 /// `settings_last_good` rather than the owner's current document?
 ///

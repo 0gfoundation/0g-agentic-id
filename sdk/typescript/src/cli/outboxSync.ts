@@ -6,21 +6,20 @@
  * "-1", "-2", … before its extension (saveDownload). Files over the download
  * limit are skipped and reported once.
  *
- * Once a file is saved and its size (and hash, when the listing has one)
- * match the outbox's, it is removed from the outbox (`remove`): the owner
- * has it, and the agent's disk does not keep a copy. A runtime without the
- * delete route keeps its files; deleting is then not tried again this
- * session.
+ * After a verified save, the client acknowledges its SHA-256. The runtime
+ * retires that revision only. Older runtimes keep the remote file.
  *
  * Which versions of which files were saved is kept next to that folder
  * (`outbox-saved.json`: name → size, time, hash, local path), so a check
- * downloads only what changed. Without it (lost, unreadable) a check downloads
+ * downloads only what changed. Failed transfers and remote cleanup retry
+ * with backoff; cleanup rechecks the saved local copy before deleting.
+ * Without the index (lost, unreadable) a check downloads
  * the outbox again and the content comparison keeps it from saving copies.
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { extname, join, sep } from 'node:path';
+import { dirname, extname, join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AgentFile } from '../AgentClient';
 import { cleanCell } from './commands/cells';
@@ -56,6 +55,8 @@ export interface OutboxSync {
   unseen(): number;
   /** `/files` listed these: not new any more. */
   listed(files: readonly AgentFile[]): void;
+  /** The recorded path of the most recently saved revision, if its bytes still match. */
+  savedPath(name: string): string | undefined;
   /** Where files are saved. */
   readonly dir: string;
 }
@@ -67,8 +68,10 @@ export function makeOutboxSync(o: {
   download(name: string): Promise<Uint8Array>;
   /** Whether new files are saved (else only counted). */
   auto(): boolean;
-  /** Remove a saved file from the outbox; see {@link AgentClient.deleteFile}. */
-  remove?(name: string): Promise<'deleted' | 'missing' | 'unsupported'>;
+  /** Ask the runtime to retire only the specified revision. */
+  remove?(name: string, sha256: string): Promise<'deleted' | 'missing' | 'changed' | 'unsupported'>;
+  /** Clock for retry scheduling. */
+  now?: () => number;
 }): OutboxSync {
   const base = agentFilesDir(o.agentId, o.home);
   const dir = join(base, 'outbox');
@@ -80,22 +83,55 @@ export function makeOutboxSync(o: {
   let unseen: AgentFile[] = [];
   let running: Promise<OutboxEvent[]> | null = null;
   let canRemove = !!o.remove;
+  const now = o.now ?? Date.now;
+  const retries = new Map<string, { attempts: number; at: number }>();
+  const ready = (key: string): boolean => (retries.get(key)?.at ?? 0) <= now();
+  const failed = (key: string): void => {
+    const attempts = (retries.get(key)?.attempts ?? 0) + 1;
+    retries.set(key, { attempts, at: now() + Math.min(300_000, OUTBOX_POLL_MS * 2 ** Math.min(attempts - 1, 4)) });
+  };
 
-  const version = (f: AgentFile): string => `${f.name}\u0000${f.bytes}\u0000${f.mtime}`;
+  const version = (f: AgentFile): string => `${f.name}\u0000${f.bytes}\u0000${f.mtime}\u0000${f.sha256 ?? ''}`;
   const isNew = (f: AgentFile): boolean => {
     const s = index[f.name];
     return !s || s.bytes !== f.bytes || s.mtime !== f.mtime || (!!f.sha256 && !!s.sha256 && f.sha256 !== s.sha256);
   };
 
+  async function removeSaved(f: AgentFile): Promise<'changed' | undefined> {
+    const key = `delete:${version(f)}`;
+    if (!canRemove || !ready(key)) return;
+    const saved = index[f.name];
+    if (!saved?.path || saved.bytes !== f.bytes || saved.mtime !== f.mtime || !saved.sha256 || (f.sha256 && saved.sha256 !== f.sha256)) return;
+    // The owner may have moved, removed or edited the local file since a
+    // failed acknowledgement. An index entry alone is not a delivered copy.
+    if (!verifiedPath(dir, saved)) return;
+    try {
+      const result = await o.remove!(f.name, saved.sha256);
+      if (result === 'unsupported') canRemove = false;
+      retries.delete(key);
+      if (result === 'changed') return result;
+    } catch { failed(key); }
+  }
+
   async function run(): Promise<OutboxEvent[]> {
-    const files = (await o.list()).filter((f) => isNew(f) && !reported.has(version(f))).reverse(); // oldest first
+    const files = (await o.list()).reverse(); // oldest first
+    const present = new Set(files.map(version));
+    for (const key of reported) if (!present.has(key)) reported.delete(key);
+    for (const key of shown) if (!present.has(key)) shown.delete(key);
+    const versions = new Set(files.flatMap((f) => [`download:${version(f)}`, `delete:${version(f)}`]));
+    for (const key of retries.keys()) if (!versions.has(key)) retries.delete(key);
     const events: OutboxEvent[] = [];
     if (!o.auto()) {
-      unseen = files.filter((f) => !shown.has(version(f)));
+      unseen = files.filter((f) => isNew(f) && !reported.has(version(f)) && !shown.has(version(f)));
       return events;
     }
     unseen = [];
     for (const f of files) {
+      // A large file's listing can lack a digest. Its size and mtime may
+      // both be unchanged even though the server rejected the old content.
+      if (!isNew(f) && await removeSaved(f) !== 'changed') continue;
+      const key = `download:${version(f)}`;
+      if (!ready(key) || (reported.has(version(f)) && !retries.has(key))) continue;
       if (f.bytes > DOWNLOAD_MAX_BYTES) {
         reported.add(version(f));
         events.push({ kind: 'skipped', name: f.name, bytes: f.bytes });
@@ -107,19 +143,20 @@ export function makeOutboxSync(o: {
         mkdirSync(dir, { recursive: true });
         const have = sameFile(dir, f.name, bytes.length, sha256);
         const path = have ?? saveDownload(bytes, f.name, dir);
-        index[f.name] = { bytes: f.bytes, mtime: f.mtime, sha256: f.sha256 ?? sha256, path };
-        writeIndex(indexFile, index);
+        const saved = { bytes: bytes.length, mtime: f.mtime, sha256, path };
+        // Persist the receipt before acknowledging. A failed write leaves the
+        // remote available and the next check can reuse the local bytes.
+        writeIndex(indexFile, f.name, saved);
+        index[f.name] = saved;
+        retries.delete(key);
         if (!have) events.push({ kind: 'saved', name: f.name, bytes: bytes.length, path });
         // The owner has it: take it off the agent's disk, unless what came
         // down is not what the listing described (it changed meanwhile).
-        if (canRemove && bytes.length === f.bytes && (!f.sha256 || f.sha256 === sha256)) {
-          try {
-            if ((await o.remove!(f.name)) === 'unsupported') canRemove = false;
-          } catch { /* kept in the outbox; its age clears it later */ }
-        }
+        if (bytes.length === f.bytes && (!f.sha256 || f.sha256 === sha256)) await removeSaved(f);
       } catch (e) {
+        failed(key);
+        if (!reported.has(version(f))) events.push({ kind: 'failed', name: f.name, bytes: f.bytes, error: (e as Error).message });
         reported.add(version(f));
-        events.push({ kind: 'failed', name: f.name, bytes: f.bytes, error: (e as Error).message });
       }
     }
     return events;
@@ -135,7 +172,19 @@ export function makeOutboxSync(o: {
     listed(files) {
       for (const f of files) shown.add(version(f));
     },
+    savedPath(name) {
+      return verifiedPath(dir, readIndex(indexFile)[name]);
+    },
   };
+}
+
+function verifiedPath(dir: string, saved: Saved | undefined): string | undefined {
+  if (!saved?.sha256 || typeof saved.path !== 'string' || dirname(saved.path) !== dir) return;
+  try {
+    const st = lstatSync(saved.path);
+    if (!st.isFile() || st.size !== saved.bytes || st.size > DOWNLOAD_MAX_BYTES) return;
+    if (createHash('sha256').update(readFileSync(saved.path)).digest('hex') === saved.sha256) return saved.path;
+  } catch { /* The user may have moved or removed this copy. */ }
 }
 
 /** A file in `dir` that is `name` (or `name` saved under -1, -2, …) with this content, if any. */
@@ -155,7 +204,7 @@ function sameFile(dir: string, name: string, bytes: number, sha256: string): str
     if (!same.test(n)) continue;
     const p = join(dir, n);
     try {
-      const st = statSync(p);
+      const st = lstatSync(p);
       if (!st.isFile() || st.size !== bytes) continue;
       if (createHash('sha256').update(readFileSync(p)).digest('hex') === sha256) return p;
     } catch {
@@ -168,20 +217,18 @@ function sameFile(dir: string, name: string, bytes: number, sha256: string): str
 function readIndex(file: string): Record<string, Saved> {
   try {
     const j = JSON.parse(readFileSync(file, 'utf8')) as unknown;
-    return j && typeof j === 'object' && !Array.isArray(j) ? (j as Record<string, Saved>) : {};
+    return Object.assign(Object.create(null), j && typeof j === 'object' && !Array.isArray(j) ? j : {});
   } catch {
-    return {};
+    return Object.create(null);
   }
 }
 
-function writeIndex(file: string, index: Record<string, Saved>): void {
-  try {
-    const tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
-    renameSync(tmp, file);
-  } catch {
-    // The files are saved; without the record the next session compares content instead.
-  }
+function writeIndex(file: string, name: string, saved: Saved): void {
+  const index = readIndex(file);
+  index[name] = saved;
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
+  renameSync(tmp, file);
 }
 
 /** `path` with the home folder written as `~`. */
@@ -223,7 +270,7 @@ export function renderOutboxEvent(e: OutboxEvent, links: boolean, home: string =
     return `${name} (${size(e.bytes)}) is over the ${size(DOWNLOAD_MAX_BYTES)} download limit: not saved\n`;
   }
   if (e.kind === 'failed') {
-    return `could not save ${name}: ${cleanCell(e.error ?? 'no reason given')} — /download ${name} tries again\n`;
+    return `could not save ${name}: ${cleanCell(e.error ?? 'no reason given')} — will retry; /download ${name} tries now\n`;
   }
   const path = e.path ?? '';
   const renamed = localName(e.name) !== path.slice(path.lastIndexOf(sep) + 1);

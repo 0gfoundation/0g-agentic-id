@@ -26,7 +26,8 @@ function session() {
 test('steerable: messages steer; an empty line or a lone command does not', () => {
   assert.equal(steerable({ text: 'use the v2 API instead', multi: false, pasted: false }), true);
   assert.equal(steerable({ text: 'first\nsecond', multi: true, pasted: false }), true);
-  assert.equal(steerable({ text: '/status is a word here', multi: false, pasted: true }), true);
+  assert.equal(steerable({ text: '/status is a word here', multi: false, pasted: true }), false);
+  assert.equal(steerable({ text: '/status\nquoted document', multi: true, pasted: true }), true);
   assert.equal(steerable({ text: '/status', multi: false, pasted: false }), false);
   assert.equal(steerable({ text: '   ', multi: false, pasted: false }), false);
 });

@@ -417,10 +417,12 @@ mod tests {
                 .any(|x| x.starts_with("AgentDNA 0.5.0: please move agent(s) 530 ")),
             "{subjects:?}"
         );
-        // 530's last week later on: its own reminder.
+        // Move the fixture forward by 15 days. Its second deadline must
+        // still have a different timestamp from 528's first reminder when
+        // both sweeps run within the same wall-clock second.
         s.write(&release_file(
-            days(-38),
-            &[(OLD, days(-8)), (OLD2, days(6))],
+            days(-39),
+            &[(OLD, days(-9)), (OLD2, days(5))],
         ));
         assert_eq!(remind_releases(&s.state).await.unwrap(), 1);
         assert!(s.sent()[2].1.starts_with("Reminder: move agent(s) 530 "));

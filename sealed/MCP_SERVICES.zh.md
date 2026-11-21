@@ -17,6 +17,8 @@ manifest 必填 `id`、`command`、`args`、`files`；可选 `worker`、`descrip
 和审计路径 `release`（`?sealed-release=1`），保留原始请求路径。沿用现有公网
 8080，不新增端口或管理入口。
 
+托管条目还包含当前 `state`。停止或不受支持的程序保留在发现信息中供版本审计，但不接受工作。客户端应显示该状态，仅挂载或提供 `state` 为 `running` 的入口；没有 state 的条目来自旧运行时。
+
 简单无状态服务不填 `worker`，每个 POST 启动临时沙箱。异步任务声明
 `worker:{command,args}`：sealed 启动**隔离的协调进程**（coordinator）处理 MCP，带服务私有、持久化的
 `$HOME` 和仅限该服务的进程控制 socket；每个任务再启动**独立临时 worker**，用私有的临时

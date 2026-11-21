@@ -212,7 +212,7 @@ test('a turn: the status row says what the agent does and Esc, notices sit at it
   await v.scr.close();
 });
 
-test('tool calls: one dim line per run, in plain words, where the run happened; thinking alone adds none', async () => {
+test('tool calls: one summary per turn despite interleaved text; thinking alone adds none', async () => {
   const v = await view({ cols: 70 });
   const t = v.scr.turn();
   for (const l of ['thinking', 'tool/call bash', 'tool/result bash', 'tool/call bash', 'tool/result bash', 'tool/call read']) t.activity(l);
@@ -224,7 +224,7 @@ test('tool calls: one dim line per run, in plain words, where the run happened; 
   t.end();
   v.scr.write('\n');
   const s = await v.read();
-  assert.deepEqual(s.shown.slice(1, 5), ['· ran 2 commands, read a file', 'agent> Two commands and a file.', 'More text', '· searched the web']);
+  assert.deepEqual(s.shown.slice(1, 4), ['agent> Two commands and a file.', 'More text', '· ran 2 commands, read a file, searched the web']);
   await v.scr.close();
 });
 

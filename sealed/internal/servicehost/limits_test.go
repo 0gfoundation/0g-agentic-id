@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -402,6 +403,49 @@ func TestDiscardDirReturnsBeforeRemoval(t *testing.T) {
 	}
 	if err := privsep.RemoveAll(queued[0]); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDiscardDirOverlayRenameFailure(t *testing.T) {
+	root(t)
+	for _, cause := range []error{syscall.EXDEV, syscall.EACCES} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "old")
+			if err := os.MkdirAll(filepath.Join(dir, "nested"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			outside := filepath.Join(t.TempDir(), "keep")
+			if err := os.WriteFile(outside, []byte("keep"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(dir, "nested", "link")); err != nil {
+				t.Fatal(err)
+			}
+			old := removeInBackground
+			removeInBackground = func(string) { t.Fatal("failed rename must not queue removal of a reusable path") }
+			defer func() { removeInBackground = old }()
+			err := discardDirWithRename(dir, func(from, to string) error {
+				return &os.LinkError{Op: "rename", Old: from, New: to, Err: cause}
+			})
+			if cause == syscall.EXDEV {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+					t.Fatalf("old directory remains: %v", err)
+				}
+				if err := os.Mkdir(dir, 0700); err != nil {
+					t.Fatalf("cannot reuse cleared path: %v", err)
+				}
+			} else if !errors.Is(err, cause) {
+				t.Fatalf("unexpected rename error: %v", err)
+			} else if _, err := os.Lstat(filepath.Join(dir, "nested", "link")); err != nil {
+				t.Fatalf("unrelated rename failure must preserve the old tree: %v", err)
+			}
+			if got, err := os.ReadFile(outside); err != nil || string(got) != "keep" {
+				t.Fatalf("cleanup followed a link: %q %v", got, err)
+			}
+		})
 	}
 }
 

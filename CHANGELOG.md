@@ -12,6 +12,29 @@ loses `(unreleased)` when the version ships.
   (`attestor/scripts/release-entry.mjs`; attestor README, "Announcing a
   release").
 
+## 0.5.2
+
+Files created by 0g-harness are acknowledged by revision, and model settings survive a sealed runtime handoff.
+
+- After saving a file, the CLI acknowledges the exact revision it downloaded. If the agent overwrites the same name during the transfer, the newer revision stays available. The CLI can find a previously saved revision under a numbered filename. With an older runtime, it keeps the remote copy when it cannot acknowledge it safely.
+- File delivery guidance now explains when automatic downloads run and how to download a file manually. Existing sessions whose titles start with a number can be reopened by quoting their title.
+- Pasting a line that ends in the last terminal column preserves the plain CLI’s scrollback.
+- Model and credential updates distinguish changes applied to a running agent from changes saved for its next start. A sealed handoff no longer rolls back the selected model.
+- The schedule list shows the interval and run count for repeating jobs, marks overdue runs as due now, and shows when the next run time is unknown.
+
+On testnet, install the CLI with `npm install -g @0gfoundation/0g-agentdna@next`.
+
+## 0.5.1
+
+Pasted slash commands execute in the CLI, file deliveries retry automatically, and 0g-harness reports when a hosted service has stopped.
+
+- The CLI accepts quoted activity IDs and session titles, looks up short IDs in the latest 500 activities, and groups a turn’s tool calls on one line. The deploy wizard selects 0g-harness by default when it is offered.
+- A session opened while its agent is stopped can save files and clean up remote copies after the agent starts. Failed transfers retry, and each successful save prints the local path once.
+- The CLI includes a 0g-compute credential preset. Owners can store a model key while the agent is stopped and use it on the next start.
+- On the updated 0g-harness runtime, hosted services start on OverlayFS snapshots and report their lifecycle state in `/hello`. The SDK and CLI omit stopped services from the list of callable services.
+
+On testnet, install the CLI with `npm install -g @0gfoundation/0g-agentdna@next`.
+
 ## 0.5.0
 
 Layered runtime (the sealed program and the 0g-harness package update themselves), owner credentials, operators, sessions and tasks, configurable web search, a new CLI agent session.

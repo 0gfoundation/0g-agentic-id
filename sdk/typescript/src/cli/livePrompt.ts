@@ -47,7 +47,7 @@ export interface TurnView {
   refresh(): void;
   /** Said after the status line's time (` · Esc to stop`) by a view whose prompt does not say it. */
   readonly stopHint?: string;
-  /** An activity label of the turn ("tool/call bash"), for a view that sums up each run of tool calls. */
+  /** An activity label of the turn ("tool/call bash"), for a view that sums up the turn's tool calls. */
   activity?(label: string): void;
   /** The turn is over: the region and its prompt go, the reply's unfinished
    *  line is left as written (no line break). */
@@ -455,6 +455,11 @@ export class LiveTurn implements TurnView {
 
   beforeKey(key: Key): void {
     if (this.ended || this.closed || !this.promptShown) return;
+    // At the right margin a terminal can still be waiting to wrap. Some
+    // readline versions defer that wrap when appending text. Redraw before
+    // a submission or paste boundary so the cursor and getCursorPos agree.
+    if ((key.name === 'return' || key.name === 'enter' || key.name === 'paste-end')
+      && this.rl.line && this.rl.getCursorPos().cols === 0) this.rl.prompt(true);
     this.snap = { cursor: this.cursorRows(), end: this.endRows(), line: false };
     // ↑ on an empty prompt takes back the newest queued entry, instead of
     // readline's history (emptied for this one key).

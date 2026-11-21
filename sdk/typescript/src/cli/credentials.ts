@@ -96,6 +96,13 @@ const BEARER: CredentialPosition = { kind: 'header', name: 'Authorization', temp
  * goes with a token as the password.
  */
 export const CRED_PRESETS: Record<string, CredPreset> = {
+  '0g-compute': {
+    hosts: ['router-api.0g.ai'],
+    positions: [BEARER],
+    description: '0G Compute router API key',
+    create: 'https://pc.0g.ai/dashboard/api-keys',
+    tip: 'for tool calls to the router; use set model provider=0g-compute for the agent\'s inference key',
+  },
   github: {
     hosts: ['api.github.com', 'uploads.github.com', 'github.com'],
     // GitHub does not use the Basic username to authenticate a token, but it must not be empty.
@@ -705,7 +712,7 @@ export async function ensureModelKey(ag: AgenticID, sealId: Hash, provider: stri
   const { markKey, keyMark } = modelKeyMarkOf(sealId, provider, value);
   recordModelKeyMark(markKey, { valueHash: out.valueHash, keyMark });
   io.out(`added ${name}${out.pushWarning ? `; not applied to the running agent: ${out.pushWarning}` : ''}`);
-  if (state === null) io.out(`the agent is not running: on an image from before model keys in cred, the switch takes a reset with the ${provider} key`);
+  if (state === null) io.out('saved; the agent takes this model key when it next starts');
   return 'added';
 }
 
@@ -964,12 +971,13 @@ export async function credOp(ag: AgenticID, sealId: Hash, args: string[], io: Cr
       }
       const others = cur.definitions.filter((d) => d.name !== name).map(inputOf);
       const out = await cred.put(sealId, [...others, entry], { baseVersion: cur.version, ...at }).catch(conflict);
-      if (io.json) return emitOk({ sealId, version: out.version, name, pushWarning: out.pushWarning ?? null });
+      if (io.json) return emitOk({ sealId, version: out.version, name, applied: out.applied, pushWarning: out.pushWarning ?? null });
       const gives = (entry.tokenRequest?.take ?? []).map((t) => `[[credential:${derivedName(name, t)}]]`);
       io.out(gives.length && entry.use === 'token_only'
         ? `${stored ? 'changed' : 'added'} ${name}; the agent asks for a token request on ${name} and then uses ${gives.join(', ')}`
         : `${stored ? 'changed' : 'added'} ${name}; the agent writes [[credential:${name}]] where the key goes`);
-      io.out(out.pushWarning ? `stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot` : 'applied to the running agent');
+      if (out.pushWarning) io.out(`stored, but not applied to the running agent: ${out.pushWarning} — it applies on the next boot`);
+      else io.out(out.applied ? 'applied to the running agent' : 'saved for the next start');
       return;
     }
     case 'rm': {

@@ -1688,7 +1688,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         seal: SealId,
         version: i64,
         generation: Option<i64>,
-        boot: Option<B256>,
+        boot: Option<SettingsBoot>,
     ) -> anyhow::Result<Option<i32>> {
         let mut tx = deployment_tx(&self.pool).await?;
         sqlx::query("SELECT seal_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
@@ -1717,10 +1717,15 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             "UPDATE deployments
              SET settings_attempts = CASE
                      WHEN settings_attempts > 0 AND settings_attempt_boot = $3
+                          AND (settings_attempt_generation IS NULL OR settings_attempt_generation = $4)
                      THEN settings_attempts
+                     WHEN settings_attempts = 1 AND settings_attempt_generation = $4
+                          AND settings_handover_to = $5 THEN 1
                      ELSE settings_attempts + 1
                  END,
                  settings_attempt_boot = $3,
+                 settings_attempt_generation = $4,
+                 settings_handover_to = $6,
                  updated_at = now()
              WHERE seal_id = $1
                AND settings_version = $2
@@ -1729,7 +1734,10 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         )
         .bind(seal.as_slice())
         .bind(version)
-        .bind(boot.map(|b| b.to_vec()))
+        .bind(boot.map(|b| b.id.to_vec()))
+        .bind(generation)
+        .bind(boot.and_then(|b| b.sealed).map(|h| h.to_vec()))
+        .bind(boot.and_then(|b| b.handover_to).map(|h| h.to_vec()))
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -2764,6 +2772,67 @@ mod settings_retry_tests {
     }
     #[tokio::test]
     #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_sealed_handoff_counts_once_for_the_selected_target_and_generation() {
+        let pool = connect(&test_database_url()).await.unwrap();
+        let repo = PostgresDeploymentRepo::new(pool.clone());
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner) VALUES($1,$2,$2)")
+            .bind(seal.as_slice())
+            .bind(Address::ZERO.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let target = B256::repeat_byte(0xb0);
+        let doc = serde_json::json!({"model":"new","versions":{"sealed":target}});
+        repo.set_settings(seal, doc.clone(), 0).await.unwrap();
+        let first = repo
+            .prepare_status_boot(seal, Some([1; 32]), Address::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        let note = |generation, version, boot_id, running| {
+            let boot = SettingsBoot::new(B256::repeat_byte(boot_id), running, Some(target));
+            repo.note_settings_attempt(seal, version, Some(generation), Some(boot))
+        };
+        let bootstrap = Some(B256::repeat_byte(0xa0));
+        let selected = Some(target);
+        assert_eq!(note(first, 1, 1, bootstrap).await.unwrap(), Some(1));
+        let (accepted, retried) =
+            tokio::join!(note(first, 1, 2, selected), note(first, 1, 2, selected));
+        assert_eq!(accepted.unwrap(), Some(1));
+        assert_eq!(retried.unwrap(), Some(1));
+        assert_eq!(note(first, 1, 3, selected).await.unwrap(), Some(2));
+
+        // A different binary, or an image without a signed sealed hash,
+        // cannot continue the planned handoff.
+        for other in [Some(B256::repeat_byte(0xc0)), None] {
+            assert!(repo.retry_settings(seal, 1).await.unwrap());
+            assert_eq!(note(first, 1, 4, bootstrap).await.unwrap(), Some(1));
+            assert_eq!(note(first, 1, 5, other).await.unwrap(), Some(2));
+        }
+        assert!(repo.retry_settings(seal, 1).await.unwrap());
+        assert_eq!(note(first, 1, 6, bootstrap).await.unwrap(), Some(1));
+        let next = repo
+            .prepare_status_boot(seal, Some([2; 32]), Address::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(note(first, 1, 7, selected).await.unwrap(), None);
+        assert_eq!(note(next, 1, 7, selected).await.unwrap(), Some(2));
+
+        // A late request for the old settings cannot spend the new version's first attempt.
+        repo.set_settings(seal, doc, 1).await.unwrap();
+        assert_eq!(note(next, 1, 8, selected).await.unwrap(), None);
+        assert_eq!(note(next, 2, 8, selected).await.unwrap(), Some(1));
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
     async fn postgres_attempts_per_boot_spent_deadlines_and_guarded_rejections() {
         let pool = connect(&test_database_url()).await.unwrap();
         let repo = PostgresDeploymentRepo::new(pool.clone());
@@ -2779,9 +2848,10 @@ mod settings_retry_tests {
             .unwrap();
         let (a, b) = (B256::repeat_byte(0x0a), B256::repeat_byte(0x0b));
         // A retry by the same boot is the same attempt; a new boot is the next.
+        let legacy = |id| Some(SettingsBoot::new(id, None, None));
         for (boot, want) in [(a, 1), (a, 1), (b, 2), (b, 2)] {
             assert_eq!(
-                repo.note_settings_attempt(seal, 1, Some(generation), Some(boot))
+                repo.note_settings_attempt(seal, 1, Some(generation), legacy(boot))
                     .await
                     .unwrap(),
                 Some(want)
@@ -2790,7 +2860,7 @@ mod settings_retry_tests {
         // A count reset to 0 ends the dedupe.
         assert!(repo.retry_settings(seal, 1).await.unwrap());
         assert_eq!(
-            repo.note_settings_attempt(seal, 1, Some(generation), Some(b))
+            repo.note_settings_attempt(seal, 1, Some(generation), legacy(b))
                 .await
                 .unwrap(),
             Some(1)
