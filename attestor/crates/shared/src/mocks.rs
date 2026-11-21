@@ -1347,9 +1347,8 @@ pub struct InMemoryDeploymentRepo {
     /// Settings served to the boot whose token hash is in `status_bindings`.
     pub served_settings: Mutex<HashMap<SealId, crate::auth::status::ServedSettings>>,
     pub boot_authorizations: Mutex<HashMap<SealId, crate::auth::status::BootAuthorization>>,
-    /// Mirror of `settings_attempt_boot`: the boot that made the last
-    /// counted settings attempt.
-    pub settings_attempt_boots: Mutex<HashMap<SealId, Option<B256>>>,
+    /// Boot, generation and planned sealed handoff for the last settings attempt.
+    settings_attempt_boots: Mutex<HashMap<SealId, (Option<i64>, SettingsBoot)>>,
     pub by_seal: Mutex<HashMap<SealId, Deployment>>,
     pub by_agent: Mutex<HashMap<AgentId, SealId>>,
     /// Mirror of `last_heartbeat` (DB column not surfaced on the
@@ -2567,7 +2566,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         seal: SealId,
         version: i64,
         generation: Option<i64>,
-        boot: Option<B256>,
+        boot: Option<SettingsBoot>,
     ) -> anyhow::Result<Option<i32>> {
         let mut rows = self.by_seal.lock().unwrap();
         let Some(d) = rows.get_mut(&seal) else {
@@ -2585,11 +2584,26 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             && d.settings_version > d.settings_confirmed_version
         {
             let mut last = self.settings_attempt_boots.lock().unwrap();
-            let same_boot = boot.is_some() && last.get(&seal).copied().flatten() == boot;
-            if !(d.settings_attempts > 0 && same_boot) {
+            let continued =
+                boot.zip(last.get(&seal))
+                    .is_some_and(|(boot, (last_gen, last_boot))| {
+                        (d.settings_attempts > 0
+                            && boot.id == last_boot.id
+                            && (last_gen.is_none() || generation == *last_gen))
+                            || (d.settings_attempts == 1
+                                && generation.is_some()
+                                && generation == *last_gen
+                                && boot.sealed.is_some()
+                                && boot.sealed == last_boot.handover_to)
+                    });
+            if !continued {
                 d.settings_attempts += 1;
             }
-            last.insert(seal, boot);
+            if let Some(boot) = boot {
+                last.insert(seal, (generation, boot));
+            } else {
+                last.remove(&seal);
+            }
             Ok(Some(d.settings_attempts))
         } else {
             Ok(None)

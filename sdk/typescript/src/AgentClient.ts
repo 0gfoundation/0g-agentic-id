@@ -434,14 +434,18 @@ export interface AgentInbox {
 /** A reminder the agent set for itself ({@link AgentClient.schedules}). */
 export interface AgentSchedule {
   id: string;
-  kind: 'after' | 'at' | 'every';
+  kind: 'after' | 'at' | 'every' | 'rrule';
+  /** iCalendar rule and start date on current 0g-harness. */
+  rrule?: string;
   /** The reminder's own text. */
   prompt: string;
   afterSeconds?: number;
   everySeconds?: number;
   /** When it comes due next (ISO 8601). */
   scheduledAt: string;
-  state: 'scheduled' | 'overdue';
+  /** Older runtimes report state; RRULE schedules report status. */
+  state?: 'scheduled' | 'overdue';
+  status?: string;
 }
 
 /**

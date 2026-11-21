@@ -597,6 +597,15 @@ test('/schedules lines: how often and when next', () => {
   assert.match(lines[1], /schedule-2\s+once\s+due now\s+call back/);
 });
 
+test('RRULE schedules show their interval and count, preserving calendar constraints', () => {
+  const row = { id: 'schedule-qa', kind: 'rrule', scheduledAt: '2030-01-02T09:00:00Z', status: 'active', prompt: 'check' };
+  const render = (rule) => renderSchedules([{ ...row, rrule: `DTSTART:20300102T090000Z\nRRULE:${rule}` }], Date.parse('2030-01-02T08:55:00Z'))[0];
+  assert.match(render('COUNT=2;INTERVAL=5;FREQ=MINUTELY'), /every 5 minutes \(2 times\)\s+in 5m/);
+  assert.match(render('FREQ=DAILY;COUNT=1'), /\bonce\s+in 5m/);
+  assert.match(render('FREQ=WEEKLY;BYDAY=MO,WE'), /RRULE:FREQ=WEEKLY;BYDAY=MO,WE/);
+  assert.match(render('FREQ=HOURLY'), /every hour/);
+});
+
 // ── 5. the settings guard ───────────────────────────────────────────────────
 
 test('0g-harness switches in others= are refused for an agent known to run another framework', () => {

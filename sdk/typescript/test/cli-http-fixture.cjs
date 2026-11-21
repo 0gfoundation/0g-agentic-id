@@ -44,7 +44,7 @@ const rpc = body => {
   }
   return {jsonrpc:'2.0',id,result};
 };
-const routeKinds = ['chat','responses','activities','inbox','events','files','sessions','steer'];
+const routeKinds = ['chat','responses','activities','inbox','events','files','schedules','sessions','steer'];
 const server = http.createServer(async(req,res) => {
   const chunks=[]; for await(const c of req) chunks.push(c);
   let body;try{body=JSON.parse(Buffer.concat(chunks).toString())}catch{}
@@ -99,6 +99,10 @@ const server = http.createServer(async(req,res) => {
     res.writeHead(200,{'content-type':'application/octet-stream'});return res.end(files.get(name));
   }
   if(u.pathname==='/v1/inbox')return json({data:[],last_id:0});
+  if(u.pathname==='/v1/schedules')return json({enabled:true,data:[{
+    id:'sched-repeat',kind:'rrule',status:'active',prompt:'recurring fixture',
+    rrule:'DTSTART:20300101T010000Z\nRRULE:FREQ=MINUTELY;INTERVAL=5;COUNT=2',scheduledAt:'2030-01-01T01:00:00Z',
+  }]});
   if(u.pathname==='/v1/activities')return json({data:[...recent,oldJob].slice(0,Math.min(500,Number(u.searchParams.get('limit')||50)))});
   if(u.pathname.startsWith('/v1/activities/')) {
     const id=decodeURIComponent(u.pathname.split('/')[3]);

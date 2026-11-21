@@ -194,6 +194,7 @@ def main():
                 require('queued owner message' in out,'queued message was not returned after Esc')
             run_case(t,'Tab queues; Esc returns queued message',queued)
             run_case(t,'/help still works after interrupted turns',lambda _:test_command(t,'/help','session commands'))
+            run_case(t,'bounded schedule shows its interval and count',lambda _:test_command(t,'/schedules','every 5 minutes (2 times)'))
             api('/fixture-mode',{'file':{'name':'qa 中文 #file.txt','text':'QA_MATRIX_FILE_OK'}})
             dest=ROOT/('matrix-download-'+mode+'.txt')
             for suffix in ['', '-1']:
@@ -202,6 +203,7 @@ def main():
             def download(before):
                 t.send('/download "qa 中文 #file.txt" "'+str(dest)+'"\r',.7)
                 require(dest.exists() and dest.read_text()=='QA_MATRIX_FILE_OK','quoted Unicode filename or destination failed')
+                require(any(f['name']=='qa 中文 #file.txt' for f in api('/v1/files')['data']),'manual download removed the remote original')
             run_case(t,'download quoted Unicode filename',download)
             def no_overwrite(before):
                 dest.write_text('LOCAL_ORIGINAL')

@@ -559,12 +559,35 @@ export function pickSession(list: readonly AgentSession[], arg: string, shown?: 
   return hit ? { hit } : {};
 }
 
+/** Describe simple schedules, keeping the full rule for calendar expressions. */
+function scheduleFrequency(r: AgentSchedule): string {
+  if (r.kind === 'at' || r.kind === 'after') return 'once';
+  if (r.kind === 'every') return r.everySeconds ? `every ${span(r.everySeconds)}` : 'recurring';
+  const lines = (r.rrule ?? '').trim().split(/\r?\n/).filter(Boolean);
+  const rules = lines.filter((line) => !/^DTSTART[;:]/i.test(line));
+  // Preserve BYDAY, time zones and other calendar constraints verbatim.
+  const raw = lines.map((line) => cleanCell(line)).join(' · ') || 'rule unavailable';
+  if (rules.length !== 1 || !/^RRULE:/i.test(rules[0]) || lines.some((line) => /^DTSTART;/i.test(line))) return raw;
+  const parts = rules[0].slice(6).toUpperCase().split(';');
+  if (!parts.every((s) => /^(FREQ=[A-Z]+|(INTERVAL|COUNT)=[1-9]\d*)$/.test(s))) return raw;
+  const fields = new Map(parts.map((s) => s.split('=') as [string, string]));
+  const units: Record<string, string> = { SECONDLY: 'second', MINUTELY: 'minute', HOURLY: 'hour', DAILY: 'day', WEEKLY: 'week', MONTHLY: 'month', YEARLY: 'year' };
+  const unit = units[fields.get('FREQ') ?? ''];
+  if (!unit || fields.size !== parts.length) return raw;
+  const count = fields.get('COUNT');
+  if (count === '1') return 'once';
+  const interval = fields.get('INTERVAL') ?? '1';
+  const how = interval === '1' ? `every ${unit}` : `every ${interval} ${unit}s`;
+  return count ? `${how} (${count} times)` : how;
+}
+
 export function renderSchedules(list: AgentSchedule[], nowMs: number): string[] {
   const idw = Math.max(2, ...list.map((r) => cleanCell(r.id).length)) + 2;
   return list.map((r) => {
-    const how = r.kind === 'every' && r.everySeconds ? `every ${span(r.everySeconds)}` : 'once';
-    const due = r.state === 'overdue' ? 'due now' : `in ${span((Date.parse(r.scheduledAt) - nowMs) / 1000)}`;
-    return `  ${cleanCell(r.id).padEnd(idw)}${how.padEnd(12)}${due.padEnd(12)}${cleanCell(r.prompt)}`;
+    const how = scheduleFrequency(r);
+    const at = Date.parse(r.scheduledAt);
+    const due = r.state === 'overdue' || at <= nowMs ? 'due now' : Number.isFinite(at) ? `in ${span((at - nowMs) / 1000)}` : 'time unknown';
+    return `  ${cleanCell(r.id).padEnd(idw)}${how.padEnd(11)} ${due.padEnd(12)}${cleanCell(r.prompt)}`;
   });
 }
 
