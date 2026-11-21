@@ -12,6 +12,18 @@ loses `(unreleased)` when the version ships.
   (`attestor/scripts/release-entry.mjs`; attestor README, "Announcing a
   release").
 
+## 0.5.2
+
+Files created by 0g-harness are acknowledged by revision, and model settings survive a sealed runtime handoff.
+
+- After saving a file, the CLI acknowledges the exact revision it downloaded. If the agent overwrites the same name during the transfer, the newer revision stays available. The CLI can find a previously saved revision under a numbered filename. With an older runtime, it keeps the remote copy when it cannot acknowledge it safely.
+- File delivery guidance now explains when automatic downloads run and how to download a file manually. Existing sessions whose titles start with a number can be reopened by quoting their title.
+- Pasting a line that ends in the last terminal column preserves the plain CLI’s scrollback.
+- Model and credential updates distinguish changes applied to a running agent from changes saved for its next start. A sealed handoff no longer rolls back the selected model.
+- The schedule list shows the interval and run count for repeating jobs, marks overdue runs as due now, and shows when the next run time is unknown.
+
+On testnet, install the CLI with `npm install -g @0gfoundation/0g-agentdna@next`.
+
 ## 0.5.1
 
 Pasted slash commands execute in the CLI, file deliveries retry automatically, and 0g-harness reports when a hosted service has stopped.
