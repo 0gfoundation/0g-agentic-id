@@ -557,10 +557,11 @@ export interface AgentClient {
      *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
      *  means the bridge doesn't narrate. */
     onActivity?: (label: string) => void;
-    /** Per-message reasoning-effort override for thinking models. Only the
-     *  prime bridge honors it today (other frameworks' HTTP surfaces don't
-     *  take a per-request level — their default is set at deploy/reset via
-     *  `thinking`); unsupported bridges ignore it. */
+    /** Per-message reasoning-effort override for thinking models. The prime
+     *  bridge honors it, and 0g-harness 0.2.1 or later (see
+     *  {@link AgentClient.turnThinking}) runs that turn at it and the next at
+     *  the saved level; other frameworks ignore it (their level is the
+     *  settings document's `thinking`). */
     thinking?: 'low' | 'high' | 'max';
     /** Fires once with the server-side task id, as soon as the agent assigns
      *  one. Only on the responses transport (see {@link AgentClient.task}):
@@ -606,6 +607,14 @@ export interface AgentClient {
    * `aborted: false` + note means the agent image predates the endpoint.
    */
   interrupt?(): Promise<{ aborted: boolean; note?: string }>;
+  /**
+   * Whether the agent runs a message at the `thinking` level it carries
+   * (0g-harness `GET /v1/harness` → `features.turn_effort`, from 0.2.1): such
+   * a level changes that turn only, with no settings write and no restart.
+   * False where the runtime does not say so (older harness, other
+   * frameworks, or a model without a thinking level).
+   */
+  turnThinking?(): Promise<boolean>;
   /**
    * Present only when this handle holds the owner key: fetch the agent's own
    * process log (the framework subprocess stdout/stderr the runtime serves at
@@ -1073,6 +1082,8 @@ export function makeAgentClient(params: {
       .catch(() => { featuresAsked = null; return null; }); // asked again next time
     return featuresAsked;
   };
+  /** Whether a message's thinking level applies to its own turn: only where the agent says so. */
+  client.turnThinking = async (): Promise<boolean> => (await harnessFeatures())?.turn_effort === true;
   /** Whether image parts carry their file name: only where the agent says it reads it. */
   const imageNames = async (images?: ChatImage[]): Promise<boolean> =>
     !!images?.some((im) => im.name) && (await harnessFeatures())?.image_names === true;

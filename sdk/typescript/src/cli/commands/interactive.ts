@@ -1711,10 +1711,12 @@ interface Session {
    *  last): lets /tasks list them and /result re-attach after a drop. The
    *  agent itself keeps the authoritative ring; this is just the ids. */
   tasks?: Array<{ id: string; prompt: string; at: number; session?: string }>;
-  /** The reasoning level /think last wrote to the settings document, mirrored
-   *  here ONLY as the per-message override for frameworks whose bridge takes
-   *  one (prime). The durable copy is the document; this is a session echo of
-   *  it, set after a successful write and never on its own. */
+  /** The reasoning level each message of this session carries, for runtimes
+   *  that take one per message. On 0g-harness 0.2.1 or later (`turnThinking`)
+   *  /think sets it on its own: the session's level, the saved one unchanged.
+   *  Elsewhere it is an echo of the level /think last wrote to the settings
+   *  document (prime takes it per message too), set only after that write
+   *  landed. */
   thinking?: 'low' | 'high' | 'max';
   /** Task id of the chat turn currently in flight (responses transport). */
   currentTask?: string | null;
@@ -4912,12 +4914,15 @@ export const L2_HELP_FULL = `session commands
                           A request the agent waits on (to read a value, to get
                           a credential, to be connected) comes up here at the
                           prompt; your answer goes back to the agent
-  /think [low|high|max]   reasoning depth for thinking models (glm etc.) —
-                          shorthand for /settings thinking=…, so it is written
-                          to the owner's document (owner-signed) and a running
-                          agent takes it at once, a stopped one at its next
-                          start. prime also takes it per message.
-                          No arg shows the level currently stored
+  /think [low|high|max]   reasoning depth for thinking models (glm etc.).
+                          On 0g-harness 0.2.1 or later: this session's
+                          messages use it from the next one, with no
+                          signature and no restart; /settings thinking=…
+                          saves a level. Elsewhere: shorthand for /settings
+                          thinking=…, written to the owner's document
+                          (owner-signed); a running agent takes it at once, a
+                          stopped one at its next start. prime also takes it
+                          per message. No arg shows the level in use
   /clear                  wipe the agent's conversation and start fresh —
                           chain-tracked memory (what the agent chose to keep)
                           is untouched; that is the difference from /reset
@@ -5492,19 +5497,28 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/think' || line.startsWith('/think ')) {
-        // /think is `/settings thinking=…` with a shorter name: it writes the
-        // owner's document, which is the only place a reasoning level lives
-        // now. (It used to set a session variable that rode a container
-        // environment variable on the next /reset — nothing reads that any
-        // more, so the command announced a change it was not making.)
+        // Where the running agent takes a level per message (0g-harness 0.2.1
+        // or later, `features.turn_effort`), /think sets this session's level:
+        // every message carries it, nothing is signed, written or restarted,
+        // and /settings thinking=… saves one. Elsewhere /think is
+        // `/settings thinking=…` with a shorter name: it writes the owner's
+        // document, the only place those frameworks read a level from.
         const arg = tokenize(line)[1];
+        const perMessage = s.phase === 'running' && !!s.client?.turnThinking && await s.client.turnThinking().catch(() => false);
+        if (arg && !(THINKING_LEVELS as readonly string[]).includes(arg)) { out(`usage: /think ${THINKING_LEVELS.join('|')}\n`); continue; }
+        if (arg && perMessage) {
+          if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
+          s.thinking = arg as ThinkingLevel;
+          out(`thinking ${arg} for this session's messages, from the next one (no restart); the agent's saved level is unchanged — /settings thinking=${arg} saves it\n`);
+          continue;
+        }
         const ag = await withWallet(ctx);
         if (!arg) {
           const doc = await ag.agent.getSettings(s.sealId);
-          out(`thinking level: ${(doc.settings?.thinking as string | undefined) ?? '(unset — the platform bounds thinking models at low)'}\n`);
+          const saved = (doc.settings?.thinking as string | undefined) ?? '(unset — the platform bounds thinking models at low)';
+          out(perMessage && s.thinking ? `thinking level: ${s.thinking} for this session's messages (saved: ${saved})\n` : `thinking level: ${saved}\n`);
           continue;
         }
-        if (!(THINKING_LEVELS as readonly string[]).includes(arg)) { out(`usage: /think ${THINKING_LEVELS.join('|')}\n`); continue; }
         if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
         const written = await settingsOp(ag, s.sealId, [`thinking=${arg}`], await ownerRouteUrl(ag, s));
         // Only mirror it into this session once the write actually landed —
