@@ -20,17 +20,17 @@ test('toolTarget: the command, file, URL or query a call works on, even from cut
 });
 
 test('liveActivityText: a tool call with its target; other labels as before', () => {
-  assert.equal(liveActivityText('tool/call bash', { tool: 'bash', arguments: '{"command":"npm test"}' }), 'running a command: npm test');
+  assert.equal(liveActivityText('tool/call bash', { tool: 'bash', arguments: { text: '{"command":"npm test"}', chars: 22 } }), 'running a command: npm test');
   assert.equal(liveActivityText('tool/call bash'), 'running a command');
-  assert.equal(liveActivityText('tool/result', { tool: 'bash', isError: false, chars: 3, excerpt: 'ok' }), 'thinking');
+  assert.equal(liveActivityText('tool/result', { tool: 'bash', result: { is_error: false, text: 'ok', chars: 2 } }), 'thinking');
   assert.equal(liveActivityText('thinking'), 'thinking');
 });
 
 test('activityDetail: the tool fields of a live event, single-line', () => {
-  assert.deepEqual(activityDetail({ type: 'response.activity', label: 'tool/call bash', tool: 'bash', call_id: 'c1', arguments: '{"command":"ls\\n-la"}' }),
-    { tool: 'bash', callId: 'c1', arguments: '{"command":"ls\\n-la"}' });
-  assert.deepEqual(activityDetail({ label: 'tool/result', tool: 'bash', call_id: 'c1', is_error: true, chars: 12, excerpt: 'line 1\nline 2' }),
-    { tool: 'bash', callId: 'c1', isError: true, chars: 12, excerpt: 'line 1 line 2' });
+  assert.deepEqual(activityDetail({ type: 'response.activity', label: 'tool/call bash', tool: 'bash', call_id: 'c1', arguments: { text: '{"command":"ls"}', chars: 1200, truncated: true } }),
+    { tool: 'bash', callId: 'c1', arguments: { text: '{"command":"ls"}', chars: 1200, truncated: true } });
+  assert.deepEqual(activityDetail({ label: 'tool/result', tool: 'bash', call_id: 'c1', result: { is_error: true, text: 'line 1\nline 2', chars: 13 } }),
+    { tool: 'bash', callId: 'c1', result: { is_error: true, text: 'line 1 line 2', chars: 13 } });
   assert.equal(activityDetail({ label: 'thinking' }), undefined);
 });
 

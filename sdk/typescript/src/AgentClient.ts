@@ -42,18 +42,19 @@ export function plainText(s: string): string {
 export function activityDetail(ev: unknown): AgentActivityDetail | undefined {
   if (!ev || typeof ev !== 'object') return undefined;
   const e = ev as Record<string, unknown>;
-  const str = (v: unknown) => (typeof v === 'string' ? plainText(v) : undefined);
-  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
-  const d: AgentActivityDetail = {
-    tool: str(e.tool),
-    callId: str(e.call_id),
-    arguments: str(e.arguments),
-    argumentsChars: num(e.arguments_chars),
-    isError: typeof e.is_error === 'boolean' ? e.is_error : undefined,
-    chars: num(e.chars),
-    excerpt: str(e.excerpt),
+  const text = (v: unknown): AgentStepText | undefined => {
+    if (!v || typeof v !== 'object') return undefined;
+    const t = v as { text?: unknown; chars?: unknown; truncated?: unknown };
+    if (typeof t.text !== 'string') return undefined;
+    return { text: plainText(t.text), chars: typeof t.chars === 'number' ? t.chars : t.text.length, ...(t.truncated === true ? { truncated: true as const } : {}) };
   };
-  for (const k of Object.keys(d) as Array<keyof AgentActivityDetail>) if (d[k] === undefined) delete d[k];
+  const d: AgentActivityDetail = {};
+  if (typeof e.tool === 'string') d.tool = plainText(e.tool);
+  if (typeof e.call_id === 'string') d.callId = plainText(e.call_id);
+  const args = text(e.arguments);
+  if (args) d.arguments = args;
+  const r = text(e.result);
+  if (r) d.result = { ...r, is_error: (e.result as { is_error?: unknown }).is_error === true };
   return Object.keys(d).length ? d : undefined;
 }
 
@@ -372,21 +373,16 @@ export interface ChatCompletion {
  */
 /**
  * What a tool call or result in a live `response.activity` event carries
- * beside its label (0g-harness `features.steps`): the tool, the call id, the
- * start of its arguments, and for a result whether it failed, its length and
- * its start. Text is single-line ({@link plainText}). Absent elsewhere.
+ * beside its label (0g-harness `features.steps`): the tool and call id, and
+ * the call's `arguments` or the result, in the same text shape as a step's
+ * ({@link AgentStepText}; cut at 1000 and 500 characters). Text is
+ * single-line ({@link plainText}). Absent elsewhere.
  */
 export interface AgentActivityDetail {
   tool?: string;
   callId?: string;
-  /** A call: its arguments' first 1000 characters; `argumentsChars` is the full length when cut. */
-  arguments?: string;
-  argumentsChars?: number;
-  /** A result. */
-  isError?: boolean;
-  chars?: number;
-  /** A result: its first 500 characters. */
-  excerpt?: string;
+  arguments?: AgentStepText;
+  result?: AgentStepText & { is_error: boolean };
 }
 
 /** A text field of a step: at most `max_chars` characters of it, and its full length. */
@@ -659,8 +655,8 @@ export interface AgentClient {
      *  means the bridge doesn't narrate. */
     onActivity?: (label: string, detail?: AgentActivityDetail) => void;
     /** Per-message reasoning-effort override for thinking models. The prime
-     *  bridge honors it, and 0g-harness 0.2.1 or later (see
-     *  {@link AgentClient.turnThinking}) runs that turn at it and the next at
+     *  bridge honors it, and 0g-harness 0.2.1 or later (`features()` lists
+     *  `turn_effort`) runs that turn at it and the next at
      *  the saved level; other frameworks ignore it (their level is the
      *  settings document's `thinking`). */
     thinking?: 'low' | 'high' | 'max';
@@ -709,13 +705,14 @@ export interface AgentClient {
    */
   interrupt?(): Promise<{ aborted: boolean; note?: string }>;
   /**
-   * Whether the agent runs a message at the `thinking` level it carries
-   * (0g-harness `GET /v1/harness` → `features.turn_effort`, from 0.2.1): such
-   * a level changes that turn only, with no settings write and no restart.
-   * False where the runtime does not say so (older harness, other
-   * frameworks, or a model without a thinking level).
+   * What the agent's runtime says it serves: 0g-harness `GET /v1/harness` →
+   * `features` (`turn_effort`: a message's `thinking` level runs that turn at
+   * it, with no settings write and no restart; `steps`: the steps and output
+   * routes and live tool details; `image_names`, `tasks`, …). Asked once per
+   * handle; null where the runtime has no such route (other frameworks). A
+   * client turns a feature on only when it is listed `true`.
    */
-  turnThinking?(): Promise<boolean>;
+  features?(): Promise<Record<string, unknown> | null>;
   /**
    * Present only when this handle holds the owner key: fetch the agent's own
    * process log (the framework subprocess stdout/stderr the runtime serves at
@@ -1198,8 +1195,7 @@ export function makeAgentClient(params: {
       .catch(() => { featuresAsked = null; return null; }); // asked again next time
     return featuresAsked;
   };
-  /** Whether a message's thinking level applies to its own turn: only where the agent says so. */
-  client.turnThinking = async (): Promise<boolean> => (await harnessFeatures())?.turn_effort === true;
+  client.features = harnessFeatures;
   /** Whether image parts carry their file name: only where the agent says it reads it. */
   const imageNames = async (images?: ChatImage[]): Promise<boolean> =>
     !!images?.some((im) => im.name) && (await harnessFeatures())?.image_names === true;

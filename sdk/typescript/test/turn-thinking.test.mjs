@@ -1,6 +1,6 @@
-// A message's thinking level applies to its own turn only where the agent
-// says so (0g-harness `GET /v1/harness` → `features.turn_effort`, 0.2.1+);
-// the client asks once and sends the level as Responses `reasoning.effort`.
+// What the agent's runtime serves comes from 0g-harness `GET /v1/harness` →
+// `features` (`turn_effort`, `steps`, …), asked once; a message's thinking
+// level goes as Responses `reasoning.effort`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -27,16 +27,16 @@ async function mockAgent(handle) {
 }
 const json = (res, status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
 
-test('turnThinking follows features.turn_effort, asked once', async () => {
-  for (const [features, want] of [[{ turn_effort: true }, true], [{ turn_effort: false }, false], [{ tasks: true }, false], [null, false]]) {
+test('features() is what GET /v1/harness lists, asked once; null without the route', async () => {
+  for (const features of [{ turn_effort: true, steps: true }, { turn_effort: false }, null]) {
     const agent = await mockAgent((req, res) => {
       if (req.url === '/v1/harness') return features ? json(res, 200, { name: '0g-harness', features }) : json(res, 404, { error: 'not found' });
       json(res, 404, {});
     });
     try {
       const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS, token: 't' });
-      assert.equal(await c.turnThinking(), want, JSON.stringify(features));
-      assert.equal(await c.turnThinking(), want);
+      assert.deepEqual(await c.features(), features, JSON.stringify(features));
+      assert.deepEqual(await c.features(), features);
       assert.equal(agent.seen.filter((r) => r.url === '/v1/harness').length, 1, 'asked once');
     } finally {
       agent.stop();

@@ -1713,7 +1713,7 @@ interface Session {
    *  agent itself keeps the authoritative ring; this is just the ids. */
   tasks?: Array<{ id: string; prompt: string; at: number; session?: string }>;
   /** The reasoning level each message of this session carries, for runtimes
-   *  that take one per message. On 0g-harness 0.2.1 or later (`turnThinking`)
+   *  that take one per message. On 0g-harness 0.2.1 or later (`features().turn_effort`)
    *  /think sets it on its own: the session's level, the saved one unchanged.
    *  Elsewhere it is an echo of the level /think last wrote to the settings
    *  document (prime takes it per message too), set only after that write
@@ -2095,7 +2095,7 @@ export function activityText(label: string): string {
  *  (0g-harness `features.steps`): "running a command: npm test". */
 export function liveActivityText(label: string, detail?: AgentActivityDetail): string {
   const base = activityText(label);
-  const target = /^tool\/call\b/.test(label.trim()) ? toolTarget(detail?.tool, detail?.arguments) : '';
+  const target = /^tool\/call\b/.test(label.trim()) ? toolTarget(detail?.tool, detail?.arguments?.text) : '';
   return target ? `${base}: ${target}` : base;
 }
 
@@ -5521,7 +5521,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // `/settings thinking=…` with a shorter name: it writes the owner's
         // document, the only place those frameworks read a level from.
         const arg = tokenize(line)[1];
-        const perMessage = s.phase === 'running' && !!s.client?.turnThinking && await s.client.turnThinking().catch(() => false);
+        const perMessage = s.phase === 'running' && (await s.client?.features?.().catch(() => null))?.turn_effort === true;
         if (arg && !(THINKING_LEVELS as readonly string[]).includes(arg)) { out(`usage: /think ${THINKING_LEVELS.join('|')}\n`); continue; }
         if (arg && perMessage) {
           if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
@@ -5714,7 +5714,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const words = tokenize(line).slice(1);
         const full = isSteps && words.includes('full');
         let named = words.find((w) => w !== 'full')?.replace(/^`([^`]+)`$/, '$1');
-        if (!s.client?.activitySteps || !s.client.activityOutput || !s.client.activities) { out('(this agent does not show steps — 0g-harness 0.2.1 or later does)\n'); continue; }
+        if (!s.client?.activitySteps || !s.client.activityOutput || !s.client.activities || (await s.client.features?.().catch(() => null))?.steps !== true) { out('(this agent does not show steps — 0g-harness 0.2.1 or later does)\n'); continue; }
         if (named && /^task-|^session-/.test(named) && isSteps && s.client.taskSteps) {
           const r = await s.client.taskSteps(named, full ? { maxChars: 65536 } : {}).catch((e: Error) => { out(`(${cleanCell(plainError(e))})\n`); return null; });
           if (r) out(`${renderTaskSteps(r, { full }).join('\n')}\n`);

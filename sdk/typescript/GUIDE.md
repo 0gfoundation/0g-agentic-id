@@ -957,8 +957,9 @@ const st = await agent.activitySteps!(running[0].id, { maxChars: 2000 });
 // st.steps: { step, duration_ms, model, usage, text?, tool_calls: [{ tool, arguments, result? }] }, text fields clipped at maxChars
 const out = await agent.activityOutput!('bash-2', { from: 0 });   // { text, next, lossy? }; read on from out.next
 await agent.taskSteps!('task-…');         // every turn of a task, with its steps
-// While a turn runs, chatStream's onActivity(label, detail) gets detail.tool / .arguments for a call,
-// and detail.isError / .chars / .excerpt for its result
+// While a turn runs, chatStream's onActivity(label, detail) gets detail.tool and detail.arguments for a
+// call, detail.result ({ is_error, text, chars, truncated? }) for its result
+await agent.features!();                  // what the runtime serves: { turn_effort, steps, … }, or null
 await agent.stopAllActivities!();         // everything running
 // tasks/taskInfo/stopTask/stopAllTasks are the deprecated names of these; "task"
 // is kept for zgh-style tasks (a unit of work with its own session and outcome)
