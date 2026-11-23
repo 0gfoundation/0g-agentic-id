@@ -952,6 +952,13 @@ const running = await agent.activities!({ status: 'active' });
 // actor = who does the work (agent | subagent), trigger = who asked
 await agent.activity!(running[0].id);     // a finished subagent's entry includes its answer
 await agent.stopActivity!('bash-2');      // a turn is cancelled, a command or subagent is killed
+// 0g-harness 0.2.1 on (features.steps): how a turn went, and what a command printed
+const st = await agent.activitySteps!(running[0].id, { maxChars: 2000 });
+// st.steps: { step, duration_ms, model, usage, text?, tool_calls: [{ tool, arguments, result? }] }, text fields clipped at maxChars
+const out = await agent.activityOutput!('bash-2', { from: 0 });   // { text, next, lossy? }; read on from out.next
+await agent.taskSteps!('task-…');         // every turn of a task, with its steps
+// While a turn runs, chatStream's onActivity(label, detail) gets detail.tool / .arguments for a call,
+// and detail.isError / .chars / .excerpt for its result
 await agent.stopAllActivities!();         // everything running
 // tasks/taskInfo/stopTask/stopAllTasks are the deprecated names of these; "task"
 // is kept for zgh-style tasks (a unit of work with its own session and outcome)
