@@ -19,7 +19,7 @@ import { basename, join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
-import type { AgentClient, AgentInboxMessage, AgentSession, AgentSchedule, AgentActivityInfo, AgentActivityStop, HarnessTask, HarnessTaskRecord, HarnessTaskSummary, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
+import type { AgentActivityDetail, AgentClient, AgentInboxMessage, AgentSession, AgentSchedule, AgentActivityInfo, AgentActivityStop, HarnessTask, HarnessTaskRecord, HarnessTaskSummary, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
 import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient, probeAttestor } from '../sdk';
@@ -43,13 +43,14 @@ import { splitHead, tokenize } from '../tokenize';
 import { completePath, describeStaged, findDroppedFiles, prepareAttachments, stageDropped, stageFile, type Staged } from '../attach';
 import { parseDownloadName, renderFiles, saveDownload } from '../download';
 import { pandaLines, svgPixelLines } from '../logo';
+import { renderTaskSteps, renderTurnSteps, toolTarget } from '../steps';
 import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
 import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePlan, applyResetInference, readDeploymentFacts, requiresProviderReset, deployWithInference } from '../inference';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'status ', 'doctor', 'providers', 'releases', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/sessions', '/activities', '/tasks', '/result', '/cancel', '/inbox', '/notices', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/sessions', '/activities', '/tasks', '/result', '/steps', '/output', '/cancel', '/inbox', '/notices', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -1806,6 +1807,7 @@ export function readOnlyCommand(line: string): boolean {
     case '/tasks': return !arg || arg === 'list' || arg === 'all' || /^show \S+$/.test(arg);
     case '/agentlog': case '/startuplog': case '/signatures': return !arg || /^\d+$/.test(arg);
     case '/settings': return !arg || arg === 'versions';
+    case '/steps': case '/output': return true;
     default: return false;
   }
 }
@@ -2087,6 +2089,14 @@ export function activityText(label: string): string {
   return 'working';
 }
 
+/** {@link activityText}, with what a tool call works on where the agent says it
+ *  (0g-harness `features.steps`): "running a command: npm test". */
+export function liveActivityText(label: string, detail?: AgentActivityDetail): string {
+  const base = activityText(label);
+  const target = /^tool\/call\b/.test(label.trim()) ? toolTarget(detail?.tool, detail?.arguments) : '';
+  return target ? `${base}: ${target}` : base;
+}
+
 /** What {@link activityText}'s words become once done: one, and several ({n}). */
 const TOOL_DONE: Record<string, [string, string]> = {
   'running a command': ['ran a command', 'ran {n} commands'],
@@ -2187,10 +2197,10 @@ async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (v
   };
   const ticker = process.stdout.isTTY ? setInterval(paint, 1000) : null;
   const onActivity = process.stdout.isTTY
-    ? (label: string): void => {
+    ? (label: string, detail?: AgentActivityDetail): void => {
         if (label.startsWith('turn/end')) { doing = null; view.status(null); return; }
         view.activity?.(label);
-        doing = cleanCell(activityText(label));
+        doing = cleanCell(liveActivityText(label, detail));
         paint();
       }
     : undefined;
@@ -4962,6 +4972,13 @@ export const L2_HELP_FULL = `session commands
                           finished one, follows a running one live; on
                           0g-harness also a subagent's answer or a command's
                           status
+  /steps [id] [full]      0g-harness: how a turn went (default: latest), or a
+                          task (task-…): each model call with its tokens and
+                          time, each tool call with what it ran and its
+                          result; full prints every line
+  /output <id>            0g-harness: what a background command printed
+                          (ids from /activities); reading leaves it to the
+                          agent too
   /cancel [id|all]        stop tasks — the brake for orphaned turns: Esc only
                           cancels a turn THIS connection started (on
                           0g-harness and prime it interrupts the agent-wide
@@ -5674,6 +5691,47 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out('re-attach with /result [id] (default: latest)\n');
         continue;
       }
+      if (line === '/steps' || line.startsWith('/steps ') || line === '/output' || line.startsWith('/output ')) {
+        // How a turn or a task went step by step, and what a background
+        // command printed (0g-harness features.steps). An id, or a unique
+        // start of one, from the activity or task list; bare /steps: this
+        // session's latest turn.
+        const isSteps = line.startsWith('/steps');
+        const words = tokenize(line).slice(1);
+        const full = isSteps && words.includes('full');
+        let named = words.find((w) => w !== 'full')?.replace(/^`([^`]+)`$/, '$1');
+        if (!s.client?.activitySteps || !s.client.activityOutput || !s.client.activities) { out('(this agent does not show steps — 0g-harness 0.2.1 or later does)\n'); continue; }
+        if (named && /^task-|^session-/.test(named) && isSteps && s.client.taskSteps) {
+          const r = await s.client.taskSteps(named, full ? { maxChars: 65536 } : {}).catch((e: Error) => { out(`(${cleanCell(plainError(e))})\n`); return null; });
+          if (r) out(`${renderTaskSteps(r, { full }).join('\n')}\n`);
+          continue;
+        }
+        if (named) {
+          const known = await s.client.activity!(named).then(() => true, () => false);
+          if (!known) {
+            const hits = (await s.client.activities({ limit: 500 }).catch(() => [])).filter((a) => a.id.startsWith(named!));
+            if (hits.length !== 1) {
+              out(hits.length ? `${hits.length} start with ${cleanCell(named)} — give more of the id\n` : `no match in the latest 500 activities for ${cleanCell(named)} — use the full id for an older activity\n`);
+              continue;
+            }
+            named = hits[0].id;
+          }
+        }
+        if (isSteps) {
+          const id = named ?? [...(s.tasks ?? [])].reverse().find((t) => t.session === s.sessionId)?.id;
+          if (!id) { out('no turn to show — /steps <id>, or chat first\n'); continue; }
+          const r = await s.client.activitySteps(id, full ? { maxChars: 65536 } : {}).catch((e: Error) => { out(`(${cleanCell(plainError(e))})\n`); return null; });
+          if (r) out(`${shortIds([cleanCell(id)])[0]}\n${renderTurnSteps(r, { full }).join('\n')}${full ? '' : '\n(/steps ' + shortIds([cleanCell(id)])[0] + ' full: every line)'}\n`);
+          continue;
+        }
+        if (!named) { out('usage: /output <id> — a background command from /activities\n'); continue; }
+        const o = await s.client.activityOutput(named).catch((e: Error) => { out(`(${cleanCell(plainError(e))})\n`); return null; });
+        if (!o) continue;
+        out(`${shortIds([cleanCell(o.id)])[0]} — ${cleanCell(o.status)}${o.lossy ? ' · (the start was dropped; this is the most recent output)' : ''}\n`);
+        if (o.text) out(`${cleanStream(o.text).replace(/\n?$/, '\n')}`);
+        else out('(no output yet)\n');
+        continue;
+      }
       if (line === '/result' || line.startsWith('/result ')) {
         // A background command or a subagent is not a turn: its record is
         // the activity list's, and it has no stream to follow.
@@ -5695,7 +5753,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (t && t.type !== 'turn') {
             out(`${shortIds([cleanCell(t.id)])[0]} — ${cleanCell(t.status)} · by ${cleanCell(t.actor)} · ${cleanCell(t.label)}\n`);
             if (t.output_text) out(`${cleanStream(t.output_text)}\n`);
-            else if (t.type === 'command') out('(a command\'s output goes to the agent, which reports on it in a notice when the command finishes — /inbox)\n');
+            else if (t.type === 'command') out(s.client.activityOutput ? `(its output: /output ${shortIds([cleanCell(t.id)])[0]})\n` : '(a command\'s output goes to the agent, which reports on it in a notice when the command finishes — /inbox)\n');
             if (t.error) out(`error: ${cleanCell(t.error)}\n`);
             continue;
           }
@@ -6412,7 +6470,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       steering = makeSteering(view, after);
       if (process.stdin.isTTY) { (ask as Ask).whileBusy?.(busyEntries(view, steering, clearActivity)); (ask as Ask).held = steering?.held ?? null; }
       const onActivity = process.stdout.isTTY
-        ? (label: string): void => {
+        ? (label: string, detail?: AgentActivityDetail): void => {
             if (label === 'steer received') {
               // The agent read an inserted message.
               clearActivity();
@@ -6428,7 +6486,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             // a failure worth reporting.
             if (/tool|bash|subagent|rlm_child/i.test(label) && label !== 'thinking') sawToolActivity = true;
             if (label.startsWith('turn/end')) { clearActivity(); return; }
-            status = cleanCell(activityText(label));
+            status = cleanCell(liveActivityText(label, detail));
             paintStatus();
           }
         : undefined;

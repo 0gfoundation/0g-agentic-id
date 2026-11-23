@@ -370,6 +370,8 @@ if (box.data.length) await agent.ackInbox!(box.data[box.data.length - 1].seq);  
 for await (const e of agent.events!({ after: box.cursor, signal })) { /* inbox.message, turn.*, activity.updated, … */ }
 await agent.activities!();                        // turns, commands, subagents: who did each, who asked
 await agent.stopActivity!('subagent-1');          // one of them; stopAllActivities() for everything running
+await agent.activitySteps!('resp_…');             // a turn step by step: model calls (tokens, time), tool calls with arguments and results
+await agent.activityOutput!('bash-…');            // a background command's output, read without taking it from the agent
 // (tasks()/stopTask() are their deprecated names; zgh-style tasks are createTask() and friends, below)
 await agent.schedules!();                         // reminders the agent set for itself
 
