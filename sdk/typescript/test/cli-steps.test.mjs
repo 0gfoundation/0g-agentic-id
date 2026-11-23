@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { renderTaskSteps, renderTurnSteps, toolTarget } from '../dist/cli/steps.js';
-import { liveActivityText, readOnlyCommand } from '../dist/cli/commands/interactive.js';
+import { LIVE_TARGET_MAX, ignoredText, liveActivityText, readOnlyCommand } from '../dist/cli/commands/interactive.js';
 import { activityDetail } from '../dist/AgentClient.js';
 
 test('toolTarget: the command, file, URL or query a call works on, even from cut-off arguments', () => {
@@ -131,4 +131,38 @@ test('stepsCommand: /steps and /output by id, prefix or default; only where the 
   assert.deepEqual(asked.at(-1), ['task', 'task-1', {}]);
   assert.equal(await run('/output bash-1'), 'bash-1 — completed\nok\n');
   assert.match(await run('/output'), /^usage: \/output <id>/);
+});
+
+test('review fixes: odd tool names, raw numbers, a long target, ignored notices', () => {
+  // A tool named like an Object.prototype key falls back to the common fields.
+  for (const tool of ['constructor', 'toString', '__proto__']) assert.equal(toolTarget(tool, '{"command":"ls"}'), 'ls', tool);
+  // Fields a runtime sends as something other than numbers are cleaned, never printed raw.
+  const out = renderTurnSteps({ turn: 1, end: { kind: 'completed' }, steps: [{ step: '\u001b]0;pwned\u0007\u001b[2J', usage: { input_tokens: '\u001b[31mX', output_tokens: 5 }, tool_calls: [] }] }).join('\n');
+  assert.doesNotMatch(out, /\u001b|\u0007/);
+  // The live target is cut, so the status line keeps its timer.
+  const long = liveActivityText('tool/call bash', { tool: 'bash', arguments: { text: JSON.stringify({ command: 'x'.repeat(500) }), chars: 520 } });
+  assert.equal(long, `running a command: ${'x'.repeat(LIVE_TARGET_MAX - 1)}…`);
+  // What a turn asked for and did not get is said in plain words.
+  assert.equal(ignoredText({ ignored: { reasoning_effort: 'this model takes no thinking level' } }), '\n(thinking level not applied: this model takes no thinking level)\n');
+  assert.equal(ignoredText({}), '');
+});
+
+test('stepsCommand: a task id as the CLI shows it (a unique start) is resolved', async () => {
+  const { stepsCommand } = await import('../dist/cli/steps.js');
+  const asked = [];
+  let refreshed = 0;
+  const client = {
+    features: async (o) => { if (o?.refresh) refreshed++; return { steps: true }; },
+    activity: async () => { throw new Error('404'); },
+    activities: async () => [],
+    activitySteps: async () => ({}),
+    activityOutput: async () => ({}),
+    listTasks: async () => [{ id: 'task-0b6e2c1a-1111' }, { id: 'task-0b6e2c1a-2222' }, { id: 'task-9f9f9f9f-3333' }],
+    taskSteps: async (id) => { asked.push(id); return { object: 'task.steps', task: id, session: id, turns: [] }; },
+  };
+  const run = async (line) => { const out = []; await stepsCommand(line, { client, shortId: (x) => x, errorText: (e) => e.message, out: (t) => out.push(t) }); return out.join(''); };
+  await run('/steps task-9f9f');
+  assert.deepEqual(asked, ['task-9f9f9f9f-3333']);
+  assert.match(await run('/steps task-0b6e2c1a'), /2 tasks start with task-0b6e2c1a/);
+  assert.ok(refreshed >= 2, 'the runtime is asked afresh each time');
 });

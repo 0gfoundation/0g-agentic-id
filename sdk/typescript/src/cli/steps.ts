@@ -38,7 +38,7 @@ function fieldOf(args: string, key: string): string | undefined {
 /** What a tool call works on, on one line: `npm test`, `/home/agent/x.md`; '' when the arguments name nothing. */
 export function toolTarget(tool: string | undefined, args: string | undefined): string {
   if (!args) return '';
-  for (const k of (tool && TARGET_FIELDS[tool]) || ANY_FIELDS) {
+  for (const k of (tool && Object.prototype.hasOwnProperty.call(TARGET_FIELDS, tool) ? TARGET_FIELDS[tool] : ANY_FIELDS)) {
     const v = fieldOf(args, k);
     if (v && v.trim()) return cleanCell(v.trim().replace(/\s*\n\s*/g, ' ⏎ '));
   }
@@ -46,7 +46,8 @@ export function toolTarget(tool: string | undefined, args: string | undefined): 
 }
 
 const secs = (ms: number | undefined) => (typeof ms === 'number' ? `${ms < 10_000 ? (ms / 1000).toFixed(1) : Math.round(ms / 1000)}s` : '');
-const n = (v: number) => v.toLocaleString('en-US');
+/** A count as the CLI prints it; anything that is not a finite number goes through cleanCell. */
+const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString('en-US') : cleanCell(v));
 
 function usageText(u: Record<string, number> | undefined): string {
   if (!u) return '';
@@ -68,7 +69,7 @@ function textLines(t: AgentStepText, full: boolean, max: number): string[] {
 
 /** One step's lines. */
 function stepLines(st: AgentStep, full: boolean): string[] {
-  const head = [`step ${st.step}`, secs(st.duration_ms), st.model ? cleanCell(st.model) : '', usageText(st.usage), st.reasoning_chars ? `thought ${n(st.reasoning_chars)} chars` : ''].filter(Boolean).join(' · ');
+  const head = [`step ${n(st.step)}`, secs(st.duration_ms), st.model ? cleanCell(st.model) : '', usageText(st.usage), st.reasoning_chars ? `thought ${n(st.reasoning_chars)} chars` : ''].filter(Boolean).join(' · ');
   const out = [head];
   for (const c of st.tool_calls) {
     const target = toolTarget(c.tool, c.arguments.text);
@@ -94,12 +95,12 @@ export function renderTurnSteps(r: Pick<AgentTurnSteps, 'turn' | 'end' | 'steps'
 /** A task's turns and their steps as lines. */
 export function renderTaskSteps(r: HarnessTaskSteps, opts: { full?: boolean } = {}): string[] {
   if (!r.turns.length) return ['(no turns recorded for this task)'];
-  return r.turns.flatMap((t, i) => [`${i ? '\n' : ''}turn ${t.turn}`, ...renderTurnSteps({ turn: t.turn, end: t.end, steps: t.steps }, opts).map((l) => `  ${l}`)]);
+  return r.turns.flatMap((t, i) => [`${i ? '\n' : ''}turn ${n(t.turn)}`, ...renderTurnSteps({ turn: t.turn, end: t.end, steps: t.steps }, opts).map((l) => `  ${l}`)]);
 }
 
 /** What `/steps` and `/output` need from the CLI session. */
 export interface StepsDeps {
-  client: Pick<AgentClient, 'features' | 'activity' | 'activities' | 'activitySteps' | 'activityOutput' | 'taskSteps'> | undefined;
+  client: Pick<AgentClient, 'features' | 'activity' | 'activities' | 'activitySteps' | 'activityOutput' | 'taskSteps' | 'listTasks'> | undefined;
   /** This session's newest turn, the default of a bare /steps. */
   latestTurn?: string;
   /** An id as the CLI shows it (short). */
@@ -121,13 +122,22 @@ export async function stepsCommand(line: string, d: StepsDeps): Promise<void> {
   const full = isSteps && words.includes('full');
   let named = words.find((w) => w !== 'full')?.replace(/^`([^`]+)`$/, '$1');
   const c = d.client;
-  if (!c?.activitySteps || !c.activityOutput || !c.activities || !c.activity || (await c.features?.().catch(() => null))?.steps !== true) {
+  if (!c?.activitySteps || !c.activityOutput || !c.activities || !c.activity || (await c.features?.({ refresh: true }).catch(() => null))?.steps !== true) {
     d.out('(this agent does not show steps — 0g-harness 0.2.1 or later does)\n');
     return;
   }
   const fail = (e: unknown) => { d.out(`(${cleanCell(d.errorText(e))})\n`); return null; };
   const opts = full ? { maxChars: 65536 } : {};
   if (isSteps && named && /^(task|session)-/.test(named) && c.taskSteps) {
+    // A task id as the CLI shows it is a unique start of one (shortIds).
+    if (c.listTasks) {
+      const ids = (await c.listTasks({ limit: 500 }).catch(() => [])).map((t) => t.id);
+      if (!ids.includes(named)) {
+        const hits = ids.filter((id) => id.startsWith(named!));
+        if (hits.length > 1) { d.out(`${hits.length} tasks start with ${cleanCell(named)} — give more of the id\n`); return; }
+        if (hits.length === 1) named = hits[0];
+      }
+    }
     const r = await c.taskSteps(named, opts).catch(fail);
     if (r) d.out(`${renderTaskSteps(r, { full }).join('\n')}\n`);
     return;

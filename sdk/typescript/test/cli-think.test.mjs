@@ -24,7 +24,7 @@ test('per message: the session carries the level; nothing is read, written or si
   await thinkCommand('low', d);
   assert.equal(d.session.thinking, 'low');
   assert.deepEqual(calls, []);
-  assert.match(out.join(''), /^thinking low for this session's messages, from the next one \(no restart\); the agent's saved level is unchanged — \/settings thinking=low saves it\n$/);
+  assert.match(out.join(''), /^thinking low for this session's messages, from the next one \(no restart\); the agent's saved level is unchanged — \/settings thinking=low saves it, \/think default goes back to it\n$/);
 });
 
 test('per message, bare /think: the session level beside the saved one', async () => {
@@ -67,5 +67,16 @@ test('max warns either way; a bad level only prints the usage', async () => {
   await thinkCommand('medium', d);
   assert.deepEqual(calls, []);
   assert.equal(d.session.thinking, undefined);
-  assert.equal(out.join(''), 'usage: /think low|high|max\n');
+  assert.equal(out.join(''), 'usage: /think low|high|max|default\n');
+});
+
+test('/think default drops the session level, so messages use the saved one', async () => {
+  const { d, calls, out } = deps({ perMessage: true });
+  d.session.thinking = 'max';
+  await thinkCommand('default', d);
+  assert.equal(d.session.thinking, undefined);
+  assert.deepEqual(calls, []);
+  assert.match(out.join(''), /saved level again \(they carried max\)/);
+  await thinkCommand('default', d);
+  assert.match(out.at(-1), /already use the saved level/);
 });

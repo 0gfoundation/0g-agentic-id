@@ -7,7 +7,7 @@
 ## 1. 问题
 
 agent 的对话必须活过**框架进程重启**——settings 通道落地后重启变高频:每次
-settings 推送、每次 `/think` 都是 Stop+Start(`manager.Reload`),崩溃走同一条路。
+settings 推送都是 Stop+Start(`manager.Reload`;`/think` 也是,但在 0g-harness 0.2.1 及以后它只设置单条消息的强度),崩溃走同一条路。
 现在 prime/dsh 把对话记在桥的**进程内存**里,一重启就**彻底失忆**,靠
 `restoreTranscript()` 重放**客户端**那份糊住——层级错位(让客户端替 harness 存
 它自己的状态)且有损(工具内部过程重建不了)。openclaw/hermes 不失忆,只是因为

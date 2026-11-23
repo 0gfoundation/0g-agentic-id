@@ -188,6 +188,8 @@ export interface ChatNotice {
   imagesSavedAsFiles?: string[];
   /** Names of files in the outbox (`downloadFile('outbox', name)`). */
   outboxFiles?: string[];
+  /** What the turn asked for and did not get, by request field, with the reason (0g-harness `harness.ignored`, e.g. `reasoning_effort`). */
+  ignored?: Record<string, string>;
 }
 
 /** A file the owner can download ({@link AgentClient.listFiles}). */
@@ -356,7 +358,7 @@ export interface AgentTask {
   output_text: string;
   error?: { message: string };
   /** Runtime notices about the message that opened it (0g-harness). */
-  harness?: { images_saved_as_files?: string[]; outbox_files?: string[] };
+  harness?: { images_saved_as_files?: string[]; outbox_files?: string[]; ignored?: Record<string, unknown> };
 }
 
 export interface ChatCompletion {
@@ -688,6 +690,8 @@ export interface AgentClient {
     startingAfter?: number;
     signal?: AbortSignal;
     onActivity?: (label: string, detail?: AgentActivityDetail) => void;
+    /** The harness's notices on the finished turn (files, what it ignored). */
+    onNotice?: (notice: ChatNotice) => void;
   }): AsyncGenerator<string>;
   /**
    * Stop one task by id — the responses-transport form of {@link interrupt}.
@@ -709,10 +713,12 @@ export interface AgentClient {
    * `features` (`turn_effort`: a message's `thinking` level runs that turn at
    * it, with no settings write and no restart; `steps`: the steps and output
    * routes and live tool details; `image_names`, `tasks`, …). Asked once per
-   * handle; null where the runtime has no such route (other frameworks). A
-   * client turns a feature on only when it is listed `true`.
+   * handle and kept; `refresh: true` asks again (after a settings change or a
+   * harness restart, which can change them). Null where the runtime has no
+   * such route (other frameworks). A client turns a feature on only when it
+   * is listed `true`.
    */
-  features?(): Promise<Record<string, unknown> | null>;
+  features?(opts?: { refresh?: boolean }): Promise<Record<string, unknown> | null>;
   /**
    * Present only when this handle holds the owner key: fetch the agent's own
    * process log (the framework subprocess stdout/stderr the runtime serves at
@@ -831,7 +837,7 @@ export interface AgentClient {
    * Send a session a message: its next turn (`mode: 'next'`, the default),
    * or a steer into its running turn (`'steer'`). Present with {@link sessions}.
    */
-  promptSession?(id: string, text: string, opts?: { mode?: 'next' | 'steer' }): Promise<SessionPromptResult>;
+  promptSession?(id: string, text: string, opts?: { mode?: 'next' | 'steer'; thinking?: 'low' | 'high' | 'max' }): Promise<SessionPromptResult>;
   /** Stop a session's running turn. Present with {@link sessions}. */
   cancelSession?(id: string): Promise<{ cancelled: string | null; session: string }>;
   /**
@@ -1046,7 +1052,11 @@ function harnessNotice(harness: AgentTask['harness'] | undefined): ChatNotice | 
   const outbox = strings(harness.outbox_files);
   if (images) n.imagesSavedAsFiles = images;
   if (outbox) n.outboxFiles = outbox;
-  return images || outbox ? n : undefined;
+  const ignored = harness.ignored && typeof harness.ignored === 'object'
+    ? Object.fromEntries(Object.entries(harness.ignored).filter(([, v]) => typeof v === 'string').map(([k, v]) => [plainText(k), plainText(v as string)]))
+    : {};
+  if (Object.keys(ignored).length) n.ignored = ignored;
+  return Object.keys(n).length ? n : undefined;
 }
 
 /**
@@ -1181,9 +1191,10 @@ export function makeAgentClient(params: {
   // What the agent's runtime says it reads (0g-harness `GET /v1/harness`,
   // `features`), asked once; null where there is no such route.
   let featuresAsked: Promise<Record<string, unknown> | null> | null = null;
-  const harnessFeatures = (): Promise<Record<string, unknown> | null> => {
+  const harnessFeatures = (opts?: { refresh?: boolean }): Promise<Record<string, unknown> | null> => {
     const r = routes.find((x) => x.kind === 'chat') ?? routes.find((x) => x.kind === 'responses');
     if (!r || !canAuth) return Promise.resolve(null);
+    if (opts?.refresh) featuresAsked = null;
     const path = r.kind === 'chat' ? `${r.prefix.replace(/\/?$/, '/')}harness` : r.prefix.replace(/responses\/?$/, 'harness');
     featuresAsked ??= doFetch(path, { signal: AbortSignal.timeout(5000) })
       .then(async (res) => {
@@ -1585,6 +1596,7 @@ export function makeAgentClient(params: {
       startingAfter: opts?.startingAfter ?? 0,
       signal: opts?.signal,
       onActivity: wrapActivity(opts?.onActivity),
+      onNotice: opts?.onNotice,
     });
     client.cancelTask = async (id) => {
       const r = await doFetch(`${rPrefix}/${id}/cancel`, { method: 'POST' });
@@ -1745,7 +1757,7 @@ export function makeAgentClient(params: {
     client.sessions = async () => ((await getJSON<{ data?: AgentSession[] }>('sessions', sessionsBase)).data ?? []).map(clean);
     client.session = async (id) => clean(await getJSON<AgentSession>('session', sid(id)));
     client.createSession = async (opts = {}) => clean(await postJSON<AgentSession>('createSession', sessionsBase, opts));
-    client.promptSession = (id, text, opts = {}) => postJSON<SessionPromptResult>('promptSession', `${sid(id)}/prompt`, { text, ...(opts.mode ? { mode: opts.mode } : {}) });
+    client.promptSession = (id, text, opts = {}) => postJSON<SessionPromptResult>('promptSession', `${sid(id)}/prompt`, { text, ...(opts.mode ? { mode: opts.mode } : {}), ...(opts.thinking ? { reasoning_effort: opts.thinking } : {}) });
     client.cancelSession = (id) => postJSON<{ cancelled: string | null; session: string }>('cancelSession', `${sid(id)}/cancel`);
   }
 
@@ -1778,7 +1790,7 @@ export function makeAgentClient(params: {
       return ((await getJSON<{ data?: HarnessTask[] }>('listTasks', `${tasksBase}${qs ? `?${qs}` : ''}`)).data ?? []).map(clean);
     };
     client.getTask = async (id) => clean(await getJSON<HarnessTask>('getTask', tid(id)));
-    client.taskSteps = (id, opts) => getJSON<HarnessTaskSteps>('taskSteps', `${tid(id)}/steps${opts?.maxChars !== undefined ? `?max_chars=${opts.maxChars}` : ''}`);
+    client.taskSteps = async (id, opts) => getJSON<HarnessTaskSteps>('taskSteps', `${tid(id)}/steps${opts?.maxChars !== undefined ? `?max_chars=${opts.maxChars}` : ''}`);
     client.taskInput = async (id, text, opts = {}) => clean(await postJSON<TaskInputResult>('taskInput', `${tid(id)}/input`, { text, ...(opts.mode ? { mode: opts.mode } : {}) }));
     client.cancelTaskRun = async (id) => clean(await postJSON<HarnessTask>('cancelTaskRun', `${tid(id)}/cancel`));
     client.archiveTask = async (id) => clean(await postJSON<HarnessTask>('archiveTask', `${tid(id)}/archive`));

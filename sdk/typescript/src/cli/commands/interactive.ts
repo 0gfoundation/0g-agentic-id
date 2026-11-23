@@ -771,7 +771,7 @@ const L1_ARGS: Record<string, string[] | (() => string[])> = {
 };
 const L2_ARGS: Record<string, string[] | ((rest: string) => string[])> = {
   '/hello': ['full'],
-  '/think': ['low', 'high', 'max'],
+  '/think': ['low', 'high', 'max', 'default'],
   '/reset': ['pick'],
   '/cancel': ['all'],
   '/inbox': ['all'],
@@ -2092,12 +2092,25 @@ export function activityText(label: string): string {
   return 'working';
 }
 
+/** Characters of a tool call's target in the live status line. */
+export const LIVE_TARGET_MAX = 60;
+
+/** The note for what a turn asked for and the agent did not apply (`harness.ignored`), or ''. */
+export function ignoredText(n: ChatNotice): string {
+  const e = Object.entries(n.ignored ?? {});
+  if (!e.length) return '';
+  const what = (k: string) => (k === 'reasoning_effort' ? 'thinking level' : k);
+  return `\n(${e.map(([k, v]) => `${cleanCell(what(k))} not applied: ${cleanCell(v)}`).join('; ')})\n`;
+}
+
 /** {@link activityText}, with what a tool call works on where the agent says it
  *  (0g-harness `features.steps`): "running a command: npm test". */
 export function liveActivityText(label: string, detail?: AgentActivityDetail): string {
   const base = activityText(label);
   const target = /^tool\/call\b/.test(label.trim()) ? toolTarget(detail?.tool, detail?.arguments?.text) : '';
-  return target ? `${base}: ${target}` : base;
+  // Short enough that the status line keeps its timer and stop hint.
+  const shown = target.length > LIVE_TARGET_MAX ? `${target.slice(0, LIVE_TARGET_MAX - 1)}…` : target;
+  return shown ? `${base}: ${shown}` : base;
 }
 
 /** What {@link activityText}'s words become once done: one, and several ({n}). */
@@ -2176,7 +2189,7 @@ async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (v
     s.attached = [];
   }
   const sid = s.sessionId!;
-  const r = await client.promptSession!(sid, sent);
+  const r = await client.promptSession!(sid, sent, s.thinking ? { thinking: s.thinking } : {});
   // Its id, for /result and /cancel in this session.
   (s.tasks ??= []).push({ id: r.id, prompt: line.slice(0, 60), at: Date.now(), session: sid });
   const ac = new AbortController();
@@ -2208,7 +2221,7 @@ async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (v
       }
     : undefined;
   try {
-    for await (const d of client.followTask!(r.id, { signal: ac.signal, ...(onActivity ? { onActivity } : {}) })) { reply += d; doing = null; view.status(null); say(d); }
+    for await (const d of client.followTask!(r.id, { signal: ac.signal, ...(onActivity ? { onActivity } : {}), onNotice: (n) => { const t = ignoredText(n); if (t) view.note(t); } })) { reply += d; doing = null; view.status(null); say(d); }
     view.end();
     if (reply && !reply.endsWith('\n')) out('\n');
   } catch (e) {
@@ -4859,7 +4872,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /sessions /activities /tasks /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /sessions /activities /tasks /result /steps /output /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
 export const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -4925,15 +4938,19 @@ export const L2_HELP_FULL = `session commands
                           A request the agent waits on (to read a value, to get
                           a credential, to be connected) comes up here at the
                           prompt; your answer goes back to the agent
-  /think [low|high|max]   reasoning depth for thinking models (glm etc.).
-                          On 0g-harness 0.2.1 or later: this session's
-                          messages use it from the next one, with no
-                          signature and no restart; /settings thinking=…
-                          saves a level. Elsewhere: shorthand for /settings
+  /think [low|high|max|default]
+                          reasoning depth for thinking models (glm etc.).
+                          A running 0g-harness 0.2.1 or later whose model
+                          takes a level: this CLI session's messages use it
+                          from the next one (owner-chat and other sessions),
+                          with no signature and no restart; default goes
+                          back to the saved level, /settings thinking=…
+                          saves one. Otherwise: shorthand for /settings
                           thinking=…, written to the owner's document
-                          (owner-signed); a running agent takes it at once, a
-                          stopped one at its next start. prime also takes it
-                          per message. No arg shows the level in use
+                          (owner-signed); a running agent restarts its
+                          framework to take it, a stopped one takes it at
+                          its next start. prime also takes it per message.
+                          No arg shows the level in use
   /clear                  wipe the agent's conversation and start fresh —
                           chain-tracked memory (what the agent chose to keep)
                           is untouched; that is the difference from /reset
@@ -5504,7 +5521,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // Owner-signed in both directions, so it needs the wallet client and
         // not the session's (possibly keyless) one.
         const ag = await withWallet(ctx);
-        await settingsOp(ag, s.sealId, tokenize(line).slice(1), await ownerRouteUrl(ag, s), s.framework, ask);
+        const written = await settingsOp(ag, s.sealId, tokenize(line).slice(1), await ownerRouteUrl(ag, s), s.framework, ask);
+        // A saved level replaces a level /think set for this session: the
+        // session's messages follow what was just saved.
+        if (written && tokenize(line).slice(1).some((a) => a.startsWith('thinking='))) s.thinking = (written.thinking as ThinkingLevel | undefined) ?? undefined;
         continue;
       }
       if (line === '/cred' || line.startsWith('/cred ')) {
@@ -5519,7 +5539,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         let ag: Awaited<ReturnType<typeof withWallet>> | undefined;
         const wallet = async () => (ag ??= await withWallet(ctx));
         await thinkCommand(tokenize(line)[1], {
-          perMessage: s.phase === 'running' && (await s.client?.features?.().catch(() => null))?.turn_effort === true,
+          perMessage: s.phase === 'running' && (await s.client?.features?.({ refresh: true }).catch(() => null))?.turn_effort === true,
           session: s,
           framework: s.framework,
           readSaved: async () => (await (await wallet()).agent.getSettings(s.sealId)).settings?.thinking as string | undefined,
@@ -5717,7 +5737,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (t && t.type !== 'turn') {
             out(`${shortIds([cleanCell(t.id)])[0]} — ${cleanCell(t.status)} · by ${cleanCell(t.actor)} · ${cleanCell(t.label)}\n`);
             if (t.output_text) out(`${cleanStream(t.output_text)}\n`);
-            else if (t.type === 'command') out(s.client.activityOutput ? `(its output: /output ${shortIds([cleanCell(t.id)])[0]})\n` : '(a command\'s output goes to the agent, which reports on it in a notice when the command finishes — /inbox)\n');
+            else if (t.type === 'command') out((await s.client.features?.({ refresh: true }).catch(() => null))?.steps === true ? `(its output: /output ${shortIds([cleanCell(t.id)])[0]})\n` : '(a command\'s output goes to the agent, which reports on it in a notice when the command finishes — /inbox)\n');
             if (t.error) out(`error: ${cleanCell(t.error)}\n`);
             continue;
           }
@@ -6473,6 +6493,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           ...(onActivity ? { onActivity } : {}),
           ...(images.length ? { images } : {}),
           onNotice: (n: ChatNotice): void => {
+            const ignored = ignoredText(n);
+            if (ignored) { clearActivity(); view.note(ignored); }
             if (n.imagesSavedAsFiles?.length) {
               clearActivity();
               view.note(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map((f) => cleanCell(basename(f))).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);

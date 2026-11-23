@@ -62,3 +62,28 @@ test('a message carries its thinking level as reasoning.effort', async () => {
     agent.stop();
   }
 });
+
+test('features({ refresh: true }) asks again; promptSession carries the level; taskSteps rejects a bad id', async () => {
+  let features = { turn_effort: true };
+  const agent = await mockAgent((req, res) => {
+    const path = req.url.split('?')[0];
+    if (path === '/v1/harness') return json(res, 200, { name: '0g-harness', features });
+    if (path === '/v1/sessions/sess-1/prompt') return json(res, 202, { merged: false, id: 'resp_1', session: 'sess-1' });
+    json(res, 404, {});
+  });
+  try {
+    const routes = [...HARNESS, { prefix: '/v1/sessions', kind: 'sessions', auth: 'bearer', signed: false }, { prefix: '/v1/tasks', kind: 'tasks', auth: 'bearer', signed: false }, { prefix: '/v1/task-feed', kind: 'task-feed', auth: 'bearer', signed: false }];
+    const c = makeAgentClient({ base: agent.base, services: [], routes, token: 't' });
+    assert.deepEqual(await c.features(), { turn_effort: true });
+    features = { turn_effort: false };
+    assert.deepEqual(await c.features(), { turn_effort: true }, 'kept');
+    assert.deepEqual(await c.features({ refresh: true }), { turn_effort: false }, 'asked again');
+    await c.promptSession('sess-1', 'hi', { thinking: 'low' });
+    await c.promptSession('sess-1', 'hi again');
+    const bodies = agent.seen.filter((r) => r.url === '/v1/sessions/sess-1/prompt').map((r) => r.body);
+    assert.deepEqual(bodies, [{ text: 'hi', reasoning_effort: 'low' }, { text: 'hi again' }]);
+    await assert.rejects(c.taskSteps('not a task id'), /not a task id/);
+  } finally {
+    agent.stop();
+  }
+});
