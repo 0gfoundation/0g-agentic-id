@@ -1,9 +1,8 @@
 # AgenticID contracts: deploy / upgrade / verify / ERC-8004 binding
 
-> The `--priority-gas-price 2000000000 --gas-price 5000000000` that recurs in the
-> commands is a hardcoded 0G-testnet workaround, **not a recommendation** — see
-> [`../QUIRKS.md`](../QUIRKS.md). (forge 1.6 often rejects it; in practice use
-> `--legacy --gas-price 5000000000 --slow`, see §4.)
+> The commands broadcast with `--legacy --with-gas-price <GAS_PRICE>`:
+> `<GAS_PRICE>` is the network's current price (`cast gas-price --rpc-url <RPC>`).
+> See [`../QUIRKS.md`](../QUIRKS.md) "Gas prices".
 
 ## 1. Architecture
 
@@ -281,7 +280,7 @@ export TEE_ORACLE=0x...           # oracle signing address generated in the TEE
 #           must be within 7200–31536000 or initialize reverts NonceMaxAgeOutOfRange)
 forge script script/Deploy.s.sol \
   --rpc-url <RPC> --private-key <PK> --broadcast \
-  --priority-gas-price 2000000000 --gas-price 5000000000
+  --legacy --with-gas-price <GAS_PRICE> --slow
 ```
 
 Timelock defaults: proposers = [OWNER] (OZ also makes every proposer a
@@ -335,13 +334,13 @@ owner hands the registry to the Timelock and becomes its guardian (§1):
 ```bash
 export TRUST_REGISTRY=0x<proxy> TIMELOCK=0x<Timelock> GUARDIAN=$OWNER
 forge script script/HandOverTrustRegistry.s.sol --rpc-url <RPC> \
-  --private-key <OWNER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --private-key <OWNER_PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 # the Timelock accepts: schedule, then execute once minDelay has passed
 export CALLS=$(cast calldata "acceptOwnership()")
 MODE=schedule forge script script/TrustRegistryCalls.s.sol --rpc-url <RPC> \
-  --private-key <PROPOSER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --private-key <PROPOSER_PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 MODE=execute forge script script/TrustRegistryCalls.s.sol --rpc-url <RPC> \
-  --private-key <EXECUTOR_PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --private-key <EXECUTOR_PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 ```
 
 An owner that signs outside forge (the mainnet vault) takes the calldata from
@@ -463,7 +462,7 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 | AgenticID impl | `0xDd046c1272c06382172C5D191728b3c72CA96292` | fixes TrustRegistry `0xB667…Eb6f` (`trustRegistry()`); no linked library (deploy `0x90a48c00a6e56d5e0d85a4854891a7787dabf6ee73c13acf7d9cb79996de4c5f`, built from tag `v0.5.0`). Previous: 1.3.0 `0xC6A4148b557e0476aCF43Afc4CD0f3933C971025` (links AttestorAppBindingLib `0xDb97…a98D`), 1.2.0 `0x63F5B71d764B903C566B47eADF5bA0679825191C`, 1.1.0 `0x99484dd8…2F70` |
 | AgenticID beacon | `0x201E35B8566EDC26057348D8419Bc8cBCa609c0E` | |
 | AttestorAppBindingLib (linked library — stateless, no proxy) | `0xDb979Ba6Eb6233919212472CFB6c85283d4ea98D` | deployed 2026-10-27 with the 1.3.0 impl; unused by 1.4.0 (kept for a rollback to 1.3.0) |
-| TrustRegistry proxy | `0xB6674CCF25bfE7552127DEF2a87b76Ac8343Eb6f` | **1.1.0** (guardian). Deployed 2026-11-19 (`DeployTrustRegistry.s.sol`, block 66429864); owner the Timelock below since block 66432258 (`HandOverTrustRegistry` multicall `0x564cee2a923eda39642deb56b2242b12a60886bb06037b9270d912ccf52a8271`: guardian `0x9C58…80Bb`, Timelock proposed; `acceptOwnership` scheduled `0xf61b086e467ac08a720dcd9bb12764bfe89abde58696c66aab5a0b52f3fc2a97` and executed `0x6a78924457b88f6441db0482ed8017962bdb5ae99202999ed09443e9147f6342`); guardian `0x9C58…80Bb`. Lists copied from AgenticID 1.3.0 by `MigrateTrust.s.sol` (`IMAGES` unset, so every listed image hash) in one multicall (tx `0xc4ae9b128fe7e1f0978ccc6ae2ac82c0b8b3431cd0ce0ea1b099e312263d2d19`): the two bound attestors below, instance binding required, and the 16 image hashes AgenticID listed, among them the four 0.4.0 (`agentdna14`) images. Then, as owner, one multicall (tx `0x808a652bfb5323e4fbd9e7993b6de833958c4d7588bdbe49ec91096645e46aa7`) listed the four 0.5.0 images (`0xfe12743b…f45f`, `0xf647c3da…c3e7`, `0x529c5404…5fc9`, `0xe3bacac8…652c`), sealed `0x7b104b93…e72d` and harness `0x3971b1db…800c`: 20 image hashes, one sealed, one harness |
+| TrustRegistry proxy | `0xB6674CCF25bfE7552127DEF2a87b76Ac8343Eb6f` | **1.1.0** (guardian). Deployed 2026-11-19 (`DeployTrustRegistry.s.sol`, block 66429864); owner the Timelock below since block 66432258 (`HandOverTrustRegistry` multicall `0x564cee2a923eda39642deb56b2242b12a60886bb06037b9270d912ccf52a8271`: guardian `0x9C58…80Bb`, Timelock proposed; `acceptOwnership` scheduled `0xf61b086e467ac08a720dcd9bb12764bfe89abde58696c66aab5a0b52f3fc2a97` and executed `0x6a78924457b88f6441db0482ed8017962bdb5ae99202999ed09443e9147f6342`); guardian `0x9C58…80Bb`. Lists copied from AgenticID 1.3.0 by `MigrateTrust.s.sol` (`IMAGES` unset, so every listed image hash) in one multicall (tx `0xc4ae9b128fe7e1f0978ccc6ae2ac82c0b8b3431cd0ce0ea1b099e312263d2d19`): the two bound attestors below, instance binding required, and the 16 image hashes AgenticID listed, among them the four 0.4.0 (`agentdna14`) images. Then, as owner, one multicall (tx `0x808a652bfb5323e4fbd9e7993b6de833958c4d7588bdbe49ec91096645e46aa7`) listed the four 0.5.0 images (`0xfe12743b…f45f`, `0xf647c3da…c3e7`, `0x529c5404…5fc9`, `0xe3bacac8…652c`), sealed `0x7b104b93…e72d` and harness `0x3971b1db…800c`. Later Timelock operations (proposer `0x9C58…80Bb`, `executeBatch`): sealed `0x36e6f3b9…7faa` for 0.5.1 on 2026-11-20 14:55 UTC (tx `0x5220019a31033ae35e9721d95398051428de7d7eebd01a95ef5586af624591d4`, block 66664018); sealed `0x46531887…8b26` and harness `0xcf96343f…156d` for 0.5.2 on 2026-11-21 14:43 UTC (tx `0x0b8e9242e150b1643b0116e020b79d5786c9b3e962a1830c37a82811825c38e5`, block 66839855). Read on chain 2026-11-23: 20 image hashes, three sealed (latest `0x46531887…8b26`), two harness (latest `0xcf96343f…156d`) |
 | TrustRegistry impl | `0xDb7dbA7a44A691973C9d3eFAcd50F8c8b514Bb23` | 1.1.0 (deploy `0xa32f23e38d46e197660f885f8ba243aeba6152a403a3855a488e32a61cf36470`) |
 | TrustRegistry beacon | `0xa29aeEB7918b573fC217100B9d0d9272CddA9933` | owned by the Timelock |
 | **ReputationRegistry proxy** (DEPRECATED — **paused** 2026-10-23: it still verifies the legacy ServeProof digest; §7) | `0xeDe70197313d0b603612dfC9801162D1aDA3D196` | 1.2.0 (audit batch — beacon-upgraded 2026-08-10, see §7) |
@@ -479,8 +478,8 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 | CloneGate impl | `0xDE66098EB524095fBa7a5d019464867AE321cCd1` | Previous: 1.0.1 `0xf9664c71…cF3` |
 | CloneGate beacon | `0x6e0291f3d104D37B405872e692C5d2652C548F0B` | |
 | StandardCloneAuthorizer | `0x013a65AEA5BE739a4BfbD2B368863ABa6FB98e6E` | official stock clone policy (immutable, no proxy) |
-| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x9ACbB44bCA8A4Ad4bcf32B8884e366F95195b185` | v5, deployed 2026-11-19 (tx `0x4e8cd50b2fe2352e5d054be7ffceb29de681e20159890c8d557ba9eef46c449d`; adds `giveFeedbackAndAttestVersioned`; reads canonical reputation `0x8004B663…8713` and VerifiedFeedback `0xc0C9…D583`). The testnet attestor advertises it once its `ATTESTOR_FEEDBACK_BATCHER_ADDR` changes; until then v4 below |
-| FeedbackBatcher v4 | `0x1869B3EFd3C61d96832B4E78d6c5F848fc56ac1a` | v4 (onERC721Received; deployed 2026-09-07); its v1 path works against VerifiedFeedback 1.3.0 |
+| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x9ACbB44bCA8A4Ad4bcf32B8884e366F95195b185` | v5, deployed 2026-11-19 (tx `0x4e8cd50b2fe2352e5d054be7ffceb29de681e20159890c8d557ba9eef46c449d`; adds `giveFeedbackAndAttestVersioned`; reads canonical reputation `0x8004B663…8713` and VerifiedFeedback `0xc0C9…D583`). The testnet attestor advertises it since its 0.5.0 deploy on 2026-11-19 08:45 UTC (`GET /config` `feedback_batcher_addr`, read 2026-11-23) |
+| FeedbackBatcher v4 | `0x1869B3EFd3C61d96832B4E78d6c5F848fc56ac1a` | v4 (onERC721Received; deployed 2026-09-07); previous, advertised until 2026-11-19 08:45 UTC; its v1 path works against VerifiedFeedback 1.3.0 |
 | TimelockController | `0x111b6c32fb3e04AC6ec2E1B38E7CC8e6fCa787F9` | `minDelay` 0; owns the beacons and, since 2026-11-19, the TrustRegistry: test's listings are Timelock operations (`TrustRegistryCalls.s.sol`, delay 0) |
 | Canonical ERC-8004 | `0x8004A818BFB912233c491871b3d84c89A494BD9e` | v2.0.0 |
 | TappRegistry (attestor infra, external) | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` | from attestor `GET /config` |

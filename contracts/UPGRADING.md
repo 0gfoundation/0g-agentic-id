@@ -112,8 +112,8 @@ schedule again.
 vault needs; build that with `cast` (see "Mainnet Step 3" below) or take the
 tx `input` from a dry run (`--sender <vault>`, no `--broadcast`:
 `broadcast/ScheduleUpgrade.s.sol/16661/dry-run/run-latest.json`). For gas see
-[`../QUIRKS.md`](../QUIRKS.md) (forge 1.6 + 0G: use
-`--legacy --gas-price 5000000000 --slow`).
+[`../QUIRKS.md`](../QUIRKS.md) (`--legacy --with-gas-price <GAS_PRICE> --slow`,
+with the network's current price from `cast gas-price`).
 
 The commands below carry no `--chain`: forge takes the chain id from
 `--rpc-url` (Galileo `https://evmrpc-testnet.0g.ai` → 16602, mainnet
@@ -130,7 +130,7 @@ protective. Pick the environment with `--rpc-url` alone.
 
 # Step 2: deploy the new impl (<RPC> picks the environment and so the chain id — no --chain, see above)
 forge create src/VerifiedFeedbackRegistry.sol:VerifiedFeedbackRegistry \
-  --rpc-url <RPC> --private-key <PK> --legacy --gas-price 5000000000 --broadcast
+  --rpc-url <RPC> --private-key <PK> --legacy --with-gas-price <GAS_PRICE> --broadcast
 
 # Step 3: proposer schedules (BEACON is the beacon to upgrade, NOT the proxy)
 export TIMELOCK=0x... BEACON=0x... NEW_IMPL=0x<from step 2>
@@ -139,7 +139,7 @@ export PREDECESSOR=$(cast hash-zero) SALT=$(cast hash-zero)   # full 32-byte hex
 # AgenticID from 1.4.0: also export TRUST_REGISTRY and TRUST_REGISTRY_OWNER — the run refuses an
 #   implementation that reads another registry ("AgenticID 1.4.0" step 7)
 forge script script/ScheduleUpgrade.s.sol --rpc-url <RPC> \
-  --private-key <PROPOSER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --private-key <PROPOSER_PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 
 # Mainnet Step 3 (proposer = Fordefi vault): build the tx data, submit it from the vault
 #   to = $TIMELOCK, value = 0. PREDECESSOR / SALT as exported above (full 32-byte hex).
@@ -163,7 +163,7 @@ cast calldata "cancel(bytes32)" $OP
 #         the same values: the opId is their hash; unset PREDECESSOR/SALT default to 0x0). DELAY is not
 #         part of the opId.
 forge script script/ExecuteUpgrade.s.sol --rpc-url <RPC> \
-  --private-key <EXECUTOR_PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --private-key <EXECUTOR_PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 ```
 
 `ExecuteUpgrade` self-checks `require(beacon.implementation() == newImpl)`.
@@ -202,14 +202,14 @@ MODE=rehearse AGENTIC_ID_BEACON=0x<AgenticID beacon> \
 #    defaults to AgenticID's owner, the governance key). Record the addresses in
 #    DEPLOYMENT.md §6.
 forge script script/DeployTrustRegistry.s.sol --rpc-url <RPC> \
-  --private-key <PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --private-key <PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 export TRUST_REGISTRY=0x<proxy from step 2>
 
 # 3. Copy the lists as the registry owner: apply broadcasts them (dev, test);
 #    plan prints them as multicall calldata for the mainnet vault
 #    (to = TRUST_REGISTRY, value = 0; BATCH calls per tx, default 40).
 MODE=apply forge script script/MigrateTrust.s.sol --rpc-url <RPC> \
-  --private-key <OWNER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --private-key <OWNER_PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 MODE=plan forge script script/MigrateTrust.s.sol --rpc-url <RPC>
 
 # 4. Check, before the upgrade: the registry holds exactly what the migration
@@ -271,25 +271,25 @@ export TIMELOCK=0x<the environment's Timelock> TRUST_REGISTRY=0x<proxy>
 # 1. Deploy the 1.1.0 implementation and upgrade the TrustRegistry beacon
 #    (§2 Steps 2–4; BEACON = the TrustRegistry beacon, owned by TIMELOCK).
 forge create src/TrustRegistry.sol:TrustRegistry \
-  --rpc-url <RPC> --private-key <PK> --legacy --gas-price 5000000000 --broadcast
+  --rpc-url <RPC> --private-key <PK> --legacy --with-gas-price <GAS_PRICE> --broadcast
 export BEACON=0x<TrustRegistry beacon> NEW_IMPL=0x<from above>
 forge script script/ScheduleUpgrade.s.sol --rpc-url <RPC> \
-  --private-key <PROPOSER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --private-key <PROPOSER_PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 forge script script/ExecuteUpgrade.s.sol --rpc-url <RPC> \
-  --private-key <EXECUTOR_PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --private-key <EXECUTOR_PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 cast call $TRUST_REGISTRY "VERSION()(string)" --rpc-url <RPC>     # 1.1.0
 cast call $TRUST_REGISTRY "guardian()(address)" --rpc-url <RPC>   # 0x0
 
 # 2. As the governance key, still the owner: guardian = itself, Timelock proposed.
 GUARDIAN=0x<governance key> forge script script/HandOverTrustRegistry.s.sol \
-  --rpc-url <RPC> --private-key <OWNER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --rpc-url <RPC> --private-key <OWNER_PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 
 # 3. The Timelock accepts: schedule, then execute once minDelay has passed.
 export CALLS=$(cast calldata "acceptOwnership()")
 MODE=schedule forge script script/TrustRegistryCalls.s.sol --rpc-url <RPC> \
-  --private-key <PROPOSER_PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --private-key <PROPOSER_PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 MODE=execute forge script script/TrustRegistryCalls.s.sol --rpc-url <RPC> \
-  --private-key <EXECUTOR_PK> --legacy --gas-price 5000000000 --broadcast --slow
+  --private-key <EXECUTOR_PK> --legacy --with-gas-price <GAS_PRICE> --broadcast --slow
 cast call $TRUST_REGISTRY "owner()(address)" --rpc-url <RPC>      # the Timelock
 ```
 
