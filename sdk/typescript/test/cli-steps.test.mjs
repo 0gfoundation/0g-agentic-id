@@ -102,3 +102,33 @@ test('activitySteps, activityOutput and taskSteps ask the harness routes', async
     srv.close();
   }
 });
+
+test('stepsCommand: /steps and /output by id, prefix or default; only where the agent lists steps', async () => {
+  const { stepsCommand } = await import('../dist/cli/steps.js');
+  const asked = [];
+  const client = (features) => ({
+    features: async () => features,
+    activity: async (id) => { if (!['resp_abc123', 'bash-1'].includes(id)) throw new Error('404'); return { id }; },
+    activities: async () => [{ id: 'resp_abc123' }, { id: 'resp_abd999' }, { id: 'bash-1' }],
+    activitySteps: async (id, o) => { asked.push(['steps', id, o]); return { object: 'steps', turn: 1, end: { kind: 'completed' }, steps: [{ step: 1, tool_calls: [], text: { text: 'hi', chars: 2 } }] }; },
+    activityOutput: async (id) => { asked.push(['output', id]); return { object: 'output', id, status: 'completed', from: 0, next: 3, text: 'ok\n' }; },
+    taskSteps: async (id, o) => { asked.push(['task', id, o]); return { object: 'task.steps', task: id, session: id, turns: [] }; },
+  });
+  const run = async (line, { features = { steps: true }, latestTurn } = {}) => {
+    const out = [];
+    await stepsCommand(line, { client: client(features), latestTurn, shortId: (id) => id.slice(0, 8), errorText: (e) => e.message, out: (t) => out.push(t) });
+    return out.join('');
+  };
+  assert.match(await run('/steps', { features: { steps: false } }), /does not show steps/);
+  assert.match(await run('/steps', { features: null }), /does not show steps/);
+  assert.match(await run('/steps'), /no turn to show/);
+  assert.match(await run('/steps', { latestTurn: 'resp_abc123' }), /^resp_abc\nstep 1\n  says: hi\nended: completed\n\(\/steps resp_abc full: every line\)\n$/);
+  assert.match(await run('/steps resp_abc1 full'), /^resp_abc\nstep 1/);
+  assert.deepEqual(asked.at(-1), ['steps', 'resp_abc123', { maxChars: 65536 }]);
+  assert.match(await run('/steps resp_ab'), /2 start with resp_ab — give more of the id/);
+  assert.match(await run('/steps nope'), /no match in the latest 500 activities/);
+  assert.match(await run('/steps task-1'), /no turns recorded for this task/);
+  assert.deepEqual(asked.at(-1), ['task', 'task-1', {}]);
+  assert.equal(await run('/output bash-1'), 'bash-1 — completed\nok\n');
+  assert.match(await run('/output'), /^usage: \/output <id>/);
+});

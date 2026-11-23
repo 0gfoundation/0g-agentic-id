@@ -1,7 +1,7 @@
 // How a turn went, as the CLI prints it: a tool call's target in the live
 // status ("running a command: npm test"), and /steps' step-by-step view of a
 // turn or a task (0g-harness `features.steps`).
-import type { AgentStep, AgentStepText, AgentTurnSteps, HarnessTaskSteps } from '../AgentClient';
+import type { AgentClient, AgentStep, AgentStepText, AgentTurnSteps, HarnessTaskSteps } from '../AgentClient';
 import { cleanCell, cleanStream } from './commands/cells';
 
 /** The argument a tool call is about, by tool: the command, the file, the URL, the query. */
@@ -95,4 +95,63 @@ export function renderTurnSteps(r: Pick<AgentTurnSteps, 'turn' | 'end' | 'steps'
 export function renderTaskSteps(r: HarnessTaskSteps, opts: { full?: boolean } = {}): string[] {
   if (!r.turns.length) return ['(no turns recorded for this task)'];
   return r.turns.flatMap((t, i) => [`${i ? '\n' : ''}turn ${t.turn}`, ...renderTurnSteps({ turn: t.turn, end: t.end, steps: t.steps }, opts).map((l) => `  ${l}`)]);
+}
+
+/** What `/steps` and `/output` need from the CLI session. */
+export interface StepsDeps {
+  client: Pick<AgentClient, 'features' | 'activity' | 'activities' | 'activitySteps' | 'activityOutput' | 'taskSteps'> | undefined;
+  /** This session's newest turn, the default of a bare /steps. */
+  latestTurn?: string;
+  /** An id as the CLI shows it (short). */
+  shortId(id: string): string;
+  /** An error in one line. */
+  errorText(e: unknown): string;
+  out(text: string): void;
+}
+
+/**
+ * Run `/steps [id|task-…] [full]` or `/output <id>`: how a turn or a task
+ * went step by step, and what a background command printed (0g-harness
+ * `features.steps`). An id is the full id or a unique start of one from the
+ * activity list.
+ */
+export async function stepsCommand(line: string, d: StepsDeps): Promise<void> {
+  const [cmd, ...words] = line.trim().split(/\s+/);
+  const isSteps = cmd === '/steps';
+  const full = isSteps && words.includes('full');
+  let named = words.find((w) => w !== 'full')?.replace(/^`([^`]+)`$/, '$1');
+  const c = d.client;
+  if (!c?.activitySteps || !c.activityOutput || !c.activities || !c.activity || (await c.features?.().catch(() => null))?.steps !== true) {
+    d.out('(this agent does not show steps — 0g-harness 0.2.1 or later does)\n');
+    return;
+  }
+  const fail = (e: unknown) => { d.out(`(${cleanCell(d.errorText(e))})\n`); return null; };
+  const opts = full ? { maxChars: 65536 } : {};
+  if (isSteps && named && /^(task|session)-/.test(named) && c.taskSteps) {
+    const r = await c.taskSteps(named, opts).catch(fail);
+    if (r) d.out(`${renderTaskSteps(r, { full }).join('\n')}\n`);
+    return;
+  }
+  if (named && !(await c.activity(named).then(() => true, () => false))) {
+    const hits = (await c.activities({ limit: 500 }).catch(() => [])).filter((a) => a.id.startsWith(named!));
+    if (hits.length !== 1) {
+      d.out(hits.length ? `${hits.length} start with ${cleanCell(named)} — give more of the id\n` : `no match in the latest 500 activities for ${cleanCell(named)} — use the full id for an older activity\n`);
+      return;
+    }
+    named = hits[0].id;
+  }
+  if (isSteps) {
+    const id = named ?? d.latestTurn;
+    if (!id) { d.out('no turn to show — /steps <id>, or chat first\n'); return; }
+    const r = await c.activitySteps(id, opts).catch(fail);
+    if (!r) return;
+    const short = d.shortId(cleanCell(id));
+    d.out(`${short}\n${renderTurnSteps(r, { full }).join('\n')}\n${full ? '' : `(/steps ${short} full: every line)\n`}`);
+    return;
+  }
+  if (!named) { d.out('usage: /output <id> — a background command from /activities\n'); return; }
+  const o = await c.activityOutput(named).catch(fail);
+  if (!o) return;
+  d.out(`${d.shortId(cleanCell(o.id))} — ${cleanCell(o.status)}${o.lossy ? ' · (the start was dropped; this is the most recent output)' : ''}\n`);
+  d.out(o.text ? cleanStream(o.text).replace(/\n?$/, '\n') : '(no output yet)\n');
 }

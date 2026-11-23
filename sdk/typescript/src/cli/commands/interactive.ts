@@ -43,7 +43,8 @@ import { splitHead, tokenize } from '../tokenize';
 import { completePath, describeStaged, findDroppedFiles, prepareAttachments, stageDropped, stageFile, type Staged } from '../attach';
 import { parseDownloadName, renderFiles, saveDownload } from '../download';
 import { pandaLines, svgPixelLines } from '../logo';
-import { renderTaskSteps, renderTurnSteps, toolTarget } from '../steps';
+import { stepsCommand, toolTarget } from '../steps';
+import { thinkCommand } from '../think';
 import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
 import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePlan, applyResetInference, readDeploymentFacts, requiresProviderReset, deployWithInference } from '../inference';
 
@@ -5514,38 +5515,17 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/think' || line.startsWith('/think ')) {
-        // Where the running agent takes a level per message (0g-harness 0.2.1
-        // or later, `features.turn_effort`), /think sets this session's level:
-        // every message carries it, nothing is signed, written or restarted,
-        // and /settings thinking=… saves one. Elsewhere /think is
-        // `/settings thinking=…` with a shorter name: it writes the owner's
-        // document, the only place those frameworks read a level from.
-        const arg = tokenize(line)[1];
-        const perMessage = s.phase === 'running' && (await s.client?.features?.().catch(() => null))?.turn_effort === true;
-        if (arg && !(THINKING_LEVELS as readonly string[]).includes(arg)) { out(`usage: /think ${THINKING_LEVELS.join('|')}\n`); continue; }
-        if (arg && perMessage) {
-          if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
-          s.thinking = arg as ThinkingLevel;
-          out(`thinking ${arg} for this session's messages, from the next one (no restart); the agent's saved level is unchanged — /settings thinking=${arg} saves it\n`);
-          continue;
-        }
-        const ag = await withWallet(ctx);
-        if (!arg) {
-          const doc = await ag.agent.getSettings(s.sealId);
-          const saved = (doc.settings?.thinking as string | undefined) ?? '(unset — the platform bounds thinking models at low)';
-          out(perMessage && s.thinking ? `thinking level: ${s.thinking} for this session's messages (saved: ${saved})\n` : `thinking level: ${saved}\n`);
-          continue;
-        }
-        if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
-        const written = await settingsOp(ag, s.sealId, [`thinking=${arg}`], await ownerRouteUrl(ag, s));
-        // Only mirror it into this session once the write actually landed —
-        // a refused or conflicted write must not leave the per-message
-        // override claiming a level the agent was never given.
-        if (written?.thinking === arg) {
-          s.thinking = arg as ThinkingLevel;
-          // Where it applies is said above (written, and pushed to a running agent).
-          if (s.framework === 'prime-agent') out('  this framework also takes it per message, so your next message uses it already\n');
-        }
+        // cli/think.ts: per message where the runtime takes it, else the saved level.
+        let ag: Awaited<ReturnType<typeof withWallet>> | undefined;
+        const wallet = async () => (ag ??= await withWallet(ctx));
+        await thinkCommand(tokenize(line)[1], {
+          perMessage: s.phase === 'running' && (await s.client?.features?.().catch(() => null))?.turn_effort === true,
+          session: s,
+          framework: s.framework,
+          readSaved: async () => (await (await wallet()).agent.getSettings(s.sealId)).settings?.thinking as string | undefined,
+          writeSaved: async (level) => { const w = await wallet(); return (await settingsOp(w, s.sealId, [`thinking=${level}`], await ownerRouteUrl(w, s)))?.thinking as string | undefined; },
+          out,
+        });
         continue;
       }
       if (line === '/sessions' || line.startsWith('/sessions ')) {
@@ -5706,44 +5686,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/steps' || line.startsWith('/steps ') || line === '/output' || line.startsWith('/output ')) {
-        // How a turn or a task went step by step, and what a background
-        // command printed (0g-harness features.steps). An id, or a unique
-        // start of one, from the activity or task list; bare /steps: this
-        // session's latest turn.
-        const isSteps = line.startsWith('/steps');
-        const words = tokenize(line).slice(1);
-        const full = isSteps && words.includes('full');
-        let named = words.find((w) => w !== 'full')?.replace(/^`([^`]+)`$/, '$1');
-        if (!s.client?.activitySteps || !s.client.activityOutput || !s.client.activities || (await s.client.features?.().catch(() => null))?.steps !== true) { out('(this agent does not show steps — 0g-harness 0.2.1 or later does)\n'); continue; }
-        if (named && /^task-|^session-/.test(named) && isSteps && s.client.taskSteps) {
-          const r = await s.client.taskSteps(named, full ? { maxChars: 65536 } : {}).catch((e: Error) => { out(`(${cleanCell(plainError(e))})\n`); return null; });
-          if (r) out(`${renderTaskSteps(r, { full }).join('\n')}\n`);
-          continue;
-        }
-        if (named) {
-          const known = await s.client.activity!(named).then(() => true, () => false);
-          if (!known) {
-            const hits = (await s.client.activities({ limit: 500 }).catch(() => [])).filter((a) => a.id.startsWith(named!));
-            if (hits.length !== 1) {
-              out(hits.length ? `${hits.length} start with ${cleanCell(named)} — give more of the id\n` : `no match in the latest 500 activities for ${cleanCell(named)} — use the full id for an older activity\n`);
-              continue;
-            }
-            named = hits[0].id;
-          }
-        }
-        if (isSteps) {
-          const id = named ?? [...(s.tasks ?? [])].reverse().find((t) => t.session === s.sessionId)?.id;
-          if (!id) { out('no turn to show — /steps <id>, or chat first\n'); continue; }
-          const r = await s.client.activitySteps(id, full ? { maxChars: 65536 } : {}).catch((e: Error) => { out(`(${cleanCell(plainError(e))})\n`); return null; });
-          if (r) out(`${shortIds([cleanCell(id)])[0]}\n${renderTurnSteps(r, { full }).join('\n')}${full ? '' : '\n(/steps ' + shortIds([cleanCell(id)])[0] + ' full: every line)'}\n`);
-          continue;
-        }
-        if (!named) { out('usage: /output <id> — a background command from /activities\n'); continue; }
-        const o = await s.client.activityOutput(named).catch((e: Error) => { out(`(${cleanCell(plainError(e))})\n`); return null; });
-        if (!o) continue;
-        out(`${shortIds([cleanCell(o.id)])[0]} — ${cleanCell(o.status)}${o.lossy ? ' · (the start was dropped; this is the most recent output)' : ''}\n`);
-        if (o.text) out(`${cleanStream(o.text).replace(/\n?$/, '\n')}`);
-        else out('(no output yet)\n');
+        // cli/steps.ts: a turn's or a task's steps, a command's output.
+        await stepsCommand(line, {
+          client: s.client,
+          latestTurn: [...(s.tasks ?? [])].reverse().find((t) => t.session === s.sessionId)?.id,
+          shortId: (id) => shortIds([id])[0],
+          errorText: plainError,
+          out,
+        });
         continue;
       }
       if (line === '/result' || line.startsWith('/result ')) {
