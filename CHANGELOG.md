@@ -12,6 +12,12 @@ loses `(unreleased)` when the version ships.
   (`attestor/scripts/release-entry.mjs`; attestor README, "Announcing a
   release").
 
+## 0.5.3 (unreleased)
+
+Agents can read their sandbox's resources and the provider's notices.
+
+- The agent can read its sandbox's CPU, memory, task and disk limits and use, and the notices the sandbox provider sends (disk near full or over its size, low balance, maintenance) with their deadlines: `GET /environment` on the sign socket, and the tool `seal_environment` on 0g-harness. Its instructions tell it to check before disk-heavy work and, before a notice's deadline, to delete files it no longer needs, save its work and tell you. A sandbox whose runner does not publish these figures reports them as unavailable.
+
 ## 0.5.2
 
 Files created by 0g-harness are acknowledged by revision, and model settings survive a sealed runtime handoff.

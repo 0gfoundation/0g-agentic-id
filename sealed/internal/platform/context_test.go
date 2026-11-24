@@ -137,7 +137,7 @@ func TestCapabilities_SealToolsAndSigningRulesFollowTheAdapter(t *testing.T) {
 	plain := Build(rs)
 	rs.SealTools, rs.SigningRules = true, true
 	declared := Build(rs)
-	for _, s := range []string{"`seal_sign_transaction`", "`seal_credential_sign`", "`seal_credential_reveal`", "server `seal-reveal`", "`mcp__seal__seal_sign`",
+	for _, s := range []string{"`seal_sign_transaction`", "`seal_credential_sign`", "`seal_credential_reveal`", "server `seal-reveal`", "`mcp__seal__seal_sign`", "`seal_environment`",
 		"keeps a record of every signature", "The socket refuses a call to AgenticID update/updateAt"} {
 		if strings.Contains(plain.Capabilities, s) {
 			t.Errorf("rendered %s for a framework that declares neither", s)
@@ -149,6 +149,12 @@ func TestCapabilities_SealToolsAndSigningRulesFollowTheAdapter(t *testing.T) {
 	for _, s := range []string{"If your framework's tool list includes native sign tools, prefer them", "Never use this endpoint for AgenticID update/updateAt on your own token"} {
 		if !strings.Contains(plain.Capabilities, s) || strings.Contains(declared.Capabilities, s) {
 			t.Errorf("%q is the wording of a framework without the signing rules only", s)
+		}
+	}
+	// The sandbox's resources are on the socket for every framework.
+	for _, pc := range []PlatformContext{plain, declared} {
+		if !strings.Contains(pc.Capabilities, "http://localhost/environment` ") {
+			t.Error("the resources endpoint is not described")
 		}
 	}
 	if !strings.Contains(plain.Constraints, "(through the sign socket or its tools)") || !strings.Contains(declared.Constraints, "(the sign socket refuses it, and its tools with it)") {

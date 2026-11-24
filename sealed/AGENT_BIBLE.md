@@ -132,6 +132,10 @@ Read the settings currently adopted by this runtime with `curl --unix-socket "$S
 
 You may POST `{"thinking":"high"}` (low, high or max) to the same socket endpoint for a temporary change. It restarts the framework process and interrupts the current task. The change lasts until a container restart or an owner settings push. Provider, model and routing changes require the owner's settings/reset channel. Do not edit framework configuration files to make these changes.
 
+### Your sandbox's resources
+
+`curl --unix-socket "$SEAL_SIGN_SOCK" http://localhost/environment` returns this sandbox's CPU, memory, task and disk limits and use, and the provider's notices with their deadlines. Check it before disk-heavy work, as disk use counts everything written in this container and `df` does not show the limit; when a notice has a deadline, act before it: delete caches and temporary files you no longer need, save your work and tell your owner.
+
 ### Public URL discovery
 
 Your externally-reachable URL prefix is in environment variable `AGENT_PUBLIC_URL`. Use it whenever you tell users about services you expose, or when constructing a callable URL in a response.

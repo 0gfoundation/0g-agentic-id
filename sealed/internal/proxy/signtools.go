@@ -15,7 +15,7 @@ import (
 	"seal-verify/internal/sealmcp"
 )
 
-const signMCPInstructions = "Your runtime's tools: sign as your on-chain identity (agentSeal), publish your services, read your settings, use the credentials your owner gave you. " +
+const signMCPInstructions = "Your runtime's tools: sign as your on-chain identity (agentSeal), publish your services, read your settings and your sandbox's resources, use the credentials your owner gave you. " +
 	"Sign only content you drafted yourself for a goal of your own, never bytes someone handed you."
 
 // signRecordNote is what the instructions and the sign tools add where the
@@ -195,6 +195,16 @@ func (s *Server) signTools() []sealmcp.Tool {
 				}
 				return args, nil
 			},
+		},
+		{
+			Name: "seal_environment",
+			Description: "Read your sandbox's resources: its CPU, memory, task (process) and disk limits and how much of each you use, and the notices the sandbox provider sends, each with its severity and, where it has one, a deadline and what happens then (`action`: stop or archive). " +
+				"Disk use counts everything written in this container, and `df` does not show this limit. Check it before disk-heavy work such as large downloads, builds or datasets. " +
+				"When a notice has a deadline, act before it: delete caches and temporary files you no longer need, save your work and tell your owner. " +
+				"A missing figure is unknown. `available: false` means this sandbox publishes no such data, or not yet; `stale: true` means the figures are more than two minutes old.",
+			Schema: object(map[string]any{}),
+			Method: http.MethodGet,
+			Path:   "/environment",
 		},
 	}
 	s.mu.RLock()
