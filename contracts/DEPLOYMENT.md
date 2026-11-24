@@ -702,16 +702,13 @@ or when the proxy was deployed at it):
 > environment has its own impls (dev
 > and test deployed separately on the same chain). The 1.2.0 / 1.1.0 impls
 > are solc 0.8.24 builds (optimizer runs 200, via-IR — the `foundry.toml` of
-> `27aef57`); AgenticID 1.3.0 and its library, and dev's 1.4.0 set
-> (AgenticID 1.4.0, TrustRegistry 1.0.0, VerifiedFeedbackRegistry 1.3.0,
-> FeedbackBatcher v5), are built with the current
+> `27aef57`); AgenticID 1.3.0 and its library, and the 1.4.0 set of dev and
+> test (AgenticID 1.4.0, TrustRegistry 1.0.0 / 1.1.0, VerifiedFeedbackRegistry
+> 1.3.0, FeedbackBatcher v5), are built with the current
 > settings (solc 0.8.38, runs 1, Cancun, `bytecode_hash = "none"`;
-> UPGRADING.md §1). Every impl and all three libraries are verified on
-> chainscan with the settings they were built with (the 1.3.0 impls with their
-> library's link address), except dev's TrustRegistry 1.1.0 impl and test's
-> AgenticID 1.4.0, TrustRegistry 1.1.0 and VerifiedFeedbackRegistry 1.3.0
-> impls and FeedbackBatcher v5, which chainscan lists as unverified (read
-> 2026-11-24). The
+> UPGRADING.md §1). Every impl, both FeedbackBatcher v5 deployments and all
+> three libraries are verified on chainscan with the settings they were built
+> with (the 1.3.0 impls with their library's link address; read 2026-11-24). The
 > deprecated fork's source reads **1.3.0** only because a shared base changed
 > under it; it is never to be deployed, and its deployed 1.2.0 instances are
 > paused. Policy-mode cloning (issue #133) shipped as the **CloneGate
