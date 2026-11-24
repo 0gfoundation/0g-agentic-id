@@ -131,6 +131,15 @@ send a loader image's sealed away without a claim (the earlier loader images,
 which carry a sealed of their own, would claim without its sealed hash), or
 refuse a claim that names one.
 
+### Mainnet caps `eth_getLogs` at 100000 blocks
+
+Measured 2026-11-24: mainnet's RPC (`https://evmrpc.0g.ai`) refuses an
+`eth_getLogs` whose `toBlock - fromBlock` exceeds 100000, with `-32602 query
+exceeds max block range 100000`; Galileo's (`https://evmrpc-testnet.0g.ai`)
+answered the whole chain, block 0 to the head, in one call. A log scan that
+must run on mainnet reads in chunks: `script/MigrateTrust.s.sol` takes
+`LOG_CHUNK=100000` there (contracts/UPGRADING.md "AgenticID 1.4.0").
+
 ---
 
 ## Etherscan-compatible verifier (0G endpoint)

@@ -177,7 +177,12 @@ mappings, so `script/MigrateTrust.s.sol` takes the candidates from AgenticID's
 events (and the registry's, for attestors) and each one's current state from
 AgenticID's views (`script/TrustMigration.sol` documents what is copied and
 checked). `FROM_BLOCK` stays 0 or AgenticID's deployment block, never later —
-the script refuses a range that does not hold AgenticID's deployment. Per
+the script refuses a range that does not hold AgenticID's deployment. It reads
+the events with `eth_getLogs`, the whole range in one call unless `LOG_CHUNK`
+sets the blocks per call: testnet's RPC takes the whole range, mainnet's
+(`https://evmrpc.0g.ai`) refuses a call whose `toBlock - fromBlock` exceeds
+100000 (`query exceeds max block range 100000`, measured 2026-11-24), so every
+mainnet run sets `LOG_CHUNK=100000` or lower (QUIRKS.md). Per
 environment — dev, then test, then mainnet:
 
 0. Choose `IMAGES`, the image hashes the registry keeps: every image a
@@ -192,6 +197,7 @@ environment — dev, then test, then mainnet:
 ```bash
 export AGENTIC_ID=0x<proxy> TIMELOCK=0x<the environment's Timelock>
 export IMAGES=0x<hash>,0x<hash>   # step 0; plan, apply and check take the same
+export LOG_CHUNK=100000           # mainnet only: its RPC refuses larger eth_getLogs ranges
 
 # 1. Rehearse on a fork, never broadcast: deploy, copy, check, upgrade (as the
 #    beacon owner), and compare every candidate's reads before and after.

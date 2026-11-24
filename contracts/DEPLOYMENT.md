@@ -427,7 +427,11 @@ constructor argument. Browser
 > batch on **2026-11-02** (AgenticID straight from 1.1.0 to 1.3.0); §6.2m was
 > re-read on chain **2026-11-03**. Dev took AgenticID 1.4.0 with TrustRegistry
 > 1.0.0, VerifiedFeedbackRegistry 1.3.0 and FeedbackBatcher v5 on
-> **2026-11-12** (§6.2, read back on chain the same day).
+> **2026-11-12** (§6.2, read back on chain the same day). Test took AgenticID
+> 1.4.0 with TrustRegistry 1.1.0, VerifiedFeedbackRegistry 1.3.0 and
+> FeedbackBatcher v5 on **2026-11-19** (§6.1). Every proxy `VERSION()` and
+> `beacon.implementation()` in §6.1 / §6.2 / §6.2m was re-read on chain
+> **2026-11-24** (§7).
 >
 > **Three canonical-bound environments run in parallel** — pick the set by env
 > (attestor `/config` values as of 2026-10-19):
@@ -672,27 +676,30 @@ vault (`removeTrustedAttestor`, tx
 
 ## 7. Contract versions & changelog
 
-Current impl versions (`VERSION()` and `beacon.implementation()` read on
-chain 2026-10-28 on dev and test, 2026-11-03 on mainnet; the date is when
-that version's beacon upgrade executed):
+Current impl versions (`VERSION()` on every proxy and
+`beacon.implementation()` on every beacon read on chain 2026-11-24 on all
+three environments; the date is when that version's beacon upgrade executed,
+or when the proxy was deployed at it):
 
 | Contract | dev VERSION | test VERSION | mainnet VERSION |
 |---|---|---|---|
-| AgenticID | **1.4.0** (2026-11-12) | **1.3.0** (2026-10-27) | **1.3.0** (2026-11-02) |
-| TrustRegistry | **1.0.0** (2026-11-12) | — (not deployed) | — (not deployed) |
+| AgenticID | **1.4.0** (2026-11-12) | **1.4.0** (2026-11-19) | **1.3.0** (2026-11-02) |
+| TrustRegistry | **1.1.0** (2026-11-13) | **1.1.0** (deployed 2026-11-19) | — (AgenticID 1.3.0 reads none: `trustRegistry()` reverts) |
 | TEEDataVerifier | **1.2.0** (2026-10-21) | **1.2.0** (2026-10-23) | **1.2.0** (2026-11-02) |
 | AgenticIDReputationRegistry (deprecated) | **1.2.0**, paused | **1.2.0**, paused | — (not deployed) |
-| VerifiedFeedbackRegistry | **1.3.0** (2026-11-12) | **1.2.0** (2026-10-23) | **1.2.0** (2026-11-02) |
+| VerifiedFeedbackRegistry | **1.3.0** (2026-11-12) | **1.3.0** (2026-11-19) | **1.2.0** (2026-11-02) |
 | CloneGate | **1.1.0** (2026-10-21) | **1.1.0** (2026-10-23) | **1.1.0** (2026-11-02) |
 
-> Test and mainnet are at parity: AgenticID
-> **1.3.0** (instance-bound attestors required on both, §6.1 / §6.2m),
-> TEEDataVerifier **1.2.0**, VerifiedFeedbackRegistry **1.2.0** and CloneGate
-> **1.1.0**. Mainnet moved to them on 2026-11-02, AgenticID straight from 1.1.0
-> (changelog entries below). Dev runs the source's AgenticID **1.4.0**,
-> TrustRegistry **1.0.0**, VerifiedFeedbackRegistry **1.3.0** and FeedbackBatcher
-> v5 since 2026-11-12; test and mainnet follow by UPGRADING.md "AgenticID
-> 1.4.0". Each environment has its own impls (dev
+> Dev and test run the source's AgenticID **1.4.0** with TrustRegistry
+> **1.1.0** (AgenticID's `trustRegistry()`: dev `0x71b4…5b17`, test
+> `0xB667…Eb6f`; §6.2 / §6.1), VerifiedFeedbackRegistry **1.3.0** and
+> FeedbackBatcher v5 — dev since 2026-11-12 (TrustRegistry 1.1.0 since
+> 2026-11-13), test since 2026-11-19. Mainnet runs AgenticID **1.3.0**
+> (instance-bound attestors required, §6.2m) and VerifiedFeedbackRegistry
+> **1.2.0**, reached on 2026-11-02 with AgenticID straight from 1.1.0
+> (changelog entries below), and follows by UPGRADING.md "AgenticID 1.4.0".
+> All three run TEEDataVerifier **1.2.0** and CloneGate **1.1.0**. Each
+> environment has its own impls (dev
 > and test deployed separately on the same chain). The 1.2.0 / 1.1.0 impls
 > are solc 0.8.24 builds (optimizer runs 200, via-IR — the `foundry.toml` of
 > `27aef57`); AgenticID 1.3.0 and its library, and dev's 1.4.0 set
@@ -701,7 +708,10 @@ that version's beacon upgrade executed):
 > settings (solc 0.8.38, runs 1, Cancun, `bytecode_hash = "none"`;
 > UPGRADING.md §1). Every impl and all three libraries are verified on
 > chainscan with the settings they were built with (the 1.3.0 impls with their
-> library's link address). The
+> library's link address), except dev's TrustRegistry 1.1.0 impl and test's
+> AgenticID 1.4.0, TrustRegistry 1.1.0 and VerifiedFeedbackRegistry 1.3.0
+> impls and FeedbackBatcher v5, which chainscan lists as unverified (read
+> 2026-11-24). The
 > deprecated fork's source reads **1.3.0** only because a shared base changed
 > under it; it is never to be deployed, and its deployed 1.2.0 instances are
 > paused. Policy-mode cloning (issue #133) shipped as the **CloneGate
@@ -711,7 +721,9 @@ that version's beacon upgrade executed):
 Changelog:
 
 - **TrustRegistry 1.1.0 — dev beacon-upgraded 2026-11-13 (upgrade block
-  65339219) and handed to the dev Timelock (block 65339465; §6.2)** — a guardian,
+  65339219) and handed to the dev Timelock (block 65339465; §6.2); test
+  deployed at 1.1.0 on 2026-11-19 (block 66429864) and handed to the test
+  Timelock (block 66432258; §6.1)** — a guardian,
   so adding trust can wait for the Timelock while removing it does not (§1):
   `guardian` appended to the namespaced struct (zero until set, no
   reinitializer); `delist` and `removeTrustedAttestor` take the owner or the
@@ -722,7 +734,8 @@ Changelog:
   Rollback to 1.0.0 leaves `guardian` unread; removing trust is then the
   owner's alone, through the Timelock once it owns the registry.
 - **AgenticID 1.4.0 + TrustRegistry 1.0.0 — dev beacon-upgraded 2026-11-12
-  (upgrade block 65156470; §6.2)** — the trust
+  (upgrade block 65156470; §6.2), test 2026-11-19 (upgrade block 66433234,
+  on TrustRegistry 1.1.0; §6.1)** — the trust
   decisions move to a new beacon-proxied `TrustRegistry` (sealed/LAYERS.md
   §10): the attestor list with its app bindings and instance mode — same
   functions, events and errors as AgenticID 1.3.0 — plus code lists by kind
@@ -744,12 +757,15 @@ Changelog:
   Dev (2026-11-12) kept only the four images it serves (`IMAGES`, the
   `pr229r2` set); `MODE=check` passed before the upgrade (every candidate
   read the same on AgenticID 1.3.0 and the registry) and after it (AgenticID
-  read the registry; the kept hashes were listed, the dropped ones not). An
+  read the registry; the kept hashes were listed, the dropped ones not). Test
+  (2026-11-19) left `IMAGES` unset: the migration listed all 16 image hashes
+  AgenticID listed (§6.1). An
   environment's `IMAGES` keeps every image its containers may boot again
   (UPGRADING.md "AgenticID 1.4.0", step 0): a container on a dropped image
   fails `/provision` at its next boot until its owner resets it.
 - **VerifiedFeedbackRegistry 1.3.0 — dev beacon-upgraded 2026-11-12 (upgrade
-  block 65156596)** — versioned ServeProofs
+  block 65156596), test 2026-11-19 (upgrade block 66433488)** — versioned
+  ServeProofs
   (ServeProof v2, the 0g-harness layered runtime): `attestVersionedFeedback`
   takes a `VersionedServeProof` (version 2 only, else
   `VerifiedFeedbackUnsupportedVersion`) whose digest adds `sealedHash`,
@@ -757,7 +773,8 @@ Changelog:
   wrap and checks, with an optional task reveal; `ServeData` gains trailing
   `sealedHash` / `harnessHash` (append-safe); new `VersionedFeedbackVerified`
   event and `getServeLayers` view. The v1 entry points, digest and events are
-  unchanged. **FeedbackBatcher v5 — dev 2026-11-12 (`0x86e7…04D5`)** — adds
+  unchanged. **FeedbackBatcher v5 — dev 2026-11-12 (`0x86e7…04D5`), test
+  2026-11-19 (`0x9ACb…b185`)** — adds
   `giveFeedbackAndAttestVersioned`; a new address, like every batcher change.
 - **AgenticID 1.3.0 — dev beacon-upgraded 2026-10-26, test 2026-10-27,
   mainnet 2026-11-02** — instance-bound trusted attestors (app identities,
