@@ -19,7 +19,7 @@ import { basename, join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, isAddress, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
-import type { AgentClient, AgentInboxMessage, AgentSession, AgentSchedule, AgentActivityInfo, AgentActivityStop, HarnessTask, HarnessTaskRecord, HarnessTaskSummary, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
+import type { AgentActivityDetail, AgentClient, AgentInboxMessage, AgentSession, AgentSchedule, AgentActivityInfo, AgentActivityStop, HarnessTask, HarnessTaskRecord, HarnessTaskSummary, ChatImage, ChatMessage, ChatNotice, SteerState } from '../../AgentClient';
 import type { ServeProof, SignatureRecord, TaskReveal } from '../../types';
 import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient, probeAttestor } from '../sdk';
@@ -43,13 +43,15 @@ import { splitHead, tokenize } from '../tokenize';
 import { completePath, describeStaged, findDroppedFiles, prepareAttachments, stageDropped, stageFile, type Staged } from '../attach';
 import { parseDownloadName, renderFiles, saveDownload } from '../download';
 import { pandaLines, svgPixelLines } from '../logo';
+import { stepsCommand, toolTarget } from '../steps';
+import { thinkCommand } from '../think';
 import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
 import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePlan, applyResetInference, readDeploymentFacts, requiresProviderReset, deployWithInference } from '../inference';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'cred ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'status ', 'doctor', 'providers', 'releases', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/sessions', '/activities', '/tasks', '/result', '/cancel', '/inbox', '/notices', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/cred', '/think', '/clear', '/compact', '/restart', '/sessions', '/activities', '/tasks', '/result', '/steps', '/output', '/cancel', '/inbox', '/notices', '/schedules', '/attach', '/files', '/download', '/agentlog', '/startuplog', '/signatures', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -769,7 +771,7 @@ const L1_ARGS: Record<string, string[] | (() => string[])> = {
 };
 const L2_ARGS: Record<string, string[] | ((rest: string) => string[])> = {
   '/hello': ['full'],
-  '/think': ['low', 'high', 'max'],
+  '/think': ['low', 'high', 'max', 'default'],
   '/reset': ['pick'],
   '/cancel': ['all'],
   '/inbox': ['all'],
@@ -1711,10 +1713,12 @@ interface Session {
    *  last): lets /tasks list them and /result re-attach after a drop. The
    *  agent itself keeps the authoritative ring; this is just the ids. */
   tasks?: Array<{ id: string; prompt: string; at: number; session?: string }>;
-  /** The reasoning level /think last wrote to the settings document, mirrored
-   *  here ONLY as the per-message override for frameworks whose bridge takes
-   *  one (prime). The durable copy is the document; this is a session echo of
-   *  it, set after a successful write and never on its own. */
+  /** The reasoning level each message of this session carries, for runtimes
+   *  that take one per message. On 0g-harness 0.2.1 or later (`features().turn_effort`)
+   *  /think sets it on its own: the session's level, the saved one unchanged.
+   *  Elsewhere it is an echo of the level /think last wrote to the settings
+   *  document (prime takes it per message too), set only after that write
+   *  landed. */
   thinking?: 'low' | 'high' | 'max';
   /** Task id of the chat turn currently in flight (responses transport). */
   currentTask?: string | null;
@@ -1806,6 +1810,7 @@ export function readOnlyCommand(line: string): boolean {
     case '/tasks': return !arg || arg === 'list' || arg === 'all' || /^show \S+$/.test(arg);
     case '/agentlog': case '/startuplog': case '/signatures': return !arg || /^\d+$/.test(arg);
     case '/settings': return !arg || arg === 'versions';
+    case '/steps': case '/output': return true;
     default: return false;
   }
 }
@@ -2087,6 +2092,27 @@ export function activityText(label: string): string {
   return 'working';
 }
 
+/** Characters of a tool call's target in the live status line. */
+export const LIVE_TARGET_MAX = 60;
+
+/** The note for what a turn asked for and the agent did not apply (`harness.ignored`), or ''. */
+export function ignoredText(n: ChatNotice): string {
+  const e = Object.entries(n.ignored ?? {});
+  if (!e.length) return '';
+  const what = (k: string) => (k === 'reasoning_effort' ? 'thinking level' : k);
+  return `\n(${e.map(([k, v]) => `${cleanCell(what(k))} not applied: ${cleanCell(v)}`).join('; ')})\n`;
+}
+
+/** {@link activityText}, with what a tool call works on where the agent says it
+ *  (0g-harness `features.steps`): "running a command: npm test". */
+export function liveActivityText(label: string, detail?: AgentActivityDetail): string {
+  const base = activityText(label);
+  const target = /^tool\/call\b/.test(label.trim()) ? toolTarget(detail?.tool, detail?.arguments?.text) : '';
+  // Short enough that the status line keeps its timer and stop hint.
+  const shown = target.length > LIVE_TARGET_MAX ? `${target.slice(0, LIVE_TARGET_MAX - 1)}…` : target;
+  return shown ? `${base}: ${shown}` : base;
+}
+
 /** What {@link activityText}'s words become once done: one, and several ({n}). */
 const TOOL_DONE: Record<string, [string, string]> = {
   'running a command': ['ran a command', 'ran {n} commands'],
@@ -2163,7 +2189,7 @@ async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (v
     s.attached = [];
   }
   const sid = s.sessionId!;
-  const r = await client.promptSession!(sid, sent);
+  const r = await client.promptSession!(sid, sent, s.thinking ? { thinking: s.thinking } : {});
   // Its id, for /result and /cancel in this session.
   (s.tasks ??= []).push({ id: r.id, prompt: line.slice(0, 60), at: Date.now(), session: sid });
   const ac = new AbortController();
@@ -2187,15 +2213,15 @@ async function chatInSession(s: Session, line: string, irq: Interrupt, busy?: (v
   };
   const ticker = process.stdout.isTTY ? setInterval(paint, 1000) : null;
   const onActivity = process.stdout.isTTY
-    ? (label: string): void => {
+    ? (label: string, detail?: AgentActivityDetail): void => {
         if (label.startsWith('turn/end')) { doing = null; view.status(null); return; }
         view.activity?.(label);
-        doing = cleanCell(activityText(label));
+        doing = cleanCell(liveActivityText(label, detail));
         paint();
       }
     : undefined;
   try {
-    for await (const d of client.followTask!(r.id, { signal: ac.signal, ...(onActivity ? { onActivity } : {}) })) { reply += d; doing = null; view.status(null); say(d); }
+    for await (const d of client.followTask!(r.id, { signal: ac.signal, ...(onActivity ? { onActivity } : {}), onNotice: (n) => { const t = ignoredText(n); if (t) view.note(t); } })) { reply += d; doing = null; view.status(null); say(d); }
     view.end();
     if (reply && !reply.endsWith('\n')) out('\n');
   } catch (e) {
@@ -4846,7 +4872,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /sessions /activities /tasks /result /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /cred /think /clear /compact /restart /sessions /activities /tasks /result /steps /output /cancel /inbox /schedules /attach /files /download /agentlog /startuplog /signatures /back /quit — Esc interrupts a turn (help: /help)';
 
 export const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -4912,12 +4938,19 @@ export const L2_HELP_FULL = `session commands
                           A request the agent waits on (to read a value, to get
                           a credential, to be connected) comes up here at the
                           prompt; your answer goes back to the agent
-  /think [low|high|max]   reasoning depth for thinking models (glm etc.) —
-                          shorthand for /settings thinking=…, so it is written
-                          to the owner's document (owner-signed) and a running
-                          agent takes it at once, a stopped one at its next
-                          start. prime also takes it per message.
-                          No arg shows the level currently stored
+  /think [low|high|max|default]
+                          reasoning depth for thinking models (glm etc.).
+                          A running 0g-harness 0.2.1 or later whose model
+                          takes a level: this CLI session's messages use it
+                          from the next one (owner-chat and other sessions),
+                          with no signature and no restart; default goes
+                          back to the saved level, /settings thinking=…
+                          saves one. Otherwise: shorthand for /settings
+                          thinking=…, written to the owner's document
+                          (owner-signed); a running agent restarts its
+                          framework to take it, a stopped one takes it at
+                          its next start. prime also takes it per message.
+                          No arg shows the level in use
   /clear                  wipe the agent's conversation and start fresh —
                           chain-tracked memory (what the agent chose to keep)
                           is untouched; that is the difference from /reset
@@ -4962,6 +4995,13 @@ export const L2_HELP_FULL = `session commands
                           finished one, follows a running one live; on
                           0g-harness also a subagent's answer or a command's
                           status
+  /steps [id] [full]      0g-harness: how a turn went (default: latest), or a
+                          task (task-…): each model call with its tokens and
+                          time, each tool call with what it ran and its
+                          result; full prints every line
+  /output <id>            0g-harness: what a background command printed
+                          (ids from /activities); reading leaves it to the
+                          agent too
   /cancel [id|all]        stop tasks — the brake for orphaned turns: Esc only
                           cancels a turn THIS connection started (on
                           0g-harness and prime it interrupts the agent-wide
@@ -5481,7 +5521,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // Owner-signed in both directions, so it needs the wallet client and
         // not the session's (possibly keyless) one.
         const ag = await withWallet(ctx);
-        await settingsOp(ag, s.sealId, tokenize(line).slice(1), await ownerRouteUrl(ag, s), s.framework, ask);
+        const written = await settingsOp(ag, s.sealId, tokenize(line).slice(1), await ownerRouteUrl(ag, s), s.framework, ask);
+        // A saved level replaces a level /think set for this session: the
+        // session's messages follow what was just saved.
+        if (written && tokenize(line).slice(1).some((a) => a.startsWith('thinking='))) s.thinking = (written.thinking as ThinkingLevel | undefined) ?? undefined;
         continue;
       }
       if (line === '/cred' || line.startsWith('/cred ')) {
@@ -5492,29 +5535,17 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/think' || line.startsWith('/think ')) {
-        // /think is `/settings thinking=…` with a shorter name: it writes the
-        // owner's document, which is the only place a reasoning level lives
-        // now. (It used to set a session variable that rode a container
-        // environment variable on the next /reset — nothing reads that any
-        // more, so the command announced a change it was not making.)
-        const arg = tokenize(line)[1];
-        const ag = await withWallet(ctx);
-        if (!arg) {
-          const doc = await ag.agent.getSettings(s.sealId);
-          out(`thinking level: ${(doc.settings?.thinking as string | undefined) ?? '(unset — the platform bounds thinking models at low)'}\n`);
-          continue;
-        }
-        if (!(THINKING_LEVELS as readonly string[]).includes(arg)) { out(`usage: /think ${THINKING_LEVELS.join('|')}\n`); continue; }
-        if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
-        const written = await settingsOp(ag, s.sealId, [`thinking=${arg}`], await ownerRouteUrl(ag, s));
-        // Only mirror it into this session once the write actually landed —
-        // a refused or conflicted write must not leave the per-message
-        // override claiming a level the agent was never given.
-        if (written?.thinking === arg) {
-          s.thinking = arg as ThinkingLevel;
-          // Where it applies is said above (written, and pushed to a running agent).
-          if (s.framework === 'prime-agent') out('  this framework also takes it per message, so your next message uses it already\n');
-        }
+        // cli/think.ts: per message where the runtime takes it, else the saved level.
+        let ag: Awaited<ReturnType<typeof withWallet>> | undefined;
+        const wallet = async () => (ag ??= await withWallet(ctx));
+        await thinkCommand(tokenize(line)[1], {
+          perMessage: s.phase === 'running' && (await s.client?.features?.({ refresh: true }).catch(() => null))?.turn_effort === true,
+          session: s,
+          framework: s.framework,
+          readSaved: async () => (await (await wallet()).agent.getSettings(s.sealId)).settings?.thinking as string | undefined,
+          writeSaved: async (level) => { const w = await wallet(); return (await settingsOp(w, s.sealId, [`thinking=${level}`], await ownerRouteUrl(w, s)))?.thinking as string | undefined; },
+          out,
+        });
         continue;
       }
       if (line === '/sessions' || line.startsWith('/sessions ')) {
@@ -5674,6 +5705,17 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out('re-attach with /result [id] (default: latest)\n');
         continue;
       }
+      if (line === '/steps' || line.startsWith('/steps ') || line === '/output' || line.startsWith('/output ')) {
+        // cli/steps.ts: a turn's or a task's steps, a command's output.
+        await stepsCommand(line, {
+          client: s.client,
+          latestTurn: [...(s.tasks ?? [])].reverse().find((t) => t.session === s.sessionId)?.id,
+          shortId: (id) => shortIds([id])[0],
+          errorText: plainError,
+          out,
+        });
+        continue;
+      }
       if (line === '/result' || line.startsWith('/result ')) {
         // A background command or a subagent is not a turn: its record is
         // the activity list's, and it has no stream to follow.
@@ -5695,7 +5737,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           if (t && t.type !== 'turn') {
             out(`${shortIds([cleanCell(t.id)])[0]} — ${cleanCell(t.status)} · by ${cleanCell(t.actor)} · ${cleanCell(t.label)}\n`);
             if (t.output_text) out(`${cleanStream(t.output_text)}\n`);
-            else if (t.type === 'command') out('(a command\'s output goes to the agent, which reports on it in a notice when the command finishes — /inbox)\n');
+            else if (t.type === 'command') out((await s.client.features?.({ refresh: true }).catch(() => null))?.steps === true ? `(its output: /output ${shortIds([cleanCell(t.id)])[0]})\n` : '(a command\'s output goes to the agent, which reports on it in a notice when the command finishes — /inbox)\n');
             if (t.error) out(`error: ${cleanCell(t.error)}\n`);
             continue;
           }
@@ -6412,7 +6454,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       steering = makeSteering(view, after);
       if (process.stdin.isTTY) { (ask as Ask).whileBusy?.(busyEntries(view, steering, clearActivity)); (ask as Ask).held = steering?.held ?? null; }
       const onActivity = process.stdout.isTTY
-        ? (label: string): void => {
+        ? (label: string, detail?: AgentActivityDetail): void => {
             if (label === 'steer received') {
               // The agent read an inserted message.
               clearActivity();
@@ -6428,7 +6470,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             // a failure worth reporting.
             if (/tool|bash|subagent|rlm_child/i.test(label) && label !== 'thinking') sawToolActivity = true;
             if (label.startsWith('turn/end')) { clearActivity(); return; }
-            status = cleanCell(activityText(label));
+            status = cleanCell(liveActivityText(label, detail));
             paintStatus();
           }
         : undefined;
@@ -6451,6 +6493,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           ...(onActivity ? { onActivity } : {}),
           ...(images.length ? { images } : {}),
           onNotice: (n: ChatNotice): void => {
+            const ignored = ignoredText(n);
+            if (ignored) { clearActivity(); view.note(ignored); }
             if (n.imagesSavedAsFiles?.length) {
               clearActivity();
               view.note(`\n(this model can't see images — saved as files the agent can read: ${n.imagesSavedAsFiles.map((f) => cleanCell(basename(f))).join(', ')}. A model that takes images sees them, e.g. /settings model=glm-5.3-flash)\n`);

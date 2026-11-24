@@ -38,6 +38,26 @@ export function plainText(s: string): string {
     .replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');
 }
 
+/** The tool fields of a live `response.activity` event ({@link AgentActivityDetail}), or undefined. */
+export function activityDetail(ev: unknown): AgentActivityDetail | undefined {
+  if (!ev || typeof ev !== 'object') return undefined;
+  const e = ev as Record<string, unknown>;
+  const text = (v: unknown): AgentStepText | undefined => {
+    if (!v || typeof v !== 'object') return undefined;
+    const t = v as { text?: unknown; chars?: unknown; truncated?: unknown };
+    if (typeof t.text !== 'string') return undefined;
+    return { text: plainText(t.text), chars: typeof t.chars === 'number' ? t.chars : t.text.length, ...(t.truncated === true ? { truncated: true as const } : {}) };
+  };
+  const d: AgentActivityDetail = {};
+  if (typeof e.tool === 'string') d.tool = plainText(e.tool);
+  if (typeof e.call_id === 'string') d.callId = plainText(e.call_id);
+  const args = text(e.arguments);
+  if (args) d.arguments = args;
+  const r = text(e.result);
+  if (r) d.result = { ...r, is_error: (e.result as { is_error?: unknown }).is_error === true };
+  return Object.keys(d).length ? d : undefined;
+}
+
 /**
  * One agent-registered service, as listed in `/hello`'s `services` array.
  * These are exact `/api/*` paths the agent's own code serves; they are not
@@ -168,6 +188,8 @@ export interface ChatNotice {
   imagesSavedAsFiles?: string[];
   /** Names of files in the outbox (`downloadFile('outbox', name)`). */
   outboxFiles?: string[];
+  /** What the turn asked for and did not get, by request field, with the reason (0g-harness `harness.ignored`, e.g. `reasoning_effort`). */
+  ignored?: Record<string, string>;
 }
 
 /** A file the owner can download ({@link AgentClient.listFiles}). */
@@ -336,7 +358,7 @@ export interface AgentTask {
   output_text: string;
   error?: { message: string };
   /** Runtime notices about the message that opened it (0g-harness). */
-  harness?: { images_saved_as_files?: string[]; outbox_files?: string[] };
+  harness?: { images_saved_as_files?: string[]; outbox_files?: string[]; ignored?: Record<string, unknown> };
 }
 
 export interface ChatCompletion {
@@ -351,6 +373,83 @@ export interface ChatCompletion {
  * for it. ("Task" is kept for zgh-style tasks: a unit of work with its own
  * session, state and outcome.)
  */
+/**
+ * What a tool call or result in a live `response.activity` event carries
+ * beside its label (0g-harness `features.steps`): the tool and call id, and
+ * the call's `arguments` or the result, in the same text shape as a step's
+ * ({@link AgentStepText}; cut at 1000 and 500 characters). Text is
+ * single-line ({@link plainText}). Absent elsewhere.
+ */
+export interface AgentActivityDetail {
+  tool?: string;
+  callId?: string;
+  arguments?: AgentStepText;
+  result?: AgentStepText & { is_error: boolean };
+}
+
+/** A text field of a step: at most `max_chars` characters of it, and its full length. */
+export interface AgentStepText {
+  text: string;
+  chars: number;
+  truncated?: true;
+}
+
+/** One tool call of a step. */
+export interface AgentStepToolCall {
+  call_id?: string;
+  tool?: string;
+  arguments: AgentStepText;
+  result?: AgentStepText & { is_error: boolean };
+  duration_ms?: number;
+}
+
+/** One model call of a turn and what followed it (0g-harness `GET /v1/activities/{id}/steps`). */
+export interface AgentStep {
+  step: number;
+  /** Unix milliseconds. */
+  started_at?: number;
+  finished_at?: number;
+  duration_ms?: number;
+  /** `provider/model`. */
+  model?: string;
+  /** Token counts as the provider reported them: `input_tokens`, `output_tokens`, `cache_read_tokens`, … */
+  usage?: Record<string, number>;
+  text?: AgentStepText;
+  reasoning_chars?: number;
+  tool_calls: AgentStepToolCall[];
+}
+
+/** A turn's steps. `turn` is null for one that never started; `end` is its end reason once it ended. */
+export interface AgentTurnSteps {
+  object: 'steps';
+  activity: string;
+  session: string;
+  turn: number | null;
+  end?: { kind: string; [k: string]: unknown };
+  steps: AgentStep[];
+}
+
+/** Every turn of a task, with its steps (0g-harness `GET /v1/tasks/{id}/steps`). */
+export interface HarnessTaskSteps {
+  object: 'task.steps';
+  task: string;
+  session: string;
+  turns: Array<{ turn: number; end?: { kind: string; [k: string]: unknown }; steps: AgentStep[] }>;
+}
+
+/** A background command's output from byte `from` (0g-harness `GET /v1/activities/{id}/output`), read without consuming it. */
+export interface AgentCommandOutput {
+  object: 'output';
+  id: string;
+  status: string;
+  from: number;
+  /** Where to read from next. */
+  next: number;
+  /** Older bytes were already dropped. */
+  lossy?: true;
+  text: string;
+}
+
 export interface AgentActivityInfo {
   /** A turn: `resp_…` (the id {@link AgentClient.task} and
    *  {@link AgentClient.followTask} take). A command: `bash-<hex>`. A
@@ -556,11 +655,12 @@ export interface AgentClient {
      *  ": activity tool/call <name>" comments — 0g-harness does). Labels like
      *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
      *  means the bridge doesn't narrate. */
-    onActivity?: (label: string) => void;
-    /** Per-message reasoning-effort override for thinking models. Only the
-     *  prime bridge honors it today (other frameworks' HTTP surfaces don't
-     *  take a per-request level — their default is set at deploy/reset via
-     *  `thinking`); unsupported bridges ignore it. */
+    onActivity?: (label: string, detail?: AgentActivityDetail) => void;
+    /** Per-message reasoning-effort override for thinking models. The prime
+     *  bridge honors it, and 0g-harness 0.2.1 or later (`features()` lists
+     *  `turn_effort`) runs that turn at it and the next at
+     *  the saved level; other frameworks ignore it (their level is the
+     *  settings document's `thinking`). */
     thinking?: 'low' | 'high' | 'max';
     /** Fires once with the server-side task id, as soon as the agent assigns
      *  one. Only on the responses transport (see {@link AgentClient.task}):
@@ -589,7 +689,9 @@ export interface AgentClient {
   followTask?(id: string, opts?: {
     startingAfter?: number;
     signal?: AbortSignal;
-    onActivity?: (label: string) => void;
+    onActivity?: (label: string, detail?: AgentActivityDetail) => void;
+    /** The harness's notices on the finished turn (files, what it ignored). */
+    onNotice?: (notice: ChatNotice) => void;
   }): AsyncGenerator<string>;
   /**
    * Stop one task by id — the responses-transport form of {@link interrupt}.
@@ -606,6 +708,17 @@ export interface AgentClient {
    * `aborted: false` + note means the agent image predates the endpoint.
    */
   interrupt?(): Promise<{ aborted: boolean; note?: string }>;
+  /**
+   * What the agent's runtime says it serves: 0g-harness `GET /v1/harness` →
+   * `features` (`turn_effort`: a message's `thinking` level runs that turn at
+   * it, with no settings write and no restart; `steps`: the steps and output
+   * routes and live tool details; `image_names`, `tasks`, …). Asked once per
+   * handle and kept; `refresh: true` asks again (after a settings change or a
+   * harness restart, which can change them). Null where the runtime has no
+   * such route (other frameworks). A client turns a feature on only when it
+   * is listed `true`.
+   */
+  features?(opts?: { refresh?: boolean }): Promise<Record<string, unknown> | null>;
   /**
    * Present only when this handle holds the owner key: fetch the agent's own
    * process log (the framework subprocess stdout/stderr the runtime serves at
@@ -650,6 +763,19 @@ export interface AgentClient {
   /** One activity of {@link activities}, by id, with its `output_text` where
    *  there is one. Present under the same conditions as {@link activities}. */
   activity?(id: string): Promise<AgentActivityInfo>;
+  /**
+   * A turn's steps: each model call (model, token usage, time, text) and each
+   * tool call with its arguments and result, from the session's log
+   * (0g-harness `features.steps`). Text fields hold at most `maxChars`
+   * characters (default 2000, at most 65536). Present with `activities`; an
+   * older harness answers 404.
+   */
+  activitySteps?(id: string, opts?: { maxChars?: number }): Promise<AgentTurnSteps>;
+  /**
+   * A background command's output from byte `from` (default 0), read without
+   * taking it from the agent. `next` in the answer is where to read on from.
+   */
+  activityOutput?(id: string, opts?: { from?: number }): Promise<AgentCommandOutput>;
   /**
    * Stop one activity of {@link activities}: a turn is cancelled (a queued
    * one never starts), a command or subagent is killed. Already-executed
@@ -711,7 +837,7 @@ export interface AgentClient {
    * Send a session a message: its next turn (`mode: 'next'`, the default),
    * or a steer into its running turn (`'steer'`). Present with {@link sessions}.
    */
-  promptSession?(id: string, text: string, opts?: { mode?: 'next' | 'steer' }): Promise<SessionPromptResult>;
+  promptSession?(id: string, text: string, opts?: { mode?: 'next' | 'steer'; thinking?: 'low' | 'high' | 'max' }): Promise<SessionPromptResult>;
   /** Stop a session's running turn. Present with {@link sessions}. */
   cancelSession?(id: string): Promise<{ cancelled: string | null; session: string }>;
   /**
@@ -726,6 +852,8 @@ export interface AgentClient {
   listTasks?(opts?: { state?: HarnessTaskState | HarnessTaskState[]; metadata?: Record<string, string>; limit?: number }): Promise<HarnessTask[]>;
   /** One task. Present with {@link createTask}. */
   getTask?(id: string): Promise<HarnessTask>;
+  /** Every turn of a task with its steps (as {@link activitySteps}). */
+  taskSteps?(id: string, opts?: { maxChars?: number }): Promise<HarnessTaskSteps>;
   /**
    * Input for a task: to a resting task it starts a run; to a working one
    * `mode: 'steer'` (the default) reaches the running turn and `'next'` is
@@ -924,7 +1052,11 @@ function harnessNotice(harness: AgentTask['harness'] | undefined): ChatNotice | 
   const outbox = strings(harness.outbox_files);
   if (images) n.imagesSavedAsFiles = images;
   if (outbox) n.outboxFiles = outbox;
-  return images || outbox ? n : undefined;
+  const ignored = harness.ignored && typeof harness.ignored === 'object'
+    ? Object.fromEntries(Object.entries(harness.ignored).filter(([, v]) => typeof v === 'string').map(([k, v]) => [plainText(k), plainText(v as string)]))
+    : {};
+  if (Object.keys(ignored).length) n.ignored = ignored;
+  return Object.keys(n).length ? n : undefined;
 }
 
 /**
@@ -1059,9 +1191,10 @@ export function makeAgentClient(params: {
   // What the agent's runtime says it reads (0g-harness `GET /v1/harness`,
   // `features`), asked once; null where there is no such route.
   let featuresAsked: Promise<Record<string, unknown> | null> | null = null;
-  const harnessFeatures = (): Promise<Record<string, unknown> | null> => {
+  const harnessFeatures = (opts?: { refresh?: boolean }): Promise<Record<string, unknown> | null> => {
     const r = routes.find((x) => x.kind === 'chat') ?? routes.find((x) => x.kind === 'responses');
     if (!r || !canAuth) return Promise.resolve(null);
+    if (opts?.refresh) featuresAsked = null;
     const path = r.kind === 'chat' ? `${r.prefix.replace(/\/?$/, '/')}harness` : r.prefix.replace(/responses\/?$/, 'harness');
     featuresAsked ??= doFetch(path, { signal: AbortSignal.timeout(5000) })
       .then(async (res) => {
@@ -1073,6 +1206,7 @@ export function makeAgentClient(params: {
       .catch(() => { featuresAsked = null; return null; }); // asked again next time
     return featuresAsked;
   };
+  client.features = harnessFeatures;
   /** Whether image parts carry their file name: only where the agent says it reads it. */
   const imageNames = async (images?: ChatImage[]): Promise<boolean> =>
     !!images?.some((im) => im.name) && (await harnessFeatures())?.image_names === true;
@@ -1224,16 +1358,16 @@ export function makeAgentClient(params: {
     // Normalize activity labels across serving layers: hermes narrates its
     // reasoning phase as tool_name "_thinking" many times a second — collapse
     // to the throttled "thinking" label the callers already understand.
-    const wrapActivity = (onActivity?: (label: string) => void): ((label: string) => void) | undefined => {
+    const wrapActivity = (onActivity?: (label: string, detail?: AgentActivityDetail) => void): ((label: string, detail?: AgentActivityDetail) => void) | undefined => {
       if (!onActivity) return undefined;
       let lastThinkingAt = 0;
-      return (label: string) => {
+      return (label: string, detail?: AgentActivityDetail) => {
         if (label === '_thinking' || label === 'thinking') {
           const now = Date.now();
           if (now - lastThinkingAt > 2000) { lastThinkingAt = now; onActivity('thinking'); }
           return;
         }
-        onActivity(label);
+        onActivity(label, detail);
       };
     };
 
@@ -1276,7 +1410,7 @@ export function makeAgentClient(params: {
       id?: string;
       startingAfter?: number;
       signal?: AbortSignal;
-      onActivity?: (label: string) => void;
+      onActivity?: (label: string, detail?: AgentActivityDetail) => void;
       onNotice?: (notice: ChatNotice) => void;
     }): AsyncGenerator<string> {
       const id = args.id;
@@ -1358,7 +1492,7 @@ export function makeAgentClient(params: {
                 }
                 case 'response.activity': {
                   const label = (chunk as { label?: string }).label;
-                  if (args.onActivity && typeof label === 'string') args.onActivity(plainText(label));
+                  if (args.onActivity && typeof label === 'string') args.onActivity(plainText(label), activityDetail(chunk));
                   break;
                 }
                 case 'response.completed':
@@ -1462,6 +1596,7 @@ export function makeAgentClient(params: {
       startingAfter: opts?.startingAfter ?? 0,
       signal: opts?.signal,
       onActivity: wrapActivity(opts?.onActivity),
+      onNotice: opts?.onNotice,
     });
     client.cancelTask = async (id) => {
       const r = await doFetch(`${rPrefix}/${id}/cancel`, { method: 'POST' });
@@ -1537,6 +1672,10 @@ export function makeAgentClient(params: {
     };
     client.stopAllActivities = async () =>
       (await activityCall<{ data: AgentActivityStop[] }>('stopAllActivities', '/all/cancel', true)).data;
+    client.activitySteps = (id, opts) =>
+      activityCall<AgentTurnSteps>('activitySteps', `/${encodeURIComponent(id)}/steps${query({ max_chars: opts?.maxChars })}`);
+    client.activityOutput = (id, opts) =>
+      activityCall<AgentCommandOutput>('activityOutput', `/${encodeURIComponent(id)}/output${query({ from: opts?.from })}`);
     client.tasks = client.activities;
     client.taskInfo = client.activity;
     client.stopTask = client.stopActivity;
@@ -1618,7 +1757,7 @@ export function makeAgentClient(params: {
     client.sessions = async () => ((await getJSON<{ data?: AgentSession[] }>('sessions', sessionsBase)).data ?? []).map(clean);
     client.session = async (id) => clean(await getJSON<AgentSession>('session', sid(id)));
     client.createSession = async (opts = {}) => clean(await postJSON<AgentSession>('createSession', sessionsBase, opts));
-    client.promptSession = (id, text, opts = {}) => postJSON<SessionPromptResult>('promptSession', `${sid(id)}/prompt`, { text, ...(opts.mode ? { mode: opts.mode } : {}) });
+    client.promptSession = (id, text, opts = {}) => postJSON<SessionPromptResult>('promptSession', `${sid(id)}/prompt`, { text, ...(opts.mode ? { mode: opts.mode } : {}), ...(opts.thinking ? { reasoning_effort: opts.thinking } : {}) });
     client.cancelSession = (id) => postJSON<{ cancelled: string | null; session: string }>('cancelSession', `${sid(id)}/cancel`);
   }
 
@@ -1651,6 +1790,7 @@ export function makeAgentClient(params: {
       return ((await getJSON<{ data?: HarnessTask[] }>('listTasks', `${tasksBase}${qs ? `?${qs}` : ''}`)).data ?? []).map(clean);
     };
     client.getTask = async (id) => clean(await getJSON<HarnessTask>('getTask', tid(id)));
+    client.taskSteps = async (id, opts) => getJSON<HarnessTaskSteps>('taskSteps', `${tid(id)}/steps${opts?.maxChars !== undefined ? `?max_chars=${opts.maxChars}` : ''}`);
     client.taskInput = async (id, text, opts = {}) => clean(await postJSON<TaskInputResult>('taskInput', `${tid(id)}/input`, { text, ...(opts.mode ? { mode: opts.mode } : {}) }));
     client.cancelTaskRun = async (id) => clean(await postJSON<HarnessTask>('cancelTaskRun', `${tid(id)}/cancel`));
     client.archiveTask = async (id) => clean(await postJSON<HarnessTask>('archiveTask', `${tid(id)}/archive`));

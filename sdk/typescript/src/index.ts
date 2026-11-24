@@ -33,7 +33,7 @@ export type { ReleaseNotice, ReleaseMigration, AgentMigration, MigrationState } 
 export { makeAgentClient } from './AgentClient';
 export type {
   AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask,
-  AgentActivityInfo, AgentActivityStop, AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
+  AgentActivityInfo, AgentActivityStop, AgentActivityDetail, AgentStep, AgentStepText, AgentStepToolCall, AgentTurnSteps, AgentCommandOutput, HarnessTaskSteps, AgentTaskInfo, AgentTaskStop, AgentInbox, AgentInboxMessage, AgentSchedule, AgentEvent,
   ChatImage, ChatNotice, UploadedFile, SteerResult, AgentSession, SessionPromptResult, HarnessTask, HarnessTaskState, HarnessTaskRecord, HarnessTaskSummary, HarnessTaskFeedEvent, CreateTaskOptions, TaskInputResult, SteerState, AgentFile, AgentFileDir,
 } from './AgentClient';
 export { mcpServices, withImages } from './AgentClient';

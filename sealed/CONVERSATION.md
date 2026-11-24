@@ -9,7 +9,8 @@ instrument, not an afterthought). Chinese mirror: `CONVERSATION.zh.md`.
 
 An agent's conversation must survive a **framework process restart** — and
 since the settings channel landed, restarts are *frequent*: every settings
-push and every `/think` is a Stop+Start (`manager.Reload`), and a crash
+push is a Stop+Start (`manager.Reload`; so is `/think`, except on 0g-harness
+0.2.1 or later, where it sets a per-message level), and a crash
 replays the same path. Today prime/dsh hold the conversation in the bridge's
 **process memory**, so a restart is **total amnesia**, papered over by
 `restoreTranscript()` replaying the *client's* copy — a layer violation
