@@ -17,6 +17,7 @@ var supportedVersions = []string{
 	"0.1.0", // Existing bindings remain accepted; the last entry stays preferred.
 	"0.2.0", // DSH 0.2.2-rc.1, native MCP and handle-based persistence
 	"0.2.1", // per-turn model choice, steps and command output (same DSH)
+	"0.2.2", // subagent_wait, helpers that read the web and images, stream-cut retry, the sandbox's environment file (same DSH)
 }
 
 // whitelistMax returns the version sealed targets: always the last element.
