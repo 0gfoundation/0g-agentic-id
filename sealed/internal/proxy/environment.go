@@ -31,8 +31,10 @@ import (
 var environmentFile = "/run/0g/environment.json"
 
 const (
-	// maxEnvironmentFile bounds the read; the runner's file is far smaller.
-	maxEnvironmentFile = 64 << 10
+	// maxEnvironmentFile bounds the read. The runner's largest file (16
+	// notices of 2000 bytes, each <, > or & escaped to 6 bytes) is about
+	// 195 KB.
+	maxEnvironmentFile = 256 << 10
 	// environmentStaleAfter is the age past which the figures are reported
 	// stale: the runner has missed several of its 30 s rewrites.
 	environmentStaleAfter = 120 * time.Second
@@ -47,8 +49,13 @@ type environmentAnswer struct {
 	// AgeSeconds is now - updated_at, in whole seconds (0 for a time ahead
 	// of sealed's clock).
 	AgeSeconds *int64 `json:"age_seconds,omitempty"`
-	// Stale is AgeSeconds past environmentStaleAfter.
+	// Stale is AgeSeconds past environmentStaleAfter. It covers the file's
+	// rewrite only; the disk figures have their own age, DiskAgeSeconds.
 	Stale *bool `json:"stale,omitempty"`
+	// DiskAgeSeconds is now - disk.measured_at, in whole seconds (0 for a
+	// time ahead of sealed's clock): the runner measures disk use less often
+	// than it rewrites the file.
+	DiskAgeSeconds *int64 `json:"disk_age_seconds,omitempty"`
 	// DiskUsedPct is disk.used_bytes / disk.limit_bytes in percent, to one
 	// decimal; above 100 when the sandbox is over its disk size.
 	DiskUsedPct *float64        `json:"disk_used_pct,omitempty"`
@@ -76,7 +83,7 @@ func readEnvironment(path string, now time.Time) environmentAnswer {
 	case errors.Is(err, fs.ErrNotExist):
 		return unavailable("this sandbox publishes no environment data: its runner does not provide it, the sandbox started less than a minute ago, or this is not a 0G sandbox")
 	case errors.Is(err, privsep.ErrTooLarge):
-		return unavailable("the sandbox's environment data is larger than 64 KiB and was not read")
+		return unavailable("the sandbox's environment data is larger than 256 KiB and was not read")
 	case err != nil:
 		var pe *fs.PathError
 		if errors.As(err, &pe) {
@@ -93,22 +100,40 @@ func readEnvironment(path string, now time.Time) environmentAnswer {
 		return unavailable("the sandbox's environment data is not a valid JSON object")
 	}
 	out := environmentAnswer{Available: true, Environment: compact.Bytes()}
-	if at, ok := env["updated_at"].(string); ok {
-		if t, err := time.Parse(time.RFC3339, at); err == nil {
-			age := max(now.Sub(t), 0)
-			secs, stale := int64(age/time.Second), age > environmentStaleAfter
-			out.AgeSeconds, out.Stale = &secs, &stale
-		}
+	if age, ok := environmentAge(env["updated_at"], now); ok {
+		secs, stale := int64(age/time.Second), age > environmentStaleAfter
+		out.AgeSeconds, out.Stale = &secs, &stale
 	}
 	if disk, ok := env["disk"].(map[string]any); ok {
 		used, usedOK := environmentNumber(disk["used_bytes"])
 		limit, limitOK := environmentNumber(disk["limit_bytes"])
 		if usedOK && limitOK && limit > 0 {
-			pct := math.Round(used/limit*1000) / 10
-			out.DiskUsedPct = &pct
+			// A finite quotient only: +Inf would fail the JSON encoding
+			// after the status line is out.
+			if pct := math.Round(used/limit*1000) / 10; !math.IsInf(pct, 0) {
+				out.DiskUsedPct = &pct
+			}
+		}
+		if age, ok := environmentAge(disk["measured_at"], now); ok {
+			secs := int64(age / time.Second)
+			out.DiskAgeSeconds = &secs
 		}
 	}
 	return out
+}
+
+// environmentAge is now - v for v an RFC 3339 time, 0 for a time ahead of
+// now.
+func environmentAge(v any, now time.Time) (time.Duration, bool) {
+	at, ok := v.(string)
+	if !ok {
+		return 0, false
+	}
+	t, err := time.Parse(time.RFC3339, at)
+	if err != nil {
+		return 0, false
+	}
+	return max(now.Sub(t), 0), true
 }
 
 // decodeEnvironment parses raw as exactly one JSON object, numbers kept as
