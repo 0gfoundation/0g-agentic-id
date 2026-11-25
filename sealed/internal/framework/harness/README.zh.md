@@ -65,7 +65,7 @@ harness 可以请 sealed 重启它(签名 socket 上的 `POST /harness/restart`)
 | **平台控制点** | 见下面两项 |
 
 两个平台控制点:
-- **DSH 原生 `dsh-mcp-client`**：通过私有 stdio-to-Unix 桥连接。工具由 sealed 在 socket 上列出（POST /mcp：签名 socket 上是签名、服务、设置和凭据，取值单独在自己的 socket 上），每次调用都走对应端点，检查、拒绝和记录仍由 sealed 执行。
+- **DSH 原生 `dsh-mcp-client`**：通过私有 stdio-to-Unix 桥连接。工具由 sealed 在 socket 上列出（POST /mcp：签名 socket 上是签名、服务、设置、沙箱资源和凭据，取值单独在自己的 socket 上），每次调用都走对应端点，检查、拒绝和记录仍由 sealed 执行。
 - **`subagent-guard`**:写文件、执行命令、签名,只有主 agent 能做。
 
 **故意没挂这些**(每条都有原因):

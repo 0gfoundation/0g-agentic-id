@@ -167,7 +167,7 @@ committed (`../../LAYERS.md` §3).
 | subagents (`subagents` on) | `dsh-subagent` + `dsh-subagent-spawn-in-process` + `dsh-tool-subagent`. Each helper is one-shot and runs in the background as a job. Depth is 1. Its tools are `read` and `skill` only |
 | persistence | DSH single-writer `dsh-session-persistence-jsonl`; legacy 0.1.1 conversations migrate through the released session-format catalog |
 | reminders (`schedule` on) | `dsh-schedule` and `dsh-tool-schedule`, with native session persistence and a separate JSON schedule store |
-| **platform control points** | DSH native `dsh-mcp-client` through private stdio-to-Unix bridges. sealed lists tools on its sockets (POST /mcp: signing, services, settings and credentials on the sign socket, reveal on its own socket) and runs each call through that socket's endpoint; checks, refusals and records remain in sealed |
+| **platform control points** | DSH native `dsh-mcp-client` through private stdio-to-Unix bridges. sealed lists tools on its sockets (POST /mcp: signing, services, settings, the sandbox's resources and credentials on the sign socket, reveal on its own socket) and runs each call through that socket's endpoint; checks, refusals and records remain in sealed |
 | | `subagent-guard`: only the main agent writes files, runs commands or signs |
 
 **Deliberately NOT mounted** (each a decision):

@@ -44,14 +44,14 @@ func TestSignMCP_ListsTheSocketsEndpoints(t *testing.T) {
 		sort.Strings(n)
 		return strings.Join(n, ",")
 	}
-	const base = "seal_register_service,seal_services,seal_set_thinking,seal_settings,seal_sign,seal_sign_transaction,seal_sign_typed_data"
+	const base = "seal_environment,seal_register_service,seal_services,seal_set_thinking,seal_settings,seal_sign,seal_sign_transaction,seal_sign_typed_data"
 	if got := names(); got != base {
 		t.Fatalf("tools: %s", got)
 	}
 	// A framework that runs from a harness package lists the restart before
 	// it is wired: its harness asks for the list during the first start.
 	s.adapter = harnessAdapter{}
-	if got := names(); got != "seal_register_service,seal_restart_harness,seal_services,seal_set_thinking,seal_settings,seal_sign,seal_sign_transaction,seal_sign_typed_data" {
+	if got := names(); got != "seal_environment,seal_register_service,seal_restart_harness,seal_services,seal_set_thinking,seal_settings,seal_sign,seal_sign_transaction,seal_sign_typed_data" {
 		t.Fatalf("tools for a harness-package framework: %s", got)
 	}
 }
