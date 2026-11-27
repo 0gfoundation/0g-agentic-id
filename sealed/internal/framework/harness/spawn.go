@@ -684,14 +684,17 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			get("/v1/events")),
 		// What runs or ran: turns, background commands, subagents.
 		route("/v1/activities", "activities", "What the agent is doing and has done, and who asked for it.",
-			get("/v1/activities"), get("/v1/activities/{id}"), post("/v1/activities/{id}/cancel")),
+			get("/v1/activities"), get("/v1/activities/{id}"), post("/v1/activities/{id}/cancel"),
+			// A turn's steps (model and tool calls) and a background command's
+			// output (0g-harness 0.2.1, features.steps).
+			get("/v1/activities/{id}/steps"), get("/v1/activities/{id}/output")),
 		// zgh-style tasks: a piece of work the owner hands the agent, with
 		// its own session, workspace, state and outcome records. The feed's
 		// own kind, task-feed, tells a client that /v1/tasks names these
 		// tasks: before them, a runtime declared kind "tasks" for the
 		// activity list's old name.
 		route("/v1/tasks", "tasks", "The owner's long-running tasks.",
-			get("/v1/tasks"), post("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/input"), post("/v1/tasks/{id}/cancel"), post("/v1/tasks/{id}/archive"), get("/v1/tasks/{id}/events")),
+			get("/v1/tasks"), post("/v1/tasks"), get("/v1/tasks/{id}"), post("/v1/tasks/{id}/input"), post("/v1/tasks/{id}/cancel"), post("/v1/tasks/{id}/archive"), get("/v1/tasks/{id}/events"), get("/v1/tasks/{id}/steps")),
 		route("/v1/task-feed", "task-feed", "A live feed of changes to the owner's tasks.",
 			get("/v1/task-feed")),
 		route("/v1/schedules", "schedules", "Reminders the agent set for itself.",

@@ -62,7 +62,13 @@ interface IAgenticIDTrustRegistry {
 ///                             BeaconUpgraded / Upgraded log).
 ///           TO_BLOCK        — last block (default: the latest)
 ///           LOG_CHUNK       — blocks per eth_getLogs; 0 = the whole range in
-///                             one call (default 0; 0G's RPC accepts it)
+///                             one call (default 0). Testnet's RPC
+///                             (evmrpc-testnet.0g.ai) takes the whole range;
+///                             mainnet's (evmrpc.0g.ai) refuses a call whose
+///                             toBlock - fromBlock exceeds 100000 ("query
+///                             exceeds max block range 100000", measured
+///                             2026-11-24), so mainnet needs LOG_CHUNK=100000
+///                             or lower.
 ///           BATCH           — owner calls per multicall (default 40)
 ///
 ///         plan and apply expect AgenticID still on 1.3.0 and a TrustRegistry

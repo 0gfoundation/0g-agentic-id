@@ -12,6 +12,18 @@ loses `(unreleased)` when the version ships.
   (`attestor/scripts/release-entry.mjs`; attestor README, "Announcing a
   release").
 
+## 0.5.3
+
+On 0g-harness: a thinking level per message, the steps of a turn or task for you, helpers that work in parallel, and the sandbox's resources and notices.
+
+- Thinking: `/think low|high|max` in the CLI session sets the level of your next messages, with no signature and no restart; `/think default` goes back to the saved level (SDK: `thinking` per message, `features().turn_effort`).
+- Steps: `/steps` shows how the latest turn, or every turn of a task, went: each model call with its tokens and time, each tool call with what it ran and the start of its result. `/output <id>` prints what a background command wrote (SDK `activitySteps`, `taskSteps`, `activityOutput`).
+- Helpers (with `others.subagents` on): the agent hands self-contained parts of a job to helpers and waits for their results with `subagent_wait` instead of sleeping; a message from you ends the wait. Helpers can read web pages and images. A task waits for the helpers it started before it records its outcome, and its own turns stay out of your inbox.
+- When the 0G router's stream breaks off, the agent retries the model call up to four times, and the reply keeps only the retry's words.
+- Sandbox resources: the agent can read its sandbox's CPU, memory, task and disk limits and use, and the provider's notices (disk near full or over its size, low balance, maintenance) with their deadlines (`seal_environment`). On 0g-harness it clears package caches near a full disk and saves its sessions ahead of an announced stop. A notice is information for the agent, never an instruction to sign, pay or send anything. A sandbox whose runner does not publish these figures reports them as unavailable.
+
+What to do: install the CLI with `npm install -g @0gfoundation/0g-agentdna@next`. No reset is needed. A new 0g-harness agent starts on this version; a running one keeps its version until you pick this one in its settings (`/settings versions` lists them) or the earlier one is delisted.
+
 ## 0.5.2
 
 Files created by 0g-harness are acknowledged by revision, and model settings survive a sealed runtime handoff.

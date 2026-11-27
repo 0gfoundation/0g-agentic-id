@@ -56,35 +56,42 @@ Correct approach: freeze `block.timestamp`-style values into a local *before*
 
 ## 0G Galileo Testnet RPC
 
-### `eth_maxPriorityFeePerGas` returns 1 wei
+### Gas prices
 
-Estimating EIP-1559 fees the standard way via `with_recommended_fillers()`
-yields a 1 wei priority fee, which the mempool rejects outright ("tip cap below
-minimum 2 gwei").
+Read on 2026-11-23 (`cast gas-price`, `eth_maxPriorityFeePerGas`, base fee):
 
-The attestor's alloy chain client (`attestor/crates/shared/src/chain.rs`)
-already works around this — it skips `GasFiller` and, per transaction, manually
-calls `set_max_priority_fee_per_gas` + `set_max_fee_per_gas`, with the gas limit
-computed explicitly via `estimate_gas` + a 20% buffer.
+| Network | Gas price | Priority fee | Base fee |
+|---|---|---|---|
+| Galileo testnet (16602) | 2000 gwei | 2000 gwei | 7 wei |
+| Mainnet (16661) | 4 gwei | 4 gwei | 7 wei |
 
-### Foundry scripts must hardcode gas-price
+Galileo's price rose on 2026-11-12. Transactions priced for the old level
+(2 gwei tip, 10 gwei cap) are no longer included there.
 
-> Scope note: this bites Foundry/cast (which trusts the node's 1-wei tip
-> verbatim). viem-based clients (the TypeScript SDK) estimate fees above
-> the minimum on their own — verified by real SDK writes (deposit /
-> giveFeedback / transferFrom) landing without overrides.
+### The attestor sets its fees from the environment
 
-For the same reason, `forge script` / `forge create` commands need an explicit
-gas price, otherwise they either estimate 1 wei and get rejected, or take 0G's
-default estimate (too low) and never get included. Note the two-flag form
-(`--priority-gas-price 2000000000 --gas-price 5000000000`) is **not** a
-recommendation — forge 1.6 often rejects it; in practice use
-`--legacy --gas-price 5000000000 --slow`.
+The attestor's alloy chain client (`attestor/crates/shared/src/chain.rs`) skips
+`GasFiller` and, per transaction, calls `set_max_priority_fee_per_gas` +
+`set_max_fee_per_gas` with `ATTESTOR_PRIORITY_FEE_GWEI` /
+`ATTESTOR_MAX_FEE_GWEI`; the gas limit is `estimate_gas` + 20%. The mainnet
+attestor runs on the code defaults (2 / 10 gwei). On Galileo set
+`ATTESTOR_PRIORITY_FEE_GWEI=1000` and `ATTESTOR_MAX_FEE_GWEI=2000`, as the dev
+and testnet attestors do. (The client skips `GasFiller` because Galileo's
+`eth_maxPriorityFeePerGas` used to answer 1 wei.)
 
-### The hardcoded gas-price flags all over the deploy / upgrade docs are this workaround
+### Foundry scripts take an explicit gas price
 
-See the deploy / upgrade command blocks in
-[`contracts/DEPLOYMENT.md`](contracts/DEPLOYMENT.md).
+> Scope note: viem-based clients (the TypeScript SDK) estimate fees on their
+> own — verified by real SDK writes (deposit / giveFeedback / transferFrom)
+> landing without overrides.
+
+Broadcast `forge script` with `--legacy --with-gas-price <GAS_PRICE> --slow`,
+where `<GAS_PRICE>` is the network's current price (`cast gas-price --rpc-url
+<RPC>`). On `forge script`, `--gas-price` sets only the simulation's gas price,
+not the broadcast's. `forge create` and `cast send` take `--gas-price`. The
+deploy / upgrade command blocks in
+[`contracts/DEPLOYMENT.md`](contracts/DEPLOYMENT.md) and
+[`contracts/UPGRADING.md`](contracts/UPGRADING.md) use this form.
 
 ### Receipt-availability lag → `waitForTransaction` false alarms
 
@@ -123,6 +130,15 @@ Treating any node error as "no registry" would, on a passing RPC hiccup,
 send a loader image's sealed away without a claim (the earlier loader images,
 which carry a sealed of their own, would claim without its sealed hash), or
 refuse a claim that names one.
+
+### Mainnet caps `eth_getLogs` at 100000 blocks
+
+Measured 2026-11-24: mainnet's RPC (`https://evmrpc.0g.ai`) refuses an
+`eth_getLogs` whose `toBlock - fromBlock` exceeds 100000, with `-32602 query
+exceeds max block range 100000`; Galileo's (`https://evmrpc-testnet.0g.ai`)
+answered the whole chain, block 0 to the head, in one call. A log scan that
+must run on mainnet reads in chunks: `script/MigrateTrust.s.sol` takes
+`LOG_CHUNK=100000` there (contracts/UPGRADING.md "AgenticID 1.4.0").
 
 ---
 
