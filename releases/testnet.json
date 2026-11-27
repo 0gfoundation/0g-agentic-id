@@ -1,6 +1,11 @@
 {
   "releases": [
     {
+      "version": "0.5.3",
+      "published_at": "2026-11-25T09:46:29Z",
+      "migrate": []
+    },
+    {
       "version": "0.5.2",
       "published_at": "2026-11-21T14:43:18Z",
       "migrate": []
